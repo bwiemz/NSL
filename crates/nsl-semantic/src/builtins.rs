@@ -252,6 +252,31 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // dropout(tensor, p, training) -> tensor
+    def(
+        "dropout",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Float, Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
+    def(
+        "conv2d",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone(), Type::Int, Type::Int, Type::Int, Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // maxpool2d(input, kernel_h, kernel_w, stride, padding) -> tensor
+    def(
+        "maxpool2d",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int, Type::Int, Type::Int, Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Tensor reduction / element-wise builtins (take tensor(s), return tensor)
     for name in &["mean", "sum", "neg", "clamp", "reduce_max", "gather"] {
         def(

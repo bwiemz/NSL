@@ -1,0 +1,5 @@
+let x = ones([2, 3])
+let d = dropout(x, 0.5, 1)
+print(d)
+let d2 = dropout(x, 0.5, 0)
+print(d2)

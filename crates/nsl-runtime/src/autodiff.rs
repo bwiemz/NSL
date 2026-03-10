@@ -52,6 +52,9 @@ pub enum TapeOp {
     EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
     LayerNorm { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_mean: i64, saved_inv_std: i64, saved_weight: i64 },
     RMSNorm { input: i64, weight: i64, out: i64, saved_input: i64, saved_rms: i64, saved_weight: i64 },
+    Dropout { a: i64, out: i64, saved_mask: i64, scale: f64 },
+    Conv2d { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_weight: i64, stride_h: usize, stride_w: usize, pad_h: usize, pad_w: usize },
+    MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
 }
 
 struct Tape {
@@ -170,6 +173,13 @@ pub extern "C" fn nsl_tape_stop() {
                 TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
                     tensor_free(*saved_input);
                     tensor_free(*saved_rms);
+                    tensor_free(*saved_weight);
+                }
+                TapeOp::Dropout { saved_mask, .. } => {
+                    tensor_free(*saved_mask);
+                }
+                TapeOp::Conv2d { saved_input, saved_weight, .. } => {
+                    tensor_free(*saved_input);
                     tensor_free(*saved_weight);
                 }
                 _ => {}
@@ -798,6 +808,123 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
     (dx_ptr, dw_ptr)
 }
 
+/// Dropout backward: grad_input = grad_output * mask * scale
+fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let mask = NslTensor::from_ptr(mask_ptr);
+    let len = grad.len as usize;
+    let ndim = grad.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(grad.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    for i in 0..len {
+        let g = unsafe { *grad.data.add(i) };
+        let m = unsafe { *mask.data.add(i) };
+        unsafe { *data.add(i) = g * m * scale };
+    }
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
+/// Conv2d backward: returns (grad_input, grad_weight, grad_bias)
+fn conv2d_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) -> (i64, i64, i64) {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+
+    let n = unsafe { *input.shape.add(0) } as usize;
+    let c_in = unsafe { *input.shape.add(1) } as usize;
+    let h = unsafe { *input.shape.add(2) } as usize;
+    let w = unsafe { *input.shape.add(3) } as usize;
+
+    let c_out = unsafe { *weight.shape.add(0) } as usize;
+    let kh = unsafe { *weight.shape.add(2) } as usize;
+    let kw = unsafe { *weight.shape.add(3) } as usize;
+
+    let h_out = unsafe { *grad.shape.add(2) } as usize;
+    let w_out = unsafe { *grad.shape.add(3) } as usize;
+
+    // Allocate grad_input [N, C_in, H, W]
+    let dx_ptr = create_tensor_with_shape(&[n as i64, c_in as i64, h as i64, w as i64], 0.0);
+    let dx = NslTensor::from_ptr(dx_ptr);
+
+    // Allocate grad_weight [C_out, C_in, kH, kW]
+    let dw_ptr = create_tensor_with_shape(&[c_out as i64, c_in as i64, kh as i64, kw as i64], 0.0);
+    let dw = NslTensor::from_ptr(dw_ptr);
+
+    // Allocate grad_bias [C_out]
+    let db_ptr = create_tensor_with_shape(&[c_out as i64], 0.0);
+    let db = NslTensor::from_ptr(db_ptr);
+
+    for ni in 0..n {
+        for co in 0..c_out {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let g_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
+                    let g_val = unsafe { *grad.data.add(g_idx) };
+
+                    // grad_bias[co] += grad_out[n][co][oh][ow]
+                    unsafe { *db.data.add(co) += g_val };
+
+                    for ci in 0..c_in {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let ih = oh * stride_h + ky;
+                                let iw = ow * stride_w + kx;
+                                if ih >= pad_h && iw >= pad_w && ih - pad_h < h && iw - pad_w < w {
+                                    let real_ih = ih - pad_h;
+                                    let real_iw = iw - pad_w;
+                                    let input_idx = ni * (c_in * h * w) + ci * (h * w) + real_ih * w + real_iw;
+                                    let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
+
+                                    // grad_weight[co][ci][ky][kx] += grad_out * input
+                                    unsafe { *dw.data.add(weight_idx) += g_val * *input.data.add(input_idx) };
+
+                                    // grad_input[ni][ci][real_ih][real_iw] += grad_out * weight
+                                    unsafe { *dx.data.add(input_idx) += g_val * *weight.data.add(weight_idx) };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (dx_ptr, dw_ptr, db_ptr)
+}
+
+/// MaxPool2d backward: scatter gradient to argmax positions
+fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let out = NslTensor::from_ptr(out_ptr);
+
+    let grad_len = grad.len as usize;
+    for i in 0..grad_len {
+        let g_val = unsafe { *grad.data.add(i) };
+        let idx = argmax[i];
+        unsafe { *out.data.add(idx) += g_val };
+    }
+
+    out_ptr
+}
+
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
 #[no_mangle]
@@ -1116,6 +1243,33 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let grad_result = rmsnorm_backward(g, *saved_input, *saved_rms, *saved_weight);
                     accumulate_grad(&mut grad_map, *input, grad_result.0);
                     accumulate_grad(&mut grad_map, *weight, grad_result.1);
+                }
+            }
+            TapeOp::Dropout { a, out, saved_mask, scale } => {
+                // grad_input = grad_output * mask * scale
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = dropout_backward(g, *saved_mask, *scale);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Conv2d { input, weight, bias, out, saved_input, saved_weight, stride_h, stride_w, pad_h, pad_w } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let (grad_input, grad_weight, grad_bias) = conv2d_backward(
+                        g, *saved_input, *saved_weight, *stride_h, *stride_w, *pad_h, *pad_w,
+                    );
+                    accumulate_grad(&mut grad_map, *input, grad_input);
+                    accumulate_grad(&mut grad_map, *weight, grad_weight);
+                    if *bias != 0 {
+                        accumulate_grad(&mut grad_map, *bias, grad_bias);
+                    } else {
+                        tensor_free(grad_bias);
+                    }
+                }
+            }
+            TapeOp::MaxPool2d { a, out, saved_argmax, input_shape } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = maxpool2d_backward(g, input_shape, saved_argmax);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
         }

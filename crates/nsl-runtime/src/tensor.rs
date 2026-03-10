@@ -2267,3 +2267,261 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 
     out_ptr
 }
+
+// === Dropout ===
+
+/// Dropout with inverted scaling. During training (training != 0, p > 0), randomly zero elements
+/// with probability p and scale surviving elements by 1/(1-p). During eval, returns a clone.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i64 {
+    // Eval mode or p==0: identity
+    if training == 0 || p == 0.0 {
+        return nsl_tensor_clone(tensor_ptr);
+    }
+
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len as usize;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let out_data = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Generate dropout mask: 1.0 if kept, 0.0 if dropped
+    let mask_shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, mask_shape, ndim as usize) };
+    let mask_strides = NslTensor::compute_strides(mask_shape, ndim);
+    let mask_data = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+
+    let scale = 1.0 / (1.0 - p);
+
+    // Simple LCG random number generator
+    let mut seed: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(12345);
+
+    for i in 0..len {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let rand_val = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        let keep = if rand_val >= p { 1.0 } else { 0.0 };
+        unsafe {
+            *mask_data.add(i) = keep;
+            *out_data.add(i) = *a.data.add(i) * keep * scale;
+        }
+    }
+
+    let result = Box::new(NslTensor {
+        data: out_data, shape, strides, ndim, len: len as i64, refcount: 1,
+    });
+    let result_ptr = Box::into_raw(result) as i64;
+
+    let mask_tensor = Box::new(NslTensor {
+        data: mask_data, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: 1,
+    });
+    let mask_ptr = Box::into_raw(mask_tensor) as i64;
+
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(mask_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Dropout {
+            a: tensor_ptr,
+            out: result_ptr,
+            saved_mask: mask_ptr,
+            scale,
+        });
+    } else {
+        nsl_tensor_free(mask_ptr);
+    }
+
+    result_ptr
+}
+
+// === Conv2d ===
+
+/// 2D convolution: input [N,C_in,H,W], weight [C_out,C_in,kH,kW], bias [C_out] (0 for no bias).
+/// Returns output [N,C_out,H_out,W_out].
+#[no_mangle]
+pub extern "C" fn nsl_tensor_conv2d(
+    input_ptr: i64,
+    weight_ptr: i64,
+    bias_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
+) -> i64 {
+    let input = NslTensor::from_ptr(input_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+
+    let n = unsafe { *input.shape.add(0) } as usize;
+    let c_in = unsafe { *input.shape.add(1) } as usize;
+    let h = unsafe { *input.shape.add(2) } as usize;
+    let w = unsafe { *input.shape.add(3) } as usize;
+
+    let c_out = unsafe { *weight.shape.add(0) } as usize;
+    let kh = unsafe { *weight.shape.add(2) } as usize;
+    let kw = unsafe { *weight.shape.add(3) } as usize;
+
+    let sh = stride_h as usize;
+    let sw = stride_w as usize;
+    let ph = pad_h as usize;
+    let pw = pad_w as usize;
+
+    let h_out = (h + 2 * ph - kh) / sh + 1;
+    let w_out = (w + 2 * pw - kw) / sw + 1;
+
+    let out_len = n * c_out * h_out * w_out;
+    let out_shape = checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = n as i64;
+        *out_shape.add(1) = c_out as i64;
+        *out_shape.add(2) = h_out as i64;
+        *out_shape.add(3) = w_out as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 4);
+    let out_data = checked_alloc_zeroed(out_len * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Direct nested-loop convolution
+    for ni in 0..n {
+        for co in 0..c_out {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut val = 0.0_f64;
+                    for ci in 0..c_in {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let ih = oh * sh + ky;
+                                let iw = ow * sw + kx;
+                                // Check padding bounds
+                                if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
+                                    let input_idx = ni * (c_in * h * w) + ci * (h * w) + (ih - ph) * w + (iw - pw);
+                                    let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
+                                    val += unsafe { *input.data.add(input_idx) * *weight.data.add(weight_idx) };
+                                }
+                            }
+                        }
+                    }
+                    // Add bias if provided
+                    if bias_ptr != 0 {
+                        let bias = NslTensor::from_ptr(bias_ptr);
+                        val += unsafe { *bias.data.add(co) };
+                    }
+                    let out_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
+                    unsafe { *out_data.add(out_idx) = val };
+                }
+            }
+        }
+    }
+
+    let result = Box::new(NslTensor {
+        data: out_data, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
+    });
+    let result_ptr = Box::into_raw(result) as i64;
+
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(input_ptr).refcount += 1;
+        NslTensor::from_ptr(weight_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Conv2d {
+            input: input_ptr,
+            weight: weight_ptr,
+            bias: bias_ptr,
+            out: result_ptr,
+            saved_input: input_ptr,
+            saved_weight: weight_ptr,
+            stride_h: sh,
+            stride_w: sw,
+            pad_h: ph,
+            pad_w: pw,
+        });
+    }
+
+    result_ptr
+}
+
+// === MaxPool2d ===
+
+/// 2D max pooling: input [N,C,H,W] -> output [N,C,H_out,W_out].
+/// Saves argmax indices for backward gradient routing.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_maxpool2d(
+    input_ptr: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    stride: i64,
+    padding: i64,
+) -> i64 {
+    let input = NslTensor::from_ptr(input_ptr);
+
+    let n = unsafe { *input.shape.add(0) } as usize;
+    let c = unsafe { *input.shape.add(1) } as usize;
+    let h = unsafe { *input.shape.add(2) } as usize;
+    let w = unsafe { *input.shape.add(3) } as usize;
+
+    let kh = kernel_h as usize;
+    let kw = kernel_w as usize;
+    let s = stride as usize;
+    let pad = padding as usize;
+
+    let h_out = (h + 2 * pad - kh) / s + 1;
+    let w_out = (w + 2 * pad - kw) / s + 1;
+
+    let out_len = n * c * h_out * w_out;
+    let out_shape = checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = n as i64;
+        *out_shape.add(1) = c as i64;
+        *out_shape.add(2) = h_out as i64;
+        *out_shape.add(3) = w_out as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 4);
+    let out_data = checked_alloc(out_len * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Save argmax indices for backward
+    let mut argmax_indices: Vec<usize> = vec![0; out_len];
+
+    for ni in 0..n {
+        for ci in 0..c {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut max_val = f64::NEG_INFINITY;
+                    let mut max_idx: usize = 0;
+                    for ky in 0..kh {
+                        for kx in 0..kw {
+                            let ih = oh * s + ky;
+                            let iw = ow * s + kx;
+                            if ih >= pad && iw >= pad && ih - pad < h && iw - pad < w {
+                                let input_idx = ni * (c * h * w) + ci * (h * w) + (ih - pad) * w + (iw - pad);
+                                let val = unsafe { *input.data.add(input_idx) };
+                                if val > max_val {
+                                    max_val = val;
+                                    max_idx = input_idx;
+                                }
+                            }
+                        }
+                    }
+                    let out_idx = ni * (c * h_out * w_out) + ci * (h_out * w_out) + oh * w_out + ow;
+                    unsafe { *out_data.add(out_idx) = max_val };
+                    argmax_indices[out_idx] = max_idx;
+                }
+            }
+        }
+    }
+
+    let result = Box::new(NslTensor {
+        data: out_data, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
+    });
+    let result_ptr = Box::into_raw(result) as i64;
+
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(input_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
+            a: input_ptr,
+            out: result_ptr,
+            saved_argmax: argmax_indices,
+            input_shape: vec![n as i64, c as i64, h as i64, w as i64],
+        });
+    }
+
+    result_ptr
+}

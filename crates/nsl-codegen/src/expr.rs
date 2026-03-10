@@ -751,6 +751,45 @@ impl Compiler<'_> {
             let eps_f = if is_float_type(&eps_type) { eps_val } else { builder.ins().fcvt_from_sint(cl_types::F64, eps_val) };
             return self.compile_call_by_name(builder, "nsl_tensor_rmsnorm", &[input_val, weight_val, eps_f]);
         }
+        // dropout(tensor, p, training) -> tensor
+        if func_name == "dropout" && !self.functions.contains_key(&func_name) {
+            if args.len() != 3 {
+                return Err(CodegenError::new("dropout() takes exactly 3 arguments (tensor, p, training)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let p_val = self.compile_expr(builder, state, &args[1].value)?;
+            let p_type = self.node_type(args[1].value.id).clone();
+            let p_f = if is_float_type(&p_type) { p_val } else { builder.ins().fcvt_from_sint(cl_types::F64, p_val) };
+            let training_val = self.compile_expr(builder, state, &args[2].value)?;
+            let training_i8 = builder.ins().ireduce(cl_types::I8, training_val);
+            return self.compile_call_by_name(builder, "nsl_tensor_dropout", &[tensor_val, p_f, training_i8]);
+        }
+        // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
+        if func_name == "conv2d" && !self.functions.contains_key(&func_name) {
+            if args.len() != 7 {
+                return Err(CodegenError::new("conv2d() takes exactly 7 arguments (input, weight, bias, stride_h, stride_w, pad_h, pad_w)"));
+            }
+            let input_val = self.compile_expr(builder, state, &args[0].value)?;
+            let weight_val = self.compile_expr(builder, state, &args[1].value)?;
+            let bias_val = self.compile_expr(builder, state, &args[2].value)?;
+            let stride_h = self.compile_expr(builder, state, &args[3].value)?;
+            let stride_w = self.compile_expr(builder, state, &args[4].value)?;
+            let pad_h = self.compile_expr(builder, state, &args[5].value)?;
+            let pad_w = self.compile_expr(builder, state, &args[6].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_conv2d", &[input_val, weight_val, bias_val, stride_h, stride_w, pad_h, pad_w]);
+        }
+        // maxpool2d(input, kernel_h, kernel_w, stride, padding) -> tensor
+        if func_name == "maxpool2d" && !self.functions.contains_key(&func_name) {
+            if args.len() != 5 {
+                return Err(CodegenError::new("maxpool2d() takes exactly 5 arguments (input, kernel_h, kernel_w, stride, padding)"));
+            }
+            let input_val = self.compile_expr(builder, state, &args[0].value)?;
+            let kernel_h = self.compile_expr(builder, state, &args[1].value)?;
+            let kernel_w = self.compile_expr(builder, state, &args[2].value)?;
+            let stride_val = self.compile_expr(builder, state, &args[3].value)?;
+            let padding_val = self.compile_expr(builder, state, &args[4].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_maxpool2d", &[input_val, kernel_h, kernel_w, stride_val, padding_val]);
+        }
         // embedding_lookup(weight, indices) -> tensor
         if func_name == "embedding_lookup" && !self.functions.contains_key(&func_name) {
             if args.len() != 2 {
