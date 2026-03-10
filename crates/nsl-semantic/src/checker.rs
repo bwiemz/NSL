@@ -263,7 +263,37 @@ impl<'a> TypeChecker<'a> {
             StmtKind::Expr(expr) => {
                 self.check_expr(expr);
             }
-            StmtKind::Decorated { decorators: _, stmt } => {
+            StmtKind::Decorated { decorators, stmt } => {
+                // Validate @test decorator constraints
+                for deco in decorators {
+                    if deco.name.len() == 1 {
+                        let dname = self.interner.resolve(deco.name[0].0).unwrap_or("").to_string();
+                        if dname == "test" {
+                            // @test must decorate a function
+                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                                // @test functions must have no parameters
+                                if !fn_def.params.is_empty() {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@test function must have no parameters")
+                                            .with_label(fn_def.span, "has parameters"),
+                                    );
+                                }
+                                // @test functions must have no return type
+                                if fn_def.return_type.is_some() {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@test function must not have a return type")
+                                            .with_label(fn_def.span, "has return type"),
+                                    );
+                                }
+                            } else {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@test can only decorate a function definition")
+                                        .with_label(deco.span, "invalid @test target"),
+                                );
+                            }
+                        }
+                    }
+                }
                 self.check_stmt(stmt);
             }
             // ML blocks: walk children for name resolution but defer validation

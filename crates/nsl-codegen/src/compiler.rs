@@ -61,6 +61,8 @@ pub struct Compiler<'a> {
     pub dump_ir: bool,
     /// Functions decorated with `@no_grad` — tape is paused during their execution.
     pub no_grad_fns: HashSet<String>,
+    /// Functions decorated with `@test` — discovered by `nsl test` runner.
+    pub test_fns: Vec<String>,
     /// Module prefix for name mangling. Empty means no mangling (entry module / single-file).
     pub module_prefix: String,
     func_index: u32,
@@ -117,6 +119,7 @@ impl<'a> Compiler<'a> {
             call_conv,
             dump_ir: false,
             no_grad_fns: HashSet::new(),
+            test_fns: Vec::new(),
             module_prefix: String::new(),
             func_index: 0,
         })
@@ -494,13 +497,15 @@ impl<'a> Compiler<'a> {
                 .map_err(|e| CodegenError::new(format!("failed to declare fn '{raw_name}': {e}")))?;
             self.functions.insert(raw_name.clone(), (func_id, sig));
 
-            // Track @no_grad decorated functions
+            // Track decorated functions
             if let Some(decos) = decorators {
                 for d in decos {
                     if d.name.len() == 1 {
                         let dname = self.resolve_sym(d.name[0]);
                         if dname == "no_grad" {
                             self.no_grad_fns.insert(raw_name.clone());
+                        } else if dname == "test" {
+                            self.test_fns.push(raw_name.clone());
                         }
                     }
                 }
