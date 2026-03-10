@@ -1,0 +1,14 @@
+fn sgd_step(param: Tensor, grad: Tensor, velocity: Tensor, lr: float, momentum: float, dampening: float, weight_decay: float, nesterov: bool):
+    if weight_decay > 0.0:
+        let g = grad + weight_decay * param
+    else:
+        let g = grad
+    if momentum > 0.0:
+        copy_data(velocity, momentum * velocity + (1.0 - dampening) * g)
+        if nesterov:
+            let update = g + momentum * velocity
+        else:
+            let update = velocity
+        copy_data(param, param - lr * update)
+    else:
+        copy_data(param, param - lr * g)

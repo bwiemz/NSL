@@ -1,0 +1,10 @@
+fn adam_step(param: Tensor, grad: Tensor, m: Tensor, v: Tensor, lr: float, beta1: float, beta2: float, eps: float, weight_decay: float, t: float):
+    if weight_decay > 0.0:
+        let g = grad + weight_decay * param
+    else:
+        let g = grad
+    copy_data(m, beta1 * m + (1.0 - beta1) * g)
+    copy_data(v, beta2 * v + (1.0 - beta2) * g * g)
+    let m_hat = m * (1.0 / (1.0 - beta1 ** t))
+    let v_hat = v * (1.0 / (1.0 - beta2 ** t))
+    copy_data(param, param - lr * m_hat / (sqrt(v_hat) + eps))
