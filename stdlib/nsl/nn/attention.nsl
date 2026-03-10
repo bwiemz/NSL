@@ -9,6 +9,10 @@ model Attention(dim: int, num_heads: int):
         let k = x @ self.k_proj
         let v = x @ self.v_proj
         let scale = sqrt(full([1], float(dim)))
-        let attn = softmax(q @ k.transpose(0, 1) / scale, -1)
+        # Transpose last two dims of k for attention scores (Q @ K^T).
+        # Uses negative indexing (-2, -1) so this works for both
+        # unbatched 2D [seq, dim] and batched 3D+ inputs.
+        let k_t = k.transpose(-2, -1)
+        let attn = softmax(q @ k_t / scale, -1)
         let out = attn @ v
         return out @ self.out_proj

@@ -352,13 +352,19 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
 pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
 
-    if dim0 < 0 || dim0 >= tensor.ndim || dim1 < 0 || dim1 >= tensor.ndim {
+    // Support negative dimension indices (e.g., -1 = last dim, -2 = second to last)
+    let d0 = if dim0 < 0 { dim0 + tensor.ndim } else { dim0 };
+    let d1 = if dim1 < 0 { dim1 + tensor.ndim } else { dim1 };
+
+    if d0 < 0 || d0 >= tensor.ndim || d1 < 0 || d1 >= tensor.ndim {
         eprintln!(
             "nsl: transpose dimensions out of range ({}, {} for ndim {})",
             dim0, dim1, tensor.ndim
         );
         std::process::abort();
     }
+    let dim0 = d0;
+    let dim1 = d1;
 
     // Deep copy with transposed shape
     let ndim = tensor.ndim;
@@ -2086,14 +2092,15 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 
     // For each index, copy the corresponding row from weight
     for i in 0..seq_len {
-        let idx = unsafe { *indices.data.add(i) } as usize;
-        if idx >= vocab_size {
+        let raw_idx = unsafe { *indices.data.add(i) } as i64;
+        if raw_idx < 0 || raw_idx >= vocab_size as i64 {
             eprintln!(
                 "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
-                idx, vocab_size
+                raw_idx, vocab_size
             );
             std::process::abort();
         }
+        let idx = raw_idx as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 weight.data.add(idx * embed_dim),
