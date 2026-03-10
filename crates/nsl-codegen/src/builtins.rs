@@ -196,6 +196,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tokenizer_decode", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tokenizer_vocab_size", &[types::I64], Some(types::I64)),
     ("nsl_tokenizer_encode_batch", &[types::I64, types::I64, types::I8, types::I8, types::I64], Some(types::I64)),
+    // Quantization (M16)
+    ("nsl_qtensor_quantize", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_qtensor_dequantize", &[types::I64], Some(types::I64)),
+    ("nsl_qtensor_matmul_mixed", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_qtensor_free", &[types::I64], None),
+    ("nsl_qtensor_addref", &[types::I64], None),
+    ("nsl_qtensor_release", &[types::I64], None),
+    ("nsl_qtensor_dtype", &[types::I64], Some(types::I64)),
+    ("nsl_qtensor_shape", &[types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

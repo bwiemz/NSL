@@ -391,6 +391,48 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // Quantization functions (M16)
+    // nsl_qtensor_quantize(tensor, dtype, granularity, axis, group_size) -> QuantizedTensor
+    def(
+        "nsl_qtensor_quantize",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Int, Type::Int, Type::Int, Type::Int],
+            ret: Box::new(Type::QuantizedTensor),
+        },
+    );
+    // nsl_qtensor_dequantize(qtensor) -> Tensor
+    def(
+        "nsl_qtensor_dequantize",
+        Type::Function {
+            params: vec![Type::QuantizedTensor],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // nsl_qtensor_matmul_mixed(tensor, qtensor) -> Tensor
+    def(
+        "nsl_qtensor_matmul_mixed",
+        Type::Function {
+            params: vec![Type::Unknown, Type::QuantizedTensor],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // nsl_qtensor_dtype(qtensor) -> Int
+    def(
+        "nsl_qtensor_dtype",
+        Type::Function {
+            params: vec![Type::QuantizedTensor],
+            ret: Box::new(Type::Int),
+        },
+    );
+    // nsl_qtensor_shape(qtensor) -> Tensor (1D shape as f64 values)
+    def(
+        "nsl_qtensor_shape",
+        Type::Function {
+            params: vec![Type::QuantizedTensor],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Math functions (always return Float — coerce int args at codegen level)
     for name in &["sqrt", "log", "exp", "sin", "cos", "floor"] {
         def(

@@ -540,6 +540,54 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Mixed-precision matmul
+// ---------------------------------------------------------------------------
+
+/// Mixed-precision matmul: NslTensor (f64) @ QuantizedTensor -> NslTensor (f64).
+/// Dequantizes the quantized weight on-the-fly during matmul.
+/// qw must be 2D [K, N]. x must have last dim = K.
+#[no_mangle]
+pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
+    // Validate qw is 2D
+    let qw = QuantizedTensor::from_ptr(qw_ptr);
+    if qw.ndim != 2 {
+        eprintln!(
+            "nsl: nsl_qtensor_matmul_mixed: quantized weight must be 2D, got {}D",
+            qw.ndim
+        );
+        std::process::abort();
+    }
+
+    // Validate x last dim matches qw dim 0
+    let x = NslTensor::from_ptr(x_ptr);
+    let qw_k = unsafe { *qw.shape.add(0) };
+    let x_last = if x.ndim > 0 {
+        unsafe { *x.shape.add((x.ndim - 1) as usize) }
+    } else {
+        eprintln!("nsl: nsl_qtensor_matmul_mixed: x must be at least 1D");
+        std::process::abort();
+    };
+    if x_last != qw_k {
+        eprintln!(
+            "nsl: nsl_qtensor_matmul_mixed: x last dim ({}) != qw dim 0 ({})",
+            x_last, qw_k
+        );
+        std::process::abort();
+    }
+
+    // Dequantize the quantized weight to a temporary NslTensor
+    let deq_ptr = nsl_qtensor_dequantize(qw_ptr);
+
+    // Perform matmul: x @ deq
+    let result_ptr = crate::tensor::nsl_tensor_matmul(x_ptr, deq_ptr);
+
+    // Free the temporary dequantized tensor
+    crate::tensor::nsl_tensor_free(deq_ptr);
+
+    result_ptr
+}
+
+// ---------------------------------------------------------------------------
 // Query helpers
 // ---------------------------------------------------------------------------
 

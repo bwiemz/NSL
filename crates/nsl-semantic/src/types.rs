@@ -55,6 +55,9 @@ pub enum Type {
         format: SparseFormat,
     },
 
+    /// Opaque quantized tensor handle (always i64 pointer at IR level).
+    QuantizedTensor,
+
     // Callable
     Function {
         params: Vec<Type>,
@@ -381,6 +384,7 @@ pub fn display_type(ty: &Type) -> String {
             let ps: Vec<String> = params.iter().map(|t| display_type(t)).collect();
             format!("({}) -> {}", ps.join(", "), display_type(ret))
         }
+        Type::QuantizedTensor => "QuantizedTensor".into(),
         Type::Module { .. } => "module".into(),
         Type::Unknown => "unknown".into(),
         Type::Error => "error".into(),

@@ -957,6 +957,48 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tokenizer_encode_batch", &[handle, texts, padding_i8, truncation_i8, max_len]);
         }
 
+        // Quantization functions (M16)
+        if func_name == "nsl_qtensor_quantize" && !self.functions.contains_key(&func_name) {
+            if args.len() != 5 {
+                return Err(CodegenError::new("nsl_qtensor_quantize() takes exactly 5 arguments (tensor, dtype, granularity, axis, group_size)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dtype_val = self.compile_expr(builder, state, &args[1].value)?;
+            let gran_val = self.compile_expr(builder, state, &args[2].value)?;
+            let axis_val = self.compile_expr(builder, state, &args[3].value)?;
+            let group_val = self.compile_expr(builder, state, &args[4].value)?;
+            return self.compile_call_by_name(builder, "nsl_qtensor_quantize", &[tensor_val, dtype_val, gran_val, axis_val, group_val]);
+        }
+        if func_name == "nsl_qtensor_dequantize" && !self.functions.contains_key(&func_name) {
+            if args.len() != 1 {
+                return Err(CodegenError::new("nsl_qtensor_dequantize() takes exactly 1 argument (qtensor)"));
+            }
+            let qt_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt_val]);
+        }
+        if func_name == "nsl_qtensor_matmul_mixed" && !self.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("nsl_qtensor_matmul_mixed() takes exactly 2 arguments (tensor, qtensor)"));
+            }
+            let x_val = self.compile_expr(builder, state, &args[0].value)?;
+            let qw_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_qtensor_matmul_mixed", &[x_val, qw_val]);
+        }
+        if func_name == "nsl_qtensor_dtype" && !self.functions.contains_key(&func_name) {
+            if args.len() != 1 {
+                return Err(CodegenError::new("nsl_qtensor_dtype() takes exactly 1 argument (qtensor)"));
+            }
+            let qt_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_qtensor_dtype", &[qt_val]);
+        }
+        if func_name == "nsl_qtensor_shape" && !self.functions.contains_key(&func_name) {
+            if args.len() != 1 {
+                return Err(CodegenError::new("nsl_qtensor_shape() takes exactly 1 argument (qtensor)"));
+            }
+            let qt_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_qtensor_shape", &[qt_val]);
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();
