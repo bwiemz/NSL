@@ -76,6 +76,14 @@ Output:
 - Tape-based reverse-mode autodiff
 - `@no_grad` decorator to exclude functions from tape
 - Supports: add, sub, mul, div, matmul, exp, log, sqrt, abs, clamp, sum, mean, reduce_max, gather
+- Broadcasting: NumPy-style broadcast for elementwise ops
+
+### Neural Network Layers
+- **Activation functions**: relu, gelu, silu, sigmoid, tanh, softmax
+- **Layers**: Linear, Embedding, MLP, Attention, Conv2d, MaxPool2d
+- **Normalization**: LayerNorm, RMSNorm
+- **Regularization**: Dropout (training-mode aware)
+- **Weight init**: randn for Kaiming-style initialization
 
 ### Training DSL
 - `train(model=m, epochs=N):` declarative training blocks
@@ -86,9 +94,21 @@ Output:
 - Callbacks: `on_step(step, loss)`, `on_epoch(epoch, loss)`
 - `.nslm` checkpoint format for model serialization
 
+### Tokenization
+- Byte-level tokenizer (no training needed)
+- BPE tokenizer via HuggingFace `tokenizers` crate
+- Encode text → token ID tensors, decode back to text
+- Batch encoding with padding and attention masks
+
+### Test Framework
+- `@test` decorator marks functions as test cases
+- `assert_eq`, `assert_close` for value and tensor assertions
+- `nsl test` CLI with process isolation (each test in separate process)
+- Filter tests with `--filter`
+
 ## Building
 
-Requires Rust (stable). No other dependencies.
+Requires Rust (stable).
 
 ```bash
 cargo build -p nsl-cli
@@ -119,9 +139,15 @@ crates/
 
 stdlib/nsl/        Standard library (written in NSL)
   math.nsl         Basic math utilities
+  nn/layers.nsl    Linear, Embedding, MLP
+  nn/norms.nsl     LayerNorm, RMSNorm
+  nn/activations.nsl  Activation function wrappers
+  nn/attention.nsl Dot-product attention
+  nn/dropout.nsl   Dropout layer
   nn/losses.nsl    Loss functions (mse, l1, cross_entropy, bce)
   optim/           Optimizers (sgd, adam, adamw, lion, muon, soap)
   optim/schedulers.nsl  Learning rate schedulers
+  tokenize/        Tokenizer wrappers
 
 spec/              Language specification (13 chapters)
 examples/          Example programs and integration tests
@@ -137,6 +163,12 @@ cargo test --workspace
 
 # Run a specific integration test
 cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl
+
+# Run NSL test suite
+cargo run -p nsl-cli -- test tests/m15_test.nsl
+
+# Run end-to-end language model demo
+cargo run -p nsl-cli -- run examples/m15_tiny_lm.nsl
 ```
 
 ## Development Status
@@ -151,7 +183,7 @@ NSL is in active development. Current milestone progress:
 | M12 | `grad` keyword + tape-based autodiff | Complete |
 | M13 | Import system + multi-file compilation | Complete |
 | M14 | Training DSL + optimizers + schedulers | Complete |
-| M15 | Data pipeline + tokenization | Planned |
+| M15 | NN stdlib + tokenization + test framework | Complete |
 | M16 | Quantization (`quant` keyword) | Planned |
 | M17 | GPU/CUDA + `kernel` keyword | Planned |
 | M18 | Interop (PyTorch, HuggingFace, ONNX) | Planned |
