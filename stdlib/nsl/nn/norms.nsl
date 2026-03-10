@@ -1,0 +1,14 @@
+model LayerNorm(dim: int):
+    weight: Tensor = ones([dim])
+    bias: Tensor = zeros([dim])
+    eps: float = 0.00001
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return layernorm(x, self.weight, self.bias, self.eps)
+
+model RMSNorm(dim: int):
+    weight: Tensor = ones([dim])
+    eps: float = 0.00001
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return rmsnorm(x, self.weight, self.eps)

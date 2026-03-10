@@ -1,0 +1,17 @@
+fn relu_act(x: Tensor) -> Tensor:
+    return relu(x)
+
+fn gelu_act(x: Tensor) -> Tensor:
+    return gelu(x)
+
+fn silu_act(x: Tensor) -> Tensor:
+    return silu(x)
+
+fn sigmoid_act(x: Tensor) -> Tensor:
+    return sigmoid(x)
+
+fn tanh_act(x: Tensor) -> Tensor:
+    return tanh(x)
+
+fn softmax_act(x: Tensor, dim: int) -> Tensor:
+    return softmax(x, dim)

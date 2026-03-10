@@ -1,0 +1,5 @@
+model Dropout(p: float):
+    prob: float = p
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return dropout(x, self.prob, is_training())

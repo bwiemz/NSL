@@ -1,0 +1,14 @@
+model Attention(dim: int, num_heads: int):
+    q_proj: Tensor = randn([dim, dim])
+    k_proj: Tensor = randn([dim, dim])
+    v_proj: Tensor = randn([dim, dim])
+    out_proj: Tensor = randn([dim, dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let q = x @ self.q_proj
+        let k = x @ self.k_proj
+        let v = x @ self.v_proj
+        let scale = sqrt(full([1], float(dim)))
+        let attn = softmax(q @ k.transpose(0, 1) / scale, -1)
+        let out = attn @ v
+        return out @ self.out_proj
