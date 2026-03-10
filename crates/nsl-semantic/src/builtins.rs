@@ -164,6 +164,25 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
     def(
+        "assert_eq",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "assert_close",
+        Type::Function {
+            params: vec![
+                Type::Tensor { shape: Shape::unknown(), dtype: DType::Unknown, device: Device::Unknown },
+                Type::Tensor { shape: Shape::unknown(), dtype: DType::Unknown, device: Device::Unknown },
+                Type::Float,
+                Type::Float,
+            ],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
         "exit",
         Type::Function {
             params: vec![Type::Int],

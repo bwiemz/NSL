@@ -525,6 +525,52 @@ impl Compiler<'_> {
             builder.ins().call(fref, &[cond_i8, msg]);
             return Ok(builder.ins().iconst(cl_types::I64, 0));
         }
+        // assert_eq(a, b)
+        if func_name == "assert_eq" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("assert_eq() takes exactly 2 arguments"));
+            }
+            let a = self.compile_expr(builder, state, &args[0].value)?;
+            let b = self.compile_expr(builder, state, &args[1].value)?;
+            let a_type = self.node_type(args[0].value.id).clone();
+            let b_type = self.node_type(args[1].value.id).clone();
+            let is_float = is_float_type(&a_type) || is_float_type(&b_type);
+
+            let msg_str = "assert_eq";
+            self.intern_string(msg_str)?;
+            let msg_ptr = self.compile_string_literal(builder, msg_str)?;
+            let msg_len = builder.ins().iconst(cl_types::I64, msg_str.len() as i64);
+
+            if is_float {
+                let a_f = if is_float_type(&a_type) { a } else { builder.ins().fcvt_from_sint(cl_types::F64, a) };
+                let b_f = if is_float_type(&b_type) { b } else { builder.ins().fcvt_from_sint(cl_types::F64, b) };
+                return self.compile_call_by_name(builder, "nsl_assert_eq_float", &[a_f, b_f, msg_ptr, msg_len]);
+            }
+            return self.compile_call_by_name(builder, "nsl_assert_eq_int", &[a, b, msg_ptr, msg_len]);
+        }
+        // assert_close(a, b, rtol, atol)
+        if func_name == "assert_close" {
+            if args.len() != 4 {
+                return Err(CodegenError::new("assert_close() takes exactly 4 arguments (tensor, tensor, rtol, atol)"));
+            }
+            let a = self.compile_expr(builder, state, &args[0].value)?;
+            let b = self.compile_expr(builder, state, &args[1].value)?;
+            let rtol = self.compile_expr(builder, state, &args[2].value)?;
+            let atol = self.compile_expr(builder, state, &args[3].value)?;
+
+            // Coerce rtol/atol to f64 if they are int
+            let rtol_type = self.node_type(args[2].value.id).clone();
+            let atol_type = self.node_type(args[3].value.id).clone();
+            let rtol_f = if is_float_type(&rtol_type) { rtol } else { builder.ins().fcvt_from_sint(cl_types::F64, rtol) };
+            let atol_f = if is_float_type(&atol_type) { atol } else { builder.ins().fcvt_from_sint(cl_types::F64, atol) };
+
+            let msg_str = "assert_close";
+            self.intern_string(msg_str)?;
+            let msg_ptr = self.compile_string_literal(builder, msg_str)?;
+            let msg_len = builder.ins().iconst(cl_types::I64, msg_str.len() as i64);
+
+            return self.compile_call_by_name(builder, "nsl_assert_close", &[a, b, rtol_f, atol_f, msg_ptr, msg_len]);
+        }
         // Exit
         if func_name == "exit" {
             if args.len() != 1 {

@@ -1,0 +1,9 @@
+let a = 5
+let b = 5
+assert_eq(a, b)
+
+let x = ones([3])
+let y = ones([3])
+assert_close(x, y, 0.001, 0.001)
+
+print("All assertions passed!")
