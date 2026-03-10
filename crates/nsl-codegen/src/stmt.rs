@@ -1,12 +1,13 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::InstBuilder;
+use cranelift_codegen::ir::{InstBuilder, MemFlags};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
 use nsl_ast::operator::AssignOp;
 use nsl_ast::pattern::PatternKind;
-use nsl_ast::expr::SubscriptKind;
+use nsl_ast::expr::{ExprKind, SubscriptKind};
+use nsl_ast::block::TrainSection;
 use nsl_ast::stmt::{Stmt, StmtKind};
 
 use crate::compiler::Compiler;
@@ -179,11 +180,15 @@ impl Compiler<'_> {
                 self.compile_grad_block(builder, state, grad)?;
             }
 
+            StmtKind::TrainBlock(train) => {
+                self.compile_train_block(builder, state, train)?;
+            }
+
             StmtKind::StructDef(_) | StmtKind::ModelDef(_)
             | StmtKind::EnumDef(_) | StmtKind::TraitDef(_)
             | StmtKind::Import(_) | StmtKind::FromImport(_)
             | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_)
-            | StmtKind::TrainBlock(_) | StmtKind::QuantBlock(_)
+            | StmtKind::QuantBlock(_)
             | StmtKind::KernelDef(_) => {}
 
             StmtKind::WhileLet { pattern, expr, body } => {
@@ -793,6 +798,432 @@ impl Compiler<'_> {
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
         state.current_block = Some(merge_block);
+        Ok(())
+    }
+
+    fn compile_train_block(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        train: &nsl_ast::block::TrainBlock,
+    ) -> Result<(), CodegenError> {
+        // ── 1. Extract config from train(...) args ──────────────────────
+        let mut model_sym: Option<nsl_ast::Symbol> = None;
+        let mut epochs: i64 = 1;
+
+        for arg in &train.config {
+            if let Some(name_sym) = arg.name {
+                let name = self.resolve_sym(name_sym).to_string();
+                match name.as_str() {
+                    "model" => {
+                        if let ExprKind::Ident(sym) = &arg.value.kind {
+                            model_sym = Some(*sym);
+                        } else {
+                            return Err(CodegenError::new("train 'model' arg must be an identifier"));
+                        }
+                    }
+                    "epochs" => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            epochs = *n;
+                        } else {
+                            return Err(CodegenError::new("train 'epochs' arg must be an integer literal"));
+                        }
+                    }
+                    _ => {} // ignore unknown config for forward compat
+                }
+            }
+        }
+
+        let model_sym = model_sym.ok_or_else(|| {
+            CodegenError::new("train block requires 'model=<ident>' config argument")
+        })?;
+
+        // ── 2. Extract optimizer info from sections ─────────────────────
+        let mut optimizer_name = String::new();
+        let mut lr_value: f64 = 0.01;
+        let mut momentum_value: f64 = 0.0;
+        let mut dampening_value: f64 = 0.0;
+        let mut weight_decay_value: f64 = 0.0;
+        let mut nesterov_value: bool = false;
+        let mut step_body: Option<&nsl_ast::stmt::Block> = None;
+        let mut callbacks: Vec<&nsl_ast::block::CallbackDef> = Vec::new();
+
+        for section in &train.sections {
+            match section {
+                TrainSection::Optimizer(expr) => {
+                    // Parse call like SGD(lr=0.01, momentum=0.9)
+                    if let ExprKind::Call { callee, args } = &expr.kind {
+                        if let ExprKind::Ident(sym) = &callee.kind {
+                            optimizer_name = self.resolve_sym(*sym).to_string().to_lowercase();
+                        }
+                        for arg in args {
+                            if let Some(name_sym) = arg.name {
+                                let name = self.resolve_sym(name_sym).to_string();
+                                match name.as_str() {
+                                    "lr" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            lr_value = *f;
+                                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                            lr_value = *n as f64;
+                                        }
+                                    }
+                                    "momentum" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            momentum_value = *f;
+                                        }
+                                    }
+                                    "dampening" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            dampening_value = *f;
+                                        }
+                                    }
+                                    "weight_decay" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            weight_decay_value = *f;
+                                        }
+                                    }
+                                    "nesterov" => {
+                                        if let ExprKind::BoolLiteral(b) = &arg.value.kind {
+                                            nesterov_value = *b;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                TrainSection::Step { body, .. } => {
+                    step_body = Some(body);
+                }
+                TrainSection::Callbacks(cbs) => {
+                    callbacks.extend(cbs.iter());
+                }
+                _ => {} // Data, Scheduler, Eval, Distribute, Stmt — not yet implemented
+            }
+        }
+
+        if optimizer_name.is_empty() {
+            return Err(CodegenError::new("train block requires an optimizer section"));
+        }
+
+        let step_body = step_body.ok_or_else(|| {
+            CodegenError::new("train block requires a step section")
+        })?;
+
+        // ── 3. Resolve model type and build param list ──────────────────
+        // Get the model pointer from state
+        let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
+            CodegenError::new(format!(
+                "undefined model variable '{}' in train block",
+                self.resolve_sym(model_sym)
+            ))
+        })?;
+        let model_ptr = builder.use_var(model_var);
+
+        // Resolve model type name — search type_map for any entry with Model/Struct type
+        // that matches what we know about this variable, or fall back to the variable name
+        let model_var_name = self.resolve_sym(model_sym).to_string();
+        let model_type_name = {
+            // Try to find the model type by checking all type_map entries
+            let mut found_name = None;
+            for (_node_id, ty) in self.type_map.iter() {
+                match ty {
+                    nsl_semantic::types::Type::Model { name, .. } => {
+                        let n = self.resolve_sym(*name).to_string();
+                        if self.struct_layouts.contains_key(&n) {
+                            found_name = Some(n);
+                            break;
+                        }
+                    }
+                    nsl_semantic::types::Type::Struct { name, .. } => {
+                        let n = self.resolve_sym(*name).to_string();
+                        if self.struct_layouts.contains_key(&n) {
+                            // Only use if it looks like a model (has tensor fields)
+                            found_name = Some(n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Fallback: try variable name directly, or capitalize it
+            found_name.unwrap_or_else(|| {
+                // Try capitalized form (common: variable 'm' → type 'M' not useful)
+                // Just use the variable name and hope struct_layouts has it
+                model_var_name.clone()
+            })
+        };
+
+        let layout = self.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!(
+                "no struct layout found for model '{}' in train block",
+                model_type_name
+            ))
+        })?;
+
+        let num_params = layout.fields.len();
+
+        // Build param_list: NslList of tensor pointers (model fields)
+        let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for field in &layout.fields {
+            let field_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                model_ptr,
+                field.offset as i32,
+            );
+            self.compile_call_by_name(builder, "nsl_list_push", &[param_list, field_val])?;
+        }
+
+        // ── 4. Create velocity buffers (1 per param for SGD) ────────────
+        let mut velocity_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        for field in &layout.fields {
+            let field_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                model_ptr,
+                field.offset as i32,
+            );
+            let vel = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
+            velocity_vals.push(vel);
+        }
+
+        // ── 5. Initialize lr and step_count variables ───────────────────
+        let lr_var = state.new_variable();
+        builder.declare_var(lr_var, cl_types::F64);
+        let lr_const = builder.ins().f64const(lr_value);
+        builder.def_var(lr_var, lr_const);
+
+        let step_count_var = state.new_variable();
+        builder.declare_var(step_count_var, cl_types::I64);
+        let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(step_count_var, zero_i64);
+
+        // ── 6. Emit epoch loop ──────────────────────────────────────────
+        let epoch_counter_var = state.new_variable();
+        builder.declare_var(epoch_counter_var, cl_types::I64);
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(epoch_counter_var, zero);
+
+        let epochs_val = builder.ins().iconst(cl_types::I64, epochs);
+
+        let header_block = builder.create_block();
+        let body_block = builder.create_block();
+        let increment_block = builder.create_block();
+        let exit_block = builder.create_block();
+
+        builder.ins().jump(header_block, &[]);
+
+        builder.switch_to_block(header_block);
+        state.current_block = Some(header_block);
+        let counter = builder.use_var(epoch_counter_var);
+        let cond = builder.ins().icmp(IntCC::SignedLessThan, counter, epochs_val);
+        builder.ins().brif(cond, body_block, &[], exit_block, &[]);
+
+        builder.switch_to_block(body_block);
+        builder.seal_block(body_block);
+        state.current_block = Some(body_block);
+
+        // ── 7. Inside body: tape_start → step body → find loss → backward → optimizer → callbacks ──
+
+        // 7a. Start tape recording
+        self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
+
+        // 7b. Compile step body stmts
+        for stmt in &step_body.stmts {
+            self.compile_stmt(builder, state, stmt)?;
+        }
+
+        // 7c. Find loss variable — look for "loss" in state.variables by name
+        let loss_val = {
+            let mut found = None;
+            for (sym, (var, _)) in &state.variables {
+                if self.resolve_sym(*sym) == "loss" {
+                    found = Some(builder.use_var(*var));
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                CodegenError::new("train step body must assign to a variable named 'loss'")
+            })?
+        };
+
+        // 7d. Run backward pass
+        let grads_list = self.compile_call_by_name(
+            builder,
+            "nsl_tape_backward",
+            &[loss_val, param_list],
+        )?;
+
+        // 7e. Stop tape
+        self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
+
+        // 7f. Optimizer step: for each param, call optimizer step function
+        let optimizer_fn_name = match optimizer_name.as_str() {
+            "sgd" => "nsl__optim__sgd__sgd_step",
+            "adam" => "nsl__optim__adam__adam_step",
+            "adamw" => "nsl__optim__adamw__adamw_step",
+            "lion" => "nsl__optim__lion__lion_step",
+            "muon" => "nsl__optim__muon__muon_step",
+            "soap" => "nsl__optim__soap__soap_step",
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "unsupported optimizer '{}' in train block", optimizer_name
+                )));
+            }
+        };
+
+        // Check if optimizer function exists, try fallback name patterns
+        let opt_fn = if self.functions.contains_key(optimizer_fn_name) {
+            optimizer_fn_name.to_string()
+        } else {
+            // Try simpler name: e.g. "sgd_step"
+            let simple = format!("{}_step", optimizer_name);
+            if self.functions.contains_key(&simple) {
+                simple
+            } else if self.runtime_fns.contains_key(optimizer_fn_name) {
+                optimizer_fn_name.to_string()
+            } else if self.runtime_fns.contains_key(&simple) {
+                simple
+            } else {
+                // Register as runtime function so it can be resolved at link time
+                optimizer_fn_name.to_string()
+            }
+        };
+
+        let lr = builder.use_var(lr_var);
+        let momentum_const = builder.ins().f64const(momentum_value);
+        let dampening_const = builder.ins().f64const(dampening_value);
+        let weight_decay_const = builder.ins().f64const(weight_decay_value);
+        let nesterov_const = builder.ins().iconst(cl_types::I64, if nesterov_value { 1 } else { 0 });
+
+        for i in 0..num_params {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+
+            // Get param tensor from param_list
+            let param_val = self.compile_call_by_name(
+                builder, "nsl_list_get", &[param_list, idx],
+            )?;
+
+            // Get gradient from grads_list
+            let grad_val = self.compile_call_by_name(
+                builder, "nsl_list_get", &[grads_list, idx],
+            )?;
+
+            let vel = velocity_vals[i];
+
+            // Call: sgd_step(param, grad, velocity, lr, momentum, dampening, weight_decay, nesterov)
+            match optimizer_name.as_str() {
+                "sgd" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, vel, lr, momentum_const, dampening_const, weight_decay_const, nesterov_const],
+                    )?;
+                }
+                _ => {
+                    // For now, only SGD is fully supported; others use a simpler 4-arg call
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, vel, lr],
+                    )?;
+                }
+            }
+        }
+
+        // 7g. Increment step count
+        let sc = builder.use_var(step_count_var);
+        let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+        let sc_next = builder.ins().iadd(sc, one_i64);
+        builder.def_var(step_count_var, sc_next);
+
+        // 7h. Callbacks: compile on_step body with step_count and loss bound
+        for cb in &callbacks {
+            let cb_name = self.resolve_sym(cb.name).to_string();
+            if cb_name == "on_step" {
+                // Bind callback params: on_step(step, loss)
+                for param in &cb.params {
+                    let pname = self.resolve_sym(param.name).to_string();
+                    match pname.as_str() {
+                        "step" => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let step_val = builder.use_var(step_count_var);
+                            builder.def_var(var, step_val);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                        "loss" => {
+                            // loss is already in state.variables, but rebind for callback scope
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            builder.def_var(var, loss_val);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                        _ => {
+                            // Unknown callback param — bind to zero
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let z = builder.ins().iconst(cl_types::I64, 0);
+                            builder.def_var(var, z);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                    }
+                }
+                // Compile callback body
+                for stmt in &cb.body.stmts {
+                    self.compile_stmt(builder, state, stmt)?;
+                }
+            } else if cb_name == "on_epoch" || cb_name == "on_epoch_end" {
+                // Bind epoch counter and loss
+                for param in &cb.params {
+                    let pname = self.resolve_sym(param.name).to_string();
+                    match pname.as_str() {
+                        "epoch" => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let epoch_val = builder.use_var(epoch_counter_var);
+                            builder.def_var(var, epoch_val);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                        "loss" => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            builder.def_var(var, loss_val);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                        _ => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let z = builder.ins().iconst(cl_types::I64, 0);
+                            builder.def_var(var, z);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                    }
+                }
+                for stmt in &cb.body.stmts {
+                    self.compile_stmt(builder, state, stmt)?;
+                }
+            }
+        }
+
+        // ── 8. Increment epoch counter and loop back ────────────────────
+        if !is_block_filled(builder, body_block) {
+            builder.ins().jump(increment_block, &[]);
+        }
+
+        builder.switch_to_block(increment_block);
+        builder.seal_block(increment_block);
+        state.current_block = Some(increment_block);
+        let counter = builder.use_var(epoch_counter_var);
+        let one = builder.ins().iconst(cl_types::I64, 1);
+        let next = builder.ins().iadd(counter, one);
+        builder.def_var(epoch_counter_var, next);
+        builder.ins().jump(header_block, &[]);
+
+        builder.seal_block(header_block);
+        builder.switch_to_block(exit_block);
+        builder.seal_block(exit_block);
+        state.current_block = Some(exit_block);
+
         Ok(())
     }
 
