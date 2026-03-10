@@ -1,0 +1,21 @@
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model=m, epochs=10):
+    optimizer: AdamW(lr=0.01, weight_decay=0.01)
+    scheduler: warmup_cosine(warmup_steps=3, total_steps=10, min_lr=0.001)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)

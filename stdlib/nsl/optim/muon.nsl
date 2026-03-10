@@ -1,7 +1,7 @@
-fn muon_step(param: Tensor, grad: Tensor, velocity: Tensor, lr: float, momentum: float, nesterov: bool):
-    copy_data(velocity, momentum * velocity + grad)
+fn muon_step(param: Tensor, gradient: Tensor, velocity: Tensor, lr: float, momentum: float, nesterov: bool):
+    copy_data(velocity, momentum * velocity + gradient)
     if nesterov:
-        let update = grad + momentum * velocity
+        let update = gradient + momentum * velocity
     else:
         let update = velocity
     copy_data(param, param - lr * update)

@@ -622,8 +622,10 @@ impl<'a> TypeChecker<'a> {
                 TrainSection::Optimizer(expr) => {
                     self.check_expr(expr);
                 }
-                TrainSection::Scheduler(expr) => {
-                    self.check_expr(expr);
+                TrainSection::Scheduler(_expr) => {
+                    // Skip type-checking the scheduler call: codegen auto-injects
+                    // base_lr and step as the first two arguments, so the user-facing
+                    // arg count is intentionally less than the stdlib signature.
                 }
                 TrainSection::Step { param: _, body } => {
                     has_step = true;
