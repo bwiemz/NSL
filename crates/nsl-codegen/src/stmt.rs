@@ -1076,7 +1076,9 @@ impl Compiler<'_> {
 
         // ── 7. Inside body: tape_start → step body → find loss → backward → optimizer → callbacks ──
 
-        // 7a. Start tape recording
+        // 7a. Set training mode = true, then start tape recording
+        let true_val = builder.ins().iconst(cl_types::I8, 1);
+        self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
 
         // 7b. Compile step body stmts
@@ -1105,8 +1107,10 @@ impl Compiler<'_> {
             &[loss_val, param_list],
         )?;
 
-        // 7e. Stop tape
+        // 7e. Stop tape and restore eval mode
         self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
+        let false_val = builder.ins().iconst(cl_types::I8, 0);
+        self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
         // 7f. Optimizer step: for each param, call optimizer step function
         let optimizer_fn_name = match optimizer_name.as_str() {
