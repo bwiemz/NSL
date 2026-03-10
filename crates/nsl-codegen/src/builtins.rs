@@ -179,6 +179,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_dropout", &[types::I64, types::F64, types::I8], Some(types::I64)),
     ("nsl_tensor_conv2d", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_maxpool2d", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    // String deallocation (M15)
+    ("nsl_string_free", &[types::I64], None),
 ];
 
 /// Declare all runtime functions as imports in the module.

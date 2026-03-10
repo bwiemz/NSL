@@ -196,3 +196,15 @@ pub extern "C" fn nsl_str_contains(s: i64, sub: i64) -> i8 {
     let substr = unsafe { as_cstr(sub) }.to_str().unwrap_or("");
     if text.contains(substr) { 1 } else { 0 }
 }
+
+/// Free a dynamically allocated string (allocated by checked_alloc).
+/// Used for tokenizer decode return values and other dynamic strings.
+#[no_mangle]
+pub extern "C" fn nsl_string_free(ptr: i64) {
+    if ptr == 0 { return; }
+    // Strings are null-terminated C strings allocated via checked_alloc.
+    // We need to find the length to free the right amount.
+    let cstr = unsafe { CStr::from_ptr(ptr as *const c_char) };
+    let len = cstr.to_bytes_with_nul().len();
+    unsafe { crate::memory::checked_free(ptr as *mut u8, len); }
+}
