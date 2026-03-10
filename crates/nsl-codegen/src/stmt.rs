@@ -1580,8 +1580,8 @@ impl Compiler<'_> {
                     &[src_val, dtype_v, gran_v, axis_v, gs_v],
                 )?;
                 let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
-                // Free the intermediate QuantizedTensor
-                self.compile_call_by_name(builder, "nsl_qtensor_free", &[qt])?;
+                // Release the intermediate QuantizedTensor (refcount-aware)
+                self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
                 builder.ins().store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
             }
         }
