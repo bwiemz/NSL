@@ -48,9 +48,38 @@ pub struct GradBlock {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QuantBlock {
-    pub config: Vec<Arg>,
-    pub body: Vec<Stmt>,
+    pub kind: QuantKind,
+    pub name: Symbol,
+    pub source: Symbol,
+    pub default_dtype: Option<QuantDtype>,
+    pub default_granularity: Option<QuantGranularity>,
+    pub exclude: Vec<String>,
+    pub calibration: Option<CalibrationConfig>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum QuantKind {
+    Static,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum QuantDtype {
+    Int8,
+    Int4,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum QuantGranularity {
+    PerTensor,
+    PerChannel(i64),
+    PerGroup(i64, i64),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CalibrationConfig {
+    pub data: Symbol,
+    pub samples: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

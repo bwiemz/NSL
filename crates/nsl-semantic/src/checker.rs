@@ -325,10 +325,99 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
-            StmtKind::QuantBlock(_quant) => {
-                // Quant block validation deferred to M3.
-                // Config args use DSL-specific keyword values (int8, per_channel, etc.)
-                // that aren't general expressions.
+            StmtKind::QuantBlock(quant) => {
+                // Validate source is a known model variable
+                let source_ty = if let Some((_sid, info)) =
+                    self.scopes.lookup(self.current_scope, quant.source)
+                {
+                    info.ty.clone()
+                } else {
+                    let source_name = self.interner.resolve(quant.source.0).unwrap_or("<unknown>").to_string();
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "quant source '{source_name}' is not defined"
+                        ))
+                        .with_label(quant.span, "undefined source"),
+                    );
+                    Type::Error
+                };
+
+                // Check source is a Model type
+                let model_fields = match &source_ty {
+                    Type::Model { fields, .. } => fields.clone(),
+                    Type::Error | Type::Unknown => Vec::new(),
+                    _ => {
+                        let source_name = self.interner.resolve(quant.source.0).unwrap_or("<unknown>").to_string();
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "quant source '{source_name}' is not a model type"
+                            ))
+                            .with_label(quant.span, "expected model type"),
+                        );
+                        Vec::new()
+                    }
+                };
+
+                // Resolve exclude globs against model field names
+                let excluded_fields: Vec<String> = if !quant.exclude.is_empty() {
+                    let field_names: Vec<String> = model_fields
+                        .iter()
+                        .map(|(sym, _)| {
+                            self.interner.resolve(sym.0).unwrap_or("").to_string()
+                        })
+                        .collect();
+                    field_names
+                        .iter()
+                        .filter(|name| {
+                            quant.exclude.iter().any(|pattern| glob_match(pattern, name))
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Validate calibration data variable if present
+                if let Some(ref cal) = quant.calibration {
+                    if self.scopes.lookup(self.current_scope, cal.data).is_none() {
+                        let data_name = self.interner.resolve(cal.data.0).unwrap_or("<unknown>").to_string();
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "calibration data variable '{data_name}' is not defined"
+                            ))
+                            .with_label(quant.span, "undefined calibration data"),
+                        );
+                    }
+                }
+
+                // Build quantized model type: clone fields, replace tensor types
+                // for non-excluded fields with QuantizedTensor
+                let quantized_fields: Vec<(nsl_ast::Symbol, Type)> = model_fields
+                    .iter()
+                    .map(|(sym, ty)| {
+                        let field_name = self.interner.resolve(sym.0).unwrap_or("").to_string();
+                        let is_excluded = excluded_fields.contains(&field_name);
+                        if !is_excluded && ty.is_tensor() {
+                            (*sym, Type::QuantizedTensor)
+                        } else {
+                            (*sym, ty.clone())
+                        }
+                    })
+                    .collect();
+
+                // Get the source model's methods
+                let model_methods = match &source_ty {
+                    Type::Model { methods, .. } => methods.clone(),
+                    _ => Vec::new(),
+                };
+
+                // Register output variable with quantized Model type
+                let quant_model_ty = Type::Model {
+                    name: quant.name,
+                    fields: quantized_fields,
+                    methods: model_methods,
+                };
+                self.declare_symbol(quant.name, quant_model_ty, quant.span, true, false);
             }
             StmtKind::KernelDef(kernel) => {
                 self.declare_symbol(kernel.name, Type::Unknown, kernel.span, true, false);
@@ -1519,4 +1608,40 @@ impl<'a> TypeChecker<'a> {
             .unwrap_or("<unknown>")
             .to_string()
     }
+}
+
+/// Simple glob matching supporting `*` as a wildcard that matches any number
+/// of characters (including zero). Uses a two-pointer / DP-lite approach.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (plen, tlen) = (pat.len(), txt.len());
+
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0;
+
+    while ti < tlen {
+        if pi < plen && (pat[pi] == txt[ti] || pat[pi] == '?') {
+            pi += 1;
+            ti += 1;
+        } else if pi < plen && pat[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < plen && pat[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == plen
 }
