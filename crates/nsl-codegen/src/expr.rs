@@ -370,6 +370,14 @@ impl Compiler<'_> {
         if let ExprKind::MemberAccess { object, member } = &callee.kind {
             let member_name = self.resolve_sym(*member).to_string();
             let obj_type = self.node_type(object.id).clone();
+            // Module alias call: math.clamp(...) → call "clamp"
+            if matches!(obj_type, Type::Module { .. }) {
+                let mut arg_vals = Vec::new();
+                for arg in args {
+                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                }
+                return self.compile_call_by_name(builder, &member_name, &arg_vals);
+            }
             if matches!(obj_type, Type::Str) {
                 return self.compile_str_method_call(builder, state, object, &member_name, args);
             }
@@ -728,6 +736,22 @@ impl Compiler<'_> {
         _expr: &Expr,
     ) -> Result<Value, CodegenError> {
         let member_name = self.resolve_sym(member).to_string();
+
+        // Check if this is a module alias access: math.clamp (non-call context)
+        {
+            let obj_type = self.node_type(object.id).clone();
+            if matches!(obj_type, Type::Module { .. }) {
+                // Module member access in non-call context — return function reference
+                // This is handled at call site; for now return a dummy value
+                if let Some((func_id, _sig)) = self.functions.get(&member_name) {
+                    let fref = self.module.declare_func_in_func(*func_id, builder.func);
+                    return Ok(builder.ins().func_addr(crate::types::pointer_type(), fref));
+                }
+                return Err(CodegenError::new(format!(
+                    "module has no export '{member_name}'"
+                )));
+            }
+        }
 
         // Check if this is an enum variant access: EnumName.VariantName
         if let ExprKind::Ident(obj_sym) = &object.kind {

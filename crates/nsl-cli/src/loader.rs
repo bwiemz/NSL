@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use nsl_ast::decl::{FromImportStmt, ImportItems};
+use nsl_ast::decl::{FromImportStmt, ImportItems, ImportStmt};
 use nsl_ast::stmt::{Stmt, StmtKind};
 use nsl_ast::{Module, Symbol};
 use nsl_errors::{Level, SourceMap};
@@ -28,6 +28,8 @@ pub struct ModuleData {
     pub enum_defs: HashMap<String, Vec<(String, i64)>>,
     /// Paths this module imports from
     pub dependencies: Vec<PathBuf>,
+    /// Module prefix for name mangling (empty for entry module)
+    pub module_prefix: String,
 }
 
 /// The complete module graph for a compilation unit.
@@ -38,24 +40,44 @@ pub struct ModuleGraph {
     pub dep_order: Vec<PathBuf>,
 }
 
-/// Scan a module's AST for `from X import Y` statements and resolve them to file paths.
+/// Represents a discovered import — either `from X import Y` or `import X as alias`.
+#[derive(Clone)]
+enum ImportInfo {
+    From(FromImportStmt),
+    Alias { #[allow(dead_code)] stmt: ImportStmt, alias: Symbol },
+}
+
+/// Scan a module's AST for import statements and resolve them to file paths.
 fn discover_imports(
     stmts: &[Stmt],
     source_file: &Path,
     interner: &Interner,
-) -> Result<Vec<(PathBuf, FromImportStmt)>, String> {
+) -> Result<Vec<(PathBuf, ImportInfo)>, String> {
     let mut imports = Vec::new();
 
     for stmt in stmts {
-        if let StmtKind::FromImport(from_import) = &stmt.kind {
-            let resolved = resolver::resolve_import(
-                &from_import.module_path,
-                source_file,
-                interner,
-            )?;
-            imports.push((resolved, from_import.clone()));
+        match &stmt.kind {
+            StmtKind::FromImport(from_import) => {
+                let resolved = resolver::resolve_import(
+                    &from_import.module_path,
+                    source_file,
+                    interner,
+                )?;
+                imports.push((resolved, ImportInfo::From(from_import.clone())));
+            }
+            StmtKind::Import(import_stmt) if import_stmt.alias.is_some() => {
+                let resolved = resolver::resolve_import(
+                    &import_stmt.path,
+                    source_file,
+                    interner,
+                )?;
+                imports.push((resolved, ImportInfo::Alias {
+                    stmt: import_stmt.clone(),
+                    alias: import_stmt.alias.unwrap(),
+                }));
+            }
+            _ => {}
         }
-        // `import X` without `from` — we don't resolve these to files yet (no dot-access)
     }
 
     Ok(imports)
@@ -134,7 +156,7 @@ pub fn load_all_modules(
         .map_err(|e| format!("cannot canonicalize entry file '{}': {e}", entry_file.display()))?;
 
     // Phase 1: Parse all modules (iterative worklist)
-    let mut parsed: HashMap<PathBuf, (Module, Vec<(PathBuf, FromImportStmt)>)> = HashMap::new();
+    let mut parsed: HashMap<PathBuf, (Module, Vec<(PathBuf, ImportInfo)>)> = HashMap::new();
     let mut worklist: Vec<PathBuf> = vec![entry_path.clone()];
 
     while let Some(file_path) = worklist.pop() {
@@ -190,9 +212,16 @@ pub fn load_all_modules(
 
         // Build import_types from already-analyzed dependencies
         let mut import_types: HashMap<Symbol, Type> = HashMap::new();
-        for (dep_path, from_import) in &imports {
+        for (dep_path, import_info) in &imports {
             if let Some(dep_data) = modules.get(dep_path) {
-                inject_import_types(from_import, &dep_data.exports, &mut import_types);
+                match import_info {
+                    ImportInfo::From(from_import) => {
+                        inject_import_types(from_import, &dep_data.exports, &mut import_types);
+                    }
+                    ImportInfo::Alias { alias, .. } => {
+                        inject_alias_import(*alias, &dep_data.exports, &mut import_types);
+                    }
+                }
             }
         }
 
@@ -224,6 +253,15 @@ pub fn load_all_modules(
 
         let dep_paths: Vec<PathBuf> = imports.iter().map(|(p, _)| p.clone()).collect();
 
+        // Compute module prefix for name mangling.
+        // Entry module gets empty prefix (no mangling).
+        let base_dir = entry_path.parent().unwrap_or(Path::new("."));
+        let module_prefix = if *path == entry_path {
+            String::new()
+        } else {
+            crate::mangling::module_prefix(path, base_dir)
+        };
+
         modules.insert(path.clone(), ModuleData {
             path: path.clone(),
             ast,
@@ -234,6 +272,7 @@ pub fn load_all_modules(
             enum_variants,
             enum_defs,
             dependencies: dep_paths,
+            module_prefix,
         });
     }
 
@@ -274,10 +313,23 @@ fn inject_import_types(
     }
 }
 
+/// Inject all exports from a dependency as a `Type::Module` under the alias symbol.
+fn inject_alias_import(
+    alias: Symbol,
+    dep_exports: &HashMap<Symbol, Type>,
+    import_types: &mut HashMap<Symbol, Type>,
+) {
+    let exports: HashMap<Symbol, Box<Type>> = dep_exports
+        .iter()
+        .map(|(sym, ty)| (*sym, Box::new(ty.clone())))
+        .collect();
+    import_types.insert(alias, Type::Module { exports });
+}
+
 /// Topological sort of modules. Dependencies come before dependents.
 fn topological_sort(
     entry: &PathBuf,
-    parsed: &HashMap<PathBuf, (Module, Vec<(PathBuf, FromImportStmt)>)>,
+    parsed: &HashMap<PathBuf, (Module, Vec<(PathBuf, ImportInfo)>)>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut order = Vec::new();
     let mut visited = HashSet::new();
@@ -285,7 +337,7 @@ fn topological_sort(
 
     fn visit(
         path: &PathBuf,
-        parsed: &HashMap<PathBuf, (Module, Vec<(PathBuf, FromImportStmt)>)>,
+        parsed: &HashMap<PathBuf, (Module, Vec<(PathBuf, ImportInfo)>)>,
         visited: &mut HashSet<PathBuf>,
         in_stack: &mut HashSet<PathBuf>,
         order: &mut Vec<PathBuf>,

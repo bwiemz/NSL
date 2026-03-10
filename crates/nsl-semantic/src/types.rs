@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use nsl_ast::Symbol;
 
 use crate::shapes;
@@ -79,6 +81,12 @@ pub enum Type {
 
     // Generic type variable (tracked but not instantiated in M2)
     TypeVar(Symbol),
+
+    /// A module alias (e.g., `import nsl.math as math`).
+    /// Contains the exported symbols of the module.
+    Module {
+        exports: HashMap<Symbol, Box<Type>>,
+    },
 
     /// Type is unknown (inference failed or annotation missing).
     /// Propagates silently without generating diagnostics.
@@ -369,6 +377,7 @@ pub fn display_type(ty: &Type) -> String {
             let ps: Vec<String> = params.iter().map(|t| display_type(t)).collect();
             format!("({}) -> {}", ps.join(", "), display_type(ret))
         }
+        Type::Module { .. } => "module".into(),
         Type::Unknown => "unknown".into(),
         Type::Error => "error".into(),
         Type::NoneType => "None".into(),

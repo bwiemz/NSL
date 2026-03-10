@@ -1,4 +1,5 @@
 mod loader;
+mod mangling;
 mod resolver;
 
 use std::collections::HashMap;
@@ -212,12 +213,13 @@ fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool
     }
 }
 
-/// Check if a file has any `from X import Y` statements by quick-scanning.
+/// Check if a file has any import statements by quick-scanning.
 fn has_imports(file: &PathBuf) -> bool {
     if let Ok(source) = std::fs::read_to_string(file) {
         source.lines().any(|line| {
             let trimmed = line.trim();
-            trimmed.starts_with("from ") && trimmed.contains(" import ")
+            (trimmed.starts_with("from ") && trimmed.contains(" import "))
+                || (trimmed.starts_with("import ") && trimmed.contains(" as "))
         })
     } else {
         false
@@ -347,9 +349,10 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
 
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::FnDef(fn_def) = &stmt.kind {
-                        let name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                        let raw_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                        let mangled_name = crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
                         let sig = temp_compiler.build_fn_signature(fn_def);
-                        imported_fns.push((name, sig));
+                        imported_fns.push((raw_name, mangled_name, sig));
                     }
                 }
 
@@ -389,6 +392,7 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
                 &mod_data.ast,
                 &interner,
                 &mod_data.type_map,
+                &mod_data.module_prefix,
                 dump_ir,
             ) {
                 Ok(bytes) => bytes,

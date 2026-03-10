@@ -103,6 +103,7 @@ pub struct Decorator {
 pub struct ImportStmt {
     pub path: Vec<Symbol>,
     pub items: ImportItems,
+    pub alias: Option<Symbol>,
     pub span: Span,
 }
 

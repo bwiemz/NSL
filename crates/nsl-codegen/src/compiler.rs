@@ -61,7 +61,19 @@ pub struct Compiler<'a> {
     pub dump_ir: bool,
     /// Functions decorated with `@no_grad` — tape is paused during their execution.
     pub no_grad_fns: HashSet<String>,
+    /// Module prefix for name mangling. Empty means no mangling (entry module / single-file).
+    pub module_prefix: String,
     func_index: u32,
+}
+
+/// Mangle a function name with a module prefix for unique Cranelift symbols.
+/// If prefix is empty, returns the name unchanged.
+fn mangle_name(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}__{name}")
+    }
 }
 
 impl<'a> Compiler<'a> {
@@ -105,6 +117,7 @@ impl<'a> Compiler<'a> {
             call_conv,
             dump_ir: false,
             no_grad_fns: HashSet::new(),
+            module_prefix: String::new(),
             func_index: 0,
         })
     }
@@ -473,12 +486,13 @@ impl<'a> Compiler<'a> {
                 }
                 _ => continue,
             };
-            let name = self.resolve_sym(fn_def.name).to_string();
+            let raw_name = self.resolve_sym(fn_def.name).to_string();
+            let cranelift_name = mangle_name(&self.module_prefix, &raw_name);
             let sig = self.build_fn_signature(fn_def);
             let func_id = self.module
-                .declare_function(&name, linkage, &sig)
-                .map_err(|e| CodegenError::new(format!("failed to declare fn '{name}': {e}")))?;
-            self.functions.insert(name.clone(), (func_id, sig));
+                .declare_function(&cranelift_name, linkage, &sig)
+                .map_err(|e| CodegenError::new(format!("failed to declare fn '{raw_name}': {e}")))?;
+            self.functions.insert(raw_name.clone(), (func_id, sig));
 
             // Track @no_grad decorated functions
             if let Some(decos) = decorators {
@@ -486,7 +500,7 @@ impl<'a> Compiler<'a> {
                     if d.name.len() == 1 {
                         let dname = self.resolve_sym(d.name[0]);
                         if dname == "no_grad" {
-                            self.no_grad_fns.insert(name.clone());
+                            self.no_grad_fns.insert(raw_name.clone());
                         }
                     }
                 }
@@ -611,15 +625,19 @@ impl<'a> Compiler<'a> {
     }
 
     /// Declare functions imported from other modules (Linkage::Import).
+    /// Declare imported functions from other modules.
+    /// Each entry is (raw_name, mangled_name, signature).
+    /// The mangled name is used for the Cranelift symbol (must match the export),
+    /// while the raw name is used as the lookup key in self.functions.
     pub fn declare_imported_functions(
         &mut self,
-        imports: &[(String, Signature)],
+        imports: &[(String, String, Signature)],
     ) -> Result<(), CodegenError> {
-        for (name, sig) in imports {
+        for (raw_name, mangled_name, sig) in imports {
             let func_id = self.module
-                .declare_function(name, Linkage::Import, sig)
-                .map_err(|e| CodegenError::new(format!("failed to declare imported fn '{name}': {e}")))?;
-            self.functions.insert(name.clone(), (func_id, sig.clone()));
+                .declare_function(mangled_name, Linkage::Import, sig)
+                .map_err(|e| CodegenError::new(format!("failed to declare imported fn '{raw_name}': {e}")))?;
+            self.functions.insert(raw_name.clone(), (func_id, sig.clone()));
         }
         Ok(())
     }
@@ -1110,10 +1128,12 @@ pub fn compile_module(
     ast: &nsl_ast::Module,
     interner: &Interner,
     type_map: &TypeMap,
+    module_prefix: &str,
     dump_ir: bool,
 ) -> Result<Vec<u8>, CodegenError> {
     let mut compiler = Compiler::new(interner, type_map)?;
     compiler.dump_ir = dump_ir;
+    compiler.module_prefix = module_prefix.to_string();
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
@@ -1128,12 +1148,13 @@ pub fn compile_module(
 
 /// Compile the entry module with imported functions from other modules.
 /// Own functions use Linkage::Export, imported functions use Linkage::Import.
+/// imported_fns entries are (raw_name, mangled_name, signature).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_entry(
     ast: &nsl_ast::Module,
     interner: &Interner,
     type_map: &TypeMap,
-    imported_fns: &[(String, Signature)],
+    imported_fns: &[(String, String, Signature)],
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
     imported_enum_variants: HashMap<String, i64>,
     imported_enum_defs: HashMap<String, Vec<(String, i64)>>,

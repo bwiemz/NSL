@@ -392,6 +392,7 @@ pub fn parse_import_stmt(p: &mut Parser) -> Stmt {
                 kind: StmtKind::Import(ImportStmt {
                     path,
                     items: ImportItems::Glob,
+                    alias: None,
                     span: start.merge(p.prev_span()),
                 }),
                 span: start.merge(p.prev_span()),
@@ -406,6 +407,7 @@ pub fn parse_import_stmt(p: &mut Parser) -> Stmt {
                 kind: StmtKind::Import(ImportStmt {
                     path,
                     items: ImportItems::Named(items),
+                    alias: None,
                     span: start.merge(p.prev_span()),
                 }),
                 span: start.merge(p.prev_span()),
@@ -416,12 +418,21 @@ pub fn parse_import_stmt(p: &mut Parser) -> Stmt {
         path.push(seg);
     }
 
-    // Simple module import: import nsl.nn
+    // Check for alias: import nsl.math as math
+    let alias = if p.eat(&TokenKind::As) {
+        let (a, _) = p.expect_ident();
+        Some(a)
+    } else {
+        None
+    };
+
+    // Simple module import: import nsl.nn  (or import nsl.math as math)
     p.expect_end_of_stmt();
     Stmt {
         kind: StmtKind::Import(ImportStmt {
             path,
             items: ImportItems::Module,
+            alias,
             span: start.merge(p.prev_span()),
         }),
         span: start.merge(p.prev_span()),

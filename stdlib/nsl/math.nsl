@@ -1,0 +1,29 @@
+# NSL Standard Library — nsl.math
+# Basic math utility functions
+
+fn clamp(x: float, lo: float, hi: float) -> float:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+fn lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+fn sign(x: float) -> float:
+    if x > 0.0:
+        return 1.0
+    if x < 0.0:
+        return -1.0
+    return 0.0
+
+fn max_val(a: float, b: float) -> float:
+    if a > b:
+        return a
+    return b
+
+fn min_val(a: float, b: float) -> float:
+    if a < b:
+        return a
+    return b

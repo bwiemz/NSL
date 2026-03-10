@@ -556,6 +556,13 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_import(&mut self, import: &ImportStmt) {
+        // Handle `import nsl.math as math` — alias imports
+        if let Some(alias) = import.alias {
+            let ty = self.import_types.get(&alias).cloned().unwrap_or(Type::Unknown);
+            self.declare_symbol(alias, ty, import.span, true, false);
+            return;
+        }
+
         match &import.items {
             ImportItems::Module => {
                 // `import nsl.nn` — declare last path segment
@@ -1160,6 +1167,17 @@ impl<'a> TypeChecker<'a> {
         let obj_ty = self.check_expr(object);
 
         match &obj_ty {
+            Type::Module { exports } => {
+                if let Some(ty) = exports.get(&member) {
+                    return *ty.clone();
+                }
+                let name = self.resolve_name(member);
+                self.diagnostics.push(
+                    Diagnostic::error(format!("module has no export `{name}`"))
+                        .with_label(span, "not found in module"),
+                );
+                return Type::Error;
+            }
             Type::Struct { fields, .. } => {
                 if let Some((_, field_ty)) = fields.iter().find(|(name, _)| *name == member) {
                     field_ty.clone()

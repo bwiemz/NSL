@@ -1,0 +1,5 @@
+import nsl.math as math
+
+print(math.clamp(100.0, 0.0, 50.0))
+print(math.sign(-3.14))
+print(math.lerp(0.0, 100.0, 0.25))

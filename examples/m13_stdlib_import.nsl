@@ -1,0 +1,9 @@
+# M13 Stdlib Import Test
+from nsl.math import clamp, lerp, sign
+
+print(clamp(5.0, 0.0, 3.0))
+print(clamp(-1.0, 0.0, 10.0))
+print(lerp(0.0, 10.0, 0.5))
+print(sign(-42.0))
+print(sign(0.0))
+print(sign(7.0))

@@ -1,0 +1,5 @@
+fn double(x: float) -> float:
+    return x * 2.0
+
+fn negate(x: float) -> float:
+    return 0.0 - x

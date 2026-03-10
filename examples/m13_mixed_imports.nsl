@@ -1,0 +1,8 @@
+# M13 Mixed Import Test — stdlib + relative in same file
+from nsl.math import clamp
+from m13_helpers import double, negate
+
+let x = double(3.0)
+print(x)
+print(clamp(x, 0.0, 5.0))
+print(negate(x))
