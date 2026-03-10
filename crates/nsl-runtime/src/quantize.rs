@@ -230,9 +230,21 @@ fn compute_scale_zp(values: &[f64], qmin: f64, qmax: f64) -> (f32, u8) {
         if v > max_val { max_val = v; }
     }
 
-    // Clamp range to prevent div-by-zero on zero-variance groups
-    let range = (max_val - min_val).max(1e-7);
-    let scale = range / (qmax - qmin);
+    // Handle zero-variance case: all values identical or nearly so
+    let raw_range = max_val - min_val;
+    if raw_range < 1e-7 {
+        // Map the constant value to the midpoint of the quantized range
+        let mid_q = ((qmin + qmax) / 2.0).round();
+        // scale chosen so that dequant(mid_q) ≈ the constant value
+        // dequant: (q - zp) * scale = val → if zp=0, scale = val/mid_q
+        // But we need to handle val=0 too. Use: scale = max(|val|, 1e-7) / mid_q
+        let abs_val = min_val.abs().max(1e-7);
+        let scale = abs_val / mid_q;
+        let zp = (mid_q - min_val / scale).round().clamp(qmin, qmax) as u8;
+        return (scale as f32, zp);
+    }
+
+    let scale = raw_range / (qmax - qmin);
     let zp = (-min_val / scale).round().clamp(qmin, qmax) as u8;
     (scale as f32, zp)
 }

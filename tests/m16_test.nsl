@@ -1,0 +1,53 @@
+# M16 Quantization Tests
+
+@test
+fn test_int8_per_tensor_roundtrip():
+    let t = randn([4, 8])
+    let qt = nsl_qtensor_quantize(t, 0, 0, 0, 0)
+    let deq = nsl_qtensor_dequantize(qt)
+    assert_close(t, deq, 0.1, 0.1)
+
+@test
+fn test_int8_per_channel_roundtrip():
+    let t = randn([4, 8])
+    let qt = nsl_qtensor_quantize(t, 0, 1, 0, 0)
+    let deq = nsl_qtensor_dequantize(qt)
+    assert_close(t, deq, 0.05, 0.05)
+
+@test
+fn test_int4_per_group_roundtrip():
+    let t = randn([8, 16])
+    let qt = nsl_qtensor_quantize(t, 1, 2, 0, 4)
+    let deq = nsl_qtensor_dequantize(qt)
+    assert_close(t, deq, 0.5, 0.5)
+
+@test
+fn test_int4_packing_exact():
+    let t = full([4], 0.5)
+    let qt = nsl_qtensor_quantize(t, 1, 0, 0, 0)
+    let deq = nsl_qtensor_dequantize(qt)
+    assert_close(t, deq, 0.2, 0.2)
+
+@test
+fn test_zero_variance_no_nan():
+    let t = full([8, 8], 3.0)
+    let qt = nsl_qtensor_quantize(t, 0, 0, 0, 0)
+    let deq = nsl_qtensor_dequantize(qt)
+    assert_close(t, deq, 0.01, 0.01)
+
+@test
+fn test_mixed_matmul_correctness():
+    let x = randn([4, 8])
+    let w = randn([8, 16])
+    let expected = x @ w
+    let qw = nsl_qtensor_quantize(w, 0, 1, 0, 0)
+    let result = nsl_qtensor_matmul_mixed(x, qw)
+    assert_close(expected, result, 1.0, 0.15)
+
+@test
+fn test_qtensor_dtype_query():
+    let t = randn([4, 4])
+    let qt8 = nsl_qtensor_quantize(t, 0, 0, 0, 0)
+    let qt4 = nsl_qtensor_quantize(t, 1, 0, 0, 0)
+    assert_eq(nsl_qtensor_dtype(qt8), 0)
+    assert_eq(nsl_qtensor_dtype(qt4), 1)
