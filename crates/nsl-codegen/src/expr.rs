@@ -546,8 +546,19 @@ impl Compiler<'_> {
         if func_name == "args" {
             return self.compile_call_by_name(builder, "nsl_args", &[]);
         }
+        // Training mode
+        if func_name == "is_training" {
+            return self.compile_call_by_name(builder, "nsl_is_training", &[]);
+        }
+        if func_name == "set_training_mode" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("set_training_mode() takes exactly 1 argument (bool)"));
+            }
+            let mode_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_set_training_mode", &[mode_val]);
+        }
         // Tensor creation builtins
-        if matches!(func_name.as_str(), "zeros" | "ones" | "rand") {
+        if matches!(func_name.as_str(), "zeros" | "ones" | "rand" | "randn") {
             if args.len() != 1 {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument (shape list)")));
             }

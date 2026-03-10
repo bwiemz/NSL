@@ -1,6 +1,25 @@
+use std::cell::Cell;
+
 use crate::autodiff;
 use crate::list::{nsl_list_new, nsl_list_push, NslList};
 use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
+
+// ---------------------------------------------------------------------------
+// Global training mode (thread-local)
+// ---------------------------------------------------------------------------
+thread_local! {
+    static TRAINING_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_set_training_mode(mode: i8) {
+    TRAINING_MODE.with(|t| t.set(mode != 0));
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_is_training() -> i8 {
+    TRAINING_MODE.with(|t| t.get() as i8)
+}
 
 #[repr(C)]
 pub struct NslTensor {
@@ -121,6 +140,49 @@ pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
         let val = (seed >> 11) as f64 / (1u64 << 53) as f64;
         unsafe { *tensor.data.add(i) = val };
     }
+    ptr
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
+    let ptr = tensor_from_shape_list(shape_list, 0.0);
+    let tensor = NslTensor::from_ptr(ptr);
+    // Box-Muller transform: generate N(0,1) from uniform samples
+    let mut seed: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(12345);
+
+    let len = tensor.len as usize;
+    let mut i = 0;
+    while i + 1 < len {
+        // Generate two uniform (0,1) samples via LCG
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u1 = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-15); // avoid log(0)
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u2 = (seed >> 11) as f64 / (1u64 << 53) as f64;
+
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
+        let z1 = mag * (2.0 * std::f64::consts::PI * u2).sin();
+        unsafe {
+            *tensor.data.add(i) = z0;
+            *tensor.data.add(i + 1) = z1;
+        }
+        i += 2;
+    }
+    // If odd number of elements, generate one more pair and use first
+    if i < len {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u1 = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-15);
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let u2 = (seed >> 11) as f64 / (1u64 << 53) as f64;
+
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
+        unsafe { *tensor.data.add(i) = z0 };
+    }
+    let _ = seed; // suppress unused warning
     ptr
 }
 

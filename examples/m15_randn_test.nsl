@@ -1,0 +1,17 @@
+# Test randn() tensor creation and training mode
+
+let t = randn([3, 4])
+print("randn([3, 4]):")
+print(t)
+
+# Training mode
+print("is_training (default):")
+print(is_training())
+
+set_training_mode(true)
+print("is_training (after set true):")
+print(is_training())
+
+set_training_mode(false)
+print("is_training (after set false):")
+print(is_training())

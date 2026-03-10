@@ -95,6 +95,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_zeros", &[types::I64], Some(types::I64)),
     ("nsl_tensor_ones", &[types::I64], Some(types::I64)),
     ("nsl_tensor_rand", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_randn", &[types::I64], Some(types::I64)),
+    // Training mode
+    ("nsl_set_training_mode", &[types::I8], None),
+    ("nsl_is_training", &[], Some(types::I8)),
     ("nsl_tensor_full", &[types::I64, types::F64], Some(types::I64)),
     ("nsl_tensor_arange", &[types::F64, types::F64, types::F64], Some(types::I64)),
     // Tensor element access

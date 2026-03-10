@@ -131,6 +131,22 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         );
     }
 
+    // Training mode
+    def(
+        "is_training",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Bool),
+        },
+    );
+    def(
+        "set_training_mode",
+        Type::Function {
+            params: vec![Type::Bool],
+            ret: Box::new(Type::Void),
+        },
+    );
+
     // Utility functions
     def(
         "assert",
