@@ -130,3 +130,16 @@ pub extern "C" fn nsl_list_slice(list_ptr: i64, lo: i64, hi: i64, step_val: i64)
 
     result
 }
+
+/// Free an NslList and its backing data buffer.
+/// Does NOT free the elements — they are owned by whoever stored them.
+#[no_mangle]
+pub extern "C" fn nsl_list_free(list_ptr: i64) {
+    if list_ptr == 0 {
+        return;
+    }
+    let list = unsafe { Box::from_raw(list_ptr as *mut NslList) };
+    let size = (list.cap as usize) * std::mem::size_of::<i64>();
+    unsafe { crate::memory::checked_free(list.data as *mut u8, size); }
+    // Box drops here, freeing the NslList struct
+}

@@ -171,7 +171,9 @@ pub extern "C" fn nsl_tape_resume() {
 /// Create a tensor of ones with the same shape as the given tensor.
 fn ones_like(tensor_ptr: i64) -> i64 {
     let shape_list = tensor_shape(tensor_ptr);
-    tensor_ones(shape_list)
+    let result = tensor_ones(shape_list);
+    crate::list::nsl_list_free(shape_list);
+    result
 }
 
 /// Accumulate gradient: grads[key] += grad_tensor.
@@ -612,6 +614,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             // No gradient computed for this param — return zeros_like
             let shape_list = tensor_shape(*ptr);
             let zeros = tensor_zeros(shape_list);
+            crate::list::nsl_list_free(shape_list);
             crate::list::nsl_list_push(result_list, zeros);
         }
     }

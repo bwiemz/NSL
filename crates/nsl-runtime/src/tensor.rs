@@ -1424,7 +1424,9 @@ pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
             nsl_list_push(shape_list, *tensor.shape.add(i));
         }
     }
-    nsl_tensor_zeros(shape_list)
+    let result = nsl_tensor_zeros(shape_list);
+    crate::list::nsl_list_free(shape_list);
+    result
 }
 
 // === Gradient clipping ===
@@ -1446,8 +1448,13 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     }
     let norm = sum_sq.sqrt();
 
-    // If norm > max_norm, scale all gradients by (max_norm / (norm + 1e-6))
-    if norm > max_norm {
+    // Fast path: skip scaling when gradients are within bounds
+    if norm <= max_norm {
+        return;
+    }
+
+    // norm > max_norm: scale all gradients by (max_norm / (norm + 1e-6))
+    {
         let scale = max_norm / (norm + 1e-6);
         for g in 0..num_grads {
             let tensor_ptr = unsafe { *list.data.add(g) };

@@ -144,24 +144,42 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
     for i in 0..tensors.len as usize {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
-        for j in 0..tensor.len as usize {
-            if offset + 8 > data.len() {
-                eprintln!(
-                    "nsl: model_load: unexpected end of file at offset {} (tensor {}, element {})",
-                    offset, i, j
-                );
-                std::process::abort();
-            }
-            let val = f64::from_le_bytes(
-                data[offset..offset + 8]
-                    .try_into()
-                    .unwrap_or_else(|_| std::process::abort()),
+        let byte_count = (tensor.len as usize) * 8;
+        if offset + byte_count > data.len() {
+            eprintln!(
+                "nsl: model_load: unexpected end of file at offset {} (tensor {}, need {} bytes, have {})",
+                offset, i, byte_count, data.len() - offset
             );
-            unsafe {
-                *tensor.data.add(j) = val;
-            }
-            offset += 8;
+            std::process::abort();
         }
+
+        #[cfg(target_endian = "little")]
+        {
+            // Fast path: bulk copy on little-endian hardware (x86, ARM, etc.)
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data[offset..].as_ptr(),
+                    tensor.data as *mut u8,
+                    byte_count,
+                );
+            }
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            for j in 0..tensor.len as usize {
+                let val = f64::from_le_bytes(
+                    data[offset + j * 8..offset + j * 8 + 8]
+                        .try_into()
+                        .unwrap_or_else(|_| std::process::abort()),
+                );
+                unsafe {
+                    *tensor.data.add(j) = val;
+                }
+            }
+        }
+
+        offset += byte_count;
     }
 }
 
