@@ -1,0 +1,22 @@
+model Linear(in_features: int, out_features: int):
+    w: Tensor = randn([out_features, in_features])
+    b: Tensor = zeros([out_features])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return bias_add(x @ self.w.transpose(0, 1), self.b)
+
+model Embedding(vocab_size: int, embed_dim: int):
+    weight: Tensor = randn([vocab_size, embed_dim])
+
+    fn forward(self, indices: Tensor) -> Tensor:
+        return embedding_lookup(self.weight, indices)
+
+model MLP(in_features: int, hidden: int, out_features: int):
+    w1: Tensor = randn([hidden, in_features])
+    b1: Tensor = zeros([hidden])
+    w2: Tensor = randn([out_features, hidden])
+    b2: Tensor = zeros([out_features])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = gelu(bias_add(x @ self.w1.transpose(0, 1), self.b1))
+        return bias_add(h @ self.w2.transpose(0, 1), self.b2)
