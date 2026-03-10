@@ -159,4 +159,4 @@ NSL is in active development. Current milestone progress:
 
 ## License
 
-MIT
+APACHE 2.0
