@@ -1,0 +1,9 @@
+@test
+fn test_ones():
+    let x = ones([3])
+    assert_close(x, ones([3]), 0.001, 0.001)
+
+@test
+fn test_zeros():
+    let x = zeros([3])
+    assert_close(x, zeros([3]), 0.001, 0.001)

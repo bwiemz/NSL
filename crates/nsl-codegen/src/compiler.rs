@@ -1100,6 +1100,178 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// Compile a test-dispatch main() that reads `--run <name>` from argv and
+    /// calls the corresponding @test function. Used by `nsl test`.
+    pub fn compile_test_main(&mut self) -> Result<(), CodegenError> {
+        let test_fns = self.test_fns.clone();
+        if test_fns.is_empty() {
+            return Err(CodegenError::new("no @test functions found".to_string()));
+        }
+
+        // Ensure test function name strings are in the string pool
+        let run_flag = "--run".to_string();
+        self.intern_string(&run_flag)?;
+        for name in &test_fns {
+            self.intern_string(name)?;
+        }
+
+        let mut sig = self.module.make_signature();
+        sig.call_conv = self.call_conv;
+        sig.params.push(AbiParam::new(cl_types::I32)); // argc
+        sig.params.push(AbiParam::new(cl_types::I64)); // argv
+        sig.returns.push(AbiParam::new(cl_types::I32));
+
+        let main_id = self.module
+            .declare_function("main", Linkage::Export, &sig)
+            .map_err(|e| CodegenError::new(format!("failed to declare main: {e}")))?;
+
+        let mut ctx = Context::for_function(Function::with_name_signature(
+            UserFuncName::user(0, self.next_func_index()),
+            sig,
+        ));
+        let mut fn_builder_ctx = FunctionBuilderContext::new();
+
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+
+            // Initialize args
+            let argc_val = builder.block_params(entry)[0];
+            let argv_val = builder.block_params(entry)[1];
+            let init_id = self.runtime_fns["nsl_args_init"].0;
+            let init_ref = self.module.declare_func_in_func(init_id, builder.func);
+            builder.ins().call(init_ref, &[argc_val, argv_val]);
+
+            // Get args list
+            let args_id = self.runtime_fns["nsl_args"].0;
+            let args_ref = self.module.declare_func_in_func(args_id, builder.func);
+            let args_call = builder.ins().call(args_ref, &[]);
+            let args_list = builder.inst_results(args_call)[0];
+
+            // Get list length
+            let len_id = self.runtime_fns["nsl_list_len"].0;
+            let len_ref = self.module.declare_func_in_func(len_id, builder.func);
+            let len_call = builder.ins().call(len_ref, &[args_list]);
+            let args_len = builder.inst_results(len_call)[0];
+
+            // Check argc >= 3 (program, --run, test_name)
+            let three = builder.ins().iconst(cl_types::I64, 3);
+            let has_args = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual, args_len, three);
+
+            let dispatch_block = builder.create_block();
+            let exit_one_block = builder.create_block();
+
+            builder.ins().brif(has_args, dispatch_block, &[], exit_one_block, &[]);
+
+            // exit(1) block — no --run flag
+            builder.switch_to_block(exit_one_block);
+            builder.seal_block(exit_one_block);
+            let one = builder.ins().iconst(cl_types::I32, 1);
+            builder.ins().return_(&[one]);
+
+            // Dispatch block: check argv[1] == "--run"
+            builder.switch_to_block(dispatch_block);
+            builder.seal_block(dispatch_block);
+
+            let get_id = self.runtime_fns["nsl_list_get"].0;
+            let get_ref = self.module.declare_func_in_func(get_id, builder.func);
+            let eq_id = self.runtime_fns["nsl_str_eq"].0;
+            let eq_ref = self.module.declare_func_in_func(eq_id, builder.func);
+
+            // argv[1]
+            let idx1 = builder.ins().iconst(cl_types::I64, 1);
+            let get_call1 = builder.ins().call(get_ref, &[args_list, idx1]);
+            let arg1 = builder.inst_results(get_call1)[0];
+
+            // "--run" string constant
+            let run_data_id = self.string_pool[&run_flag];
+            let run_gv = self.module.declare_data_in_func(run_data_id, builder.func);
+            let run_ptr = builder.ins().symbol_value(cl_types::I64, run_gv);
+
+            let eq_call = builder.ins().call(eq_ref, &[arg1, run_ptr]);
+            let is_run = builder.inst_results(eq_call)[0];
+            let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
+            let run_check = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, is_run, zero_i64);
+
+            let name_check_block = builder.create_block();
+            let exit_one_block2 = builder.create_block();
+
+            builder.ins().brif(run_check, name_check_block, &[], exit_one_block2, &[]);
+
+            builder.switch_to_block(exit_one_block2);
+            builder.seal_block(exit_one_block2);
+            let one2 = builder.ins().iconst(cl_types::I32, 1);
+            builder.ins().return_(&[one2]);
+
+            // Name check block: get argv[2] and match against test names
+            builder.switch_to_block(name_check_block);
+            builder.seal_block(name_check_block);
+
+            let idx2 = builder.ins().iconst(cl_types::I64, 2);
+            let get_call2 = builder.ins().call(get_ref, &[args_list, idx2]);
+            let arg2 = builder.inst_results(get_call2)[0];
+
+            // Build chain: if arg2 == "test_name" { call test_name(); return 0; }
+            let exit_fail_block = builder.create_block();
+
+            for (i, test_name) in test_fns.iter().enumerate() {
+                let match_block = builder.create_block();
+                let next_block = if i + 1 < test_fns.len() {
+                    builder.create_block()
+                } else {
+                    exit_fail_block
+                };
+
+                // Compare arg2 with test_name string constant
+                let name_data_id = self.string_pool[test_name];
+                let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
+                let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+                let eq_ref2 = self.module.declare_func_in_func(eq_id, builder.func);
+                let eq_call2 = builder.ins().call(eq_ref2, &[arg2, name_ptr]);
+                let is_match = builder.inst_results(eq_call2)[0];
+                let zero2 = builder.ins().iconst(cl_types::I64, 0);
+                let match_check = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, is_match, zero2);
+
+                builder.ins().brif(match_check, match_block, &[], next_block, &[]);
+
+                // Match block: call the test function and return 0
+                builder.switch_to_block(match_block);
+                builder.seal_block(match_block);
+
+                let (func_id, _) = &self.functions[test_name];
+                let fn_ref = self.module.declare_func_in_func(*func_id, builder.func);
+                builder.ins().call(fn_ref, &[]);
+                let zero_ret = builder.ins().iconst(cl_types::I32, 0);
+                builder.ins().return_(&[zero_ret]);
+
+                if i + 1 < test_fns.len() {
+                    builder.switch_to_block(next_block);
+                    builder.seal_block(next_block);
+                }
+            }
+
+            // No match — exit with code 2
+            builder.switch_to_block(exit_fail_block);
+            builder.seal_block(exit_fail_block);
+            let two = builder.ins().iconst(cl_types::I32, 2);
+            builder.ins().return_(&[two]);
+
+            builder.finalize();
+        }
+
+        if self.dump_ir {
+            eprintln!("--- IR: main (test dispatch) ---\n{}", ctx.func.display());
+        }
+
+        self.module.define_function(main_id, &mut ctx)
+            .map_err(|e| CodegenError::new(format!("failed to define test main: {e}")))?;
+        Ok(())
+    }
+
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {
         let product = self.module.finish();
         product.emit().map_err(|e| CodegenError::new(format!("failed to emit object: {e}")))
@@ -1126,6 +1298,34 @@ pub fn compile(
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     compiler.finalize()
+}
+
+/// Compile in test mode: functions are compiled normally but main() dispatches
+/// to @test functions based on `--run <name>` argv. Returns (object_bytes, test_fn_names).
+pub fn compile_test(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    dump_ir: bool,
+) -> Result<(Vec<u8>, Vec<String>), CodegenError> {
+    let mut compiler = Compiler::new(interner, type_map)?;
+    compiler.dump_ir = dump_ir;
+    compiler.intern_string("")?;
+    compiler.collect_strings(&ast.stmts)?;
+    compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_structs(&ast.stmts)?;
+    compiler.collect_models(&ast.stmts)?;
+    compiler.declare_runtime_functions()?;
+    compiler.declare_user_functions(&ast.stmts)?;
+    compiler.compile_user_functions(&ast.stmts)?;
+    compiler.compile_pending_lambdas()?;
+    let test_fns = compiler.test_fns.clone();
+    if test_fns.is_empty() {
+        return Err(CodegenError::new("no @test functions found".to_string()));
+    }
+    compiler.compile_test_main()?;
+    let bytes = compiler.finalize()?;
+    Ok((bytes, test_fns))
 }
 
 /// Compile a library module (non-entry). Functions use Linkage::Export, no main().
