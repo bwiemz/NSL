@@ -10,6 +10,8 @@ use nsl_semantic::checker::TypeMap;
 use nsl_semantic::scope::{ScopeId, ScopeMap};
 use nsl_semantic::types::Type;
 
+use nsl_ast::expr::ExprKind;
+
 use crate::resolver;
 
 /// Data for a single parsed and analyzed module.
@@ -81,6 +83,65 @@ fn discover_imports(
     }
 
     Ok(imports)
+}
+
+/// Scan statements for train blocks and inject synthetic `from nsl.optim.X import *`
+/// imports so the optimizer stdlib modules are compiled and linked automatically.
+/// Also injects `from nsl.nn.losses import *` since train blocks commonly use loss functions.
+fn inject_train_block_imports(
+    stmts: &[Stmt],
+    interner: &mut Interner,
+) -> Vec<Stmt> {
+    let mut synthetic_stmts = Vec::new();
+
+    for stmt in stmts {
+        if let StmtKind::TrainBlock(train) = &stmt.kind {
+            for section in &train.sections {
+                if let nsl_ast::block::TrainSection::Optimizer(expr) = section {
+                    // Extract optimizer name from call expression: e.g. SGD(lr=0.01)
+                    if let ExprKind::Call { callee, .. } = &expr.kind {
+                        if let ExprKind::Ident(sym) = &callee.kind {
+                            let name = interner.resolve(sym.0).unwrap_or("").to_lowercase();
+                            let module_segments = match name.as_str() {
+                                "sgd" => Some(["nsl", "optim", "sgd"]),
+                                "adam" => Some(["nsl", "optim", "adam"]),
+                                "adamw" => Some(["nsl", "optim", "adamw"]),
+                                "lion" => Some(["nsl", "optim", "lion"]),
+                                "muon" => Some(["nsl", "optim", "muon"]),
+                                "soap" => Some(["nsl", "optim", "soap"]),
+                                _ => None,
+                            };
+
+                            if let Some(segments) = module_segments {
+                                let module_path: Vec<Symbol> = segments
+                                    .iter()
+                                    .map(|s| Symbol(interner.get_or_intern(s)))
+                                    .collect();
+
+                                let dummy_span = nsl_ast::Span {
+                                    file_id: nsl_errors::FileId(0),
+                                    start: nsl_errors::BytePos(0),
+                                    end: nsl_errors::BytePos(0),
+                                };
+
+                                synthetic_stmts.push(Stmt {
+                                    kind: StmtKind::FromImport(FromImportStmt {
+                                        module_path,
+                                        items: ImportItems::Glob,
+                                        span: dummy_span,
+                                    }),
+                                    span: dummy_span,
+                                    id: nsl_ast::NodeId::next(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    synthetic_stmts
 }
 
 /// Extract exported symbols from an analyzed module.
@@ -186,8 +247,20 @@ pub fn load_all_modules(
             return Err(format!("errors in '{}'", file_path.display()));
         }
 
+        // For the entry file, auto-inject imports for train block optimizer/scheduler modules
+        let mut module = parse_result.module;
+        if file_path == entry_path {
+            let synthetic = inject_train_block_imports(&module.stmts, interner);
+            if !synthetic.is_empty() {
+                // Prepend synthetic imports so discover_imports picks them up
+                let mut new_stmts = synthetic;
+                new_stmts.extend(module.stmts);
+                module.stmts = new_stmts;
+            }
+        }
+
         // Discover imports from this module
-        let imports = discover_imports(&parse_result.module.stmts, &file_path, interner)?;
+        let imports = discover_imports(&module.stmts, &file_path, interner)?;
 
         // Add new dependencies to worklist
         for (dep_path, _) in &imports {
@@ -196,7 +269,7 @@ pub fn load_all_modules(
             }
         }
 
-        parsed.insert(file_path.clone(), (parse_result.module, imports));
+        parsed.insert(file_path.clone(), (module, imports));
     }
 
     // Circular imports are detected by topological_sort (DFS with in_stack detection)

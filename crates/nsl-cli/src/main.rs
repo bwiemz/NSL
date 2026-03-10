@@ -213,13 +213,16 @@ fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool
     }
 }
 
-/// Check if a file has any import statements by quick-scanning.
-fn has_imports(file: &PathBuf) -> bool {
+/// Check if a file has any import statements or train blocks by quick-scanning.
+/// Train blocks need multi-file compilation because optimizer stdlib modules
+/// are auto-imported.
+fn needs_multi_file(file: &PathBuf) -> bool {
     if let Ok(source) = std::fs::read_to_string(file) {
         source.lines().any(|line| {
             let trimmed = line.trim();
             (trimmed.starts_with("from ") && trimmed.contains(" import "))
                 || (trimmed.starts_with("import ") && trimmed.contains(" as "))
+                || trimmed.starts_with("train(")
         })
     } else {
         false
@@ -231,7 +234,7 @@ fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: b
 }
 
 fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
-    if has_imports(file) {
+    if needs_multi_file(file) {
         run_build_multi(file, output, emit_obj, dump_ir, quiet);
     } else {
         run_build_single(file, output, emit_obj, dump_ir, quiet);
