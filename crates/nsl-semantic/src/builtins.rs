@@ -194,7 +194,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     }
 
     // Math functions (always return Float — coerce int args at codegen level)
-    for name in &["sqrt", "log", "exp", "sin", "cos"] {
+    for name in &["sqrt", "log", "exp", "sin", "cos", "floor"] {
         def(
             name,
             Type::Function {

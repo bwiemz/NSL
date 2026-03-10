@@ -1,0 +1,34 @@
+fn constant_lr(base_lr: float, step: float) -> float:
+    return base_lr
+
+fn step_lr(base_lr: float, step: float, step_size: float, gamma: float) -> float:
+    return base_lr * gamma ** floor(step / step_size)
+
+fn exponential_lr(base_lr: float, step: float, gamma: float) -> float:
+    return base_lr * gamma ** step
+
+fn linear_decay(base_lr: float, step: float, total_steps: float, end_factor: float) -> float:
+    if step >= total_steps:
+        return base_lr * end_factor
+    let progress = step / total_steps
+    return base_lr * (1.0 - progress * (1.0 - end_factor))
+
+fn cosine_anneal(base_lr: float, step: float, t_max: float, eta_min: float) -> float:
+    if step >= t_max:
+        return eta_min
+    return eta_min + (base_lr - eta_min) * 0.5 * (1.0 + cos(3.14159265 * step / t_max))
+
+fn warmup_cosine(base_lr: float, step: float, warmup_steps: float, total_steps: float, min_lr: float) -> float:
+    if step < warmup_steps:
+        return base_lr * (step / warmup_steps)
+    let progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    if progress >= 1.0:
+        return min_lr
+    return min_lr + (base_lr - min_lr) * 0.5 * (1.0 + cos(3.14159265 * progress))
+
+fn one_cycle(base_lr: float, step: float, max_lr: float, total_steps: float, pct_start: float) -> float:
+    let warmup_end = total_steps * pct_start
+    if step < warmup_end:
+        return base_lr + (max_lr - base_lr) * (step / warmup_end)
+    let progress = (step - warmup_end) / (total_steps - warmup_end)
+    return max_lr * 0.5 * (1.0 + cos(3.14159265 * progress))

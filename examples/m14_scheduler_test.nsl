@@ -1,0 +1,7 @@
+from nsl.optim.schedulers import constant_lr, warmup_cosine
+
+let lr1 = constant_lr(0.001, 0.0)
+print(lr1)
+
+let lr2 = warmup_cosine(0.001, 5.0, 10.0, 100.0, 0.0001)
+print(lr2)

@@ -1034,7 +1034,7 @@ impl<'a> TypeChecker<'a> {
 
             // Math builtins (exp, log, sqrt, sin, cos, abs) — when called with tensor or
             // unknown args, return the arg type (tensor) instead of Float.
-            if matches!(name.as_str(), "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg") {
+            if matches!(name.as_str(), "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg" | "floor") {
                 if let Some(first_arg_ty) = arg_types.first() {
                     if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
                         return first_arg_ty.clone();
