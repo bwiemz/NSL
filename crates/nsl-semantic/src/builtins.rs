@@ -182,6 +182,26 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // Optimizer constructors (used in train block DSL: optimizer: SGD(lr=0.01))
+    for name in &["SGD", "Adam", "AdamW", "Lion", "Muon", "SOAP"] {
+        def(
+            name,
+            Type::Function {
+                params: vec![Type::Unknown],
+                ret: Box::new(Type::Unknown),
+            },
+        );
+    }
+
+    // Tensor mutation: copy_data(dest, src) — in-place copy
+    def(
+        "copy_data",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(Type::Void),
+        },
+    );
+
     // Tensor reduction / element-wise builtins (take tensor(s), return tensor)
     for name in &["mean", "sum", "neg", "clamp", "reduce_max", "gather"] {
         def(

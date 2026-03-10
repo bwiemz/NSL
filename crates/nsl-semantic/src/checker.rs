@@ -634,7 +634,35 @@ impl<'a> TypeChecker<'a> {
                 }
                 TrainSection::Callbacks(callbacks) => {
                     for cb in callbacks {
-                        self.check_block(&cb.body, ScopeKind::Block);
+                        // Create a new scope and declare callback params
+                        let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+                        let prev = self.current_scope;
+                        self.current_scope = scope;
+
+                        for param in &cb.params {
+                            let param_ty = if let Some(type_ann) = &param.type_ann {
+                                self.resolve_type(type_ann)
+                            } else {
+                                // Infer types for well-known callback params
+                                let pname = self.resolve_name(param.name);
+                                match pname.as_str() {
+                                    "step" | "epoch" => Type::Int,
+                                    "loss" => Type::Tensor {
+                                        shape: Shape::unknown(),
+                                        dtype: DType::F64,
+                                        device: Device::Cpu,
+                                    },
+                                    _ => Type::Unknown,
+                                }
+                            };
+                            self.declare_symbol(param.name, param_ty, param.span, false, true);
+                        }
+
+                        for s in &cb.body.stmts {
+                            self.check_stmt(s);
+                        }
+
+                        self.current_scope = prev;
                     }
                 }
                 TrainSection::Distribute(expr) => {

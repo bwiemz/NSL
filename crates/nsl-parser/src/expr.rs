@@ -397,10 +397,18 @@ pub fn parse_args(p: &mut Parser) -> Vec<Arg> {
         let start = p.current_span();
 
         // Check for keyword argument: name=value
-        if let TokenKind::Ident(sym) = p.peek().clone() {
+        // Also handle language keywords used as kwarg names (e.g. model=m in train blocks)
+        let kwarg_sym = match p.peek().clone() {
+            TokenKind::Ident(sym) => Some(sym),
+            TokenKind::Model if matches!(p.peek_at(1), &TokenKind::Eq) => {
+                Some(p.interner.get_or_intern("model"))
+            }
+            _ => None,
+        };
+        if let Some(sym) = kwarg_sym {
             if matches!(p.peek_at(1), &TokenKind::Eq) {
                 let name = sym;
-                p.advance(); // consume ident
+                p.advance(); // consume ident/keyword
                 p.advance(); // consume =
                 let value = parse_expr(p);
                 let span = start.merge(value.span);
