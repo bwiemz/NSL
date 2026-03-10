@@ -414,20 +414,8 @@ pub extern "C" fn nsl_qtensor_quantize(
             }
         }
         _ => {
-            // Fallback: per-tensor
-            let (scale, zp) = compute_scale_zp(&src, qmin, qmax);
-            unsafe {
-                *qt_ref.scale = scale;
-                *qt_ref.zero_point = zp;
-            }
-            for i in 0..total {
-                let q = quantize_val(src[i], scale, zp, qmin, qmax);
-                match dtype {
-                    DTYPE_INT4 => int4_pack(qt_ref.data, i, q),
-                    DTYPE_INT8 => unsafe { *qt_ref.data.add(i) = q },
-                    _ => unreachable!(),
-                }
-            }
+            eprintln!("nsl: unknown quantization granularity {}", granularity);
+            std::process::abort();
         }
     }
 
@@ -526,17 +514,8 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
             }
         }
         _ => {
-            // Fallback: treat as per-tensor
-            let scale = unsafe { *qt.scale };
-            let zp = unsafe { *qt.zero_point };
-            for i in 0..total {
-                let q = match qt.dtype {
-                    DTYPE_INT4 => int4_unpack(qt.data, i),
-                    DTYPE_INT8 => unsafe { *qt.data.add(i) },
-                    _ => unreachable!(),
-                };
-                unsafe { *data.add(i) = dequantize_val(q, scale, zp) };
-            }
+            eprintln!("nsl: unknown quantization granularity {} in dequantize", qt.granularity);
+            std::process::abort();
         }
     }
 

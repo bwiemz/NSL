@@ -2,11 +2,15 @@
 # String-to-enum mapping before crossing FFI boundary
 
 fn quantize(t: Tensor, dtype: str, granularity: str, axis: int, group_size: int) -> QuantizedTensor:
-    let dtype_id = 0
+    let dtype_id = -1
+    if dtype == "int8":
+        dtype_id = 0
     if dtype == "int4":
         dtype_id = 1
 
-    let gran_id = 0
+    let gran_id = -1
+    if granularity == "per_tensor":
+        gran_id = 0
     if granularity == "per_channel":
         gran_id = 1
     if granularity == "per_group":

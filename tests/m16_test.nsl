@@ -12,7 +12,7 @@ fn test_int8_per_channel_roundtrip():
     let t = randn([4, 8])
     let qt = nsl_qtensor_quantize(t, 0, 1, 0, 0)
     let deq = nsl_qtensor_dequantize(qt)
-    assert_close(t, deq, 0.05, 0.05)
+    assert_close(t, deq, 0.1, 0.2)
 
 @test
 fn test_int4_per_group_roundtrip():

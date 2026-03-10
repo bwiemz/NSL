@@ -1093,8 +1093,9 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             TapeOp::MatMul { a, b, out, saved_a, saved_b } => {
                 if let Some(&g) = grad_map.get(out) {
                     // d/dA(A@B) = G @ B^T, d/dB(A@B) = A^T @ G
-                    let b_t = tensor_transpose(*saved_b, 0, 1);
-                    let a_t = tensor_transpose(*saved_a, 0, 1);
+                    // Use -2,-1 to transpose the last two dims (correct for batched matmul)
+                    let b_t = tensor_transpose(*saved_b, -2, -1);
+                    let a_t = tensor_transpose(*saved_a, -2, -1);
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
                     let grad_a = tensor_matmul(g_clone1, b_t);

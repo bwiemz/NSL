@@ -711,46 +711,123 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
-    if a.ndim != 2 || b.ndim != 2 {
+    if a.ndim < 2 || b.ndim < 2 {
         eprintln!(
-            "nsl: matmul requires 2D tensors (got {}D and {}D)",
+            "nsl: matmul requires at least 2D tensors (got {}D and {}D)",
             a.ndim, b.ndim
         );
         std::process::abort();
     }
 
-    let m = unsafe { *a.shape.add(0) }; // rows of A
-    let k = unsafe { *a.shape.add(1) }; // cols of A
-    let k2 = unsafe { *b.shape.add(0) }; // rows of B
-    let n = unsafe { *b.shape.add(1) }; // cols of B
+    let a_shape = get_shape_vec(a);
+    let b_shape = get_shape_vec(b);
+    let a_nd = a.ndim as usize;
+    let b_nd = b.ndim as usize;
+
+    let m = a_shape[a_nd - 2];
+    let k = a_shape[a_nd - 1];
+    let k2 = b_shape[b_nd - 2];
+    let n = b_shape[b_nd - 1];
 
     if k != k2 {
         eprintln!(
-            "nsl: matmul dimension mismatch ({}x{} @ {}x{})",
+            "nsl: matmul inner dimension mismatch ({}x{} @ {}x{})",
             m, k, k2, n
         );
         std::process::abort();
     }
 
-    // Result is m x n
-    let ndim: i64 = 2;
-    let len = m * n;
-    let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe {
-        *shape.add(0) = m;
-        *shape.add(1) = n;
+    // Broadcast batch dimensions (all dims before last two)
+    let a_batch: Vec<i64> = a_shape[..a_nd - 2].to_vec();
+    let b_batch: Vec<i64> = b_shape[..b_nd - 2].to_vec();
+
+    // Compute broadcast batch shape
+    let max_batch_nd = a_batch.len().max(b_batch.len());
+    let mut out_batch: Vec<i64> = Vec::with_capacity(max_batch_nd);
+    for i in 0..max_batch_nd {
+        let a_dim = if i < max_batch_nd - a_batch.len() { 1 } else { a_batch[i - (max_batch_nd - a_batch.len())] };
+        let b_dim = if i < max_batch_nd - b_batch.len() { 1 } else { b_batch[i - (max_batch_nd - b_batch.len())] };
+        if a_dim != b_dim && a_dim != 1 && b_dim != 1 {
+            eprintln!("nsl: matmul batch dimension mismatch at dim {}: {} vs {}", i, a_dim, b_dim);
+            std::process::abort();
+        }
+        out_batch.push(a_dim.max(b_dim));
     }
-    let strides = NslTensor::compute_strides(shape, ndim);
+
+    // Build output shape: batch_dims + [m, n]
+    let out_nd = out_batch.len() + 2;
+    let mut out_shape_vec: Vec<i64> = out_batch.clone();
+    out_shape_vec.push(m);
+    out_shape_vec.push(n);
+
+    let total_batch: i64 = out_batch.iter().product::<i64>().max(1);
+    let len = total_batch * m * n;
+
+    let shape = checked_alloc(out_nd * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in out_shape_vec.iter().enumerate() {
+        unsafe { *shape.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape, out_nd as i64);
     let data = checked_alloc_zeroed((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
-    // Naive triple-loop matmul
-    for i in 0..m as usize {
-        for j in 0..k as usize {
-            let a_val = unsafe { *a.data.add(i * k as usize + j) };
-            for l in 0..n as usize {
-                let b_val = unsafe { *b.data.add(j * n as usize + l) };
-                unsafe {
-                    *data.add(i * n as usize + l) += a_val * b_val;
+    let a_mat_stride = (m * k) as usize;
+    let b_mat_stride = (k2 * n) as usize;
+    let out_mat_stride = (m * n) as usize;
+
+    // Precompute per-dimension strides for a and b batch dims (for broadcast mapping)
+    let mut a_batch_strides: Vec<usize> = vec![0; max_batch_nd];
+    let mut b_batch_strides: Vec<usize> = vec![0; max_batch_nd];
+    {
+        let mut a_s = 1usize;
+        let mut b_s = 1usize;
+        for i in (0..max_batch_nd).rev() {
+            let a_offset = max_batch_nd - a_batch.len();
+            let b_offset = max_batch_nd - b_batch.len();
+            let a_d = if i < a_offset { 1 } else { a_batch[i - a_offset] as usize };
+            let b_d = if i < b_offset { 1 } else { b_batch[i - b_offset] as usize };
+            a_batch_strides[i] = a_s;
+            b_batch_strides[i] = b_s;
+            a_s *= a_d;
+            b_s *= b_d;
+        }
+    }
+
+    for batch_idx in 0..total_batch as usize {
+        // Decompose flat batch_idx into per-dimension coordinates, then map to a/b
+        let mut a_batch_idx = 0usize;
+        let mut b_batch_idx = 0usize;
+        let mut remaining = batch_idx;
+        for i in 0..max_batch_nd {
+            let next_stride = if i + 1 < max_batch_nd {
+                out_batch[i + 1..].iter().product::<i64>() as usize
+            } else {
+                1
+            };
+            let coord = remaining / next_stride;
+            remaining %= next_stride;
+
+            let a_offset = max_batch_nd - a_batch.len();
+            let b_offset = max_batch_nd - b_batch.len();
+            let a_d = if i < a_offset { 1 } else { a_batch[i - a_offset] as usize };
+            let b_d = if i < b_offset { 1 } else { b_batch[i - b_offset] as usize };
+            // Clamp coordinate to broadcast dim (size-1 dims broadcast to 0)
+            a_batch_idx += coord.min(a_d - 1) * a_batch_strides[i];
+            b_batch_idx += coord.min(b_d - 1) * b_batch_strides[i];
+        }
+
+        let a_base = a_batch_idx * a_mat_stride;
+        let b_base = b_batch_idx * b_mat_stride;
+        let out_base = batch_idx * out_mat_stride;
+
+        // 2D matmul for this batch element
+        for i in 0..m as usize {
+            for j in 0..k as usize {
+                let a_val = unsafe { *a.data.add(a_base + i * k as usize + j) };
+                for l in 0..n as usize {
+                    let b_val = unsafe { *b.data.add(b_base + j * n as usize + l) };
+                    unsafe {
+                        *data.add(out_base + i * n as usize + l) += a_val * b_val;
+                    }
                 }
             }
         }
@@ -760,7 +837,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         data,
         shape,
         strides,
-        ndim,
+        ndim: out_nd as i64,
         len,
         refcount: 1,
     });
@@ -1111,9 +1188,17 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     // For 2D dim=1: output[b] = input[b, indices[b]]
     // For 2D dim=0: output[c] = input[indices[c], c]
     if ndim == 2 {
+        let gather_dim_size = input_shape[d] as usize;
         if d == 1 {
             for b in 0..batch {
                 let idx = unsafe { *indices.data.add(b) } as usize;
+                if idx >= gather_dim_size {
+                    eprintln!(
+                        "nsl: gather index {} out of bounds for dim {} with size {}",
+                        idx, d, gather_dim_size
+                    );
+                    std::process::abort();
+                }
                 let val = unsafe { *tensor.data.add(b * in_strides[0] + idx * in_strides[1]) };
                 unsafe { *result.data.add(b) = val };
             }
@@ -1122,6 +1207,13 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
             let cols = input_shape[1] as usize;
             for c in 0..cols {
                 let idx = unsafe { *indices.data.add(c) } as usize;
+                if idx >= gather_dim_size {
+                    eprintln!(
+                        "nsl: gather index {} out of bounds for dim {} with size {}",
+                        idx, d, gather_dim_size
+                    );
+                    std::process::abort();
+                }
                 let val = unsafe { *tensor.data.add(idx * in_strides[0] + c * in_strides[1]) };
                 unsafe { *result.data.add(c) = val };
             }
@@ -2244,12 +2336,12 @@ pub extern "C" fn nsl_tensor_layernorm(
     let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
 
     if autodiff::is_recording() {
-        // Bump refcounts for saved tensors
+        // Bump refcounts for tensors that are also visible to user code
         NslTensor::from_ptr(input_ptr).refcount += 1;
         NslTensor::from_ptr(weight_ptr).refcount += 1;
-        // mean and inv_std are freshly created with refcount=1; bump for tape
-        NslTensor::from_ptr(mean_ptr).refcount += 1;
-        NslTensor::from_ptr(inv_std_ptr).refcount += 1;
+        // mean and inv_std are purely internal to the tape (refcount=1).
+        // Do NOT bump — no user-space variable will ever free them, so bumping
+        // would cause a permanent leak on every training step.
         autodiff::maybe_record(autodiff::TapeOp::LayerNorm {
             input: input_ptr,
             weight: weight_ptr,
@@ -2339,7 +2431,8 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
     if autodiff::is_recording() {
         NslTensor::from_ptr(input_ptr).refcount += 1;
         NslTensor::from_ptr(weight_ptr).refcount += 1;
-        NslTensor::from_ptr(rms_ptr).refcount += 1;
+        // rms_tensor is purely internal to the tape (refcount=1).
+        // Do NOT bump — no user-space variable will ever free it.
         autodiff::maybe_record(autodiff::TapeOp::RMSNorm {
             input: input_ptr,
             weight: weight_ptr,
