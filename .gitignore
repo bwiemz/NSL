@@ -1,2 +1,4 @@
 /.serena
 /target/
+/.VSCodeCounter/
+*.exe
