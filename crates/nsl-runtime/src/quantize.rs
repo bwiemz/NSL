@@ -10,7 +10,6 @@ use crate::tensor::NslTensor;
 // Constants
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Used implicitly as the default match arm for dtype
 const DTYPE_INT8: i64 = 0;
 const DTYPE_INT4: i64 = 1;
 
@@ -107,7 +106,8 @@ fn alloc_qtensor(
     // Data buffer size: INT8 = 1 byte/elem, INT4 = ceil(total/2) bytes
     let data_bytes = match dtype {
         DTYPE_INT4 => (total + 1) / 2,
-        _ => total,
+        DTYPE_INT8 => total,
+        _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
     };
 
     // MUST use zeroed alloc — int4_pack uses |= which blends with existing bits
@@ -147,7 +147,8 @@ pub extern "C" fn nsl_qtensor_free(ptr: i64) {
 
     let data_bytes = match qt.dtype {
         DTYPE_INT4 => (total + 1) / 2,
-        _ => total,
+        DTYPE_INT8 => total,
+        _ => { eprintln!("nsl: unknown quantization dtype {}", qt.dtype); std::process::abort(); }
     };
 
     unsafe {
@@ -280,7 +281,8 @@ pub extern "C" fn nsl_qtensor_quantize(
 
     let (qmin, qmax) = match dtype {
         DTYPE_INT4 => (0.0_f64, 15.0_f64),
-        _ => (0.0_f64, 255.0_f64),
+        DTYPE_INT8 => (0.0_f64, 255.0_f64),
+        _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
     };
 
     // Read all source data into a Vec for easier slicing
@@ -297,7 +299,8 @@ pub extern "C" fn nsl_qtensor_quantize(
                 let q = quantize_val(src[i], scale, zp, qmin, qmax);
                 match dtype {
                     DTYPE_INT4 => int4_pack(qt_ref.data, i, q),
-                    _ => unsafe { *qt_ref.data.add(i) = q },
+                    DTYPE_INT8 => unsafe { *qt_ref.data.add(i) = q },
+                    _ => unreachable!(),
                 }
             }
         }
@@ -337,7 +340,8 @@ pub extern "C" fn nsl_qtensor_quantize(
                         let q = quantize_val(channel_vals[vi], scale, zp, qmin, qmax);
                         match dtype {
                             DTYPE_INT4 => int4_pack(qt_ref.data, idx, q),
-                            _ => unsafe { *qt_ref.data.add(idx) = q },
+                            DTYPE_INT8 => unsafe { *qt_ref.data.add(idx) = q },
+                            _ => unreachable!(),
                         }
                         vi += 1;
                     }
@@ -386,7 +390,8 @@ pub extern "C" fn nsl_qtensor_quantize(
                             let q = quantize_val(group_vals[vi], scale, zp, qmin, qmax);
                             match dtype {
                                 DTYPE_INT4 => int4_pack(qt_ref.data, idx, q),
-                                _ => unsafe { *qt_ref.data.add(idx) = q },
+                                DTYPE_INT8 => unsafe { *qt_ref.data.add(idx) = q },
+                            _ => unreachable!(),
                             }
                             vi += 1;
                         }
@@ -407,7 +412,8 @@ pub extern "C" fn nsl_qtensor_quantize(
                 let q = quantize_val(src[i], scale, zp, qmin, qmax);
                 match dtype {
                     DTYPE_INT4 => int4_pack(qt_ref.data, i, q),
-                    _ => unsafe { *qt_ref.data.add(i) = q },
+                    DTYPE_INT8 => unsafe { *qt_ref.data.add(i) = q },
+                    _ => unreachable!(),
                 }
             }
         }
@@ -442,7 +448,8 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
             for i in 0..total {
                 let q = match qt.dtype {
                     DTYPE_INT4 => int4_unpack(qt.data, i),
-                    _ => unsafe { *qt.data.add(i) },
+                    DTYPE_INT8 => unsafe { *qt.data.add(i) },
+                    _ => unreachable!(),
                 };
                 unsafe { *data.add(i) = dequantize_val(q, scale, zp) };
             }
@@ -464,7 +471,8 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
                         let idx = o * axis_size * inner_size + ch * inner_size + inner;
                         let q = match qt.dtype {
                             DTYPE_INT4 => int4_unpack(qt.data, idx),
-                            _ => unsafe { *qt.data.add(idx) },
+                            DTYPE_INT8 => unsafe { *qt.data.add(idx) },
+                            _ => unreachable!(),
                         };
                         unsafe { *data.add(idx) = dequantize_val(q, scale, zp) };
                     }
@@ -495,7 +503,8 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
                             let idx = o * axis_size * inner_size + ch * inner_size + inner;
                             let q = match qt.dtype {
                                 DTYPE_INT4 => int4_unpack(qt.data, idx),
-                                _ => unsafe { *qt.data.add(idx) },
+                                DTYPE_INT8 => unsafe { *qt.data.add(idx) },
+                            _ => unreachable!(),
                             };
                             unsafe { *data.add(idx) = dequantize_val(q, scale, zp) };
                         }
@@ -511,7 +520,8 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
             for i in 0..total {
                 let q = match qt.dtype {
                     DTYPE_INT4 => int4_unpack(qt.data, i),
-                    _ => unsafe { *qt.data.add(i) },
+                    DTYPE_INT8 => unsafe { *qt.data.add(i) },
+                    _ => unreachable!(),
                 };
                 unsafe { *data.add(i) = dequantize_val(q, scale, zp) };
             }
