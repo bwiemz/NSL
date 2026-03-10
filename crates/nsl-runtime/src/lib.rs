@@ -20,3 +20,4 @@ pub mod tensor;
 pub mod autodiff;
 pub mod checkpoint;
 pub mod tokenizer;
+pub mod quantize;
