@@ -216,6 +216,10 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
     {
         return true;
     }
+    // List covariance: List<A> assignable to List<B> if A assignable to B
+    if let (Type::List(src_elem), Type::List(tgt_elem)) = (source, target) {
+        return is_assignable(src_elem, tgt_elem);
+    }
     // NoneType -> Optional<T>
     if matches!(source, Type::NoneType) && matches!(target, Type::Optional(_)) {
         return true;
