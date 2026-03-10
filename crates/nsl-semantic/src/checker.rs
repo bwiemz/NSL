@@ -604,11 +604,54 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_train_block(&mut self, _train: &TrainBlock) {
-        // Train block validation deferred to M3.
-        // Train blocks use DSL-specific syntax (data:, optimizer:, scheduler:,
-        // step(batch):, callbacks:) with keyword values like bf16, per_channel, etc.
-        // that aren't general expressions in the regular scope.
+    fn check_train_block(&mut self, train: &TrainBlock) {
+        // Check config expressions (model=, epochs=, etc.)
+        for arg in &train.config {
+            self.check_expr(&arg.value);
+        }
+
+        let mut has_step = false;
+
+        for section in &train.sections {
+            match section {
+                TrainSection::Data(stmts) => {
+                    for stmt in stmts {
+                        self.check_stmt(stmt);
+                    }
+                }
+                TrainSection::Optimizer(expr) => {
+                    self.check_expr(expr);
+                }
+                TrainSection::Scheduler(expr) => {
+                    self.check_expr(expr);
+                }
+                TrainSection::Step { param: _, body } => {
+                    has_step = true;
+                    self.check_block(body, ScopeKind::Block);
+                }
+                TrainSection::Eval { param: _, body } => {
+                    self.check_block(body, ScopeKind::Block);
+                }
+                TrainSection::Callbacks(callbacks) => {
+                    for cb in callbacks {
+                        self.check_block(&cb.body, ScopeKind::Block);
+                    }
+                }
+                TrainSection::Distribute(expr) => {
+                    self.check_expr(expr);
+                }
+                TrainSection::Stmt(stmt) => {
+                    self.check_stmt(stmt);
+                }
+            }
+        }
+
+        if !has_step {
+            self.diagnostics.push(
+                Diagnostic::warning("train block missing 'step' section")
+                    .with_label(train.span, "expected a step(batch): section"),
+            );
+        }
     }
 
     // ===== Expression checking =====
