@@ -12,7 +12,7 @@ use nsl_semantic::types::Type;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
-use crate::types::{is_float_type, nsl_type_to_cl, pointer_type};
+use crate::types::{is_float_type, is_int_type, nsl_type_to_cl, pointer_type};
 
 impl Compiler<'_> {
     pub fn compile_expr(
@@ -350,6 +350,9 @@ impl Compiler<'_> {
         let val = self.compile_expr(builder, state, operand)?;
         let ty = self.node_type(operand.id).clone();
         match op {
+            UnaryOp::Neg if matches!(ty, Type::Tensor { .. }) => {
+                self.compile_call_by_name(builder, "nsl_tensor_neg", &[val])
+            }
             UnaryOp::Neg if is_float_type(&ty) => Ok(builder.ins().fneg(val)),
             UnaryOp::Neg => Ok(builder.ins().ineg(val)),
             UnaryOp::Not => Ok(builder.ins().icmp_imm(IntCC::Equal, val, 0)),
@@ -439,10 +442,43 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, &rt_name, &arg_vals);
         }
 
-        // Math builtins: sqrt, log, exp, sin, cos (always take f64, return f64)
+        // Math builtins: sqrt, log, exp, sin, cos (scalar path: f64 in, f64 out)
+        // For tensor arguments, fall through to the M14 tensor dispatch below.
         if matches!(func_name.as_str(), "sqrt" | "log" | "exp" | "sin" | "cos") {
             if args.len() != 1 {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+            }
+            let arg_type = self.node_type(args[0].value.id).clone();
+            if is_float_type(&arg_type) || is_int_type(&arg_type) {
+                let val = self.compile_expr(builder, state, &args[0].value)?;
+                let float_val = if is_float_type(&arg_type) {
+                    val
+                } else {
+                    builder.ins().fcvt_from_sint(cl_types::F64, val)
+                };
+                let rt_name = format!("nsl_{func_name}");
+                return self.compile_call_by_name(builder, &rt_name, &[float_val]);
+            }
+            // else: tensor type — fall through to M14 tensor dispatch
+        }
+        // abs: dispatch to int or float variant (scalar only)
+        // For tensor arguments, fall through to the M14 tensor dispatch below.
+        if func_name == "abs" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("abs() takes exactly 1 argument"));
+            }
+            let arg_type = self.node_type(args[0].value.id).clone();
+            if is_float_type(&arg_type) || is_int_type(&arg_type) {
+                let val = self.compile_expr(builder, state, &args[0].value)?;
+                let rt_name = if is_float_type(&arg_type) { "nsl_abs_float" } else { "nsl_abs_int" };
+                return self.compile_call_by_name(builder, rt_name, &[val]);
+            }
+            // else: tensor type — fall through to M14 tensor dispatch
+        }
+        // floor: scalar f64 dispatch
+        if func_name == "floor" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("floor() takes exactly 1 argument"));
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
             let arg_type = self.node_type(args[0].value.id).clone();
@@ -451,18 +487,7 @@ impl Compiler<'_> {
             } else {
                 builder.ins().fcvt_from_sint(cl_types::F64, val)
             };
-            let rt_name = format!("nsl_{func_name}");
-            return self.compile_call_by_name(builder, &rt_name, &[float_val]);
-        }
-        // abs: dispatch to int or float variant
-        if func_name == "abs" {
-            if args.len() != 1 {
-                return Err(CodegenError::new("abs() takes exactly 1 argument"));
-            }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
-            let arg_type = self.node_type(args[0].value.id).clone();
-            let rt_name = if is_float_type(&arg_type) { "nsl_abs_float" } else { "nsl_abs_int" };
-            return self.compile_call_by_name(builder, rt_name, &[val]);
+            return self.compile_call_by_name(builder, "nsl_floor", &[float_val]);
         }
         // min/max: dispatch to int or float variant
         if matches!(func_name.as_str(), "min" | "max") {
