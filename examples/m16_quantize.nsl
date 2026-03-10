@@ -1,0 +1,31 @@
+# M16 Quantization Example
+# Demonstrates the quant static block for weight quantization
+
+model TinyModel(dim: int):
+    w1: Tensor = randn([dim, 64])
+    b1: Tensor = zeros([64])
+    w2: Tensor = randn([64, dim])
+    b2: Tensor = zeros([dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = gelu(bias_add(x @ self.w1, self.b1))
+        return bias_add(h @ self.w2, self.b2)
+
+# Create a model
+let m = TinyModel(32)
+
+# Full-precision forward pass
+let x = randn([4, 32])
+let y_full = m.forward(x)
+print(y_full)
+
+# Quantize weights to INT4, per-group(32), keep biases in f64
+quant static qm from m:
+    default: int4, per_group(32)
+    exclude: ["b*"]
+
+# Quantized forward pass
+let y_quant = qm.forward(x)
+print(y_quant)
+
+print("Done")
