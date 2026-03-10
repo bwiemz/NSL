@@ -4,11 +4,11 @@ use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
 
 #[repr(C)]
 pub struct NslTensor {
-    data: *mut f64,
-    shape: *mut i64,
-    strides: *mut i64,
-    ndim: i64,
-    len: i64,
+    pub(crate) data: *mut f64,
+    pub(crate) shape: *mut i64,
+    pub(crate) strides: *mut i64,
+    pub(crate) ndim: i64,
+    pub(crate) len: i64,
     pub(crate) refcount: i64,
 }
 
@@ -17,7 +17,7 @@ impl NslTensor {
         unsafe { &mut *(ptr as *mut NslTensor) }
     }
 
-    fn compute_strides(shape: *const i64, ndim: i64) -> *mut i64 {
+    pub(crate) fn compute_strides(shape: *const i64, ndim: i64) -> *mut i64 {
         let n = ndim as usize;
         let strides = checked_alloc(n * std::mem::size_of::<i64>()) as *mut i64;
         if n > 0 {
@@ -633,44 +633,368 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
 
 // === Reductions ===
 
+/// Helper: get the shape of a tensor as a Vec<i64>.
+fn get_shape_vec(tensor: &NslTensor) -> Vec<i64> {
+    (0..tensor.ndim as usize)
+        .map(|i| unsafe { *tensor.shape.add(i) })
+        .collect()
+}
+
+/// Helper: get the strides of a tensor as a Vec<usize>.
+fn get_strides_vec(tensor: &NslTensor) -> Vec<usize> {
+    (0..tensor.ndim as usize)
+        .map(|i| unsafe { *tensor.strides.add(i) } as usize)
+        .collect()
+}
+
+/// Helper: create a tensor with a given shape (Rust slice), returning (ptr, &mut NslTensor).
+fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
+    let ndim = shape.len() as i64;
+    let mut total: i64 = 1;
+    for &s in shape {
+        total *= s;
+    }
+
+    let shape_ptr =
+        checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in shape.iter().enumerate() {
+        unsafe { *shape_ptr.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape_ptr, ndim);
+    let data = checked_alloc_zeroed((total as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    let tensor = Box::new(NslTensor {
+        data,
+        shape: shape_ptr,
+        strides,
+        ndim,
+        len: total,
+        refcount: 1,
+    });
+    Box::into_raw(tensor) as i64
+}
+
+/// Global sum reduction (backward compatible wrapper).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sum(tensor_ptr: i64) -> i64 {
+    nsl_tensor_sum_dim(tensor_ptr, -1, 0)
+}
+
+/// Global mean reduction (backward compatible wrapper).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
+    nsl_tensor_mean_dim(tensor_ptr, -1, 0)
+}
+
+/// Sum reduction along a dimension (dim=-1 means global).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    let mut total = 0.0;
-    for i in 0..tensor.len as usize {
-        total += unsafe { *tensor.data.add(i) };
+    let input_shape = get_shape_vec(tensor);
+    let keepdim_bool = keepdim != 0;
+
+    if dim == -1 {
+        // Global reduction
+        let mut total = 0.0;
+        for i in 0..tensor.len as usize {
+            total += unsafe { *tensor.data.add(i) };
+        }
+        let result = create_scalar_tensor(total);
+        if autodiff::is_recording() {
+            autodiff::maybe_record(autodiff::TapeOp::SumReduce {
+                a: tensor_ptr,
+                out: result,
+                dim: -1,
+                keepdim: false,
+                input_shape,
+            });
+        }
+        return result;
     }
-    let result = create_scalar_tensor(total);
+
+    let ndim = tensor.ndim as usize;
+    let d = dim as usize;
+    if d >= ndim {
+        eprintln!("nsl: sum_dim dimension {} out of range for {}D tensor", dim, ndim);
+        std::process::abort();
+    }
+
+    let in_strides = get_strides_vec(tensor);
+
+    // Compute output shape
+    let out_shape: Vec<i64> = if keepdim_bool {
+        input_shape.iter().enumerate()
+            .map(|(i, &s)| if i == d { 1 } else { s })
+            .collect()
+    } else {
+        input_shape.iter().enumerate()
+            .filter(|&(i, _)| i != d)
+            .map(|(_, &s)| s)
+            .collect()
+    };
+
+    let result_ptr = create_tensor_with_shape_rs(&out_shape);
+    let result = NslTensor::from_ptr(result_ptr);
+    let out_strides = get_strides_vec(result);
+
+    // Iterate all elements of input, accumulate into output
+    let total_in = tensor.len as usize;
+    for flat_in in 0..total_in {
+        // Decompose flat_in into multi-index using input strides
+        let mut remaining = flat_in;
+        let mut indices = vec![0usize; ndim];
+        for dd in 0..ndim {
+            indices[dd] = remaining / in_strides[dd];
+            remaining %= in_strides[dd];
+        }
+
+        // Compute output flat index (skip or collapse the reduced dim)
+        let mut out_flat = 0usize;
+        let mut oi = 0usize;
+        for dd in 0..ndim {
+            if dd == d {
+                if keepdim_bool {
+                    // dim is kept as size 1, index=0
+                    oi += 1;
+                }
+                continue;
+            }
+            out_flat += indices[dd] * out_strides[oi];
+            oi += 1;
+        }
+
+        let val = unsafe { *tensor.data.add(flat_in) };
+        unsafe { *result.data.add(out_flat) += val };
+    }
+
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::SumReduce {
             a: tensor_ptr,
-            out: result,
+            out: result_ptr,
+            dim,
+            keepdim: keepdim_bool,
+            input_shape,
         });
     }
-    result
+    result_ptr
 }
 
+/// Mean reduction along a dimension (dim=-1 means global).
 #[no_mangle]
-pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
+pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    if tensor.len == 0 {
-        return create_scalar_tensor(0.0);
+    let input_shape = get_shape_vec(tensor);
+    let keepdim_bool = keepdim != 0;
+
+    if dim == -1 {
+        // Global reduction
+        if tensor.len == 0 {
+            return create_scalar_tensor(0.0);
+        }
+        let num_elements = tensor.len;
+        let mut total = 0.0;
+        for i in 0..num_elements as usize {
+            total += unsafe { *tensor.data.add(i) };
+        }
+        total /= num_elements as f64;
+        let result = create_scalar_tensor(total);
+        if autodiff::is_recording() {
+            autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
+                a: tensor_ptr,
+                out: result,
+                dim: -1,
+                keepdim: false,
+                num_elements,
+                input_shape,
+            });
+        }
+        return result;
     }
-    let num_elements = tensor.len;
-    let mut total = 0.0;
-    for i in 0..num_elements as usize {
-        total += unsafe { *tensor.data.add(i) };
+
+    let ndim = tensor.ndim as usize;
+    let d = dim as usize;
+    if d >= ndim {
+        eprintln!("nsl: mean_dim dimension {} out of range for {}D tensor", dim, ndim);
+        std::process::abort();
     }
-    total /= num_elements as f64;
-    let result = create_scalar_tensor(total);
+
+    let dim_size = input_shape[d];
+
+    // Sum first, then divide
+    let sum_ptr = nsl_tensor_sum_dim(tensor_ptr, dim, keepdim);
+
+    // Remove the SumReduce tape entry that sum_dim just recorded (we want MeanReduce instead)
+    if autodiff::is_recording() {
+        crate::autodiff::pop_last_op();
+    }
+
+    // Divide by dim_size
+    let result = NslTensor::from_ptr(sum_ptr);
+    for i in 0..result.len as usize {
+        unsafe { *result.data.add(i) /= dim_size as f64 };
+    }
+
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
             a: tensor_ptr,
-            out: result,
-            num_elements,
+            out: sum_ptr,
+            dim,
+            keepdim: keepdim_bool,
+            num_elements: dim_size,
+            input_shape,
         });
     }
-    result
+    sum_ptr
+}
+
+/// Reduce max along a dimension.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let input_shape = get_shape_vec(tensor);
+    let keepdim_bool = keepdim != 0;
+    let ndim = tensor.ndim as usize;
+    let d = dim as usize;
+
+    if d >= ndim {
+        eprintln!("nsl: reduce_max dimension {} out of range for {}D tensor", dim, ndim);
+        std::process::abort();
+    }
+
+    let in_strides = get_strides_vec(tensor);
+
+    // Compute output shape
+    let out_shape: Vec<i64> = if keepdim_bool {
+        input_shape.iter().enumerate()
+            .map(|(i, &s)| if i == d { 1 } else { s })
+            .collect()
+    } else {
+        input_shape.iter().enumerate()
+            .filter(|&(i, _)| i != d)
+            .map(|(_, &s)| s)
+            .collect()
+    };
+
+    let result_ptr = create_tensor_with_shape_rs(&out_shape);
+    let result = NslTensor::from_ptr(result_ptr);
+    let out_strides = get_strides_vec(result);
+    let out_total = result.len as usize;
+
+    // Initialize with -inf
+    for i in 0..out_total {
+        unsafe { *result.data.add(i) = f64::NEG_INFINITY };
+    }
+
+    // Track argmax per output position
+    let mut argmax = vec![0usize; out_total];
+
+    // Iterate all elements of input
+    let total_in = tensor.len as usize;
+    for flat_in in 0..total_in {
+        let mut remaining = flat_in;
+        let mut indices = vec![0usize; ndim];
+        for dd in 0..ndim {
+            indices[dd] = remaining / in_strides[dd];
+            remaining %= in_strides[dd];
+        }
+
+        // Compute output flat index
+        let mut out_flat = 0usize;
+        let mut oi = 0usize;
+        for dd in 0..ndim {
+            if dd == d {
+                if keepdim_bool {
+                    oi += 1;
+                }
+                continue;
+            }
+            out_flat += indices[dd] * out_strides[oi];
+            oi += 1;
+        }
+
+        let val = unsafe { *tensor.data.add(flat_in) };
+        let cur = unsafe { *result.data.add(out_flat) };
+        if val > cur {
+            unsafe { *result.data.add(out_flat) = val };
+            argmax[out_flat] = indices[d];
+        }
+    }
+
+    if autodiff::is_recording() {
+        autodiff::maybe_record(autodiff::TapeOp::ReduceMax {
+            a: tensor_ptr,
+            out: result_ptr,
+            dim,
+            keepdim: keepdim_bool,
+            saved_argmax: argmax,
+            input_shape,
+        });
+    }
+    result_ptr
+}
+
+/// Gather along a dimension: output[b] = tensor[b, indices[b]] (for dim=1, 2D input).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let indices = NslTensor::from_ptr(indices_ptr);
+    let input_shape = get_shape_vec(tensor);
+    let ndim = tensor.ndim as usize;
+    let d = dim as usize;
+
+    if d >= ndim {
+        eprintln!("nsl: gather dimension {} out of range for {}D tensor", dim, ndim);
+        std::process::abort();
+    }
+
+    let in_strides = get_strides_vec(tensor);
+    let batch = indices.len as usize;
+
+    // Output shape: input shape with dim removed
+    // For [batch, classes] with dim=1 and indices [batch] -> output [batch]
+    let out_shape: Vec<i64> = input_shape.iter().enumerate()
+        .filter(|&(i, _)| i != d)
+        .map(|(_, &s)| s)
+        .collect();
+
+    let result_ptr = create_tensor_with_shape_rs(&out_shape);
+    let result = NslTensor::from_ptr(result_ptr);
+
+    // For 2D dim=1: output[b] = input[b, indices[b]]
+    // For 2D dim=0: output[c] = input[indices[c], c]
+    if ndim == 2 {
+        if d == 1 {
+            for b in 0..batch {
+                let idx = unsafe { *indices.data.add(b) } as usize;
+                let val = unsafe { *tensor.data.add(b * in_strides[0] + idx * in_strides[1]) };
+                unsafe { *result.data.add(b) = val };
+            }
+        } else {
+            // dim=0
+            let cols = input_shape[1] as usize;
+            for c in 0..cols {
+                let idx = unsafe { *indices.data.add(c) } as usize;
+                let val = unsafe { *tensor.data.add(idx * in_strides[0] + c * in_strides[1]) };
+                unsafe { *result.data.add(c) = val };
+            }
+        }
+    } else {
+        eprintln!("nsl: gather currently only supports 2D tensors");
+        std::process::abort();
+    }
+
+    if autodiff::is_recording() {
+        // Save indices for backward
+        NslTensor::from_ptr(indices_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Gather {
+            a: tensor_ptr,
+            out: result_ptr,
+            dim,
+            indices_ptr,
+            input_shape,
+        });
+    }
+    result_ptr
 }
 
 // === Element-wise math ops ===

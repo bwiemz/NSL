@@ -32,8 +32,10 @@ pub enum TapeOp {
     MulScalar { a: i64, scalar: f64, out: i64 },
     AddScalar { a: i64, out: i64 },
     Transpose { a: i64, out: i64, dim0: i64, dim1: i64 },
-    SumReduce { a: i64, out: i64 },
-    MeanReduce { a: i64, out: i64, num_elements: i64 },
+    SumReduce { a: i64, out: i64, dim: i64, keepdim: bool, input_shape: Vec<i64> },
+    MeanReduce { a: i64, out: i64, dim: i64, keepdim: bool, num_elements: i64, input_shape: Vec<i64> },
+    ReduceMax { a: i64, out: i64, dim: i64, keepdim: bool, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
+    Gather { a: i64, out: i64, dim: i64, indices_ptr: i64, input_shape: Vec<i64> },
     Exp { a: i64, out: i64, saved_out: i64 },
     Log { a: i64, out: i64, saved_a: i64 },
     Sqrt { a: i64, out: i64, saved_out: i64 },
@@ -69,6 +71,13 @@ pub fn is_recording() -> bool {
         let tape = t.borrow();
         tape.recording && tape.pause_depth == 0
     })
+}
+
+/// Remove the last recorded op from the tape (used when a compound op replaces a sub-op).
+pub fn pop_last_op() {
+    TAPE.with(|t| {
+        t.borrow_mut().ops.pop();
+    });
 }
 
 /// Records an operation on the tape if recording is active.
@@ -128,6 +137,9 @@ pub extern "C" fn nsl_tape_stop() {
                 | TapeOp::Clamp { saved_a, .. } => {
                     tensor_free(*saved_a);
                 }
+                TapeOp::Gather { indices_ptr, .. } => {
+                    tensor_free(*indices_ptr);
+                }
                 _ => {}
             }
         }
@@ -177,6 +189,196 @@ fn accumulate_grad(grads: &mut HashMap<i64, i64>, key: i64, grad_tensor: i64) {
     } else {
         grads.insert(key, grad_tensor);
     }
+}
+
+/// Create a tensor with the given shape, filled with zeros.
+fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
+    use crate::memory::checked_alloc_zeroed;
+    use crate::tensor::NslTensor;
+
+    let ndim = shape.len() as i64;
+    let mut total: i64 = 1;
+    for &s in shape {
+        total *= s;
+    }
+
+    let shape_ptr = crate::memory::checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in shape.iter().enumerate() {
+        unsafe { *shape_ptr.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape_ptr, ndim);
+
+    let data_size = (total as usize) * std::mem::size_of::<f64>();
+    let data = if fill == 0.0 {
+        checked_alloc_zeroed(data_size) as *mut f64
+    } else {
+        let data = crate::memory::checked_alloc(data_size) as *mut f64;
+        for i in 0..total as usize {
+            unsafe { *data.add(i) = fill };
+        }
+        data
+    };
+
+    let tensor = Box::new(NslTensor {
+        data,
+        shape: shape_ptr,
+        strides,
+        ndim,
+        len: total,
+        refcount: 1,
+    });
+    Box::into_raw(tensor) as i64
+}
+
+/// Broadcast a gradient tensor along a reduced dimension back to input_shape.
+/// grad has the reduced shape; we need to expand it along `dim` to match input_shape.
+fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let ndim = input_shape.len();
+
+    // Create output with input_shape
+    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let out = NslTensor::from_ptr(out_ptr);
+
+    let out_strides: Vec<usize> = (0..ndim)
+        .map(|i| unsafe { *out.strides.add(i) } as usize)
+        .collect();
+
+    // Build grad strides for indexing: grad has shape with dim removed (or dim=1 if keepdim)
+    // We compute the grad linear index by skipping the reduced dim
+    let grad_strides: Vec<usize> = (0..grad.ndim as usize)
+        .map(|i| unsafe { *grad.strides.add(i) } as usize)
+        .collect();
+
+    let total = out.len as usize;
+    for flat_idx in 0..total {
+        // Convert flat_idx to multi-dim indices using output strides
+        let mut remaining = flat_idx;
+        let mut indices = vec![0usize; ndim];
+        for d in 0..ndim {
+            indices[d] = remaining / out_strides[d];
+            remaining %= out_strides[d];
+        }
+
+        // Compute grad index by removing the reduced dim
+        let mut grad_idx = 0usize;
+        let mut gi = 0usize;
+        for d in 0..ndim {
+            if d == dim {
+                continue;
+            }
+            grad_idx += indices[d] * grad_strides[gi];
+            gi += 1;
+        }
+
+        unsafe {
+            *out.data.add(flat_idx) = *grad.data.add(grad_idx);
+        }
+    }
+
+    out_ptr
+}
+
+/// Scatter gradient to argmax positions for ReduceMax backward.
+fn scatter_grad_to_argmax(
+    grad_ptr: i64,
+    input_shape: &[i64],
+    dim: usize,
+    argmax: &[usize],
+) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let ndim = input_shape.len();
+    // Create zero output with input_shape
+    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let out = NslTensor::from_ptr(out_ptr);
+
+    let out_strides: Vec<usize> = (0..ndim)
+        .map(|i| unsafe { *out.strides.add(i) } as usize)
+        .collect();
+
+    let grad_strides: Vec<usize> = (0..grad.ndim as usize)
+        .map(|i| unsafe { *grad.strides.add(i) } as usize)
+        .collect();
+
+    // Iterate over reduced shape positions (grad positions)
+    let grad_total = grad.len as usize;
+    for grad_flat in 0..grad_total {
+        // Convert to multi-index in grad space
+        let mut remaining = grad_flat;
+        let mut grad_indices = vec![0usize; grad.ndim as usize];
+        for d in 0..grad.ndim as usize {
+            grad_indices[d] = remaining / grad_strides[d];
+            remaining %= grad_strides[d];
+        }
+
+        let max_idx = argmax[grad_flat];
+
+        // Build the full output index: insert the argmax at dim
+        let mut out_offset = 0usize;
+        let mut gi = 0usize;
+        for d in 0..ndim {
+            if d == dim {
+                out_offset += max_idx * out_strides[d];
+            } else {
+                out_offset += grad_indices[gi] * out_strides[d];
+                gi += 1;
+            }
+        }
+
+        let g_val = unsafe { *grad.data.add(grad_flat) };
+        unsafe { *out.data.add(out_offset) += g_val };
+    }
+
+    out_ptr
+}
+
+/// Scatter gather gradient back to input shape.
+fn scatter_gather_grad(
+    grad_ptr: i64,
+    input_shape: &[i64],
+    dim: usize,
+    indices_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let indices = NslTensor::from_ptr(indices_ptr);
+
+    // Create zero gradient with input_shape
+    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let out = NslTensor::from_ptr(out_ptr);
+
+    let out_strides: Vec<usize> = (0..input_shape.len())
+        .map(|i| unsafe { *out.strides.add(i) } as usize)
+        .collect();
+
+    // For cross_entropy: input=[batch, classes], dim=1, indices=[batch]
+    // grad=[batch], output[b, indices[b]] += grad[b]
+    let batch = indices.len as usize;
+    for b in 0..batch {
+        let idx = unsafe { *indices.data.add(b) } as usize;
+        let g_val = unsafe { *grad.data.add(b) };
+        // out_offset = b * stride[0] + idx * stride[1]
+        let mut out_offset = 0usize;
+        // Build index: for dimensions before dim, use b; at dim, use idx
+        // For general case with dim=1 and 2D input:
+        // indices is 1D [batch], grad is 1D [batch]
+        if input_shape.len() == 2 && dim == 1 {
+            out_offset = b * out_strides[0] + idx * out_strides[1];
+        } else {
+            // General case: not needed for cross_entropy but let's handle 2D dim=0 too
+            if dim == 0 {
+                out_offset = idx * out_strides[0] + b * out_strides[1];
+            }
+        }
+        unsafe { *out.data.add(out_offset) += g_val };
+    }
+
+    out_ptr
 }
 
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
@@ -299,22 +501,50 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::SumReduce { a, out } => {
+            TapeOp::SumReduce { a, out, dim, input_shape, .. } => {
                 if let Some(&g) = grad_map.get(out) {
-                    // g is a 0-d scalar tensor; broadcast to shape of a
-                    let scalar_val = tensor_item(g);
-                    let ones = ones_like(*a);
-                    let grad_a = tensor_mul_scalar(ones, scalar_val);
-                    tensor_free(ones);
+                    if *dim == -1 {
+                        // Global reduction: g is scalar, broadcast to input shape
+                        let scalar_val = tensor_item(g);
+                        let ones = ones_like(*a);
+                        let grad_a = tensor_mul_scalar(ones, scalar_val);
+                        tensor_free(ones);
+                        accumulate_grad(&mut grad_map, *a, grad_a);
+                    } else {
+                        // Dimensional reduction: broadcast g along reduced dim
+                        let grad_a = broadcast_grad_along_dim(g, input_shape, *dim as usize);
+                        accumulate_grad(&mut grad_map, *a, grad_a);
+                    }
+                }
+            }
+            TapeOp::MeanReduce { a, out, dim, num_elements, input_shape, .. } => {
+                if let Some(&g) = grad_map.get(out) {
+                    if *dim == -1 {
+                        // Global reduction
+                        let scalar_val = tensor_item(g);
+                        let ones = ones_like(*a);
+                        let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64));
+                        tensor_free(ones);
+                        accumulate_grad(&mut grad_map, *a, grad_a);
+                    } else {
+                        // Dimensional reduction: broadcast then scale
+                        let expanded = broadcast_grad_along_dim(g, input_shape, *dim as usize);
+                        let grad_a = tensor_mul_scalar(expanded, 1.0 / (*num_elements as f64));
+                        tensor_free(expanded);
+                        accumulate_grad(&mut grad_map, *a, grad_a);
+                    }
+                }
+            }
+            TapeOp::ReduceMax { a, out, dim, saved_argmax, input_shape, .. } => {
+                if let Some(&g) = grad_map.get(out) {
+                    // Scatter grad to argmax positions, zero elsewhere
+                    let grad_a = scatter_grad_to_argmax(g, input_shape, *dim as usize, saved_argmax);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::MeanReduce { a, out, num_elements } => {
+            TapeOp::Gather { a, out, dim, indices_ptr, input_shape } => {
                 if let Some(&g) = grad_map.get(out) {
-                    let scalar_val = tensor_item(g);
-                    let ones = ones_like(*a);
-                    let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64));
-                    tensor_free(ones);
+                    let grad_a = scatter_gather_grad(g, input_shape, *dim as usize, *indices_ptr);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
