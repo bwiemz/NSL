@@ -18,3 +18,4 @@ pub mod file_io;
 pub mod args;
 pub mod tensor;
 pub mod autodiff;
+pub mod checkpoint;
