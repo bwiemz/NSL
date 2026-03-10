@@ -182,6 +182,17 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // Tensor reduction / element-wise builtins (take tensor(s), return tensor)
+    for name in &["mean", "sum", "neg", "clamp", "reduce_max", "gather"] {
+        def(
+            name,
+            Type::Function {
+                params: vec![Type::Unknown],
+                ret: Box::new(Type::Unknown),
+            },
+        );
+    }
+
     // Math functions (always return Float — coerce int args at codegen level)
     for name in &["sqrt", "log", "exp", "sin", "cos"] {
         def(

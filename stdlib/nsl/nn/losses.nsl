@@ -1,0 +1,18 @@
+fn mse_loss(pred: Tensor, target: Tensor) -> Tensor:
+    let diff = pred - target
+    return mean(diff * diff)
+
+fn l1_loss(pred: Tensor, target: Tensor) -> Tensor:
+    return mean(abs(pred - target))
+
+fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
+    let max_val = reduce_max(logits, 1, 1)
+    let shifted = logits - max_val
+    let exp_sum = sum(exp(shifted), 1, 1)
+    let log_probs = shifted - log(exp_sum)
+    let nll = neg(gather(log_probs, 1, targets))
+    return mean(nll)
+
+fn bce_loss(pred: Tensor, target: Tensor) -> Tensor:
+    let clamped = clamp(pred, 0.0000001, 0.9999999)
+    return neg(mean(target * log(clamped) + (1.0 - target) * log(1.0 - clamped)))

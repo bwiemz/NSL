@@ -29,6 +29,14 @@ pub(crate) fn stdlib_roots() -> Vec<PathBuf> {
         }
     }
 
+    // 3. cwd-relative stdlib/ (for development: `cargo run` from workspace root)
+    if let Ok(cwd) = std::env::current_dir() {
+        let stdlib = cwd.join("stdlib");
+        if stdlib.is_dir() && !roots.iter().any(|r| r == &stdlib) {
+            roots.push(stdlib);
+        }
+    }
+
     roots
 }
 

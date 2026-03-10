@@ -1,0 +1,6 @@
+from nsl.nn.losses import mse_loss
+
+let pred = ones([4])
+let target = zeros([4])
+let loss = mse_loss(pred, target)
+print(loss)

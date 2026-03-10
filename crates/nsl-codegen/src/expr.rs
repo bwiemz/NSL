@@ -610,7 +610,10 @@ impl Compiler<'_> {
         }
 
         // Element-wise tensor builtins (M14)
-        if matches!(func_name.as_str(), "exp" | "log" | "sqrt" | "abs" | "sign" | "neg") {
+        // Skip if there's a user-defined function with the same name (e.g., nsl.math.sign)
+        if matches!(func_name.as_str(), "exp" | "log" | "sqrt" | "abs" | "sign" | "neg")
+            && !self.functions.contains_key(&func_name)
+        {
             if args.len() != 1 {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
             }
@@ -618,7 +621,7 @@ impl Compiler<'_> {
             let rt_name = format!("nsl_tensor_{func_name}");
             return self.compile_call_by_name(builder, &rt_name, &[val]);
         }
-        if func_name == "clamp" {
+        if func_name == "clamp" && !self.functions.contains_key(&func_name) {
             if args.len() != 3 {
                 return Err(CodegenError::new("clamp() takes exactly 3 arguments (tensor, min, max)"));
             }
@@ -1921,8 +1924,9 @@ impl Compiler<'_> {
             };
             self.compile_call_by_name(builder, rt_name, &[lhs, rhs])
         } else if left_is_tensor {
-            // Tensor-scalar: convert scalar to f64
-            let scalar = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
+            // Tensor-scalar: ensure scalar is f64
+            let rhs_ty = builder.func.dfg.value_type(rhs);
+            let scalar = if rhs_ty == cl_types::F64 { rhs } else { builder.ins().fcvt_from_sint(cl_types::F64, rhs) };
             let rt_name = match op {
                 BinOp::Add => "nsl_tensor_add_scalar",
                 BinOp::Mul => "nsl_tensor_mul_scalar",
@@ -1931,18 +1935,29 @@ impl Compiler<'_> {
                     let neg = builder.ins().fneg(scalar);
                     return self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, neg]);
                 }
+                BinOp::Div => {
+                    // tensor / scalar = tensor * (1/scalar)
+                    let one = builder.ins().f64const(1.0);
+                    let inv = builder.ins().fdiv(one, scalar);
+                    return self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, inv]);
+                }
                 _ => return Err(CodegenError::new(format!("unsupported tensor-scalar op: {op:?}"))),
             };
             self.compile_call_by_name(builder, rt_name, &[lhs, scalar])
         } else {
-            // Scalar-tensor
-            let scalar = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
-            let rt_name = match op {
-                BinOp::Add => "nsl_tensor_add_scalar",
-                BinOp::Mul => "nsl_tensor_mul_scalar",
+            // Scalar-tensor: ensure scalar is f64
+            let lhs_ty = builder.func.dfg.value_type(lhs);
+            let scalar = if lhs_ty == cl_types::F64 { lhs } else { builder.ins().fcvt_from_sint(cl_types::F64, lhs) };
+            match op {
+                BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[rhs, scalar]),
+                BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[rhs, scalar]),
+                BinOp::Sub => {
+                    // scalar - tensor = neg(tensor) + scalar
+                    let neg_tensor = self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
+                    self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[neg_tensor, scalar])
+                }
                 _ => return Err(CodegenError::new(format!("unsupported scalar-tensor op: {op:?}"))),
-            };
-            self.compile_call_by_name(builder, rt_name, &[rhs, scalar])
+            }
         }
     }
 

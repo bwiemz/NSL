@@ -1031,6 +1031,25 @@ impl<'a> TypeChecker<'a> {
                     device: Device::Cpu,
                 };
             }
+
+            // Math builtins (exp, log, sqrt, sin, cos, abs) — when called with tensor or
+            // unknown args, return the arg type (tensor) instead of Float.
+            if matches!(name.as_str(), "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg") {
+                if let Some(first_arg_ty) = arg_types.first() {
+                    if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
+                        return first_arg_ty.clone();
+                    }
+                }
+            }
+
+            // Tensor reduction / manipulation builtins — always return tensor-like
+            if matches!(name.as_str(), "mean" | "sum" | "reduce_max" | "gather" | "clamp" | "neg") {
+                if let Some(first_arg_ty) = arg_types.first() {
+                    if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
+                        return first_arg_ty.clone();
+                    }
+                }
+            }
         }
 
         // Tensor method shape inference (reshape, transpose)
