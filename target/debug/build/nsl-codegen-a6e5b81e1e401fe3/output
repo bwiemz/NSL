@@ -1,2 +1,0 @@
-cargo:rustc-env=NSL_RUNTIME_LIB_PATH=C:\Users\bwiem\projects\NSL\target\debug\nsl_runtime.lib
-cargo:rerun-if-changed=C:\Users\bwiem\projects\NSL\target\debug\nsl_runtime.lib
