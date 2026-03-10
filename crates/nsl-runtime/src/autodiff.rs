@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::list::NslList;
+use crate::memory::checked_alloc;
 use crate::tensor::{
     nsl_tensor_add as tensor_add,
     nsl_tensor_clone as tensor_clone,
@@ -23,10 +24,10 @@ use crate::tensor::{
 #[allow(dead_code)]
 #[derive(Clone)]
 pub enum TapeOp {
-    Add { a: i64, b: i64, out: i64 },
-    Sub { a: i64, b: i64, out: i64 },
-    Mul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64 },
-    Div { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64 },
+    Add { a: i64, b: i64, out: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
+    Sub { a: i64, b: i64, out: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
+    Mul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
+    Div { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
     MatMul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64 },
     Neg { a: i64, out: i64 },
     MulScalar { a: i64, scalar: f64, out: i64 },
@@ -277,6 +278,81 @@ fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
         refcount: 1,
     });
     Box::into_raw(tensor) as i64
+}
+
+/// Reduce a gradient to match the original input shape after broadcasting.
+/// If grad has shape [10, 256] but original input was [10, 1], sum along dim 1 with keepdim.
+/// If grad has ndim 2 but original was ndim 1, reduce and squeeze appropriately.
+fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let grad_ndim = grad.ndim as usize;
+    let orig_ndim = orig_shape.len();
+
+    // Build the right-aligned original shape padded with 1s
+    let mut orig_padded = vec![1i64; grad_ndim];
+    for i in 0..orig_ndim {
+        orig_padded[grad_ndim - orig_ndim + i] = orig_shape[i];
+    }
+
+    // Check which dims were broadcast (orig was 1 but grad is > 1)
+    let grad_shape: Vec<i64> = (0..grad_ndim)
+        .map(|i| unsafe { *grad.shape.add(i) })
+        .collect();
+
+    // If shapes already match, return clone
+    if grad_shape == orig_shape {
+        return tensor_clone(grad_ptr);
+    }
+
+    let mut result = tensor_clone(grad_ptr);
+
+    // Sum along dimensions that were broadcast (where orig was 1 but grad > 1)
+    // We also need to handle leading dims that don't exist in orig (padded with 1)
+    for d in 0..grad_ndim {
+        if orig_padded[d] == 1 && grad_shape[d] > 1 {
+            let old = result;
+            // Sum along dim d, keepdim=true to maintain ndim
+            result = crate::tensor::nsl_tensor_sum_dim(result, d as i64, 1);
+            if old != grad_ptr {
+                tensor_free(old);
+            }
+        }
+    }
+
+    // If orig had fewer dims, squeeze the leading dims
+    if orig_ndim < grad_ndim {
+        let res = NslTensor::from_ptr(result);
+        // Reshape to orig_shape
+        let new_shape = checked_alloc(orig_ndim * std::mem::size_of::<i64>()) as *mut i64;
+        for i in 0..orig_ndim {
+            unsafe { *new_shape.add(i) = orig_shape[i] };
+        }
+        let new_strides = NslTensor::compute_strides(new_shape, orig_ndim as i64);
+        let mut total: i64 = 1;
+        for &s in orig_shape {
+            total *= s;
+        }
+        // Copy data
+        let new_data = checked_alloc((total as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        unsafe { std::ptr::copy_nonoverlapping(res.data, new_data, total as usize) };
+        let out = Box::new(NslTensor {
+            data: new_data,
+            shape: new_shape,
+            strides: new_strides,
+            ndim: orig_ndim as i64,
+            len: total,
+            refcount: 1,
+        });
+        let out_ptr = Box::into_raw(out) as i64;
+        if result != grad_ptr {
+            tensor_free(result);
+        }
+        return out_ptr;
+    }
+
+    result
 }
 
 /// Broadcast a gradient tensor along a reduced dimension back to input_shape.
@@ -954,40 +1030,49 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     // Walk tape in reverse, applying chain rule
     for op in ops.iter().rev() {
         match op {
-            TapeOp::Add { a, b, out } => {
+            TapeOp::Add { a, b, out, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
-                    accumulate_grad(&mut grad_map, *a, tensor_clone(g));
-                    accumulate_grad(&mut grad_map, *b, tensor_clone(g));
+                    let ga = reduce_grad_for_broadcast(g, a_shape);
+                    let gb = reduce_grad_for_broadcast(g, b_shape);
+                    accumulate_grad(&mut grad_map, *a, ga);
+                    accumulate_grad(&mut grad_map, *b, gb);
                 }
             }
-            TapeOp::Sub { a, b, out } => {
+            TapeOp::Sub { a, b, out, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
-                    accumulate_grad(&mut grad_map, *a, tensor_clone(g));
-                    let g_clone = tensor_clone(g);
-                    let neg_g = tensor_neg(g_clone);
-                    tensor_free(g_clone);
-                    accumulate_grad(&mut grad_map, *b, neg_g);
+                    let ga = reduce_grad_for_broadcast(g, a_shape);
+                    let gb_full = tensor_neg(tensor_clone(g));
+                    let gb = reduce_grad_for_broadcast(gb_full, b_shape);
+                    if gb != gb_full { tensor_free(gb_full); }
+                    accumulate_grad(&mut grad_map, *a, ga);
+                    accumulate_grad(&mut grad_map, *b, gb);
                 }
             }
-            TapeOp::Mul { a, b, out, saved_a, saved_b } => {
+            TapeOp::Mul { a, b, out, saved_a, saved_b, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
                     // d/da(a*b) = g * b, d/db(a*b) = g * a
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
-                    let grad_a = tensor_mul(g_clone1, *saved_b);
-                    let grad_b = tensor_mul(g_clone2, *saved_a);
+                    let grad_a_full = tensor_mul(g_clone1, *saved_b);
+                    let grad_b_full = tensor_mul(g_clone2, *saved_a);
                     tensor_free(g_clone1);
                     tensor_free(g_clone2);
+                    let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
+                    let grad_b = reduce_grad_for_broadcast(grad_b_full, b_shape);
+                    if grad_a != grad_a_full { tensor_free(grad_a_full); }
+                    if grad_b != grad_b_full { tensor_free(grad_b_full); }
                     accumulate_grad(&mut grad_map, *a, grad_a);
                     accumulate_grad(&mut grad_map, *b, grad_b);
                 }
             }
-            TapeOp::Div { a, b, out, saved_a, saved_b } => {
+            TapeOp::Div { a, b, out, saved_a, saved_b, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
                     // d/da(a/b) = g / b
                     let g_clone1 = tensor_clone(g);
-                    let grad_a = tensor_div(g_clone1, *saved_b);
+                    let grad_a_full = tensor_div(g_clone1, *saved_b);
                     tensor_free(g_clone1);
+                    let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
+                    if grad_a != grad_a_full { tensor_free(grad_a_full); }
                     accumulate_grad(&mut grad_map, *a, grad_a);
 
                     // d/db(a/b) = -g * a / b^2
@@ -996,10 +1081,12 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     tensor_free(g_clone2);
                     let neg_ga = tensor_mul(neg_g, *saved_a);
                     let b_sq = tensor_mul(*saved_b, *saved_b);
-                    let grad_b = tensor_div(neg_ga, b_sq);
+                    let grad_b_full = tensor_div(neg_ga, b_sq);
                     tensor_free(neg_g);
                     tensor_free(neg_ga);
                     tensor_free(b_sq);
+                    let grad_b = reduce_grad_for_broadcast(grad_b_full, b_shape);
+                    if grad_b != grad_b_full { tensor_free(grad_b_full); }
                     accumulate_grad(&mut grad_map, *b, grad_b);
                 }
             }

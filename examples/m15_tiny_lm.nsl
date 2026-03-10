@@ -1,0 +1,54 @@
+# Tiny Language Model — End-to-End Integration Test
+# Tokenize text → build model → train → observe loss decrease
+#
+# This demonstrates the full NSL ML pipeline:
+#   1. Byte-level tokenization
+#   2. Model definition with model keyword
+#   3. Embedding lookup, layer norm, GELU, linear projection
+#   4. Cross-entropy loss for next-token prediction
+#   5. Training with Adam optimizer
+
+from nsl.nn.losses import cross_entropy
+
+# --- Tokenize ---
+let tok = byte_tokenizer_new()
+let text = "hello world"
+let encoded = tokenizer_encode(tok, text)
+print("Encoded tokens:")
+print(encoded)
+
+# Next-token prediction: input = tokens[0..-1], targets = tokens[1..end]
+let input_ids = tensor_slice(encoded, 0, 0, 10)
+let target_ids = tensor_slice(encoded, 0, 1, 11)
+
+# --- Model ---
+# TinyLM: embed → layernorm → gelu → linear projection to vocab
+# vocab_size=256 (byte-level), hidden_dim=64
+model TinyLM:
+    embed_w: Tensor = randn([256, 64])
+    ln_w: Tensor = ones([64])
+    ln_b: Tensor = zeros([64])
+    proj_w: Tensor = randn([256, 64])
+    proj_b: Tensor = zeros([256])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = embedding_lookup(self.embed_w, x)
+        h = layernorm(h, self.ln_w, self.ln_b, 0.00001)
+        h = gelu(h)
+        return bias_add(h @ self.proj_w.transpose(0, 1), self.proj_b)
+
+let m = TinyLM()
+
+# --- Train ---
+print("Training TinyLM (next-token prediction):")
+train(model=m, epochs=20):
+    optimizer: Adam(lr=0.01)
+    step(batch):
+        let logits = m.forward(input_ids)
+        let loss = cross_entropy(logits, target_ids)
+    callbacks:
+        on_epoch(epoch, loss):
+            print(loss)
+
+# --- Verify ---
+print("Done! Loss should have decreased significantly.")

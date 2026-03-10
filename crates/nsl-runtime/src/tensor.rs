@@ -437,37 +437,105 @@ fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
-    if a.ndim != b.ndim {
-        eprintln!(
-            "nsl: tensor shape mismatch in elementwise op (ndim {} vs {})",
-            a.ndim, b.ndim
-        );
-        std::process::abort();
+    let a_ndim = a.ndim as usize;
+    let b_ndim = b.ndim as usize;
+    let out_ndim = a_ndim.max(b_ndim);
+
+    // Build shapes right-aligned (NumPy broadcasting rules)
+    let mut a_shape = vec![1i64; out_ndim];
+    let mut b_shape = vec![1i64; out_ndim];
+    for i in 0..a_ndim {
+        a_shape[out_ndim - a_ndim + i] = unsafe { *a.shape.add(i) };
     }
-    for i in 0..a.ndim as usize {
-        if unsafe { *a.shape.add(i) != *b.shape.add(i) } {
-            eprintln!("nsl: tensor shape mismatch in elementwise op");
+    for i in 0..b_ndim {
+        b_shape[out_ndim - b_ndim + i] = unsafe { *b.shape.add(i) };
+    }
+
+    // Compute output shape
+    let mut out_shape_vec = vec![0i64; out_ndim];
+    for i in 0..out_ndim {
+        let da = a_shape[i];
+        let db = b_shape[i];
+        if da == db {
+            out_shape_vec[i] = da;
+        } else if da == 1 {
+            out_shape_vec[i] = db;
+        } else if db == 1 {
+            out_shape_vec[i] = da;
+        } else {
+            eprintln!(
+                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})",
+                i, da, db
+            );
             std::process::abort();
         }
     }
 
-    let len = a.len;
-    let ndim = a.ndim;
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
-    let strides = NslTensor::compute_strides(shape, ndim);
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+    let mut out_len: i64 = 1;
+    for &s in &out_shape_vec {
+        out_len *= s;
+    }
 
-    for i in 0..len as usize {
-        unsafe { *data.add(i) = op(*a.data.add(i), *b.data.add(i)) };
+    let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..out_ndim {
+        unsafe { *shape.add(i) = out_shape_vec[i] };
+    }
+    let strides = NslTensor::compute_strides(shape, out_ndim as i64);
+    let data = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Compute strides for a and b (0 for broadcast dims)
+    let mut a_strides = vec![0i64; out_ndim];
+    let mut b_strides = vec![0i64; out_ndim];
+    {
+        let mut s = 1i64;
+        for i in (0..out_ndim).rev() {
+            if a_shape[i] > 1 {
+                a_strides[i] = s;
+            }
+            s *= a_shape[i];
+        }
+        s = 1;
+        for i in (0..out_ndim).rev() {
+            if b_shape[i] > 1 {
+                b_strides[i] = s;
+            }
+            s *= b_shape[i];
+        }
+    }
+
+    // Iterate over output elements using multi-index
+    for flat in 0..out_len as usize {
+        let mut rem = flat;
+        let mut a_idx: usize = 0;
+        let mut b_idx: usize = 0;
+        for d in 0..out_ndim {
+            let _dim_size = out_shape_vec[d] as usize;
+            let coord = rem / {
+                let mut p = 1usize;
+                for dd in (d + 1)..out_ndim {
+                    p *= out_shape_vec[dd] as usize;
+                }
+                p
+            };
+            rem %= {
+                let mut p = 1usize;
+                for dd in (d + 1)..out_ndim {
+                    p *= out_shape_vec[dd] as usize;
+                }
+                p
+            };
+            a_idx += coord * a_strides[d] as usize;
+            b_idx += coord * b_strides[d] as usize;
+        }
+        unsafe { *data.add(flat) = op(*a.data.add(a_idx), *b.data.add(b_idx)) };
     }
 
     let result = Box::new(NslTensor {
         data,
         shape,
         strides,
-        ndim,
-        len,
+        ndim: out_ndim as i64,
+        len: out_len,
         refcount: 1,
     });
     Box::into_raw(result) as i64
@@ -475,24 +543,30 @@ fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x + y);
     if autodiff::is_recording() {
-        autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result });
+        autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
     }
     result
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x - y);
     if autodiff::is_recording() {
-        autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result });
+        autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
     }
     result
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x * y);
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount += 1;
@@ -503,6 +577,8 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
             out: result,
             saved_a: a,
             saved_b: b,
+            a_shape,
+            b_shape,
         });
     }
     result
@@ -510,6 +586,8 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x / y);
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount += 1;
@@ -520,6 +598,8 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
             out: result,
             saved_a: a,
             saved_b: b,
+            a_shape,
+            b_shape,
         });
     }
     result
