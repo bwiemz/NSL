@@ -1,0 +1,7 @@
+let tok = byte_tokenizer_new()
+let ids = tokenizer_encode(tok, "hello")
+print(ids)
+let text = tokenizer_decode(tok, ids)
+print(text)
+let vocab = tokenizer_vocab_size(tok)
+print(vocab)

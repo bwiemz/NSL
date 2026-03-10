@@ -333,6 +333,64 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // Tokenizer functions (M15)
+    def(
+        "byte_tokenizer_new",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "bpe_train",
+        Type::Function {
+            params: vec![Type::Str, Type::Int, Type::Int, Type::List(Box::new(Type::Str))],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "tokenizer_load",
+        Type::Function {
+            params: vec![Type::Str],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "tokenizer_save",
+        Type::Function {
+            params: vec![Type::Int, Type::Str],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "tokenizer_encode",
+        Type::Function {
+            params: vec![Type::Int, Type::Str],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    def(
+        "tokenizer_decode",
+        Type::Function {
+            params: vec![Type::Int, tensor_ret.clone()],
+            ret: Box::new(Type::Str),
+        },
+    );
+    def(
+        "tokenizer_vocab_size",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "tokenizer_encode_batch",
+        Type::Function {
+            params: vec![Type::Int, Type::List(Box::new(Type::Str)), Type::Int, Type::Int, Type::Int],
+            ret: Box::new(Type::List(Box::new(tensor_ret.clone()))),
+        },
+    );
+
     // Math functions (always return Float — coerce int args at codegen level)
     for name in &["sqrt", "log", "exp", "sin", "cos", "floor"] {
         def(

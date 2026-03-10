@@ -891,6 +891,72 @@ impl Compiler<'_> {
             }
         }
 
+        // Tokenizer functions (M15)
+        if func_name == "byte_tokenizer_new" {
+            return self.compile_call_by_name(builder, "nsl_byte_tokenizer_new", &[]);
+        }
+        if func_name == "bpe_train" {
+            if args.len() != 4 {
+                return Err(CodegenError::new("bpe_train() takes exactly 4 arguments (corpus_path, vocab_size, min_freq, special_tokens)"));
+            }
+            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let vocab_size = self.compile_expr(builder, state, &args[1].value)?;
+            let min_freq = self.compile_expr(builder, state, &args[2].value)?;
+            let special_tokens = self.compile_expr(builder, state, &args[3].value)?;
+            return self.compile_call_by_name(builder, "nsl_bpe_train", &[path_val, vocab_size, min_freq, special_tokens]);
+        }
+        if func_name == "tokenizer_load" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("tokenizer_load() takes exactly 1 argument (path)"));
+            }
+            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_tokenizer_load", &[path_val]);
+        }
+        if func_name == "tokenizer_save" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("tokenizer_save() takes exactly 2 arguments (handle, path)"));
+            }
+            let handle = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tokenizer_save", &[handle, path_val]);
+        }
+        if func_name == "tokenizer_encode" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("tokenizer_encode() takes exactly 2 arguments (handle, text)"));
+            }
+            let handle = self.compile_expr(builder, state, &args[0].value)?;
+            let text_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tokenizer_encode", &[handle, text_val]);
+        }
+        if func_name == "tokenizer_decode" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("tokenizer_decode() takes exactly 2 arguments (handle, tensor)"));
+            }
+            let handle = self.compile_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tokenizer_decode", &[handle, tensor_val]);
+        }
+        if func_name == "tokenizer_vocab_size" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("tokenizer_vocab_size() takes exactly 1 argument (handle)"));
+            }
+            let handle = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_tokenizer_vocab_size", &[handle]);
+        }
+        if func_name == "tokenizer_encode_batch" {
+            if args.len() != 5 {
+                return Err(CodegenError::new("tokenizer_encode_batch() takes exactly 5 arguments (handle, texts, padding, truncation, max_len)"));
+            }
+            let handle = self.compile_expr(builder, state, &args[0].value)?;
+            let texts = self.compile_expr(builder, state, &args[1].value)?;
+            let padding = self.compile_expr(builder, state, &args[2].value)?;
+            let padding_i8 = builder.ins().ireduce(cl_types::I8, padding);
+            let truncation = self.compile_expr(builder, state, &args[3].value)?;
+            let truncation_i8 = builder.ins().ireduce(cl_types::I8, truncation);
+            let max_len = self.compile_expr(builder, state, &args[4].value)?;
+            return self.compile_call_by_name(builder, "nsl_tokenizer_encode_batch", &[handle, texts, padding_i8, truncation_i8, max_len]);
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();

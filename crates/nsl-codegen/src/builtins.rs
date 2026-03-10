@@ -187,6 +187,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_assert_eq_int", &[types::I64, types::I64, types::I64, types::I64], None),
     ("nsl_assert_eq_float", &[types::F64, types::F64, types::I64, types::I64], None),
     ("nsl_assert_close", &[types::I64, types::I64, types::F64, types::F64, types::I64, types::I64], None),
+    // Tokenizer functions (M15)
+    ("nsl_byte_tokenizer_new", &[], Some(types::I64)),
+    ("nsl_bpe_train", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tokenizer_load", &[types::I64], Some(types::I64)),
+    ("nsl_tokenizer_save", &[types::I64, types::I64], None),
+    ("nsl_tokenizer_encode", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tokenizer_decode", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tokenizer_vocab_size", &[types::I64], Some(types::I64)),
+    ("nsl_tokenizer_encode_batch", &[types::I64, types::I64, types::I8, types::I8, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
