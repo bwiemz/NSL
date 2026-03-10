@@ -7,7 +7,7 @@ use cranelift_module::Module;
 use nsl_ast::operator::AssignOp;
 use nsl_ast::pattern::PatternKind;
 use nsl_ast::expr::{ExprKind, SubscriptKind};
-use nsl_ast::block::TrainSection;
+use nsl_ast::block::{QuantDtype, QuantGranularity, TrainSection};
 use nsl_ast::stmt::{Stmt, StmtKind};
 
 use crate::compiler::Compiler;
@@ -188,8 +188,11 @@ impl Compiler<'_> {
             | StmtKind::EnumDef(_) | StmtKind::TraitDef(_)
             | StmtKind::Import(_) | StmtKind::FromImport(_)
             | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_)
-            | StmtKind::QuantBlock(_)
             | StmtKind::KernelDef(_) => {}
+
+            StmtKind::QuantBlock(ref quant) => {
+                self.compile_quant_block(builder, state, quant)?;
+            }
 
             StmtKind::WhileLet { pattern, expr, body } => {
                 self.compile_while_let(builder, state, pattern, expr, body)?;
@@ -1480,4 +1483,156 @@ impl Compiler<'_> {
 
         Ok(())
     }
+
+    // ── Quant block codegen ──────────────────────────────────────────
+
+    pub fn compile_quant_block(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        quant: &nsl_ast::block::QuantBlock,
+    ) -> Result<(), CodegenError> {
+        // 1. Get source model variable
+        let source_sym = quant.source;
+        let source_val = {
+            let (var, _) = state.variables.get(&source_sym).ok_or_else(|| {
+                CodegenError::new(format!(
+                    "undefined model variable '{}' in quant block",
+                    self.resolve_sym(source_sym)
+                ))
+            })?;
+            builder.use_var(*var)
+        };
+
+        // 2. Resolve model type name using the same strategy as train blocks:
+        //    scan the type_map for a Model type with a known struct layout.
+        let model_type_name = {
+            let mut found_name = None;
+            for (_node_id, ty) in self.type_map.iter() {
+                match ty {
+                    nsl_semantic::types::Type::Model { name, .. } => {
+                        let n = self.resolve_sym(*name).to_string();
+                        if self.struct_layouts.contains_key(&n) {
+                            found_name = Some(n);
+                            break;
+                        }
+                    }
+                    nsl_semantic::types::Type::Struct { name, .. } => {
+                        let n = self.resolve_sym(*name).to_string();
+                        if self.struct_layouts.contains_key(&n) {
+                            found_name = Some(n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found_name.unwrap_or_else(|| self.resolve_sym(source_sym).to_string())
+        };
+
+        let layout = self.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!(
+                "no struct layout found for model '{}' in quant block",
+                model_type_name
+            ))
+        })?;
+
+        // 3. Compute dtype/granularity integer codes for the runtime call
+        let dtype_code: i64 = match quant.default_dtype {
+            Some(QuantDtype::Int4) => 1,
+            Some(QuantDtype::Int8) | None => 0,
+        };
+        let (gran_code, axis_val, gs_val): (i64, i64, i64) = match &quant.default_granularity {
+            Some(QuantGranularity::PerChannel(a)) => (1, *a, 0),
+            Some(QuantGranularity::PerGroup(a, gs)) => (2, *a, *gs),
+            Some(QuantGranularity::PerTensor) | None => (0, 0, 0),
+        };
+
+        let dtype_v = builder.ins().iconst(cl_types::I64, dtype_code);
+        let gran_v = builder.ins().iconst(cl_types::I64, gran_code);
+        let axis_v = builder.ins().iconst(cl_types::I64, axis_val);
+        let gs_v = builder.ins().iconst(cl_types::I64, gs_val);
+
+        // 4. Allocate a new struct with the same layout as the source model
+        let alloc_size = builder.ins().iconst(cl_types::I64, layout.total_size.max(8) as i64);
+        let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
+
+        // 5. For each field: quantize→dequantize (or clone if excluded)
+        for field in &layout.fields {
+            let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
+            let src_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                source_val,
+                field.offset as i32,
+            );
+
+            if is_excluded {
+                // Copy as-is via clone (bumps refcount internally)
+                let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[src_val])?;
+                builder.ins().store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
+            } else {
+                // Quantize then immediately dequantize — validates the roundtrip and
+                // shows quantization effects (precision loss) while storing a regular
+                // NslTensor that the original forward method can consume directly.
+                let qt = self.compile_call_by_name(
+                    builder,
+                    "nsl_qtensor_quantize",
+                    &[src_val, dtype_v, gran_v, axis_v, gs_v],
+                )?;
+                let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
+                // Free the intermediate QuantizedTensor
+                self.compile_call_by_name(builder, "nsl_qtensor_free", &[qt])?;
+                builder.ins().store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
+            }
+        }
+
+        // 6. Register the quantized model with the same struct layout and methods
+        //    so that forward dispatch works identically to the source model.
+        let quant_name = self.resolve_sym(quant.name).to_string();
+        if !self.struct_layouts.contains_key(&quant_name) {
+            self.struct_layouts.insert(quant_name.clone(), layout);
+        }
+        if let Some(methods) = self.model_methods.get(&model_type_name).cloned() {
+            self.model_methods.insert(quant_name, methods);
+        }
+
+        // 7. Bind the new struct pointer as the output variable
+        let var = state.new_variable();
+        builder.declare_var(var, cl_types::I64);
+        builder.def_var(var, new_ptr);
+        state.variables.insert(quant.name, (var, cl_types::I64));
+
+        Ok(())
+    }
+}
+
+/// Simple glob matching supporting `*` (any sequence) and `?` (single char) wildcards.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pb = pattern.as_bytes();
+    let tb = text.as_bytes();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star_pi = usize::MAX;
+    let mut star_ti = 0usize;
+
+    while ti < tb.len() {
+        if pi < pb.len() && (pb[pi] == b'?' || pb[pi] == tb[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pb.len() && pb[pi] == b'*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pb.len() && pb[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pb.len()
 }

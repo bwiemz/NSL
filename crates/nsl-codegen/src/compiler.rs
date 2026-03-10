@@ -1034,7 +1034,6 @@ impl<'a> Compiler<'a> {
                         | StmtKind::EnumDef(_) | StmtKind::TraitDef(_)
                         | StmtKind::Import(_) | StmtKind::FromImport(_)
                         | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_)
-                        | StmtKind::QuantBlock(_)
                         | StmtKind::KernelDef(_)
                 )
             })
