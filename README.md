@@ -100,6 +100,15 @@ Output:
 - Encode text → token ID tensors, decode back to text
 - Batch encoding with padding and attention masks
 
+### Quantization
+- `quant static` block for declarative weight quantization
+- `QuantizedTensor` type with packed INT4 (2 values/byte) and INT8 storage
+- Per-tensor, per-channel, and per-group granularity
+- Asymmetric affine quantization (weight-only RTN)
+- Mixed-precision matmul (`nsl_qtensor_matmul_mixed`)
+- Model monomorphization: compiler synthesizes quantized model type
+- Glob-based `exclude` patterns to keep specific layers in full precision
+
 ### Test Framework
 - `@test` decorator marks functions as test cases
 - `assert_eq`, `assert_close` for value and tensor assertions
@@ -148,6 +157,7 @@ stdlib/nsl/        Standard library (written in NSL)
   optim/           Optimizers (sgd, adam, adamw, lion, muon, soap)
   optim/schedulers.nsl  Learning rate schedulers
   tokenize/        Tokenizer wrappers
+  quant/ops.nsl    Quantization wrappers
 
 spec/              Language specification (13 chapters)
 examples/          Example programs and integration tests
@@ -169,6 +179,9 @@ cargo run -p nsl-cli -- test tests/m15_test.nsl
 
 # Run end-to-end language model demo
 cargo run -p nsl-cli -- run examples/m15_tiny_lm.nsl
+
+# Run quantization example
+cargo run -p nsl-cli -- run examples/m16_quantize.nsl
 ```
 
 ## Development Status
@@ -184,10 +197,12 @@ NSL is in active development. Current milestone progress:
 | M13 | Import system + multi-file compilation | Complete |
 | M14 | Training DSL + optimizers + schedulers | Complete |
 | M15 | NN stdlib + tokenization + test framework | Complete |
-| M16 | Quantization (`quant` keyword) | Planned |
+| M16 | Quantization foundations (`quant static` block) | Complete |
 | M17 | GPU/CUDA + `kernel` keyword | Planned |
 | M18 | Interop (PyTorch, HuggingFace, ONNX) | Planned |
 | M19-20 | Package ecosystem + v0.1 release | Planned |
+| M21 | Advanced quantization (FP8, activation quant) | Planned |
+| M22 | Algorithmic quantization (QAT, GPTQ, AWQ) | Planned |
 
 ## License
 
