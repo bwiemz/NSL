@@ -673,6 +673,256 @@ pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
     result
 }
 
+// === Element-wise math ops ===
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        unsafe { *data.add(i) = (*a.data.add(i)).exp() };
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(result).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Exp {
+            a: tensor_ptr,
+            out: result,
+            saved_out: result,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        unsafe { *data.add(i) = (*a.data.add(i)).ln() };
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Log {
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        unsafe { *data.add(i) = (*a.data.add(i)).sqrt() };
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(result).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Sqrt {
+            a: tensor_ptr,
+            out: result,
+            saved_out: result,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        unsafe { *data.add(i) = (*a.data.add(i)).abs() };
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Abs {
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let val = unsafe { *a.data.add(i) };
+        unsafe {
+            *data.add(i) = if val > 0.0 {
+                1.0
+            } else if val < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        };
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    // sign is non-differentiable — no tape recording
+    Box::into_raw(result) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let val = unsafe { *a.data.add(i) };
+        unsafe { *data.add(i) = val.clamp(min_val, max_val) };
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Clamp {
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
+            min_val,
+            max_val,
+        });
+    }
+    result
+}
+
+/// Helper for clamp backward: produces grad * mask where mask is 1 where input is strictly
+/// between min_val and max_val, and 0 otherwise.
+pub(crate) fn nsl_tensor_clamp_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    min_val: f64,
+    max_val: f64,
+) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let len = input.len;
+    let ndim = input.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let val = unsafe { *input.data.add(i) };
+        let g_val = unsafe { *grad.data.add(i) };
+        unsafe {
+            *data.add(i) = if val > min_val && val < max_val {
+                g_val
+            } else {
+                0.0
+            };
+        }
+    }
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+    });
+    Box::into_raw(result) as i64
+}
+
 // === Scalar extraction ===
 
 #[no_mangle]

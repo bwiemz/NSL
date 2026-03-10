@@ -14,9 +14,9 @@ use crate::tensor::{
     nsl_tensor_neg as tensor_neg,
     nsl_tensor_ones as tensor_ones,
     nsl_tensor_shape as tensor_shape,
+    nsl_tensor_sign as tensor_sign,
     nsl_tensor_transpose as tensor_transpose,
     nsl_tensor_zeros as tensor_zeros,
-    NslTensor,
 };
 
 /// Operations recorded on the tape during forward passes inside `grad` blocks.
@@ -34,6 +34,11 @@ pub enum TapeOp {
     Transpose { a: i64, out: i64, dim0: i64, dim1: i64 },
     SumReduce { a: i64, out: i64 },
     MeanReduce { a: i64, out: i64, num_elements: i64 },
+    Exp { a: i64, out: i64, saved_out: i64 },
+    Log { a: i64, out: i64, saved_a: i64 },
+    Sqrt { a: i64, out: i64, saved_out: i64 },
+    Abs { a: i64, out: i64, saved_a: i64 },
+    Clamp { a: i64, out: i64, saved_a: i64, min_val: f64, max_val: f64 },
 }
 
 struct Tape {
@@ -104,7 +109,7 @@ pub extern "C" fn nsl_tape_stop() {
         tape.recording = false;
         tape.pause_depth = 0;
 
-        // Release saved tensor refs (Mul, Div, MatMul hold extra refs).
+        // Release saved tensor refs (ops that hold extra refs).
         // Use tensor_free so tensors are actually deallocated if refcount hits 0.
         for op in tape.ops.iter() {
             match op {
@@ -113,6 +118,15 @@ pub extern "C" fn nsl_tape_stop() {
                 | TapeOp::MatMul { saved_a, saved_b, .. } => {
                     tensor_free(*saved_a);
                     tensor_free(*saved_b);
+                }
+                TapeOp::Exp { saved_out, .. }
+                | TapeOp::Sqrt { saved_out, .. } => {
+                    tensor_free(*saved_out);
+                }
+                TapeOp::Log { saved_a, .. }
+                | TapeOp::Abs { saved_a, .. }
+                | TapeOp::Clamp { saved_a, .. } => {
+                    tensor_free(*saved_a);
                 }
                 _ => {}
             }
@@ -301,6 +315,55 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let ones = ones_like(*a);
                     let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64));
                     tensor_free(ones);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Exp { a, out, saved_out } => {
+                // d/da(exp(a)) = exp(a) = saved_out
+                if let Some(&g) = grad_map.get(out) {
+                    let g_clone = tensor_clone(g);
+                    let grad_a = tensor_mul(g_clone, *saved_out);
+                    tensor_free(g_clone);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Log { a, out, saved_a } => {
+                // d/da(log(a)) = 1/a
+                if let Some(&g) = grad_map.get(out) {
+                    let g_clone = tensor_clone(g);
+                    let grad_a = tensor_div(g_clone, *saved_a);
+                    tensor_free(g_clone);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Sqrt { a, out, saved_out } => {
+                // d/da(sqrt(a)) = 1 / (2 * sqrt(a)) = 1 / (2 * saved_out)
+                if let Some(&g) = grad_map.get(out) {
+                    let g_clone = tensor_clone(g);
+                    let two_sqrt = tensor_mul_scalar(*saved_out, 2.0);
+                    let grad_a = tensor_div(g_clone, two_sqrt);
+                    tensor_free(g_clone);
+                    tensor_free(two_sqrt);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Abs { a, out, saved_a } => {
+                // d/da(abs(a)) = sign(a)
+                if let Some(&g) = grad_map.get(out) {
+                    let g_clone = tensor_clone(g);
+                    let sign = tensor_sign(*saved_a);
+                    let grad_a = tensor_mul(g_clone, sign);
+                    tensor_free(g_clone);
+                    tensor_free(sign);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Clamp { a, out, saved_a, min_val, max_val } => {
+                // Gradient passes through where unclamped, zero where clamped
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = crate::tensor::nsl_tensor_clamp_backward(
+                        g, *saved_a, *min_val, *max_val,
+                    );
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
