@@ -76,10 +76,10 @@ The existing C runtime (`nsl_runtime.c`, ~770 LOC) is migrated to Rust in M9.
 **Tooling:** `nsl test` command
 **Deliverable:** Tokenize text -> feed to model -> train a language model
 
-### M16: Quantization
-**ML:** `quant` keyword/block, QuantizedTensor type, INT8/INT4/FP8, static PTQ, GPTQ, sensitivity analysis; quant ops in Rust runtime
+### M16: Quantization Foundations
+**ML:** `quant static` block, `QuantizedTensor` type (packed INT4/INT8), weight-only RTN quantization, per-tensor/per-channel/per-group granularity, mixed-precision matmul, model monomorphization (compiler synthesizes quantized model type)
 **Tooling:** `nsl bench` command
-**Deliverable:** Quantize a trained model, measure degradation
+**Deliverable:** Quantize a trained model's weights to INT4/INT8, run inference with mixed-precision matmul
 
 ### M17: GPU + Kernels
 **ML:** Device type system (CPU/CUDA), Rust CUDA runtime bindings, `kernel` keyword, @fuse, @autotune, GPU tensor ops
@@ -100,6 +100,16 @@ The existing C runtime (`nsl_runtime.c`, ~770 LOC) is migrated to Rust in M9.
 **ML:** Full GPT-2 pipeline from spec 13, all in NSL
 **Tooling:** Polish all tooling, error messages, examples, CI/CD
 **Deliverable:** The spec 13 example runs end-to-end -- ship v0.1
+
+### M21: Advanced Quantization
+**ML:** FP8 dtype support, activation quantization (W8A8) with calibration data, mixed-precision layer assignment (`quant.mixed_precision` block), sensitivity analysis (measure per-layer accuracy impact)
+**Tooling:** Quantization analysis reporting
+**Deliverable:** Quantize a model with W8A8 activation quantization, auto-assign mixed precision based on sensitivity
+
+### M22: Algorithmic Quantization
+**ML:** QAT (quantization-aware training with fake quantize in forward pass), GPTQ (second-order weight quantization), AWQ (activation-aware weight quantization), SmoothQuant (activation difficulty migration), hardware-targeted quantization profiles
+**Tooling:** Hardware profile configs
+**Deliverable:** GPTQ-quantize a large model, deploy with hardware-specific profiles
 
 ---
 
@@ -130,11 +140,13 @@ M9 (Runtime + Tensors)
                 |-> M13 (Training)
                      |-> M14 (Data + LSP)
                      |-> M15 (Tokenization + Stdlib)
-                     |-> M16 (Quantization)
+                     |-> M16 (Quantization Foundations)
                           |-> M17 (GPU)
-                               |-> M18 (Interop + Export)
-                                    |-> M19 (Packages)
-                                         |-> M20 (v0.1 Release)
+                          |    |-> M18 (Interop + Export)
+                          |         |-> M19 (Packages)
+                          |              |-> M20 (v0.1 Release)
+                          |-> M21 (Advanced Quantization)
+                               |-> M22 (Algorithmic Quantization)
 ```
 
 M14, M15, M16 can be developed in parallel after M13 is complete.
