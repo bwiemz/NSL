@@ -47,6 +47,8 @@ pub enum TapeOp {
     Sigmoid { a: i64, out: i64, saved_out: i64 },
     Tanh { a: i64, out: i64, saved_out: i64 },
     Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
+    Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
+    Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
 }
 
 struct Tape {
@@ -552,6 +554,95 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     Box::into_raw(t) as i64
 }
 
+/// Slice backward: create zeros with input_shape, copy grad into the [start, start+slice_len) region along dim.
+fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let ndim = input_shape.len();
+
+    // Create zero output with original input_shape
+    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let out = NslTensor::from_ptr(out_ptr);
+
+    let out_strides: Vec<usize> = (0..ndim)
+        .map(|i| unsafe { *out.strides.add(i) } as usize)
+        .collect();
+    let grad_strides: Vec<usize> = (0..ndim)
+        .map(|i| unsafe { *grad.strides.add(i) } as usize)
+        .collect();
+
+    let grad_total = grad.len as usize;
+    for flat in 0..grad_total {
+        // Convert flat index in grad to multi-dim, offset by start on the sliced dim
+        let mut remaining = flat;
+        let mut out_offset: usize = 0;
+        for axis in 0..ndim {
+            let idx = remaining / grad_strides[axis];
+            remaining %= grad_strides[axis];
+            if axis == dim {
+                out_offset += (idx + start) * out_strides[axis];
+            } else {
+                out_offset += idx * out_strides[axis];
+            }
+        }
+        unsafe { *out.data.add(out_offset) = *grad.data.add(flat) };
+    }
+
+    out_ptr
+}
+
+/// Cat backward: split the gradient along the cat dim into pieces matching the original input sizes.
+fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let ndim = grad.ndim as usize;
+
+    let grad_shape: Vec<i64> = (0..ndim)
+        .map(|i| unsafe { *grad.shape.add(i) })
+        .collect();
+    let grad_strides: Vec<usize> = (0..ndim)
+        .map(|i| unsafe { *grad.strides.add(i) } as usize)
+        .collect();
+
+    let mut results = Vec::with_capacity(split_sizes.len());
+    let mut offset: usize = 0;
+
+    for &split_size in split_sizes {
+        // Build shape for this piece
+        let mut piece_shape = grad_shape.clone();
+        piece_shape[dim] = split_size;
+
+        let piece_ptr = create_tensor_with_shape(&piece_shape, 0.0);
+        let piece = NslTensor::from_ptr(piece_ptr);
+        let piece_strides: Vec<usize> = (0..ndim)
+            .map(|i| unsafe { *piece.strides.add(i) } as usize)
+            .collect();
+
+        let piece_total = piece.len as usize;
+        for flat in 0..piece_total {
+            let mut remaining = flat;
+            let mut grad_offset: usize = 0;
+            for axis in 0..ndim {
+                let idx = remaining / piece_strides[axis];
+                remaining %= piece_strides[axis];
+                if axis == dim {
+                    grad_offset += (idx + offset) * grad_strides[axis];
+                } else {
+                    grad_offset += idx * grad_strides[axis];
+                }
+            }
+            unsafe { *piece.data.add(flat) = *grad.data.add(grad_offset) };
+        }
+
+        results.push(piece_ptr);
+        offset += split_size as usize;
+    }
+
+    results
+}
+
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
 #[no_mangle]
@@ -806,6 +897,22 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = softmax_backward(g, *saved_out, *dim);
                     accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Slice { a, out, dim, start, input_shape } => {
+                // Backward: create zeros with original input shape, copy grad into [start, start+slice_len)
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = slice_backward(g, input_shape, *dim as usize, *start as usize);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Cat { inputs, out, dim, split_sizes } => {
+                // Backward: split the gradient along the cat dim into pieces
+                if let Some(&g) = grad_map.get(out) {
+                    let grads = cat_backward(g, *dim as usize, split_sizes);
+                    for (i, grad_piece) in grads.into_iter().enumerate() {
+                        accumulate_grad(&mut grad_map, inputs[i], grad_piece);
+                    }
                 }
             }
         }

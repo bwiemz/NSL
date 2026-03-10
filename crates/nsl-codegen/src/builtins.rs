@@ -167,6 +167,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_sigmoid", &[types::I64], Some(types::I64)),
     ("nsl_tensor_tanh_act", &[types::I64], Some(types::I64)),
     ("nsl_tensor_softmax", &[types::I64, types::I64], Some(types::I64)),
+    // Slice & Cat (M15)
+    ("nsl_tensor_slice", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_cat", &[types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

@@ -1,0 +1,8 @@
+let a = arange(0.0, 3.0, 1.0)
+let b = arange(3.0, 6.0, 1.0)
+print(a)
+print(b)
+
+let tensors = [a, b]
+let c = tensor_cat(tensors, 0)
+print(c)

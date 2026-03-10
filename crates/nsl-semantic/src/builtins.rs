@@ -237,6 +237,23 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         );
     }
 
+    // tensor_slice(tensor, dim, start, end) -> tensor
+    def(
+        "tensor_slice",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int, Type::Int, Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // tensor_cat(list_of_tensors, dim) -> tensor
+    def(
+        "tensor_cat",
+        Type::Function {
+            params: vec![Type::List(Box::new(tensor_ret.clone())), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Math functions (always return Float — coerce int args at codegen level)
     for name in &["sqrt", "log", "exp", "sin", "cos", "floor"] {
         def(

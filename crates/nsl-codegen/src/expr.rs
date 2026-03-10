@@ -725,6 +725,26 @@ impl Compiler<'_> {
             let indices = self.compile_expr(builder, state, &args[2].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_gather", &[t, dim, indices]);
         }
+        // tensor_slice(tensor, dim, start, end) -> tensor
+        if func_name == "tensor_slice" {
+            if args.len() != 4 {
+                return Err(CodegenError::new("tensor_slice() takes exactly 4 arguments (tensor, dim, start, end)"));
+            }
+            let t = self.compile_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_expr(builder, state, &args[1].value)?;
+            let start = self.compile_expr(builder, state, &args[2].value)?;
+            let end = self.compile_expr(builder, state, &args[3].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_slice", &[t, dim, start, end]);
+        }
+        // tensor_cat(list_of_tensors, dim) -> tensor
+        if func_name == "tensor_cat" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("tensor_cat() takes exactly 2 arguments (tensor_list, dim)"));
+            }
+            let list = self.compile_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_cat", &[list, dim]);
+        }
         // sum/mean with dim args — overload: sum(tensor) or sum(tensor, dim, keepdim)
         if matches!(func_name.as_str(), "sum" | "mean") {
             if args.len() == 1 {

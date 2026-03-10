@@ -1763,3 +1763,202 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tensor Slice
+// ---------------------------------------------------------------------------
+
+/// Slice a tensor along a dimension: extract elements [start, end) along dim.
+/// Supports negative indices (e.g., -1 means last element).
+/// Input shape [d0, d1, ..., d_dim, ...] -> output shape [d0, d1, ..., (end-start), ...]
+#[no_mangle]
+pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+
+    // Normalize dim
+    let d = if dim < 0 { (tensor.ndim + dim) as usize } else { dim as usize };
+    assert!(d < ndim, "nsl_tensor_slice: dim {dim} out of range for ndim {ndim}");
+
+    let dim_size = unsafe { *tensor.shape.add(d) };
+
+    // Normalize start/end with negative index support
+    let s = if start < 0 { (dim_size + start).max(0) } else { start.min(dim_size) };
+    let e = if end < 0 { (dim_size + end).max(0) } else { end.min(dim_size) };
+    let slice_len = (e - s).max(0);
+
+    // Build output shape
+    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim {
+        if i == d {
+            unsafe { *out_shape.add(i) = slice_len };
+        } else {
+            unsafe { *out_shape.add(i) = *tensor.shape.add(i) };
+        }
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, tensor.ndim);
+    let out_len = NslTensor::total_elements(out_shape, tensor.ndim);
+
+    let data = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Copy data: iterate over all output elements, mapping back to input
+    let in_strides: Vec<i64> = (0..ndim)
+        .map(|i| unsafe { *tensor.strides.add(i) })
+        .collect();
+    let o_strides: Vec<i64> = (0..ndim)
+        .map(|i| unsafe { *out_strides.add(i) })
+        .collect();
+
+    for flat in 0..out_len as usize {
+        // Convert flat index to multi-dim in output space
+        let mut remaining = flat;
+        let mut in_offset: usize = 0;
+        for axis in 0..ndim {
+            let idx = remaining / o_strides[axis] as usize;
+            remaining %= o_strides[axis] as usize;
+            if axis == d {
+                in_offset += (idx + s as usize) * in_strides[axis] as usize;
+            } else {
+                in_offset += idx * in_strides[axis] as usize;
+            }
+        }
+        unsafe { *data.add(flat) = *tensor.data.add(in_offset) };
+    }
+
+    // Save input shape for backward
+    let input_shape: Vec<i64> = (0..ndim)
+        .map(|i| unsafe { *tensor.shape.add(i) })
+        .collect();
+
+    let out = Box::new(NslTensor {
+        data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: tensor.ndim,
+        len: out_len,
+        refcount: 1,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    // Record on tape for autodiff
+    autodiff::maybe_record(autodiff::TapeOp::Slice {
+        a: tensor_ptr,
+        out: out_ptr,
+        dim: dim,
+        start: s,
+        input_shape,
+    });
+
+    out_ptr
+}
+
+// ---------------------------------------------------------------------------
+// Tensor Cat
+// ---------------------------------------------------------------------------
+
+/// Concatenate a list of tensors along a dimension.
+/// All tensors must have same shape except on the cat dimension.
+/// Returns a new tensor with the cat dimension being the sum of all input dim sizes.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
+    let list = NslList::from_ptr(tensor_list);
+    let num_tensors = list.len as usize;
+    assert!(num_tensors > 0, "nsl_tensor_cat: empty tensor list");
+
+    let first = NslTensor::from_ptr(unsafe { *list.data.add(0) });
+    let ndim = first.ndim as usize;
+    let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
+    assert!(d < ndim, "nsl_tensor_cat: dim {dim} out of range for ndim {ndim}");
+
+    // Collect split sizes and validate shapes
+    let mut split_sizes: Vec<i64> = Vec::with_capacity(num_tensors);
+    let mut total_cat_dim: i64 = 0;
+
+    for t_idx in 0..num_tensors {
+        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
+        let cat_size = unsafe { *t.shape.add(d) };
+        split_sizes.push(cat_size);
+        total_cat_dim += cat_size;
+        // Validate non-cat dimensions match
+        for axis in 0..ndim {
+            if axis != d {
+                let s1 = unsafe { *first.shape.add(axis) };
+                let s2 = unsafe { *t.shape.add(axis) };
+                assert_eq!(s1, s2, "nsl_tensor_cat: shape mismatch at dim {axis}: {s1} vs {s2}");
+            }
+        }
+    }
+
+    // Build output shape
+    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim {
+        if i == d {
+            unsafe { *out_shape.add(i) = total_cat_dim };
+        } else {
+            unsafe { *out_shape.add(i) = *first.shape.add(i) };
+        }
+    }
+    let out_ndim = first.ndim;
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+    let out_len = NslTensor::total_elements(out_shape, out_ndim);
+    let data = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    let o_strides: Vec<i64> = (0..ndim)
+        .map(|i| unsafe { *out_strides.add(i) })
+        .collect();
+
+    // Copy data from each tensor
+    let mut cat_offset: usize = 0;
+    for t_idx in 0..num_tensors {
+        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        let t_strides: Vec<i64> = (0..ndim)
+            .map(|i| unsafe { *t.strides.add(i) })
+            .collect();
+        let _t_shape: Vec<i64> = (0..ndim)
+            .map(|i| unsafe { *t.shape.add(i) })
+            .collect();
+
+        let t_len = t.len as usize;
+        for flat in 0..t_len {
+            // Convert flat index to multi-dim in tensor space
+            let mut remaining = flat;
+            let mut out_offset: usize = 0;
+            for axis in 0..ndim {
+                let idx = remaining / t_strides[axis] as usize;
+                remaining %= t_strides[axis] as usize;
+                if axis == d {
+                    out_offset += (idx + cat_offset) * o_strides[axis] as usize;
+                } else {
+                    out_offset += idx * o_strides[axis] as usize;
+                }
+            }
+            unsafe { *data.add(out_offset) = *t.data.add(flat) };
+        }
+        cat_offset += split_sizes[t_idx] as usize;
+    }
+
+    let out = Box::new(NslTensor {
+        data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: out_ndim,
+        len: out_len,
+        refcount: 1,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    // Collect input ptrs for tape
+    let input_ptrs: Vec<i64> = (0..num_tensors)
+        .map(|i| unsafe { *list.data.add(i) })
+        .collect();
+
+    autodiff::maybe_record(autodiff::TapeOp::Cat {
+        inputs: input_ptrs,
+        out: out_ptr,
+        dim: dim,
+        split_sizes,
+    });
+
+    out_ptr
+}

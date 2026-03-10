@@ -1,0 +1,6 @@
+let t = arange(0.0, 10.0, 1.0)
+print(t)
+let s = tensor_slice(t, 0, 2, 7)
+print(s)
+let s2 = tensor_slice(t, 0, 0, -1)
+print(s2)
