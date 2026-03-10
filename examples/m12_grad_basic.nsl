@@ -1,0 +1,14 @@
+# M12 Basic Gradient Test
+# d/dw sum(x * w) where x = ones([3]), w = ones([3])
+# Forward: x * w = [1, 1, 1], sum = 3.0
+# Backward: d/dw = x = [1, 1, 1]
+
+let w = ones([3])
+let x = ones([3])
+
+let (loss, grads) = grad(w):
+    let y = x * w
+    y.sum()
+
+print(loss)
+print(grads)

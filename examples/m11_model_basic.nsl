@@ -1,0 +1,17 @@
+# M11 Basic Model Test
+
+model Counter(start: int):
+    value: int = start
+
+    fn get(self) -> int:
+        return self.value
+
+    fn increment(self):
+        self.value = self.value + 1
+
+let c = Counter(10)
+print(c.get())
+c.increment()
+c.increment()
+c.increment()
+print(c.get())

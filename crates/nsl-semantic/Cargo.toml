@@ -1,0 +1,13 @@
+[package]
+name = "nsl-semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nsl-errors.workspace = true
+nsl-lexer.workspace = true
+nsl-ast.workspace = true
+
+[dev-dependencies]
+string-interner.workspace = true

@@ -1,0 +1,71 @@
+# NSL M5 Feature Test
+
+# ── Dict literals (string values) ──────────────────────────────────
+let d = {name: "alice", role: "admin"}
+print(d["name"])
+d["role"] = "user"
+print(d["role"])
+
+# ── Dict literals (int values) ────────────────────────────────────
+let scores = {math: 95, science: 88}
+print(scores["math"])
+if "name" in d:
+    print("has name")
+if "missing" in d:
+    print("bug")
+else:
+    print("no missing key")
+
+# ── Tuple literals ──────────────────────────────────────────────────
+let t = (10, 20, 30)
+print(t[0])
+print(t[2])
+
+# ── Lambda expressions ──────────────────────────────────────────────
+let double = |x: int| x * 2
+print(double(5))
+let add = |a: int, b: int| a + b
+print(add(3, 4))
+
+# ── Higher-order functions ──────────────────────────────────────────
+let nums = [1, 2, 3, 4, 5]
+let doubled = map(|x: int| x * 2, nums)
+for v in doubled:
+    print(v)
+
+let evens = filter(|x: int| x % 2 == 0, nums)
+for e in evens:
+    print(e)
+
+let rev = reversed(nums)
+for r in rev:
+    print(r)
+
+let s = sorted([5, 3, 1, 4, 2])
+for v in s:
+    print(v)
+
+# ── String methods ──────────────────────────────────────────────────
+let greeting = "Hello, World!"
+print(greeting.upper())
+print(greeting.lower())
+
+let csv = "a,b,c"
+let parts = csv.split(",")
+for p in parts:
+    print(p)
+print(",".join(parts))
+
+print(greeting.replace("World", "NSL"))
+print(greeting.find("World"))
+print(greeting.startswith("Hello"))
+print(greeting.endswith("!"))
+print(greeting.contains("World"))
+
+let padded = "  hello  "
+print(padded.strip())
+
+# ── Range expression ───────────────────────────────────────────────
+let r = 0..5
+for i in r:
+    print(i)

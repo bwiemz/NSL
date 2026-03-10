@@ -1,0 +1,15 @@
+# M11 Forward Dispatch Test
+
+model Doubler():
+    factor: int = 2
+
+    fn forward(self, x: int) -> int:
+        return x * self.factor
+
+let d = Doubler()
+
+# Explicit method call
+print(d.forward(5))
+
+# Forward dispatch: calling model as function
+print(d(5))

@@ -1,0 +1,7 @@
+Hello from NeuralScript! Result: 52
+big number
+2
+4
+6
+8
+10

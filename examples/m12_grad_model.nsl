@@ -1,0 +1,19 @@
+# M12 Model Gradient Test
+# Compute gradient of a model's forward pass
+# This tests that the global tape transparently records through model.forward()
+
+model Linear():
+    weight: Tensor = ones([3, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+let m = Linear()
+let x = ones([2, 3])
+
+let (loss, grads) = grad(m.weight):
+    let y = m.forward(x)
+    y.sum()
+
+print(loss)
+print(grads)

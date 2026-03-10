@@ -1,0 +1,40 @@
+## Type Errors Test — Intentional errors for semantic analysis validation
+## Each section should produce at least one diagnostic
+
+# 1. Undefined variable
+let x = undefined_var
+
+# 2. Type mismatch in assignment
+let y: int = "hello"
+
+# 3. Const reassignment
+const PI = 3.14
+PI = 2.71
+
+# 4. Calling a non-callable
+let not_a_function = 42
+not_a_function(1, 2)
+
+# 5. Return outside function
+return 42
+
+# 6. Break outside loop
+break
+
+# 7. Continue outside loop
+continue
+
+# 8. Too few arguments
+fn add(a: int, b: int) -> int:
+    return a + b
+
+add(1)
+
+# 9. Undefined type in annotation
+let z: NonExistentType = 10
+
+# 10. Wrong argument type
+fn greet(name: str) -> str:
+    return name
+
+greet(42)

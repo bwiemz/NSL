@@ -1,0 +1,12 @@
+# M11 Tensor Model Test
+
+model SimpleLinear():
+    weight: Tensor = ones([3, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+let m = SimpleLinear()
+let x = ones([2, 3])
+let y = m.forward(x)
+print(y)

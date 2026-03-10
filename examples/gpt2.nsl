@@ -1,0 +1,147 @@
+## GPT-2 (124M) — Complete Training, Quantization, and Deployment Pipeline
+## NeuralScript v0.1
+
+import nsl.nn.{Linear, Embedding, LayerNorm, Dropout, MLP, softmax, gelu}
+import nsl.nn.{cross_entropy, causal_mask}
+import nsl.optim.{AdamW, WarmupCosine}
+import nsl.data.{MemoryMapped, DataLoader, SequencePacker}
+import nsl.tokenize.{BPETrainer, Tokenizer}
+import nsl.quant.{quantize, gptq}
+import nsl.export.{to_onnx}
+import nsl.bench.{benchmark, count_params, summary}
+import nsl.compat.{save_safetensors}
+import nsl.data.{Dataset}
+
+# CONFIGURATION
+
+const CONFIG = {
+    vocab_size:    50257,
+    d_model:       768,
+    n_layers:      12,
+    n_heads:       12,
+    d_ff:          3072,
+    max_seq:       1024,
+    dropout:       0.1,
+    batch_size:    8,
+    accumulate:    4,
+    lr:            6e-4,
+    warmup_steps:  2000,
+    total_steps:   100000,
+    weight_decay:  0.1,
+}
+
+# STEP 2: MODEL — GPT-2 Transformer Decoder
+
+## Single transformer block
+model GPT2Block(d_model: int, n_heads: int, d_ff: int, dropout: f32):
+    ln1: LayerNorm = LayerNorm(d_model)
+    ln2: LayerNorm = LayerNorm(d_model)
+    c_attn: Linear = Linear(d_model, 3 * d_model)
+    c_proj: Linear = Linear(d_model, d_model)
+    attn_drop: Dropout = Dropout(dropout)
+    resid_drop: Dropout = Dropout(dropout)
+    c_fc: Linear = Linear(d_model, d_ff)
+    c_fc_proj: Linear = Linear(d_ff, d_model)
+    mlp_drop: Dropout = Dropout(dropout)
+    n_heads: int = n_heads
+    head_dim: int = d_model // n_heads
+
+    fn forward(self, x: Tensor<[batch, seq, d_model], bf16>) -> Tensor<[batch, seq, d_model], bf16>:
+        let h = self.ln1(x)
+        let qkv = self.c_attn(h)
+        let attn = softmax(qkv, dim=-1) |> self.attn_drop
+        let out = self.c_proj(attn) |> self.resid_drop
+        let x = x + out
+        let h = self.ln2(x)
+        let ff = self.c_fc(h) |> gelu |> self.c_fc_proj |> self.mlp_drop
+        return x + ff
+
+## Full GPT-2
+model GPT2(vocab_size: int, d_model: int, n_layers: int, n_heads: int, d_ff: int, max_seq: int, dropout: f32):
+    wte: Embedding = Embedding(vocab_size, d_model)
+    wpe: Embedding = Embedding(max_seq, d_model)
+    drop: Dropout = Dropout(dropout)
+    ln_f: LayerNorm = LayerNorm(d_model)
+    lm_head: Linear = Linear(d_model, vocab_size, bias=false)
+
+    fn forward(self, input_ids: Tensor<[batch, seq], int32>) -> Tensor<[batch, seq, vocab_size], bf16>:
+        let h = self.wte(input_ids) + self.wpe(input_ids)
+        let h = self.drop(h)
+        let h = self.ln_f(h)
+        return self.lm_head(h)
+
+# Instantiate
+let gpt = GPT2(
+    vocab_size  = CONFIG.vocab_size,
+    d_model     = CONFIG.d_model,
+    n_layers    = CONFIG.n_layers,
+    n_heads     = CONFIG.n_heads,
+    d_ff        = CONFIG.d_ff,
+    max_seq     = CONFIG.max_seq,
+    dropout     = CONFIG.dropout
+)
+
+print(f"GPT-2 initialized: {count_params(gpt)} parameters")
+
+# STEP 3: DATASET
+
+dataset train_data("openwebtext"):
+    source = MemoryMapped("data/openwebtext_tokens.bin", dtype=int32)
+    sequence_length = CONFIG.max_seq
+    packing = true
+    pack_separator = gpt_tokenizer.eos_token_id
+
+# STEP 4: TRAINING
+
+train(epochs=1, precision=bf16):
+    data:
+        source      = train_data
+        batch_size  = CONFIG.batch_size
+        num_workers = 8
+
+    optimizer: AdamW(
+        lr           = CONFIG.lr,
+        weight_decay = CONFIG.weight_decay
+    )
+
+    scheduler: WarmupCosine(
+        warmup_steps = CONFIG.warmup_steps,
+        total_steps  = CONFIG.total_steps
+    )
+
+    step(batch):
+        let logits = gpt.forward(batch.input_ids)
+        loss = cross_entropy(logits, batch.labels)
+
+    callbacks:
+        on_step(step, loss):
+            if step % 200 == 0:
+                print(f"step {step} | loss {loss}")
+
+print("Training complete!")
+
+# STEP 5: QUANTIZATION
+
+quant(scheme=int8, mode=aware, granularity=per_channel):
+    target = gpt
+
+# STEP 6: EXPORT
+
+to_onnx(gpt, input_shape=[1, CONFIG.max_seq], output="exports/gpt2.onnx")
+
+# STEP 7: BENCHMARK
+
+let perf = benchmark(gpt, input_shape=[1, CONFIG.max_seq], num_iters=100)
+print(f"Throughput: {perf.tokens_per_second} tok/s")
+
+# Helper function
+@no_grad
+fn evaluate_loss(mdl: GPT2, data: Dataset, max_batches: int = -1) -> f32:
+    let total_loss = 0.0
+    let count = 0
+    for batch in data:
+        let logits = mdl.forward(batch.input_ids)
+        let loss = cross_entropy(logits, batch.labels)
+        total_loss = total_loss + loss
+        count = count + 1
+    return total_loss / count

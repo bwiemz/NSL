@@ -1,0 +1,14 @@
+# M12 Matmul Gradient Test
+# d/dw sum(x @ w) where x = ones([2, 3]), w = ones([3, 4])
+# Forward: x @ w = full([2, 4], 3.0), sum = 24.0
+# Backward: d/dw = x^T @ ones([2, 4]) = full([3, 4], 2.0)
+
+let x = ones([2, 3])
+let w = ones([3, 4])
+
+let (loss, grads) = grad(w):
+    let y = x @ w
+    y.sum()
+
+print(loss)
+print(grads)

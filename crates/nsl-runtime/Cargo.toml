@@ -1,0 +1,11 @@
+[package]
+name = "nsl-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NeuralScript runtime library (static lib linked into compiled programs)"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]

@@ -1,0 +1,33 @@
+# Simple NSL example
+
+let x = 42
+let y: float = 3.14
+const name = "NeuralScript"
+
+fn add(a: int, b: int) -> int:
+    return a + b
+
+let result = add(x, 10)
+print(f"Hello from {name}! Result: {result}")
+
+# Control flow
+if result > 50:
+    print("big number")
+elif result > 25:
+    print("medium number")
+else:
+    print("small number")
+
+# List and loop
+let items = [1, 2, 3, 4, 5]
+for item in items:
+    let doubled = item * 2
+    print(doubled)
+
+# Struct
+struct Point:
+    x: float
+    y: float
+
+let p = Point(x=1.0, y=2.0)
+let dist = (p.x ** 2 + p.y ** 2) ** 0.5

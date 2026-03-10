@@ -1,0 +1,9 @@
+[package]
+name = "nsl-errors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codespan-reporting.workspace = true
+serde.workspace = true

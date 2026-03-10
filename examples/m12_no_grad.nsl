@@ -1,0 +1,21 @@
+# M12 @no_grad Test
+# frozen_transform's operations are NOT recorded on the tape
+# So no gradient flows back through it to w
+
+let w = ones([3])
+let x = ones([3])
+
+@no_grad
+fn frozen_transform(t: Tensor) -> Tensor:
+    return t * ones([3])
+
+let (loss, grads) = grad(w):
+    let y = x * w
+    let z = frozen_transform(y)
+    z.sum()
+
+# z.sum() = 3.0 (same computation)
+# But gradient of z w.r.t. w is zero because the tape has no record
+# of how z was produced from y (frozen_transform was @no_grad)
+print(loss)
+print(grads)

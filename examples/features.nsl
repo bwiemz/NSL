@@ -1,0 +1,92 @@
+# NSL M4 Feature Test
+
+# ── Subscript access ─────────────────────────────────────────────
+let numbers = [10, 20, 30, 40, 50]
+print(numbers[0])
+print(numbers[2])
+print(numbers[4])
+
+# ── Subscript assignment ─────────────────────────────────────────
+numbers[1] = 99
+print(numbers[1])
+
+# ── range() with 1, 2, 3 args ───────────────────────────────────
+let r1 = range(5)
+for i in r1:
+    print(i)
+
+let r2 = range(2, 5)
+for i in r2:
+    print(i)
+
+let r3 = range(0, 10, 3)
+for i in r3:
+    print(i)
+
+# ── Type conversions ─────────────────────────────────────────────
+let x: float = 3.7
+let y = int(x)
+print(y)
+
+let z = float(42)
+print(z)
+
+let s = str(123)
+print(s)
+
+let b = bool(1)
+print(b)
+
+# ── 'in' operator ───────────────────────────────────────────────
+let items = [1, 2, 3, 4, 5]
+if 3 in items:
+    print("found 3")
+if 99 in items:
+    print("found 99")
+else:
+    print("99 not found")
+
+# ── Enum + match ─────────────────────────────────────────────────
+enum Color:
+    Red
+    Green
+    Blue
+
+let c = Color.Red
+match c:
+    case Red:
+        print("it is red")
+    case Green:
+        print("it is green")
+    case Blue:
+        print("it is blue")
+
+# ── Match with literals ──────────────────────────────────────────
+let score = 42
+match score:
+    case 100:
+        print("perfect")
+    case 42:
+        print("the answer")
+    case _:
+        print("something else")
+
+# ── List comprehension ───────────────────────────────────────────
+let squares = [x ** 2 for x in range(6)]
+for s in squares:
+    print(s)
+
+# ── List comprehension with filter ───────────────────────────────
+let evens = [x for x in range(10) if x % 2 == 0]
+for e in evens:
+    print(e)
+
+# ── Struct member assignment ─────────────────────────────────────
+struct Point:
+    x: float
+    y: float
+
+let p = Point(x=1.0, y=2.0)
+print(p.x)
+p.x = 5.0
+print(p.x)

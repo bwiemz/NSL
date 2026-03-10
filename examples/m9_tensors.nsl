@@ -1,0 +1,22 @@
+# M9 Tensor Demo
+
+# Basic tensor creation
+let a = zeros([2, 3])
+print(a)
+
+let b = ones([2, 3])
+print(b)
+
+# Elementwise operations
+let c = a + b
+print(c)
+
+# Matrix multiply
+let x = ones([3, 4])
+let y = ones([4, 2])
+let z = x @ y
+print(z)
+
+# Reductions
+let total = z.sum()
+print(total)

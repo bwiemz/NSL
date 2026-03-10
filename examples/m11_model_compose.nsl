@@ -1,0 +1,21 @@
+# M11 Model Composition Test
+
+model ScaleUp():
+    weight: Tensor = ones([3, 5])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+model ScaleDown():
+    weight: Tensor = ones([5, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+let up = ScaleUp()
+let down = ScaleDown()
+
+let x = ones([2, 3])
+let h = up.forward(x)
+let y = down.forward(h)
+print(y)

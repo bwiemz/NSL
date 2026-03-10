@@ -1,0 +1,8 @@
+from utils import add, greet, double
+
+print(add(3, 4))
+greet("world")
+print(double(21))
+
+assert(add(10, 20) == 30, "add works")
+exit(0)

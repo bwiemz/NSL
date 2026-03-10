@@ -1,0 +1,18 @@
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\settings.rs
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\types.rs
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\opcodes.rs
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\inst_builder.rs
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\settings-x86.rs
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\clif_opt.isle
+Writing generated file: C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\clif_lower.isle
+Rebuilding C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_opt.rs
+Writing ISLE-generated Rust code to C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_opt.rs
+Rebuilding C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_x64.rs
+Writing ISLE-generated Rust code to C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_x64.rs
+Rebuilding C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_aarch64.rs
+Writing ISLE-generated Rust code to C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_aarch64.rs
+Rebuilding C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_s390x.rs
+Writing ISLE-generated Rust code to C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_s390x.rs
+Rebuilding C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_riscv64.rs
+Writing ISLE-generated Rust code to C:\Users\bwiem\projects\NSL\target\debug\build\cranelift-codegen-055ce7c2d5c3f33c\out\isle_riscv64.rs
+fatal: not a git repository (or any of the parent directories): .git

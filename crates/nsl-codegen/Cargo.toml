@@ -1,0 +1,18 @@
+[package]
+name = "nsl-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nsl-ast.workspace = true
+nsl-lexer.workspace = true
+nsl-semantic.workspace = true
+nsl-errors.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-object.workspace = true
+cranelift-native.workspace = true
+target-lexicon.workspace = true
+nsl-runtime = { path = "../nsl-runtime" }

@@ -1,0 +1,40 @@
+# ── Math functions ──────────────────────────────────
+print(sqrt(16.0))
+print(sqrt(9))
+print(abs(-42))
+print(min(3, 7))
+print(max(3, 7))
+
+# ── Assert ──────────────────────────────────────────
+assert(1 == 1, "basic assert")
+assert(sqrt(4.0) == 2.0, "sqrt assert")
+
+# ── File I/O ────────────────────────────────────────
+write_file("test_m6.txt", "hello NSL file I/O")
+let content = read_file("test_m6.txt")
+print(content)
+assert(file_exists("test_m6.txt"), "file should exist")
+assert(not file_exists("nonexistent.txt"), "file should not exist")
+
+# ── Command-line args ───────────────────────────────
+let a = args()
+print(len(a))
+
+# ── Closures ────────────────────────────────────────
+let offset = 10
+let adder = |x: int| x + offset
+print(adder(5))
+print(adder(20))
+
+let multiplier = 3
+let scale = |x: int| x * multiplier
+print(scale(7))
+
+# ── While-let ───────────────────────────────────────
+let counter = 5
+while let n = counter:
+    print(n)
+    counter = counter - 1
+
+# ── Exit ────────────────────────────────────────────
+exit(0)

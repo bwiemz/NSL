@@ -1,0 +1,33 @@
+# M10 Shape Checking Demo
+
+# Shape inference from creation
+let a = zeros([3, 4])
+let b = ones([3, 4])
+
+# Shape propagation through arithmetic
+let c = a + b
+print(c)
+
+# Matmul with known shapes
+let x = ones([3, 4])
+let y = ones([4, 2])
+let z = x @ y
+print(z)
+
+# Scalar-tensor ops preserve shape
+let d = a * 2
+print(d)
+
+# Type annotations
+let w: Tensor<[4, 2], f64> = ones([4, 2])
+print(w)
+
+# Reshape with known shape
+let r = z.reshape([6, 1])
+print(r)
+
+# Transpose with known shape
+let t = x.transpose(0, 1)
+# t should be [4, 3], so t @ ones([3, 2]) should work
+let check = t @ ones([3, 2])
+print(check)
