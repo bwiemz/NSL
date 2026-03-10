@@ -172,6 +172,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cat", &[types::I64, types::I64], Some(types::I64)),
     // Embedding lookup (M15)
     ("nsl_tensor_embedding_lookup", &[types::I64, types::I64], Some(types::I64)),
+    // LayerNorm & RMSNorm (M15)
+    ("nsl_tensor_layernorm", &[types::I64, types::I64, types::I64, types::F64], Some(types::I64)),
+    ("nsl_tensor_rmsnorm", &[types::I64, types::I64, types::F64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

@@ -235,6 +235,23 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // layernorm(input, weight, bias, eps) -> tensor
+    def(
+        "layernorm",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone(), Type::Float],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // rmsnorm(input, weight, eps) -> tensor
+    def(
+        "rmsnorm",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), Type::Float],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Tensor reduction / element-wise builtins (take tensor(s), return tensor)
     for name in &["mean", "sum", "neg", "clamp", "reduce_max", "gather"] {
         def(

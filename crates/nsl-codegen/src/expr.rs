@@ -725,6 +725,32 @@ impl Compiler<'_> {
             let indices = self.compile_expr(builder, state, &args[2].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_gather", &[t, dim, indices]);
         }
+        // layernorm(input, weight, bias, eps) -> tensor
+        if func_name == "layernorm" && !self.functions.contains_key(&func_name) {
+            if args.len() != 4 {
+                return Err(CodegenError::new("layernorm() takes exactly 4 arguments (input, weight, bias, eps)"));
+            }
+            let input_val = self.compile_expr(builder, state, &args[0].value)?;
+            let weight_val = self.compile_expr(builder, state, &args[1].value)?;
+            let bias_val = self.compile_expr(builder, state, &args[2].value)?;
+            let eps_val = self.compile_expr(builder, state, &args[3].value)?;
+            // Ensure eps is f64
+            let eps_type = self.node_type(args[3].value.id).clone();
+            let eps_f = if is_float_type(&eps_type) { eps_val } else { builder.ins().fcvt_from_sint(cl_types::F64, eps_val) };
+            return self.compile_call_by_name(builder, "nsl_tensor_layernorm", &[input_val, weight_val, bias_val, eps_f]);
+        }
+        // rmsnorm(input, weight, eps) -> tensor
+        if func_name == "rmsnorm" && !self.functions.contains_key(&func_name) {
+            if args.len() != 3 {
+                return Err(CodegenError::new("rmsnorm() takes exactly 3 arguments (input, weight, eps)"));
+            }
+            let input_val = self.compile_expr(builder, state, &args[0].value)?;
+            let weight_val = self.compile_expr(builder, state, &args[1].value)?;
+            let eps_val = self.compile_expr(builder, state, &args[2].value)?;
+            let eps_type = self.node_type(args[2].value.id).clone();
+            let eps_f = if is_float_type(&eps_type) { eps_val } else { builder.ins().fcvt_from_sint(cl_types::F64, eps_val) };
+            return self.compile_call_by_name(builder, "nsl_tensor_rmsnorm", &[input_val, weight_val, eps_f]);
+        }
         // embedding_lookup(weight, indices) -> tensor
         if func_name == "embedding_lookup" && !self.functions.contains_key(&func_name) {
             if args.len() != 2 {

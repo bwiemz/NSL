@@ -50,6 +50,8 @@ pub enum TapeOp {
     Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
     Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
     EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
+    LayerNorm { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_mean: i64, saved_inv_std: i64, saved_weight: i64 },
+    RMSNorm { input: i64, weight: i64, out: i64, saved_input: i64, saved_rms: i64, saved_weight: i64 },
 }
 
 struct Tape {
@@ -158,6 +160,17 @@ pub extern "C" fn nsl_tape_stop() {
                 TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
                     tensor_free(*saved_weight);
                     tensor_free(*saved_indices);
+                }
+                TapeOp::LayerNorm { saved_input, saved_mean, saved_inv_std, saved_weight, .. } => {
+                    tensor_free(*saved_input);
+                    tensor_free(*saved_mean);
+                    tensor_free(*saved_inv_std);
+                    tensor_free(*saved_weight);
+                }
+                TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
+                    tensor_free(*saved_input);
+                    tensor_free(*saved_rms);
+                    tensor_free(*saved_weight);
                 }
                 _ => {}
             }
@@ -648,6 +661,143 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
     results
 }
 
+/// LayerNorm backward: returns (grad_input, grad_weight, grad_bias)
+/// Per row of size N:
+///   d_normalized = d_out * weight
+///   d_x = (1/N) * inv_std * (N * d_normalized - sum(d_normalized) - normalized * sum(d_normalized * normalized))
+///   d_weight = sum(d_out * normalized, across batch)
+///   d_bias = sum(d_out, across batch)
+fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr: i64, weight_ptr: i64) -> (i64, i64, i64) {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let mean_t = NslTensor::from_ptr(mean_ptr);
+    let inv_std_t = NslTensor::from_ptr(inv_std_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+
+    let total = input.len as usize;
+    let ndim = input.ndim as usize;
+    let n = unsafe { *input.shape.add(ndim - 1) } as usize;
+    let num_rows = total / n;
+    let nf = n as f64;
+
+    // grad_input: same shape as input
+    let dx_ptr = create_tensor_with_shape(
+        &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
+        0.0,
+    );
+    let dx = NslTensor::from_ptr(dx_ptr);
+
+    // grad_weight: shape [N]
+    let dw_ptr = create_tensor_with_shape(&[n as i64], 0.0);
+    let dw = NslTensor::from_ptr(dw_ptr);
+
+    // grad_bias: shape [N]
+    let db_ptr = create_tensor_with_shape(&[n as i64], 0.0);
+    let db = NslTensor::from_ptr(db_ptr);
+
+    for row in 0..num_rows {
+        let base = row * n;
+        let mean_val = unsafe { *mean_t.data.add(row) };
+        let inv_std_val = unsafe { *inv_std_t.data.add(row) };
+
+        // Compute d_normalized = d_out * weight, and normalized values
+        // Also accumulate sum(d_normalized) and sum(d_normalized * normalized)
+        let mut sum_dnorm = 0.0_f64;
+        let mut sum_dnorm_norm = 0.0_f64;
+
+        for j in 0..n {
+            let g = unsafe { *grad.data.add(base + j) };
+            let w = unsafe { *weight.data.add(j) };
+            let x = unsafe { *input.data.add(base + j) };
+            let normalized = (x - mean_val) * inv_std_val;
+            let d_normalized = g * w;
+            sum_dnorm += d_normalized;
+            sum_dnorm_norm += d_normalized * normalized;
+
+            // Accumulate d_weight and d_bias
+            unsafe {
+                *dw.data.add(j) += g * normalized;
+                *db.data.add(j) += g;
+            }
+        }
+
+        // Compute d_x for each element in this row
+        for j in 0..n {
+            let g = unsafe { *grad.data.add(base + j) };
+            let w = unsafe { *weight.data.add(j) };
+            let x = unsafe { *input.data.add(base + j) };
+            let normalized = (x - mean_val) * inv_std_val;
+            let d_normalized = g * w;
+            let d_x = (1.0 / nf) * inv_std_val * (nf * d_normalized - sum_dnorm - normalized * sum_dnorm_norm);
+            unsafe { *dx.data.add(base + j) = d_x };
+        }
+    }
+
+    (dx_ptr, dw_ptr, db_ptr)
+}
+
+/// RMSNorm backward: returns (grad_input, grad_weight)
+/// Per row of size N:
+///   d_x = weight * (d_out / rms - x * sum(d_out * x) / (N * rms^3))
+///   d_weight = sum(d_out * (x / rms), across batch)
+fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64) -> (i64, i64) {
+    use crate::tensor::NslTensor;
+
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let rms_t = NslTensor::from_ptr(rms_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+
+    let total = input.len as usize;
+    let ndim = input.ndim as usize;
+    let n = unsafe { *input.shape.add(ndim - 1) } as usize;
+    let num_rows = total / n;
+    let nf = n as f64;
+
+    // grad_input: same shape as input
+    let dx_ptr = create_tensor_with_shape(
+        &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
+        0.0,
+    );
+    let dx = NslTensor::from_ptr(dx_ptr);
+
+    // grad_weight: shape [N]
+    let dw_ptr = create_tensor_with_shape(&[n as i64], 0.0);
+    let dw = NslTensor::from_ptr(dw_ptr);
+
+    for row in 0..num_rows {
+        let base = row * n;
+        let rms_val = unsafe { *rms_t.data.add(row) };
+        let rms_cubed = rms_val * rms_val * rms_val;
+
+        // Compute sum(d_out * weight * x) for this row
+        let mut sum_dout_x = 0.0_f64;
+        for j in 0..n {
+            let g = unsafe { *grad.data.add(base + j) };
+            let w = unsafe { *weight.data.add(j) };
+            let x = unsafe { *input.data.add(base + j) };
+            sum_dout_x += g * w * x;
+        }
+
+        for j in 0..n {
+            let g = unsafe { *grad.data.add(base + j) };
+            let w = unsafe { *weight.data.add(j) };
+            let x = unsafe { *input.data.add(base + j) };
+
+            // d_x = w * (d_out / rms - x * sum(d_out * w * x) / (N * rms^3))
+            let d_x = w * (g / rms_val - x * sum_dout_x / (nf * rms_cubed));
+            unsafe { *dx.data.add(base + j) = d_x };
+
+            // d_weight accumulate: d_out * (x / rms)
+            unsafe { *dw.data.add(j) += g * (x / rms_val) };
+        }
+    }
+
+    (dx_ptr, dw_ptr)
+}
+
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
 #[no_mangle]
@@ -951,6 +1101,21 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     for (i, grad_piece) in grads.into_iter().enumerate() {
                         accumulate_grad(&mut grad_map, inputs[i], grad_piece);
                     }
+                }
+            }
+            TapeOp::LayerNorm { input, weight, bias, out, saved_input, saved_mean, saved_inv_std, saved_weight } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_input = layernorm_backward(g, *saved_input, *saved_mean, *saved_inv_std, *saved_weight);
+                    accumulate_grad(&mut grad_map, *input, grad_input.0);
+                    accumulate_grad(&mut grad_map, *weight, grad_input.1);
+                    accumulate_grad(&mut grad_map, *bias, grad_input.2);
+                }
+            }
+            TapeOp::RMSNorm { input, weight, out, saved_input, saved_rms, saved_weight } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_result = rmsnorm_backward(g, *saved_input, *saved_rms, *saved_weight);
+                    accumulate_grad(&mut grad_map, *input, grad_result.0);
+                    accumulate_grad(&mut grad_map, *weight, grad_result.1);
                 }
             }
         }

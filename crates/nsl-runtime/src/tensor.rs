@@ -2047,3 +2047,223 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 
     out_ptr
 }
+
+// === LayerNorm & RMSNorm (fused runtime primitives) ===
+
+/// LayerNorm: normalize over last dimension, then scale and shift.
+/// input: [*, N], weight: [N], bias: [N]
+/// For each "row" (slice along last dim):
+///   mean = mean(row)
+///   var = mean((row - mean)^2)
+///   normalized = (row - mean) / sqrt(var + eps)
+///   output = normalized * weight + bias
+/// Saves {input, mean, inv_std, weight} for backward.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_layernorm(
+    input_ptr: i64,
+    weight_ptr: i64,
+    bias_ptr: i64,
+    eps: f64,
+) -> i64 {
+    let input = NslTensor::from_ptr(input_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+    let bias = NslTensor::from_ptr(bias_ptr);
+
+    let total = input.len as usize;
+    let ndim = input.ndim as usize;
+    let n = unsafe { *input.shape.add(ndim - 1) } as usize; // last dim size
+    let num_rows = total / n;
+
+    // Allocate output with same shape as input
+    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(input.shape, out_shape, ndim) };
+    let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
+    let out_data = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Saved tensors for backward: mean [num_rows] and inv_std [num_rows]
+    let mean_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *mean_shape = num_rows as i64 };
+    let mean_strides = NslTensor::compute_strides(mean_shape, 1);
+    let mean_data = checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+
+    let inv_std_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *inv_std_shape = num_rows as i64 };
+    let inv_std_strides = NslTensor::compute_strides(inv_std_shape, 1);
+    let inv_std_data = checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+
+    for row in 0..num_rows {
+        let base = row * n;
+
+        // Compute mean
+        let mut sum = 0.0_f64;
+        for j in 0..n {
+            sum += unsafe { *input.data.add(base + j) };
+        }
+        let mean_val = sum / n as f64;
+
+        // Compute variance
+        let mut var = 0.0_f64;
+        for j in 0..n {
+            let diff = unsafe { *input.data.add(base + j) } - mean_val;
+            var += diff * diff;
+        }
+        var /= n as f64;
+
+        let inv_std_val = 1.0 / (var + eps).sqrt();
+
+        unsafe {
+            *mean_data.add(row) = mean_val;
+            *inv_std_data.add(row) = inv_std_val;
+        }
+
+        // normalized * weight + bias
+        for j in 0..n {
+            let x = unsafe { *input.data.add(base + j) };
+            let normalized = (x - mean_val) * inv_std_val;
+            let w = unsafe { *weight.data.add(j) };
+            let b = unsafe { *bias.data.add(j) };
+            unsafe { *out_data.add(base + j) = normalized * w + b };
+        }
+    }
+
+    let out = Box::new(NslTensor {
+        data: out_data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: ndim as i64,
+        len: total as i64,
+        refcount: 1,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    let mean_tensor = Box::new(NslTensor {
+        data: mean_data,
+        shape: mean_shape,
+        strides: mean_strides,
+        ndim: 1,
+        len: num_rows as i64,
+        refcount: 1,
+    });
+    let mean_ptr = Box::into_raw(mean_tensor) as i64;
+
+    let inv_std_tensor = Box::new(NslTensor {
+        data: inv_std_data,
+        shape: inv_std_shape,
+        strides: inv_std_strides,
+        ndim: 1,
+        len: num_rows as i64,
+        refcount: 1,
+    });
+    let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
+
+    if autodiff::is_recording() {
+        // Bump refcounts for saved tensors
+        NslTensor::from_ptr(input_ptr).refcount += 1;
+        NslTensor::from_ptr(weight_ptr).refcount += 1;
+        // mean and inv_std are freshly created with refcount=1; bump for tape
+        NslTensor::from_ptr(mean_ptr).refcount += 1;
+        NslTensor::from_ptr(inv_std_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::LayerNorm {
+            input: input_ptr,
+            weight: weight_ptr,
+            bias: bias_ptr,
+            out: out_ptr,
+            saved_input: input_ptr,
+            saved_mean: mean_ptr,
+            saved_inv_std: inv_std_ptr,
+            saved_weight: weight_ptr,
+        });
+    } else {
+        // Not recording — free the saved tensors since they won't be used
+        nsl_tensor_free(mean_ptr);
+        nsl_tensor_free(inv_std_ptr);
+    }
+
+    out_ptr
+}
+
+/// RMSNorm: normalize by root-mean-square, scale by weight (no bias, no mean subtraction).
+/// rms = sqrt(mean(x^2) + eps)
+/// output = x / rms * weight
+/// Saves {input, rms, weight} for backward.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) -> i64 {
+    let input = NslTensor::from_ptr(input_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+
+    let total = input.len as usize;
+    let ndim = input.ndim as usize;
+    let n = unsafe { *input.shape.add(ndim - 1) } as usize;
+    let num_rows = total / n;
+
+    // Allocate output with same shape as input
+    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(input.shape, out_shape, ndim) };
+    let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
+    let out_data = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Saved: rms per row [num_rows]
+    let rms_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *rms_shape = num_rows as i64 };
+    let rms_strides = NslTensor::compute_strides(rms_shape, 1);
+    let rms_data = checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+
+    for row in 0..num_rows {
+        let base = row * n;
+
+        // Compute mean(x^2)
+        let mut sum_sq = 0.0_f64;
+        for j in 0..n {
+            let x = unsafe { *input.data.add(base + j) };
+            sum_sq += x * x;
+        }
+        let rms_val = (sum_sq / n as f64 + eps).sqrt();
+
+        unsafe { *rms_data.add(row) = rms_val };
+
+        // output = x / rms * weight
+        for j in 0..n {
+            let x = unsafe { *input.data.add(base + j) };
+            let w = unsafe { *weight.data.add(j) };
+            unsafe { *out_data.add(base + j) = x / rms_val * w };
+        }
+    }
+
+    let out = Box::new(NslTensor {
+        data: out_data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: ndim as i64,
+        len: total as i64,
+        refcount: 1,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    let rms_tensor = Box::new(NslTensor {
+        data: rms_data,
+        shape: rms_shape,
+        strides: rms_strides,
+        ndim: 1,
+        len: num_rows as i64,
+        refcount: 1,
+    });
+    let rms_ptr = Box::into_raw(rms_tensor) as i64;
+
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(input_ptr).refcount += 1;
+        NslTensor::from_ptr(weight_ptr).refcount += 1;
+        NslTensor::from_ptr(rms_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::RMSNorm {
+            input: input_ptr,
+            weight: weight_ptr,
+            out: out_ptr,
+            saved_input: input_ptr,
+            saved_rms: rms_ptr,
+            saved_weight: weight_ptr,
+        });
+    } else {
+        nsl_tensor_free(rms_ptr);
+    }
+
+    out_ptr
+}

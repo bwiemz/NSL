@@ -1,0 +1,8 @@
+let x = ones([2, 4])
+let w = ones([4])
+let b = zeros([4])
+let out = layernorm(x, w, b, 0.00001)
+print(out)
+
+let rms_out = rmsnorm(x, w, 0.00001)
+print(rms_out)
