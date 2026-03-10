@@ -55,6 +55,7 @@ pub enum TapeOp {
     Dropout { a: i64, out: i64, saved_mask: i64, scale: f64 },
     Conv2d { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_weight: i64, stride_h: usize, stride_w: usize, pad_h: usize, pad_w: usize },
     MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
+    BiasAdd { tensor: i64, bias: i64, out: i64 },
 }
 
 struct Tape {
@@ -181,6 +182,10 @@ pub extern "C" fn nsl_tape_stop() {
                 TapeOp::Conv2d { saved_input, saved_weight, .. } => {
                     tensor_free(*saved_input);
                     tensor_free(*saved_weight);
+                }
+                TapeOp::BiasAdd { tensor, bias, .. } => {
+                    tensor_free(*tensor);
+                    tensor_free(*bias);
                 }
                 _ => {}
             }
@@ -1270,6 +1275,36 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = maxpool2d_backward(g, input_shape, saved_argmax);
                     accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::BiasAdd { tensor, bias, out } => {
+                // grad_tensor = upstream grad (same shape as tensor [M, N])
+                // grad_bias = sum(upstream grad, dim=0) -> [N]
+                if let Some(&g) = grad_map.get(out) {
+                    // grad for tensor is just the upstream gradient
+                    let grad_tensor = tensor_clone(g);
+                    accumulate_grad(&mut grad_map, *tensor, grad_tensor);
+
+                    // grad for bias = sum over batch dim (rows)
+                    let g_t = crate::tensor::NslTensor::from_ptr(g);
+                    let rows = unsafe { *g_t.shape.add(0) } as usize;
+                    let cols = unsafe { *g_t.shape.add(1) } as usize;
+
+                    let bias_shape_list = crate::list::nsl_list_new();
+                    crate::list::nsl_list_push(bias_shape_list, cols as i64);
+                    let grad_bias = tensor_zeros(bias_shape_list);
+                    crate::list::nsl_list_free(bias_shape_list);
+
+                    let grad_bias_t = crate::tensor::NslTensor::from_ptr(grad_bias);
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            unsafe {
+                                *grad_bias_t.data.add(j) += *g_t.data.add(i * cols + j);
+                            }
+                        }
+                    }
+
+                    accumulate_grad(&mut grad_map, *bias, grad_bias);
                 }
             }
         }

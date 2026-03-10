@@ -2525,3 +2525,79 @@ pub extern "C" fn nsl_tensor_maxpool2d(
 
     result_ptr
 }
+
+/// Add 1D bias [N] to 2D tensor [M, N] — broadcasts bias along rows.
+/// output[i, j] = tensor[i, j] + bias[j]
+#[no_mangle]
+pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let bias = NslTensor::from_ptr(bias_ptr);
+
+    if tensor.ndim != 2 {
+        eprintln!(
+            "nsl: bias_add requires 2D tensor (got {}D)",
+            tensor.ndim
+        );
+        std::process::abort();
+    }
+    if bias.ndim != 1 {
+        eprintln!(
+            "nsl: bias_add requires 1D bias (got {}D)",
+            bias.ndim
+        );
+        std::process::abort();
+    }
+
+    let rows = unsafe { *tensor.shape.add(0) } as usize;
+    let cols = unsafe { *tensor.shape.add(1) } as usize;
+    let bias_len = unsafe { *bias.shape.add(0) } as usize;
+
+    if cols != bias_len {
+        eprintln!(
+            "nsl: bias_add shape mismatch — tensor has {} cols but bias has {} elements",
+            cols, bias_len
+        );
+        std::process::abort();
+    }
+
+    // Output shape: same as tensor [rows, cols]
+    let out_ndim: i64 = 2;
+    let out_len = (rows * cols) as i64;
+    let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = rows as i64;
+        *out_shape.add(1) = cols as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+    let out_data = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..rows {
+        for j in 0..cols {
+            unsafe {
+                *out_data.add(i * cols + j) = *tensor.data.add(i * cols + j) + *bias.data.add(j);
+            }
+        }
+    }
+
+    let out = Box::new(NslTensor {
+        data: out_data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: out_ndim,
+        len: out_len,
+        refcount: 1,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(bias_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::BiasAdd {
+            tensor: tensor_ptr,
+            bias: bias_ptr,
+            out: out_ptr,
+        });
+    }
+
+    out_ptr
+}

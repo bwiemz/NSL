@@ -1,0 +1,4 @@
+let x = ones([2, 3])
+let b = full([3], 10.0)
+let y = bias_add(x, b)
+print(y)

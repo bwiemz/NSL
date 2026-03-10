@@ -845,6 +845,15 @@ impl Compiler<'_> {
             let indices_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_embedding_lookup", &[weight_val, indices_val]);
         }
+        // bias_add(tensor, bias) -> tensor — broadcasts 1D bias over 2D tensor
+        if func_name == "bias_add" && !self.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("bias_add() takes exactly 2 arguments (tensor, bias)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let bias_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_bias_add", &[tensor_val, bias_val]);
+        }
         // tensor_slice(tensor, dim, start, end) -> tensor
         if func_name == "tensor_slice" {
             if args.len() != 4 {
