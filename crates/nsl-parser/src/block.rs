@@ -202,23 +202,8 @@ pub fn parse_quant_block_stmt(p: &mut Parser) -> Stmt {
     // Parse output name
     let (name, _) = p.expect_ident();
 
-    // Expect 'from' (an identifier, not a keyword)
-    if let TokenKind::Ident(sym) = p.peek().clone() {
-        let text = p.interner.resolve(sym).unwrap_or("").to_string();
-        if text == "from" {
-            p.advance();
-        } else {
-            p.diagnostics.push(
-                nsl_errors::Diagnostic::error(format!("expected 'from', found '{text}'"))
-                    .with_label(p.current_span(), "expected 'from'"),
-            );
-        }
-    } else {
-        p.diagnostics.push(
-            nsl_errors::Diagnostic::error(format!("expected 'from', found {}", p.peek()))
-                .with_label(p.current_span(), "expected 'from'"),
-        );
-    }
+    // Expect 'from' keyword
+    p.expect(&TokenKind::From);
 
     // Parse source model name
     let (source, _) = p.expect_ident();
