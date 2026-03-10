@@ -1145,7 +1145,7 @@ impl Compiler<'_> {
         let momentum_const = builder.ins().f64const(momentum_value);
         let dampening_const = builder.ins().f64const(dampening_value);
         let weight_decay_const = builder.ins().f64const(weight_decay_value);
-        let nesterov_const = builder.ins().iconst(cl_types::I64, if nesterov_value { 1 } else { 0 });
+        let nesterov_const = builder.ins().iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
         let beta1_const = builder.ins().f64const(beta1_value);
         let beta2_const = builder.ins().f64const(beta2_value);
         let eps_const = builder.ins().f64const(eps_value);
