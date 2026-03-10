@@ -49,6 +49,7 @@ pub enum TapeOp {
     Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
     Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
+    EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
 }
 
 struct Tape {
@@ -153,6 +154,10 @@ pub extern "C" fn nsl_tape_stop() {
                 }
                 TapeOp::Gather { indices_ptr, .. } => {
                     tensor_free(*indices_ptr);
+                }
+                TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
+                    tensor_free(*saved_weight);
+                    tensor_free(*saved_indices);
                 }
                 _ => {}
             }
@@ -904,6 +909,39 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = slice_backward(g, input_shape, *dim as usize, *start as usize);
                     accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::EmbeddingLookup { weight, indices: _, out, saved_weight, saved_indices } => {
+                // Backward: scatter-add output gradient rows into weight gradient
+                if let Some(&g) = grad_map.get(out) {
+                    let w = crate::tensor::NslTensor::from_ptr(*saved_weight);
+                    let idx_t = crate::tensor::NslTensor::from_ptr(*saved_indices);
+                    let vocab_size = unsafe { *w.shape.add(0) } as usize;
+                    let embed_dim = unsafe { *w.shape.add(1) } as usize;
+                    let seq_len = unsafe { *idx_t.shape.add(0) } as usize;
+
+                    // Create zero gradient with same shape as weight [vocab_size, embed_dim]
+                    let w_shape_list = tensor_shape(*saved_weight);
+                    let grad_w = tensor_zeros(w_shape_list);
+                    crate::list::nsl_list_free(w_shape_list);
+
+                    let grad_w_t = crate::tensor::NslTensor::from_ptr(grad_w);
+                    let g_t = crate::tensor::NslTensor::from_ptr(g);
+
+                    // Scatter-add: for each position i, add grad_out[i, :] to grad_w[idx[i], :]
+                    for i in 0..seq_len {
+                        let idx = unsafe { *idx_t.data.add(i) } as usize;
+                        if idx < vocab_size {
+                            for j in 0..embed_dim {
+                                unsafe {
+                                    *grad_w_t.data.add(idx * embed_dim + j) +=
+                                        *g_t.data.add(i * embed_dim + j);
+                                }
+                            }
+                        }
+                    }
+
+                    accumulate_grad(&mut grad_map, *weight, grad_w);
                 }
             }
             TapeOp::Cat { inputs, out, dim, split_sizes } => {

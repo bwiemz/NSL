@@ -1,0 +1,4 @@
+let weight = ones([5, 3])
+let indices = arange(0.0, 3.0, 1.0)
+let out = embedding_lookup(weight, indices)
+print(out)

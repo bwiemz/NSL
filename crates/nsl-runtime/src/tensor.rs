@@ -1962,3 +1962,88 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 
     out_ptr
 }
+
+// === Embedding lookup ===
+
+/// Look up rows from an embedding weight matrix by integer indices.
+/// weight: [vocab_size, embed_dim], indices: [seq_len] (f64 values cast to integer indices)
+/// output: [seq_len, embed_dim]
+#[no_mangle]
+pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
+    let weight = NslTensor::from_ptr(weight_ptr);
+    let indices = NslTensor::from_ptr(indices_ptr);
+
+    if weight.ndim != 2 {
+        eprintln!(
+            "nsl: embedding_lookup requires 2D weight tensor (got {}D)",
+            weight.ndim
+        );
+        std::process::abort();
+    }
+    if indices.ndim != 1 {
+        eprintln!(
+            "nsl: embedding_lookup requires 1D indices tensor (got {}D)",
+            indices.ndim
+        );
+        std::process::abort();
+    }
+
+    let vocab_size = unsafe { *weight.shape.add(0) } as usize;
+    let embed_dim = unsafe { *weight.shape.add(1) } as usize;
+    let seq_len = unsafe { *indices.shape.add(0) } as usize;
+
+    // Output shape: [seq_len, embed_dim]
+    let out_ndim: i64 = 2;
+    let out_len = (seq_len * embed_dim) as i64;
+    let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = seq_len as i64;
+        *out_shape.add(1) = embed_dim as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+    let out_data =
+        checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    // For each index, copy the corresponding row from weight
+    for i in 0..seq_len {
+        let idx = unsafe { *indices.data.add(i) } as usize;
+        if idx >= vocab_size {
+            eprintln!(
+                "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
+                idx, vocab_size
+            );
+            std::process::abort();
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                weight.data.add(idx * embed_dim),
+                out_data.add(i * embed_dim),
+                embed_dim,
+            );
+        }
+    }
+
+    let out = Box::new(NslTensor {
+        data: out_data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: out_ndim,
+        len: out_len,
+        refcount: 1,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(weight_ptr).refcount += 1;
+        NslTensor::from_ptr(indices_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::EmbeddingLookup {
+            weight: weight_ptr,
+            indices: indices_ptr,
+            out: out_ptr,
+            saved_weight: weight_ptr,
+            saved_indices: indices_ptr,
+        });
+    }
+
+    out_ptr
+}

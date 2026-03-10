@@ -226,6 +226,15 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // embedding_lookup(weight, indices) -> tensor
+    def(
+        "embedding_lookup",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone()],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Tensor reduction / element-wise builtins (take tensor(s), return tensor)
     for name in &["mean", "sum", "neg", "clamp", "reduce_max", "gather"] {
         def(

@@ -725,6 +725,15 @@ impl Compiler<'_> {
             let indices = self.compile_expr(builder, state, &args[2].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_gather", &[t, dim, indices]);
         }
+        // embedding_lookup(weight, indices) -> tensor
+        if func_name == "embedding_lookup" && !self.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("embedding_lookup() takes exactly 2 arguments (weight, indices)"));
+            }
+            let weight_val = self.compile_expr(builder, state, &args[0].value)?;
+            let indices_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_embedding_lookup", &[weight_val, indices_val]);
+        }
         // tensor_slice(tensor, dim, start, end) -> tensor
         if func_name == "tensor_slice" {
             if args.len() != 4 {
