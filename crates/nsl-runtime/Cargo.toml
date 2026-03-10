@@ -9,3 +9,4 @@ description = "NeuralScript runtime library (static lib linked into compiled pro
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
