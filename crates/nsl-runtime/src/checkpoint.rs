@@ -5,6 +5,14 @@ use std::io::Write;
 const MAGIC: &[u8; 4] = b"NSLM";
 const VERSION: u32 = 1;
 
+/// Write helper: aborts on I/O error instead of panicking across extern "C".
+fn write_or_abort(file: &mut std::fs::File, buf: &[u8], context: &str) {
+    if let Err(e) = file.write_all(buf) {
+        eprintln!("nsl: model_save: {}: {}", context, e);
+        std::process::abort();
+    }
+}
+
 /// Save model parameters to .nslm binary format.
 /// path_ptr/path_len: string pointer and length for file path
 /// param_names_ptr: NslList of string pointers
@@ -22,10 +30,13 @@ pub extern "C" fn nsl_model_save(
     };
     let names = NslList::from_ptr(param_names_ptr);
     let tensors = NslList::from_ptr(param_tensors_ptr);
-    assert_eq!(
-        names.len, tensors.len,
-        "model_save: name/tensor count mismatch"
-    );
+    if names.len != tensors.len {
+        eprintln!(
+            "nsl: model_save: name/tensor count mismatch ({} names, {} tensors)",
+            names.len, tensors.len
+        );
+        std::process::abort();
+    }
 
     // Build JSON header
     let mut params_json = Vec::new();
@@ -33,7 +44,7 @@ pub extern "C" fn nsl_model_save(
     for i in 0..tensors.len as usize {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
-        assert_tensor_contiguous(tensor, i);
+        check_tensor_contiguous(tensor, i);
         let nbytes = (tensor.len as u64) * 8;
         let shape: Vec<i64> = (0..tensor.ndim as usize)
             .map(|d| unsafe { *tensor.shape.add(d) })
@@ -47,17 +58,27 @@ pub extern "C" fn nsl_model_save(
     let header = format!(r#"{{"params":[{}]}}"#, params_json.join(","));
     let header_bytes = header.as_bytes();
 
-    let mut file = std::fs::File::create(path).expect("model_save: cannot create file");
-    file.write_all(MAGIC).unwrap();
-    file.write_all(&VERSION.to_le_bytes()).unwrap();
-    file.write_all(&(header_bytes.len() as u64).to_le_bytes())
-        .unwrap();
-    file.write_all(header_bytes).unwrap();
+    let mut file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("nsl: model_save: cannot create file '{}': {}", path, e);
+            std::process::abort();
+        }
+    };
+    write_or_abort(&mut file, MAGIC, "write magic");
+    write_or_abort(&mut file, &VERSION.to_le_bytes(), "write version");
+    write_or_abort(
+        &mut file,
+        &(header_bytes.len() as u64).to_le_bytes(),
+        "write header size",
+    );
+    write_or_abort(&mut file, header_bytes, "write header");
 
     // Pad to 64-byte alignment
     let total_header = 4 + 4 + 8 + header_bytes.len();
     let padding = (64 - (total_header % 64)) % 64;
-    file.write_all(&vec![0u8; padding]).unwrap();
+    let pad_buf = [0u8; 64];
+    write_or_abort(&mut file, &pad_buf[..padding], "write padding");
 
     // Raw tensor data (little-endian f64)
     for i in 0..tensors.len as usize {
@@ -65,7 +86,7 @@ pub extern "C" fn nsl_model_save(
         let tensor = NslTensor::from_ptr(tensor_ptr);
         for j in 0..tensor.len as usize {
             let val = unsafe { *tensor.data.add(j) };
-            file.write_all(&val.to_le_bytes()).unwrap();
+            write_or_abort(&mut file, &val.to_le_bytes(), "write tensor data");
         }
     }
 }
@@ -78,12 +99,42 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
         std::str::from_utf8_unchecked(slice)
     };
     let tensors = NslList::from_ptr(param_tensors_ptr);
-    let data = std::fs::read(path).expect("model_load: cannot read file");
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("nsl: model_load: cannot read file '{}': {}", path, e);
+            std::process::abort();
+        }
+    };
 
-    assert_eq!(&data[0..4], MAGIC, "model_load: invalid .nslm file");
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    assert_eq!(version, VERSION, "model_load: unsupported version");
-    let header_size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+    if data.len() < 16 {
+        eprintln!(
+            "nsl: model_load: file too small ({} bytes, need at least 16)",
+            data.len()
+        );
+        std::process::abort();
+    }
+    if &data[0..4] != MAGIC {
+        eprintln!("nsl: model_load: invalid .nslm file (bad magic)");
+        std::process::abort();
+    }
+    let version = u32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .unwrap_or_else(|_| std::process::abort()),
+    );
+    if version != VERSION {
+        eprintln!(
+            "nsl: model_load: unsupported version {} (expected {})",
+            version, VERSION
+        );
+        std::process::abort();
+    }
+    let header_size = u64::from_le_bytes(
+        data[8..16]
+            .try_into()
+            .unwrap_or_else(|_| std::process::abort()),
+    ) as usize;
 
     let total_header = 16 + header_size;
     let padding = (64 - (total_header % 64)) % 64;
@@ -94,7 +145,18 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
         for j in 0..tensor.len as usize {
-            let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            if offset + 8 > data.len() {
+                eprintln!(
+                    "nsl: model_load: unexpected end of file at offset {} (tensor {}, element {})",
+                    offset, i, j
+                );
+                std::process::abort();
+            }
+            let val = f64::from_le_bytes(
+                data[offset..offset + 8]
+                    .try_into()
+                    .unwrap_or_else(|_| std::process::abort()),
+            );
             unsafe {
                 *tensor.data.add(j) = val;
             }
@@ -103,18 +165,20 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
     }
 }
 
-fn assert_tensor_contiguous(tensor: &NslTensor, idx: usize) {
+fn check_tensor_contiguous(tensor: &NslTensor, idx: usize) {
     if tensor.ndim <= 1 {
         return;
     }
     let mut expected_stride = 1i64;
     for d in (0..tensor.ndim as usize).rev() {
         let actual = unsafe { *tensor.strides.add(d) };
-        assert_eq!(
-            actual, expected_stride,
-            "model_save: parameter {} is not contiguous (dim {} stride {} expected {})",
-            idx, d, actual, expected_stride
-        );
+        if actual != expected_stride {
+            eprintln!(
+                "nsl: model_save: parameter {} is not contiguous (dim {} stride {} expected {})",
+                idx, d, actual, expected_stride
+            );
+            std::process::abort();
+        }
         expected_stride *= unsafe { *tensor.shape.add(d) };
     }
 }
