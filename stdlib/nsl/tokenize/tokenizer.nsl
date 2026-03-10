@@ -1,0 +1,20 @@
+# NSL Tokenizer stdlib wrappers
+# These wrap runtime builtins for import convenience
+
+fn create_byte_tokenizer() -> int:
+    return byte_tokenizer_new()
+
+fn encode(tok: int, text: str) -> Tensor:
+    return tokenizer_encode(tok, text)
+
+fn decode(tok: int, ids: Tensor) -> str:
+    return tokenizer_decode(tok, ids)
+
+fn vocab_size(tok: int) -> int:
+    return tokenizer_vocab_size(tok)
+
+fn save(tok: int, path: str):
+    tokenizer_save(tok, path)
+
+fn load(path: str) -> int:
+    return tokenizer_load(path)
