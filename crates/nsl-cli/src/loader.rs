@@ -97,6 +97,32 @@ fn inject_train_block_imports(
     for stmt in stmts {
         if let StmtKind::TrainBlock(train) = &stmt.kind {
             for section in &train.sections {
+                if let nsl_ast::block::TrainSection::Scheduler(expr) = section {
+                    // Auto-import nsl.optim.schedulers when a scheduler section is present
+                    if let ExprKind::Call { .. } = &expr.kind {
+                        let sched_segments = ["nsl", "optim", "schedulers"];
+                        let module_path: Vec<Symbol> = sched_segments
+                            .iter()
+                            .map(|s| Symbol(interner.get_or_intern(s)))
+                            .collect();
+
+                        let dummy_span = nsl_ast::Span {
+                            file_id: nsl_errors::FileId(0),
+                            start: nsl_errors::BytePos(0),
+                            end: nsl_errors::BytePos(0),
+                        };
+
+                        synthetic_stmts.push(Stmt {
+                            kind: StmtKind::FromImport(FromImportStmt {
+                                module_path,
+                                items: ImportItems::Glob,
+                                span: dummy_span,
+                            }),
+                            span: dummy_span,
+                            id: nsl_ast::NodeId::next(),
+                        });
+                    }
+                }
                 if let nsl_ast::block::TrainSection::Optimizer(expr) = section {
                     // Extract optimizer name from call expression: e.g. SGD(lr=0.01)
                     if let ExprKind::Call { callee, .. } = &expr.kind {

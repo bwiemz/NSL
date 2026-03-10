@@ -845,8 +845,13 @@ impl Compiler<'_> {
         let mut dampening_value: f64 = 0.0;
         let mut weight_decay_value: f64 = 0.0;
         let mut nesterov_value: bool = false;
+        let mut beta1_value: f64 = 0.9;
+        let mut beta2_value: f64 = 0.999;
+        let mut eps_value: f64 = 1e-8;
         let mut step_body: Option<&nsl_ast::stmt::Block> = None;
         let mut callbacks: Vec<&nsl_ast::block::CallbackDef> = Vec::new();
+        let mut scheduler_name = String::new();
+        let mut scheduler_args: Vec<(String, f64)> = Vec::new();
 
         for section in &train.sections {
             match section {
@@ -887,6 +892,21 @@ impl Compiler<'_> {
                                             nesterov_value = *b;
                                         }
                                     }
+                                    "beta1" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            beta1_value = *f;
+                                        }
+                                    }
+                                    "beta2" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            beta2_value = *f;
+                                        }
+                                    }
+                                    "eps" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            eps_value = *f;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -899,7 +919,24 @@ impl Compiler<'_> {
                 TrainSection::Callbacks(cbs) => {
                     callbacks.extend(cbs.iter());
                 }
-                _ => {} // Data, Scheduler, Eval, Distribute, Stmt — not yet implemented
+                TrainSection::Scheduler(expr) => {
+                    if let ExprKind::Call { callee, args } = &expr.kind {
+                        if let ExprKind::Ident(sym) = &callee.kind {
+                            scheduler_name = self.resolve_sym(*sym).to_string();
+                        }
+                        for arg in args {
+                            if let Some(name_sym) = arg.name {
+                                let name = self.resolve_sym(name_sym).to_string();
+                                if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                    scheduler_args.push((name, *f));
+                                } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                    scheduler_args.push((name, *n as f64));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {} // Data, Eval, Distribute, Stmt — not yet implemented
             }
         }
 
@@ -975,8 +1012,17 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_push", &[param_list, field_val])?;
         }
 
-        // ── 4. Create velocity buffers (1 per param for SGD) ────────────
-        let mut velocity_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        // ── 4. Create optimizer state buffers ─────────────────────────
+        // Number of state buffers per param depends on optimizer:
+        //   SGD/Lion/Muon: 1 (velocity/momentum)
+        //   Adam/AdamW/SOAP: 2 (first moment m, second moment v)
+        let num_state_buffers = match optimizer_name.as_str() {
+            "adam" | "adamw" | "soap" => 2,
+            _ => 1,
+        };
+
+        let mut state_buf_1: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        let mut state_buf_2: Vec<cranelift_codegen::ir::Value> = Vec::new();
         for field in &layout.fields {
             let field_val = builder.ins().load(
                 field.cl_type,
@@ -984,8 +1030,12 @@ impl Compiler<'_> {
                 model_ptr,
                 field.offset as i32,
             );
-            let vel = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
-            velocity_vals.push(vel);
+            let buf1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
+            state_buf_1.push(buf1);
+            if num_state_buffers >= 2 {
+                let buf2 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
+                state_buf_2.push(buf2);
+            }
         }
 
         // ── 5. Initialize lr and step_count variables ───────────────────
@@ -1096,6 +1146,9 @@ impl Compiler<'_> {
         let dampening_const = builder.ins().f64const(dampening_value);
         let weight_decay_const = builder.ins().f64const(weight_decay_value);
         let nesterov_const = builder.ins().iconst(cl_types::I64, if nesterov_value { 1 } else { 0 });
+        let beta1_const = builder.ins().f64const(beta1_value);
+        let beta2_const = builder.ins().f64const(beta2_value);
+        let eps_const = builder.ins().f64const(eps_value);
 
         for i in 0..num_params {
             let idx = builder.ins().iconst(cl_types::I64, i as i64);
@@ -1110,22 +1163,46 @@ impl Compiler<'_> {
                 builder, "nsl_list_get", &[grads_list, idx],
             )?;
 
-            let vel = velocity_vals[i];
-
-            // Call: sgd_step(param, grad, velocity, lr, momentum, dampening, weight_decay, nesterov)
             match optimizer_name.as_str() {
                 "sgd" => {
                     self.compile_call_by_name(
                         builder, &opt_fn,
-                        &[param_val, grad_val, vel, lr, momentum_const, dampening_const, weight_decay_const, nesterov_const],
+                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, dampening_const, weight_decay_const, nesterov_const],
+                    )?;
+                }
+                "adam" | "adamw" => {
+                    // Adam/AdamW need t = step_count + 1 (1-based) as float
+                    let t_val = builder.use_var(step_count_var);
+                    let one = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_one = builder.ins().iadd(t_val, one);
+                    let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const, weight_decay_const, t_float],
+                    )?;
+                }
+                "lion" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], lr, beta1_const, beta2_const, weight_decay_const],
+                    )?;
+                }
+                "muon" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, nesterov_const],
+                    )?;
+                }
+                "soap" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const],
                     )?;
                 }
                 _ => {
-                    // For now, only SGD is fully supported; others use a simpler 4-arg call
-                    self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, vel, lr],
-                    )?;
+                    return Err(CodegenError::new(format!(
+                        "unsupported optimizer '{}' in train block", optimizer_name
+                    )));
                 }
             }
         }
@@ -1135,6 +1212,94 @@ impl Compiler<'_> {
         let one_i64 = builder.ins().iconst(cl_types::I64, 1);
         let sc_next = builder.ins().iadd(sc, one_i64);
         builder.def_var(step_count_var, sc_next);
+
+        // 7g2. Scheduler: update learning rate if scheduler is configured
+        if !scheduler_name.is_empty() {
+            let sched_fn_name = match scheduler_name.to_lowercase().as_str() {
+                "constant_lr" | "constantlr" => "constant_lr",
+                "step_lr" | "steplr" => "step_lr",
+                "exponential_lr" | "exponentiallr" => "exponential_lr",
+                "linear_decay" | "lineardecay" => "linear_decay",
+                "cosine_anneal" | "cosineanneal" => "cosine_anneal",
+                "warmup_cosine" | "warmupcosine" => "warmup_cosine",
+                "one_cycle" | "onecycle" => "one_cycle",
+                _ => &scheduler_name,
+            };
+            let mangled = format!("nsl__optim__schedulers__{}", sched_fn_name);
+
+            // Find the actual function name (check functions/runtime_fns with fallback)
+            let sched_fn = if self.functions.contains_key(mangled.as_str()) {
+                mangled.clone()
+            } else {
+                let simple = sched_fn_name.to_string();
+                if self.functions.contains_key(simple.as_str()) {
+                    simple
+                } else if self.runtime_fns.contains_key(mangled.as_str()) {
+                    mangled.clone()
+                } else if self.runtime_fns.contains_key(simple.as_str()) {
+                    simple
+                } else {
+                    mangled.clone()
+                }
+            };
+
+            let base_lr_val = builder.ins().f64const(lr_value);
+            let step_count_val = builder.use_var(step_count_var);
+            let step_float = builder.ins().fcvt_from_sint(cl_types::F64, step_count_val);
+
+            let new_lr = match sched_fn_name {
+                "constant_lr" => {
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float])?
+                }
+                "step_lr" => {
+                    let step_size = scheduler_args.iter().find(|(n, _)| n == "step_size").map(|(_, v)| *v).unwrap_or(10.0);
+                    let gamma = scheduler_args.iter().find(|(n, _)| n == "gamma").map(|(_, v)| *v).unwrap_or(0.1);
+                    let ss_val = builder.ins().f64const(step_size);
+                    let g_val = builder.ins().f64const(gamma);
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ss_val, g_val])?
+                }
+                "exponential_lr" => {
+                    let gamma = scheduler_args.iter().find(|(n, _)| n == "gamma").map(|(_, v)| *v).unwrap_or(0.95);
+                    let g_val = builder.ins().f64const(gamma);
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, g_val])?
+                }
+                "linear_decay" => {
+                    let total_steps = scheduler_args.iter().find(|(n, _)| n == "total_steps").map(|(_, v)| *v).unwrap_or(1000.0);
+                    let end_factor = scheduler_args.iter().find(|(n, _)| n == "end_factor").map(|(_, v)| *v).unwrap_or(0.0);
+                    let ts_val = builder.ins().f64const(total_steps);
+                    let ef_val = builder.ins().f64const(end_factor);
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ts_val, ef_val])?
+                }
+                "cosine_anneal" => {
+                    let t_max = scheduler_args.iter().find(|(n, _)| n == "t_max").map(|(_, v)| *v).unwrap_or(1000.0);
+                    let eta_min = scheduler_args.iter().find(|(n, _)| n == "eta_min").map(|(_, v)| *v).unwrap_or(0.0);
+                    let tm_val = builder.ins().f64const(t_max);
+                    let em_val = builder.ins().f64const(eta_min);
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, tm_val, em_val])?
+                }
+                "warmup_cosine" => {
+                    let ws = scheduler_args.iter().find(|(n, _)| n == "warmup_steps").map(|(_, v)| *v).unwrap_or(100.0);
+                    let ts = scheduler_args.iter().find(|(n, _)| n == "total_steps").map(|(_, v)| *v).unwrap_or(1000.0);
+                    let ml = scheduler_args.iter().find(|(n, _)| n == "min_lr").map(|(_, v)| *v).unwrap_or(1e-5);
+                    let ws_val = builder.ins().f64const(ws);
+                    let ts_val = builder.ins().f64const(ts);
+                    let ml_val = builder.ins().f64const(ml);
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ws_val, ts_val, ml_val])?
+                }
+                "one_cycle" => {
+                    let max_lr = scheduler_args.iter().find(|(n, _)| n == "max_lr").map(|(_, v)| *v).unwrap_or(lr_value * 10.0);
+                    let total_steps = scheduler_args.iter().find(|(n, _)| n == "total_steps").map(|(_, v)| *v).unwrap_or(1000.0);
+                    let pct_start = scheduler_args.iter().find(|(n, _)| n == "pct_start").map(|(_, v)| *v).unwrap_or(0.3);
+                    let ml_val = builder.ins().f64const(max_lr);
+                    let ts_val = builder.ins().f64const(total_steps);
+                    let ps_val = builder.ins().f64const(pct_start);
+                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ml_val, ts_val, ps_val])?
+                }
+                _ => base_lr_val, // fallback: no change
+            };
+
+            builder.def_var(lr_var, new_lr);
+        }
 
         // 7h. Callbacks: compile on_step body with step_count and loss bound
         for cb in &callbacks {
