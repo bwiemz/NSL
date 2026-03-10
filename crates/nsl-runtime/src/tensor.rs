@@ -1,5 +1,5 @@
 use crate::autodiff;
-use crate::list::NslList;
+use crate::list::{nsl_list_new, nsl_list_push, NslList};
 use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
 
 #[repr(C)]
@@ -1371,6 +1371,92 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
             }
             // Free the NslTensor struct itself
             drop(Box::from_raw(tensor as *mut NslTensor));
+        }
+    }
+}
+
+// === In-place mutation ops (NOT taped — used outside grad blocks) ===
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
+    let dst = NslTensor::from_ptr(dst_ptr);
+    let src = NslTensor::from_ptr(src_ptr);
+    assert_eq!(
+        dst.len, src.len,
+        "nsl_tensor_copy_data: dst len {} != src len {}",
+        dst.len, src.len
+    );
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.data, dst.data, dst.len as usize);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
+    let dst = NslTensor::from_ptr(dst_ptr);
+    let src = NslTensor::from_ptr(src_ptr);
+    assert_eq!(
+        dst.len, src.len,
+        "nsl_tensor_add_inplace: dst len {} != src len {}",
+        dst.len, src.len
+    );
+    for i in 0..dst.len as usize {
+        unsafe {
+            *dst.data.add(i) += *src.data.add(i);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    unsafe {
+        std::ptr::write_bytes(tensor.data, 0, tensor.len as usize);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let shape_list = nsl_list_new();
+    for i in 0..tensor.ndim as usize {
+        unsafe {
+            nsl_list_push(shape_list, *tensor.shape.add(i));
+        }
+    }
+    nsl_tensor_zeros(shape_list)
+}
+
+// === Gradient clipping ===
+
+#[no_mangle]
+pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
+    let list = NslList::from_ptr(grad_list_ptr);
+    let num_grads = list.len as usize;
+
+    // Compute global L2 norm: sqrt(sum of squares of all elements across all tensors)
+    let mut sum_sq: f64 = 0.0;
+    for g in 0..num_grads {
+        let tensor_ptr = unsafe { *list.data.add(g) };
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        for i in 0..tensor.len as usize {
+            let val = unsafe { *tensor.data.add(i) };
+            sum_sq += val * val;
+        }
+    }
+    let norm = sum_sq.sqrt();
+
+    // If norm > max_norm, scale all gradients by (max_norm / (norm + 1e-6))
+    if norm > max_norm {
+        let scale = max_norm / (norm + 1e-6);
+        for g in 0..num_grads {
+            let tensor_ptr = unsafe { *list.data.add(g) };
+            let tensor = NslTensor::from_ptr(tensor_ptr);
+            for i in 0..tensor.len as usize {
+                unsafe {
+                    *tensor.data.add(i) *= scale;
+                }
+            }
         }
     }
 }

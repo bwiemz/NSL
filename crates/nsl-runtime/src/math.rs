@@ -30,3 +30,6 @@ pub extern "C" fn nsl_min_float(a: f64, b: f64) -> f64 { a.min(b) }
 
 #[no_mangle]
 pub extern "C" fn nsl_max_float(a: f64, b: f64) -> f64 { a.max(b) }
+
+#[no_mangle]
+pub extern "C" fn nsl_floor(x: f64) -> f64 { x.floor() }
