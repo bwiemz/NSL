@@ -132,6 +132,30 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tape_backward", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tape_pause", &[], None),
     ("nsl_tape_resume", &[], None),
+    // Element-wise tensor ops (M14)
+    ("nsl_tensor_exp", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_log", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_sqrt", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_abs", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_sign", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_clamp", &[types::I64, types::F64, types::F64], Some(types::I64)),
+    // Dimensional reductions (M14)
+    ("nsl_tensor_sum_dim", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_mean_dim", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_reduce_max", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_gather", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // In-place mutation ops (M14)
+    ("nsl_tensor_copy_data", &[types::I64, types::I64], None),
+    ("nsl_tensor_add_inplace", &[types::I64, types::I64], None),
+    ("nsl_tensor_zero_inplace", &[types::I64], None),
+    ("nsl_tensor_zeros_like", &[types::I64], Some(types::I64)),
+    // Gradient clipping (M14)
+    ("nsl_clip_grad_norm", &[types::I64, types::F64], None),
+    // Checkpoint I/O (M14)
+    ("nsl_model_save", &[types::I64, types::I64, types::I64, types::I64], None),
+    ("nsl_model_load", &[types::I64, types::I64, types::I64], None),
+    // Scalar math (M14)
+    ("nsl_floor", &[types::F64], Some(types::F64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

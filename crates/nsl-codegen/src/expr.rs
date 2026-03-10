@@ -584,6 +584,97 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_arange", &[start, stop, step]);
         }
 
+        // Element-wise tensor builtins (M14)
+        if matches!(func_name.as_str(), "exp" | "log" | "sqrt" | "abs" | "sign" | "neg") {
+            if args.len() != 1 {
+                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+            }
+            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let rt_name = format!("nsl_tensor_{func_name}");
+            return self.compile_call_by_name(builder, &rt_name, &[val]);
+        }
+        if func_name == "clamp" {
+            if args.len() != 3 {
+                return Err(CodegenError::new("clamp() takes exactly 3 arguments (tensor, min, max)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let min_val = self.compile_expr(builder, state, &args[1].value)?;
+            let max_val = self.compile_expr(builder, state, &args[2].value)?;
+            // Ensure min/max are f64
+            let min_type = self.node_type(args[1].value.id).clone();
+            let min_f = if is_float_type(&min_type) { min_val } else { builder.ins().fcvt_from_sint(cl_types::F64, min_val) };
+            let max_type = self.node_type(args[2].value.id).clone();
+            let max_f = if is_float_type(&max_type) { max_val } else { builder.ins().fcvt_from_sint(cl_types::F64, max_val) };
+            return self.compile_call_by_name(builder, "nsl_tensor_clamp", &[tensor_val, min_f, max_f]);
+        }
+        if func_name == "copy_data" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("copy_data() takes exactly 2 arguments (dest, src)"));
+            }
+            let dest = self.compile_expr(builder, state, &args[0].value)?;
+            let src = self.compile_expr(builder, state, &args[1].value)?;
+            self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dest, src])?;
+            return Ok(dest);
+        }
+        if func_name == "add_inplace" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("add_inplace() takes exactly 2 arguments (dest, src)"));
+            }
+            let dest = self.compile_expr(builder, state, &args[0].value)?;
+            let src = self.compile_expr(builder, state, &args[1].value)?;
+            self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dest, src])?;
+            return Ok(dest);
+        }
+        if func_name == "zero_inplace" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("zero_inplace() takes exactly 1 argument"));
+            }
+            let val = self.compile_expr(builder, state, &args[0].value)?;
+            self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[val])?;
+            return Ok(val);
+        }
+        if func_name == "zeros_like" {
+            if args.len() != 1 {
+                return Err(CodegenError::new("zeros_like() takes exactly 1 argument"));
+            }
+            let val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[val]);
+        }
+        if func_name == "reduce_max" {
+            if args.len() != 3 {
+                return Err(CodegenError::new("reduce_max() takes exactly 3 arguments (tensor, dim, keepdim)"));
+            }
+            let t = self.compile_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_expr(builder, state, &args[1].value)?;
+            let keepdim = self.compile_expr(builder, state, &args[2].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_reduce_max", &[t, dim, keepdim]);
+        }
+        if func_name == "gather" {
+            if args.len() != 3 {
+                return Err(CodegenError::new("gather() takes exactly 3 arguments (tensor, dim, indices)"));
+            }
+            let t = self.compile_expr(builder, state, &args[0].value)?;
+            let dim = self.compile_expr(builder, state, &args[1].value)?;
+            let indices = self.compile_expr(builder, state, &args[2].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_gather", &[t, dim, indices]);
+        }
+        // sum/mean with dim args — overload: sum(tensor) or sum(tensor, dim, keepdim)
+        if matches!(func_name.as_str(), "sum" | "mean") {
+            if args.len() == 1 {
+                let val = self.compile_expr(builder, state, &args[0].value)?;
+                let rt_name = format!("nsl_tensor_{func_name}");
+                return self.compile_call_by_name(builder, &rt_name, &[val]);
+            } else if args.len() == 3 {
+                let t = self.compile_expr(builder, state, &args[0].value)?;
+                let dim = self.compile_expr(builder, state, &args[1].value)?;
+                let keepdim = self.compile_expr(builder, state, &args[2].value)?;
+                let rt_name = format!("nsl_tensor_{func_name}_dim");
+                return self.compile_call_by_name(builder, &rt_name, &[t, dim, keepdim]);
+            } else {
+                return Err(CodegenError::new(format!("{func_name}() takes 1 or 3 arguments")));
+            }
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();
