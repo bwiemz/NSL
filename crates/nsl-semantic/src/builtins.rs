@@ -101,15 +101,23 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     );
 
     // Activation functions (take tensor, return tensor)
-    for name in &["relu", "gelu", "silu", "sigmoid", "tanh", "softmax"] {
+    for name in &["relu", "gelu", "silu", "sigmoid", "tanh"] {
         def(
             name,
             Type::Function {
-                params: vec![Type::Unknown],
-                ret: Box::new(Type::Unknown),
+                params: vec![tensor_ret.clone()],
+                ret: Box::new(tensor_ret.clone()),
             },
         );
     }
+    // softmax(tensor, dim) -> tensor
+    def(
+        "softmax",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
 
     // NN layer constructors
     for name in &[

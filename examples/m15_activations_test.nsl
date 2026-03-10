@@ -1,0 +1,19 @@
+let x = full([4], -1.0)
+let r = relu(x)
+print(r)
+
+let x2 = ones([2, 3])
+let g = gelu(x2)
+print(g)
+
+let s = sigmoid(zeros([3]))
+print(s)
+
+let t = tanh(zeros([3]))
+print(t)
+
+let si = silu(ones([3]))
+print(si)
+
+let sm = softmax(ones([2, 3]), 1)
+print(sm)

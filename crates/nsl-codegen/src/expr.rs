@@ -632,6 +632,34 @@ impl Compiler<'_> {
             let rt_name = format!("nsl_tensor_{func_name}");
             return self.compile_call_by_name(builder, &rt_name, &[val]);
         }
+        // Activation functions (M15): relu, gelu, silu, sigmoid — single tensor arg
+        if matches!(func_name.as_str(), "relu" | "gelu" | "silu" | "sigmoid")
+            && !self.functions.contains_key(&func_name)
+        {
+            if args.len() != 1 {
+                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+            }
+            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let rt_name = format!("nsl_tensor_{func_name}");
+            return self.compile_call_by_name(builder, &rt_name, &[val]);
+        }
+        // tanh activation: maps NSL name "tanh" to runtime "nsl_tensor_tanh_act"
+        if func_name == "tanh" && !self.functions.contains_key(&func_name) {
+            if args.len() != 1 {
+                return Err(CodegenError::new("tanh() takes exactly 1 argument"));
+            }
+            let val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_tanh_act", &[val]);
+        }
+        // softmax(tensor, dim) — two args
+        if func_name == "softmax" && !self.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("softmax() takes exactly 2 arguments (tensor, dim)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
+        }
         if func_name == "clamp" && !self.functions.contains_key(&func_name) {
             if args.len() != 3 {
                 return Err(CodegenError::new("clamp() takes exactly 3 arguments (tensor, min, max)"));

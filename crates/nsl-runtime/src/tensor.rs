@@ -1309,6 +1309,240 @@ pub(crate) fn nsl_tensor_clamp_backward(
     Box::into_raw(result) as i64
 }
 
+// === Activation functions ===
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let val = unsafe { *a.data.add(i) };
+        unsafe { *data.add(i) = if val > 0.0 { val } else { 0.0 } };
+    }
+
+    let result = Box::new(NslTensor {
+        data, shape, strides, ndim, len, refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::ReLU {
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+    for i in 0..len as usize {
+        let x = unsafe { *a.data.add(i) };
+        let inner = c * (x + 0.044715 * x * x * x);
+        unsafe { *data.add(i) = 0.5 * x * (1.0 + inner.tanh()) };
+    }
+
+    let result = Box::new(NslTensor {
+        data, shape, strides, ndim, len, refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::GELU {
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let x = unsafe { *a.data.add(i) };
+        let sig = 1.0 / (1.0 + (-x).exp());
+        unsafe { *data.add(i) = x * sig };
+    }
+
+    let result = Box::new(NslTensor {
+        data, shape, strides, ndim, len, refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::SiLU {
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let x = unsafe { *a.data.add(i) };
+        unsafe { *data.add(i) = 1.0 / (1.0 + (-x).exp()) };
+    }
+
+    let result = Box::new(NslTensor {
+        data, shape, strides, ndim, len, refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(result).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Sigmoid {
+            a: tensor_ptr,
+            out: result,
+            saved_out: result,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..len as usize {
+        let x = unsafe { *a.data.add(i) };
+        unsafe { *data.add(i) = x.tanh() };
+    }
+
+    let result = Box::new(NslTensor {
+        data, shape, strides, ndim, len, refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(result).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Tanh {
+            a: tensor_ptr,
+            out: result,
+            saved_out: result,
+        });
+    }
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
+    let a = NslTensor::from_ptr(tensor_ptr);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = checked_alloc_zeroed((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    // Normalize dim
+    let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
+
+    let a_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *a.shape.add(i) }).collect();
+    let a_strides: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *a.strides.add(i) }).collect();
+    let dim_size = a_shape[d] as usize;
+
+    // Iterate over all positions except along dim d
+    // Total number of "slices" = total / dim_size
+    let num_slices = (len as usize) / dim_size;
+
+    // For each slice, compute the base index (index with dim d = 0)
+    // We iterate linearly and reconstruct multi-dim indices
+    for slice_idx in 0..num_slices {
+        // Convert slice_idx to multi-dim index (skipping dim d)
+        let mut remaining = slice_idx;
+        let mut base_offset: usize = 0;
+        for axis in (0..ndim as usize).rev() {
+            if axis == d {
+                continue;
+            }
+            let idx = remaining % (a_shape[axis] as usize);
+            remaining /= a_shape[axis] as usize;
+            base_offset += idx * (a_strides[axis] as usize);
+        }
+
+        // Find max along dim for numerical stability
+        let mut max_val = f64::NEG_INFINITY;
+        for k in 0..dim_size {
+            let offset = base_offset + k * (a_strides[d] as usize);
+            let val = unsafe { *a.data.add(offset) };
+            if val > max_val {
+                max_val = val;
+            }
+        }
+
+        // Compute exp(x - max) and sum
+        let mut sum = 0.0_f64;
+        for k in 0..dim_size {
+            let offset = base_offset + k * (a_strides[d] as usize);
+            let val = unsafe { *a.data.add(offset) };
+            let e = (val - max_val).exp();
+            unsafe { *data.add(offset) = e };
+            sum += e;
+        }
+
+        // Normalize
+        for k in 0..dim_size {
+            let offset = base_offset + k * (a_strides[d] as usize);
+            unsafe { *data.add(offset) /= sum };
+        }
+    }
+
+    let result = Box::new(NslTensor {
+        data, shape, strides, ndim, len, refcount: 1,
+    });
+    let result = Box::into_raw(result) as i64;
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(result).refcount += 1;
+        autodiff::maybe_record(autodiff::TapeOp::Softmax {
+            a: tensor_ptr,
+            out: result,
+            saved_out: result,
+            dim,
+        });
+    }
+    result
+}
+
 // === Scalar extraction ===
 
 #[no_mangle]

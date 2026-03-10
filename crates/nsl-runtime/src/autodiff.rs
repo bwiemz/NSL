@@ -41,6 +41,12 @@ pub enum TapeOp {
     Sqrt { a: i64, out: i64, saved_out: i64 },
     Abs { a: i64, out: i64, saved_a: i64 },
     Clamp { a: i64, out: i64, saved_a: i64, min_val: f64, max_val: f64 },
+    ReLU { a: i64, out: i64, saved_a: i64 },
+    GELU { a: i64, out: i64, saved_a: i64 },
+    SiLU { a: i64, out: i64, saved_a: i64 },
+    Sigmoid { a: i64, out: i64, saved_out: i64 },
+    Tanh { a: i64, out: i64, saved_out: i64 },
+    Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
 }
 
 struct Tape {
@@ -129,12 +135,18 @@ pub extern "C" fn nsl_tape_stop() {
                     tensor_free(*saved_b);
                 }
                 TapeOp::Exp { saved_out, .. }
-                | TapeOp::Sqrt { saved_out, .. } => {
+                | TapeOp::Sqrt { saved_out, .. }
+                | TapeOp::Sigmoid { saved_out, .. }
+                | TapeOp::Tanh { saved_out, .. }
+                | TapeOp::Softmax { saved_out, .. } => {
                     tensor_free(*saved_out);
                 }
                 TapeOp::Log { saved_a, .. }
                 | TapeOp::Abs { saved_a, .. }
-                | TapeOp::Clamp { saved_a, .. } => {
+                | TapeOp::Clamp { saved_a, .. }
+                | TapeOp::ReLU { saved_a, .. }
+                | TapeOp::GELU { saved_a, .. }
+                | TapeOp::SiLU { saved_a, .. } => {
                     tensor_free(*saved_a);
                 }
                 TapeOp::Gather { indices_ptr, .. } => {
@@ -383,6 +395,163 @@ fn scatter_gather_grad(
     out_ptr
 }
 
+/// ReLU backward: grad * (input > 0 ? 1 : 0)
+fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let len = input.len as usize;
+    let ndim = input.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    for i in 0..len {
+        let x = unsafe { *input.data.add(i) };
+        let g = unsafe { *grad.data.add(i) };
+        unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
+    }
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
+/// GELU backward: gelu'(x) = 0.5*(1+tanh(c*(x+0.044715*x^3))) + 0.5*x*sech^2(c*(x+0.044715*x^3))*c*(1+3*0.044715*x^2)
+fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let len = input.len as usize;
+    let ndim = input.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+    for i in 0..len {
+        let x = unsafe { *input.data.add(i) };
+        let g = unsafe { *grad.data.add(i) };
+        let inner = c * (x + 0.044715 * x * x * x);
+        let tanh_inner = inner.tanh();
+        let sech2 = 1.0 - tanh_inner * tanh_inner;
+        let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
+        unsafe { *data.add(i) = g * deriv };
+    }
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
+/// SiLU backward: sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let len = input.len as usize;
+    let ndim = input.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    for i in 0..len {
+        let x = unsafe { *input.data.add(i) };
+        let g = unsafe { *grad.data.add(i) };
+        let sig = 1.0 / (1.0 + (-x).exp());
+        let deriv = sig * (1.0 + x * (1.0 - sig));
+        unsafe { *data.add(i) = g * deriv };
+    }
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
+/// Sigmoid backward: out * (1 - out)
+fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let out = NslTensor::from_ptr(out_ptr);
+    let len = out.len as usize;
+    let ndim = out.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    for i in 0..len {
+        let o = unsafe { *out.data.add(i) };
+        let g = unsafe { *grad.data.add(i) };
+        unsafe { *data.add(i) = g * o * (1.0 - o) };
+    }
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
+/// Tanh backward: 1 - out^2
+fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let out = NslTensor::from_ptr(out_ptr);
+    let len = out.len as usize;
+    let ndim = out.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    for i in 0..len {
+        let o = unsafe { *out.data.add(i) };
+        let g = unsafe { *grad.data.add(i) };
+        unsafe { *data.add(i) = g * (1.0 - o * o) };
+    }
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
+/// Softmax backward: grad_input_i = output_i * (grad_i - sum(grad * output)) along dim
+fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let out = NslTensor::from_ptr(out_ptr);
+    let len = out.len as usize;
+    let ndim = out.ndim;
+    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc_zeroed(len * std::mem::size_of::<f64>()) as *mut f64;
+
+    let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
+    let o_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.shape.add(i) }).collect();
+    let o_strides: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.strides.add(i) }).collect();
+    let dim_size = o_shape[d] as usize;
+    let num_slices = len / dim_size;
+
+    for slice_idx in 0..num_slices {
+        let mut remaining = slice_idx;
+        let mut base_offset: usize = 0;
+        for axis in (0..ndim as usize).rev() {
+            if axis == d { continue; }
+            let idx = remaining % (o_shape[axis] as usize);
+            remaining /= o_shape[axis] as usize;
+            base_offset += idx * (o_strides[axis] as usize);
+        }
+
+        // Compute dot = sum(grad * output) along this slice
+        let mut dot = 0.0_f64;
+        for k in 0..dim_size {
+            let offset = base_offset + k * (o_strides[d] as usize);
+            let g = unsafe { *grad.data.add(offset) };
+            let o = unsafe { *out.data.add(offset) };
+            dot += g * o;
+        }
+
+        // grad_input_i = output_i * (grad_i - dot)
+        for k in 0..dim_size {
+            let offset = base_offset + k * (o_strides[d] as usize);
+            let g = unsafe { *grad.data.add(offset) };
+            let o = unsafe { *out.data.add(offset) };
+            unsafe { *data.add(offset) = o * (g - dot) };
+        }
+    }
+
+    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    Box::into_raw(t) as i64
+}
+
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
 #[no_mangle]
@@ -596,6 +765,46 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let grad_a = crate::tensor::nsl_tensor_clamp_backward(
                         g, *saved_a, *min_val, *max_val,
                     );
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::ReLU { a, out, saved_a } => {
+                // d/da(relu(a)) = (a > 0) ? 1 : 0
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = relu_backward(g, *saved_a);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::GELU { a, out, saved_a } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = gelu_backward(g, *saved_a);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::SiLU { a, out, saved_a } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = silu_backward(g, *saved_a);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Sigmoid { a, out, saved_out } => {
+                // d/da(sigmoid(a)) = sigmoid(a) * (1 - sigmoid(a)) = out * (1 - out)
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = sigmoid_backward(g, *saved_out);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Tanh { a, out, saved_out } => {
+                // d/da(tanh(a)) = 1 - tanh(a)^2 = 1 - out^2
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = tanh_backward(g, *saved_out);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Softmax { a, out, saved_out, dim } => {
+                // grad_input_i = output_i * (grad_i - sum(grad * output)) along softmax dim
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_a = softmax_backward(g, *saved_out, *dim);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
