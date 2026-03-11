@@ -1,6 +1,8 @@
 //! CUDA runtime: context management, kernel launch, module cache.
 //! Only compiled when the `cuda` feature is enabled.
 
+use std::ffi::c_void;
+
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
@@ -21,7 +23,12 @@ pub(crate) mod inner {
 
     static CUDA_STATE: OnceLock<Mutex<CudaState>> = OnceLock::new();
 
-    pub(crate) fn ensure_init() -> &'static Mutex<CudaState> {
+    /// Ensure CUDA is initialized. Called from FFI exports.
+    pub(crate) fn init() {
+        let _ = state();
+    }
+
+    fn state() -> &'static Mutex<CudaState> {
         CUDA_STATE.get_or_init(|| {
             unsafe {
                 let result = cuInit(0);
@@ -40,11 +47,18 @@ pub(crate) mod inner {
                     result
                 );
                 let mut context: CUcontext = std::ptr::null_mut();
-                let result = cuCtxCreate_v2(&mut context, 0, device);
+                let result = cuDevicePrimaryCtxRetain(&mut context, device);
                 assert_eq!(
                     result,
                     CUresult::CUDA_SUCCESS,
-                    "cuCtxCreate failed: {:?}",
+                    "cuDevicePrimaryCtxRetain failed: {:?}",
+                    result
+                );
+                let result = cuCtxSetCurrent(context);
+                assert_eq!(
+                    result,
+                    CUresult::CUDA_SUCCESS,
+                    "cuCtxSetCurrent failed: {:?}",
                     result
                 );
                 Mutex::new(CudaState {
@@ -58,7 +72,7 @@ pub(crate) mod inner {
 
     /// Allocate unified memory (accessible from both CPU and GPU).
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
-        ensure_init();
+        state();
         unsafe {
             let mut ptr: CUdeviceptr = 0;
             let result = cuMemAllocManaged(
@@ -92,13 +106,18 @@ pub(crate) mod inner {
 
     /// Prefetch memory to device. Best-effort: silently ignores NOT_SUPPORTED.
     pub(crate) fn prefetch_to_device(ptr: *mut c_void, size_bytes: usize, device_id: i32) {
-        let state = ensure_init();
+        let state = state();
         let _guard = state.lock().unwrap();
         unsafe {
-            let result = cuMemPrefetchAsync(
+            let location = CUmemLocation {
+                type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+                id: device_id,
+            };
+            let result = cuMemPrefetchAsync_v2(
                 ptr as CUdeviceptr,
                 size_bytes,
-                device_id,
+                location,
+                0, // flags
                 std::ptr::null_mut(), // default stream
             );
             if result != CUresult::CUDA_SUCCESS
@@ -118,7 +137,7 @@ pub(crate) mod inner {
         block: [i64; 3],
         args: &[*mut c_void],
     ) -> CUresult {
-        let state = ensure_init();
+        let state = state();
         let mut guard = state.lock().unwrap();
 
         // Cache modules by PTX pointer address (stable .rodata addresses)
@@ -175,7 +194,7 @@ pub(crate) mod inner {
 pub extern "C" fn nsl_cuda_init() -> i64 {
     #[cfg(feature = "cuda")]
     {
-        inner::ensure_init();
+        inner::init();
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -228,5 +247,116 @@ pub extern "C" fn nsl_kernel_launch(
         let _ = (block_x, block_y, block_z, args_ptr, num_args);
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    const VEC_ADD_PTX: &str = "\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry vec_add(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 c_ptr,
+    .param .u64 n
+) {
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %fs<4>;
+    .reg .pred %p1;
+
+    ld.param.u64 %rd1, [a_ptr];
+    ld.param.u64 %rd2, [b_ptr];
+    ld.param.u64 %rd3, [c_ptr];
+    ld.param.u64 %rd4, [n];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mul.lo.u32 %r3, %r1, %r2;
+    mov.u32 %r1, %tid.x;
+    add.u32 %r3, %r3, %r1;
+    cvt.u64.u32 %rd5, %r3;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.f32 %fs1, [%rd7];
+    add.u64 %rd7, %rd2, %rd6;
+    ld.global.f32 %fs2, [%rd7];
+    add.f32 %fs3, %fs1, %fs2;
+    add.u64 %rd7, %rd3, %rd6;
+    st.global.f32 [%rd7], %fs3;
+
+DONE:
+    ret;
+}\0";
+
+    #[test]
+    fn test_vec_add_kernel_launch() {
+        let n: usize = 1024;
+        let size_bytes = n * std::mem::size_of::<f32>();
+
+        // Allocate unified memory
+        let a = inner::alloc_managed(size_bytes);
+        let b = inner::alloc_managed(size_bytes);
+        let c = inner::alloc_managed(size_bytes);
+
+        // Fill a and b on CPU (unified memory allows this)
+        let a_slice = unsafe { std::slice::from_raw_parts_mut(a as *mut f32, n) };
+        let b_slice = unsafe { std::slice::from_raw_parts_mut(b as *mut f32, n) };
+        for i in 0..n {
+            a_slice[i] = i as f32;
+            b_slice[i] = (i * 2) as f32;
+        }
+
+        // Launch kernel
+        let n_val = n as u64;
+        let mut a_arg = a as u64;
+        let mut b_arg = b as u64;
+        let mut c_arg = c as u64;
+        let mut n_arg = n_val;
+
+        let args: [*mut std::ffi::c_void; 4] = [
+            &mut a_arg as *mut _ as *mut std::ffi::c_void,
+            &mut b_arg as *mut _ as *mut std::ffi::c_void,
+            &mut c_arg as *mut _ as *mut std::ffi::c_void,
+            &mut n_arg as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let block_size = 256i64;
+        let grid_size = ((n as i64) + block_size - 1) / block_size;
+
+        let result = inner::kernel_launch(
+            VEC_ADD_PTX.as_ptr(),
+            "vec_add\0".as_ptr(),
+            [grid_size, 1, 1],
+            [block_size, 1, 1],
+            &args.map(|p| p),
+        );
+        assert_eq!(result as u32, 0, "kernel launch failed");
+
+        // Synchronize to ensure kernel completed
+        unsafe {
+            let sync = cudarc::driver::sys::cuCtxSynchronize();
+            assert_eq!(sync as u32, 0, "sync failed");
+        }
+
+        // Verify results on CPU (unified memory)
+        let c_slice = unsafe { std::slice::from_raw_parts(c as *const f32, n) };
+        for i in 0..n {
+            let expected = (i + i * 2) as f32;
+            assert_eq!(c_slice[i], expected, "mismatch at index {}", i);
+        }
+
+        // Cleanup
+        inner::free_managed(a);
+        inner::free_managed(b);
+        inner::free_managed(c);
     }
 }
