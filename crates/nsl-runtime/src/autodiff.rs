@@ -15,6 +15,7 @@ use crate::tensor::{
     nsl_tensor_mul_scalar as tensor_mul_scalar,
     nsl_tensor_neg as tensor_neg,
     nsl_tensor_ones as tensor_ones,
+    nsl_tensor_ones_like,
     nsl_tensor_shape as tensor_shape,
     nsl_tensor_sign as tensor_sign,
     nsl_tensor_transpose as tensor_transpose,
@@ -217,12 +218,9 @@ pub extern "C" fn nsl_tape_resume() {
     });
 }
 
-/// Create a tensor of ones with the same shape as the given tensor.
+/// Create a tensor of ones with the same shape and device as the given tensor.
 fn ones_like(tensor_ptr: i64) -> i64 {
-    let shape_list = tensor_shape(tensor_ptr);
-    let result = tensor_ones(shape_list);
-    crate::list::nsl_list_free(shape_list);
-    result
+    nsl_tensor_ones_like(tensor_ptr)
 }
 
 /// Accumulate gradient: grads[key] += grad_tensor.
