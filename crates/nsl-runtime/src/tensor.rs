@@ -715,6 +715,17 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
+    // GPU dispatch
+    {
+        let a = unsafe { &*(a_ptr as *const NslTensor) };
+        if a.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_matmul_f32(a_ptr, b_ptr); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
+
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
