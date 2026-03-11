@@ -1,0 +1,48 @@
+# M17 GPU Compute End-to-End Test
+
+# Custom kernel: scale and add bias (fused op)
+kernel scale_add(x, scale, bias, out):
+    let i = thread_id()
+    out[i] = x[i] * scale[i] + bias[i]
+
+# Test 1: GPU matmul
+let a = full([4, 8], 1.0)
+let b = full([8, 2], 0.5)
+let ga = a.to(cuda)
+let gb = b.to(cuda)
+let gc = ga @ gb
+let c = gc.to(cpu)
+assert_close(c, full([4, 2], 4.0), 0.1, 0.1)
+print("Test 1 matmul: PASS")
+
+# Test 2: GPU element-wise add
+let x = full([512], 3.0)
+let y = full([512], 2.0)
+let gx = x.to(cuda)
+let gy = y.to(cuda)
+let gsum = gx + gy
+let sum_cpu = gsum.to(cpu)
+assert_close(sum_cpu, full([512], 5.0), 0.01, 0.01)
+print("Test 2 add: PASS")
+
+# Test 3: GPU element-wise mul
+let gprod = gx * gy
+let prod_cpu = gprod.to(cpu)
+assert_close(prod_cpu, full([512], 6.0), 0.01, 0.01)
+print("Test 3 mul: PASS")
+
+# Test 4: Custom kernel (fused scale + bias)
+let data = full([256], 2.0)
+let sc = full([256], 3.0)
+let bi = full([256], 1.0)
+let result = zeros([256])
+let gdata = data.to(cuda)
+let gsc = sc.to(cuda)
+let gbi = bi.to(cuda)
+let gresult = result.to(cuda)
+scale_add(gdata, gsc, gbi, gresult, grid=1, block=256)
+let out = gresult.to(cpu)
+assert_close(out, full([256], 7.0), 0.01, 0.01)
+print("Test 4 kernel: PASS")
+
+print("m17_gpu_training_test: ALL PASS")

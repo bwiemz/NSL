@@ -216,8 +216,15 @@ impl Compiler<'_> {
         }
 
         // Tensor operations
-        let left_is_tensor = left_type.is_tensor();
-        let right_is_tensor = right_type.is_tensor();
+        // Unknown (indeterminate) types are treated as tensors when:
+        //  - The op is MatMul (@ is tensor-only)
+        //  - The other operand is a tensor
+        //  - Both operands are indeterminate (likely from .to(device) or other runtime returns)
+        let both_indeterminate = left_type.is_indeterminate() && right_type.is_indeterminate();
+        let left_is_tensor = left_type.is_tensor()
+            || (left_type.is_indeterminate() && (matches!(op, BinOp::MatMul) || right_type.is_tensor() || both_indeterminate));
+        let right_is_tensor = right_type.is_tensor()
+            || (right_type.is_indeterminate() && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
             return self.compile_tensor_binary_op(builder, lhs, rhs, op, left_is_tensor, right_is_tensor);
         }
