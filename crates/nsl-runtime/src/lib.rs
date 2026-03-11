@@ -17,6 +17,7 @@ pub mod assert;
 pub mod file_io;
 pub mod args;
 pub mod tensor;
+pub(crate) mod cpu;
 pub mod autodiff;
 pub mod checkpoint;
 pub mod tokenizer;
