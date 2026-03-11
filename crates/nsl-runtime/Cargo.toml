@@ -10,3 +10,8 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+cudarc = { version = "0.12", default-features = false, features = ["driver"], optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
