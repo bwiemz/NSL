@@ -1,0 +1,17 @@
+# Test Task 4: nsl_tensor_expand
+# [1,4] expand to [3,4]
+let a = full([1, 4], 5.0)
+let b = a.expand([3, 4])
+print(b)
+
+# [4] expand to [3,4] (right-align pads with 1 on left)
+let c = full([4], 7.0)
+let d = c.expand([3, 4])
+print(d)
+
+# [3,1] expand to [3,4]
+let e = full([3, 1], 9.0)
+let f = e.expand([3, 4])
+print(f)
+
+print("expand: PASS")
