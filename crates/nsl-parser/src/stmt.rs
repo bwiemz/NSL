@@ -338,6 +338,18 @@ fn parse_yield_stmt(p: &mut Parser) -> Stmt {
     }
 }
 
+/// Check whether an expression is a valid assignment target.
+fn is_valid_assign_target(expr: &nsl_ast::expr::Expr) -> bool {
+    use nsl_ast::expr::ExprKind;
+    matches!(
+        &expr.kind,
+        ExprKind::Ident(_)
+            | ExprKind::MemberAccess { .. }
+            | ExprKind::Subscript { .. }
+            | ExprKind::SelfRef
+    )
+}
+
 fn parse_expr_or_assign(p: &mut Parser) -> Stmt {
     let start = p.current_span();
     let expr = parse_expr(p);
@@ -353,6 +365,13 @@ fn parse_expr_or_assign(p: &mut Parser) -> Stmt {
     };
 
     if let Some(op) = op {
+        // Validate that the target is assignable
+        if !is_valid_assign_target(&expr) {
+            p.diagnostics.push(
+                nsl_errors::Diagnostic::error("invalid assignment target")
+                    .with_label(expr.span, "not assignable"),
+            );
+        }
         p.advance(); // consume assignment operator
         let value = parse_expr(p);
         let span = start.merge(value.span);

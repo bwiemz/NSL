@@ -862,18 +862,33 @@ impl<'a> TypeChecker<'a> {
             ExprKind::MemberAccess { object, member } => {
                 self.check_member_access(object, *member, expr.span)
             }
-            ExprKind::Subscript { object, index: _ } => {
+            ExprKind::Subscript { object, index } => {
                 let obj_ty = self.check_expr(object);
                 match &obj_ty {
                     Type::List(elem) => *elem.clone(),
                     Type::Dict(_, val) => *val.clone(),
                     Type::Str => Type::Str,
                     Type::Tuple(elems) => {
-                        // Can't know which element at compile time
                         if elems.is_empty() {
                             Type::Unknown
+                        } else if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
+                            if let ExprKind::IntLiteral(i) = &idx_expr.kind {
+                                let idx = if *i < 0 {
+                                    (*i + elems.len() as i64) as usize
+                                } else {
+                                    *i as usize
+                                };
+                                if idx < elems.len() {
+                                    elems[idx].clone()
+                                } else {
+                                    Type::Unknown
+                                }
+                            } else {
+                                Type::Unknown
+                            }
                         } else {
-                            elems[0].clone()
+                            // Slice or multi-dim on tuple
+                            Type::Unknown
                         }
                     }
                     _ => Type::Unknown,

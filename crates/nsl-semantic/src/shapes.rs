@@ -91,8 +91,8 @@ pub fn unify_dim(a: &Dim, b: &Dim) -> Option<Dim> {
             Some(Dim::Concrete(*n))
         }
 
-        // Different symbolic names: could be equal at runtime, accept conservatively
-        (Dim::Symbolic(a), Dim::Symbolic(_)) => Some(Dim::Symbolic(*a)),
+        // Different symbolic names: treat as incompatible to catch shape errors
+        (Dim::Symbolic(_), Dim::Symbolic(_)) => None,
 
         // Named dims: unify the inner size
         (Dim::Named { name: n1, size: s1 }, Dim::Named { name: n2, size: s2 }) if n1 == n2 => {
