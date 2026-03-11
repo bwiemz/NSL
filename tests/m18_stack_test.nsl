@@ -1,0 +1,13 @@
+# Test Task 3: nsl_tensor_stack
+# Three [4] tensors stacked at dim=0 -> [3,4]
+let a = full([4], 1.0)
+let b = full([4], 2.0)
+let c = full([4], 3.0)
+let result = stack([a, b, c], 0)
+print(result)
+
+# Stack at dim=1: [4,3]
+let result2 = stack([a, b, c], 1)
+print(result2)
+
+print("stack: PASS")
