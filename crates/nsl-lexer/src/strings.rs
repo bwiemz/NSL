@@ -114,9 +114,11 @@ fn lex_escape(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnos
         Some('u') => {
             if cursor.eat('{') {
                 let mut hex = String::new();
+                let mut found_close = false;
                 while let Some(c) = cursor.peek() {
                     if c == '}' {
                         cursor.advance();
+                        found_close = true;
                         break;
                     }
                     if c.is_ascii_hexdigit() && hex.len() < 6 {
@@ -130,8 +132,31 @@ fn lex_escape(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnos
                         return None;
                     }
                 }
+                if !found_close {
+                    diagnostics.push(
+                        Diagnostic::error("unterminated \\u{...} escape (missing '}')")
+                            .with_label(cursor.span_from(start), "here"),
+                    );
+                    return None;
+                }
+                if hex.is_empty() {
+                    diagnostics.push(
+                        Diagnostic::error("empty \\u{} escape sequence")
+                            .with_label(cursor.span_from(start), "here"),
+                    );
+                    return None;
+                }
                 let code = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
-                char::from_u32(code)
+                match char::from_u32(code) {
+                    Some(ch) => Some(ch),
+                    None => {
+                        diagnostics.push(
+                            Diagnostic::error(format!("invalid unicode code point: U+{:04X}", code))
+                                .with_label(cursor.span_from(start), "here"),
+                        );
+                        None
+                    }
+                }
             } else {
                 diagnostics.push(
                     Diagnostic::error("expected '{' after \\u")

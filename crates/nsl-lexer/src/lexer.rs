@@ -21,7 +21,8 @@ pub struct Lexer<'a> {
     /// Whether the previous line ended with a line continuation `\`.
     line_continuation: bool,
     /// F-string nesting state: each entry is the brace depth within an f-string expression.
-    fstring_stack: Vec<u32>,
+    /// Stack of (brace_depth, quote_char) for nested f-string expressions.
+    fstring_stack: Vec<(u32, char)>,
 }
 
 impl<'a> Lexer<'a> {
@@ -75,15 +76,15 @@ impl<'a> Lexer<'a> {
         // Handle f-string expression mode
         if !self.fstring_stack.is_empty() {
             if self.cursor.peek() == Some('}') {
-                let depth = self.fstring_stack.last_mut().unwrap();
+                let (depth, _quote) = self.fstring_stack.last_mut().unwrap();
                 if *depth == 0 {
-                    // End of f-string expression
+                    // End of f-string expression — resume text with the correct quote char
                     let start = self.cursor.pos();
                     self.cursor.advance();
                     self.push_token(TokenKind::FStringExprEnd, start);
-                    self.fstring_stack.pop();
-                    // Continue lexing the rest of the f-string text
-                    self.lex_fstring_text();
+                    let (_d, quote) = self.fstring_stack.pop().unwrap();
+                    // Continue lexing the rest of the f-string text with the original quote
+                    self.lex_fstring_text_with_quote(quote);
                     return;
                 } else {
                     *depth -= 1;
@@ -91,7 +92,7 @@ impl<'a> Lexer<'a> {
                 }
             } else if self.cursor.peek() == Some('{') {
                 // Nested brace in f-string expression
-                if let Some(depth) = self.fstring_stack.last_mut() {
+                if let Some((depth, _)) = self.fstring_stack.last_mut() {
                     *depth += 1;
                 }
                 // Fall through to normal `{` handling
@@ -203,8 +204,27 @@ impl<'a> Lexer<'a> {
                     if self.cursor.peek() == Some(quote) && self.cursor.peek_at(1) == Some(quote) {
                         self.cursor.advance();
                         self.cursor.advance();
-                        // Triple f-string — not yet supported, treat as regular string
+                        // Triple f-string — not yet supported; consume body until closing triple quotes
                         self.push_token(TokenKind::FStringStart, start);
+                        self.diagnostics.push(
+                            Diagnostic::error("triple-quoted f-strings are not yet supported")
+                                .with_label(self.cursor.span_from(start), "here"),
+                        );
+                        loop {
+                            match self.cursor.peek() {
+                                None => break,
+                                Some(c) if c == quote
+                                    && self.cursor.peek_at(1) == Some(quote)
+                                    && self.cursor.peek_at(2) == Some(quote) =>
+                                {
+                                    self.cursor.advance();
+                                    self.cursor.advance();
+                                    self.cursor.advance();
+                                    break;
+                                }
+                                _ => { self.cursor.advance(); }
+                            }
+                        }
                         self.push_token(TokenKind::FStringEnd, start);
                     } else {
                         self.push_token(TokenKind::FStringStart, start);
@@ -444,11 +464,6 @@ impl<'a> Lexer<'a> {
         ident
     }
 
-    fn lex_fstring_text(&mut self) {
-        // Default: double-quote f-string
-        self.lex_fstring_text_with_quote('"');
-    }
-
     fn lex_fstring_text_with_quote(&mut self, quote: char) {
         let start = self.cursor.pos();
         let mut text = String::new();
@@ -489,8 +504,8 @@ impl<'a> Lexer<'a> {
                         let brace_start = self.cursor.pos();
                         self.cursor.advance(); // consume {
                         self.push_token(TokenKind::FStringExprStart, brace_start);
-                        // Push f-string state with brace depth 0
-                        self.fstring_stack.push(0);
+                        // Push f-string state with brace depth 0 and the quote char
+                        self.fstring_stack.push((0, quote));
                         return; // Return to main scan loop to lex the expression
                     }
                 }
