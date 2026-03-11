@@ -77,10 +77,8 @@ pub extern "C" fn nsl_sorted(list_ptr: i64) -> i64 {
 pub extern "C" fn nsl_reversed(list_ptr: i64) -> i64 {
     let src = NslList::from_ptr(list_ptr);
     let result = nsl_list_new();
-    let mut i = src.len - 1;
-    while i >= 0 {
+    for i in (0..src.len).rev() {
         nsl_list_push(result, unsafe { *src.data.add(i as usize) });
-        i -= 1;
     }
     result
 }

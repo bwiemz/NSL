@@ -45,13 +45,19 @@ pub extern "C" fn nsl_model_save(
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
         check_tensor_contiguous(tensor, i);
-        let nbytes = (tensor.len as u64) * 8;
+        let elem_size = tensor.element_size();
+        let nbytes = (tensor.len as u64) * (elem_size as u64);
         let shape: Vec<i64> = (0..tensor.ndim as usize)
             .map(|d| unsafe { *tensor.shape.add(d) })
             .collect();
+        let name_ptr = unsafe { *names.data.add(i) };
+        let name = unsafe {
+            std::ffi::CStr::from_ptr(name_ptr as *const std::os::raw::c_char)
+        }.to_str().unwrap_or("?");
+        let dtype_str = if tensor.dtype == 1 { "f32" } else { "f64" };
         params_json.push(format!(
-            r#"{{"name":"param_{}","shape":{:?},"dtype":"f64","offset":{},"nbytes":{}}}"#,
-            i, shape, data_offset, nbytes
+            r#"{{"name":"{}","shape":{:?},"dtype":"{}","offset":{},"nbytes":{}}}"#,
+            name, shape, dtype_str, data_offset, nbytes
         ));
         data_offset += nbytes;
     }
@@ -80,14 +86,15 @@ pub extern "C" fn nsl_model_save(
     let pad_buf = [0u8; 64];
     write_or_abort(&mut file, &pad_buf[..padding], "write padding");
 
-    // Raw tensor data (little-endian f64)
+    // Raw tensor data (little-endian, dtype-aware)
     for i in 0..tensors.len as usize {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
-        for j in 0..tensor.len as usize {
-            let val = unsafe { *tensor.data_f64().add(j) };
-            write_or_abort(&mut file, &val.to_le_bytes(), "write tensor data");
-        }
+        let byte_count = (tensor.len as usize) * tensor.element_size();
+        let data_slice = unsafe {
+            std::slice::from_raw_parts(tensor.data as *const u8, byte_count)
+        };
+        write_or_abort(&mut file, data_slice, "write tensor data");
     }
 }
 
@@ -144,7 +151,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
     for i in 0..tensors.len as usize {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
-        let byte_count = (tensor.len as usize) * 8;
+        let byte_count = (tensor.len as usize) * tensor.element_size();
         if offset + byte_count > data.len() {
             eprintln!(
                 "nsl: model_load: unexpected end of file at offset {} (tensor {}, need {} bytes, have {})",
@@ -167,14 +174,23 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
 
         #[cfg(not(target_endian = "little"))]
         {
+            let elem_size = tensor.element_size();
             for j in 0..tensor.len as usize {
-                let val = f64::from_le_bytes(
-                    data[offset + j * 8..offset + j * 8 + 8]
-                        .try_into()
-                        .unwrap_or_else(|_| std::process::abort()),
-                );
-                unsafe {
-                    *tensor.data_f64().add(j) = val;
+                let start = offset + j * elem_size;
+                if tensor.dtype == 1 {
+                    let val = f32::from_le_bytes(
+                        data[start..start + 4]
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    );
+                    unsafe { *tensor.data_f32().add(j) = val; }
+                } else {
+                    let val = f64::from_le_bytes(
+                        data[start..start + 8]
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    );
+                    unsafe { *tensor.data_f64().add(j) = val; }
                 }
             }
         }
