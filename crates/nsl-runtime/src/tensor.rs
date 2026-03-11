@@ -84,8 +84,10 @@ impl NslTensor {
 
     pub(crate) fn copy_shape(src: *const i64, ndim: i64) -> *mut i64 {
         let n = ndim as usize;
-        let layout = std::alloc::Layout::array::<i64>(n).unwrap();
-        let dst = unsafe { std::alloc::alloc(layout) as *mut i64 };
+        if n == 0 {
+            return std::ptr::null_mut();
+        }
+        let dst = checked_alloc(n * std::mem::size_of::<i64>()) as *mut i64;
         unsafe { std::ptr::copy_nonoverlapping(src, dst, n); }
         dst
     }
@@ -1115,21 +1117,30 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
-    for i in 0..len as usize {
-        unsafe { *data.add(i) = -(*a.data_f64().add(i)) };
-    }
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = -(*a.data_f32().add(i)) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = -(*a.data_f64().add(i)) };
+        }
+        buf as *mut c_void
+    };
 
     let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+        data,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
-        device: 0,
-        dtype: 0,
+        device: a.device,
+        dtype: a.dtype,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1197,21 +1208,30 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
-    for i in 0..len as usize {
-        unsafe { *data.add(i) = *a.data_f64().add(i) * s };
-    }
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f32().add(i) * (s as f32) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f64().add(i) * s };
+        }
+        buf as *mut c_void
+    };
 
     let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+        data,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
-        device: 0,
-        dtype: 0,
+        device: a.device,
+        dtype: a.dtype,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1943,30 +1963,36 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
-    for i in 0..len as usize {
-        let val = unsafe { *a.data_f64().add(i) };
-        unsafe {
-            *data.add(i) = if val > 0.0 {
-                1.0
-            } else if val < 0.0 {
-                -1.0
-            } else {
-                0.0
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            let val = unsafe { *a.data_f32().add(i) };
+            unsafe {
+                *buf.add(i) = if val > 0.0 { 1.0f32 } else if val < 0.0 { -1.0f32 } else { 0.0f32 };
             }
-        };
-    }
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            let val = unsafe { *a.data_f64().add(i) };
+            unsafe {
+                *buf.add(i) = if val > 0.0 { 1.0 } else if val < 0.0 { -1.0 } else { 0.0 };
+            }
+        }
+        buf as *mut c_void
+    };
 
     let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+        data,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
-        device: 0,
-        dtype: 0,
+        device: a.device,
+        dtype: a.dtype,
     });
     // sign is non-differentiable — no tape recording
     Box::into_raw(result) as i64
@@ -2338,7 +2364,10 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
         );
         std::process::abort();
     }
-    unsafe { *tensor.data_f64() }
+    match tensor.dtype {
+        1 => unsafe { *tensor.data_f32() as f64 },
+        _ => unsafe { *tensor.data_f64() },
+    }
 }
 
 // === Display ===
@@ -2349,7 +2378,11 @@ pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
 
     if tensor.ndim == 0 {
         if tensor.len > 0 {
-            print_float_value(unsafe { *tensor.data_f64() });
+            let val = match tensor.dtype {
+                1 => unsafe { *tensor.data_f32() as f64 },
+                _ => unsafe { *tensor.data_f64() },
+            };
+            print_float_value(val);
             println!();
         } else {
             println!("tensor([])");
@@ -2358,7 +2391,7 @@ pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
     }
 
     print!("tensor(");
-    print_tensor_recursive(tensor.data_f64(), tensor.shape, tensor.strides, tensor.ndim, 0);
+    print_tensor_recursive(tensor.data as *const u8, tensor.dtype, tensor.shape, tensor.strides, tensor.ndim, 0);
     println!(")");
 }
 
@@ -2372,7 +2405,8 @@ fn print_float_value(v: f64) {
 }
 
 fn print_tensor_recursive(
-    data: *mut f64,
+    data: *const u8,
+    dtype: u8,
     shape: *mut i64,
     strides: *mut i64,
     ndim: i64,
@@ -2380,21 +2414,25 @@ fn print_tensor_recursive(
 ) {
     let size = unsafe { *shape.add(dim) } as usize;
     let stride = unsafe { *strides.add(dim) } as usize;
+    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
 
     print!("[");
     if dim as i64 == ndim - 1 {
         // Last dimension: print values
         for i in 0..size {
             if i > 0 { print!(", "); }
-            let val = unsafe { *data.add(i * stride) };
+            let val = match dtype {
+                1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
+                _ => unsafe { *(data as *const f64).add(i * stride) },
+            };
             print_float_value(val);
         }
     } else {
         // Recursive: print sub-arrays
         for i in 0..size {
             if i > 0 { print!(", "); }
-            let offset_data = unsafe { data.add(i * stride) };
-            print_tensor_recursive(offset_data, shape, strides, ndim, dim + 1);
+            let offset_data = unsafe { data.add(i * stride * elem_size) };
+            print_tensor_recursive(offset_data, dtype, shape, strides, ndim, dim + 1);
         }
     }
     print!("]");
@@ -2413,9 +2451,10 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let data_size = (len as usize) * std::mem::size_of::<f64>();
-    let data = checked_alloc(data_size) as *mut f64;
-    unsafe { std::ptr::copy_nonoverlapping(tensor.data_f64(), data, len as usize) };
+    let elem_size = tensor.element_size();
+    let data_size = (len as usize) * elem_size;
+    let data = checked_alloc(data_size);
+    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size) };
 
     let result = Box::new(NslTensor {
         data: data as *mut c_void,
@@ -2424,8 +2463,8 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         ndim,
         len,
         refcount: 1,
-        device: 0,
-        dtype: 0,
+        device: tensor.device,
+        dtype: tensor.dtype,
     });
     Box::into_raw(result) as i64
 }
@@ -2438,7 +2477,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     tensor.refcount -= 1;
     if tensor.refcount <= 0 {
-        let data_size = (tensor.len as usize) * std::mem::size_of::<f64>();
+        let data_size = (tensor.len as usize) * tensor.element_size();
         let shape_size = (tensor.ndim as usize) * std::mem::size_of::<i64>();
         let strides_size = shape_size;
 
@@ -2467,8 +2506,14 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_copy_data: dst len {} != src len {}",
         dst.len, src.len
     );
+    assert_eq!(
+        dst.dtype, src.dtype,
+        "nsl_tensor_copy_data: dtype mismatch (dst={}, src={})",
+        dst.dtype, src.dtype
+    );
+    let byte_count = (dst.len as usize) * dst.element_size();
     unsafe {
-        std::ptr::copy_nonoverlapping(src.data_f64(), dst.data_f64(), dst.len as usize);
+        std::ptr::copy_nonoverlapping(src.data as *const u8, dst.data as *mut u8, byte_count);
     }
 }
 
@@ -2481,9 +2526,18 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_add_inplace: dst len {} != src len {}",
         dst.len, src.len
     );
-    for i in 0..dst.len as usize {
-        unsafe {
-            *dst.data_f64().add(i) += *src.data_f64().add(i);
+    assert_eq!(
+        dst.dtype, src.dtype,
+        "nsl_tensor_add_inplace: dtype mismatch (dst={}, src={})",
+        dst.dtype, src.dtype
+    );
+    if dst.dtype == 1 {
+        for i in 0..dst.len as usize {
+            unsafe { *dst.data_f32().add(i) += *src.data_f32().add(i); }
+        }
+    } else {
+        for i in 0..dst.len as usize {
+            unsafe { *dst.data_f64().add(i) += *src.data_f64().add(i); }
         }
     }
 }
@@ -2491,8 +2545,9 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    let byte_count = (tensor.len as usize) * tensor.element_size();
     unsafe {
-        std::ptr::write_bytes(tensor.data_f64(), 0, tensor.len as usize);
+        std::ptr::write_bytes(tensor.data as *mut u8, 0, byte_count);
     }
 }
 

@@ -57,7 +57,10 @@ pub fn infix_binding_power(op: &TokenKind) -> Option<(u8, u8)> {
 pub fn prefix_binding_power(op: &TokenKind) -> Option<u8> {
     match op {
         TokenKind::Minus => Some(27),
-        TokenKind::Not => Some(5),
+        // `not` must bind tighter than `and` (lbp=6) and `or` (lbp=4) but looser
+        // than comparisons (lbp=10), matching Python's precedence:
+        // `not a and b` → `(not a) and b`; `not a < b` → `not (a < b)`
+        TokenKind::Not => Some(8),
         _ => None,
     }
 }
