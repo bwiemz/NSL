@@ -50,6 +50,15 @@ fn link_gcc_multi(
         cmd.arg("-ldl");
     }
 
+    // Link CUDA driver library if available
+    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+        let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
+        if cuda_lib.is_dir() {
+            cmd.arg(format!("-L{}", cuda_lib.display()));
+            cmd.arg("-lcuda");
+        }
+    }
+
     let status = cmd
         .status()
         .map_err(|e| CodegenError::new(format!("failed to run linker '{cc}': {e}")))?;
@@ -97,6 +106,15 @@ fn link_msvc_multi(
         "synchronization.lib",
         "/NODEFAULTLIB:LIBCMT",
     ]);
+
+    // Link CUDA driver library if available (needed when runtime has cuda feature)
+    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+        let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
+        if cuda_lib.is_dir() {
+            cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
+            cmd.arg("cuda.lib");
+        }
+    }
 
     let status = cmd
         .status()

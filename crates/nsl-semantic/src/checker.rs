@@ -421,7 +421,17 @@ impl<'a> TypeChecker<'a> {
             }
             StmtKind::KernelDef(kernel) => {
                 self.declare_symbol(kernel.name, Type::Unknown, kernel.span, true, false);
-                self.check_block(&kernel.body, ScopeKind::Function);
+                // Push kernel scope and register params (like fn_def)
+                let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Function);
+                let prev_scope = self.current_scope;
+                self.current_scope = scope;
+                for param in &kernel.params {
+                    self.declare_symbol(param.name, Type::Unknown, param.span, false, true);
+                }
+                for s in &kernel.body.stmts {
+                    self.check_stmt(s);
+                }
+                self.current_scope = prev_scope;
             }
             StmtKind::TokenizerDef(tok) => {
                 // Declare the tokenizer name; body validation deferred to M3.

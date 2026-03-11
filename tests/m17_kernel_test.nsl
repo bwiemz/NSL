@@ -1,0 +1,23 @@
+# M17 GPU/CUDA End-to-End Kernel Test
+# Tests: user-defined kernel, .to(device) transfers, kernel launch with grid/block
+
+kernel vec_add(a, b, c):
+    let i = thread_id()
+    c[i] = a[i] + b[i]
+
+let a = full([1024], 1.0)
+let b = full([1024], 2.0)
+let c = zeros([1024])
+
+# Transfer tensors to GPU
+let ga = a.to(cuda)
+let gb = b.to(cuda)
+let gc = c.to(cuda)
+
+# Launch kernel: 4 blocks x 256 threads = 1024 threads
+vec_add(ga, gb, gc, grid=4, block=256)
+
+# Transfer result back to CPU and verify
+let result = gc.to(cpu)
+assert_close(result, full([1024], 3.0), 0.01, 0.01)
+print("m17_kernel_test: PASS")

@@ -184,7 +184,7 @@ pub(crate) mod inner {
         let mut kernel_args: Vec<*mut c_void> = args.to_vec();
 
         unsafe {
-            cuLaunchKernel(
+            let result = cuLaunchKernel(
                 func,
                 grid[0] as u32,
                 grid[1] as u32,
@@ -196,7 +196,12 @@ pub(crate) mod inner {
                 std::ptr::null_mut(),       // default stream
                 kernel_args.as_mut_ptr(),
                 std::ptr::null_mut(),       // no extra
-            )
+            );
+            if result != CUresult::CUDA_SUCCESS {
+                return result;
+            }
+            // Synchronize to ensure kernel completed before host reads results
+            cuCtxSynchronize()
         }
     }
 }
