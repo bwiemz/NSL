@@ -1,0 +1,15 @@
+# Test Task 2: nsl_tensor_select
+# [3,4] select(dim=0, index=0) -> [4]
+let a = full([3, 4], 0.0)
+let b = a.select(0, 0)
+print(b)
+
+# select with negative index
+let c = a.select(0, -1)
+print(c)
+
+# select on dim=1 -> [3]
+let d = a.select(1, 2)
+print(d)
+
+print("select: PASS")
