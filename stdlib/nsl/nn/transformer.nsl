@@ -1,0 +1,13 @@
+from nsl.nn.layers import Linear, MLP
+from nsl.nn.norms import LayerNorm
+from nsl.nn.attention import Attention
+
+model TransformerBlock(dim: int, num_heads: int):
+    norm1: LayerNorm = LayerNorm(dim)
+    attn: Attention = Attention(dim, num_heads)
+    norm2: LayerNorm = LayerNorm(dim)
+    mlp: MLP = MLP(dim, dim * 4, dim)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.attn.forward(self.norm1.forward(x))
+        return h + self.mlp.forward(self.norm2.forward(h))

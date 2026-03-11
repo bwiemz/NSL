@@ -1,0 +1,7 @@
+from nsl.nn.transformer import TransformerBlock
+
+let block = TransformerBlock(32, 4)
+let x = randn([8, 32])
+let y = block.forward(x)
+print(y)
+print("transformer block: PASS")

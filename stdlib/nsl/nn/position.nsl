@@ -1,0 +1,8 @@
+model PositionalEmbedding(max_seq: int, dim: int):
+    pe: Tensor = randn([max_seq, dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let s = x.shape
+        let seq_len = s[0]
+        let pos = self.pe.slice(0, 0, seq_len)
+        return x + pos
