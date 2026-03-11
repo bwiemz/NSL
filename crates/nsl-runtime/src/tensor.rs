@@ -1829,6 +1829,49 @@ pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     }
 }
 
+/// Create a zeros tensor on a specific device.
+/// `device` = 0 for CPU, 1+ for CUDA device ID.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
+    if device == 0 {
+        return nsl_tensor_zeros(shape_list);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let list = NslList::from_ptr(shape_list);
+        let ndim = list.len;
+        let mut len: i64 = 1;
+        let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+        for i in 0..ndim as usize {
+            let dim = unsafe { *list.data.add(i) };
+            unsafe { *shape.add(i) = dim };
+            len *= dim;
+        }
+
+        // Allocate CUDA unified memory (f32). Unified memory is zero-initialized.
+        let data = crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>());
+
+        let strides = NslTensor::compute_strides(shape, ndim);
+
+        let tensor = Box::new(NslTensor {
+            data,
+            shape,
+            strides,
+            ndim,
+            len,
+            refcount: 1,
+            device: device as u8,
+            dtype: 1, // f32 for GPU tensors
+        });
+        Box::into_raw(tensor) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = shape_list;
+        panic!("CUDA support not compiled. Rebuild with --features cuda");
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -1838,9 +1881,50 @@ pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
             nsl_list_push(shape_list, *tensor.shape.add(i));
         }
     }
-    let result = nsl_tensor_zeros(shape_list);
+    let result = nsl_tensor_zeros_on(shape_list, tensor.device as i64);
     crate::list::nsl_list_free(shape_list);
     result
+}
+
+/// Create a ones tensor with the same shape and device as the input tensor.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
+    let t = NslTensor::from_ptr(tensor_ptr);
+    if t.device == 0 {
+        let shape_list = nsl_list_new();
+        for i in 0..t.ndim as usize {
+            unsafe { nsl_list_push(shape_list, *t.shape.add(i)); }
+        }
+        let result = nsl_tensor_ones(shape_list);
+        crate::list::nsl_list_free(shape_list);
+        return result;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let shape_list = nsl_list_new();
+        for i in 0..t.ndim as usize {
+            unsafe { nsl_list_push(shape_list, *t.shape.add(i)); }
+        }
+        let result = nsl_tensor_zeros_on(shape_list, t.device as i64);
+        crate::list::nsl_list_free(shape_list);
+        let result_t = NslTensor::from_ptr(result);
+        // Fill with 1.0f32 on CPU side (unified memory allows this)
+        let data = result_t.data_f32();
+        for i in 0..result_t.len as usize {
+            unsafe { *data.add(i) = 1.0f32; }
+        }
+        // Prefetch to device for optimal GPU access
+        crate::cuda::inner::prefetch_to_device(
+            result_t.data,
+            (result_t.len as usize) * std::mem::size_of::<f32>(),
+            (t.device - 1) as i32,
+        );
+        result
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        panic!("CUDA support not compiled. Rebuild with --features cuda");
+    }
 }
 
 // === Gradient clipping ===

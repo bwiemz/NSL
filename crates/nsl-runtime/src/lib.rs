@@ -18,6 +18,7 @@ pub mod file_io;
 pub mod args;
 pub mod tensor;
 pub(crate) mod cpu;
+pub(crate) mod cuda;
 pub mod autodiff;
 pub mod checkpoint;
 pub mod tokenizer;
