@@ -135,6 +135,8 @@ impl<'a> TypeChecker<'a> {
                 let iter_ty = self.check_expr(iterable);
                 let elem_ty = match &iter_ty {
                     Type::List(elem) => *elem.clone(),
+                    Type::Dict(key, _val) => *key.clone(),
+                    Type::Str => Type::Str,
                     _ => Type::Unknown,
                 };
                 let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Loop);
@@ -156,22 +158,26 @@ impl<'a> TypeChecker<'a> {
                 body,
             } => {
                 let ty = self.check_expr(expr);
+                let inner_ty = match &ty {
+                    Type::Optional(inner) => *inner.clone(),
+                    _ => ty,
+                };
                 let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Loop);
                 let prev = self.current_scope;
                 self.current_scope = scope;
-                self.declare_pattern(pattern, &ty);
+                self.declare_pattern(pattern, &inner_ty);
                 for s in &body.stmts {
                     self.check_stmt(s);
                 }
                 self.current_scope = prev;
             }
             StmtKind::Match { subject, arms } => {
-                self.check_expr(subject);
+                let subject_ty = self.check_expr(subject);
                 for arm in arms {
                     let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                     let prev = self.current_scope;
                     self.current_scope = scope;
-                    self.declare_pattern(&arm.pattern, &Type::Unknown);
+                    self.declare_pattern(&arm.pattern, &subject_ty);
                     if let Some(guard) = &arm.guard {
                         self.check_expr(guard);
                     }
@@ -864,6 +870,8 @@ impl<'a> TypeChecker<'a> {
             }
             ExprKind::Subscript { object, index } => {
                 let obj_ty = self.check_expr(object);
+                // Type-check the index expression(s)
+                self.check_subscript_kind(index);
                 match &obj_ty {
                     Type::List(elem) => *elem.clone(),
                     Type::Dict(_, val) => *val.clone(),
@@ -998,8 +1006,13 @@ impl<'a> TypeChecker<'a> {
             } => {
                 self.check_expr(condition);
                 let then_ty = self.check_expr(then_expr);
-                self.check_expr(else_expr);
-                then_ty
+                let else_ty = self.check_expr(else_expr);
+                // Use the more specific type when one branch is Unknown
+                if matches!(then_ty, Type::Unknown) {
+                    else_ty
+                } else {
+                    then_ty
+                }
             }
             ExprKind::Range { start, end, .. } => {
                 if let Some(s) = start {
@@ -1396,6 +1409,24 @@ impl<'a> TypeChecker<'a> {
                 Shape { dims }
             }
             _ => Shape::unknown(),
+        }
+    }
+
+    fn check_subscript_kind(&mut self, kind: &nsl_ast::expr::SubscriptKind) {
+        match kind {
+            nsl_ast::expr::SubscriptKind::Index(expr) => {
+                self.check_expr(expr);
+            }
+            nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => {
+                if let Some(e) = lower { self.check_expr(e); }
+                if let Some(e) = upper { self.check_expr(e); }
+                if let Some(e) = step { self.check_expr(e); }
+            }
+            nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
+                for d in dims {
+                    self.check_subscript_kind(d);
+                }
+            }
         }
     }
 
