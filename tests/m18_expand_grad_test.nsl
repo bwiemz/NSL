@@ -1,0 +1,9 @@
+let x = full([1, 4], 3.0)
+
+let (loss, grads) = grad(x):
+    let y = x.expand([3, 4])
+    let z = sum(y)
+    z
+
+print(grads)
+print("expand grad: PASS")
