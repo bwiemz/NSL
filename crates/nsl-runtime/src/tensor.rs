@@ -507,6 +507,459 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
     out_ptr
 }
 
+// ---------------------------------------------------------------------------
+// Task 1: nsl_tensor_unsqueeze
+// ---------------------------------------------------------------------------
+
+/// Insert a dimension of size 1 at position `dim`.
+/// Supports negative dims: dim=-1 inserts at the end (after last existing dim).
+/// Example: [3,4] with dim=0 → [1,3,4]; dim=1 → [3,1,4]; dim=-1 → [3,4,1]
+#[no_mangle]
+pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let old_ndim = tensor.ndim;
+    let new_ndim = old_ndim + 1;
+
+    // Normalize dim: valid range is [-(old_ndim+1), old_ndim]
+    // After normalization, insert position must be in [0, old_ndim]
+    let insert_pos = if dim < 0 {
+        dim + new_ndim // e.g., dim=-1, new_ndim=3 → insert at 2 (end)
+    } else {
+        dim
+    };
+
+    if insert_pos < 0 || insert_pos > old_ndim {
+        eprintln!(
+            "nsl: unsqueeze dim {} out of range for ndim {}",
+            dim, old_ndim
+        );
+        std::process::abort();
+    }
+    let insert_pos = insert_pos as usize;
+
+    // Build new shape: copy old shape, insert 1 at insert_pos
+    let new_shape = checked_alloc((new_ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..insert_pos {
+        unsafe { *new_shape.add(i) = *tensor.shape.add(i) };
+    }
+    unsafe { *new_shape.add(insert_pos) = 1 };
+    for i in insert_pos..old_ndim as usize {
+        unsafe { *new_shape.add(i + 1) = *tensor.shape.add(i) };
+    }
+
+    let strides = NslTensor::compute_strides(new_shape, new_ndim);
+    let len = tensor.len;
+
+    // Deep copy data (dtype-aware)
+    let data: *mut c_void = if tensor.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe { std::ptr::copy_nonoverlapping(tensor.data_f32(), buf, len as usize) };
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        unsafe { std::ptr::copy_nonoverlapping(tensor.data_f64(), buf, len as usize) };
+        buf as *mut c_void
+    };
+
+    let out = Box::new(NslTensor {
+        data,
+        shape: new_shape,
+        strides,
+        ndim: new_ndim,
+        len,
+        refcount: 1,
+        device: tensor.device,
+        dtype: tensor.dtype,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    // TODO: record TapeOp::Unsqueeze (Task 7)
+
+    out_ptr
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: nsl_tensor_select
+// ---------------------------------------------------------------------------
+
+/// Extract a hyperplane at `index` along `dim`, removing that dimension.
+/// Example: [3,4] with dim=0,index=0 → [4]; dim=1,index=2 → [3]
+/// Supports negative dim and index.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+
+    // Normalize dim
+    let d = if dim < 0 { (tensor.ndim + dim) as usize } else { dim as usize };
+    if d >= ndim {
+        eprintln!("nsl: select dim {} out of range for ndim {}", dim, ndim);
+        std::process::abort();
+    }
+
+    let dim_size = unsafe { *tensor.shape.add(d) };
+
+    // Normalize index
+    let idx = if index < 0 { index + dim_size } else { index };
+    if idx < 0 || idx >= dim_size {
+        eprintln!(
+            "nsl: select index {} out of range for dim {} size {}",
+            index, dim, dim_size
+        );
+        std::process::abort();
+    }
+    let idx = idx as usize;
+
+    // Build output shape: old shape minus the selected dimension
+    let out_ndim = (ndim - 1) as i64;
+    let out_shape = checked_alloc((ndim - 1) * std::mem::size_of::<i64>()) as *mut i64;
+    let mut out_axis = 0;
+    for i in 0..ndim {
+        if i != d {
+            unsafe { *out_shape.add(out_axis) = *tensor.shape.add(i) };
+            out_axis += 1;
+        }
+    }
+
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+    let out_len = NslTensor::total_elements(out_shape, out_ndim);
+
+    // The offset into the source tensor for the selected hyperplane
+    let in_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.strides.add(i) }).collect();
+    let base_offset = idx * in_strides[d] as usize;
+
+    // For the output, gather the remaining axes
+    let out_stride_vec: Vec<i64> = (0..ndim - 1).map(|i| unsafe { *out_strides.add(i) }).collect();
+    // Build mapping: output axis -> input axis (skipping d)
+    let axis_map: Vec<usize> = (0..ndim).filter(|&i| i != d).collect();
+
+    let data: *mut c_void = if tensor.dtype == 1 {
+        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for flat in 0..out_len as usize {
+            let mut remaining = flat;
+            let mut in_offset = base_offset;
+            for (oa, &ia) in axis_map.iter().enumerate() {
+                let i = remaining / out_stride_vec[oa] as usize;
+                remaining %= out_stride_vec[oa] as usize;
+                in_offset += i * in_strides[ia] as usize;
+            }
+            unsafe { *buf.add(flat) = *tensor.data_f32().add(in_offset) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for flat in 0..out_len as usize {
+            let mut remaining = flat;
+            let mut in_offset = base_offset;
+            for (oa, &ia) in axis_map.iter().enumerate() {
+                let i = remaining / out_stride_vec[oa] as usize;
+                remaining %= out_stride_vec[oa] as usize;
+                in_offset += i * in_strides[ia] as usize;
+            }
+            unsafe { *buf.add(flat) = *tensor.data_f64().add(in_offset) };
+        }
+        buf as *mut c_void
+    };
+
+    let out = Box::new(NslTensor {
+        data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: out_ndim,
+        len: out_len,
+        refcount: 1,
+        device: tensor.device,
+        dtype: tensor.dtype,
+    });
+    // NO tape recording — select is used internally for stack backward
+    Box::into_raw(out) as i64
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: nsl_tensor_stack
+// ---------------------------------------------------------------------------
+
+/// Stack a list of same-shape tensors along a NEW dimension at position `dim`.
+/// Example: three [4] tensors stacked at dim=0 → [3,4]; at dim=1 → [4,3]
+/// Input: NslList of tensor pointers (all must have identical shape).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
+    let list = NslList::from_ptr(list_ptr);
+    let num_tensors = list.len as usize;
+    assert!(num_tensors > 0, "nsl_tensor_stack: empty tensor list");
+
+    let first = NslTensor::from_ptr(unsafe { *list.data.add(0) });
+    let in_ndim = first.ndim as usize;
+    let out_ndim = (in_ndim + 1) as i64;
+
+    // Normalize dim into [0, out_ndim] range
+    let insert_pos = if dim < 0 {
+        (dim + out_ndim) as usize
+    } else {
+        dim as usize
+    };
+    assert!(
+        insert_pos <= in_ndim,
+        "nsl_tensor_stack: dim {} out of range for ndim {}",
+        dim, in_ndim
+    );
+
+    // Validate all tensors have the same shape
+    for t_idx in 0..num_tensors {
+        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        assert_eq!(t.ndim as usize, in_ndim, "nsl_tensor_stack: ndim mismatch");
+        for axis in 0..in_ndim {
+            let s1 = unsafe { *first.shape.add(axis) };
+            let s2 = unsafe { *t.shape.add(axis) };
+            assert_eq!(s1, s2, "nsl_tensor_stack: shape mismatch at axis {}: {} vs {}", axis, s1, s2);
+        }
+    }
+
+    // Build output shape: insert num_tensors at insert_pos
+    let out_shape = checked_alloc((out_ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..insert_pos {
+        unsafe { *out_shape.add(i) = *first.shape.add(i) };
+    }
+    unsafe { *out_shape.add(insert_pos) = num_tensors as i64 };
+    for i in insert_pos..in_ndim {
+        unsafe { *out_shape.add(i + 1) = *first.shape.add(i) };
+    }
+
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+    let out_len = NslTensor::total_elements(out_shape, out_ndim);
+    let per_tensor = first.len as usize;
+
+    // Copy data: tensor t goes into the slice [t, :, :, ...] along insert_pos
+    let data: *mut c_void = if first.dtype == 1 {
+        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
+            .map(|i| unsafe { *out_strides.add(i) })
+            .collect();
+        for t_idx in 0..num_tensors {
+            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+            let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
+            for flat in 0..per_tensor {
+                // Decode flat index in input tensor space
+                let mut remaining = flat;
+                let mut in_multi: Vec<usize> = vec![0; in_ndim];
+                for axis in 0..in_ndim {
+                    in_multi[axis] = remaining / t_strides[axis] as usize;
+                    remaining %= t_strides[axis] as usize;
+                }
+                // Build output multi-index: insert t_idx at insert_pos
+                let mut out_offset = t_idx * out_stride_vec[insert_pos] as usize;
+                for (ia, &iv) in in_multi.iter().enumerate() {
+                    let oa = if ia < insert_pos { ia } else { ia + 1 };
+                    out_offset += iv * out_stride_vec[oa] as usize;
+                }
+                unsafe { *buf.add(out_offset) = *t.data_f32().add(flat) };
+            }
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
+            .map(|i| unsafe { *out_strides.add(i) })
+            .collect();
+        for t_idx in 0..num_tensors {
+            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+            let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
+            for flat in 0..per_tensor {
+                let mut remaining = flat;
+                let mut in_multi: Vec<usize> = vec![0; in_ndim];
+                for axis in 0..in_ndim {
+                    in_multi[axis] = remaining / t_strides[axis] as usize;
+                    remaining %= t_strides[axis] as usize;
+                }
+                let mut out_offset = t_idx * out_stride_vec[insert_pos] as usize;
+                for (ia, &iv) in in_multi.iter().enumerate() {
+                    let oa = if ia < insert_pos { ia } else { ia + 1 };
+                    out_offset += iv * out_stride_vec[oa] as usize;
+                }
+                unsafe { *buf.add(out_offset) = *t.data_f64().add(flat) };
+            }
+        }
+        buf as *mut c_void
+    };
+
+    let out = Box::new(NslTensor {
+        data,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: out_ndim,
+        len: out_len,
+        refcount: 1,
+        device: first.device,
+        dtype: first.dtype,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    // TODO: record TapeOp::Stack (Task 9)
+
+    out_ptr
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: nsl_tensor_expand
+// ---------------------------------------------------------------------------
+
+/// Broadcast tensor to target shape by replicating data along size-1 dimensions.
+/// Right-aligns source shape with target (pads left with 1s if needed).
+/// For each dim: source=1 → replicate; source==target → keep; otherwise abort.
+/// Example: [1,4] expand to [3,4]; [4] expand to [3,4]
+/// Input: NslList of i64 for target shape.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let list = NslList::from_ptr(shape_list);
+    let target_ndim = list.len as usize;
+
+    // Read target shape
+    let mut target_shape: Vec<i64> = Vec::with_capacity(target_ndim);
+    for i in 0..target_ndim {
+        target_shape.push(unsafe { *list.data.add(i) });
+    }
+
+    // Right-align source shape (pad left with 1s)
+    let src_ndim = tensor.ndim as usize;
+    if src_ndim > target_ndim {
+        eprintln!(
+            "nsl: expand: source ndim {} > target ndim {}",
+            src_ndim, target_ndim
+        );
+        std::process::abort();
+    }
+    let pad = target_ndim - src_ndim;
+    let src_shape: Vec<i64> = (0..target_ndim).map(|i| {
+        if i < pad { 1 } else { unsafe { *tensor.shape.add(i - pad) } }
+    }).collect();
+
+    // Validate expand rules
+    for i in 0..target_ndim {
+        let s = src_shape[i];
+        let t = target_shape[i];
+        if s != 1 && s != t {
+            eprintln!(
+                "nsl: expand: source dim {} has size {} which cannot expand to {}",
+                i, s, t
+            );
+            std::process::abort();
+        }
+    }
+
+    // Compute output
+    let out_ndim = target_ndim as i64;
+    let out_shape_ptr = checked_alloc(target_ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..target_ndim {
+        unsafe { *out_shape_ptr.add(i) = target_shape[i] };
+    }
+    let out_strides = NslTensor::compute_strides(out_shape_ptr, out_ndim);
+    let out_len = NslTensor::total_elements(out_shape_ptr, out_ndim);
+
+    // Source strides (right-aligned, with stride=0 for padded/broadcast dims)
+    let src_strides: Vec<i64> = (0..target_ndim).map(|i| {
+        if i < pad {
+            0 // broadcast dimension
+        } else {
+            let src_i = i - pad;
+            if src_shape[i] == 1 && target_shape[i] > 1 {
+                0 // replicate
+            } else {
+                unsafe { *tensor.strides.add(src_i) }
+            }
+        }
+    }).collect();
+
+    let out_stride_vec: Vec<i64> = (0..target_ndim)
+        .map(|i| unsafe { *out_strides.add(i) })
+        .collect();
+
+    let data: *mut c_void = if tensor.dtype == 1 {
+        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for flat in 0..out_len as usize {
+            let mut remaining = flat;
+            let mut src_offset: usize = 0;
+            for axis in 0..target_ndim {
+                let idx = remaining / out_stride_vec[axis] as usize;
+                remaining %= out_stride_vec[axis] as usize;
+                src_offset += idx * src_strides[axis] as usize;
+            }
+            unsafe { *buf.add(flat) = *tensor.data_f32().add(src_offset) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for flat in 0..out_len as usize {
+            let mut remaining = flat;
+            let mut src_offset: usize = 0;
+            for axis in 0..target_ndim {
+                let idx = remaining / out_stride_vec[axis] as usize;
+                remaining %= out_stride_vec[axis] as usize;
+                src_offset += idx * src_strides[axis] as usize;
+            }
+            unsafe { *buf.add(flat) = *tensor.data_f64().add(src_offset) };
+        }
+        buf as *mut c_void
+    };
+
+    let out = Box::new(NslTensor {
+        data,
+        shape: out_shape_ptr,
+        strides: out_strides,
+        ndim: out_ndim,
+        len: out_len,
+        refcount: 1,
+        device: tensor.device,
+        dtype: tensor.dtype,
+    });
+    let out_ptr = Box::into_raw(out) as i64;
+
+    // TODO: record TapeOp::Expand (Task 8)
+
+    out_ptr
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: nsl_tensor_causal_mask
+// ---------------------------------------------------------------------------
+
+/// Create a [seq_len, seq_len] causal attention mask.
+/// Lower triangle (j <= i): 0.0; upper triangle (j > i): -1e9
+/// Always CPU (device=0), always f64 (dtype=0). Not recorded on tape.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
+    let n = seq_len as usize;
+    let len = seq_len * seq_len;
+
+    let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = seq_len;
+        *out_shape.add(1) = seq_len;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+
+    for i in 0..n {
+        for j in 0..n {
+            let val = if j <= i { 0.0_f64 } else { -1e9_f64 };
+            unsafe { *data.add(i * n + j) = val };
+        }
+    }
+
+    let out = Box::new(NslTensor {
+        data: data as *mut c_void,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: 2,
+        len,
+        refcount: 1,
+        device: 0,
+        dtype: 0,
+    });
+    // NOT recorded on tape — constant, no gradient
+    Box::into_raw(out) as i64
+}
+
 // === Elementwise arithmetic ===
 
 fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64 {

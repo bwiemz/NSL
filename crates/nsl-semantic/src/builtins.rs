@@ -333,6 +333,32 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // M18a shape manipulation free functions
+    // unsqueeze(tensor, dim) -> tensor
+    def(
+        "unsqueeze",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // stack(list_of_tensors, dim) -> tensor
+    def(
+        "stack",
+        Type::Function {
+            params: vec![Type::List(Box::new(tensor_ret.clone())), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    // causal_mask(seq_len) -> tensor
+    def(
+        "causal_mask",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Tokenizer functions (M15)
     def(
         "byte_tokenizer_new",

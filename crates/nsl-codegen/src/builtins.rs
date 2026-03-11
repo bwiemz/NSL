@@ -212,6 +212,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_cuda_init", &[], Some(types::I64)),
     ("nsl_kernel_launch", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_to_device", &[types::I64, types::I64], Some(types::I64)),
+    // Shape manipulation ops (M18a)
+    ("nsl_tensor_unsqueeze", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_select", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_stack", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_expand", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_causal_mask", &[types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

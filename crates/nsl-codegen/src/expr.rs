@@ -893,6 +893,32 @@ impl Compiler<'_> {
             let dim = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_cat", &[list, dim]);
         }
+        // M18a: unsqueeze(tensor, dim) — free function form
+        if func_name == "unsqueeze" && !self.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("unsqueeze() takes exactly 2 arguments (tensor, dim)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_unsqueeze", &[tensor_val, dim_val]);
+        }
+        // M18a: stack(list_of_tensors, dim) -> tensor
+        if func_name == "stack" && !self.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("stack() takes exactly 2 arguments (tensor_list, dim)"));
+            }
+            let list_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_stack", &[list_val, dim_val]);
+        }
+        // M18a: causal_mask(seq_len) -> tensor
+        if func_name == "causal_mask" && !self.functions.contains_key(&func_name) {
+            if args.len() != 1 {
+                return Err(CodegenError::new("causal_mask() takes exactly 1 argument (seq_len)"));
+            }
+            let seq_len_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len_val]);
+        }
         // sum/mean with dim args — overload: sum(tensor) or sum(tensor, dim, keepdim)
         if matches!(func_name.as_str(), "sum" | "mean") {
             if args.len() == 1 {
@@ -2349,6 +2375,29 @@ impl Compiler<'_> {
                 }
                 let device_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_to_device", &[obj_val, device_val])
+            }
+            // M18a shape ops
+            "unsqueeze" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::new("unsqueeze() takes exactly 1 argument (dim)"));
+                }
+                let dim_val = self.compile_expr(builder, state, &args[0].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_unsqueeze", &[obj_val, dim_val])
+            }
+            "select" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::new("select() takes exactly 2 arguments (dim, index)"));
+                }
+                let dim_val = self.compile_expr(builder, state, &args[0].value)?;
+                let idx_val = self.compile_expr(builder, state, &args[1].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_select", &[obj_val, dim_val, idx_val])
+            }
+            "expand" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::new("expand() takes exactly 1 argument (shape list)"));
+                }
+                let shape_val = self.compile_expr(builder, state, &args[0].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_expand", &[obj_val, shape_val])
             }
             _ => Err(CodegenError::new(format!("unknown tensor method '.{method}()'"))),
         }
