@@ -205,6 +205,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_qtensor_release", &[types::I64], None),
     ("nsl_qtensor_dtype", &[types::I64], Some(types::I64)),
     ("nsl_qtensor_shape", &[types::I64], Some(types::I64)),
+    // Tensor creation helpers (M17)
+    ("nsl_tensor_zeros_on", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_ones_like", &[types::I64], Some(types::I64)),
+    // GPU runtime functions (M17)
+    ("nsl_cuda_init", &[], Some(types::I64)),
+    ("nsl_kernel_launch", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_to_device", &[types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

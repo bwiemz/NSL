@@ -65,6 +65,8 @@ pub struct Compiler<'a> {
     pub test_fns: Vec<String>,
     /// Module prefix for name mangling. Empty means no mangling (entry module / single-file).
     pub module_prefix: String,
+    /// Kernel name → (ptx_data_id, name_data_id) for compiled GPU kernels.
+    pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
     func_index: u32,
 }
 
@@ -121,6 +123,7 @@ impl<'a> Compiler<'a> {
             no_grad_fns: HashSet::new(),
             test_fns: Vec::new(),
             module_prefix: String::new(),
+            kernel_ptx_data: HashMap::new(),
             func_index: 0,
         })
     }

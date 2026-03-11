@@ -187,8 +187,47 @@ impl Compiler<'_> {
             StmtKind::StructDef(_) | StmtKind::ModelDef(_)
             | StmtKind::EnumDef(_) | StmtKind::TraitDef(_)
             | StmtKind::Import(_) | StmtKind::FromImport(_)
-            | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_)
-            | StmtKind::KernelDef(_) => {}
+            | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_) => {}
+
+            StmtKind::KernelDef(kernel) => {
+                let ptx_bytes = crate::kernel::KernelCompiler::compile(kernel, self.interner);
+                let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+
+                // Embed PTX bytes in .rodata
+                let ptx_data_id = self.module
+                    .declare_data(
+                        &format!("__nsl_ptx_{}", kernel_name),
+                        cranelift_module::Linkage::Local,
+                        false,
+                        false,
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to declare PTX data for kernel '{}': {e}", kernel_name)))?;
+                let mut data_desc = cranelift_module::DataDescription::new();
+                data_desc.define(ptx_bytes.into_boxed_slice());
+                self.module
+                    .define_data(ptx_data_id, &data_desc)
+                    .map_err(|e| CodegenError::new(format!("failed to define PTX data for kernel '{}': {e}", kernel_name)))?;
+
+                // Embed kernel name (null-terminated) in .rodata
+                let mut name_bytes = kernel_name.as_bytes().to_vec();
+                name_bytes.push(0);
+                let name_data_id = self.module
+                    .declare_data(
+                        &format!("__nsl_ptx_name_{}", kernel_name),
+                        cranelift_module::Linkage::Local,
+                        false,
+                        false,
+                    )
+                    .map_err(|e| CodegenError::new(format!("failed to declare name data for kernel '{}': {e}", kernel_name)))?;
+                let mut name_desc = cranelift_module::DataDescription::new();
+                name_desc.define(name_bytes.into_boxed_slice());
+                self.module
+                    .define_data(name_data_id, &name_desc)
+                    .map_err(|e| CodegenError::new(format!("failed to define name data for kernel '{}': {e}", kernel_name)))?;
+
+                // Register for kernel call codegen
+                self.kernel_ptx_data.insert(kernel_name, (ptx_data_id, name_data_id));
+            }
 
             StmtKind::QuantBlock(ref quant) => {
                 self.compile_quant_block(builder, state, quant)?;

@@ -475,6 +475,27 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     );
     def("void", Type::Void);
 
+    // GPU kernel intrinsics (M17)
+    for name in &["thread_id", "thread_id_y", "block_id", "block_id_y", "block_dim"] {
+        def(
+            name,
+            Type::Function {
+                params: vec![],
+                ret: Box::new(Type::Int),
+            },
+        );
+    }
+    def(
+        "sync_threads",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Void),
+        },
+    );
+    // Device identifier constants (M17)
+    def("cuda", Type::Int);
+    def("cpu", Type::Int);
+
     // Higher-order functions
     def(
         "map",

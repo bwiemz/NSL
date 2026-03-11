@@ -2,7 +2,7 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{DataId, Linkage, Module};
 
 use nsl_ast::expr::{Expr, ExprKind, FStringPart, SubscriptKind};
 use nsl_ast::operator::{BinOp, UnaryOp};
@@ -35,6 +35,13 @@ impl Compiler<'_> {
                     Ok(builder.use_var(*var))
                 } else {
                     let name = self.resolve_sym(*sym).to_string();
+                    // Device constants for .to(device) calls
+                    if name == "cuda" {
+                        return Ok(builder.ins().iconst(cl_types::I64, 1));
+                    }
+                    if name == "cpu" {
+                        return Ok(builder.ins().iconst(cl_types::I64, 0));
+                    }
                     // Check if it's an enum variant
                     if let Some(tag) = self.lookup_enum_variant_tag(&name) {
                         Ok(builder.ins().iconst(cl_types::I64, tag))
@@ -403,6 +410,11 @@ impl Compiler<'_> {
                 return self.compile_indirect_call(builder, state, callee, args);
             }
         };
+
+        // Check if this is a kernel call (compiled GPU kernel)
+        if let Some((ptx_data_id, name_data_id)) = self.kernel_ptx_data.get(&func_name).cloned() {
+            return self.compile_kernel_call(builder, state, &func_name.clone(), args, ptx_data_id, name_data_id);
+        }
 
         if func_name == "print" {
             return self.compile_print_call(builder, state, args);
@@ -2317,7 +2329,99 @@ impl Compiler<'_> {
             }
             "clone" => self.compile_call_by_name(builder, "nsl_tensor_clone", &[obj_val]),
             "item" => self.compile_call_by_name(builder, "nsl_tensor_item", &[obj_val]),
+            "to" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::new("to() takes exactly 1 argument (device)"));
+                }
+                let device_val = self.compile_expr(builder, state, &args[0].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_to_device", &[obj_val, device_val])
+            }
             _ => Err(CodegenError::new(format!("unknown tensor method '.{method}()'"))),
         }
+    }
+
+    fn compile_kernel_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        _kernel_name: &str,
+        args: &[nsl_ast::expr::Arg],
+        ptx_data_id: DataId,
+        name_data_id: DataId,
+    ) -> Result<Value, CodegenError> {
+        // Separate positional args (tensor params) from named args (grid, block)
+        let mut tensor_args: Vec<Value> = Vec::new();
+        let mut grid_val: Option<Value> = None;
+        let mut block_val: Option<Value> = None;
+
+        for arg in args {
+            if let Some(name_sym) = arg.name {
+                let name = self.resolve_sym(name_sym).to_string();
+                match name.as_str() {
+                    "grid" => {
+                        grid_val = Some(self.compile_expr(builder, state, &arg.value)?);
+                    }
+                    "block" => {
+                        block_val = Some(self.compile_expr(builder, state, &arg.value)?);
+                    }
+                    _ => {
+                        tensor_args.push(self.compile_expr(builder, state, &arg.value)?);
+                    }
+                }
+            } else {
+                tensor_args.push(self.compile_expr(builder, state, &arg.value)?);
+            }
+        }
+
+        let grid_x = grid_val.unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 1));
+        let grid_y = builder.ins().iconst(cl_types::I64, 1);
+        let grid_z = builder.ins().iconst(cl_types::I64, 1);
+        let block_x = block_val.unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 256));
+        let block_y = builder.ins().iconst(cl_types::I64, 1);
+        let block_z = builder.ins().iconst(cl_types::I64, 1);
+
+        // Get PTX pointer from .rodata
+        let ptx_gv = self.module.declare_data_in_func(ptx_data_id, builder.func);
+        let ptx_ptr = builder.ins().global_value(cl_types::I64, ptx_gv);
+
+        // Get kernel name pointer from .rodata
+        let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
+        let name_ptr = builder.ins().global_value(cl_types::I64, name_gv);
+
+        // Build args array on stack: each tensor arg is an i64 (pointer)
+        let num_args = tensor_args.len();
+        if num_args == 0 {
+            // No tensor args — pass null pointer and 0 count
+            let null_ptr = builder.ins().iconst(cl_types::I64, 0);
+            let num_args_val = builder.ins().iconst(cl_types::I64, 0);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_kernel_launch",
+                &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, null_ptr, num_args_val],
+            );
+        }
+
+        let slot_size = (num_args * 8) as u32;
+        let ss = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            slot_size,
+            8,
+        ));
+
+        for (i, arg_val) in tensor_args.iter().enumerate() {
+            let offset = (i * 8) as i32;
+            builder.ins().stack_store(*arg_val, ss, offset);
+        }
+
+        let args_ptr = builder.ins().stack_addr(cl_types::I64, ss, 0);
+        let num_args_val = builder.ins().iconst(cl_types::I64, num_args as i64);
+
+        // Call nsl_kernel_launch(ptx_ptr, name_ptr, grid_x, grid_y, grid_z,
+        //                        block_x, block_y, block_z, args_ptr, num_args)
+        self.compile_call_by_name(
+            builder,
+            "nsl_kernel_launch",
+            &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val],
+        )
     }
 }

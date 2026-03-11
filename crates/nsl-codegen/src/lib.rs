@@ -4,6 +4,7 @@ pub mod context;
 pub mod error;
 pub mod expr;
 pub mod func;
+pub mod kernel;
 pub mod linker;
 pub mod stmt;
 pub mod types;
