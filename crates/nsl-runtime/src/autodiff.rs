@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::collections::{HashMap, HashSet};
 
 use crate::list::NslList;
@@ -270,12 +271,14 @@ fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
     };
 
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape: shape_ptr,
         strides,
         ndim,
         len: total,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -336,15 +339,17 @@ fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
         }
         // Copy data
         let new_data = checked_alloc((total as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        unsafe { std::ptr::copy_nonoverlapping(res.data, new_data, total as usize) };
+        unsafe { std::ptr::copy_nonoverlapping(res.data_f64(), new_data, total as usize) };
         let out = Box::new(NslTensor {
-            data: new_data,
+            data: new_data as *mut c_void,
             shape: new_shape,
             strides: new_strides,
             ndim: orig_ndim as i64,
             len: total,
             refcount: 1,
-        });
+        device: 0,
+        dtype: 0,
+    });
         let out_ptr = Box::into_raw(out) as i64;
         if result != grad_ptr {
             tensor_free(result);
@@ -399,7 +404,7 @@ fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i
         }
 
         unsafe {
-            *out.data.add(flat_idx) = *grad.data.add(grad_idx);
+            *out.data_f64().add(flat_idx) = *grad.data_f64().add(grad_idx);
         }
     }
 
@@ -454,8 +459,8 @@ fn scatter_grad_to_argmax(
             }
         }
 
-        let g_val = unsafe { *grad.data.add(grad_flat) };
-        unsafe { *out.data.add(out_offset) += g_val };
+        let g_val = unsafe { *grad.data_f64().add(grad_flat) };
+        unsafe { *out.data_f64().add(out_offset) += g_val };
     }
 
     out_ptr
@@ -485,8 +490,8 @@ fn scatter_gather_grad(
     // grad=[batch], output[b, indices[b]] += grad[b]
     let batch = indices.len as usize;
     for b in 0..batch {
-        let idx = unsafe { *indices.data.add(b) } as usize;
-        let g_val = unsafe { *grad.data.add(b) };
+        let idx = unsafe { *indices.data_f64().add(b) } as usize;
+        let g_val = unsafe { *grad.data_f64().add(b) };
         // out_offset = b * stride[0] + idx * stride[1]
         let mut out_offset = 0usize;
         // Build index: for dimensions before dim, use b; at dim, use idx
@@ -500,7 +505,7 @@ fn scatter_gather_grad(
                 out_offset = idx * out_strides[0] + b * out_strides[1];
             }
         }
-        unsafe { *out.data.add(out_offset) += g_val };
+        unsafe { *out.data_f64().add(out_offset) += g_val };
     }
 
     out_ptr
@@ -518,11 +523,11 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     for i in 0..len {
-        let x = unsafe { *input.data.add(i) };
-        let g = unsafe { *grad.data.add(i) };
+        let x = unsafe { *input.data_f64().add(i) };
+        let g = unsafe { *grad.data_f64().add(i) };
         unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
     }
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -539,15 +544,15 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     let c = (2.0_f64 / std::f64::consts::PI).sqrt();
     for i in 0..len {
-        let x = unsafe { *input.data.add(i) };
-        let g = unsafe { *grad.data.add(i) };
+        let x = unsafe { *input.data_f64().add(i) };
+        let g = unsafe { *grad.data_f64().add(i) };
         let inner = c * (x + 0.044715 * x * x * x);
         let tanh_inner = inner.tanh();
         let sech2 = 1.0 - tanh_inner * tanh_inner;
         let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
         unsafe { *data.add(i) = g * deriv };
     }
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -563,13 +568,13 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     for i in 0..len {
-        let x = unsafe { *input.data.add(i) };
-        let g = unsafe { *grad.data.add(i) };
+        let x = unsafe { *input.data_f64().add(i) };
+        let g = unsafe { *grad.data_f64().add(i) };
         let sig = 1.0 / (1.0 + (-x).exp());
         let deriv = sig * (1.0 + x * (1.0 - sig));
         unsafe { *data.add(i) = g * deriv };
     }
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -585,11 +590,11 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     for i in 0..len {
-        let o = unsafe { *out.data.add(i) };
-        let g = unsafe { *grad.data.add(i) };
+        let o = unsafe { *out.data_f64().add(i) };
+        let g = unsafe { *grad.data_f64().add(i) };
         unsafe { *data.add(i) = g * o * (1.0 - o) };
     }
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -605,11 +610,11 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     for i in 0..len {
-        let o = unsafe { *out.data.add(i) };
-        let g = unsafe { *grad.data.add(i) };
+        let o = unsafe { *out.data_f64().add(i) };
+        let g = unsafe { *grad.data_f64().add(i) };
         unsafe { *data.add(i) = g * (1.0 - o * o) };
     }
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -645,21 +650,21 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         let mut dot = 0.0_f64;
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = unsafe { *grad.data.add(offset) };
-            let o = unsafe { *out.data.add(offset) };
+            let g = unsafe { *grad.data_f64().add(offset) };
+            let o = unsafe { *out.data_f64().add(offset) };
             dot += g * o;
         }
 
         // grad_input_i = output_i * (grad_i - dot)
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = unsafe { *grad.data.add(offset) };
-            let o = unsafe { *out.data.add(offset) };
+            let g = unsafe { *grad.data_f64().add(offset) };
+            let o = unsafe { *out.data_f64().add(offset) };
             unsafe { *data.add(offset) = o * (g - dot) };
         }
     }
 
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -695,7 +700,7 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
                 out_offset += idx * out_strides[axis];
             }
         }
-        unsafe { *out.data.add(out_offset) = *grad.data.add(flat) };
+        unsafe { *out.data_f64().add(out_offset) = *grad.data_f64().add(flat) };
     }
 
     out_ptr
@@ -742,7 +747,7 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
                     grad_offset += idx * grad_strides[axis];
                 }
             }
-            unsafe { *piece.data.add(flat) = *grad.data.add(grad_offset) };
+            unsafe { *piece.data_f64().add(flat) = *grad.data_f64().add(grad_offset) };
         }
 
         results.push(piece_ptr);
@@ -790,8 +795,8 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
 
     for row in 0..num_rows {
         let base = row * n;
-        let mean_val = unsafe { *mean_t.data.add(row) };
-        let inv_std_val = unsafe { *inv_std_t.data.add(row) };
+        let mean_val = unsafe { *mean_t.data_f64().add(row) };
+        let inv_std_val = unsafe { *inv_std_t.data_f64().add(row) };
 
         // Compute d_normalized = d_out * weight, and normalized values
         // Also accumulate sum(d_normalized) and sum(d_normalized * normalized)
@@ -799,9 +804,9 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
         let mut sum_dnorm_norm = 0.0_f64;
 
         for j in 0..n {
-            let g = unsafe { *grad.data.add(base + j) };
-            let w = unsafe { *weight.data.add(j) };
-            let x = unsafe { *input.data.add(base + j) };
+            let g = unsafe { *grad.data_f64().add(base + j) };
+            let w = unsafe { *weight.data_f64().add(j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
             let normalized = (x - mean_val) * inv_std_val;
             let d_normalized = g * w;
             sum_dnorm += d_normalized;
@@ -809,20 +814,20 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
 
             // Accumulate d_weight and d_bias
             unsafe {
-                *dw.data.add(j) += g * normalized;
-                *db.data.add(j) += g;
+                *dw.data_f64().add(j) += g * normalized;
+                *db.data_f64().add(j) += g;
             }
         }
 
         // Compute d_x for each element in this row
         for j in 0..n {
-            let g = unsafe { *grad.data.add(base + j) };
-            let w = unsafe { *weight.data.add(j) };
-            let x = unsafe { *input.data.add(base + j) };
+            let g = unsafe { *grad.data_f64().add(base + j) };
+            let w = unsafe { *weight.data_f64().add(j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
             let normalized = (x - mean_val) * inv_std_val;
             let d_normalized = g * w;
             let d_x = (1.0 / nf) * inv_std_val * (nf * d_normalized - sum_dnorm - normalized * sum_dnorm_norm);
-            unsafe { *dx.data.add(base + j) = d_x };
+            unsafe { *dx.data_f64().add(base + j) = d_x };
         }
     }
 
@@ -860,29 +865,29 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 
     for row in 0..num_rows {
         let base = row * n;
-        let rms_val = unsafe { *rms_t.data.add(row) };
+        let rms_val = unsafe { *rms_t.data_f64().add(row) };
         let rms_cubed = rms_val * rms_val * rms_val;
 
         // Compute sum(d_out * weight * x) for this row
         let mut sum_dout_x = 0.0_f64;
         for j in 0..n {
-            let g = unsafe { *grad.data.add(base + j) };
-            let w = unsafe { *weight.data.add(j) };
-            let x = unsafe { *input.data.add(base + j) };
+            let g = unsafe { *grad.data_f64().add(base + j) };
+            let w = unsafe { *weight.data_f64().add(j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
             sum_dout_x += g * w * x;
         }
 
         for j in 0..n {
-            let g = unsafe { *grad.data.add(base + j) };
-            let w = unsafe { *weight.data.add(j) };
-            let x = unsafe { *input.data.add(base + j) };
+            let g = unsafe { *grad.data_f64().add(base + j) };
+            let w = unsafe { *weight.data_f64().add(j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
 
             // d_x = w * (d_out / rms - x * sum(d_out * w * x) / (N * rms^3))
             let d_x = w * (g / rms_val - x * sum_dout_x / (nf * rms_cubed));
-            unsafe { *dx.data.add(base + j) = d_x };
+            unsafe { *dx.data_f64().add(base + j) = d_x };
 
             // d_weight accumulate: d_out * (x / rms)
-            unsafe { *dw.data.add(j) += g * (x / rms_val) };
+            unsafe { *dw.data_f64().add(j) += g * (x / rms_val) };
         }
     }
 
@@ -902,11 +907,11 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     for i in 0..len {
-        let g = unsafe { *grad.data.add(i) };
-        let m = unsafe { *mask.data.add(i) };
+        let g = unsafe { *grad.data_f64().add(i) };
+        let m = unsafe { *mask.data_f64().add(i) };
         unsafe { *data.add(i) = g * m * scale };
     }
-    let t = Box::new(NslTensor { data, shape, strides, ndim, len: len as i64, refcount: 1 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
     Box::into_raw(t) as i64
 }
 
@@ -955,10 +960,10 @@ fn conv2d_backward(
             for oh in 0..h_out {
                 for ow in 0..w_out {
                     let g_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
-                    let g_val = unsafe { *grad.data.add(g_idx) };
+                    let g_val = unsafe { *grad.data_f64().add(g_idx) };
 
                     // grad_bias[co] += grad_out[n][co][oh][ow]
-                    unsafe { *db.data.add(co) += g_val };
+                    unsafe { *db.data_f64().add(co) += g_val };
 
                     for ci in 0..c_in {
                         for ky in 0..kh {
@@ -972,10 +977,10 @@ fn conv2d_backward(
                                     let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
 
                                     // grad_weight[co][ci][ky][kx] += grad_out * input
-                                    unsafe { *dw.data.add(weight_idx) += g_val * *input.data.add(input_idx) };
+                                    unsafe { *dw.data_f64().add(weight_idx) += g_val * *input.data_f64().add(input_idx) };
 
                                     // grad_input[ni][ci][real_ih][real_iw] += grad_out * weight
-                                    unsafe { *dx.data.add(input_idx) += g_val * *weight.data.add(weight_idx) };
+                                    unsafe { *dx.data_f64().add(input_idx) += g_val * *weight.data_f64().add(weight_idx) };
                                 }
                             }
                         }
@@ -998,9 +1003,9 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
 
     let grad_len = grad.len as usize;
     for i in 0..grad_len {
-        let g_val = unsafe { *grad.data.add(i) };
+        let g_val = unsafe { *grad.data_f64().add(i) };
         let idx = argmax[i];
-        unsafe { *out.data.add(idx) += g_val };
+        unsafe { *out.data_f64().add(idx) += g_val };
     }
 
     out_ptr
@@ -1300,12 +1305,12 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
                     // Scatter-add: for each position i, add grad_out[i, :] to grad_w[idx[i], :]
                     for i in 0..seq_len {
-                        let idx = unsafe { *idx_t.data.add(i) } as usize;
+                        let idx = unsafe { *idx_t.data_f64().add(i) } as usize;
                         if idx < vocab_size {
                             for j in 0..embed_dim {
                                 unsafe {
-                                    *grad_w_t.data.add(idx * embed_dim + j) +=
-                                        *g_t.data.add(i * embed_dim + j);
+                                    *grad_w_t.data_f64().add(idx * embed_dim + j) +=
+                                        *g_t.data_f64().add(i * embed_dim + j);
                                 }
                             }
                         }
@@ -1387,7 +1392,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     for i in 0..rows {
                         for j in 0..cols {
                             unsafe {
-                                *grad_bias_t.data.add(j) += *g_t.data.add(i * cols + j);
+                                *grad_bias_t.data_f64().add(j) += *g_t.data_f64().add(i * cols + j);
                             }
                         }
                     }

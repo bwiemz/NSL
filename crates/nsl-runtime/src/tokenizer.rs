@@ -11,6 +11,8 @@ use tokenizers::models::TrainerWrapper;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::Tokenizer;
 
+use std::ffi::c_void;
+
 use crate::list::NslList;
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -79,12 +81,14 @@ fn make_1d_tensor(values: &[f64]) -> i64 {
     }
 
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -108,12 +112,14 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
     }
 
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -261,14 +267,14 @@ pub extern "C" fn nsl_tokenizer_decode(handle: i64, tensor_ptr: i64) -> i64 {
     match get_tokenizer(handle) {
         TokenizerKind::Byte => {
             let bytes: Vec<u8> = (0..tensor.len as usize)
-                .map(|i| unsafe { *tensor.data.add(i) } as u8)
+                .map(|i| unsafe { *tensor.data_f64().add(i) } as u8)
                 .collect();
             let s = String::from_utf8_lossy(&bytes);
             alloc_cstring(&s)
         }
         TokenizerKind::HuggingFace(tok) => {
             let ids: Vec<u32> = (0..tensor.len as usize)
-                .map(|i| unsafe { *tensor.data.add(i) } as u32)
+                .map(|i| unsafe { *tensor.data_f64().add(i) } as u32)
                 .collect();
             match tok.decode(&ids, true) {
                 Ok(s) => alloc_cstring(&s),

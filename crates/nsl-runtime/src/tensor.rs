@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::ffi::c_void;
 
 use crate::autodiff;
 use crate::list::{nsl_list_new, nsl_list_push, NslList};
@@ -23,17 +24,40 @@ pub extern "C" fn nsl_is_training() -> i8 {
 
 #[repr(C)]
 pub struct NslTensor {
-    pub(crate) data: *mut f64,
+    pub(crate) data: *mut c_void,   // Opaque: CPU f64 or GPU f32
     pub(crate) shape: *mut i64,
     pub(crate) strides: *mut i64,
     pub(crate) ndim: i64,
     pub(crate) len: i64,
     pub(crate) refcount: i64,
+    pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
+    pub(crate) dtype: u8,           // 0 = f64, 1 = f32
 }
 
 impl NslTensor {
     pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
         unsafe { &mut *(ptr as *mut NslTensor) }
+    }
+
+    #[inline]
+    pub(crate) fn data_f64(&self) -> *mut f64 {
+        assert_eq!(self.dtype, 0, "data_f64() called on non-f64 tensor (dtype={})", self.dtype);
+        self.data as *mut f64
+    }
+
+    #[inline]
+    pub(crate) fn data_f32(&self) -> *mut f32 {
+        assert_eq!(self.dtype, 1, "data_f32() called on non-f32 tensor (dtype={})", self.dtype);
+        self.data as *mut f32
+    }
+
+    #[inline]
+    pub(crate) fn element_size(&self) -> usize {
+        match self.dtype {
+            0 => std::mem::size_of::<f64>(),
+            1 => std::mem::size_of::<f32>(),
+            _ => panic!("unknown dtype {}", self.dtype),
+        }
     }
 
     pub(crate) fn compute_strides(shape: *const i64, ndim: i64) -> *mut i64 {
@@ -84,12 +108,14 @@ fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
 
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -99,12 +125,14 @@ fn create_scalar_tensor(value: f64) -> i64 {
     let data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
     unsafe { *data = value };
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape: std::ptr::null_mut(),
         strides: std::ptr::null_mut(),
         ndim: 0,
         len: 1,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -138,7 +166,7 @@ pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
     for i in 0..tensor.len as usize {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let val = (seed >> 11) as f64 / (1u64 << 53) as f64;
-        unsafe { *tensor.data.add(i) = val };
+        unsafe { *tensor.data_f64().add(i) = val };
     }
     ptr
 }
@@ -166,8 +194,8 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
         let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
         let z1 = mag * (2.0 * std::f64::consts::PI * u2).sin();
         unsafe {
-            *tensor.data.add(i) = z0;
-            *tensor.data.add(i + 1) = z1;
+            *tensor.data_f64().add(i) = z0;
+            *tensor.data_f64().add(i + 1) = z1;
         }
         i += 2;
     }
@@ -180,7 +208,7 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
 
         let mag = (-2.0 * u1.ln()).sqrt();
         let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
-        unsafe { *tensor.data.add(i) = z0 };
+        unsafe { *tensor.data_f64().add(i) = z0 };
     }
     let _ = seed; // suppress unused warning
     ptr
@@ -208,12 +236,14 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
     }
 
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -247,7 +277,7 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
         offset += (idx as usize) * (unsafe { *tensor.strides.add(i) } as usize);
     }
 
-    unsafe { *tensor.data.add(offset) }
+    unsafe { *tensor.data_f64().add(offset) }
 }
 
 #[no_mangle]
@@ -277,7 +307,7 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
         offset += (idx as usize) * (unsafe { *tensor.strides.add(i) } as usize);
     }
 
-    unsafe { *tensor.data.add(offset) = value };
+    unsafe { *tensor.data_f64().add(offset) = value };
 }
 
 // === Shape operations ===
@@ -330,6 +360,8 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         ndim: new_ndim,
         len: new_len,
         refcount: 1, // new wrapper has its own refcount
+        device: 0,
+        dtype: 0,
     });
     // Note: shared data means we need to be careful with free.
     // For M9, we just deep copy the data to keep it simple.
@@ -341,9 +373,9 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     let data_size = (new_len as usize) * std::mem::size_of::<f64>();
     let new_data = checked_alloc(data_size) as *mut f64;
     unsafe {
-        std::ptr::copy_nonoverlapping(tensor.data, new_data, new_len as usize);
+        std::ptr::copy_nonoverlapping(tensor.data_f64(), new_data, new_len as usize);
     }
-    result_tensor.data = new_data;
+    result_tensor.data = new_data as *mut c_void;
 
     result
 }
@@ -411,16 +443,18 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
             old_offset += old_indices[d] * old_strides_arr[d] as usize;
         }
 
-        unsafe { *data.add(flat_idx) = *tensor.data.add(old_offset) };
+        unsafe { *data.add(flat_idx) = *tensor.data_f64().add(old_offset) };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape: new_shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(result) as i64;
 
@@ -533,16 +567,18 @@ fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64
             a_idx += coord * a_strides[d] as usize;
             b_idx += coord * b_strides[d] as usize;
         }
-        unsafe { *data.add(flat) = op(*a.data.add(a_idx), *b.data.add(b_idx)) };
+        unsafe { *data.add(flat) = op(*a.data_f64().add(a_idx), *b.data_f64().add(b_idx)) };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim: out_ndim as i64,
         len: out_len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -622,16 +658,18 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = -(*a.data.add(i)) };
+        unsafe { *data.add(i) = -(*a.data_f64().add(i)) };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -653,16 +691,18 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = *a.data.add(i) + s };
+        unsafe { *data.add(i) = *a.data_f64().add(i) + s };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -682,16 +722,18 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = *a.data.add(i) * s };
+        unsafe { *data.add(i) = *a.data_f64().add(i) * s };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -822,9 +864,9 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         // 2D matmul for this batch element
         for i in 0..m as usize {
             for j in 0..k as usize {
-                let a_val = unsafe { *a.data.add(a_base + i * k as usize + j) };
+                let a_val = unsafe { *a.data_f64().add(a_base + i * k as usize + j) };
                 for l in 0..n as usize {
-                    let b_val = unsafe { *b.data.add(b_base + j * n as usize + l) };
+                    let b_val = unsafe { *b.data_f64().add(b_base + j * n as usize + l) };
                     unsafe {
                         *data.add(out_base + i * n as usize + l) += a_val * b_val;
                     }
@@ -834,12 +876,14 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim: out_nd as i64,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -889,12 +933,14 @@ fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
     let data = checked_alloc_zeroed((total as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     let tensor = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape: shape_ptr,
         strides,
         ndim,
         len: total,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -922,7 +968,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
         // Global reduction
         let mut total = 0.0;
         for i in 0..tensor.len as usize {
-            total += unsafe { *tensor.data.add(i) };
+            total += unsafe { *tensor.data_f64().add(i) };
         }
         let result = create_scalar_tensor(total);
         if autodiff::is_recording() {
@@ -988,8 +1034,8 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
             oi += 1;
         }
 
-        let val = unsafe { *tensor.data.add(flat_in) };
-        unsafe { *result.data.add(out_flat) += val };
+        let val = unsafe { *tensor.data_f64().add(flat_in) };
+        unsafe { *result.data_f64().add(out_flat) += val };
     }
 
     if autodiff::is_recording() {
@@ -1019,7 +1065,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
         let num_elements = tensor.len;
         let mut total = 0.0;
         for i in 0..num_elements as usize {
-            total += unsafe { *tensor.data.add(i) };
+            total += unsafe { *tensor.data_f64().add(i) };
         }
         total /= num_elements as f64;
         let result = create_scalar_tensor(total);
@@ -1056,7 +1102,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
     // Divide by dim_size
     let result = NslTensor::from_ptr(sum_ptr);
     for i in 0..result.len as usize {
-        unsafe { *result.data.add(i) /= dim_size as f64 };
+        unsafe { *result.data_f64().add(i) /= dim_size as f64 };
     }
 
     if autodiff::is_recording() {
@@ -1107,7 +1153,7 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
 
     // Initialize with -inf
     for i in 0..out_total {
-        unsafe { *result.data.add(i) = f64::NEG_INFINITY };
+        unsafe { *result.data_f64().add(i) = f64::NEG_INFINITY };
     }
 
     // Track argmax per output position
@@ -1137,10 +1183,10 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
             oi += 1;
         }
 
-        let val = unsafe { *tensor.data.add(flat_in) };
-        let cur = unsafe { *result.data.add(out_flat) };
+        let val = unsafe { *tensor.data_f64().add(flat_in) };
+        let cur = unsafe { *result.data_f64().add(out_flat) };
         if val > cur {
-            unsafe { *result.data.add(out_flat) = val };
+            unsafe { *result.data_f64().add(out_flat) = val };
             argmax[out_flat] = indices[d];
         }
     }
@@ -1191,7 +1237,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
         let gather_dim_size = input_shape[d] as usize;
         if d == 1 {
             for b in 0..batch {
-                let idx = unsafe { *indices.data.add(b) } as usize;
+                let idx = unsafe { *indices.data_f64().add(b) } as usize;
                 if idx >= gather_dim_size {
                     eprintln!(
                         "nsl: gather index {} out of bounds for dim {} with size {}",
@@ -1199,14 +1245,14 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                     );
                     std::process::abort();
                 }
-                let val = unsafe { *tensor.data.add(b * in_strides[0] + idx * in_strides[1]) };
-                unsafe { *result.data.add(b) = val };
+                let val = unsafe { *tensor.data_f64().add(b * in_strides[0] + idx * in_strides[1]) };
+                unsafe { *result.data_f64().add(b) = val };
             }
         } else {
             // dim=0
             let cols = input_shape[1] as usize;
             for c in 0..cols {
-                let idx = unsafe { *indices.data.add(c) } as usize;
+                let idx = unsafe { *indices.data_f64().add(c) } as usize;
                 if idx >= gather_dim_size {
                     eprintln!(
                         "nsl: gather index {} out of bounds for dim {} with size {}",
@@ -1214,8 +1260,8 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                     );
                     std::process::abort();
                 }
-                let val = unsafe { *tensor.data.add(idx * in_strides[0] + c * in_strides[1]) };
-                unsafe { *result.data.add(c) = val };
+                let val = unsafe { *tensor.data_f64().add(idx * in_strides[0] + c * in_strides[1]) };
+                unsafe { *result.data_f64().add(c) = val };
             }
         }
     } else {
@@ -1250,16 +1296,18 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = (*a.data.add(i)).exp() };
+        unsafe { *data.add(i) = (*a.data_f64().add(i)).exp() };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1284,16 +1332,18 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = (*a.data.add(i)).ln() };
+        unsafe { *data.add(i) = (*a.data_f64().add(i)).ln() };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1318,16 +1368,18 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = (*a.data.add(i)).sqrt() };
+        unsafe { *data.add(i) = (*a.data_f64().add(i)).sqrt() };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1352,16 +1404,18 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        unsafe { *data.add(i) = (*a.data.add(i)).abs() };
+        unsafe { *data.add(i) = (*a.data_f64().add(i)).abs() };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1386,7 +1440,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let val = unsafe { *a.data.add(i) };
+        let val = unsafe { *a.data_f64().add(i) };
         unsafe {
             *data.add(i) = if val > 0.0 {
                 1.0
@@ -1399,12 +1453,14 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     // sign is non-differentiable — no tape recording
     Box::into_raw(result) as i64
@@ -1421,17 +1477,19 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let val = unsafe { *a.data.add(i) };
+        let val = unsafe { *a.data_f64().add(i) };
         unsafe { *data.add(i) = val.clamp(min_val, max_val) };
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1465,8 +1523,8 @@ pub(crate) fn nsl_tensor_clamp_backward(
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let val = unsafe { *input.data.add(i) };
-        let g_val = unsafe { *grad.data.add(i) };
+        let val = unsafe { *input.data_f64().add(i) };
+        let g_val = unsafe { *grad.data_f64().add(i) };
         unsafe {
             *data.add(i) = if val > min_val && val < max_val {
                 g_val
@@ -1477,12 +1535,14 @@ pub(crate) fn nsl_tensor_clamp_backward(
     }
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -1500,12 +1560,14 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let val = unsafe { *a.data.add(i) };
+        let val = unsafe { *a.data_f64().add(i) };
         unsafe { *data.add(i) = if val > 0.0 { val } else { 0.0 } };
     }
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1531,13 +1593,15 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
 
     let c = (2.0_f64 / std::f64::consts::PI).sqrt();
     for i in 0..len as usize {
-        let x = unsafe { *a.data.add(i) };
+        let x = unsafe { *a.data_f64().add(i) };
         let inner = c * (x + 0.044715 * x * x * x);
         unsafe { *data.add(i) = 0.5 * x * (1.0 + inner.tanh()) };
     }
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1562,13 +1626,15 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let x = unsafe { *a.data.add(i) };
+        let x = unsafe { *a.data_f64().add(i) };
         let sig = 1.0 / (1.0 + (-x).exp());
         unsafe { *data.add(i) = x * sig };
     }
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1593,12 +1659,14 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let x = unsafe { *a.data.add(i) };
+        let x = unsafe { *a.data_f64().add(i) };
         unsafe { *data.add(i) = 1.0 / (1.0 + (-x).exp()) };
     }
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1623,12 +1691,14 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     for i in 0..len as usize {
-        let x = unsafe { *a.data.add(i) };
+        let x = unsafe { *a.data_f64().add(i) };
         unsafe { *data.add(i) = x.tanh() };
     }
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1682,7 +1752,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         let mut max_val = f64::NEG_INFINITY;
         for k in 0..dim_size {
             let offset = base_offset + k * (a_strides[d] as usize);
-            let val = unsafe { *a.data.add(offset) };
+            let val = unsafe { *a.data_f64().add(offset) };
             if val > max_val {
                 max_val = val;
             }
@@ -1692,7 +1762,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         let mut sum = 0.0_f64;
         for k in 0..dim_size {
             let offset = base_offset + k * (a_strides[d] as usize);
-            let val = unsafe { *a.data.add(offset) };
+            let val = unsafe { *a.data_f64().add(offset) };
             let e = (val - max_val).exp();
             unsafe { *data.add(offset) = e };
             sum += e;
@@ -1706,7 +1776,9 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     }
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1733,7 +1805,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
         );
         std::process::abort();
     }
-    unsafe { *tensor.data }
+    unsafe { *tensor.data_f64() }
 }
 
 // === Display ===
@@ -1744,7 +1816,7 @@ pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
 
     if tensor.ndim == 0 {
         if tensor.len > 0 {
-            print_float_value(unsafe { *tensor.data });
+            print_float_value(unsafe { *tensor.data_f64() });
             println!();
         } else {
             println!("tensor([])");
@@ -1753,7 +1825,7 @@ pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
     }
 
     print!("tensor(");
-    print_tensor_recursive(tensor.data, tensor.shape, tensor.strides, tensor.ndim, 0);
+    print_tensor_recursive(tensor.data_f64(), tensor.shape, tensor.strides, tensor.ndim, 0);
     println!(")");
 }
 
@@ -1810,15 +1882,17 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 
     let data_size = (len as usize) * std::mem::size_of::<f64>();
     let data = checked_alloc(data_size) as *mut f64;
-    unsafe { std::ptr::copy_nonoverlapping(tensor.data, data, len as usize) };
+    unsafe { std::ptr::copy_nonoverlapping(tensor.data_f64(), data, len as usize) };
 
     let result = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -1861,7 +1935,7 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         dst.len, src.len
     );
     unsafe {
-        std::ptr::copy_nonoverlapping(src.data, dst.data, dst.len as usize);
+        std::ptr::copy_nonoverlapping(src.data_f64(), dst.data_f64(), dst.len as usize);
     }
 }
 
@@ -1876,7 +1950,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     );
     for i in 0..dst.len as usize {
         unsafe {
-            *dst.data.add(i) += *src.data.add(i);
+            *dst.data_f64().add(i) += *src.data_f64().add(i);
         }
     }
 }
@@ -1885,7 +1959,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
 pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     unsafe {
-        std::ptr::write_bytes(tensor.data, 0, tensor.len as usize);
+        std::ptr::write_bytes(tensor.data_f64(), 0, tensor.len as usize);
     }
 }
 
@@ -1916,7 +1990,7 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
         let tensor_ptr = unsafe { *list.data.add(g) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
         for i in 0..tensor.len as usize {
-            let val = unsafe { *tensor.data.add(i) };
+            let val = unsafe { *tensor.data_f64().add(i) };
             sum_sq += val * val;
         }
     }
@@ -1935,7 +2009,7 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
             let tensor = NslTensor::from_ptr(tensor_ptr);
             for i in 0..tensor.len as usize {
                 unsafe {
-                    *tensor.data.add(i) *= scale;
+                    *tensor.data_f64().add(i) *= scale;
                 }
             }
         }
@@ -2000,7 +2074,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
                 in_offset += idx * in_strides[axis] as usize;
             }
         }
-        unsafe { *data.add(flat) = *tensor.data.add(in_offset) };
+        unsafe { *data.add(flat) = *tensor.data_f64().add(in_offset) };
     }
 
     // Save input shape for backward
@@ -2009,12 +2083,14 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         .collect();
 
     let out = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape: out_shape,
         strides: out_strides,
         ndim: tensor.ndim,
         len: out_len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -2111,18 +2187,20 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
                     out_offset += idx * o_strides[axis] as usize;
                 }
             }
-            unsafe { *data.add(out_offset) = *t.data.add(flat) };
+            unsafe { *data.add(out_offset) = *t.data_f64().add(flat) };
         }
         cat_offset += split_sizes[t_idx] as usize;
     }
 
     let out = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape: out_shape,
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -2184,7 +2262,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 
     // For each index, copy the corresponding row from weight
     for i in 0..seq_len {
-        let raw_idx = unsafe { *indices.data.add(i) } as i64;
+        let raw_idx = unsafe { *indices.data_f64().add(i) } as i64;
         if raw_idx < 0 || raw_idx >= vocab_size as i64 {
             eprintln!(
                 "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
@@ -2195,7 +2273,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         let idx = raw_idx as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(
-                weight.data.add(idx * embed_dim),
+                weight.data_f64().add(idx * embed_dim),
                 out_data.add(i * embed_dim),
                 embed_dim,
             );
@@ -2203,12 +2281,14 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     }
 
     let out = Box::new(NslTensor {
-        data: out_data,
+        data: out_data as *mut c_void,
         shape: out_shape,
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -2276,14 +2356,14 @@ pub extern "C" fn nsl_tensor_layernorm(
         // Compute mean
         let mut sum = 0.0_f64;
         for j in 0..n {
-            sum += unsafe { *input.data.add(base + j) };
+            sum += unsafe { *input.data_f64().add(base + j) };
         }
         let mean_val = sum / n as f64;
 
         // Compute variance
         let mut var = 0.0_f64;
         for j in 0..n {
-            let diff = unsafe { *input.data.add(base + j) } - mean_val;
+            let diff = unsafe { *input.data_f64().add(base + j) } - mean_val;
             var += diff * diff;
         }
         var /= n as f64;
@@ -2297,41 +2377,47 @@ pub extern "C" fn nsl_tensor_layernorm(
 
         // normalized * weight + bias
         for j in 0..n {
-            let x = unsafe { *input.data.add(base + j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
             let normalized = (x - mean_val) * inv_std_val;
-            let w = unsafe { *weight.data.add(j) };
-            let b = unsafe { *bias.data.add(j) };
+            let w = unsafe { *weight.data_f64().add(j) };
+            let b = unsafe { *bias.data_f64().add(j) };
             unsafe { *out_data.add(base + j) = normalized * w + b };
         }
     }
 
     let out = Box::new(NslTensor {
-        data: out_data,
+        data: out_data as *mut c_void,
         shape: out_shape,
         strides: out_strides,
         ndim: ndim as i64,
         len: total as i64,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
     let mean_tensor = Box::new(NslTensor {
-        data: mean_data,
+        data: mean_data as *mut c_void,
         shape: mean_shape,
         strides: mean_strides,
         ndim: 1,
         len: num_rows as i64,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let mean_ptr = Box::into_raw(mean_tensor) as i64;
 
     let inv_std_tensor = Box::new(NslTensor {
-        data: inv_std_data,
+        data: inv_std_data as *mut c_void,
         shape: inv_std_shape,
         strides: inv_std_strides,
         ndim: 1,
         len: num_rows as i64,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
 
@@ -2393,7 +2479,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         // Compute mean(x^2)
         let mut sum_sq = 0.0_f64;
         for j in 0..n {
-            let x = unsafe { *input.data.add(base + j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
             sum_sq += x * x;
         }
         let rms_val = (sum_sq / n as f64 + eps).sqrt();
@@ -2402,29 +2488,33 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 
         // output = x / rms * weight
         for j in 0..n {
-            let x = unsafe { *input.data.add(base + j) };
-            let w = unsafe { *weight.data.add(j) };
+            let x = unsafe { *input.data_f64().add(base + j) };
+            let w = unsafe { *weight.data_f64().add(j) };
             unsafe { *out_data.add(base + j) = x / rms_val * w };
         }
     }
 
     let out = Box::new(NslTensor {
-        data: out_data,
+        data: out_data as *mut c_void,
         shape: out_shape,
         strides: out_strides,
         ndim: ndim as i64,
         len: total as i64,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
     let rms_tensor = Box::new(NslTensor {
-        data: rms_data,
+        data: rms_data as *mut c_void,
         shape: rms_shape,
         strides: rms_strides,
         ndim: 1,
         len: num_rows as i64,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let rms_ptr = Box::into_raw(rms_tensor) as i64;
 
@@ -2487,17 +2577,21 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         let keep = if rand_val >= p { 1.0 } else { 0.0 };
         unsafe {
             *mask_data.add(i) = keep;
-            *out_data.add(i) = *a.data.add(i) * keep * scale;
+            *out_data.add(i) = *a.data_f64().add(i) * keep * scale;
         }
     }
 
     let result = Box::new(NslTensor {
-        data: out_data, shape, strides, ndim, len: len as i64, refcount: 1,
+        data: out_data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
     let mask_tensor = Box::new(NslTensor {
-        data: mask_data, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: 1,
+        data: mask_data as *mut c_void, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let mask_ptr = Box::into_raw(mask_tensor) as i64;
 
@@ -2577,7 +2671,7 @@ pub extern "C" fn nsl_tensor_conv2d(
                                 if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
                                     let input_idx = ni * (c_in * h * w) + ci * (h * w) + (ih - ph) * w + (iw - pw);
                                     let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
-                                    val += unsafe { *input.data.add(input_idx) * *weight.data.add(weight_idx) };
+                                    val += unsafe { *input.data_f64().add(input_idx) * *weight.data_f64().add(weight_idx) };
                                 }
                             }
                         }
@@ -2585,7 +2679,7 @@ pub extern "C" fn nsl_tensor_conv2d(
                     // Add bias if provided
                     if bias_ptr != 0 {
                         let bias = NslTensor::from_ptr(bias_ptr);
-                        val += unsafe { *bias.data.add(co) };
+                        val += unsafe { *bias.data_f64().add(co) };
                     }
                     let out_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
                     unsafe { *out_data.add(out_idx) = val };
@@ -2595,7 +2689,9 @@ pub extern "C" fn nsl_tensor_conv2d(
     }
 
     let result = Box::new(NslTensor {
-        data: out_data, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
+        data: out_data as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -2672,7 +2768,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
                             let iw = ow * s + kx;
                             if ih >= pad && iw >= pad && ih - pad < h && iw - pad < w {
                                 let input_idx = ni * (c * h * w) + ci * (h * w) + (ih - pad) * w + (iw - pad);
-                                let val = unsafe { *input.data.add(input_idx) };
+                                let val = unsafe { *input.data_f64().add(input_idx) };
                                 if val > max_val {
                                     max_val = val;
                                     max_idx = input_idx;
@@ -2689,7 +2785,9 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     }
 
     let result = Box::new(NslTensor {
-        data: out_data, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
+        data: out_data as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -2754,18 +2852,20 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     for i in 0..rows {
         for j in 0..cols {
             unsafe {
-                *out_data.add(i * cols + j) = *tensor.data.add(i * cols + j) + *bias.data.add(j);
+                *out_data.add(i * cols + j) = *tensor.data_f64().add(i * cols + j) + *bias.data_f64().add(j);
             }
         }
     }
 
     let out = Box::new(NslTensor {
-        data: out_data,
+        data: out_data as *mut c_void,
         shape: out_shape,
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 

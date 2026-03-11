@@ -87,8 +87,8 @@ pub extern "C" fn nsl_assert_close(
 
     // Element-wise closeness check: |a - b| <= atol + rtol * |b|
     for i in 0..a.len as usize {
-        let va = unsafe { *a.data.add(i) };
-        let vb = unsafe { *b.data.add(i) };
+        let va = unsafe { *a.data_f64().add(i) };
+        let vb = unsafe { *b.data_f64().add(i) };
         let diff = (va - vb).abs();
         let tol = atol + rtol * vb.abs();
         if diff > tol {

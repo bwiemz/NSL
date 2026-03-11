@@ -3,6 +3,8 @@
 //! Provides INT8 and INT4 quantization with per-tensor, per-channel, and per-group granularity.
 //! Uses asymmetric affine quantization (weight-only RTN).
 
+use std::ffi::c_void;
+
 use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
 use crate::tensor::NslTensor;
 
@@ -298,7 +300,7 @@ pub extern "C" fn nsl_qtensor_quantize(
     };
 
     // Read all source data into a Vec for easier slicing
-    let src: Vec<f64> = (0..total).map(|i| unsafe { *tensor.data.add(i) }).collect();
+    let src: Vec<f64> = (0..total).map(|i| unsafe { *tensor.data_f64().add(i) }).collect();
 
     match granularity {
         GRAN_PER_TENSOR => {
@@ -520,12 +522,14 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
     }
 
     let out = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim,
         len: total as i64,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(out) as i64
 }
@@ -606,12 +610,14 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
     unsafe { *strides = 1 };
 
     let out = Box::new(NslTensor {
-        data,
+        data: data as *mut c_void,
         shape,
         strides,
         ndim: 1,
         len: qt.ndim,
         refcount: 1,
+        device: 0,
+        dtype: 0,
     });
     Box::into_raw(out) as i64
 }

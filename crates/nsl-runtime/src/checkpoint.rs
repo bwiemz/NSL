@@ -85,7 +85,7 @@ pub extern "C" fn nsl_model_save(
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
         for j in 0..tensor.len as usize {
-            let val = unsafe { *tensor.data.add(j) };
+            let val = unsafe { *tensor.data_f64().add(j) };
             write_or_abort(&mut file, &val.to_le_bytes(), "write tensor data");
         }
     }
@@ -174,7 +174,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
                         .unwrap_or_else(|_| std::process::abort()),
                 );
                 unsafe {
-                    *tensor.data.add(j) = val;
+                    *tensor.data_f64().add(j) = val;
                 }
             }
         }
