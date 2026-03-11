@@ -226,7 +226,7 @@ impl Compiler<'_> {
         let right_is_tensor = right_type.is_tensor()
             || (right_type.is_indeterminate() && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
-            return self.compile_tensor_binary_op(builder, lhs, rhs, op, left_is_tensor, right_is_tensor);
+            return self.compile_tensor_binary_op(builder, state, lhs, rhs, op, left_is_tensor, right_is_tensor);
         }
 
         let left_is_float = is_float_type(&left_type);
@@ -2221,6 +2221,7 @@ impl Compiler<'_> {
     fn compile_tensor_binary_op(
         &mut self,
         builder: &mut FunctionBuilder,
+        state: &mut FuncState,
         lhs: Value,
         rhs: Value,
         op: BinOp,
@@ -2237,42 +2238,48 @@ impl Compiler<'_> {
                 BinOp::MatMul => "nsl_tensor_matmul",
                 _ => return Err(CodegenError::new(format!("unsupported tensor op: {op:?}"))),
             };
-            self.compile_call_by_name(builder, rt_name, &[lhs, rhs])
+            let result = self.compile_call_by_name(builder, rt_name, &[lhs, rhs])?;
+            state.tensor_temporaries.push(result);
+            Ok(result)
         } else if left_is_tensor {
             // Tensor-scalar: ensure scalar is f64
             let rhs_ty = builder.func.dfg.value_type(rhs);
             let scalar = if rhs_ty == cl_types::F64 { rhs } else { builder.ins().fcvt_from_sint(cl_types::F64, rhs) };
-            let rt_name = match op {
-                BinOp::Add => "nsl_tensor_add_scalar",
-                BinOp::Mul => "nsl_tensor_mul_scalar",
+            let result = match op {
+                BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?,
+                BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?,
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
-                    return self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, neg]);
+                    self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, neg])?
                 }
                 BinOp::Div => {
                     // tensor / scalar = tensor * (1/scalar)
                     let one = builder.ins().f64const(1.0);
                     let inv = builder.ins().fdiv(one, scalar);
-                    return self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, inv]);
+                    self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, inv])?
                 }
                 _ => return Err(CodegenError::new(format!("unsupported tensor-scalar op: {op:?}"))),
             };
-            self.compile_call_by_name(builder, rt_name, &[lhs, scalar])
+            state.tensor_temporaries.push(result);
+            Ok(result)
         } else {
             // Scalar-tensor: ensure scalar is f64
             let lhs_ty = builder.func.dfg.value_type(lhs);
             let scalar = if lhs_ty == cl_types::F64 { lhs } else { builder.ins().fcvt_from_sint(cl_types::F64, lhs) };
-            match op {
-                BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[rhs, scalar]),
-                BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[rhs, scalar]),
+            let result = match op {
+                BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[rhs, scalar])?,
+                BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[rhs, scalar])?,
                 BinOp::Sub => {
                     // scalar - tensor = neg(tensor) + scalar
                     let neg_tensor = self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[neg_tensor, scalar])
+                    state.tensor_temporaries.push(neg_tensor);
+                    self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[neg_tensor, scalar])?
                 }
                 _ => return Err(CodegenError::new(format!("unsupported scalar-tensor op: {op:?}"))),
-            }
+            };
+            state.tensor_temporaries.push(result);
+            Ok(result)
         }
     }
 

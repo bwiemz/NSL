@@ -230,8 +230,9 @@ NSL is in active development. Current milestone progress:
 | M15 | NN stdlib + tokenization + test framework | Complete |
 | M16 | Quantization foundations (`quant static` block) | Complete |
 | M17 | GPU/CUDA + `kernel` keyword | Complete |
-| M18 | Interop (PyTorch, HuggingFace, ONNX) | Planned |
-| M19-20 | Package ecosystem + v0.1 release | Planned |
+| M18 | Transformer foundations + interop (PyTorch, HuggingFace, ONNX) | Planned |
+| M19 | Data pipeline + inference sampling | Planned |
+| M20 | v0.1 release (full GPT-2 pipeline) | Planned |
 | M21 | Advanced quantization (FP8, activation quant) | Planned |
 | M22 | Algorithmic quantization (QAT, GPTQ, AWQ) | Planned |
 

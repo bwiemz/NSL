@@ -114,6 +114,9 @@ pub fn maybe_record(op: TapeOp) {
 pub extern "C" fn nsl_tape_start(param_list: i64) {
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
+        // Release any saved tensor refs from a previous tape session
+        // (prevents refcount leaks if tape_start is called without tape_stop)
+        release_tape_op_refs(&tape.ops);
         tape.ops.clear();
         tape.param_set.clear();
         tape.recording = true;
@@ -127,6 +130,66 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
     });
 }
 
+/// Release saved tensor refcounts held by tape ops.
+/// Must be called before clearing ops to prevent refcount leaks.
+fn release_tape_op_refs(ops: &[TapeOp]) {
+    for op in ops.iter() {
+        match op {
+            TapeOp::Mul { saved_a, saved_b, .. }
+            | TapeOp::Div { saved_a, saved_b, .. }
+            | TapeOp::MatMul { saved_a, saved_b, .. } => {
+                tensor_free(*saved_a);
+                tensor_free(*saved_b);
+            }
+            TapeOp::Exp { saved_out, .. }
+            | TapeOp::Sqrt { saved_out, .. }
+            | TapeOp::Sigmoid { saved_out, .. }
+            | TapeOp::Tanh { saved_out, .. }
+            | TapeOp::Softmax { saved_out, .. } => {
+                tensor_free(*saved_out);
+            }
+            TapeOp::Log { saved_a, .. }
+            | TapeOp::Abs { saved_a, .. }
+            | TapeOp::Clamp { saved_a, .. }
+            | TapeOp::ReLU { saved_a, .. }
+            | TapeOp::GELU { saved_a, .. }
+            | TapeOp::SiLU { saved_a, .. } => {
+                tensor_free(*saved_a);
+            }
+            TapeOp::Gather { indices_ptr, .. } => {
+                tensor_free(*indices_ptr);
+            }
+            TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
+                tensor_free(*saved_weight);
+                tensor_free(*saved_indices);
+            }
+            TapeOp::LayerNorm { saved_input, saved_mean, saved_inv_std, saved_weight, .. } => {
+                tensor_free(*saved_input);
+                tensor_free(*saved_mean);
+                tensor_free(*saved_inv_std);
+                tensor_free(*saved_weight);
+            }
+            TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
+                tensor_free(*saved_input);
+                tensor_free(*saved_rms);
+                tensor_free(*saved_weight);
+            }
+            TapeOp::Dropout { saved_mask, .. } => {
+                tensor_free(*saved_mask);
+            }
+            TapeOp::Conv2d { saved_input, saved_weight, .. } => {
+                tensor_free(*saved_input);
+                tensor_free(*saved_weight);
+            }
+            TapeOp::BiasAdd { tensor, bias, .. } => {
+                tensor_free(*tensor);
+                tensor_free(*bias);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Stop recording and clean up saved tensor refcounts.
 /// This prevents memory leaks even if backward is never called.
 #[no_mangle]
@@ -136,63 +199,7 @@ pub extern "C" fn nsl_tape_stop() {
         tape.recording = false;
         tape.pause_depth = 0;
 
-        // Release saved tensor refs (ops that hold extra refs).
-        // Use tensor_free so tensors are actually deallocated if refcount hits 0.
-        for op in tape.ops.iter() {
-            match op {
-                TapeOp::Mul { saved_a, saved_b, .. }
-                | TapeOp::Div { saved_a, saved_b, .. }
-                | TapeOp::MatMul { saved_a, saved_b, .. } => {
-                    tensor_free(*saved_a);
-                    tensor_free(*saved_b);
-                }
-                TapeOp::Exp { saved_out, .. }
-                | TapeOp::Sqrt { saved_out, .. }
-                | TapeOp::Sigmoid { saved_out, .. }
-                | TapeOp::Tanh { saved_out, .. }
-                | TapeOp::Softmax { saved_out, .. } => {
-                    tensor_free(*saved_out);
-                }
-                TapeOp::Log { saved_a, .. }
-                | TapeOp::Abs { saved_a, .. }
-                | TapeOp::Clamp { saved_a, .. }
-                | TapeOp::ReLU { saved_a, .. }
-                | TapeOp::GELU { saved_a, .. }
-                | TapeOp::SiLU { saved_a, .. } => {
-                    tensor_free(*saved_a);
-                }
-                TapeOp::Gather { indices_ptr, .. } => {
-                    tensor_free(*indices_ptr);
-                }
-                TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
-                    tensor_free(*saved_weight);
-                    tensor_free(*saved_indices);
-                }
-                TapeOp::LayerNorm { saved_input, saved_mean, saved_inv_std, saved_weight, .. } => {
-                    tensor_free(*saved_input);
-                    tensor_free(*saved_mean);
-                    tensor_free(*saved_inv_std);
-                    tensor_free(*saved_weight);
-                }
-                TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
-                    tensor_free(*saved_input);
-                    tensor_free(*saved_rms);
-                    tensor_free(*saved_weight);
-                }
-                TapeOp::Dropout { saved_mask, .. } => {
-                    tensor_free(*saved_mask);
-                }
-                TapeOp::Conv2d { saved_input, saved_weight, .. } => {
-                    tensor_free(*saved_input);
-                    tensor_free(*saved_weight);
-                }
-                TapeOp::BiasAdd { tensor, bias, .. } => {
-                    tensor_free(*tensor);
-                    tensor_free(*bias);
-                }
-                _ => {}
-            }
-        }
+        release_tape_op_refs(&tape.ops);
 
         tape.ops.clear();
         tape.param_set.clear();

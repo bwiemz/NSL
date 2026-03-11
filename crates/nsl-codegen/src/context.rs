@@ -35,6 +35,9 @@ pub struct FuncState {
     pub current_block: Option<ir::Block>,
     /// True when compiling a @no_grad function body — emit tape_resume before returns.
     pub is_no_grad: bool,
+    /// Cranelift Values of intermediate tensor results that need freeing after the current statement.
+    /// Prevents memory leaks from compound expressions like `a + b + c`.
+    pub tensor_temporaries: Vec<ir::Value>,
 }
 
 impl FuncState {
@@ -45,6 +48,7 @@ impl FuncState {
             loop_stack: Vec::new(),
             current_block: None,
             is_no_grad: false,
+            tensor_temporaries: Vec::new(),
         }
     }
 

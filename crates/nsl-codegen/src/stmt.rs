@@ -10,6 +10,7 @@ use nsl_ast::expr::{ExprKind, SubscriptKind};
 use nsl_ast::block::{QuantDtype, QuantGranularity, TrainSection};
 use nsl_ast::stmt::{Stmt, StmtKind};
 
+use cranelift_codegen::ir::Value;
 use crate::compiler::Compiler;
 use crate::context::{FuncState, LoopContext};
 use crate::error::CodegenError;
@@ -57,6 +58,9 @@ impl Compiler<'_> {
                             builder.def_var(var, init_val);
                             state.variables.insert(sym, (var, cl_type));
                         }
+
+                        // Free intermediate tensor temporaries (keep init_val which is now owned by the variable)
+                        self.free_tensor_temporaries(builder, state, Some(init_val));
 
                         // If the value was a closure lambda, record capture count for indirect call dispatch
                         if let Some(count) = self.last_lambda_capture_count.take() {
@@ -116,6 +120,8 @@ impl Compiler<'_> {
 
             StmtKind::Expr(expr) => {
                 let _ = self.compile_expr(builder, state, expr)?;
+                // Free all tensor temporaries from this expression (none are kept)
+                self.free_tensor_temporaries(builder, state, None);
             }
 
             StmtKind::If { condition, then_block, elif_clauses, else_block } => {
@@ -267,6 +273,8 @@ impl Compiler<'_> {
                     }
                 };
                 builder.def_var(var, final_val);
+                // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
+                self.free_tensor_temporaries(builder, state, Some(final_val));
             }
             nsl_ast::expr::ExprKind::Subscript { object, index } => {
                 let obj_val = self.compile_expr(builder, state, object)?;
@@ -384,6 +392,30 @@ impl Compiler<'_> {
             _ => return Err(CodegenError::new("only variable/subscript/member assignment supported in M4")),
         }
         Ok(())
+    }
+
+    /// Free intermediate tensor temporaries accumulated during expression compilation.
+    /// `keep` is the final result value that should NOT be freed (it's owned by a variable).
+    /// All other temporaries are intermediates from compound expressions (e.g. `a + b` in `a + b + c`).
+    fn free_tensor_temporaries(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        keep: Option<Value>,
+    ) {
+        let temps = std::mem::take(&mut state.tensor_temporaries);
+        for temp in &temps {
+            if Some(*temp) == keep {
+                continue;
+            }
+            // Emit nsl_tensor_free(temp) — but only if block is not already filled
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
+        }
     }
 
     fn compile_if_stmt(

@@ -86,18 +86,22 @@ The existing C runtime (`nsl_runtime.c`, ~770 LOC) is migrated to Rust in M9.
 **Tooling:** `nsl profile` command
 **Deliverable:** Train on GPU with fused kernels
 
-### M18: Interop + Export
-**ML:** py.call FFI (embed Python interpreter from Rust), from_torch/to_torch via DLPack, HuggingFace loading, safetensors, ONNX export
+### M18: Transformer Foundations + Interop
+**Tensor ops:** unsqueeze, expand, stack (tensor construction/shape), causal_mask, masked_fill (attention masking)
+**Language features:** Nested model fields (compose blocks inside a model), layer lists (`list<Model>` for variable-depth transformers), weight tying (`@tie_weights` for embedding/LM head sharing)
+**Interop:** py.call FFI (embed Python interpreter from Rust), from_torch/to_torch via DLPack, HuggingFace loading, safetensors, ONNX export
 **Tooling:** `nsl export` command
-**Deliverable:** Load HF model, quantize, export ONNX
+**Deliverable:** Define a real multi-layer transformer, load HF weights, run inference, export ONNX
 
-### M19: Package Ecosystem
-**ML:** nsl.dist basics (DDP), distributed training
-**Tooling:** `nsl pkg` (registry client), `nsl doc` (doc generation)
-**Deliverable:** Multi-GPU training, publish/install packages
+### M19: Data Pipeline + Inference Sampling
+**Data pipeline:** File I/O for datasets (JSONL, CSV, text), batching/shuffling DataLoader, sequence packing
+**Inference ops:** topk, multinomial (sampling), temperature/top-p/top-k decoding strategies
+**Packaging:** `nsl pkg` (registry client), `nsl doc` (doc generation)
+**Tooling:** `nsl bench` improvements
+**Deliverable:** Load a dataset, train a model, generate text with sampling
 
 ### M20: v0.1 Release
-**ML:** Full GPT-2 pipeline from spec 13, all in NSL
+**ML:** Full GPT-2 pipeline from spec 13, all in NSL; nsl.dist basics (DDP), distributed training
 **Tooling:** Polish all tooling, error messages, examples, CI/CD
 **Deliverable:** The spec 13 example runs end-to-end -- ship v0.1
 
@@ -142,8 +146,8 @@ M9 (Runtime + Tensors)
                      |-> M15 (Tokenization + Stdlib)
                      |-> M16 (Quantization Foundations)
                           |-> M17 (GPU)
-                          |    |-> M18 (Interop + Export)
-                          |         |-> M19 (Packages)
+                          |    |-> M18 (Transformer Foundations + Interop)
+                          |         |-> M19 (Data Pipeline + Inference Sampling)
                           |              |-> M20 (v0.1 Release)
                           |-> M21 (Advanced Quantization)
                                |-> M22 (Algorithmic Quantization)

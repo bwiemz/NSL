@@ -368,8 +368,8 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         ndim: new_ndim,
         len: new_len,
         refcount: 1, // new wrapper has its own refcount
-        device: 0,
-        dtype: 0,
+        device: tensor.device,
+        dtype: tensor.dtype,
     });
     // Note: shared data means we need to be careful with free.
     // For M9, we just deep copy the data to keep it simple.
@@ -378,12 +378,24 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     // Actually, let's deep copy to avoid shared ownership complexity in M9
     tensor.refcount -= 1;
     let result_tensor = NslTensor::from_ptr(result);
-    let data_size = (new_len as usize) * std::mem::size_of::<f64>();
-    let new_data = checked_alloc(data_size) as *mut f64;
-    unsafe {
-        std::ptr::copy_nonoverlapping(tensor.data_f64(), new_data, new_len as usize);
+
+    // Device/dtype-aware copy
+    if tensor.dtype == 1 {
+        // f32 (GPU tensors use unified memory, so CPU can read/write)
+        let data_size = (new_len as usize) * std::mem::size_of::<f32>();
+        let new_data = checked_alloc(data_size) as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(tensor.data_f32(), new_data, new_len as usize);
+        }
+        result_tensor.data = new_data as *mut c_void;
+    } else {
+        let data_size = (new_len as usize) * std::mem::size_of::<f64>();
+        let new_data = checked_alloc(data_size) as *mut f64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(tensor.data_f64(), new_data, new_len as usize);
+        }
+        result_tensor.data = new_data as *mut c_void;
     }
-    result_tensor.data = new_data as *mut c_void;
 
     result
 }
@@ -421,7 +433,6 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
 
     let strides = NslTensor::compute_strides(new_shape, ndim);
     let len = tensor.len;
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
     // Copy data with transposition
     let old_strides_arr: Vec<i64> = (0..ndim as usize)
@@ -431,38 +442,55 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
         .map(|i| unsafe { *strides.add(i) })
         .collect();
 
-    // Iterate over all elements of the new tensor
-    for flat_idx in 0..len as usize {
-        // Convert flat_idx to new multi-index
-        let mut remaining = flat_idx;
-        let mut new_indices = vec![0usize; ndim as usize];
-        for d in 0..ndim as usize {
-            new_indices[d] = remaining / new_strides_arr[d] as usize;
-            remaining %= new_strides_arr[d] as usize;
+    // Device/dtype-aware transposed copy
+    let data: *mut c_void = if tensor.dtype == 1 {
+        // f32 (GPU tensors use unified memory, so CPU can read/write)
+        let data = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for flat_idx in 0..len as usize {
+            let mut remaining = flat_idx;
+            let mut new_indices = vec![0usize; ndim as usize];
+            for d in 0..ndim as usize {
+                new_indices[d] = remaining / new_strides_arr[d] as usize;
+                remaining %= new_strides_arr[d] as usize;
+            }
+            let mut old_indices = new_indices.clone();
+            old_indices.swap(dim0 as usize, dim1 as usize);
+            let mut old_offset = 0usize;
+            for d in 0..ndim as usize {
+                old_offset += old_indices[d] * old_strides_arr[d] as usize;
+            }
+            unsafe { *data.add(flat_idx) = *tensor.data_f32().add(old_offset) };
         }
-
-        // Map new indices back to old indices (swap dim0 and dim1)
-        let mut old_indices = new_indices.clone();
-        old_indices.swap(dim0 as usize, dim1 as usize);
-
-        // Compute old flat offset
-        let mut old_offset = 0usize;
-        for d in 0..ndim as usize {
-            old_offset += old_indices[d] * old_strides_arr[d] as usize;
+        data as *mut c_void
+    } else {
+        let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for flat_idx in 0..len as usize {
+            let mut remaining = flat_idx;
+            let mut new_indices = vec![0usize; ndim as usize];
+            for d in 0..ndim as usize {
+                new_indices[d] = remaining / new_strides_arr[d] as usize;
+                remaining %= new_strides_arr[d] as usize;
+            }
+            let mut old_indices = new_indices.clone();
+            old_indices.swap(dim0 as usize, dim1 as usize);
+            let mut old_offset = 0usize;
+            for d in 0..ndim as usize {
+                old_offset += old_indices[d] * old_strides_arr[d] as usize;
+            }
+            unsafe { *data.add(flat_idx) = *tensor.data_f64().add(old_offset) };
         }
-
-        unsafe { *data.add(flat_idx) = *tensor.data_f64().add(old_offset) };
-    }
+        data as *mut c_void
+    };
 
     let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+        data,
         shape: new_shape,
         strides,
         ndim,
         len,
         refcount: 1,
-        device: 0,
-        dtype: 0,
+        device: tensor.device,
+        dtype: tensor.dtype,
     });
     let out_ptr = Box::into_raw(result) as i64;
 
