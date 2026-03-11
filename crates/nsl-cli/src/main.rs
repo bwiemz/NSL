@@ -233,9 +233,14 @@ fn needs_multi_file(file: &PathBuf) -> bool {
     if let Ok(source) = std::fs::read_to_string(file) {
         source.lines().any(|line| {
             let trimmed = line.trim();
+            // Skip comments — they can contain import-like text
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                return false;
+            }
             (trimmed.starts_with("from ") && trimmed.contains(" import "))
                 || (trimmed.starts_with("import ") && trimmed.contains(" as "))
                 || trimmed.starts_with("train(")
+                || trimmed.starts_with("train (")
         })
     } else {
         false
@@ -327,7 +332,7 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
         }
     };
 
-    let temp_dir = std::env::temp_dir().join("nsl_build");
+    let temp_dir = std::env::temp_dir().join(format!("nsl_build_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
         process::exit(1);
@@ -552,7 +557,7 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
 }
 
 fn run_run(file: &PathBuf, program_args: &[String]) {
-    let temp_dir = std::env::temp_dir().join("nsl_run");
+    let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
         process::exit(1);
@@ -623,7 +628,7 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
     }
 
     // Write object file and link to a temp executable
-    let temp_dir = std::env::temp_dir().join("nsl_test");
+    let temp_dir = std::env::temp_dir().join(format!("nsl_test_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
         process::exit(1);
