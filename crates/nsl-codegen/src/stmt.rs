@@ -9,6 +9,7 @@ use nsl_ast::pattern::PatternKind;
 use nsl_ast::expr::{ExprKind, SubscriptKind};
 use nsl_ast::block::{QuantDtype, QuantGranularity, TrainSection};
 use nsl_ast::stmt::{Stmt, StmtKind};
+use nsl_semantic::types::Type;
 
 use cranelift_codegen::ir::Value;
 use crate::compiler::Compiler;
@@ -590,6 +591,12 @@ impl Compiler<'_> {
         iterable: &nsl_ast::expr::Expr,
         body: &nsl_ast::stmt::Block,
     ) -> Result<(), CodegenError> {
+        // Check if iterating over a fixed model array
+        let iter_type = self.node_type(iterable.id).clone();
+        if let Type::FixedModelArray { element_model, size } = &iter_type {
+            return self.compile_for_model_array(builder, state, pattern, iterable, body, *element_model, *size);
+        }
+
         let list_val = self.compile_expr(builder, state, iterable)?;
 
         let len_id = self.runtime_fns["nsl_list_len"].0;
@@ -678,6 +685,93 @@ impl Compiler<'_> {
         }
 
         // Increment block: counter++ then jump to header
+        builder.switch_to_block(increment_block);
+        builder.seal_block(increment_block);
+        state.current_block = Some(increment_block);
+        let counter = builder.use_var(counter_var);
+        let one = builder.ins().iconst(cl_types::I64, 1);
+        let next = builder.ins().iadd(counter, one);
+        builder.def_var(counter_var, next);
+        builder.ins().jump(header_block, &[]);
+
+        builder.seal_block(header_block);
+        builder.switch_to_block(exit_block);
+        builder.seal_block(exit_block);
+        state.current_block = Some(exit_block);
+        Ok(())
+    }
+
+    fn compile_for_model_array(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        pattern: &nsl_ast::pattern::Pattern,
+        iterable: &nsl_ast::expr::Expr,
+        body: &nsl_ast::stmt::Block,
+        element_model: nsl_ast::Symbol,
+        size: i64,
+    ) -> Result<(), CodegenError> {
+        // Compile iterable to get base address of the array
+        let base_val = self.compile_expr(builder, state, iterable)?;
+
+        // Declare loop variable
+        let loop_var_sym = match &pattern.kind {
+            PatternKind::Ident(sym) => *sym,
+            _ => return Err(CodegenError::new("only ident patterns supported in model array for-loops")),
+        };
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        let elem_var = state.new_variable();
+        builder.declare_var(elem_var, cl_types::I64);
+        builder.def_var(elem_var, zero);
+        state.variables.insert(loop_var_sym, (elem_var, cl_types::I64));
+
+        // Register the loop variable's model type for method dispatch
+        let model_name = self.resolve_sym(element_model).to_string();
+        self.model_var_types.insert(loop_var_sym, model_name);
+
+        // Counter variable
+        let counter_var = state.new_variable();
+        builder.declare_var(counter_var, cl_types::I64);
+        builder.def_var(counter_var, zero);
+
+        let header_block = builder.create_block();
+        let body_block = builder.create_block();
+        let increment_block = builder.create_block();
+        let exit_block = builder.create_block();
+
+        builder.ins().jump(header_block, &[]);
+
+        // Header: check i < size
+        builder.switch_to_block(header_block);
+        state.current_block = Some(header_block);
+        let counter = builder.use_var(counter_var);
+        let limit = builder.ins().iconst(cl_types::I64, size);
+        let cond = builder.ins().icmp(IntCC::SignedLessThan, counter, limit);
+        builder.ins().brif(cond, body_block, &[], exit_block, &[]);
+
+        // Body: load element pointer from base_val + i*8
+        builder.switch_to_block(body_block);
+        builder.seal_block(body_block);
+        state.current_block = Some(body_block);
+        let counter = builder.use_var(counter_var);
+        let eight = builder.ins().iconst(cl_types::I64, 8);
+        let elem_offset = builder.ins().imul(counter, eight);
+        let addr = builder.ins().iadd(base_val, elem_offset);
+        let elem_ptr = builder.ins().load(cl_types::I64, MemFlags::trusted(), addr, 0);
+        builder.def_var(elem_var, elem_ptr);
+
+        // Compile body statements
+        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
+        for s in &body.stmts {
+            self.compile_stmt(builder, state, s)?;
+        }
+        state.loop_stack.pop();
+
+        if !is_block_filled(builder, body_block) {
+            builder.ins().jump(increment_block, &[]);
+        }
+
+        // Increment: counter++ then jump to header
         builder.switch_to_block(increment_block);
         builder.seal_block(increment_block);
         state.current_block = Some(increment_block);

@@ -1,0 +1,20 @@
+model Layer(dim: int):
+    w: Tensor = randn([dim, dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Stack(dim: int):
+    layers: [Layer; 3] = Layer(dim)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for layer in self.layers:
+            h = layer.forward(h)
+        return h
+
+let m = Stack(4)
+let x = ones([2, 4])
+let y = m.forward(x)
+print(y)
+print("model array for-loop: PASS")

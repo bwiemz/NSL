@@ -74,6 +74,35 @@ pub fn parse_primary_type(p: &mut Parser) -> TypeExpr {
             }
         }
 
+        // Fixed-size array type: [Type; N]
+        TokenKind::LeftBracket => {
+            let start = p.advance().span; // consume [
+            let elem_type = parse_type(p);
+            p.expect(&TokenKind::Semicolon);
+            let size = match p.peek().clone() {
+                TokenKind::IntLiteral(n) => {
+                    p.advance();
+                    n
+                }
+                _ => {
+                    p.diagnostics.push(
+                        nsl_errors::Diagnostic::error("expected integer literal in fixed array size")
+                            .with_label(p.current_span(), "expected integer"),
+                    );
+                    1
+                }
+            };
+            let end = p.expect(&TokenKind::RightBracket);
+            TypeExpr {
+                kind: TypeExprKind::FixedArray {
+                    element_type: Box::new(elem_type),
+                    size,
+                },
+                span: start.merge(end),
+                id: p.next_node_id(),
+            }
+        }
+
         _ => {
             let span = p.current_span();
             p.diagnostics.push(

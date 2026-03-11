@@ -101,6 +101,12 @@ pub enum Type {
 
     /// The type of `none` literal. Unifies with `Optional<T>` for any T.
     NoneType,
+
+    /// Fixed-size array of models: [TransformerBlock; 12]
+    FixedModelArray {
+        element_model: Symbol,
+        size: i64,
+    },
 }
 
 impl Type {
@@ -389,6 +395,7 @@ pub fn display_type(ty: &Type) -> String {
         Type::Unknown => "unknown".into(),
         Type::Error => "error".into(),
         Type::NoneType => "None".into(),
+        Type::FixedModelArray { size, .. } => format!("[model; {}]", size),
         _ => format!("{:?}", ty),
     }
 }

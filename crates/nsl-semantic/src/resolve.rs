@@ -58,6 +58,15 @@ impl<'a> TypeResolver<'a> {
                 Type::Tuple(types.iter().map(|t| self.resolve(t, scope)).collect())
             }
             TypeExprKind::Wildcard => Type::Unknown,
+            TypeExprKind::FixedArray { element_type, size } => {
+                let elem = self.resolve(element_type, scope);
+                if let Type::Model { name, .. } = &elem {
+                    Type::FixedModelArray { element_model: *name, size: *size }
+                } else {
+                    // For now, only model arrays supported
+                    Type::Unknown
+                }
+            }
         }
     }
 

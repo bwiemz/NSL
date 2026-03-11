@@ -401,12 +401,21 @@ impl Compiler<'_> {
             if matches!(obj_type, Type::List(_)) {
                 return self.compile_list_method_call(builder, state, object, &member_name, args);
             }
-            if obj_type.is_tensor() || matches!(obj_type, Type::Unknown) {
+            if obj_type.is_tensor() {
                 return self.compile_tensor_method_call(builder, state, object, &member_name, args);
             }
             if let Type::Model { name, .. } = &obj_type {
                 let model_name = self.resolve_sym(*name).to_string();
                 return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
+            }
+            // Fallback for model array loop variables (type is Unknown but var was bound from model array)
+            if matches!(obj_type, Type::Unknown) {
+                if let ExprKind::Ident(obj_sym) = &object.kind {
+                    if let Some(model_name) = self.model_var_types.get(obj_sym).cloned() {
+                        return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
+                    }
+                }
+                return self.compile_tensor_method_call(builder, state, object, &member_name, args);
             }
         }
 
@@ -1251,7 +1260,22 @@ impl Compiler<'_> {
 
         if let Type::Model { name, .. } = &obj_type {
             let model_name = self.resolve_sym(*name).to_string();
-            if let Some(layout) = self.struct_layouts.get(&model_name) {
+            // Check if this field is a FixedModelArray — return the address, not a loaded value
+            if let Some(field_type_map) = self.model_field_types.get(&model_name).cloned() {
+                if let Some(array_marker) = field_type_map.get(&member_name).cloned() {
+                    if array_marker.starts_with('[') {
+                        if let Some(layout) = self.struct_layouts.get(&model_name).cloned() {
+                            for field in &layout.fields {
+                                if field.name == member_name {
+                                    let offset_val = builder.ins().iconst(cl_types::I64, field.offset as i64);
+                                    return Ok(builder.ins().iadd(obj_val, offset_val));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(layout) = self.struct_layouts.get(&model_name).cloned() {
                 for field in &layout.fields {
                     if field.name == member_name {
                         let val = builder.ins().load(

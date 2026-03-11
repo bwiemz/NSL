@@ -60,6 +60,12 @@ pub enum TypeExprKind {
 
     /// _
     Wildcard,
+
+    /// Fixed-size array type: [TransformerBlock; 12]
+    FixedArray {
+        element_type: Box<TypeExpr>,
+        size: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

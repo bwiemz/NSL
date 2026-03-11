@@ -67,6 +67,11 @@ pub struct Compiler<'a> {
     pub module_prefix: String,
     /// Kernel name → (ptx_data_id, name_data_id) for compiled GPU kernels.
     pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
+    /// model_name → { field_name → type_marker }
+    /// type_marker is "[ElemModel;N]" for fixed model arrays, or the nested model name.
+    pub model_field_types: HashMap<String, HashMap<String, String>>,
+    /// Variable Symbol → model name (for model array loop variables)
+    pub model_var_types: HashMap<Symbol, String>,
     func_index: u32,
 }
 
@@ -124,6 +129,8 @@ impl<'a> Compiler<'a> {
             test_fns: Vec::new(),
             module_prefix: String::new(),
             kernel_ptx_data: HashMap::new(),
+            model_field_types: HashMap::new(),
+            model_var_types: HashMap::new(),
             func_index: 0,
         })
     }
@@ -441,11 +448,29 @@ impl<'a> Compiler<'a> {
                 let name = self.resolve_sym(md.name).to_string();
                 let mut fields = Vec::new();
                 let mut offset = 0usize;
+                let mut field_type_map: HashMap<String, String> = HashMap::new();
 
                 // Extract fields from AST LayerDecl members (type_map may not have stmt types)
                 for member in &md.members {
                     if let nsl_ast::decl::ModelMember::LayerDecl { name: field_sym, type_ann, .. } = member {
                         let field_name = self.resolve_sym(*field_sym).to_string();
+
+                        // Check if this is a FixedArray type
+                        if let nsl_ast::types::TypeExprKind::FixedArray { element_type, size } = &type_ann.kind {
+                            let align = 8usize;
+                            offset = (offset + align - 1) & !(align - 1);
+                            // Store a single StructField pointing to the base of the array
+                            fields.push(StructField { name: field_name.clone(), cl_type: cl_types::I64, offset });
+                            offset += (*size as usize) * 8;
+
+                            // Record array marker in field_type_map
+                            if let nsl_ast::types::TypeExprKind::Named(elem_sym) = &element_type.kind {
+                                let elem_name = self.resolve_sym(*elem_sym).to_string();
+                                field_type_map.insert(field_name, format!("[{};{}]", elem_name, size));
+                            }
+                            continue;
+                        }
+
                         let cl_type = match &type_ann.kind {
                             nsl_ast::types::TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
                             _ => cl_types::I64,
@@ -453,11 +478,22 @@ impl<'a> Compiler<'a> {
                         let size = cl_type.bytes() as usize;
                         let align = size.max(1);
                         offset = (offset + align - 1) & !(align - 1);
-                        fields.push(StructField { name: field_name, cl_type, offset });
+                        fields.push(StructField { name: field_name.clone(), cl_type, offset });
                         offset += size;
+
+                        // Check if this is a nested model field
+                        if let nsl_ast::types::TypeExprKind::Named(type_sym) = &type_ann.kind {
+                            let type_name = self.resolve_sym(*type_sym).to_string();
+                            if self.struct_layouts.contains_key(&type_name) {
+                                field_type_map.insert(field_name, type_name);
+                            }
+                        }
                     }
                 }
 
+                if !field_type_map.is_empty() {
+                    self.model_field_types.insert(name.clone(), field_type_map);
+                }
                 self.struct_layouts.insert(name.clone(), StructLayout { name, fields, total_size: offset });
             }
         }
@@ -931,9 +967,65 @@ impl<'a> Compiler<'a> {
             // Initialize fields
             if let Some(ref layout) = layout {
                 let field_info: Vec<_> = layout.fields.iter().map(|f| (f.name.clone(), f.cl_type, f.offset)).collect();
-                for member in &md.members {
-                    if let ModelMember::LayerDecl { name, init, .. } = member {
+                let members_clone: Vec<_> = md.members.clone();
+                for member in &members_clone {
+                    if let ModelMember::LayerDecl { name, init, type_ann, .. } = member {
                         let field_name = self.resolve_sym(*name).to_string();
+
+                        // Check if this is a FixedArray field → generate init loop
+                        if let nsl_ast::types::TypeExprKind::FixedArray { size, .. } = &type_ann.kind {
+                            let arr_size = *size;
+                            if let Some((_fname, _cl_type, field_offset)) = field_info.iter().find(|(n, _, _)| *n == field_name) {
+                                let field_offset = *field_offset;
+                                if let Some(init_expr) = init {
+                                    let init_expr_clone = init_expr.clone();
+                                    // Generate loop: for i in 0..arr_size, compile init, store at ptr+field_offset+i*8
+                                    let counter_var = state.new_variable();
+                                    builder.declare_var(counter_var, cl_types::I64);
+                                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                                    builder.def_var(counter_var, zero);
+
+                                    let loop_header = builder.create_block();
+                                    let loop_body = builder.create_block();
+                                    let loop_exit = builder.create_block();
+
+                                    builder.ins().jump(loop_header, &[]);
+
+                                    builder.switch_to_block(loop_header);
+                                    state.current_block = Some(loop_header);
+                                    let counter = builder.use_var(counter_var);
+                                    let limit = builder.ins().iconst(cl_types::I64, arr_size);
+                                    let cond = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, counter, limit);
+                                    builder.ins().brif(cond, loop_body, &[], loop_exit, &[]);
+
+                                    builder.switch_to_block(loop_body);
+                                    builder.seal_block(loop_body);
+                                    state.current_block = Some(loop_body);
+
+                                    let init_val = self.compile_expr(&mut builder, &mut state, &init_expr_clone)?;
+                                    let counter = builder.use_var(counter_var);
+                                    let eight = builder.ins().iconst(cl_types::I64, 8);
+                                    let elem_byte_offset = builder.ins().imul(counter, eight);
+                                    let base_off = builder.ins().iconst(cl_types::I64, field_offset as i64);
+                                    let total_off = builder.ins().iadd(base_off, elem_byte_offset);
+                                    let addr = builder.ins().iadd(ptr, total_off);
+                                    builder.ins().store(MemFlags::trusted(), init_val, addr, 0);
+
+                                    let next_counter = builder.use_var(counter_var);
+                                    let one = builder.ins().iconst(cl_types::I64, 1);
+                                    let next = builder.ins().iadd(next_counter, one);
+                                    builder.def_var(counter_var, next);
+                                    builder.ins().jump(loop_header, &[]);
+
+                                    builder.seal_block(loop_header);
+                                    builder.switch_to_block(loop_exit);
+                                    builder.seal_block(loop_exit);
+                                    state.current_block = Some(loop_exit);
+                                }
+                            }
+                            continue;
+                        }
+
                         if let Some((_fname, cl_type, offset)) = field_info.iter().find(|(n, _, _)| *n == field_name) {
                             if let Some(init_expr) = init {
                                 let val = self.compile_expr(&mut builder, &mut state, init_expr)?;
