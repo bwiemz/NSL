@@ -1,0 +1,9 @@
+let x = full([3, 4], 2.0)
+
+let (loss, grads) = grad(x):
+    let y = unsqueeze(x, 0)
+    let z = sum(y)
+    z
+
+print(grads)
+print("unsqueeze grad: PASS")

@@ -16,8 +16,10 @@ use crate::tensor::{
     nsl_tensor_neg as tensor_neg,
     nsl_tensor_ones as tensor_ones,
     nsl_tensor_ones_like,
+    nsl_tensor_select,
     nsl_tensor_shape as tensor_shape,
     nsl_tensor_sign as tensor_sign,
+    nsl_tensor_sum_dim,
     nsl_tensor_transpose as tensor_transpose,
     nsl_tensor_zeros as tensor_zeros,
 };
@@ -59,6 +61,9 @@ pub enum TapeOp {
     Conv2d { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_weight: i64, stride_h: usize, stride_w: usize, pad_h: usize, pad_w: usize },
     MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
     BiasAdd { tensor: i64, bias: i64, out: i64 },
+    Unsqueeze { input: i64, out: i64, input_shape: Vec<i64> },
+    Expand { input: i64, out: i64, original_shape: Vec<i64> },
+    Stack { inputs: Vec<i64>, out: i64, dim: i64 },
 }
 
 struct Tape {
@@ -185,6 +190,13 @@ fn release_tape_op_refs(ops: &[TapeOp]) {
                 tensor_free(*tensor);
                 tensor_free(*bias);
             }
+            TapeOp::Unsqueeze { .. } => {}
+            TapeOp::Expand { .. } => {}
+            TapeOp::Stack { inputs, .. } => {
+                for &inp in inputs {
+                    tensor_free(inp);
+                }
+            }
             _ => {}
         }
     }
@@ -286,6 +298,39 @@ fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
         dtype: 0,
     });
     Box::into_raw(tensor) as i64
+}
+
+/// Reshape a tensor to the given shape by deep-copying its data with new shape metadata.
+/// The element count must match (panics otherwise).
+fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = shape.len() as i64;
+    let total: i64 = shape.iter().product();
+    assert_eq!(total, tensor.len, "reshape_to_shape: size mismatch {} vs {}", total, tensor.len);
+
+    let shape_ptr = crate::memory::checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in shape.iter().enumerate() {
+        unsafe { *shape_ptr.add(i) = s; }
+    }
+    let strides = NslTensor::compute_strides(shape_ptr, ndim);
+
+    let data_size = (total as usize) * tensor.element_size();
+    let data = crate::memory::checked_alloc(data_size);
+    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data as *mut u8, data_size); }
+
+    let new_tensor = Box::new(NslTensor {
+        data: data as *mut std::ffi::c_void,
+        shape: shape_ptr,
+        strides,
+        ndim,
+        len: total,
+        refcount: 1,
+        device: tensor.device,
+        dtype: tensor.dtype,
+    });
+    Box::into_raw(new_tensor) as i64
 }
 
 /// Reduce a gradient to match the original input shape after broadcasting.
@@ -1373,6 +1418,51 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = maxpool2d_backward(g, input_shape, saved_argmax);
                     accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
+            TapeOp::Unsqueeze { input, out, input_shape } => {
+                // Unsqueeze backward: reshape gradient back to original shape
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_input = reshape_to_shape(g, input_shape);
+                    accumulate_grad(&mut grad_map, *input, grad_input);
+                }
+            }
+            TapeOp::Expand { input, out, original_shape } => {
+                // Expand backward: sum along each broadcast dimension, then reshape to original shape
+                if let Some(&g) = grad_map.get(out) {
+                    let grad_t = crate::tensor::NslTensor::from_ptr(g);
+                    let grad_shape: Vec<i64> = unsafe {
+                        std::slice::from_raw_parts(grad_t.shape, grad_t.ndim as usize)
+                    }.to_vec();
+
+                    // Right-align original shape with grad shape
+                    let offset = grad_shape.len() - original_shape.len();
+                    let mut result = tensor_clone(g);
+
+                    // Sum along broadcast dims (iterate in reverse to keep dim indices stable)
+                    for d in (0..grad_shape.len()).rev() {
+                        let orig_d = if d >= offset { original_shape[d - offset] } else { 1 };
+                        if orig_d == 1 && grad_shape[d] > 1 {
+                            let old = result;
+                            result = nsl_tensor_sum_dim(result, d as i64, 1); // keepdim=1
+                            tensor_free(old);
+                        }
+                    }
+                    // Reshape to original shape
+                    let old = result;
+                    result = reshape_to_shape(result, original_shape);
+                    if old != result { tensor_free(old); }
+
+                    accumulate_grad(&mut grad_map, *input, result);
+                }
+            }
+            TapeOp::Stack { inputs, out, dim } => {
+                // Stack backward: select gradient slice for each input
+                if let Some(&g) = grad_map.get(out) {
+                    for (i, input_id) in inputs.iter().enumerate() {
+                        let grad_piece = nsl_tensor_select(g, *dim, i as i64);
+                        accumulate_grad(&mut grad_map, *input_id, grad_piece);
+                    }
                 }
             }
             TapeOp::BiasAdd { tensor, bias, out } => {

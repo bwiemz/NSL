@@ -573,7 +573,16 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
     });
     let out_ptr = Box::into_raw(out) as i64;
 
-    // TODO: record TapeOp::Unsqueeze (Task 7)
+    if autodiff::is_recording() {
+        let input_shape = unsafe {
+            std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize)
+        }.to_vec();
+        autodiff::maybe_record(autodiff::TapeOp::Unsqueeze {
+            input: tensor_ptr,
+            out: out_ptr,
+            input_shape,
+        });
+    }
 
     out_ptr
 }
@@ -794,7 +803,21 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     });
     let out_ptr = Box::into_raw(out) as i64;
 
-    // TODO: record TapeOp::Stack (Task 9)
+    if autodiff::is_recording() {
+        let ptrs: Vec<i64> = (0..num_tensors)
+            .map(|i| unsafe { *list.data.add(i) })
+            .collect();
+        // Bump refcount on each input for tape safety
+        for &tp in &ptrs {
+            let t = unsafe { &mut *(tp as *mut NslTensor) };
+            t.refcount += 1;
+        }
+        autodiff::maybe_record(autodiff::TapeOp::Stack {
+            inputs: ptrs,
+            out: out_ptr,
+            dim: dim as i64,
+        });
+    }
 
     out_ptr
 }
@@ -914,7 +937,16 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     });
     let out_ptr = Box::into_raw(out) as i64;
 
-    // TODO: record TapeOp::Expand (Task 8)
+    if autodiff::is_recording() {
+        let original_shape = unsafe {
+            std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize)
+        }.to_vec();
+        autodiff::maybe_record(autodiff::TapeOp::Expand {
+            input: tensor_ptr,
+            out: out_ptr,
+            original_shape,
+        });
+    }
 
     out_ptr
 }
