@@ -9,5 +9,5 @@ pub mod linker;
 pub mod stmt;
 pub mod types;
 
-pub use compiler::{compile, compile_entry, compile_module, compile_test};
+pub use compiler::{compile, compile_entry, compile_module, compile_module_with_imports, compile_test};
 pub use error::CodegenError;

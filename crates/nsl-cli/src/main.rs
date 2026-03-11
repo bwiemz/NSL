@@ -344,6 +344,7 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
             // Entry module: import functions from all dependencies
             let mut imported_fns = Vec::new();
             let mut imported_struct_layouts = HashMap::new();
+            let mut imported_model_names = std::collections::HashSet::new();
             let mut imported_enum_variants = HashMap::new();
             let mut imported_enum_defs = HashMap::new();
 
@@ -372,11 +373,28 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
                     }
                 }
 
-                // Extract struct layouts from dependency
+                // Extract struct layouts from dependency (structs first, then models which may reference structs)
                 if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
                     eprintln!("codegen error collecting structs from '{}': {e}", dep_path.display());
                     process::exit(1);
                 }
+                if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
+                    eprintln!("codegen error collecting models from '{}': {e}", dep_path.display());
+                    process::exit(1);
+                }
+
+                // Import model constructor and method signatures
+                let model_sigs = temp_compiler.build_model_signatures(&dep_data.ast.stmts);
+                imported_fns.extend(model_sigs);
+
+                // Collect model names from dep (so entry module won't generate struct ctors for them)
+                for stmt in &dep_data.ast.stmts {
+                    if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
+                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        imported_model_names.insert(model_name);
+                    }
+                }
+
                 for (name, layout) in temp_compiler.struct_layouts.drain() {
                     imported_struct_layouts.insert(name, layout);
                 }
@@ -392,6 +410,7 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
                 &mod_data.type_map,
                 &imported_fns,
                 imported_struct_layouts,
+                imported_model_names,
                 imported_enum_variants,
                 imported_enum_defs,
                 dump_ir,
@@ -403,12 +422,82 @@ fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
                 }
             }
         } else {
-            // Library module: export all functions
-            match nsl_codegen::compile_module(
+            // Library module: export all functions.
+            // If this module has dependencies (imports from other modules), inject their symbols.
+            let mut lib_imported_fns = Vec::new();
+            let mut lib_struct_layouts = HashMap::new();
+            let mut lib_model_names = std::collections::HashSet::new();
+
+            // Check if this module has any imports
+            let has_imports = mod_data.ast.stmts.iter().any(|s| {
+                matches!(s.kind, nsl_ast::stmt::StmtKind::FromImport(_) | nsl_ast::stmt::StmtKind::Import(_))
+            });
+
+            if has_imports {
+                // Collect symbols from all transitive deps of this module
+                for dep_path in &graph.dep_order {
+                    if dep_path == path || dep_path == &graph.entry {
+                        continue;
+                    }
+                    // Only include deps that are before this module in dep_order
+                    // (i.e., deps of this module, not modules that depend on it)
+                    let dep_idx = graph.dep_order.iter().position(|p| p == dep_path).unwrap_or(usize::MAX);
+                    let cur_idx = graph.dep_order.iter().position(|p| p == path).unwrap_or(usize::MAX);
+                    if dep_idx >= cur_idx {
+                        continue;
+                    }
+
+                    let dep_data = &graph.modules[dep_path];
+                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("codegen error: {e}");
+                            process::exit(1);
+                        }
+                    };
+
+                    for stmt in &dep_data.ast.stmts {
+                        if let nsl_ast::stmt::StmtKind::FnDef(fn_def) = &stmt.kind {
+                            let raw_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                            let mangled_name = crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
+                            let sig = temp_compiler.build_fn_signature(fn_def);
+                            lib_imported_fns.push((raw_name, mangled_name, sig));
+                        }
+                    }
+
+                    if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
+                        eprintln!("codegen error: {e}");
+                        process::exit(1);
+                    }
+                    if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
+                        eprintln!("codegen error: {e}");
+                        process::exit(1);
+                    }
+
+                    let model_sigs = temp_compiler.build_model_signatures(&dep_data.ast.stmts);
+                    lib_imported_fns.extend(model_sigs);
+
+                    for stmt in &dep_data.ast.stmts {
+                        if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
+                            let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                            lib_model_names.insert(model_name);
+                        }
+                    }
+
+                    for (name, layout) in temp_compiler.struct_layouts.drain() {
+                        lib_struct_layouts.insert(name, layout);
+                    }
+                }
+            }
+
+            match nsl_codegen::compile_module_with_imports(
                 &mod_data.ast,
                 &interner,
                 &mod_data.type_map,
                 &mod_data.module_prefix,
+                &lib_imported_fns,
+                lib_struct_layouts,
+                lib_model_names,
                 dump_ir,
             ) {
                 Ok(bytes) => bytes,

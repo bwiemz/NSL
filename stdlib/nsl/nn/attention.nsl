@@ -3,16 +3,33 @@ model Attention(dim: int, num_heads: int):
     k_proj: Tensor = randn([dim, dim])
     v_proj: Tensor = randn([dim, dim])
     out_proj: Tensor = randn([dim, dim])
+    _num_heads: Tensor = full([1], float(num_heads))
+    _head_dim: Tensor = full([1], float(dim) / float(num_heads))
+    _dim: Tensor = full([1], float(dim))
 
     fn forward(self, x: Tensor) -> Tensor:
+        let s = x.shape
+        let seq_len = s[0]
+        let nh = int(self._num_heads.item())
+        let hd = int(self._head_dim.item())
+        let d = int(self._dim.item())
+
         let q = x @ self.q_proj
         let k = x @ self.k_proj
         let v = x @ self.v_proj
-        let scale = sqrt(full([1], float(dim)))
-        # Transpose last two dims of k for attention scores (Q @ K^T).
-        # Uses negative indexing (-2, -1) so this works for both
-        # unbatched 2D [seq, dim] and batched 3D+ inputs.
-        let k_t = k.transpose(-2, -1)
-        let attn = softmax(q @ k_t / scale, -1)
+
+        let q = q.reshape([seq_len, nh, hd]).transpose(0, 1)
+        let k = k.reshape([seq_len, nh, hd]).transpose(0, 1)
+        let v = v.reshape([seq_len, nh, hd]).transpose(0, 1)
+
+        let scale = sqrt(full([1], float(hd)))
+        let scores = (q @ k.transpose(-2, -1)) / scale
+
+        let mask = causal_mask(seq_len)
+        scores = scores + mask
+
+        let attn = softmax(scores, -1)
         let out = attn @ v
+
+        let out = out.transpose(0, 1).reshape([seq_len, d])
         return out @ self.out_proj

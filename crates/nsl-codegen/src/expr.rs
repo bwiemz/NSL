@@ -2345,14 +2345,16 @@ impl Compiler<'_> {
         // Compile object to get self pointer
         let self_val = self.compile_expr(builder, state, object)?;
 
-        // Look up mangled method name
-        let mangled = {
-            let methods = self.model_methods.get(model_name).ok_or_else(|| {
-                CodegenError::new(format!("no methods registered for model '{model_name}'"))
-            })?;
+        // Look up mangled method name.
+        // For locally defined models, use the model_methods map.
+        // For imported models, fall back to the standard naming convention.
+        let mangled = if let Some(methods) = self.model_methods.get(model_name) {
             methods.get(method_name).ok_or_else(|| {
                 CodegenError::new(format!("model '{model_name}' has no method '{method_name}'"))
             })?.clone()
+        } else {
+            // Imported model: derive mangled name from convention
+            format!("__nsl_model_{model_name}_{method_name}")
         };
 
         // Compile args
@@ -2422,6 +2424,15 @@ impl Compiler<'_> {
                 }
                 let shape_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_expand", &[obj_val, shape_val])
+            }
+            "slice" => {
+                if args.len() != 3 {
+                    return Err(CodegenError::new("slice() takes exactly 3 arguments (dim, start, end)"));
+                }
+                let dim_val = self.compile_expr(builder, state, &args[0].value)?;
+                let start_val = self.compile_expr(builder, state, &args[1].value)?;
+                let end_val = self.compile_expr(builder, state, &args[2].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_slice", &[obj_val, dim_val, start_val, end_val])
             }
             _ => Err(CodegenError::new(format!("unknown tensor method '.{method}()'"))),
         }

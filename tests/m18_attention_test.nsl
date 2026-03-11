@@ -1,0 +1,7 @@
+from nsl.nn.attention import Attention
+
+let attn = Attention(32, 4)
+let x = randn([8, 32])
+let y = attn.forward(x)
+print(y)
+print("attention: PASS")

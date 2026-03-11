@@ -1457,6 +1457,10 @@ impl<'a> TypeChecker<'a> {
                         params: vec![],
                         ret: Box::new(obj_ty.clone()),
                     },
+                    "item" => Type::Function {
+                        params: vec![],
+                        ret: Box::new(Type::Float),
+                    },
                     _ => Type::Unknown,    // tensor methods
                 }
             }

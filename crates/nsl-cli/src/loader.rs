@@ -184,6 +184,7 @@ fn extract_exports(
             StmtKind::FnDef(fn_def) => Some(fn_def.name),
             StmtKind::StructDef(sd) => Some(sd.name),
             StmtKind::EnumDef(ed) => Some(ed.name),
+            StmtKind::ModelDef(md) => Some(md.name),
             _ => None,
         };
 

@@ -72,6 +72,9 @@ pub struct Compiler<'a> {
     pub model_field_types: HashMap<String, HashMap<String, String>>,
     /// Variable Symbol → model name (for model array loop variables)
     pub model_var_types: HashMap<Symbol, String>,
+    /// Names of models imported from other modules (not defined locally).
+    /// These have struct layouts but should NOT generate struct ctors.
+    pub imported_model_names: HashSet<String>,
     func_index: u32,
 }
 
@@ -131,6 +134,7 @@ impl<'a> Compiler<'a> {
             kernel_ptx_data: HashMap::new(),
             model_field_types: HashMap::new(),
             model_var_types: HashMap::new(),
+            imported_model_names: HashSet::new(),
             func_index: 0,
         })
     }
@@ -564,7 +568,7 @@ impl<'a> Compiler<'a> {
             .collect();
 
         let struct_names: Vec<String> = self.struct_layouts.keys()
-            .filter(|k| !model_name_set.contains(*k))
+            .filter(|k| !model_name_set.contains(*k) && !self.imported_model_names.contains(*k))
             .cloned()
             .collect();
         for sname in struct_names {
@@ -716,6 +720,81 @@ impl<'a> Compiler<'a> {
         sig
     }
 
+    /// Build signatures for all model ctors and methods in a module's AST.
+    /// Returns (raw_name, mangled_name, signature) tuples for use as imported_fns.
+    pub fn build_model_signatures(&mut self, stmts: &[Stmt]) -> Vec<(String, String, Signature)> {
+        let mut result = Vec::new();
+
+        for stmt in stmts {
+            if let StmtKind::ModelDef(md) = &stmt.kind {
+                let model_name = self.resolve_sym(md.name).to_string();
+
+                // Constructor signature: (params...) -> ptr
+                let mut ctor_sig = self.module.make_signature();
+                ctor_sig.call_conv = self.call_conv;
+                for param in &md.params {
+                    let cl_type = if let Some(ref type_ann) = param.type_ann {
+                        match &type_ann.kind {
+                            TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
+                            _ => cl_types::I64,
+                        }
+                    } else {
+                        cl_types::I64
+                    };
+                    ctor_sig.params.push(AbiParam::new(cl_type));
+                }
+                ctor_sig.returns.push(AbiParam::new(pointer_type()));
+                let ctor_mangled = format!("__nsl_model_{model_name}");
+                result.push((model_name.clone(), ctor_mangled, ctor_sig));
+
+                // Method signatures
+                for member in &md.members {
+                    if let nsl_ast::decl::ModelMember::Method(fn_def) = member {
+                        let method_name = self.resolve_sym(fn_def.name).to_string();
+                        let mangled = format!("__nsl_model_{model_name}_{method_name}");
+
+                        let mut method_sig = self.module.make_signature();
+                        method_sig.call_conv = self.call_conv;
+                        // First param: self pointer
+                        method_sig.params.push(AbiParam::new(pointer_type()));
+                        // Remaining params (skip "self")
+                        for param in &fn_def.params {
+                            let pname = self.resolve_sym(param.name).to_string();
+                            if pname == "self" { continue; }
+                            let cl_type = if let Some(ref type_ann) = param.type_ann {
+                                match &type_ann.kind {
+                                    TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
+                                    _ => cl_types::I64,
+                                }
+                            } else {
+                                cl_types::I64
+                            };
+                            method_sig.params.push(AbiParam::new(cl_type));
+                        }
+                        // Return type
+                        if let Some(ref ret_type) = fn_def.return_type {
+                            match &ret_type.kind {
+                                TypeExprKind::Named(sym) => {
+                                    let name = self.resolve_sym(*sym);
+                                    if name != "void" {
+                                        method_sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                                    }
+                                }
+                                _ => { method_sig.returns.push(AbiParam::new(cl_types::I64)); }
+                            }
+                        } else {
+                            method_sig.returns.push(AbiParam::new(cl_types::I64));
+                        }
+
+                        result.push((mangled.clone(), mangled, method_sig));
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
     pub fn compile_kernels(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
@@ -782,7 +861,7 @@ impl<'a> Compiler<'a> {
 
         let layouts: Vec<(String, Vec<(cl_types::Type, usize)>, usize)> = self
             .struct_layouts.iter()
-            .filter(|(name, _)| !self.model_methods.contains_key(*name))
+            .filter(|(name, _)| !self.model_methods.contains_key(*name) && !self.imported_model_names.contains(*name))
             .map(|(name, layout)| {
                 let fields: Vec<_> = layout.fields.iter().map(|f| (f.cl_type, f.offset)).collect();
                 (name.clone(), fields, layout.total_size)
@@ -1478,15 +1557,40 @@ pub fn compile_module(
     module_prefix: &str,
     dump_ir: bool,
 ) -> Result<Vec<u8>, CodegenError> {
+    compile_module_with_imports(ast, interner, type_map, module_prefix, &[], HashMap::new(), HashSet::new(), dump_ir)
+}
+
+/// Compile a library module with imported symbols from its own dependencies.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_module_with_imports(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    module_prefix: &str,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    dump_ir: bool,
+) -> Result<Vec<u8>, CodegenError> {
     let mut compiler = Compiler::new(interner, type_map)?;
     compiler.dump_ir = dump_ir;
     compiler.module_prefix = module_prefix.to_string();
+
+    // Register imported structs/models from dependencies
+    for (name, layout) in imported_struct_layouts {
+        compiler.struct_layouts.insert(name, layout);
+    }
+    for name in imported_model_names {
+        compiler.imported_model_names.insert(name);
+    }
+
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
     compiler.declare_runtime_functions()?;
+    compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
@@ -1504,6 +1608,7 @@ pub fn compile_entry(
     type_map: &TypeMap,
     imported_fns: &[(String, String, Signature)],
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
     imported_enum_variants: HashMap<String, i64>,
     imported_enum_defs: HashMap<String, Vec<(String, i64)>>,
     dump_ir: bool,
@@ -1514,6 +1619,10 @@ pub fn compile_entry(
     // Register imported structs/enums so the entry module can reference them
     for (name, layout) in imported_struct_layouts {
         compiler.struct_layouts.insert(name, layout);
+    }
+    // Mark imported model names so we don't generate struct ctors for them
+    for name in imported_model_names {
+        compiler.imported_model_names.insert(name);
     }
     for (name, tag) in imported_enum_variants {
         compiler.enum_variants.insert(name, tag);
