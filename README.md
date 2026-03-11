@@ -10,7 +10,8 @@ NSL compiles to native code via Cranelift with zero Python or C++ dependencies. 
 - **Compile-time tensor shape checking** — catch dimension mismatches before running
 - **Native autodiff** — `grad` is a keyword, not a library call
 - **Declarative training** — `train` blocks replace boilerplate training loops
-- **No GIL, no CUDA toolkit required** — just `nsl run model.nsl`
+- **GPU/CUDA native** — `kernel` keyword for custom GPU ops, `.to(cuda)` for device transfer
+- **No GIL** — just `nsl run model.nsl`
 
 ## Quick Example
 
@@ -44,6 +45,20 @@ Output:
 3.39738624
 3.131031158784
 2.8855583159353344
+```
+
+### GPU Kernel Example
+
+```python
+kernel vec_add(a, b, c):
+    let i = thread_id()
+    c[i] = a[i] + b[i]
+
+let a = full([1024], 1.0).to(cuda)
+let b = full([1024], 2.0).to(cuda)
+let c = zeros([1024]).to(cuda)
+vec_add(a, b, c, grid=4, block=256)
+let result = c.to(cpu)  # each element = 3.0
 ```
 
 ## Features
@@ -99,6 +114,16 @@ Output:
 - BPE tokenizer via HuggingFace `tokenizers` crate
 - Encode text → token ID tensors, decode back to text
 - Batch encoding with padding and attention masks
+
+### GPU/CUDA
+- `kernel` keyword for user-defined GPU kernels (compiled to PTX)
+- `.to(cuda)` / `.to(cpu)` for transparent device transfer
+- GPU intrinsics: `thread_id()`, `block_id()`, `block_dim()`, `sync_threads()`
+- Kernel launch with explicit grid/block: `my_kernel(a, b, c, grid=4, block=256)`
+- 15 built-in GPU PTX kernels for tensor ops (add, mul, matmul, activations, etc.)
+- CUDA Unified Memory for zero-copy host/device access
+- Automatic f64↔f32 dtype conversion on device transfer
+- Optional: build with `--features cuda` to enable GPU support
 
 ### Quantization
 - `quant static` block for declarative weight quantization
@@ -182,6 +207,12 @@ cargo run -p nsl-cli -- run examples/m15_tiny_lm.nsl
 
 # Run quantization example
 cargo run -p nsl-cli -- run examples/m16_quantize.nsl
+
+# Run GPU kernel test (requires CUDA)
+cargo run -p nsl-cli --features cuda -- run tests/m17_kernel_test.nsl
+
+# Run GPU compute test (requires CUDA)
+cargo run -p nsl-cli --features cuda -- run tests/m17_gpu_training_test.nsl
 ```
 
 ## Development Status
@@ -198,7 +229,7 @@ NSL is in active development. Current milestone progress:
 | M14 | Training DSL + optimizers + schedulers | Complete |
 | M15 | NN stdlib + tokenization + test framework | Complete |
 | M16 | Quantization foundations (`quant static` block) | Complete |
-| M17 | GPU/CUDA + `kernel` keyword | Planned |
+| M17 | GPU/CUDA + `kernel` keyword | Complete |
 | M18 | Interop (PyTorch, HuggingFace, ONNX) | Planned |
 | M19-20 | Package ecosystem + v0.1 release | Planned |
 | M21 | Advanced quantization (FP8, activation quant) | Planned |
