@@ -1,0 +1,10 @@
+let a = full([4], 1.0)
+let b = full([4], 2.0)
+
+let (loss, grads) = grad(a):
+    let s = stack([a, b], 0)
+    let z = sum(s)
+    z
+
+print(grads)
+print("stack grad: PASS")
