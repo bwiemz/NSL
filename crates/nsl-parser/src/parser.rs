@@ -71,6 +71,9 @@ impl<'a> Parser<'a> {
     // === Token consumption ===
 
     pub fn advance(&mut self) -> &Token {
+        if self.tokens.is_empty() {
+            return &EOF_TOKEN;
+        }
         let tok = &self.tokens[self.pos.min(self.tokens.len() - 1)];
         if self.pos < self.tokens.len() {
             self.pos += 1;
@@ -97,6 +100,10 @@ impl<'a> Parser<'a> {
                 Diagnostic::error(format!("expected {kind}, found {}", self.peek()))
                     .with_label(span, format!("expected {kind}")),
             );
+            // Advance past the unexpected token to prevent infinite loops
+            if !self.at(&TokenKind::Eof) {
+                self.advance();
+            }
             span
         }
     }
@@ -111,6 +118,10 @@ impl<'a> Parser<'a> {
                 Diagnostic::error(format!("expected identifier, found {}", self.peek()))
                     .with_label(span, "expected identifier"),
             );
+            // Advance past the unexpected token to prevent infinite loops
+            if !self.at(&TokenKind::Eof) {
+                self.advance();
+            }
             let sym = self.interner.get_or_intern("<error>");
             (sym.into(), span)
         }
@@ -155,6 +166,10 @@ impl<'a> Parser<'a> {
             Diagnostic::error(format!("expected identifier, found {}", self.peek()))
                 .with_label(span, "expected identifier"),
         );
+        // Advance past the unexpected token to prevent infinite loops
+        if !self.at(&TokenKind::Eof) {
+            self.advance();
+        }
         let sym = self.interner.get_or_intern("<error>");
         (sym.into(), span)
     }
