@@ -1,0 +1,19 @@
+model Inner(dim: int):
+    w: Tensor = randn([dim, dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Outer(dim: int):
+    inner: Inner = Inner(dim)
+    b: Tensor = zeros([dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = self.inner.forward(x)
+        return bias_add(h, self.b)
+
+let m = Outer(4)
+let x = ones([3, 4])
+let y = m.forward(x)
+print(y)
+print("nested model: PASS")
