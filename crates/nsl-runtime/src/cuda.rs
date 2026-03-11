@@ -122,6 +122,7 @@ pub(crate) mod inner {
             );
             if result != CUresult::CUDA_SUCCESS
                 && result != CUresult::CUDA_ERROR_NOT_SUPPORTED
+                && result != CUresult::CUDA_ERROR_INVALID_DEVICE
             {
                 panic!("cuMemPrefetchAsync failed: {:?}", result);
             }
@@ -358,5 +359,49 @@ DONE:
         inner::free_managed(a);
         inner::free_managed(b);
         inner::free_managed(c);
+    }
+
+    #[test]
+    fn test_tensor_to_device_roundtrip() {
+        use crate::tensor::{NslTensor, nsl_tensor_to_device};
+
+        // Create a CPU tensor manually: [1.0, 2.0, 3.0, 4.0]
+        let data = vec![1.0f64, 2.0, 3.0, 4.0];
+        let shape = vec![4i64];
+        let strides = vec![1i64];
+        let t = Box::new(NslTensor {
+            data: data.as_ptr() as *mut std::ffi::c_void,
+            shape: shape.as_ptr() as *mut i64,
+            strides: strides.as_ptr() as *mut i64,
+            ndim: 1,
+            len: 4,
+            refcount: 1,
+            device: 0,
+            dtype: 0,
+        });
+        // Leak the vecs so the tensor can use them
+        std::mem::forget(data);
+        std::mem::forget(shape);
+        std::mem::forget(strides);
+        let cpu_tensor = Box::into_raw(t) as i64;
+
+        // Transfer CPU → GPU
+        let gpu_tensor = nsl_tensor_to_device(cpu_tensor, 1);
+        let gpu_t = unsafe { &*(gpu_tensor as *const NslTensor) };
+        assert_eq!(gpu_t.device, 1);
+        assert_eq!(gpu_t.dtype, 1); // f32
+
+        // Transfer GPU → CPU
+        let cpu_back = nsl_tensor_to_device(gpu_tensor, 0);
+        let cpu_t = unsafe { &*(cpu_back as *const NslTensor) };
+        assert_eq!(cpu_t.device, 0);
+        assert_eq!(cpu_t.dtype, 0); // f64
+
+        // Verify values survived the roundtrip (f64 → f32 → f64)
+        for i in 0..4 {
+            let val = unsafe { *cpu_t.data_f64().add(i) };
+            let expected = (i + 1) as f64;
+            assert!((val - expected).abs() < 1e-6, "mismatch at {}: {} vs {}", i, val, expected);
+        }
     }
 }

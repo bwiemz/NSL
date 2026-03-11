@@ -81,6 +81,14 @@ impl NslTensor {
         }
         total
     }
+
+    pub(crate) fn copy_shape(src: *const i64, ndim: i64) -> *mut i64 {
+        let n = ndim as usize;
+        let layout = std::alloc::Layout::array::<i64>(n).unwrap();
+        let dst = unsafe { std::alloc::alloc(layout) as *mut i64 };
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, n); }
+        dst
+    }
 }
 
 /// Helper: create a tensor from a shape list, filling data with a given value.
@@ -2830,4 +2838,98 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     }
 
     out_ptr
+}
+
+/// Transfer a tensor to a different device.
+/// CPU→GPU: converts f64 → f32, allocates unified memory, prefetches.
+/// GPU→CPU: converts f32 → f64, allocates CPU memory.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i64 {
+    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let target = target_device as u8;
+
+    if t.device == target {
+        // Same device — increment refcount and return same pointer
+        let t_mut = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        t_mut.refcount += 1;
+        return tensor_ptr;
+    }
+
+    let len = t.len as usize;
+
+    if t.device == 0 && target > 0 {
+        // CPU → GPU: f64 → f32
+        #[cfg(feature = "cuda")]
+        {
+            let src = t.data_f64();
+            let dst_size = len * std::mem::size_of::<f32>();
+            let dst = crate::cuda::inner::alloc_managed(dst_size);
+            let dst_f32 = dst as *mut f32;
+
+            // Convert f64 → f32 on CPU side (unified memory)
+            for i in 0..len {
+                unsafe { *dst_f32.add(i) = *src.add(i) as f32; }
+            }
+
+            // Prefetch to GPU
+            crate::cuda::inner::prefetch_to_device(dst, dst_size, (target - 1) as i32);
+
+            // Copy shape and strides
+            let shape = NslTensor::copy_shape(t.shape, t.ndim);
+            let strides = NslTensor::compute_strides(shape, t.ndim);
+
+            let new_t = Box::new(NslTensor {
+                data: dst,
+                shape,
+                strides,
+                ndim: t.ndim,
+                len: t.len,
+                refcount: 1,
+                device: target,
+                dtype: 1, // f32
+            });
+            return Box::into_raw(new_t) as i64;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+
+    if t.device > 0 && target == 0 {
+        // GPU → CPU: f32 → f64
+        #[cfg(feature = "cuda")]
+        {
+            // Sync to ensure GPU writes are visible
+            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+            let src = t.data_f32();
+            let dst_size = len * std::mem::size_of::<f64>();
+            let layout = std::alloc::Layout::from_size_align(dst_size, 8).unwrap();
+            let dst = unsafe { std::alloc::alloc(layout) as *mut f64 };
+            let dst_void = dst as *mut std::ffi::c_void;
+
+            // Convert f32 → f64
+            for i in 0..len {
+                unsafe { *dst.add(i) = *src.add(i) as f64; }
+            }
+
+            let shape = NslTensor::copy_shape(t.shape, t.ndim);
+            let strides = NslTensor::compute_strides(shape, t.ndim);
+
+            let new_t = Box::new(NslTensor {
+                data: dst_void,
+                shape,
+                strides,
+                ndim: t.ndim,
+                len: t.len,
+                refcount: 1,
+                device: 0,
+                dtype: 0, // f64
+            });
+            return Box::into_raw(new_t) as i64;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+
+    panic!("GPU-to-GPU transfer not yet supported");
 }
