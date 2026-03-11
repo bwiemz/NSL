@@ -25,7 +25,17 @@ pub(crate) mod inner {
 
     /// Ensure CUDA is initialized. Called from FFI exports.
     pub(crate) fn init() {
-        let _ = state();
+        ensure_context();
+    }
+
+    /// Ensure the CUDA context is current on the calling thread.
+    /// Must be called before any CUDA driver API call.
+    fn ensure_context() {
+        let s = state();
+        let guard = s.lock().unwrap();
+        unsafe {
+            cuCtxSetCurrent(guard.context);
+        }
     }
 
     fn state() -> &'static Mutex<CudaState> {
@@ -72,7 +82,7 @@ pub(crate) mod inner {
 
     /// Allocate unified memory (accessible from both CPU and GPU).
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
-        state();
+        ensure_context();
         unsafe {
             let mut ptr: CUdeviceptr = 0;
             let result = cuMemAllocManaged(
@@ -140,6 +150,7 @@ pub(crate) mod inner {
     ) -> CUresult {
         let state = state();
         let mut guard = state.lock().unwrap();
+        unsafe { cuCtxSetCurrent(guard.context); }
 
         // Cache modules by PTX pointer address (stable .rodata addresses)
         let cache_key = ptx_ptr as usize;
