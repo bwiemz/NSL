@@ -1,0 +1,10 @@
+# Test Task 5: nsl_tensor_causal_mask
+# Creates [4,4] causal mask: lower triangle=0.0, upper=-1e9
+let mask = causal_mask(4)
+print(mask)
+
+# Smaller mask
+let mask2 = causal_mask(2)
+print(mask2)
+
+print("causal_mask: PASS")
