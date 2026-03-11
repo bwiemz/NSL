@@ -1096,7 +1096,9 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             TapeOp::Sub { a, b, out, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
                     let ga = reduce_grad_for_broadcast(g, a_shape);
-                    let gb_full = tensor_neg(tensor_clone(g));
+                    let g_clone = tensor_clone(g);
+                    let gb_full = tensor_neg(g_clone);
+                    tensor_free(g_clone); // free the clone; tensor_neg created a new tensor
                     let gb = reduce_grad_for_broadcast(gb_full, b_shape);
                     if gb != gb_full { tensor_free(gb_full); }
                     accumulate_grad(&mut grad_map, *a, ga);

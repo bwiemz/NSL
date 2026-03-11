@@ -1717,6 +1717,15 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     if ndim == 2 {
         let gather_dim_size = input_shape[d] as usize;
         if d == 1 {
+            // dim=1: output[b] = input[b, indices[b]], requires indices.len == rows
+            let rows = input_shape[0] as usize;
+            if batch != rows {
+                eprintln!(
+                    "nsl: gather dim=1 requires indices length ({}) == input rows ({})",
+                    batch, rows
+                );
+                std::process::abort();
+            }
             for b in 0..batch {
                 let idx = unsafe { *indices.data_f64().add(b) } as usize;
                 if idx >= gather_dim_size {
@@ -1730,8 +1739,15 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                 unsafe { *result.data_f64().add(b) = val };
             }
         } else {
-            // dim=0
+            // dim=0: output[c] = input[indices[c], c], requires indices.len == cols
             let cols = input_shape[1] as usize;
+            if batch != cols {
+                eprintln!(
+                    "nsl: gather dim=0 requires indices length ({}) == input cols ({})",
+                    batch, cols
+                );
+                std::process::abort();
+            }
             for c in 0..cols {
                 let idx = unsafe { *indices.data_f64().add(c) } as usize;
                 if idx >= gather_dim_size {
@@ -2482,7 +2498,21 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
         let strides_size = shape_size;
 
         unsafe {
-            checked_free(tensor.data as *mut u8, data_size);
+            // GPU tensors use CUDA unified memory — must free with cuMemFree, not CPU dealloc
+            if tensor.device > 0 {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::free_managed(tensor.data);
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    // Shouldn't happen: GPU tensor without CUDA support
+                    checked_free(tensor.data as *mut u8, data_size);
+                }
+            } else {
+                checked_free(tensor.data as *mut u8, data_size);
+            }
+            // Shape and strides are always CPU-allocated
             if !tensor.shape.is_null() {
                 checked_free(tensor.shape as *mut u8, shape_size);
             }
@@ -2880,6 +2910,14 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let input_ptrs: Vec<i64> = (0..num_tensors)
         .map(|i| unsafe { *list.data.add(i) })
         .collect();
+
+    if autodiff::is_recording() {
+        // Bump refcount on each input for tape safety (prevent use-after-free)
+        for &tp in &input_ptrs {
+            let t = unsafe { &mut *(tp as *mut NslTensor) };
+            t.refcount += 1;
+        }
+    }
 
     autodiff::maybe_record(autodiff::TapeOp::Cat {
         inputs: input_ptrs,
