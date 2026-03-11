@@ -354,3 +354,252 @@ pub(crate) const ADD_SCALAR_F32_PTX: &str = "\
     st.global.f32 [%rd6], %fs1;\n\
 DONE: ret;\n\
 }\0";
+
+// --- Unary math ops: exp, log, sqrt, abs, sign ---
+
+/// exp(x) = 2^(x * log2(e))  using ex2.approx
+pub(crate) const EXP_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_exp_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    mul.f32 %fs2, %fs1, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %fs1, %fs2;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+/// ln(x) = log2(x) * ln(2)  using lg2.approx
+pub(crate) const LOG_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_log_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    lg2.approx.f32 %fs2, %fs1;\n\
+    mul.f32 %fs1, %fs2, 0f3F317218;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+pub(crate) const SQRT_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sqrt_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    sqrt.rn.f32 %fs1, %fs1;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+pub(crate) const ABS_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_abs_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    abs.f32 %fs1, %fs1;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+/// sign(x): 1.0 if x>0, -1.0 if x<0, 0.0 if x==0
+pub(crate) const SIGN_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sign_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    mov.f32 %fs2, 0f00000000;\n\
+    setp.gt.f32 %p1, %fs1, %fs2;\n\
+    setp.lt.f32 %p2, %fs1, %fs2;\n\
+    selp.f32 %fs1, 0f3F800000, 0f00000000, %p1;\n\
+    selp.f32 %fs2, 0fBF800000, %fs1, %p2;\n\
+    mov.f32 %fs1, %fs2;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+// --- Activation functions ---
+
+/// sigmoid(x) = 1 / (1 + exp(-x))
+pub(crate) const SIGMOID_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sigmoid_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<3>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    neg.f32 %fs2, %fs1;\n\
+    mul.f32 %fs2, %fs2, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %fs2, %fs2;\n\
+    add.f32 %fs2, %fs2, 0f3F800000;\n\
+    rcp.approx.f32 %fs1, %fs2;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";
+
+/// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+pub(crate) const TANH_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_tanh_f32(\n\
+    .param .u64 a, .param .u64 c, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<7>;\n\
+    .reg .f32 %fs<4>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [a];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    add.f32 %fs2, %fs1, %fs1;\n\
+    mul.f32 %fs2, %fs2, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %fs2, %fs2;\n\
+    add.f32 %fs3, %fs2, 0f3F800000;\n\
+    sub.f32 %fs2, %fs2, 0f3F800000;\n\
+    div.approx.f32 %fs1, %fs2, %fs3;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    st.global.f32 [%rd6], %fs1;\n\
+DONE: ret;\n\
+}\0";

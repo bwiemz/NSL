@@ -1235,6 +1235,15 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1271,6 +1280,15 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1307,6 +1325,15 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1343,6 +1370,15 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1379,6 +1415,15 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1607,6 +1652,15 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1639,6 +1693,15 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;
