@@ -487,6 +487,15 @@ fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
+    {
+        let ta = unsafe { &*(a as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x + y);
@@ -498,6 +507,15 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
+    {
+        let ta = unsafe { &*(a as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x - y);
@@ -509,6 +527,15 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
+    {
+        let ta = unsafe { &*(a as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x * y);
@@ -530,6 +557,15 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
+    {
+        let ta = unsafe { &*(a as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x / y);
@@ -551,6 +587,15 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(a_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -584,6 +629,15 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
+    {
+        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(a_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -615,6 +669,15 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
+    {
+        let ta = unsafe { &*(a_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(a_ptr);
     let len = a.len;
     let ndim = a.ndim;
@@ -1425,6 +1488,15 @@ pub(crate) fn nsl_tensor_clamp_backward(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            { return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0"); }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len;
     let ndim = a.ndim;

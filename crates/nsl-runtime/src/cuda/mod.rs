@@ -1,7 +1,10 @@
 //! CUDA runtime: context management, kernel launch, module cache.
 //! Only compiled when the `cuda` feature is enabled.
 
+#[cfg(feature = "cuda")]
 use std::ffi::c_void;
+
+pub(crate) mod kernels;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
@@ -196,6 +199,120 @@ pub(crate) mod inner {
             )
         }
     }
+}
+
+// === GPU op helpers ===
+
+/// GPU elementwise binary op.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    assert_eq!(a.len, b.len, "GPU elementwise: length mismatch");
+
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor {
+        data: out_data, shape, strides,
+        ndim: a.ndim, len: a.len, refcount: 1,
+        device: a.device, dtype: 1,
+    });
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args,
+    );
+    assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    out_ptr as i64
+}
+
+/// GPU elementwise unary op.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4);
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor {
+        data: out_data, shape, strides,
+        ndim: a.ndim, len: a.len, refcount: 1,
+        device: a.device, dtype: 1,
+    });
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args,
+    );
+    assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    out_ptr as i64
+}
+
+/// GPU scalar op (tensor op scalar).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &str) -> i64 {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4);
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor {
+        data: out_data, shape, strides,
+        ndim: a.ndim, len: a.len, refcount: 1,
+        device: a.device, dtype: 1,
+    });
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut s_val = scalar;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut s_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args,
+    );
+    assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    out_ptr as i64
 }
 
 // === FFI exports ===
@@ -413,6 +530,55 @@ DONE:
             let val = unsafe { *cpu_t.data_f64().add(i) };
             let expected = (i + 1) as f64;
             assert!((val - expected).abs() < 1e-6, "mismatch at {}: {} vs {}", i, val, expected);
+        }
+    }
+
+    #[test]
+    fn test_gpu_elementwise_add() {
+        use crate::tensor::{NslTensor, nsl_tensor_to_device, nsl_tensor_add};
+
+        // Create CPU tensors manually
+        let a_data = vec![1.0f64, 2.0, 3.0, 4.0];
+        let b_data = vec![10.0f64, 20.0, 30.0, 40.0];
+        let shape = vec![4i64];
+        let strides = vec![1i64];
+
+        let a = Box::new(NslTensor {
+            data: a_data.as_ptr() as *mut std::ffi::c_void,
+            shape: shape.as_ptr() as *mut i64,
+            strides: strides.as_ptr() as *mut i64,
+            ndim: 1, len: 4, refcount: 1, device: 0, dtype: 0,
+        });
+        std::mem::forget(a_data); std::mem::forget(shape.clone()); std::mem::forget(strides.clone());
+        let a_cpu = Box::into_raw(a) as i64;
+
+        let shape2 = vec![4i64];
+        let strides2 = vec![1i64];
+        let b = Box::new(NslTensor {
+            data: b_data.as_ptr() as *mut std::ffi::c_void,
+            shape: shape2.as_ptr() as *mut i64,
+            strides: strides2.as_ptr() as *mut i64,
+            ndim: 1, len: 4, refcount: 1, device: 0, dtype: 0,
+        });
+        std::mem::forget(b_data); std::mem::forget(shape2); std::mem::forget(strides2);
+        let b_cpu = Box::into_raw(b) as i64;
+
+        // Transfer to GPU
+        let a_gpu = nsl_tensor_to_device(a_cpu, 1);
+        let b_gpu = nsl_tensor_to_device(b_cpu, 1);
+
+        // Add on GPU
+        let c_gpu = nsl_tensor_add(a_gpu, b_gpu);
+
+        // Sync and transfer back
+        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        let c_cpu = nsl_tensor_to_device(c_gpu, 0);
+        let c = unsafe { &*(c_cpu as *const NslTensor) };
+
+        let expected = [11.0, 22.0, 33.0, 44.0];
+        for i in 0..4 {
+            let val = unsafe { *c.data_f64().add(i) };
+            assert!((val - expected[i]).abs() < 0.1, "mismatch at {}: {} vs {}", i, val, expected[i]);
         }
     }
 }
