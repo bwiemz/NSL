@@ -105,6 +105,8 @@ impl Compiler<'_> {
             StmtKind::Return(expr) => {
                 if let Some(e) = expr {
                     let val = self.compile_expr(builder, state, e)?;
+                    // Free intermediate tensor temporaries before returning (keep return value)
+                    self.free_tensor_temporaries(builder, state, Some(val));
                     // @no_grad: resume tape before explicit return
                     if state.is_no_grad {
                         self.compile_call_by_name(builder, "nsl_tape_resume", &[])?;
@@ -1343,7 +1345,17 @@ impl Compiler<'_> {
             }
         }
 
-        // 7g. Increment step count
+        // 7g. Free gradient tensors and the grads_list to prevent per-step memory leak
+        for i in 0..num_params {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+            let grad_val = self.compile_call_by_name(
+                builder, "nsl_list_get", &[grads_list, idx],
+            )?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
+        }
+        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+
+        // 7h. Increment step count
         let sc = builder.use_var(step_count_var);
         let one_i64 = builder.ins().iconst(cl_types::I64, 1);
         let sc_next = builder.ins().iadd(sc, one_i64);
@@ -1524,6 +1536,9 @@ impl Compiler<'_> {
         builder.switch_to_block(exit_block);
         builder.seal_block(exit_block);
         state.current_block = Some(exit_block);
+
+        // Free param_list after training loop completes
+        self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
 
         Ok(())
     }

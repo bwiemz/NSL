@@ -26,6 +26,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_list_len", &[types::I64], Some(types::I64)),
     ("nsl_list_set", &[types::I64, types::I64, types::I64], None),
     ("nsl_list_contains", &[types::I64, types::I64], Some(types::I8)),
+    ("nsl_list_free", &[types::I64], None),
     // String
     ("nsl_str_concat", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_int_to_str", &[types::I64], Some(types::I64)),

@@ -541,7 +541,13 @@ impl Compiler<'_> {
                 return Err(CodegenError::new("assert() requires at least 1 argument"));
             }
             let cond_val = self.compile_expr(builder, state, &args[0].value)?;
-            let cond_i8 = builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0);
+            let cond_type = self.node_type(args[0].value.id).clone();
+            let cond_i8 = if crate::types::is_float_type(&cond_type) {
+                let zero = builder.ins().f64const(0.0);
+                builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::NotEqual, cond_val, zero)
+            } else {
+                builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0)
+            };
             let msg = if args.len() > 1 {
                 self.compile_expr(builder, state, &args[1].value)?
             } else {
@@ -1761,6 +1767,10 @@ impl Compiler<'_> {
                 let offset = (16 + i * 8) as i32;
                 builder.ins().store(MemFlags::trusted(), val, closure_ptr, offset);
             }
+
+            // TODO(M19): Implement nsl_closure_free — closure_ptr is heap-allocated via nsl_alloc
+            // and currently leaks when the variable holding it goes out of scope, since it's not
+            // hooked into the NslTensor refcounting or scope-teardown logic.
 
             // Record how many captures this closure has (keyed by a sentinel — caller will
             // transfer this to the variable that receives the closure result).
