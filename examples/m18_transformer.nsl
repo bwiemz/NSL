@@ -1,0 +1,36 @@
+from nsl.nn.layers import Linear, Embedding
+from nsl.nn.norms import LayerNorm
+from nsl.nn.attention import Attention
+from nsl.nn.position import PositionalEmbedding
+from nsl.nn.transformer import TransformerBlock
+
+# Define a small transformer
+model Transformer(vocab_size: int, dim: int, num_heads: int, max_seq: int):
+    embed: Embedding = Embedding(vocab_size, dim)
+    pos_embed: PositionalEmbedding = PositionalEmbedding(max_seq, dim)
+    blocks: [TransformerBlock; 2] = TransformerBlock(dim, num_heads)
+    norm: LayerNorm = LayerNorm(dim)
+    head: Linear = Linear(dim, vocab_size)
+
+    fn forward(self, tokens: Tensor) -> Tensor:
+        let x = self.embed.forward(tokens)
+        let x = self.pos_embed.forward(x)
+        for block in self.blocks:
+            x = block.forward(x)
+        let x = self.norm.forward(x)
+        return x @ self.head.w.transpose(0, 1)
+
+# Create model
+let transformer = Transformer(64, 32, 4, 128)
+
+# Create dummy input (sequence of token indices)
+let tokens = zeros([8])
+
+# Forward pass
+let logits = transformer.forward(tokens)
+print(logits)
+
+let s = logits.shape
+print(s)
+
+print("m18_transformer: ALL PASS")
