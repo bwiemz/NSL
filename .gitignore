@@ -1,4 +1,5 @@
 /.serena
 /target/
 /.VSCodeCounter/
-*.exe.worktrees/
+*.exe
+.worktrees/
