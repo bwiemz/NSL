@@ -41,3 +41,4 @@ pub mod onnx_proto;
 pub mod sampling;
 pub mod data_source;
 pub mod packing;
+pub mod dataloader;
