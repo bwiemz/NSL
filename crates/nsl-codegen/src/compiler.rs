@@ -1153,7 +1153,9 @@ impl<'a> Compiler<'a> {
                 if let ModelMember::Method(fn_def) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
-                    let (func_id, sig) = self.functions[&mangled].clone();
+                    let (func_id, sig) = self.functions.get(&mangled)
+                        .ok_or_else(|| CodegenError::new(format!("model method '{}' not registered", mangled)))?
+                        .clone();
 
                     let mut ctx = Context::for_function(Function::with_name_signature(
                         UserFuncName::user(0, self.next_func_index()),
