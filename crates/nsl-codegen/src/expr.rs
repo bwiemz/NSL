@@ -385,7 +385,7 @@ impl Compiler<'_> {
 
     /// Emit a runtime check that the integer divisor is non-zero.
     /// On x86, `sdiv` / `srem` with divisor=0 causes SIGFPE (hardware fault).
-    fn compile_divmod_guard(
+    pub(crate) fn compile_divmod_guard(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
