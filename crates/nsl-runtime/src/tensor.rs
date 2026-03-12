@@ -399,6 +399,13 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         result_tensor.data = new_data as *mut c_void;
     }
 
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Reshape, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
+    }
+
     result
 }
 
@@ -505,6 +512,12 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
             dim1,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(out_ptr);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Transpose, vec![tensor_ptr], out_ptr, shape, rt.dtype, vec![]);
+    }
 
     out_ptr
 }
@@ -584,6 +597,12 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
             out: out_ptr,
             input_shape,
         });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(out_ptr);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Unsqueeze, vec![tensor_ptr], out_ptr, shape, rt.dtype, vec![]);
     }
 
     out_ptr
@@ -949,6 +968,12 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
             original_shape,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(out_ptr);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Expand, vec![tensor_ptr], out_ptr, shape, rt.dtype, vec![]);
+    }
 
     out_ptr
 }
@@ -1017,6 +1042,12 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Add, vec![a, b], result, shape, rt.dtype, vec![]);
+    }
     result
 }
 
@@ -1036,6 +1067,12 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
     let result = tensor_elementwise_op(a, b, |x, y| x - y);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Sub, vec![a, b], result, shape, rt.dtype, vec![]);
     }
     result
 }
@@ -1067,6 +1104,12 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
             b_shape,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Mul, vec![a, b], result, shape, rt.dtype, vec![]);
+    }
     result
 }
 
@@ -1096,6 +1139,12 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
             a_shape,
             b_shape,
         });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Div, vec![a, b], result, shape, rt.dtype, vec![]);
     }
     result
 }
@@ -1145,6 +1194,12 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Neg { a: a_ptr, out: result });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Neg, vec![a_ptr], result, shape, rt.dtype, vec![]);
     }
     result
 }
@@ -1405,6 +1460,12 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
             saved_a: a_ptr,
             saved_b: b_ptr,
         });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::MatMul, vec![a_ptr, b_ptr], result, shape, rt.dtype, vec![]);
     }
     result
 }
@@ -1824,6 +1885,12 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
             saved_out: result,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Exp, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
+    }
     result
 }
 
@@ -1869,6 +1936,12 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
             saved_a: tensor_ptr,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Log, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
+    }
     result
 }
 
@@ -1913,6 +1986,12 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
             out: result,
             saved_out: result,
         });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Sqrt, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
     }
     result
 }
@@ -2135,6 +2214,12 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
             saved_a: tensor_ptr,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Relu, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
+    }
     result
 }
 
@@ -2243,6 +2328,12 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
             saved_out: result,
         });
     }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Sigmoid, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
+    }
     result
 }
 
@@ -2283,6 +2374,12 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
             out: result,
             saved_out: result,
         });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Tanh, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
     }
     result
 }
@@ -2364,6 +2461,19 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
             saved_out: result,
             dim,
         });
+    }
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(result);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Softmax,
+            vec![tensor_ptr],
+            result,
+            shape,
+            rt.dtype,
+            vec![("axis".to_string(), crate::trace::AttrValue::Int(dim))],
+        );
     }
     result
 }
@@ -2919,12 +3029,22 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         }
     }
 
+    #[cfg(feature = "interop")]
+    let trace_input_ptrs = input_ptrs.clone();
+
     autodiff::maybe_record(autodiff::TapeOp::Cat {
         inputs: input_ptrs,
         out: out_ptr,
         dim: dim,
         split_sizes,
     });
+
+    #[cfg(feature = "interop")]
+    if crate::trace::is_tracing() {
+        let rt = NslTensor::from_ptr(out_ptr);
+        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        crate::trace::record_op(crate::trace::OpType::Concat, trace_input_ptrs, out_ptr, shape, rt.dtype, vec![]);
+    }
 
     out_ptr
 }
