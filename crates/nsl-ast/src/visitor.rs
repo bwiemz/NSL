@@ -85,12 +85,29 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
             }
         }
         StmtKind::FnDef(f) => {
+            for param in &f.params {
+                if let Some(default) = &param.default {
+                    v.visit_expr(default);
+                }
+            }
             v.visit_block(&f.body);
         }
         StmtKind::ModelDef(m) => {
+            for param in &m.params {
+                if let Some(default) = &param.default {
+                    v.visit_expr(default);
+                }
+            }
             for member in &m.members {
                 match member {
-                    crate::decl::ModelMember::Method(f) => v.visit_block(&f.body),
+                    crate::decl::ModelMember::Method(f) => {
+                        for param in &f.params {
+                            if let Some(default) = &param.default {
+                                v.visit_expr(default);
+                            }
+                        }
+                        v.visit_block(&f.body);
+                    }
                     crate::decl::ModelMember::LayerDecl { init, .. } => {
                         if let Some(init) = init {
                             v.visit_expr(init);
@@ -150,7 +167,14 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
         StmtKind::Expr(e) => {
             v.visit_expr(e);
         }
-        StmtKind::Decorated { stmt, .. } => {
+        StmtKind::Decorated { decorators, stmt } => {
+            for dec in decorators {
+                if let Some(args) = &dec.args {
+                    for arg in args {
+                        v.visit_expr(&arg.value);
+                    }
+                }
+            }
             v.visit_stmt(stmt);
         }
         StmtKind::TrainBlock(train) => {
@@ -189,6 +213,11 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
             v.visit_block(&g.body);
         }
         StmtKind::KernelDef(k) => {
+            for param in &k.params {
+                if let Some(default) = &param.default {
+                    v.visit_expr(default);
+                }
+            }
             v.visit_block(&k.body);
         }
         StmtKind::TokenizerDef(t) => {
@@ -200,6 +229,30 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
             v.visit_expr(&d.source);
             for s in &d.body {
                 v.visit_stmt(s);
+            }
+        }
+        StmtKind::StructDef(s) => {
+            for field in &s.fields {
+                if let Some(default) = &field.default {
+                    v.visit_expr(default);
+                }
+            }
+        }
+        StmtKind::EnumDef(e) => {
+            for variant in &e.variants {
+                if let Some(val) = &variant.value {
+                    v.visit_expr(val);
+                }
+            }
+        }
+        StmtKind::TraitDef(t) => {
+            for method in &t.methods {
+                for param in &method.params {
+                    if let Some(default) = &param.default {
+                        v.visit_expr(default);
+                    }
+                }
+                v.visit_block(&method.body);
             }
         }
         _ => {}
