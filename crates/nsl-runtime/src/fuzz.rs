@@ -410,9 +410,9 @@ impl FuzzState {
 
                 let grad_list = crate::autodiff::nsl_tape_backward(loss, param_list);
 
-                let grad_list_ref = crate::list::NslList::from_ptr(grad_list);
-                for i in 0..grad_list_ref.len as usize {
-                    let grad_ptr = unsafe { *grad_list_ref.data.add(i) };
+                let n = nsl_list_len(grad_list);
+                for i in 0..n {
+                    let grad_ptr = nsl_list_get(grad_list, i);
                     nsl_tensor_free(grad_ptr);
                 }
                 nsl_list_free(grad_list);
@@ -471,6 +471,23 @@ fn assert_counter_balance(seed: u64) {
             ac as isize - fc as isize,
             ab as isize - fb as isize,
             seed
+        );
+    }
+
+    let cac = stats::cuda_alloc_count();
+    let cfc = stats::cuda_free_count();
+    let cab = stats::cuda_alloc_bytes();
+    let cfb = stats::cuda_free_bytes();
+
+    if cac != cfc || cab != cfb {
+        panic!(
+            "FUZZ FAILURE at seed={}\n\
+             CUDA: allocated {} ({} bytes), freed {} ({} bytes)\n\
+             Leaked: {} tensors, {} bytes",
+            seed,
+            cac, cab, cfc, cfb,
+            cac as isize - cfc as isize,
+            cab as isize - cfb as isize,
         );
     }
 }
