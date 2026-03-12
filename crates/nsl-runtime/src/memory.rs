@@ -73,3 +73,48 @@ pub(crate) unsafe fn checked_free(ptr: *mut u8, size: usize) {
         unsafe { dealloc(ptr, layout) };
     }
 }
+
+/// Allocation statistics for fuzz testing. Only compiled in test builds.
+#[cfg(test)]
+pub mod stats {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub static FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+    pub static FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    pub static CUDA_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub static CUDA_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub static CUDA_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+    pub static CUDA_FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        for counter in [
+            &ALLOC_COUNT, &FREE_COUNT, &ALLOC_BYTES, &FREE_BYTES,
+            &CUDA_ALLOC_COUNT, &CUDA_FREE_COUNT, &CUDA_ALLOC_BYTES, &CUDA_FREE_BYTES,
+        ] {
+            counter.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub fn cpu_alloc(size: usize) {
+        ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+        ALLOC_BYTES.fetch_add(size, Ordering::SeqCst);
+    }
+
+    pub fn cpu_free(size: usize) {
+        FREE_COUNT.fetch_add(1, Ordering::SeqCst);
+        FREE_BYTES.fetch_add(size, Ordering::SeqCst);
+    }
+
+    pub fn cuda_alloc(size: usize) {
+        CUDA_ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+        CUDA_ALLOC_BYTES.fetch_add(size, Ordering::SeqCst);
+    }
+
+    pub fn cuda_free(size: usize) {
+        CUDA_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
+        CUDA_FREE_BYTES.fetch_add(size, Ordering::SeqCst);
+    }
+}
