@@ -261,9 +261,9 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                // Check type compatibility for plain assignment
-                if *op == AssignOp::Assign && !is_assignable(&value_ty, &target_ty) {
-                    if !target_ty.is_indeterminate() {
+                // Check type compatibility
+                if *op == AssignOp::Assign {
+                    if !is_assignable(&value_ty, &target_ty) && !target_ty.is_indeterminate() {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "type mismatch in assignment: expected {}, got {}",
@@ -271,6 +271,24 @@ impl<'a> TypeChecker<'a> {
                             ))
                             .with_label(value.span, "wrong type"),
                         );
+                    }
+                } else {
+                    // Compound assignment (+=, -=, *=, /=): both sides must be numeric
+                    let is_numeric = |ty: &Type| matches!(ty,
+                        Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8
+                        | Type::Uint8 | Type::Float | Type::F64 | Type::F32
+                        | Type::Tensor { .. } | Type::Unknown
+                    );
+                    if !is_numeric(&target_ty) || !is_numeric(&value_ty) {
+                        if !target_ty.is_indeterminate() && !value_ty.is_indeterminate() {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "invalid operand types for compound assignment: {} and {}",
+                                    display_type(&target_ty), display_type(&value_ty)
+                                ))
+                                .with_label(value.span, "invalid type for compound assignment"),
+                            );
+                        }
                     }
                 }
             }
