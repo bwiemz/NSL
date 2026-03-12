@@ -2350,6 +2350,10 @@ pub(crate) fn nsl_tensor_clamp_backward(
     max_val: f64,
 ) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        return crate::cuda::gpu_clamp_backward(grad_ptr, input_ptr, min_val as f32, max_val as f32);
+    }
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len;
     let ndim = input.ndim;

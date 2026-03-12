@@ -394,6 +394,139 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     out_ptr as i64
 }
 
+// === GPU backward op helpers ===
+
+/// GPU backward binary op: takes grad tensor and a saved tensor, produces output of same shape as grad.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    assert_eq!(a.len, b.len, "GPU backward: length mismatch between grad and saved tensors");
+
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor {
+        data: out_data, shape, strides,
+        ndim: a.ndim, len: a.len, refcount: 1,
+        device: a.device, dtype: 1,
+        owns_data: 1,
+    });
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args,
+    );
+    assert_eq!(result as u32, 0, "GPU backward kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    out_ptr as i64
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_relu_backward(grad: i64, input: i64) -> i64 {
+    gpu_backward_binary(
+        grad, input,
+        kernels::RELU_BACKWARD_F32_PTX,
+        "nsl_relu_backward_f32\0",
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sigmoid_backward(grad: i64, saved_out: i64) -> i64 {
+    gpu_backward_binary(
+        grad, saved_out,
+        kernels::SIGMOID_BACKWARD_F32_PTX,
+        "nsl_sigmoid_backward_f32\0",
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
+    gpu_backward_binary(
+        grad, saved_out,
+        kernels::TANH_BACKWARD_F32_PTX,
+        "nsl_tanh_backward_f32\0",
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
+    gpu_backward_binary(
+        grad, input,
+        kernels::GELU_BACKWARD_F32_PTX,
+        "nsl_gelu_backward_f32\0",
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_silu_backward(grad: i64, input: i64) -> i64 {
+    gpu_backward_binary(
+        grad, input,
+        kernels::SILU_BACKWARD_F32_PTX,
+        "nsl_silu_backward_f32\0",
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f32) -> i64 {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(grad as *const NslTensor) };
+    let b = unsafe { &*(input as *const NslTensor) };
+    assert_eq!(a.len, b.len, "GPU clamp_backward: length mismatch");
+
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4);
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor {
+        data: out_data, shape, strides,
+        ndim: a.ndim, len: a.len, refcount: 1,
+        device: a.device, dtype: 1,
+        owns_data: 1,
+    });
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut min_arg = min_val;
+    let mut max_arg = max_val;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut min_arg as *mut _ as *mut std::ffi::c_void,
+        &mut max_arg as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::CLAMP_BACKWARD_F32_PTX.as_ptr(),
+        "nsl_clamp_backward_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args,
+    );
+    assert_eq!(result as u32, 0, "GPU clamp_backward kernel failed: {}", result as u32);
+    out_ptr as i64
+}
+
 // === FFI exports ===
 
 /// Initialize the CUDA runtime (device 0, primary context).

@@ -566,6 +566,271 @@ pub(crate) const SIGMOID_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
+// --- Backward kernels for activation functions ---
+
+/// relu_backward: out[i] = input[i] > 0 ? grad[i] : 0
+pub(crate) const RELU_BACKWARD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_relu_backward_f32(\n\
+    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<4>;\n\
+    .reg .pred %p<2>;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [input];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    mov.f32 %fs3, 0f00000000;\n\
+    setp.gt.f32 %p1, %fs2, %fs3;\n\
+    selp.f32 %fs3, %fs1, 0f00000000, %p1;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs3;\n\
+DONE: ret;\n\
+}\0";
+
+/// sigmoid_backward: out[i] = grad[i] * saved[i] * (1 - saved[i])
+/// saved[i] is the sigmoid output
+pub(crate) const SIGMOID_BACKWARD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sigmoid_backward_f32(\n\
+    .param .u64 grad, .param .u64 saved, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<5>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [saved];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    sub.f32 %fs3, 0f3F800000, %fs2;\n\
+    mul.f32 %fs3, %fs2, %fs3;\n\
+    mul.f32 %fs3, %fs1, %fs3;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs3;\n\
+DONE: ret;\n\
+}\0";
+
+/// tanh_backward: out[i] = grad[i] * (1 - saved[i] * saved[i])
+/// saved[i] is the tanh output
+pub(crate) const TANH_BACKWARD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_tanh_backward_f32(\n\
+    .param .u64 grad, .param .u64 saved, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<5>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [saved];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    mul.f32 %fs3, %fs2, %fs2;\n\
+    sub.f32 %fs3, 0f3F800000, %fs3;\n\
+    mul.f32 %fs3, %fs1, %fs3;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs3;\n\
+DONE: ret;\n\
+}\0";
+
+/// gelu_backward using tanh approximation derivative
+/// k = 0.0356774*x^3 + 0.797885*x
+/// sech2 = 1 - tanh(k)^2
+/// out[i] = grad[i] * 0.5 * (1 + tanh(k) + x * sech2 * (0.107032*x + 0.797885))
+pub(crate) const GELU_BACKWARD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_gelu_backward_f32(\n\
+    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<12>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [input];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    mul.f32 %fs3, %fs2, %fs2;\n\
+    mul.f32 %fs3, %fs3, %fs2;\n\
+    mul.f32 %fs3, %fs3, 0f3D124925;\n\
+    mul.f32 %fs4, %fs2, 0f3F4C422A;\n\
+    add.f32 %fs3, %fs3, %fs4;\n\
+    add.f32 %fs4, %fs3, %fs3;\n\
+    mul.f32 %fs4, %fs4, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %fs4, %fs4;\n\
+    add.f32 %fs5, %fs4, 0f3F800000;\n\
+    sub.f32 %fs4, %fs4, 0f3F800000;\n\
+    div.approx.f32 %fs6, %fs4, %fs5;\n\
+    mul.f32 %fs7, %fs6, %fs6;\n\
+    sub.f32 %fs7, 0f3F800000, %fs7;\n\
+    mul.f32 %fs8, %fs2, %fs2;\n\
+    mul.f32 %fs8, %fs8, 0f3DD8ECA1;\n\
+    add.f32 %fs8, %fs8, 0f3F4C422A;\n\
+    mul.f32 %fs8, %fs2, %fs8;\n\
+    mul.f32 %fs8, %fs7, %fs8;\n\
+    add.f32 %fs8, %fs6, %fs8;\n\
+    add.f32 %fs8, 0f3F800000, %fs8;\n\
+    mul.f32 %fs8, 0f3F000000, %fs8;\n\
+    mul.f32 %fs8, %fs1, %fs8;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs8;\n\
+DONE: ret;\n\
+}\0";
+
+/// silu_backward: sig = 1/(1+exp(-x)); out[i] = grad[i] * (sig + x*sig*(1-sig))
+pub(crate) const SILU_BACKWARD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_silu_backward_f32(\n\
+    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<8>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [input];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    neg.f32 %fs3, %fs2;\n\
+    mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %fs3, %fs3;\n\
+    add.f32 %fs3, %fs3, 0f3F800000;\n\
+    rcp.approx.f32 %fs3, %fs3;\n\
+    sub.f32 %fs4, 0f3F800000, %fs3;\n\
+    mul.f32 %fs4, %fs2, %fs4;\n\
+    mul.f32 %fs4, %fs3, %fs4;\n\
+    add.f32 %fs4, %fs3, %fs4;\n\
+    mul.f32 %fs4, %fs1, %fs4;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs4;\n\
+DONE: ret;\n\
+}\0";
+
+/// clamp_backward: out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0
+pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_clamp_backward_f32(\n\
+    .param .u64 grad, .param .u64 input, .param .u64 out,\n\
+    .param .f32 min_val, .param .f32 max_val, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<6>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [input];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.f32 %fs4, [min_val];\n\
+    ld.param.f32 %fs5, [max_val];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    setp.ge.f32 %p1, %fs2, %fs4;\n\
+    setp.le.f32 %p2, %fs2, %fs5;\n\
+    and.pred %p1, %p1, %p2;\n\
+    selp.f32 %fs3, %fs1, 0f00000000, %p1;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs3;\n\
+DONE: ret;\n\
+}\0";
+
 /// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
 pub(crate) const TANH_F32_PTX: &str = "\
 .version 7.0\n\

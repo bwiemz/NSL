@@ -584,6 +584,10 @@ fn scatter_gather_grad(
 fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        return crate::cuda::gpu_relu_backward(grad_ptr, input_ptr);
+    }
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
@@ -616,6 +620,10 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        return crate::cuda::gpu_gelu_backward(grad_ptr, input_ptr);
+    }
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
@@ -659,6 +667,10 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        return crate::cuda::gpu_silu_backward(grad_ptr, input_ptr);
+    }
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
@@ -695,6 +707,10 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        return crate::cuda::gpu_sigmoid_backward(grad_ptr, out_ptr);
+    }
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
@@ -727,6 +743,10 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
 fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        return crate::cuda::gpu_tanh_backward(grad_ptr, out_ptr);
+    }
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
