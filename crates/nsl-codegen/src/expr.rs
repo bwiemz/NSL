@@ -2690,9 +2690,19 @@ impl Compiler<'_> {
             state.tensor_temporaries.push(result);
             Ok(result)
         } else if left_is_tensor {
-            // Tensor-scalar: ensure scalar is f64
+            // Tensor-scalar: ensure scalar is f64 for the runtime FFI
+            // (runtime handles f64→f32 demotion when tensor is f32)
             let rhs_ty = builder.func.dfg.value_type(rhs);
-            let scalar = if rhs_ty == cl_types::F64 { rhs } else { builder.ins().fcvt_from_sint(cl_types::F64, rhs) };
+            let scalar = if rhs_ty == cl_types::F64 {
+                rhs
+            } else if rhs_ty == cl_types::F32 {
+                // F32 scalar (e.g., from model weight .item()) — promote to f64
+                builder.ins().fpromote(cl_types::F64, rhs)
+            } else if rhs_ty.is_int() {
+                builder.ins().fcvt_from_sint(cl_types::F64, rhs)
+            } else {
+                rhs
+            };
             let result = match op {
                 BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?,
                 BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?,
