@@ -45,6 +45,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_dict_len", &[types::I64], Some(types::I64)),
     ("nsl_dict_contains", &[types::I64, types::I64], Some(types::I8)),
     ("nsl_dict_keys", &[types::I64], Some(types::I64)),
+    ("nsl_dict_free", &[types::I64], None),
     // String comparison
     ("nsl_str_eq", &[types::I64, types::I64], Some(types::I64)),
     // String repeat & slice
@@ -231,6 +232,29 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_trace_stop", &[], Some(types::I64)),
     // ONNX export (M18b Tasks 9-10)
     ("nsl_onnx_export", &[types::I64, types::I64, types::I64], None),
+    // Sampling primitives (M19)
+    ("nsl_manual_seed", &[types::I64], None),
+    ("nsl_tensor_topk", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_multinomial", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_argmax", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_cumsum", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_lt_scalar", &[types::I64, types::F64], Some(types::I64)),
+    // Tensor mutation (M19)
+    ("nsl_tensor_set_element", &[types::I64, types::I64, types::I64, types::F64], None),
+    ("nsl_tensor_slice_assign", &[types::I64, types::I64, types::I64, types::I64], None),
+    // Data sources (M19)
+    ("nsl_load_jsonl", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_load_csv", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_load_mmap", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // DataLoader (M19)
+    ("nsl_dataloader_create", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_dataloader_start", &[types::I64], None),
+    ("nsl_dataloader_next_batch", &[types::I64], Some(types::I64)),
+    ("nsl_dataloader_reset", &[types::I64], None),
+    ("nsl_dataloader_stop", &[types::I64], None),
+    ("nsl_dataloader_free", &[types::I64], None),
+    // Packing efficiency (M19)
+    ("nsl_packing_efficiency", &[types::I64], Some(types::F64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

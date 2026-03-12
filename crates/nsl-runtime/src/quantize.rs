@@ -530,6 +530,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(out) as i64
 }
@@ -618,6 +619,7 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(out) as i64
 }

@@ -1,0 +1,13 @@
+# M19 Integration Test: Data Sources
+
+# Test JSONL loading
+let texts = load_jsonl("tests/fixtures/test_data.jsonl", "text")
+print("JSONL loaded, count:")
+print(len(texts))
+
+# Test CSV loading
+let names = load_csv("tests/fixtures/test_data.csv", 0)
+print("CSV loaded, count:")
+print(len(names))
+
+print("Data source tests: PASS")

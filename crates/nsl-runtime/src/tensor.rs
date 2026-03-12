@@ -32,6 +32,7 @@ pub struct NslTensor {
     pub(crate) refcount: i64,
     pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
     pub(crate) dtype: u8,           // 0 = f64, 1 = f32
+    pub(crate) owns_data: u8,       // 1 = heap-owned (free on drop), 0 = borrowed/mmap
 }
 
 impl NslTensor {
@@ -126,6 +127,7 @@ fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }
@@ -143,6 +145,7 @@ fn create_scalar_tensor(value: f64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }
@@ -254,6 +257,7 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }
@@ -372,6 +376,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         refcount: 1, // new wrapper has its own refcount
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     // Note: shared data means we need to be careful with free.
     // For M9, we just deep copy the data to keep it simple.
@@ -500,6 +505,7 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
         refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(result) as i64;
 
@@ -585,6 +591,7 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
         refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -700,6 +707,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
         refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     // NO tape recording — select is used internally for stack backward
     Box::into_raw(out) as i64
@@ -821,6 +829,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         refcount: 1,
         device: first.device,
         dtype: first.dtype,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -955,6 +964,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -1014,6 +1024,7 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     // NOT recorded on tape — constant, no gradient
     Box::into_raw(out) as i64
@@ -1190,6 +1201,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         refcount: 1,
         device: a.device,
         dtype: a.dtype,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1238,6 +1250,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1287,6 +1300,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         refcount: 1,
         device: a.device,
         dtype: a.dtype,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1448,6 +1462,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1875,6 +1890,7 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1926,6 +1942,7 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -1977,6 +1994,7 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2028,6 +2046,7 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2088,6 +2107,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
         refcount: 1,
         device: a.device,
         dtype: a.dtype,
+        owns_data: 1,
     });
     // sign is non-differentiable — no tape recording
     Box::into_raw(result) as i64
@@ -2117,6 +2137,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2170,6 +2191,7 @@ pub(crate) fn nsl_tensor_clamp_backward(
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(result) as i64
 }
@@ -2204,6 +2226,7 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
         data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2244,6 +2267,7 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
         data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2277,6 +2301,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
         data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2318,6 +2343,7 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
         data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2365,6 +2391,7 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
         data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2451,6 +2478,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         data: data as *mut c_void, shape, strides, ndim, len, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -2591,6 +2619,7 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     Box::into_raw(result) as i64
 }
@@ -2608,19 +2637,22 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
         let strides_size = shape_size;
 
         unsafe {
-            // GPU tensors use CUDA unified memory — must free with cuMemFree, not CPU dealloc
-            if tensor.device > 0 {
-                #[cfg(feature = "cuda")]
-                {
-                    crate::cuda::free_managed(tensor.data);
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    // Shouldn't happen: GPU tensor without CUDA support
+            // Only free data if this tensor owns it (not borrowed/mmap)
+            if tensor.owns_data != 0 {
+                // GPU tensors use CUDA unified memory — must free with cuMemFree, not CPU dealloc
+                if tensor.device > 0 {
+                    #[cfg(feature = "cuda")]
+                    {
+                        crate::cuda::free_managed(tensor.data);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        // Shouldn't happen: GPU tensor without CUDA support
+                        checked_free(tensor.data as *mut u8, data_size);
+                    }
+                } else {
                     checked_free(tensor.data as *mut u8, data_size);
                 }
-            } else {
-                checked_free(tensor.data as *mut u8, data_size);
             }
             // Shape and strides are always CPU-allocated
             if !tensor.shape.is_null() {
@@ -2724,6 +2756,7 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
             refcount: 1,
             device: device as u8,
             dtype: 1, // f32 for GPU tensors
+            owns_data: 1,
         });
         Box::into_raw(tensor) as i64
     }
@@ -2903,6 +2936,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -3013,6 +3047,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -3119,6 +3154,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -3224,6 +3260,7 @@ pub extern "C" fn nsl_tensor_layernorm(
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -3236,6 +3273,7 @@ pub extern "C" fn nsl_tensor_layernorm(
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let mean_ptr = Box::into_raw(mean_tensor) as i64;
 
@@ -3248,6 +3286,7 @@ pub extern "C" fn nsl_tensor_layernorm(
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
 
@@ -3333,6 +3372,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -3345,6 +3385,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let rms_ptr = Box::into_raw(rms_tensor) as i64;
 
@@ -3415,6 +3456,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         data: out_data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -3422,6 +3464,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         data: mask_data as *mut c_void, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let mask_ptr = Box::into_raw(mask_tensor) as i64;
 
@@ -3522,6 +3565,7 @@ pub extern "C" fn nsl_tensor_conv2d(
         data: out_data as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -3618,6 +3662,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
         data: out_data as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -3696,6 +3741,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -3759,6 +3805,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 refcount: 1,
                 device: target,
                 dtype: 1, // f32
+                owns_data: 1,
             });
             return Box::into_raw(new_t) as i64;
         }
@@ -3796,6 +3843,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 refcount: 1,
                 device: 0,
                 dtype: 0, // f64
+                owns_data: 1,
             });
             return Box::into_raw(new_t) as i64;
         }
@@ -3804,4 +3852,208 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     }
 
     panic!("GPU-to-GPU transfer not yet supported");
+}
+
+// ---------------------------------------------------------------------------
+// Slice assignment primitives (M19 data pipeline)
+// ---------------------------------------------------------------------------
+
+/// Describes one dimension of a slice assignment operation.
+#[repr(C)]
+pub struct NslSliceDim {
+    pub is_scalar: u8, // 1 = single index, 0 = range
+    pub start: i64,
+    pub end: i64, // ignored if is_scalar=1
+}
+
+/// Set a single element in a tensor by flat indices.
+/// `indices_ptr` points to an array of `i64` indices, one per dimension.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_set_element(
+    tensor_ptr: i64,
+    indices_ptr: i64,
+    num_indices: i64,
+    value: f64,
+) {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+    let n = num_indices as usize;
+
+    if n != ndim {
+        eprintln!(
+            "nsl: set_element: expected {} indices, got {}",
+            ndim, n
+        );
+        std::process::abort();
+    }
+
+    let strides = crate::cpu::get_strides_vec(tensor);
+    let mut offset: usize = 0;
+    for d in 0..ndim {
+        let idx = unsafe { *(indices_ptr as *const i64).add(d) } as usize;
+        let dim_size = unsafe { *tensor.shape.add(d) } as usize;
+        if idx >= dim_size {
+            eprintln!(
+                "nsl: set_element: index {} out of bounds for dim {} (size {})",
+                idx, d, dim_size
+            );
+            std::process::abort();
+        }
+        offset += idx * strides[d];
+    }
+
+    unsafe { *tensor.data_f64().add(offset) = value };
+}
+
+/// Assign `src` tensor into a slice of `target` tensor.
+/// `dims_ptr` points to an array of [`NslSliceDim`], one per dimension.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_slice_assign(
+    target_ptr: i64,
+    src_ptr: i64,
+    dims_ptr: i64,
+    num_dims: i64,
+) {
+    let target = NslTensor::from_ptr(target_ptr);
+    let src = NslTensor::from_ptr(src_ptr);
+    let ndim = num_dims as usize;
+    let dims =
+        unsafe { std::slice::from_raw_parts(dims_ptr as *const NslSliceDim, ndim) };
+    let target_strides = crate::cpu::get_strides_vec(target);
+    let target_shape = crate::cpu::get_shape_vec(target);
+
+    // Compute the slice region: for each dim, determine start..end range
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        let dim_size = target_shape[d] as usize;
+        if dims[d].is_scalar != 0 {
+            let idx = if dims[d].start < 0 {
+                (dim_size as i64 + dims[d].start) as usize
+            } else {
+                dims[d].start as usize
+            };
+            ranges.push((idx, idx + 1));
+        } else {
+            let start = if dims[d].start < 0 {
+                (dim_size as i64 + dims[d].start) as usize
+            } else {
+                dims[d].start as usize
+            };
+            let end = if dims[d].end < 0 {
+                (dim_size as i64 + dims[d].end) as usize
+            } else {
+                dims[d].end.min(dim_size as i64) as usize
+            };
+            ranges.push((start, end));
+        }
+    }
+
+    // Iterate over all positions in the slice and copy from src
+    let mut src_flat = 0usize;
+
+    fn recurse(
+        depth: usize,
+        ndim: usize,
+        ranges: &[(usize, usize)],
+        target: &NslTensor,
+        src: &NslTensor,
+        target_strides: &[usize],
+        target_offset: usize,
+        src_flat: &mut usize,
+    ) {
+        if depth == ndim {
+            if *src_flat < src.len as usize {
+                let val = unsafe { *src.data_f64().add(*src_flat) };
+                unsafe { *target.data_f64().add(target_offset) = val };
+                *src_flat += 1;
+            }
+            return;
+        }
+        let (start, end) = ranges[depth];
+        for i in start..end {
+            recurse(
+                depth + 1,
+                ndim,
+                ranges,
+                target,
+                src,
+                target_strides,
+                target_offset + i * target_strides[depth],
+                src_flat,
+            );
+        }
+    }
+
+    recurse(
+        0,
+        ndim,
+        &ranges,
+        target,
+        src,
+        &target_strides,
+        0,
+        &mut src_flat,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_element() {
+        // Create a 2x3 zero tensor
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 2);
+        crate::list::nsl_list_push(shape, 3);
+        let t = nsl_tensor_zeros(shape);
+        let indices: [i64; 2] = [1, 2];
+        nsl_tensor_set_element(t, indices.as_ptr() as i64, 2, 42.0);
+        let tensor = NslTensor::from_ptr(t);
+        // Element at [1, 2]: row 1 * 3 + col 2 = 5
+        assert_eq!(unsafe { *tensor.data_f64().add(5) }, 42.0);
+    }
+
+    #[test]
+    fn test_slice_assign() {
+        // Create a 2x4 zero tensor, assign [10,20,30] into [0, 0:3]
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 2);
+        crate::list::nsl_list_push(shape, 4);
+        let target = nsl_tensor_zeros(shape);
+
+        let src = create_tensor_with_shape_rs(&[3]);
+        let s = NslTensor::from_ptr(src);
+        unsafe {
+            *s.data_f64().add(0) = 10.0;
+            *s.data_f64().add(1) = 20.0;
+            *s.data_f64().add(2) = 30.0;
+        }
+
+        // Slice: [0, 0:3] => dim0: scalar index 0, dim1: range 0..3
+        let dims = [
+            NslSliceDim {
+                is_scalar: 1,
+                start: 0,
+                end: 0,
+            },
+            NslSliceDim {
+                is_scalar: 0,
+                start: 0,
+                end: 3,
+            },
+        ];
+        nsl_tensor_slice_assign(target, src, dims.as_ptr() as i64, 2);
+
+        let t = NslTensor::from_ptr(target);
+        assert_eq!(unsafe { *t.data_f64().add(0) }, 10.0); // [0,0]
+        assert_eq!(unsafe { *t.data_f64().add(1) }, 20.0); // [0,1]
+        assert_eq!(unsafe { *t.data_f64().add(2) }, 30.0); // [0,2]
+        assert_eq!(unsafe { *t.data_f64().add(3) }, 0.0); // [0,3] unchanged
+        assert_eq!(unsafe { *t.data_f64().add(4) }, 0.0); // [1,0] unchanged
+    }
 }

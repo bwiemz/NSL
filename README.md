@@ -232,7 +232,7 @@ NSL is in active development. Current milestone progress:
 | M17 | GPU/CUDA + `kernel` keyword | Complete |
 | M18a | Transformer foundations (tensor ops + model composition) | Complete |
 | M18b | Interop (safetensors, HuggingFace loading, ONNX export) | Complete |
-| M19 | Data pipeline + inference sampling | Planned |
+| M19 | Data pipeline + inference sampling | Complete |
 | M20 | v0.1 release (full GPT-2 pipeline) | Planned |
 | M21 | Advanced quantization (FP8, activation quant) | Planned |
 | M22 | Algorithmic quantization (QAT, GPTQ, AWQ) | Planned |

@@ -89,6 +89,7 @@ fn make_1d_tensor(values: &[f64]) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }
@@ -120,6 +121,7 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }

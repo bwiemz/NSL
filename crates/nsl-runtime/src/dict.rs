@@ -183,3 +183,26 @@ pub extern "C" fn nsl_dict_keys(dict_ptr: i64) -> i64 {
     }
     result
 }
+
+#[no_mangle]
+pub extern "C" fn nsl_dict_free(dict_ptr: i64) {
+    if dict_ptr == 0 { return; }
+    let dict = unsafe { &mut *(dict_ptr as *mut NslDict) };
+    for i in 0..dict.num_buckets as usize {
+        let mut entry = unsafe { *dict.buckets.add(i) };
+        while !entry.is_null() {
+            let e = unsafe { &*entry };
+            let next = e.next;
+            // Free value (tensor pointer) via refcount decrement
+            crate::tensor::nsl_tensor_free(e.value);
+            // Free the entry struct itself
+            unsafe { drop(Box::from_raw(entry)) };
+            entry = next;
+        }
+    }
+    // Free bucket array
+    let bucket_size = (dict.num_buckets as usize) * std::mem::size_of::<*mut NslDictEntry>();
+    unsafe { crate::memory::checked_free(dict.buckets as *mut u8, bucket_size) };
+    // Free dict struct
+    unsafe { drop(Box::from_raw(dict as *mut NslDict)) };
+}

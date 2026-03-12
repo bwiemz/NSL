@@ -16,3 +16,4 @@ cranelift-object.workspace = true
 cranelift-native.workspace = true
 target-lexicon.workspace = true
 nsl-runtime = { path = "../nsl-runtime" }
+serde_json = "1"

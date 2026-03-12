@@ -38,6 +38,8 @@ pub struct FuncState {
     /// Cranelift Values of intermediate tensor results that need freeing after the current statement.
     /// Prevents memory leaks from compound expressions like `a + b + c`.
     pub tensor_temporaries: Vec<ir::Value>,
+    /// Cranelift Values of DataLoader pointers that need stop+free at scope exit.
+    pub dataloader_vars: Vec<ir::Value>,
 }
 
 impl FuncState {
@@ -49,6 +51,7 @@ impl FuncState {
             current_block: None,
             is_no_grad: false,
             tensor_temporaries: Vec::new(),
+            dataloader_vars: Vec::new(),
         }
     }
 
