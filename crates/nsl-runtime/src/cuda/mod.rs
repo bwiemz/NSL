@@ -26,6 +26,16 @@ pub(crate) mod inner {
 
     static CUDA_STATE: OnceLock<Mutex<CudaState>> = OnceLock::new();
 
+    #[cfg(test)]
+    use std::collections::HashMap as TestHashMap;
+    #[cfg(test)]
+    static CUDA_SIZE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<TestHashMap<usize, usize>>> = std::sync::OnceLock::new();
+
+    #[cfg(test)]
+    fn cuda_size_registry() -> &'static std::sync::Mutex<TestHashMap<usize, usize>> {
+        CUDA_SIZE_REGISTRY.get_or_init(|| std::sync::Mutex::new(TestHashMap::new()))
+    }
+
     /// Ensure CUDA is initialized. Called from FFI exports.
     pub(crate) fn init() {
         ensure_context();
@@ -100,6 +110,10 @@ pub(crate) mod inner {
                 size_bytes,
                 result
             );
+            #[cfg(test)]
+            crate::memory::stats::cuda_alloc(size_bytes);
+            #[cfg(test)]
+            cuda_size_registry().lock().unwrap().insert(ptr as usize, size_bytes);
             ptr as *mut c_void
         }
     }
@@ -107,6 +121,11 @@ pub(crate) mod inner {
     /// Free unified memory.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         ensure_context();
+        #[cfg(test)]
+        {
+            let size = cuda_size_registry().lock().unwrap().remove(&(ptr as usize)).unwrap_or(0);
+            crate::memory::stats::cuda_free(size);
+        }
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);
             assert_eq!(
