@@ -37,3 +37,5 @@ pub mod trace;
 pub mod onnx;
 #[cfg(feature = "interop")]
 pub mod onnx_proto;
+
+pub mod sampling;

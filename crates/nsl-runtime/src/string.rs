@@ -197,6 +197,16 @@ pub extern "C" fn nsl_str_contains(s: i64, sub: i64) -> i8 {
     if text.contains(substr) { 1 } else { 0 }
 }
 
+/// Create a NUL-terminated C string from a Rust &str. Returns pointer as i64.
+pub fn nsl_str_from_rust(s: &str) -> i64 {
+    let ptr = crate::memory::checked_alloc(s.len() + 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr, s.len());
+        *ptr.add(s.len()) = 0; // NUL terminator
+    }
+    ptr as i64
+}
+
 /// Free a dynamically allocated string (allocated by checked_alloc).
 /// Used for tokenizer decode return values and other dynamic strings.
 #[no_mangle]
