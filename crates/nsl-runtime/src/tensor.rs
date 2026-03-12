@@ -460,14 +460,28 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     if tensor.dtype == 1 {
         // f32 (GPU tensors use unified memory, so CPU can read/write)
         let data_size = (new_len as usize) * std::mem::size_of::<f32>();
-        let new_data = checked_alloc(data_size) as *mut f32;
+        let new_data = if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            { crate::cuda::inner::alloc_managed(data_size) as *mut f32 }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            checked_alloc(data_size) as *mut f32
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(tensor.data_f32(), new_data, new_len as usize);
         }
         result_tensor.data = new_data as *mut c_void;
     } else {
         let data_size = (new_len as usize) * std::mem::size_of::<f64>();
-        let new_data = checked_alloc(data_size) as *mut f64;
+        let new_data = if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            { crate::cuda::inner::alloc_managed(data_size) as *mut f64 }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            checked_alloc(data_size) as *mut f64
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(tensor.data_f64(), new_data, new_len as usize);
         }
@@ -529,7 +543,14 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
     // Device/dtype-aware transposed copy
     let data: *mut c_void = if tensor.dtype == 1 {
         // f32 (GPU tensors use unified memory, so CPU can read/write)
-        let data = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        let data = if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>()) as *mut f32 }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32
+        };
         for flat_idx in 0..len as usize {
             let mut remaining = flat_idx;
             let mut new_indices = vec![0usize; ndim as usize];
@@ -547,7 +568,14 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
         }
         data as *mut c_void
     } else {
-        let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        let data = if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f64>()) as *mut f64 }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64
+        };
         for flat_idx in 0..len as usize {
             let mut remaining = flat_idx;
             let mut new_indices = vec![0usize; ndim as usize];
@@ -641,13 +669,27 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
     let strides = NslTensor::compute_strides(new_shape, new_ndim);
     let len = tensor.len;
 
-    // Deep copy data (dtype-aware)
+    // Deep copy data (dtype-aware, device-aware)
     let data: *mut c_void = if tensor.dtype == 1 {
-        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        let buf = if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>()) as *mut f32 }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32
+        };
         unsafe { std::ptr::copy_nonoverlapping(tensor.data_f32(), buf, len as usize) };
         buf as *mut c_void
     } else {
-        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        let buf = if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f64>()) as *mut f64 }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64
+        };
         unsafe { std::ptr::copy_nonoverlapping(tensor.data_f64(), buf, len as usize) };
         buf as *mut c_void
     };
@@ -3261,13 +3303,15 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
     let out_ptr = Box::into_raw(out) as i64;
 
     // Record on tape for autodiff
-    autodiff::maybe_record(autodiff::TapeOp::Slice {
-        a: tensor_ptr,
-        out: out_ptr,
-        dim: dim,
-        start: s,
-        input_shape,
-    });
+    if autodiff::is_recording() {
+        autodiff::maybe_record(autodiff::TapeOp::Slice {
+            a: tensor_ptr,
+            out: out_ptr,
+            dim: dim,
+            start: s,
+            input_shape,
+        });
+    }
 
     out_ptr
 }
@@ -3405,12 +3449,14 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     #[cfg(feature = "interop")]
     let trace_input_ptrs = input_ptrs.clone();
 
-    autodiff::maybe_record(autodiff::TapeOp::Cat {
-        inputs: input_ptrs,
-        out: out_ptr,
-        dim: dim,
-        split_sizes,
-    });
+    if autodiff::is_recording() {
+        autodiff::maybe_record(autodiff::TapeOp::Cat {
+            inputs: input_ptrs,
+            out: out_ptr,
+            dim: dim,
+            split_sizes,
+        });
+    }
 
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
@@ -3921,6 +3967,10 @@ pub extern "C" fn nsl_tensor_conv2d(
     let ph = pad_h as usize;
     let pw = pad_w as usize;
 
+    if h + 2 * ph < kh || w + 2 * pw < kw {
+        eprintln!("nsl: conv2d kernel larger than padded input");
+        std::process::abort();
+    }
     let h_out = (h + 2 * ph - kh) / sh + 1;
     let w_out = (w + 2 * pw - kw) / sw + 1;
 
@@ -4039,6 +4089,10 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     let s = stride as usize;
     let pad = padding as usize;
 
+    if h + 2 * pad < kh || w + 2 * pad < kw {
+        eprintln!("nsl: maxpool2d kernel larger than padded input");
+        std::process::abort();
+    }
     let h_out = (h + 2 * pad - kh) / s + 1;
     let w_out = (w + 2 * pad - kw) / s + 1;
 
