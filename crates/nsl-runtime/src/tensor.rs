@@ -96,6 +96,89 @@ impl NslTensor {
         unsafe { std::ptr::copy_nonoverlapping(src, dst, n); }
         dst
     }
+
+    /// Returns true if the tensor has a contiguous row-major memory layout.
+    /// A tensor is contiguous when strides match what compute_strides would produce.
+    pub(crate) fn is_contiguous(&self) -> bool {
+        if self.ndim <= 1 {
+            return true;
+        }
+        let ndim = self.ndim as usize;
+        unsafe {
+            let mut expected_stride = 1_i64;
+            for d in (0..ndim).rev() {
+                if *self.strides.add(d) != expected_stride {
+                    return false;
+                }
+                expected_stride *= *self.shape.add(d);
+            }
+        }
+        true
+    }
+
+    /// Create a new contiguous (row-major) copy of this tensor.
+    /// If the tensor is already contiguous, this behaves like clone.
+    /// For strided/transposed tensors, data is re-laid-out into row-major order.
+    pub(crate) fn make_contiguous(ptr: i64) -> i64 {
+        let tensor = NslTensor::from_ptr(ptr);
+        if tensor.is_contiguous() {
+            // Fast path: just memcpy
+            return nsl_tensor_clone(ptr);
+        }
+
+        let ndim = tensor.ndim as usize;
+        let len = tensor.len as usize;
+        let elem_size = tensor.element_size();
+
+        let new_shape = NslTensor::copy_shape(tensor.shape, tensor.ndim);
+        let new_strides = NslTensor::compute_strides(new_shape, tensor.ndim);
+        let new_data = checked_alloc(len * elem_size);
+
+        // Read shape and strides into vecs for indexing
+        let shape_vec: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.shape.add(i) }).collect();
+        let src_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.strides.add(i) }).collect();
+
+        // Iterate over all elements by multi-index, copy from strided src to contiguous dst
+        for flat in 0..len {
+            // Convert flat index to multi-index (row-major)
+            let mut remaining = flat;
+            let mut src_offset = 0_usize;
+            for d in 0..ndim {
+                // Compute product of remaining dimensions for row-major decomposition
+                let stride_in_flat: usize = if d + 1 < ndim {
+                    shape_vec[d + 1..].iter().map(|&s| s as usize).product()
+                } else {
+                    1
+                };
+                let idx = remaining / stride_in_flat;
+                remaining %= stride_in_flat;
+                src_offset += idx * (src_strides[d] as usize);
+            }
+
+            if tensor.dtype == 1 {
+                unsafe {
+                    *(new_data as *mut f32).add(flat) = *tensor.data_f32().add(src_offset);
+                }
+            } else {
+                unsafe {
+                    *(new_data as *mut f64).add(flat) = *tensor.data_f64().add(src_offset);
+                }
+            }
+        }
+
+        let result = Box::new(NslTensor {
+            data: new_data as *mut c_void,
+            shape: new_shape,
+            strides: new_strides,
+            ndim: tensor.ndim,
+            len: tensor.len,
+            refcount: 1,
+            device: tensor.device,
+            dtype: tensor.dtype,
+            owns_data: 1,
+        });
+        Box::into_raw(result) as i64
+    }
 }
 
 /// Helper: create a tensor from a shape list, filling data with a given value (f32, dtype=1).
@@ -1961,15 +2044,30 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
         std::process::abort();
     }
 
-    let in_strides = get_strides_vec(tensor);
-    let batch = indices.len as usize;
+    let num_indices = indices.len as usize;
+    let gather_dim_size = input_shape[d] as usize;
 
-    // Output shape: input shape with dim removed
+    // Output shape: input shape with d_dim replaced by num_indices
     // For [batch, classes] with dim=1 and indices [batch] -> output [batch]
+    // For [batch, seq, vocab] with dim=2 and indices [batch*seq] -> output [batch, seq]
     let out_shape: Vec<i64> = input_shape.iter().enumerate()
         .filter(|&(i, _)| i != d)
         .map(|(_, &s)| s)
         .collect();
+
+    // Compute the number of "outer" elements (product of dims before d)
+    // and "inner" elements (product of dims after d)
+    let outer: usize = input_shape[..d].iter().map(|&s| s as usize).product::<usize>().max(1);
+    let inner: usize = input_shape[d+1..].iter().map(|&s| s as usize).product::<usize>().max(1);
+
+    // indices must match outer dimension count
+    if num_indices != outer {
+        eprintln!(
+            "nsl: gather dim={} requires indices length ({}) == outer size ({})",
+            d, num_indices, outer
+        );
+        std::process::abort();
+    }
 
     let result_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&out_shape, tensor.dtype);
     let result = NslTensor::from_ptr(result_ptr);
@@ -1983,68 +2081,29 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
         }
     };
 
-    // For 2D dim=1: output[b] = input[b, indices[b]]
-    // For 2D dim=0: output[c] = input[indices[c], c]
-    if ndim == 2 {
-        let gather_dim_size = input_shape[d] as usize;
-        if d == 1 {
-            // dim=1: output[b] = input[b, indices[b]], requires indices.len == rows
-            let rows = input_shape[0] as usize;
-            if batch != rows {
-                eprintln!(
-                    "nsl: gather dim=1 requires indices length ({}) == input rows ({})",
-                    batch, rows
-                );
-                std::process::abort();
-            }
-            for b in 0..batch {
-                let idx = read_idx(b);
-                if idx >= gather_dim_size {
-                    eprintln!(
-                        "nsl: gather index {} out of bounds for dim {} with size {}",
-                        idx, d, gather_dim_size
-                    );
-                    std::process::abort();
-                }
-                if tensor.dtype == 1 {
-                    let val = unsafe { *tensor.data_f32().add(b * in_strides[0] + idx * in_strides[1]) };
-                    unsafe { *result.data_f32().add(b) = val };
-                } else {
-                    let val = unsafe { *tensor.data_f64().add(b * in_strides[0] + idx * in_strides[1]) };
-                    unsafe { *result.data_f64().add(b) = val };
-                }
-            }
-        } else {
-            // dim=0: output[c] = input[indices[c], c], requires indices.len == cols
-            let cols = input_shape[1] as usize;
-            if batch != cols {
-                eprintln!(
-                    "nsl: gather dim=0 requires indices length ({}) == input cols ({})",
-                    batch, cols
-                );
-                std::process::abort();
-            }
-            for c in 0..cols {
-                let idx = read_idx(c);
-                if idx >= gather_dim_size {
-                    eprintln!(
-                        "nsl: gather index {} out of bounds for dim {} with size {}",
-                        idx, d, gather_dim_size
-                    );
-                    std::process::abort();
-                }
-                if tensor.dtype == 1 {
-                    let val = unsafe { *tensor.data_f32().add(idx * in_strides[0] + c * in_strides[1]) };
-                    unsafe { *result.data_f32().add(c) = val };
-                } else {
-                    let val = unsafe { *tensor.data_f64().add(idx * in_strides[0] + c * in_strides[1]) };
-                    unsafe { *result.data_f64().add(c) = val };
-                }
+    // General N-D gather along dimension d:
+    // For each outer position o and each inner position k,
+    //   output[o * inner + k] = input[o * (gather_dim_size * inner) + idx * inner + k]
+    for o in 0..outer {
+        let idx = read_idx(o);
+        if idx >= gather_dim_size {
+            eprintln!(
+                "nsl: gather index {} out of bounds for dim {} with size {}",
+                idx, d, gather_dim_size
+            );
+            std::process::abort();
+        }
+        let in_base = o * gather_dim_size * inner + idx * inner;
+        let out_base = o * inner;
+        for k in 0..inner {
+            if tensor.dtype == 1 {
+                let val = unsafe { *tensor.data_f32().add(in_base + k) };
+                unsafe { *result.data_f32().add(out_base + k) = val };
+            } else {
+                let val = unsafe { *tensor.data_f64().add(in_base + k) };
+                unsafe { *result.data_f64().add(out_base + k) = val };
             }
         }
-    } else {
-        eprintln!("nsl: gather currently only supports 2D tensors");
-        std::process::abort();
     }
 
     if autodiff::is_recording() {
@@ -3584,7 +3643,16 @@ pub extern "C" fn nsl_tensor_layernorm(
     bias_ptr: i64,
     eps: f64,
 ) -> i64 {
-    let input = NslTensor::from_ptr(input_ptr);
+    // If input is not contiguous (e.g. transposed), make a contiguous copy first
+    let input_ref = NslTensor::from_ptr(input_ptr);
+    let need_contig = !input_ref.is_contiguous();
+    let effective_input_ptr = if need_contig {
+        NslTensor::make_contiguous(input_ptr)
+    } else {
+        input_ptr
+    };
+
+    let input = NslTensor::from_ptr(effective_input_ptr);
     let weight = NslTensor::from_ptr(weight_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
 
@@ -3738,6 +3806,11 @@ pub extern "C" fn nsl_tensor_layernorm(
         nsl_tensor_free(inv_std_ptr);
     }
 
+    // Free the contiguous copy if we made one
+    if need_contig {
+        nsl_tensor_free(effective_input_ptr);
+    }
+
     out_ptr
 }
 
@@ -3747,7 +3820,16 @@ pub extern "C" fn nsl_tensor_layernorm(
 /// Saves {input, rms, weight} for backward.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) -> i64 {
-    let input = NslTensor::from_ptr(input_ptr);
+    // If input is not contiguous (e.g. transposed), make a contiguous copy first
+    let input_ref = NslTensor::from_ptr(input_ptr);
+    let need_contig = !input_ref.is_contiguous();
+    let effective_input_ptr = if need_contig {
+        NslTensor::make_contiguous(input_ptr)
+    } else {
+        input_ptr
+    };
+
+    let input = NslTensor::from_ptr(effective_input_ptr);
     let weight = NslTensor::from_ptr(weight_ptr);
 
     let total = input.len as usize;
@@ -3848,6 +3930,11 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         });
     } else {
         nsl_tensor_free(rms_ptr);
+    }
+
+    // Free the contiguous copy if we made one
+    if need_contig {
+        nsl_tensor_free(effective_input_ptr);
     }
 
     out_ptr
