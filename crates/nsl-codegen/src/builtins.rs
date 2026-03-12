@@ -45,6 +45,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_dict_len", &[types::I64], Some(types::I64)),
     ("nsl_dict_contains", &[types::I64, types::I64], Some(types::I8)),
     ("nsl_dict_keys", &[types::I64], Some(types::I64)),
+    ("nsl_dict_free", &[types::I64], None),
     // String comparison
     ("nsl_str_eq", &[types::I64, types::I64], Some(types::I64)),
     // String repeat & slice
