@@ -65,15 +65,28 @@ impl Compiler<'_> {
                 if sig.returns.is_empty() {
                     builder.ins().return_(&[]);
                 } else {
+                    // The function has a return type but control flow reached the
+                    // end without an explicit `return`.  For scalar types (F64/F32/
+                    // integers) returning zero is safe.  For pointer-sized types
+                    // (I64) this would produce a null pointer — emit a trap instead
+                    // so we get a clear runtime abort rather than a segfault.
                     let ret_type = sig.returns[0].value_type;
-                    let zero = if ret_type == cl_types::F64 {
-                        builder.ins().f64const(0.0)
+                    if ret_type == cl_types::F64 {
+                        let zero = builder.ins().f64const(0.0);
+                        builder.ins().return_(&[zero]);
                     } else if ret_type == cl_types::F32 {
-                        builder.ins().f32const(0.0)
+                        let zero = builder.ins().f32const(0.0);
+                        builder.ins().return_(&[zero]);
+                    } else if ret_type == cl_types::I64 {
+                        // I64 is used for tensor/list/string pointers — returning 0
+                        // would be a null pointer.  Trap instead.
+                        builder
+                            .ins()
+                            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(2));
                     } else {
-                        builder.ins().iconst(ret_type, 0)
-                    };
-                    builder.ins().return_(&[zero]);
+                        let zero = builder.ins().iconst(ret_type, 0);
+                        builder.ins().return_(&[zero]);
+                    }
                 }
             }
 
