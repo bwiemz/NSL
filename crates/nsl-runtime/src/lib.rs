@@ -39,3 +39,4 @@ pub mod onnx;
 pub mod onnx_proto;
 
 pub mod sampling;
+pub mod data_source;
