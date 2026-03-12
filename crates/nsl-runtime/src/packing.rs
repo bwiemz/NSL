@@ -3,7 +3,7 @@
 //! Packs a flat token stream into fixed-size batches, building causal
 //! block-diagonal attention masks that respect document boundaries (EOS tokens).
 
-use crate::cpu::create_tensor_with_shape_rs;
+use crate::cpu::{create_tensor_with_shape_rs_dtype};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
 use crate::tensor::NslTensor;
@@ -108,27 +108,27 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     let s = batch.seq_len as i64;
 
     // input_ids [B, S]
-    let ids_ptr = create_tensor_with_shape_rs(&[b, s]);
+    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
     let ids_tensor = NslTensor::from_ptr(ids_ptr);
-    let ids_data = ids_tensor.data_f64();
+    let ids_data = ids_tensor.data_f32();
     for (i, &v) in batch.input_ids.iter().enumerate() {
-        unsafe { *ids_data.add(i) = v as f64 };
+        unsafe { *ids_data.add(i) = v as f32 };
     }
 
     // labels [B, S]
-    let lbl_ptr = create_tensor_with_shape_rs(&[b, s]);
+    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
     let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
-    let lbl_data = lbl_tensor.data_f64();
+    let lbl_data = lbl_tensor.data_f32();
     for (i, &v) in batch.labels.iter().enumerate() {
-        unsafe { *lbl_data.add(i) = v as f64 };
+        unsafe { *lbl_data.add(i) = v as f32 };
     }
 
     // attention_mask [B, S, S]
-    let mask_ptr = create_tensor_with_shape_rs(&[b, s, s]);
+    let mask_ptr = create_tensor_with_shape_rs_dtype(&[b, s, s], 1);
     let mask_tensor = NslTensor::from_ptr(mask_ptr);
-    let mask_data = mask_tensor.data_f64();
+    let mask_data = mask_tensor.data_f32();
     for (i, &v) in batch.mask.iter().enumerate() {
-        unsafe { *mask_data.add(i) = v as f64 };
+        unsafe { *mask_data.add(i) = v };
     }
 
     let dict = nsl_dict_new();

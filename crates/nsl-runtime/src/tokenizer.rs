@@ -269,14 +269,22 @@ pub extern "C" fn nsl_tokenizer_decode(handle: i64, tensor_ptr: i64) -> i64 {
     match get_tokenizer(handle) {
         TokenizerKind::Byte => {
             let bytes: Vec<u8> = (0..tensor.len as usize)
-                .map(|i| unsafe { *tensor.data_f64().add(i) } as u8)
+                .map(|i| if tensor.dtype == 1 {
+                    unsafe { (*tensor.data_f32().add(i)) as u8 }
+                } else {
+                    unsafe { (*tensor.data_f64().add(i)) as u8 }
+                })
                 .collect();
             let s = String::from_utf8_lossy(&bytes);
             alloc_cstring(&s)
         }
         TokenizerKind::HuggingFace(tok) => {
             let ids: Vec<u32> = (0..tensor.len as usize)
-                .map(|i| unsafe { *tensor.data_f64().add(i) } as u32)
+                .map(|i| if tensor.dtype == 1 {
+                    unsafe { (*tensor.data_f32().add(i)) as u32 }
+                } else {
+                    unsafe { (*tensor.data_f64().add(i)) as u32 }
+                })
                 .collect();
             match tok.decode(&ids, true) {
                 Ok(s) => alloc_cstring(&s),

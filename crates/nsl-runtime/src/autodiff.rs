@@ -14,7 +14,6 @@ use crate::tensor::{
     nsl_tensor_mul as tensor_mul,
     nsl_tensor_mul_scalar as tensor_mul_scalar,
     nsl_tensor_neg as tensor_neg,
-    nsl_tensor_ones as tensor_ones,
     nsl_tensor_ones_like,
     nsl_tensor_select,
     nsl_tensor_shape as tensor_shape,
@@ -874,13 +873,13 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_size = len * elem_size;
-    let data_raw = if on_gpu {
+    let data_raw: *mut c_void = if on_gpu {
         #[cfg(feature = "cuda")]
         { crate::cuda::inner::alloc_managed(data_size) }
         #[cfg(not(feature = "cuda"))]
-        { crate::memory::checked_alloc_zeroed(data_size) }
+        { crate::memory::checked_alloc_zeroed(data_size) as *mut c_void }
     } else {
-        crate::memory::checked_alloc_zeroed(data_size)
+        crate::memory::checked_alloc_zeroed(data_size) as *mut c_void
     };
 
     let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };

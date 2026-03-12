@@ -194,6 +194,28 @@ fn create_scalar_tensor(value: f64) -> i64 {
     Box::into_raw(tensor) as i64
 }
 
+/// Create a 0-d scalar tensor with dtype-aware storage (dtype=0 → f64, dtype=1 → f32).
+fn create_scalar_tensor_dtype(value: f64, dtype: u8) -> i64 {
+    if dtype == 1 {
+        create_scalar_tensor(value)
+    } else {
+        let data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
+        unsafe { *data = value };
+        let tensor = Box::new(NslTensor {
+            data: data as *mut c_void,
+            shape: std::ptr::null_mut(),
+            strides: std::ptr::null_mut(),
+            ndim: 0,
+            len: 1,
+            refcount: 1,
+            device: 0,
+            dtype: 0,
+            owns_data: 1,
+        });
+        Box::into_raw(tensor) as i64
+    }
+}
+
 // === Creation ===
 
 #[no_mangle]
@@ -1615,7 +1637,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
             }
             s
         };
-        let result = create_scalar_tensor(total);
+        let result = create_scalar_tensor_dtype(total, tensor.dtype);
         if autodiff::is_recording() {
             autodiff::maybe_record(autodiff::TapeOp::SumReduce {
                 a: tensor_ptr,
@@ -1710,7 +1732,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
     if dim == -1 {
         // Global reduction
         if tensor.len == 0 {
-            return create_scalar_tensor(0.0);
+            return create_scalar_tensor_dtype(0.0, tensor.dtype);
         }
         let num_elements = tensor.len;
         let total = if tensor.dtype == 1 {
@@ -1726,7 +1748,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
             }
             s / num_elements as f64
         };
-        let result = create_scalar_tensor(total);
+        let result = create_scalar_tensor_dtype(total, tensor.dtype);
         if autodiff::is_recording() {
             autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
                 a: tensor_ptr,
@@ -2911,7 +2933,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                 if tensor.device > 0 {
                     #[cfg(feature = "cuda")]
                     {
-                        crate::cuda::free_managed(tensor.data);
+                        crate::cuda::inner::free_managed(tensor.data);
                     }
                     #[cfg(not(feature = "cuda"))]
                     {

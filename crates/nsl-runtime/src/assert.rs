@@ -86,17 +86,35 @@ pub extern "C" fn nsl_assert_close(
     }
 
     // Element-wise closeness check: |a - b| <= atol + rtol * |b|
-    for i in 0..a.len as usize {
-        let va = unsafe { *a.data_f64().add(i) };
-        let vb = unsafe { *b.data_f64().add(i) };
-        let diff = (va - vb).abs();
-        let tol = atol + rtol * vb.abs();
-        if diff > tol {
-            eprintln!(
-                "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
-                msg, i, va, vb, diff, tol
-            );
-            std::process::abort();
+    if a.dtype == 1 && b.dtype == 1 {
+        // f32 path
+        for i in 0..a.len as usize {
+            let va = unsafe { *a.data_f32().add(i) } as f64;
+            let vb = unsafe { *b.data_f32().add(i) } as f64;
+            let diff = (va - vb).abs();
+            let tol = atol + rtol * vb.abs();
+            if diff > tol {
+                eprintln!(
+                    "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
+                    msg, i, va, vb, diff, tol
+                );
+                std::process::abort();
+            }
+        }
+    } else {
+        // f64 path
+        for i in 0..a.len as usize {
+            let va = unsafe { *a.data_f64().add(i) };
+            let vb = unsafe { *b.data_f64().add(i) };
+            let diff = (va - vb).abs();
+            let tol = atol + rtol * vb.abs();
+            if diff > tol {
+                eprintln!(
+                    "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
+                    msg, i, va, vb, diff, tol
+                );
+                std::process::abort();
+            }
         }
     }
 }

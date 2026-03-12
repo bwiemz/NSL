@@ -434,6 +434,8 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
         [grid, 1, 1], [block, 1, 1], &args,
     );
     assert_eq!(result as u32, 0, "GPU backward kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    #[allow(unused_unsafe)]
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
     out_ptr as i64
 }
 
@@ -524,6 +526,8 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
         [grid, 1, 1], [block, 1, 1], &args,
     );
     assert_eq!(result as u32, 0, "GPU clamp_backward kernel failed: {}", result as u32);
+    #[allow(unused_unsafe)]
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
     out_ptr as i64
 }
 
