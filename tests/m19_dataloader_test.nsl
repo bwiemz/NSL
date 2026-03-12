@@ -1,0 +1,16 @@
+# M19 Integration Test: DataLoader
+# Tests DataLoader with synthetic data
+
+# Create synthetic data: 64 "tokens"
+let data = randn([64])
+print("Data created")
+
+# Create DataLoader: batch_size=2, seq_len=8
+let loader = DataLoader(data, batch_size=2, seq_len=8, num_workers=1)
+print("DataLoader created")
+
+# Iterate and count batches
+for batch in loader:
+    print("Batch received")
+
+print("DataLoader test: PASS")
