@@ -604,6 +604,11 @@ impl Compiler<'_> {
             return self.compile_for_model_array(builder, state, pattern, iterable, body, *element_model, *size);
         }
 
+        // DataLoader iteration: `for batch in loader:`
+        if matches!(iter_type, Type::Unknown) {
+            return self.compile_for_dataloader(builder, state, pattern, iterable, body);
+        }
+
         let list_val = self.compile_expr(builder, state, iterable)?;
 
         let len_id = self.runtime_fns["nsl_list_len"].0;
@@ -794,6 +799,81 @@ impl Compiler<'_> {
         builder.switch_to_block(exit_block);
         builder.seal_block(exit_block);
         state.current_block = Some(exit_block);
+        Ok(())
+    }
+
+    // ── DataLoader for-loop ──────────────────────────────────────────
+
+    fn compile_for_dataloader(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        pattern: &nsl_ast::pattern::Pattern,
+        iterable: &nsl_ast::expr::Expr,
+        body: &nsl_ast::stmt::Block,
+    ) -> Result<(), CodegenError> {
+        let dl_val = self.compile_expr(builder, state, iterable)?;
+
+        // Extract loop variable symbol (must be simple ident)
+        let loop_var_sym = match &pattern.kind {
+            PatternKind::Ident(sym) => *sym,
+            _ => return Err(CodegenError::new("only ident patterns supported in DataLoader for-loops")),
+        };
+
+        // Declare cranelift variable for the batch pointer
+        let batch_var = state.new_variable();
+        builder.declare_var(batch_var, cl_types::I64);
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(batch_var, zero);
+        state.variables.insert(loop_var_sym, (batch_var, cl_types::I64));
+
+        // Create blocks: header, body, cleanup, exit
+        let header_block = builder.create_block();
+        let body_block = builder.create_block();
+        let cleanup_block = builder.create_block();
+        let exit_block = builder.create_block();
+
+        builder.ins().jump(header_block, &[]);
+
+        // Header: call nsl_dataloader_next_batch, branch on null
+        builder.switch_to_block(header_block);
+        state.current_block = Some(header_block);
+        let batch_ptr = self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_val])?;
+        builder.def_var(batch_var, batch_ptr);
+        let is_null = builder.ins().icmp_imm(IntCC::Equal, batch_ptr, 0);
+        builder.ins().brif(is_null, exit_block, &[], body_block, &[]);
+
+        // Body: compile loop body statements
+        builder.switch_to_block(body_block);
+        builder.seal_block(body_block);
+        state.current_block = Some(body_block);
+
+        state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block });
+        for s in &body.stmts {
+            self.compile_stmt(builder, state, s)?;
+        }
+        state.loop_stack.pop();
+
+        let current = state.current_block.unwrap_or(body_block);
+        if !is_block_filled(builder, current) {
+            builder.ins().jump(cleanup_block, &[]);
+        }
+
+        // Cleanup: free the batch dict, then loop back to header
+        builder.switch_to_block(cleanup_block);
+        builder.seal_block(cleanup_block);
+        state.current_block = Some(cleanup_block);
+        let batch_to_free = builder.use_var(batch_var);
+        self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
+        builder.ins().jump(header_block, &[]);
+
+        // Exit: reset the dataloader for potential next epoch
+        builder.seal_block(header_block);
+        builder.switch_to_block(exit_block);
+        builder.seal_block(exit_block);
+        state.current_block = Some(exit_block);
+        self.compile_call_by_name(builder, "nsl_dataloader_reset", &[dl_val])?;
+
         Ok(())
     }
 
