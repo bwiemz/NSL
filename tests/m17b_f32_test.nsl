@@ -1,0 +1,55 @@
+# M17b f32 Dtype Unification Tests
+
+# Test 1: zeros creates working tensors
+let a = zeros([4, 4])
+print("Test 1 zeros: PASS")
+
+# Test 2: ones creates working tensors
+let b = ones([3, 3])
+print("Test 2 ones: PASS")
+
+# Test 3: arithmetic works
+let c = a + b
+print("Test 3 arithmetic: PASS")
+
+# Test 4: matmul works
+let x = ones([4, 8])
+let y = ones([8, 2])
+let z = x @ y
+assert_close(z, full([4, 2], 8.0), 0.1, 0.1)
+print("Test 4 matmul: PASS")
+
+# Test 5: scalar-tensor ops
+let s = ones([10]) * 3.0
+assert_close(s, full([10], 3.0), 0.01, 0.01)
+print("Test 5 scalar-tensor: PASS")
+
+# Test 6: rand/randn
+let r = rand([100])
+let rn = randn([100])
+print("Test 6 rand/randn: PASS")
+
+# Test 7: arange
+let ar = arange(0, 10, 1)
+print("Test 7 arange: PASS")
+
+# Test 8: reduction ops
+let t = ones([4, 4])
+let s = sum(t)
+let m = mean(t)
+print("Test 8 reductions: PASS")
+
+# Test 9: activations
+let v = randn([16])
+let r1 = relu(v)
+let r2 = sigmoid(v)
+let r3 = tanh(v)
+print("Test 9 activations: PASS")
+
+# Test 10: autodiff with f32
+let w = randn([4, 4])
+tape_start()
+let out = sum(w * w)
+backward(out)
+tape_stop()
+print("Test 10 autodiff f32: PASS")

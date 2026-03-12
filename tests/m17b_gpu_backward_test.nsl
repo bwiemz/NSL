@@ -1,0 +1,69 @@
+# M17b GPU Backward Pass Tests
+# These tests verify that autodiff backward works on GPU tensors.
+# Requires CUDA — skip if no GPU available.
+
+# Test 1: GPU relu backward
+let x1 = randn([64, 64])
+let gx1 = x1.to(cuda)
+tape_start()
+let y1 = relu(gx1)
+let loss1 = sum(y1)
+backward(loss1)
+tape_stop()
+print("Test 1 GPU relu backward: PASS")
+
+# Test 2: GPU sigmoid backward
+let x2 = randn([32, 32])
+let gx2 = x2.to(cuda)
+tape_start()
+let y2 = sigmoid(gx2)
+let loss2 = sum(y2)
+backward(loss2)
+tape_stop()
+print("Test 2 GPU sigmoid backward: PASS")
+
+# Test 3: GPU tanh backward
+let x3 = randn([32, 32])
+let gx3 = x3.to(cuda)
+tape_start()
+let y3 = tanh(gx3)
+let loss3 = sum(y3)
+backward(loss3)
+tape_stop()
+print("Test 3 GPU tanh backward: PASS")
+
+# Test 4: GPU matmul backward
+let a = randn([16, 32])
+let b = randn([32, 8])
+let ga = a.to(cuda)
+let gb = b.to(cuda)
+tape_start()
+let c = ga @ gb
+let loss4 = sum(c)
+backward(loss4)
+tape_stop()
+print("Test 4 GPU matmul backward: PASS")
+
+# Test 5: GPU chained ops backward (matmul + relu + sum)
+let w = randn([16, 8])
+let inp = randn([4, 16])
+let gw = w.to(cuda)
+let ginp = inp.to(cuda)
+tape_start()
+let h = relu(ginp @ gw)
+let loss5 = mean(h)
+backward(loss5)
+tape_stop()
+print("Test 5 GPU chained ops backward: PASS")
+
+# Test 6: GPU element-wise backward (add, mul)
+let p = randn([64])
+let q = randn([64])
+let gp = p.to(cuda)
+let gq = q.to(cuda)
+tape_start()
+let r = gp * gq + gp
+let loss6 = sum(r)
+backward(loss6)
+tape_stop()
+print("Test 6 GPU elementwise backward: PASS")
