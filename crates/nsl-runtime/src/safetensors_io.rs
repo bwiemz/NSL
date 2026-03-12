@@ -160,7 +160,10 @@ pub(crate) fn allocate_f32_tensor(
 pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64) -> i64 {
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
-        std::str::from_utf8_unchecked(slice)
+        std::str::from_utf8(slice).unwrap_or_else(|_| {
+            eprintln!("[nsl] safetensors_load: path is not valid UTF-8");
+            std::process::abort();
+        })
     };
 
     let bytes = match std::fs::read(path) {
@@ -224,7 +227,10 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
 
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
-        std::str::from_utf8_unchecked(slice)
+        std::str::from_utf8(slice).unwrap_or_else(|_| {
+            eprintln!("[nsl] safetensors_save: path is not valid UTF-8");
+            std::process::abort();
+        })
     };
 
     // Collect key list from dict
