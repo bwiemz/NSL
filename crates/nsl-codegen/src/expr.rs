@@ -2490,11 +2490,11 @@ impl Compiler<'_> {
 
         // Get PTX pointer from .rodata
         let ptx_gv = self.module.declare_data_in_func(ptx_data_id, builder.func);
-        let ptx_ptr = builder.ins().global_value(cl_types::I64, ptx_gv);
+        let ptx_ptr = builder.ins().symbol_value(pointer_type(), ptx_gv);
 
         // Get kernel name pointer from .rodata
         let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
-        let name_ptr = builder.ins().global_value(cl_types::I64, name_gv);
+        let name_ptr = builder.ins().symbol_value(pointer_type(), name_gv);
 
         // Build args array on stack: each tensor arg is an i64 (pointer)
         let num_args = tensor_args.len();
