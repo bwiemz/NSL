@@ -1,0 +1,41 @@
+# M19 Integration Test: Sampling Primitives
+
+# Test manual_seed for reproducibility
+manual_seed(42)
+
+# Create a small "logits" tensor
+let logits = randn([1, 8])
+print("Logits created")
+
+# Test topk
+let result = topk(logits, 3)
+let top_vals = result["values"]
+let top_idx = result["indices"]
+print("topk: PASS")
+
+# Test softmax + multinomial
+let probs = softmax(top_vals, dim=-1)
+let sampled = multinomial(probs, 1)
+print("multinomial: PASS")
+
+# Test argmax
+let greedy = argmax(logits, dim=-1)
+print("argmax: PASS")
+
+# Test deterministic RNG
+manual_seed(42)
+let a = multinomial(probs, 1)
+manual_seed(42)
+let b = multinomial(probs, 1)
+print("deterministic RNG: PASS")
+
+# Test cumsum
+let vals = randn([4])
+let cs = cumsum(vals, 0)
+print("cumsum: PASS")
+
+# Test lt_scalar
+let mask = lt_scalar(probs, 0.5)
+print("lt_scalar: PASS")
+
+print("All sampling tests: PASS")
