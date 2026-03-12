@@ -98,8 +98,48 @@ impl NslTensor {
     }
 }
 
-/// Helper: create a tensor from a shape list, filling data with a given value.
+/// Helper: create a tensor from a shape list, filling data with a given value (f32, dtype=1).
 fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
+    let list = NslList::from_ptr(shape_list);
+    let ndim = list.len;
+
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim as usize {
+        unsafe { *shape.add(i) = *list.data.add(i) };
+    }
+
+    let len = NslTensor::total_elements(shape, ndim);
+    let fill_f32 = fill as f32;
+    let data_size = (len as usize) * std::mem::size_of::<f32>();
+    let data = if fill == 0.0 {
+        checked_alloc_zeroed(data_size) as *mut f32
+    } else {
+        let data = checked_alloc(data_size) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *data.add(i) = fill_f32 };
+        }
+        data
+    };
+
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    let tensor = Box::new(NslTensor {
+        data: data as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+        device: 0,
+        dtype: 1,
+        owns_data: 1,
+    });
+    Box::into_raw(tensor) as i64
+}
+
+/// Helper: create a tensor from a shape list, filling data with a given value (f64, dtype=0).
+/// Used for operations that explicitly require double precision.
+fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
     let list = NslList::from_ptr(shape_list);
     let ndim = list.len;
 
@@ -136,10 +176,10 @@ fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
     Box::into_raw(tensor) as i64
 }
 
-/// Create a 0-d scalar tensor containing a single f64 value.
+/// Create a 0-d scalar tensor containing a single f32 value (dtype=1).
 fn create_scalar_tensor(value: f64) -> i64 {
-    let data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
-    unsafe { *data = value };
+    let data = checked_alloc(std::mem::size_of::<f32>()) as *mut f32;
+    unsafe { *data = value as f32 };
     let tensor = Box::new(NslTensor {
         data: data as *mut c_void,
         shape: std::ptr::null_mut(),
@@ -148,7 +188,7 @@ fn create_scalar_tensor(value: f64) -> i64 {
         len: 1,
         refcount: 1,
         device: 0,
-        dtype: 0,
+        dtype: 1,
         owns_data: 1,
     });
     Box::into_raw(tensor) as i64
@@ -176,8 +216,8 @@ pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
     let ptr = tensor_from_shape_list(shape_list, 0.0);
     let tensor = NslTensor::from_ptr(ptr);
     for i in 0..tensor.len as usize {
-        let val = crate::sampling::rng_f64();
-        unsafe { *tensor.data_f64().add(i) = val };
+        let val = crate::sampling::rng_f64() as f32;
+        unsafe { *tensor.data_f32().add(i) = val };
     }
     ptr
 }
@@ -194,11 +234,11 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
         let u2 = crate::sampling::rng_f64();
 
         let mag = (-2.0 * u1.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
-        let z1 = mag * (2.0 * std::f64::consts::PI * u2).sin();
+        let z0 = (mag * (2.0 * std::f64::consts::PI * u2).cos()) as f32;
+        let z1 = (mag * (2.0 * std::f64::consts::PI * u2).sin()) as f32;
         unsafe {
-            *tensor.data_f64().add(i) = z0;
-            *tensor.data_f64().add(i + 1) = z1;
+            *tensor.data_f32().add(i) = z0;
+            *tensor.data_f32().add(i + 1) = z1;
         }
         i += 2;
     }
@@ -208,8 +248,8 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
         let u2 = crate::sampling::rng_f64();
 
         let mag = (-2.0 * u1.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
-        unsafe { *tensor.data_f64().add(i) = z0 };
+        let z0 = (mag * (2.0 * std::f64::consts::PI * u2).cos()) as f32;
+        unsafe { *tensor.data_f32().add(i) = z0 };
     }
     ptr
 }
@@ -230,9 +270,9 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
     let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
     unsafe { *strides = 1 };
 
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
     for i in 0..len as usize {
-        unsafe { *data.add(i) = start + (i as f64) * step };
+        unsafe { *data.add(i) = (start + (i as f64) * step) as f32 };
     }
 
     let tensor = Box::new(NslTensor {
@@ -243,7 +283,7 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
         len,
         refcount: 1,
         device: 0,
-        dtype: 0,
+        dtype: 1,
         owns_data: 1,
     });
     Box::into_raw(tensor) as i64
@@ -3904,7 +3944,11 @@ pub extern "C" fn nsl_tensor_set_element(
         offset += idx * strides[d];
     }
 
-    unsafe { *tensor.data_f64().add(offset) = value };
+    if tensor.dtype == 1 {
+        unsafe { *tensor.data_f32().add(offset) = value as f32 };
+    } else {
+        unsafe { *tensor.data_f64().add(offset) = value };
+    }
 }
 
 /// Assign `src` tensor into a slice of `target` tensor.
@@ -3965,8 +4009,17 @@ pub extern "C" fn nsl_tensor_slice_assign(
     ) {
         if depth == ndim {
             if *src_flat < src.len as usize {
-                let val = unsafe { *src.data_f64().add(*src_flat) };
-                unsafe { *target.data_f64().add(target_offset) = val };
+                // Read from src (handle both dtypes) and write to target (handle both dtypes)
+                let val: f64 = if src.dtype == 1 {
+                    unsafe { *src.data_f32().add(*src_flat) as f64 }
+                } else {
+                    unsafe { *src.data_f64().add(*src_flat) }
+                };
+                if target.dtype == 1 {
+                    unsafe { *target.data_f32().add(target_offset) = val as f32 };
+                } else {
+                    unsafe { *target.data_f64().add(target_offset) = val };
+                }
                 *src_flat += 1;
             }
             return;
@@ -4017,7 +4070,7 @@ mod tests {
         nsl_tensor_set_element(t, indices.as_ptr() as i64, 2, 42.0);
         let tensor = NslTensor::from_ptr(t);
         // Element at [1, 2]: row 1 * 3 + col 2 = 5
-        assert_eq!(unsafe { *tensor.data_f64().add(5) }, 42.0);
+        assert_eq!(unsafe { *tensor.data_f32().add(5) }, 42.0_f32);
     }
 
     #[test]
@@ -4028,12 +4081,15 @@ mod tests {
         crate::list::nsl_list_push(shape, 4);
         let target = nsl_tensor_zeros(shape);
 
-        let src = create_tensor_with_shape_rs(&[3]);
+        // Create src as an f32 tensor (use nsl_tensor_zeros then set elements)
+        let src_shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(src_shape, 3);
+        let src = nsl_tensor_zeros(src_shape);
         let s = NslTensor::from_ptr(src);
         unsafe {
-            *s.data_f64().add(0) = 10.0;
-            *s.data_f64().add(1) = 20.0;
-            *s.data_f64().add(2) = 30.0;
+            *s.data_f32().add(0) = 10.0_f32;
+            *s.data_f32().add(1) = 20.0_f32;
+            *s.data_f32().add(2) = 30.0_f32;
         }
 
         // Slice: [0, 0:3] => dim0: scalar index 0, dim1: range 0..3
@@ -4052,10 +4108,10 @@ mod tests {
         nsl_tensor_slice_assign(target, src, dims.as_ptr() as i64, 2);
 
         let t = NslTensor::from_ptr(target);
-        assert_eq!(unsafe { *t.data_f64().add(0) }, 10.0); // [0,0]
-        assert_eq!(unsafe { *t.data_f64().add(1) }, 20.0); // [0,1]
-        assert_eq!(unsafe { *t.data_f64().add(2) }, 30.0); // [0,2]
-        assert_eq!(unsafe { *t.data_f64().add(3) }, 0.0); // [0,3] unchanged
-        assert_eq!(unsafe { *t.data_f64().add(4) }, 0.0); // [1,0] unchanged
+        assert_eq!(unsafe { *t.data_f32().add(0) }, 10.0_f32); // [0,0]
+        assert_eq!(unsafe { *t.data_f32().add(1) }, 20.0_f32); // [0,1]
+        assert_eq!(unsafe { *t.data_f32().add(2) }, 30.0_f32); // [0,2]
+        assert_eq!(unsafe { *t.data_f32().add(3) }, 0.0_f32); // [0,3] unchanged
+        assert_eq!(unsafe { *t.data_f32().add(4) }, 0.0_f32); // [1,0] unchanged
     }
 }
