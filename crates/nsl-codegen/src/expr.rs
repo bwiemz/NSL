@@ -1112,6 +1112,173 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_safetensors_save", &[dict_val, path_val, path_len]);
         }
 
+        // ── M19: Sampling intrinsics ─────────────────────────────────
+
+        // manual_seed(seed)
+        if func_name == "manual_seed" {
+            let seed_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_manual_seed", &[seed_val]);
+        }
+
+        // topk(tensor, k, dim=-1)
+        if func_name == "topk" {
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_expr(builder, state, &args[1].value)?;
+            let dim_val = if args.len() > 2 {
+                self.compile_expr(builder, state, &args[2].value)?
+            } else {
+                builder.ins().iconst(cl_types::I64, -1i64 as i64)
+            };
+            return self.compile_call_by_name(builder, "nsl_tensor_topk", &[tensor_val, k_val, dim_val]);
+        }
+
+        // multinomial(tensor, num_samples)
+        if func_name == "multinomial" {
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let n_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_multinomial", &[tensor_val, n_val]);
+        }
+
+        // argmax(tensor, dim=-1)
+        if func_name == "argmax" {
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dim_val = if args.len() > 1 {
+                self.compile_expr(builder, state, &args[1].value)?
+            } else {
+                builder.ins().iconst(cl_types::I64, -1i64 as i64)
+            };
+            return self.compile_call_by_name(builder, "nsl_tensor_argmax", &[tensor_val, dim_val]);
+        }
+
+        // cumsum(tensor, dim)
+        if func_name == "cumsum" {
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_cumsum", &[tensor_val, dim_val]);
+        }
+
+        // lt_scalar(tensor, scalar)
+        if func_name == "lt_scalar" {
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let scalar_val = self.compile_expr(builder, state, &args[1].value)?;
+            // Ensure scalar is f64
+            let scalar_ty = builder.func.dfg.value_type(scalar_val);
+            let scalar_f64 = if scalar_ty == cl_types::F64 {
+                scalar_val
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, scalar_val)
+            };
+            return self.compile_call_by_name(builder, "nsl_tensor_lt_scalar", &[tensor_val, scalar_f64]);
+        }
+
+        // ── M19: Data source intrinsics ─────────────────────────────
+
+        // load_jsonl("path", "field")
+        if func_name == "load_jsonl" {
+            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_len = if let ExprKind::StringLiteral(s) = &args[0].value.kind {
+                builder.ins().iconst(cl_types::I64, s.len() as i64)
+            } else {
+                self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
+            };
+            let field_val = self.compile_expr(builder, state, &args[1].value)?;
+            let field_len = if let ExprKind::StringLiteral(s) = &args[1].value.kind {
+                builder.ins().iconst(cl_types::I64, s.len() as i64)
+            } else {
+                self.compile_call_by_name(builder, "nsl_str_len", &[field_val])?
+            };
+            return self.compile_call_by_name(builder, "nsl_load_jsonl", &[path_val, path_len, field_val, field_len]);
+        }
+
+        // load_csv("path", col_idx, has_header=1)
+        if func_name == "load_csv" {
+            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_len = if let ExprKind::StringLiteral(s) = &args[0].value.kind {
+                builder.ins().iconst(cl_types::I64, s.len() as i64)
+            } else {
+                self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
+            };
+            let col_val = self.compile_expr(builder, state, &args[1].value)?;
+            let header_val = if args.len() > 2 {
+                self.compile_expr(builder, state, &args[2].value)?
+            } else {
+                builder.ins().iconst(cl_types::I64, 1)
+            };
+            return self.compile_call_by_name(builder, "nsl_load_csv", &[path_val, path_len, col_val, header_val]);
+        }
+
+        // load_mmap("path", dtype)
+        if func_name == "load_mmap" {
+            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_len = if let ExprKind::StringLiteral(s) = &args[0].value.kind {
+                builder.ins().iconst(cl_types::I64, s.len() as i64)
+            } else {
+                self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
+            };
+            let dtype_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(builder, "nsl_load_mmap", &[path_val, path_len, dtype_val]);
+        }
+
+        // ── M19: DataLoader intrinsic ───────────────────────────────
+
+        // DataLoader(data, batch_size=32, seq_len=128, ...)
+        if func_name == "DataLoader" {
+            let data_val = self.compile_expr(builder, state, &args[0].value)?;
+
+            // Build JSON config from keyword args at compile time
+            let mut config = serde_json::Map::new();
+            for arg in args.iter().skip(1) {
+                if let Some(name_sym) = arg.name {
+                    let key = self.resolve_sym(name_sym).to_string();
+                    match &arg.value.kind {
+                        ExprKind::IntLiteral(v) => {
+                            config.insert(key, serde_json::Value::Number(serde_json::Number::from(*v)));
+                        }
+                        ExprKind::BoolLiteral(v) => {
+                            config.insert(key, serde_json::Value::Bool(*v));
+                        }
+                        ExprKind::FloatLiteral(v) => {
+                            if let Some(n) = serde_json::Number::from_f64(*v) {
+                                config.insert(key, serde_json::Value::Number(n));
+                            }
+                        }
+                        _ => {
+                            return Err(CodegenError::new(format!(
+                                "DataLoader(): keyword argument '{}' must be a compile-time constant", key
+                            )));
+                        }
+                    }
+                }
+            }
+            let config_json = serde_json::Value::Object(config).to_string();
+
+            // Intern the config string as data
+            let config_data_id = self.intern_string(&config_json)?;
+            let config_gv = self.module.declare_data_in_func(config_data_id, builder.func);
+            let config_ptr = builder.ins().symbol_value(pointer_type(), config_gv);
+            let config_len = builder.ins().iconst(cl_types::I64, config_json.len() as i64);
+
+            // Read tensor .len field (offset 32: data:8 + shape:8 + strides:8 + ndim:8)
+            let tensor_len = builder.ins().load(
+                cl_types::I64,
+                MemFlags::trusted(),
+                data_val,
+                cranelift_codegen::ir::immediates::Offset32::new(32),
+            );
+
+            // Read tensor .data field (offset 0)
+            let tensor_data = builder.ins().load(
+                cl_types::I64,
+                MemFlags::trusted(),
+                data_val,
+                cranelift_codegen::ir::immediates::Offset32::new(0),
+            );
+
+            let dl_ptr = self.compile_call_by_name(builder, "nsl_dataloader_create", &[tensor_data, tensor_len, config_ptr, config_len])?;
+            self.compile_call_by_name(builder, "nsl_dataloader_start", &[dl_ptr])?;
+            return Ok(dl_ptr);
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();
@@ -2496,6 +2663,22 @@ impl Compiler<'_> {
                 let start_val = self.compile_expr(builder, state, &args[1].value)?;
                 let end_val = self.compile_expr(builder, state, &args[2].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_slice", &[obj_val, dim_val, start_val, end_val])
+            }
+            // M19: cumsum(dim)
+            "cumsum" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::new("cumsum() takes exactly 1 argument (dim)"));
+                }
+                let dim_val = self.compile_expr(builder, state, &args[0].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_cumsum", &[obj_val, dim_val])
+            }
+            // M19: shape(dim) — returns a single dimension size as i64
+            "shape" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::new("shape() takes exactly 1 argument (dim)"));
+                }
+                let dim_val = self.compile_expr(builder, state, &args[0].value)?;
+                self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[obj_val, dim_val])
             }
             _ => Err(CodegenError::new(format!("unknown tensor method '.{method}()'"))),
         }
