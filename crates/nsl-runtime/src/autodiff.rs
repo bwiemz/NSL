@@ -259,8 +259,13 @@ fn accumulate_grad(grads: &mut HashMap<i64, i64>, key: i64, grad_tensor: i64) {
     }
 }
 
-/// Create a tensor with the given shape, filled with zeros.
+/// Create a tensor with the given shape, filled with zeros (f64, dtype=0).
 fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
+    create_tensor_with_shape_dtype(shape, fill, 0)
+}
+
+/// Create a tensor with the given shape, filled with `fill`, and a specified dtype.
+fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u8) -> i64 {
     use crate::memory::checked_alloc_zeroed;
     use crate::tensor::NslTensor;
 
@@ -276,26 +281,33 @@ fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
-    let data_size = (total as usize) * std::mem::size_of::<f64>();
-    let data = if fill == 0.0 {
-        checked_alloc_zeroed(data_size) as *mut f64
+    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_size = (total as usize) * elem_size;
+    let data_raw: *mut c_void = if fill == 0.0 {
+        checked_alloc_zeroed(data_size) as *mut c_void
+    } else if dtype == 1 {
+        let data = crate::memory::checked_alloc(data_size) as *mut f32;
+        for i in 0..total as usize {
+            unsafe { *data.add(i) = fill as f32 };
+        }
+        data as *mut c_void
     } else {
         let data = crate::memory::checked_alloc(data_size) as *mut f64;
         for i in 0..total as usize {
             unsafe { *data.add(i) = fill };
         }
-        data
+        data as *mut c_void
     };
 
     let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+        data: data_raw as *mut c_void,
         shape: shape_ptr,
         strides,
         ndim,
         len: total,
         refcount: 1,
         device: 0,
-        dtype: 0,
+        dtype,
         owns_data: 1,
     });
     Box::into_raw(tensor) as i64
@@ -389,18 +401,19 @@ fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
         for &s in orig_shape {
             total *= s;
         }
-        // Copy data
-        let new_data = checked_alloc((total as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        unsafe { std::ptr::copy_nonoverlapping(res.data_f64(), new_data, total as usize) };
+        // Copy data (byte-level copy, preserves dtype)
+        let elem_size = res.element_size();
+        let new_data_raw = checked_alloc((total as usize) * elem_size);
+        unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw as *mut u8, (total as usize) * elem_size) };
         let out = Box::new(NslTensor {
-            data: new_data as *mut c_void,
+            data: new_data_raw as *mut c_void,
             shape: new_shape,
             strides: new_strides,
             ndim: orig_ndim as i64,
             len: total,
             refcount: 1,
         device: 0,
-        dtype: 0,
+        dtype: res.dtype,
         owns_data: 1,
     });
         let out_ptr = Box::into_raw(out) as i64;
@@ -420,24 +433,22 @@ fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i
 
     let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
+    let grad_dtype = grad.dtype;
 
-    // Create output with input_shape
-    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    // Create output with input_shape, matching grad dtype
+    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
     let out_strides: Vec<usize> = (0..ndim)
         .map(|i| unsafe { *out.strides.add(i) } as usize)
         .collect();
 
-    // Build grad strides for indexing: grad has shape with dim removed (or dim=1 if keepdim)
-    // We compute the grad linear index by skipping the reduced dim
     let grad_strides: Vec<usize> = (0..grad.ndim as usize)
         .map(|i| unsafe { *grad.strides.add(i) } as usize)
         .collect();
 
     let total = out.len as usize;
     for flat_idx in 0..total {
-        // Convert flat_idx to multi-dim indices using output strides
         let mut remaining = flat_idx;
         let mut indices = vec![0usize; ndim];
         for d in 0..ndim {
@@ -445,7 +456,6 @@ fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i
             remaining %= out_strides[d];
         }
 
-        // Compute grad index by removing the reduced dim
         let mut grad_idx = 0usize;
         let mut gi = 0usize;
         for d in 0..ndim {
@@ -456,8 +466,10 @@ fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i
             gi += 1;
         }
 
-        unsafe {
-            *out.data_f64().add(flat_idx) = *grad.data_f64().add(grad_idx);
+        if grad_dtype == 1 {
+            unsafe { *out.data_f32().add(flat_idx) = *grad.data_f32().add(grad_idx); }
+        } else {
+            unsafe { *out.data_f64().add(flat_idx) = *grad.data_f64().add(grad_idx); }
         }
     }
 
@@ -475,8 +487,9 @@ fn scatter_grad_to_argmax(
 
     let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
-    // Create zero output with input_shape
-    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let grad_dtype = grad.dtype;
+    // Create zero output with input_shape, matching grad dtype
+    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
     let out_strides: Vec<usize> = (0..ndim)
@@ -487,10 +500,8 @@ fn scatter_grad_to_argmax(
         .map(|i| unsafe { *grad.strides.add(i) } as usize)
         .collect();
 
-    // Iterate over reduced shape positions (grad positions)
     let grad_total = grad.len as usize;
     for grad_flat in 0..grad_total {
-        // Convert to multi-index in grad space
         let mut remaining = grad_flat;
         let mut grad_indices = vec![0usize; grad.ndim as usize];
         for d in 0..grad.ndim as usize {
@@ -500,7 +511,6 @@ fn scatter_grad_to_argmax(
 
         let max_idx = argmax[grad_flat];
 
-        // Build the full output index: insert the argmax at dim
         let mut out_offset = 0usize;
         let mut gi = 0usize;
         for d in 0..ndim {
@@ -512,8 +522,13 @@ fn scatter_grad_to_argmax(
             }
         }
 
-        let g_val = unsafe { *grad.data_f64().add(grad_flat) };
-        unsafe { *out.data_f64().add(out_offset) += g_val };
+        if grad_dtype == 1 {
+            let g_val = unsafe { *grad.data_f32().add(grad_flat) };
+            unsafe { *out.data_f32().add(out_offset) += g_val };
+        } else {
+            let g_val = unsafe { *grad.data_f64().add(grad_flat) };
+            unsafe { *out.data_f64().add(out_offset) += g_val };
+        }
     }
 
     out_ptr
@@ -530,35 +545,36 @@ fn scatter_gather_grad(
 
     let grad = NslTensor::from_ptr(grad_ptr);
     let indices = NslTensor::from_ptr(indices_ptr);
+    let grad_dtype = grad.dtype;
 
-    // Create zero gradient with input_shape
-    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    // Create zero gradient with input_shape, matching grad dtype
+    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
     let out_strides: Vec<usize> = (0..input_shape.len())
         .map(|i| unsafe { *out.strides.add(i) } as usize)
         .collect();
-
     // For cross_entropy: input=[batch, classes], dim=1, indices=[batch]
     // grad=[batch], output[b, indices[b]] += grad[b]
     let batch = indices.len as usize;
     for b in 0..batch {
-        let idx = unsafe { *indices.data_f64().add(b) } as usize;
-        let g_val = unsafe { *grad.data_f64().add(b) };
-        // out_offset = b * stride[0] + idx * stride[1]
+        let idx = if indices.dtype == 1 { (unsafe { *indices.data_f32().add(b) }) as usize }
+                  else { (unsafe { *indices.data_f64().add(b) }) as usize };
         let mut out_offset = 0usize;
-        // Build index: for dimensions before dim, use b; at dim, use idx
-        // For general case with dim=1 and 2D input:
-        // indices is 1D [batch], grad is 1D [batch]
         if input_shape.len() == 2 && dim == 1 {
             out_offset = b * out_strides[0] + idx * out_strides[1];
         } else {
-            // General case: not needed for cross_entropy but let's handle 2D dim=0 too
             if dim == 0 {
                 out_offset = idx * out_strides[0] + b * out_strides[1];
             }
         }
-        unsafe { *out.data_f64().add(out_offset) += g_val };
+        if grad_dtype == 1 {
+            let g_val = unsafe { *grad.data_f32().add(b) };
+            unsafe { *out.data_f32().add(out_offset) += g_val };
+        } else {
+            let g_val = unsafe { *grad.data_f64().add(b) };
+            unsafe { *out.data_f64().add(out_offset) += g_val };
+        }
     }
 
     out_ptr
@@ -571,16 +587,28 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
+    let in_dtype = input.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
-    for i in 0..len {
-        let x = unsafe { *input.data_f64().add(i) };
-        let g = unsafe { *grad.data_f64().add(i) };
-        unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
+    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc(len * elem_size);
+    if in_dtype == 1 {
+        let data = data_raw as *mut f32;
+        for i in 0..len {
+            let x = unsafe { *input.data_f32().add(i) };
+            let g = unsafe { *grad.data_f32().add(i) };
+            unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
+        }
+    } else {
+        let data = data_raw as *mut f64;
+        for i in 0..len {
+            let x = unsafe { *input.data_f64().add(i) };
+            let g = unsafe { *grad.data_f64().add(i) };
+            unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
+        }
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: in_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -591,21 +619,39 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
+    let in_dtype = input.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc(len * elem_size);
     let c = (2.0_f64 / std::f64::consts::PI).sqrt();
-    for i in 0..len {
-        let x = unsafe { *input.data_f64().add(i) };
-        let g = unsafe { *grad.data_f64().add(i) };
-        let inner = c * (x + 0.044715 * x * x * x);
-        let tanh_inner = inner.tanh();
-        let sech2 = 1.0 - tanh_inner * tanh_inner;
-        let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
-        unsafe { *data.add(i) = g * deriv };
+    if in_dtype == 1 {
+        let data = data_raw as *mut f32;
+        let c_f32 = c as f32;
+        for i in 0..len {
+            let x = unsafe { *input.data_f32().add(i) } as f64;
+            let g = unsafe { *grad.data_f32().add(i) } as f64;
+            let inner = c * (x + 0.044715 * x * x * x);
+            let tanh_inner = inner.tanh();
+            let sech2 = 1.0 - tanh_inner * tanh_inner;
+            let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
+            unsafe { *data.add(i) = (g * deriv) as f32 };
+            let _ = c_f32; // suppress unused warning
+        }
+    } else {
+        let data = data_raw as *mut f64;
+        for i in 0..len {
+            let x = unsafe { *input.data_f64().add(i) };
+            let g = unsafe { *grad.data_f64().add(i) };
+            let inner = c * (x + 0.044715 * x * x * x);
+            let tanh_inner = inner.tanh();
+            let sech2 = 1.0 - tanh_inner * tanh_inner;
+            let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
+            unsafe { *data.add(i) = g * deriv };
+        }
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: in_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -616,18 +662,32 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
+    let in_dtype = input.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
-    for i in 0..len {
-        let x = unsafe { *input.data_f64().add(i) };
-        let g = unsafe { *grad.data_f64().add(i) };
-        let sig = 1.0 / (1.0 + (-x).exp());
-        let deriv = sig * (1.0 + x * (1.0 - sig));
-        unsafe { *data.add(i) = g * deriv };
+    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc(len * elem_size);
+    if in_dtype == 1 {
+        let data = data_raw as *mut f32;
+        for i in 0..len {
+            let x = unsafe { *input.data_f32().add(i) } as f64;
+            let g = unsafe { *grad.data_f32().add(i) } as f64;
+            let sig = 1.0 / (1.0 + (-x).exp());
+            let deriv = sig * (1.0 + x * (1.0 - sig));
+            unsafe { *data.add(i) = (g * deriv) as f32 };
+        }
+    } else {
+        let data = data_raw as *mut f64;
+        for i in 0..len {
+            let x = unsafe { *input.data_f64().add(i) };
+            let g = unsafe { *grad.data_f64().add(i) };
+            let sig = 1.0 / (1.0 + (-x).exp());
+            let deriv = sig * (1.0 + x * (1.0 - sig));
+            unsafe { *data.add(i) = g * deriv };
+        }
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: in_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -638,16 +698,28 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
+    let out_dtype = out.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
-    for i in 0..len {
-        let o = unsafe { *out.data_f64().add(i) };
-        let g = unsafe { *grad.data_f64().add(i) };
-        unsafe { *data.add(i) = g * o * (1.0 - o) };
+    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc(len * elem_size);
+    if out_dtype == 1 {
+        let data = data_raw as *mut f32;
+        for i in 0..len {
+            let o = unsafe { *out.data_f32().add(i) };
+            let g = unsafe { *grad.data_f32().add(i) };
+            unsafe { *data.add(i) = g * o * (1.0 - o) };
+        }
+    } else {
+        let data = data_raw as *mut f64;
+        for i in 0..len {
+            let o = unsafe { *out.data_f64().add(i) };
+            let g = unsafe { *grad.data_f64().add(i) };
+            unsafe { *data.add(i) = g * o * (1.0 - o) };
+        }
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: out_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -658,16 +730,28 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
+    let out_dtype = out.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
-    for i in 0..len {
-        let o = unsafe { *out.data_f64().add(i) };
-        let g = unsafe { *grad.data_f64().add(i) };
-        unsafe { *data.add(i) = g * (1.0 - o * o) };
+    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc(len * elem_size);
+    if out_dtype == 1 {
+        let data = data_raw as *mut f32;
+        for i in 0..len {
+            let o = unsafe { *out.data_f32().add(i) };
+            let g = unsafe { *grad.data_f32().add(i) };
+            unsafe { *data.add(i) = g * (1.0 - o * o) };
+        }
+    } else {
+        let data = data_raw as *mut f64;
+        for i in 0..len {
+            let o = unsafe { *out.data_f64().add(i) };
+            let g = unsafe { *grad.data_f64().add(i) };
+            unsafe { *data.add(i) = g * (1.0 - o * o) };
+        }
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: out_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -678,10 +762,12 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
+    let out_dtype = out.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc_zeroed(len * std::mem::size_of::<f64>()) as *mut f64;
+    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc_zeroed(len * elem_size);
 
     let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
     let o_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.shape.add(i) }).collect();
@@ -699,25 +785,28 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
             base_offset += idx * (o_strides[axis] as usize);
         }
 
-        // Compute dot = sum(grad * output) along this slice
         let mut dot = 0.0_f64;
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = unsafe { *grad.data_f64().add(offset) };
-            let o = unsafe { *out.data_f64().add(offset) };
+            let g = if out_dtype == 1 { unsafe { *grad.data_f32().add(offset) as f64 } } else { unsafe { *grad.data_f64().add(offset) } };
+            let o = if out_dtype == 1 { unsafe { *out.data_f32().add(offset) as f64 } } else { unsafe { *out.data_f64().add(offset) } };
             dot += g * o;
         }
 
-        // grad_input_i = output_i * (grad_i - dot)
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = unsafe { *grad.data_f64().add(offset) };
-            let o = unsafe { *out.data_f64().add(offset) };
-            unsafe { *data.add(offset) = o * (g - dot) };
+            let g = if out_dtype == 1 { unsafe { *grad.data_f32().add(offset) as f64 } } else { unsafe { *grad.data_f64().add(offset) } };
+            let o = if out_dtype == 1 { unsafe { *out.data_f32().add(offset) as f64 } } else { unsafe { *out.data_f64().add(offset) } };
+            let val = o * (g - dot);
+            if out_dtype == 1 {
+                unsafe { *(data_raw as *mut f32).add(offset) = val as f32 };
+            } else {
+                unsafe { *(data_raw as *mut f64).add(offset) = val };
+            }
         }
     }
 
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: out_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -728,8 +817,9 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
     let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
 
-    // Create zero output with original input_shape
-    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let grad_dtype = grad.dtype;
+    // Create zero output with original input_shape, matching grad dtype
+    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
     let out_strides: Vec<usize> = (0..ndim)
@@ -741,7 +831,6 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
 
     let grad_total = grad.len as usize;
     for flat in 0..grad_total {
-        // Convert flat index in grad to multi-dim, offset by start on the sliced dim
         let mut remaining = flat;
         let mut out_offset: usize = 0;
         for axis in 0..ndim {
@@ -753,7 +842,11 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
                 out_offset += idx * out_strides[axis];
             }
         }
-        unsafe { *out.data_f64().add(out_offset) = *grad.data_f64().add(flat) };
+        if grad_dtype == 1 {
+            unsafe { *out.data_f32().add(out_offset) = *grad.data_f32().add(flat) };
+        } else {
+            unsafe { *out.data_f64().add(out_offset) = *grad.data_f64().add(flat) };
+        }
     }
 
     out_ptr
@@ -765,6 +858,7 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
 
     let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = grad.ndim as usize;
+    let grad_dtype = grad.dtype;
 
     let grad_shape: Vec<i64> = (0..ndim)
         .map(|i| unsafe { *grad.shape.add(i) })
@@ -777,11 +871,10 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
     let mut offset: usize = 0;
 
     for &split_size in split_sizes {
-        // Build shape for this piece
         let mut piece_shape = grad_shape.clone();
         piece_shape[dim] = split_size;
 
-        let piece_ptr = create_tensor_with_shape(&piece_shape, 0.0);
+        let piece_ptr = create_tensor_with_shape_dtype(&piece_shape, 0.0, grad_dtype);
         let piece = NslTensor::from_ptr(piece_ptr);
         let piece_strides: Vec<usize> = (0..ndim)
             .map(|i| unsafe { *piece.strides.add(i) } as usize)
@@ -800,7 +893,11 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
                     grad_offset += idx * grad_strides[axis];
                 }
             }
-            unsafe { *piece.data_f64().add(flat) = *grad.data_f64().add(grad_offset) };
+            if grad_dtype == 1 {
+                unsafe { *piece.data_f32().add(flat) = *grad.data_f32().add(grad_offset) };
+            } else {
+                unsafe { *piece.data_f64().add(flat) = *grad.data_f64().add(grad_offset) };
+            }
         }
 
         results.push(piece_ptr);
@@ -821,66 +918,82 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
 
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
-    let mean_t = NslTensor::from_ptr(mean_ptr);
-    let inv_std_t = NslTensor::from_ptr(inv_std_ptr);
+    let mean_t = NslTensor::from_ptr(mean_ptr);   // always f64
+    let inv_std_t = NslTensor::from_ptr(inv_std_ptr); // always f64
     let weight = NslTensor::from_ptr(weight_ptr);
 
+    let in_dtype = input.dtype;
     let total = input.len as usize;
     let ndim = input.ndim as usize;
     let n = unsafe { *input.shape.add(ndim - 1) } as usize;
     let num_rows = total / n;
     let nf = n as f64;
 
-    // grad_input: same shape as input
-    let dx_ptr = create_tensor_with_shape(
+    let read_grad = |i: usize| -> f64 {
+        if grad.dtype == 1 { unsafe { *grad.data_f32().add(i) as f64 } } else { unsafe { *grad.data_f64().add(i) } }
+    };
+    let read_weight = |i: usize| -> f64 {
+        if weight.dtype == 1 { unsafe { *weight.data_f32().add(i) as f64 } } else { unsafe { *weight.data_f64().add(i) } }
+    };
+    let read_input = |i: usize| -> f64 {
+        if in_dtype == 1 { unsafe { *input.data_f32().add(i) as f64 } } else { unsafe { *input.data_f64().add(i) } }
+    };
+
+    // grad_input: same shape as input (matches input dtype)
+    let dx_ptr = create_tensor_with_shape_dtype(
         &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
-        0.0,
+        0.0, in_dtype,
     );
     let dx = NslTensor::from_ptr(dx_ptr);
 
-    // grad_weight: shape [N]
-    let dw_ptr = create_tensor_with_shape(&[n as i64], 0.0);
+    // grad_weight and grad_bias: shape [N], match weight dtype
+    let dw_ptr = create_tensor_with_shape_dtype(&[n as i64], 0.0, weight.dtype);
     let dw = NslTensor::from_ptr(dw_ptr);
-
-    // grad_bias: shape [N]
-    let db_ptr = create_tensor_with_shape(&[n as i64], 0.0);
+    let db_ptr = create_tensor_with_shape_dtype(&[n as i64], 0.0, weight.dtype);
     let db = NslTensor::from_ptr(db_ptr);
+
+    let write_dx = |i: usize, val: f64| {
+        if in_dtype == 1 { unsafe { *dx.data_f32().add(i) = val as f32 } }
+        else { unsafe { *dx.data_f64().add(i) = val } }
+    };
+    let write_dw = |i: usize, val: f64| {
+        if dw.dtype == 1 { unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 } }
+        else { unsafe { *dw.data_f64().add(i) += val } }
+    };
+    let write_db = |i: usize, val: f64| {
+        if db.dtype == 1 { unsafe { *db.data_f32().add(i) = (*db.data_f32().add(i) as f64 + val) as f32 } }
+        else { unsafe { *db.data_f64().add(i) += val } }
+    };
 
     for row in 0..num_rows {
         let base = row * n;
         let mean_val = unsafe { *mean_t.data_f64().add(row) };
         let inv_std_val = unsafe { *inv_std_t.data_f64().add(row) };
 
-        // Compute d_normalized = d_out * weight, and normalized values
-        // Also accumulate sum(d_normalized) and sum(d_normalized * normalized)
         let mut sum_dnorm = 0.0_f64;
         let mut sum_dnorm_norm = 0.0_f64;
 
         for j in 0..n {
-            let g = unsafe { *grad.data_f64().add(base + j) };
-            let w = unsafe { *weight.data_f64().add(j) };
-            let x = unsafe { *input.data_f64().add(base + j) };
+            let g = read_grad(base + j);
+            let w = read_weight(j);
+            let x = read_input(base + j);
             let normalized = (x - mean_val) * inv_std_val;
             let d_normalized = g * w;
             sum_dnorm += d_normalized;
             sum_dnorm_norm += d_normalized * normalized;
 
-            // Accumulate d_weight and d_bias
-            unsafe {
-                *dw.data_f64().add(j) += g * normalized;
-                *db.data_f64().add(j) += g;
-            }
+            write_dw(j, g * normalized);
+            write_db(j, g);
         }
 
-        // Compute d_x for each element in this row
         for j in 0..n {
-            let g = unsafe { *grad.data_f64().add(base + j) };
-            let w = unsafe { *weight.data_f64().add(j) };
-            let x = unsafe { *input.data_f64().add(base + j) };
+            let g = read_grad(base + j);
+            let w = read_weight(j);
+            let x = read_input(base + j);
             let normalized = (x - mean_val) * inv_std_val;
             let d_normalized = g * w;
             let d_x = (1.0 / nf) * inv_std_val * (nf * d_normalized - sum_dnorm - normalized * sum_dnorm_norm);
-            unsafe { *dx.data_f64().add(base + j) = d_x };
+            write_dx(base + j, d_x);
         }
     }
 
@@ -896,51 +1009,67 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
-    let rms_t = NslTensor::from_ptr(rms_ptr);
+    let rms_t = NslTensor::from_ptr(rms_ptr); // always f64
     let weight = NslTensor::from_ptr(weight_ptr);
 
+    let in_dtype = input.dtype;
     let total = input.len as usize;
     let ndim = input.ndim as usize;
     let n = unsafe { *input.shape.add(ndim - 1) } as usize;
     let num_rows = total / n;
     let nf = n as f64;
 
-    // grad_input: same shape as input
-    let dx_ptr = create_tensor_with_shape(
+    let read_grad = |i: usize| -> f64 {
+        if grad.dtype == 1 { unsafe { *grad.data_f32().add(i) as f64 } } else { unsafe { *grad.data_f64().add(i) } }
+    };
+    let read_weight = |i: usize| -> f64 {
+        if weight.dtype == 1 { unsafe { *weight.data_f32().add(i) as f64 } } else { unsafe { *weight.data_f64().add(i) } }
+    };
+    let read_input = |i: usize| -> f64 {
+        if in_dtype == 1 { unsafe { *input.data_f32().add(i) as f64 } } else { unsafe { *input.data_f64().add(i) } }
+    };
+
+    // grad_input: same shape as input (matches input dtype)
+    let dx_ptr = create_tensor_with_shape_dtype(
         &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
-        0.0,
+        0.0, in_dtype,
     );
     let dx = NslTensor::from_ptr(dx_ptr);
 
-    // grad_weight: shape [N]
-    let dw_ptr = create_tensor_with_shape(&[n as i64], 0.0);
+    // grad_weight: shape [N], match weight dtype
+    let dw_ptr = create_tensor_with_shape_dtype(&[n as i64], 0.0, weight.dtype);
     let dw = NslTensor::from_ptr(dw_ptr);
+
+    let write_dx = |i: usize, val: f64| {
+        if in_dtype == 1 { unsafe { *dx.data_f32().add(i) = val as f32 } }
+        else { unsafe { *dx.data_f64().add(i) = val } }
+    };
+    let write_dw = |i: usize, val: f64| {
+        if dw.dtype == 1 { unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 } }
+        else { unsafe { *dw.data_f64().add(i) += val } }
+    };
 
     for row in 0..num_rows {
         let base = row * n;
         let rms_val = unsafe { *rms_t.data_f64().add(row) };
         let rms_cubed = rms_val * rms_val * rms_val;
 
-        // Compute sum(d_out * weight * x) for this row
         let mut sum_dout_x = 0.0_f64;
         for j in 0..n {
-            let g = unsafe { *grad.data_f64().add(base + j) };
-            let w = unsafe { *weight.data_f64().add(j) };
-            let x = unsafe { *input.data_f64().add(base + j) };
+            let g = read_grad(base + j);
+            let w = read_weight(j);
+            let x = read_input(base + j);
             sum_dout_x += g * w * x;
         }
 
         for j in 0..n {
-            let g = unsafe { *grad.data_f64().add(base + j) };
-            let w = unsafe { *weight.data_f64().add(j) };
-            let x = unsafe { *input.data_f64().add(base + j) };
+            let g = read_grad(base + j);
+            let w = read_weight(j);
+            let x = read_input(base + j);
 
-            // d_x = w * (d_out / rms - x * sum(d_out * w * x) / (N * rms^3))
             let d_x = w * (g / rms_val - x * sum_dout_x / (nf * rms_cubed));
-            unsafe { *dx.data_f64().add(base + j) = d_x };
-
-            // d_weight accumulate: d_out * (x / rms)
-            unsafe { *dw.data_f64().add(j) += g * (x / rms_val) };
+            write_dx(base + j, d_x);
+            write_dw(j, g * (x / rms_val));
         }
     }
 
@@ -952,19 +1081,31 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     use crate::tensor::NslTensor;
 
     let grad = NslTensor::from_ptr(grad_ptr);
-    let mask = NslTensor::from_ptr(mask_ptr);
+    let mask = NslTensor::from_ptr(mask_ptr); // always f64
     let len = grad.len as usize;
     let ndim = grad.ndim;
+    let grad_dtype = grad.dtype;
     let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(grad.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = crate::memory::checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
-    for i in 0..len {
-        let g = unsafe { *grad.data_f64().add(i) };
-        let m = unsafe { *mask.data_f64().add(i) };
-        unsafe { *data.add(i) = g * m * scale };
+    let elem_size = if grad_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_raw = crate::memory::checked_alloc(len * elem_size);
+    if grad_dtype == 1 {
+        let data = data_raw as *mut f32;
+        for i in 0..len {
+            let g = unsafe { *grad.data_f32().add(i) as f64 };
+            let m = unsafe { *mask.data_f64().add(i) };
+            unsafe { *data.add(i) = (g * m * scale) as f32 };
+        }
+    } else {
+        let data = data_raw as *mut f64;
+        for i in 0..len {
+            let g = unsafe { *grad.data_f64().add(i) };
+            let m = unsafe { *mask.data_f64().add(i) };
+            unsafe { *data.add(i) = g * m * scale };
+        }
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: grad_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -996,27 +1137,55 @@ fn conv2d_backward(
     let h_out = unsafe { *grad.shape.add(2) } as usize;
     let w_out = unsafe { *grad.shape.add(3) } as usize;
 
+    let in_dtype = input.dtype;
+    let grad_dtype = grad.dtype;
+    // Output grads match their respective source dtypes
+    let dx_dtype = in_dtype;
+    let dw_dtype = weight.dtype;
+
+    let read_grad = |i: usize| -> f64 {
+        if grad_dtype == 1 { unsafe { *grad.data_f32().add(i) as f64 } } else { unsafe { *grad.data_f64().add(i) } }
+    };
+    let read_input = |i: usize| -> f64 {
+        if in_dtype == 1 { unsafe { *input.data_f32().add(i) as f64 } } else { unsafe { *input.data_f64().add(i) } }
+    };
+    let read_weight = |i: usize| -> f64 {
+        if weight.dtype == 1 { unsafe { *weight.data_f32().add(i) as f64 } } else { unsafe { *weight.data_f64().add(i) } }
+    };
+
     // Allocate grad_input [N, C_in, H, W]
-    let dx_ptr = create_tensor_with_shape(&[n as i64, c_in as i64, h as i64, w as i64], 0.0);
+    let dx_ptr = create_tensor_with_shape_dtype(&[n as i64, c_in as i64, h as i64, w as i64], 0.0, dx_dtype);
     let dx = NslTensor::from_ptr(dx_ptr);
 
     // Allocate grad_weight [C_out, C_in, kH, kW]
-    let dw_ptr = create_tensor_with_shape(&[c_out as i64, c_in as i64, kh as i64, kw as i64], 0.0);
+    let dw_ptr = create_tensor_with_shape_dtype(&[c_out as i64, c_in as i64, kh as i64, kw as i64], 0.0, dw_dtype);
     let dw = NslTensor::from_ptr(dw_ptr);
 
-    // Allocate grad_bias [C_out]
-    let db_ptr = create_tensor_with_shape(&[c_out as i64], 0.0);
+    // Allocate grad_bias [C_out] — matches weight dtype
+    let db_ptr = create_tensor_with_shape_dtype(&[c_out as i64], 0.0, dw_dtype);
     let db = NslTensor::from_ptr(db_ptr);
+
+    let add_dx = |i: usize, val: f64| {
+        if dx_dtype == 1 { unsafe { *dx.data_f32().add(i) = (*dx.data_f32().add(i) as f64 + val) as f32 } }
+        else { unsafe { *dx.data_f64().add(i) += val } }
+    };
+    let add_dw = |i: usize, val: f64| {
+        if dw_dtype == 1 { unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 } }
+        else { unsafe { *dw.data_f64().add(i) += val } }
+    };
+    let add_db = |i: usize, val: f64| {
+        if dw_dtype == 1 { unsafe { *db.data_f32().add(i) = (*db.data_f32().add(i) as f64 + val) as f32 } }
+        else { unsafe { *db.data_f64().add(i) += val } }
+    };
 
     for ni in 0..n {
         for co in 0..c_out {
             for oh in 0..h_out {
                 for ow in 0..w_out {
                     let g_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
-                    let g_val = unsafe { *grad.data_f64().add(g_idx) };
+                    let g_val = read_grad(g_idx);
 
-                    // grad_bias[co] += grad_out[n][co][oh][ow]
-                    unsafe { *db.data_f64().add(co) += g_val };
+                    add_db(co, g_val);
 
                     for ci in 0..c_in {
                         for ky in 0..kh {
@@ -1029,11 +1198,8 @@ fn conv2d_backward(
                                     let input_idx = ni * (c_in * h * w) + ci * (h * w) + real_ih * w + real_iw;
                                     let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
 
-                                    // grad_weight[co][ci][ky][kx] += grad_out * input
-                                    unsafe { *dw.data_f64().add(weight_idx) += g_val * *input.data_f64().add(input_idx) };
-
-                                    // grad_input[ni][ci][real_ih][real_iw] += grad_out * weight
-                                    unsafe { *dx.data_f64().add(input_idx) += g_val * *weight.data_f64().add(weight_idx) };
+                                    add_dw(weight_idx, g_val * read_input(input_idx));
+                                    add_dx(input_idx, g_val * read_weight(weight_idx));
                                 }
                             }
                         }
@@ -1051,14 +1217,23 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
     use crate::tensor::NslTensor;
 
     let grad = NslTensor::from_ptr(grad_ptr);
-    let out_ptr = create_tensor_with_shape(input_shape, 0.0);
+    let grad_dtype = grad.dtype;
+    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
     let grad_len = grad.len as usize;
-    for i in 0..grad_len {
-        let g_val = unsafe { *grad.data_f64().add(i) };
-        let idx = argmax[i];
-        unsafe { *out.data_f64().add(idx) += g_val };
+    if grad_dtype == 1 {
+        for i in 0..grad_len {
+            let g_val = unsafe { *grad.data_f32().add(i) };
+            let idx = argmax[i];
+            unsafe { *out.data_f32().add(idx) += g_val };
+        }
+    } else {
+        for i in 0..grad_len {
+            let g_val = unsafe { *grad.data_f64().add(i) };
+            let idx = argmax[i];
+            unsafe { *out.data_f64().add(idx) += g_val };
+        }
     }
 
     out_ptr
@@ -1357,15 +1532,21 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
                     let grad_w_t = crate::tensor::NslTensor::from_ptr(grad_w);
                     let g_t = crate::tensor::NslTensor::from_ptr(g);
+                    let grad_w_dtype = grad_w_t.dtype;
 
                     // Scatter-add: for each position i, add grad_out[i, :] to grad_w[idx[i], :]
                     for i in 0..seq_len {
-                        let idx = unsafe { *idx_t.data_f64().add(i) } as usize;
+                        let idx = if idx_t.dtype == 1 { (unsafe { *idx_t.data_f32().add(i) }) as usize }
+                                  else { (unsafe { *idx_t.data_f64().add(i) }) as usize };
                         if idx < vocab_size {
                             for j in 0..embed_dim {
-                                unsafe {
-                                    *grad_w_t.data_f64().add(idx * embed_dim + j) +=
-                                        *g_t.data_f64().add(i * embed_dim + j);
+                                if grad_w_dtype == 1 {
+                                    let g_val = unsafe { *g_t.data_f32().add(i * embed_dim + j) };
+                                    unsafe { *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val };
+                                } else {
+                                    let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) as f64 } }
+                                                else { unsafe { *g_t.data_f64().add(i * embed_dim + j) } };
+                                    unsafe { *grad_w_t.data_f64().add(idx * embed_dim + j) += g_val };
                                 }
                             }
                         }
@@ -1483,16 +1664,17 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let rows = unsafe { *g_t.shape.add(0) } as usize;
                     let cols = unsafe { *g_t.shape.add(1) } as usize;
 
-                    let bias_shape_list = crate::list::nsl_list_new();
-                    crate::list::nsl_list_push(bias_shape_list, cols as i64);
-                    let grad_bias = tensor_zeros(bias_shape_list);
-                    crate::list::nsl_list_free(bias_shape_list);
-
+                    let g_dtype = g_t.dtype;
+                    let grad_bias = crate::cpu::create_tensor_with_shape_rs_dtype(&[cols as i64], g_dtype);
                     let grad_bias_t = crate::tensor::NslTensor::from_ptr(grad_bias);
                     for i in 0..rows {
                         for j in 0..cols {
-                            unsafe {
-                                *grad_bias_t.data_f64().add(j) += *g_t.data_f64().add(i * cols + j);
+                            if g_dtype == 1 {
+                                let gv = unsafe { *g_t.data_f32().add(i * cols + j) };
+                                unsafe { *grad_bias_t.data_f32().add(j) += gv };
+                            } else {
+                                let gv = unsafe { *g_t.data_f64().add(i * cols + j) };
+                                unsafe { *grad_bias_t.data_f64().add(j) += gv };
                             }
                         }
                     }
