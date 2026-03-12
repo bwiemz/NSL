@@ -1,0 +1,17 @@
+# NeuralScript Interop Module (nsl.compat)
+#
+# Provides interoperability with external ML frameworks:
+#
+# Built-in intrinsics (available without importing this module):
+#   load_safetensors(path)         — Load tensors from a .safetensors file
+#   save_safetensors(dict, path)   — Save tensor dict to a .safetensors file
+#   from_hf("repo/id", model)     — Download HuggingFace weights into a model
+#   to_onnx(model, input, path)   — Export model to ONNX via tracing
+#
+# All functions above are compiler intrinsics. They can be called
+# directly from any NSL source file without importing this module.
+#
+# This module exists for documentation and future wrapper utilities.
+
+fn compat_version() -> int:
+    return 1

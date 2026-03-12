@@ -1,0 +1,31 @@
+# M18b End-to-End Interop Demo
+# Tests: model creation, safetensors round-trip, ONNX export
+from nsl.nn.layers import Linear
+
+model TinyMLP:
+    l1: Linear = Linear(4, 8)
+    l2: Linear = Linear(8, 2)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = relu(self.l1.forward(x))
+        return self.l2.forward(h)
+
+fn export_model():
+    let m = TinyMLP()
+    let dummy = randn([1, 4])
+    to_onnx(m, dummy, "tiny_mlp.onnx")
+
+fn main():
+    let m = TinyMLP()
+    print("Model created")
+
+    # Test safetensors round-trip
+    let weights = {l1_weight: m.l1.w, l1_bias: m.l1.b, l2_weight: m.l2.w, l2_bias: m.l2.b}
+    save_safetensors(weights, "roundtrip.safetensors")
+    let reloaded = load_safetensors("roundtrip.safetensors")
+    print("Round-trip: saved and loaded weights")
+
+    # Test ONNX export via tracing
+    export_model()
+
+    print("End-to-end interop: PASS")

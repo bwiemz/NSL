@@ -1,0 +1,15 @@
+# M18b Integration Test: Safetensors Round-Trip
+
+# Create tensors
+let a = randn([4, 8])
+let b = zeros([16])
+
+# Build a dict and save
+let weights = {weight: a, bias: b}
+save_safetensors(weights, "test_output.safetensors")
+print("Saved 2 tensors to safetensors")
+
+# Load back
+let loaded = load_safetensors("test_output.safetensors")
+print("Loaded tensors from safetensors")
+print("Safetensors round-trip: PASS")

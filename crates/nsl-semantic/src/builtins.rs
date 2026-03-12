@@ -565,4 +565,38 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
         },
     );
+
+    // Interop intrinsics (M18b)
+    // load_safetensors(path, device=0) -> Dict[str, Tensor]
+    def(
+        "load_safetensors",
+        Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()))),
+        },
+    );
+    // save_safetensors(dict, path) -> void
+    def(
+        "save_safetensors",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(Type::Void),
+        },
+    );
+    // from_hf(repo_id, model, device=0) -> model
+    def(
+        "from_hf",
+        Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Unknown),
+        },
+    );
+    // to_onnx(model, input, path) -> void
+    def(
+        "to_onnx",
+        Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Void),
+        },
+    );
 }

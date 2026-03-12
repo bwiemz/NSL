@@ -1069,6 +1069,49 @@ impl Compiler<'_> {
             return self.compile_to_onnx(builder, state, args);
         }
 
+        // Safetensors load intrinsic: load_safetensors("path.safetensors")
+        // Optional second arg: device (0=CPU default, 1=CUDA)
+        if func_name == "load_safetensors" {
+            if args.is_empty() || args.len() > 2 {
+                return Err(CodegenError::new("load_safetensors() takes 1-2 arguments (path, device=0)"));
+            }
+            let path_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_str = match &args[0].value.kind {
+                ExprKind::StringLiteral(s) => s.clone(),
+                _ => {
+                    return Err(CodegenError::new(
+                        "load_safetensors(): first argument must be a string literal (file path)",
+                    ));
+                }
+            };
+            let path_len = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
+            let device_val = if args.len() > 1 {
+                self.compile_expr(builder, state, &args[1].value)?
+            } else {
+                builder.ins().iconst(cl_types::I64, 0)
+            };
+            return self.compile_call_by_name(builder, "nsl_safetensors_load", &[path_val, path_len, device_val]);
+        }
+
+        // Safetensors save intrinsic: save_safetensors(weights_dict, "path.safetensors")
+        if func_name == "save_safetensors" {
+            if args.len() != 2 {
+                return Err(CodegenError::new("save_safetensors() takes exactly 2 arguments (weights_dict, path)"));
+            }
+            let dict_val = self.compile_expr(builder, state, &args[0].value)?;
+            let path_val = self.compile_expr(builder, state, &args[1].value)?;
+            let path_str = match &args[1].value.kind {
+                ExprKind::StringLiteral(s) => s.clone(),
+                _ => {
+                    return Err(CodegenError::new(
+                        "save_safetensors(): second argument must be a string literal (file path)",
+                    ));
+                }
+            };
+            let path_len = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
+            return self.compile_call_by_name(builder, "nsl_safetensors_save", &[dict_val, path_val, path_len]);
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();

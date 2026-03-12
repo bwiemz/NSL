@@ -1,0 +1,19 @@
+# M18b Integration Test: ONNX Export
+from nsl.nn.layers import Linear
+
+model SimpleMLP:
+    l1: Linear = Linear(4, 8)
+    l2: Linear = Linear(8, 2)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = relu(self.l1.forward(x))
+        return self.l2.forward(h)
+
+fn export_model():
+    let m = SimpleMLP()
+    let dummy = randn([1, 4])
+    to_onnx(m, dummy, "test_mlp.onnx")
+
+fn main():
+    export_model()
+    print("ONNX export: PASS")

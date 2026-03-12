@@ -104,6 +104,8 @@ fn link_msvc_multi(
         "userenv.lib",
         "ws2_32.lib",
         "synchronization.lib",
+        "shell32.lib",
+        "ole32.lib",
         "/NODEFAULTLIB:LIBCMT",
     ]);
 
