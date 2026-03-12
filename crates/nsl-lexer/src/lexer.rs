@@ -44,14 +44,16 @@ impl<'a> Lexer<'a> {
             self.scan_token();
         }
 
-        // Emit final newline if last line didn't end with one
-        if let Some(last) = self.tokens.last() {
-            if last.kind != TokenKind::Newline {
-                self.tokens.push(Token {
-                    kind: TokenKind::Newline,
-                    span: self.eof_span(),
-                });
-            }
+        // Emit final newline if last line didn't end with one (or if source was empty)
+        let needs_newline = match self.tokens.last() {
+            None => true,
+            Some(t) => t.kind != TokenKind::Newline,
+        };
+        if needs_newline {
+            self.tokens.push(Token {
+                kind: TokenKind::Newline,
+                span: self.eof_span(),
+            });
         }
 
         // Emit remaining DEDENTs
@@ -470,7 +472,7 @@ impl<'a> Lexer<'a> {
 
         loop {
             match self.cursor.peek() {
-                None | Some('\n') => {
+                None | Some('\n') | Some('\r') => {
                     if !text.is_empty() {
                         self.push_token(TokenKind::FStringText(text), start);
                     }

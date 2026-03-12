@@ -121,22 +121,23 @@ fn lex_decimal(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagno
         }
     }
 
-    // Check for exponent
+    // Check for exponent — only consume `e`/`E` if followed by digits or sign+digits,
+    // otherwise `123e` or `123east` should lex as integer `123` followed by identifier.
     if let Some('e' | 'E') = cursor.peek() {
-        is_float = true;
-        number_str.push(cursor.advance().unwrap());
-        if let Some('+' | '-') = cursor.peek() {
+        let has_exp_digits = match cursor.peek_at(1) {
+            Some('+' | '-') => matches!(cursor.peek_at(2), Some('0'..='9')),
+            Some('0'..='9') => true,
+            _ => false,
+        };
+        if has_exp_digits {
+            is_float = true;
             number_str.push(cursor.advance().unwrap());
+            if let Some('+' | '-') = cursor.peek() {
+                number_str.push(cursor.advance().unwrap());
+            }
+            let exp = eat_digits(cursor, |c| c.is_ascii_digit());
+            number_str.push_str(exp);
         }
-        let exp = eat_digits(cursor, |c| c.is_ascii_digit());
-        if exp.is_empty() {
-            diagnostics.push(
-                Diagnostic::error("expected digits in exponent")
-                    .with_label(cursor.span_from(start), "here"),
-            );
-            return TokenKind::Error("invalid number literal".into());
-        }
-        number_str.push_str(exp);
     }
 
     // Remove underscores for parsing
