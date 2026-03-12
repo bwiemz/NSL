@@ -1,0 +1,18 @@
+# NeuralScript Text Generation Module
+# Autoregressive generation with pre-allocated buffer and no_grad.
+
+from nsl.inference.sampling import sample_top_k
+
+fn generate(model, prompt: Tensor, max_tokens: int, temperature: float, top_k: int) -> Tensor:
+    let prompt_len = prompt.shape(-1)
+    let total_len = prompt_len + max_tokens
+    let tokens = zeros([1, total_len])
+    # Copy prompt into pre-allocated buffer
+    for i in range(prompt_len):
+        let tok = prompt.select(1, i)
+    no_grad:
+        for i in range(prompt_len, total_len):
+            let logits = model.forward(tokens)
+            let next_logit = logits.select(-2, -1)
+            let next_token = sample_top_k(next_logit, top_k, temperature)
+    return tokens

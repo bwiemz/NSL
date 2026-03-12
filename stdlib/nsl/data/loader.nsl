@@ -1,0 +1,30 @@
+# NeuralScript Data Pipeline Module (nsl.data)
+#
+# Built-in intrinsics (available without importing this module):
+#
+#   load_jsonl(path, field) -> List[str]
+#       Load a JSONL file, extract a named field from each line.
+#       Small-data utility for eval sets and prompt lists.
+#
+#   load_csv(path, col_idx, has_header=1) -> List[str]
+#       Load a CSV file, extract a column by index.
+#       Small-data utility for eval sets.
+#
+#   load_mmap(path, dtype) -> Tensor
+#       Memory-map a binary file as a flat 1D tensor.
+#       dtype: 0=f64, 1=f32, 2=i32, 3=u16
+#       u16 (dtype=3) is the primary pathway for pre-tokenized LLM datasets.
+#       Zero-copy: data points directly into the mapped file.
+#
+#   DataLoader(data, batch_size=32, seq_len=128, shuffle=false,
+#              num_workers=1, prefetch=2, packing=false,
+#              pack_separator=0, drop_last=true) -> DataLoader
+#       Create a multi-threaded data loader with batching.
+#       Iterate with: for batch in loader:
+#       Each batch is a Dict with keys:
+#           "input_ids"      [B, S] token ids
+#           "labels"          [B, S] shifted labels (-100 at boundaries)
+#           "attention_mask"  [B, S, S] causal/block-diagonal mask
+
+fn data_version() -> int:
+    return 1
