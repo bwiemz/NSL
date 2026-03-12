@@ -1711,6 +1711,14 @@ impl Compiler<'_> {
         // Free param_list after training loop completes
         self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
 
+        // Free optimizer state buffers (momentum/velocity tensors)
+        for &buf in &state_buf_1 {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
+        }
+        for &buf in &state_buf_2 {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
+        }
+
         Ok(())
     }
 
@@ -1766,6 +1774,10 @@ impl Compiler<'_> {
             "nsl_list_get",
             &[grads_list, zero],
         )?;
+
+        // 7b. Free the temporary lists (grad_tensor was extracted, still alive)
+        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
 
         // 8. Bind output variables if pattern exists
         //    loss is bound as scalar tensor ptr (I64) — use .item() for f64
