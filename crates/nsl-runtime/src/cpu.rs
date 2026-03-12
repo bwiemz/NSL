@@ -113,6 +113,7 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(result) as i64
 }
@@ -156,6 +157,7 @@ pub(crate) fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }

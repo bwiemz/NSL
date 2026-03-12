@@ -296,6 +296,7 @@ fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
         refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
     Box::into_raw(tensor) as i64
 }
@@ -329,6 +330,7 @@ fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
         refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
+        owns_data: 1,
     });
     Box::into_raw(new_tensor) as i64
 }
@@ -399,6 +401,7 @@ fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
             refcount: 1,
         device: 0,
         dtype: 0,
+        owns_data: 1,
     });
         let out_ptr = Box::into_raw(out) as i64;
         if result != grad_ptr {
@@ -577,7 +580,7 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
         let g = unsafe { *grad.data_f64().add(i) };
         unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -602,7 +605,7 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
         let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
         unsafe { *data.add(i) = g * deriv };
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -624,7 +627,7 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
         let deriv = sig * (1.0 + x * (1.0 - sig));
         unsafe { *data.add(i) = g * deriv };
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -644,7 +647,7 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
         let g = unsafe { *grad.data_f64().add(i) };
         unsafe { *data.add(i) = g * o * (1.0 - o) };
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -664,7 +667,7 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
         let g = unsafe { *grad.data_f64().add(i) };
         unsafe { *data.add(i) = g * (1.0 - o * o) };
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -714,7 +717,7 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         }
     }
 
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -961,7 +964,7 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
         let m = unsafe { *mask.data_f64().add(i) };
         unsafe { *data.add(i) = g * m * scale };
     }
-    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0 });
+    let t = Box::new(NslTensor { data: data as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: 0, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
