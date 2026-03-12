@@ -40,6 +40,9 @@ pub struct FuncState {
     pub tensor_temporaries: Vec<ir::Value>,
     /// Cranelift Values of DataLoader pointers that need stop+free at scope exit.
     pub dataloader_vars: Vec<ir::Value>,
+    /// Stack of scope markers into tensor_temporaries, pushed on loop entry, popped on exit.
+    /// Used to emit cleanup at break/continue without corrupting compiler state.
+    pub temp_scope_stack: Vec<usize>,
 }
 
 impl FuncState {
@@ -52,6 +55,7 @@ impl FuncState {
             is_no_grad: false,
             tensor_temporaries: Vec::new(),
             dataloader_vars: Vec::new(),
+            temp_scope_stack: Vec::new(),
         }
     }
 
