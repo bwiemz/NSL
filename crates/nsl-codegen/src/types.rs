@@ -31,8 +31,27 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
         Type::Optional(_) => types::I64,
         Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } => types::I64,
         Type::Void => types::I8, // should not appear as value type
-        Type::Unknown | Type::Error => types::I64,
-        _ => types::I64, // default: pointer/opaque
+        Type::Unknown | Type::Error => {
+            #[cfg(debug_assertions)]
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[nsl-codegen] warning: Type::Unknown reached codegen (defaulting to I64)");
+                }
+            }
+            types::I64
+        }
+        // Remaining variants: all pointer/opaque at IR level
+        Type::Sparse { .. }
+        | Type::QuantizedTensor
+        | Type::Function { .. }
+        | Type::Enum { .. }
+        | Type::Union(_)
+        | Type::TypeVar(_)
+        | Type::Module { .. }
+        | Type::NoneType
+        | Type::FixedModelArray { .. } => types::I64,
     }
 }
 
