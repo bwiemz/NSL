@@ -313,6 +313,87 @@ fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u8) -> i64 {
     Box::into_raw(tensor) as i64
 }
 
+/// Like `create_tensor_with_shape_dtype` but allocates data in unified CUDA memory when device > 0.
+/// This allows CPU code to populate the tensor while the result is accessible on GPU.
+fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u8, device: u8) -> i64 {
+    use crate::memory::checked_alloc_zeroed;
+    use crate::tensor::NslTensor;
+
+    if device == 0 {
+        return create_tensor_with_shape_dtype(shape, fill, dtype);
+    }
+
+    let ndim = shape.len() as i64;
+    let mut total: i64 = 1;
+    for &s in shape {
+        total *= s;
+    }
+
+    let shape_ptr = crate::memory::checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in shape.iter().enumerate() {
+        unsafe { *shape_ptr.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape_ptr, ndim);
+
+    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let data_size = (total as usize) * elem_size;
+
+    let data_raw: *mut c_void = {
+        #[cfg(feature = "cuda")]
+        {
+            // Allocate in unified memory (zero-initialized via CUDA managed memory semantics).
+            // cuMemAllocManaged does not guarantee zero-init, so we zero it explicitly.
+            let ptr = crate::cuda::inner::alloc_managed(data_size);
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, data_size) };
+            if fill != 0.0 {
+                if dtype == 1 {
+                    let fptr = ptr as *mut f32;
+                    for i in 0..total as usize {
+                        unsafe { *fptr.add(i) = fill as f32 };
+                    }
+                } else {
+                    let fptr = ptr as *mut f64;
+                    for i in 0..total as usize {
+                        unsafe { *fptr.add(i) = fill };
+                    }
+                }
+            }
+            ptr
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            if fill == 0.0 {
+                checked_alloc_zeroed(data_size) as *mut c_void
+            } else if dtype == 1 {
+                let data = crate::memory::checked_alloc(data_size) as *mut f32;
+                for i in 0..total as usize {
+                    unsafe { *data.add(i) = fill as f32 };
+                }
+                data as *mut c_void
+            } else {
+                let data = crate::memory::checked_alloc(data_size) as *mut f64;
+                for i in 0..total as usize {
+                    unsafe { *data.add(i) = fill };
+                }
+                data as *mut c_void
+            }
+        }
+    };
+
+    let tensor = Box::new(NslTensor {
+        data: data_raw,
+        shape: shape_ptr,
+        strides,
+        ndim,
+        len: total,
+        refcount: 1,
+        device,
+        dtype,
+        owns_data: 1,
+    });
+    Box::into_raw(tensor) as i64
+}
+
 /// Reshape a tensor to the given shape by deep-copying its data with new shape metadata.
 /// The element count must match (panics otherwise).
 fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
@@ -780,6 +861,11 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     let out = NslTensor::from_ptr(out_ptr);
+    let on_gpu = grad.device > 0;
+    #[cfg(feature = "cuda")]
+    if on_gpu {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    }
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
@@ -787,7 +873,15 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
-    let data_raw = crate::memory::checked_alloc_zeroed(len * elem_size);
+    let data_size = len * elem_size;
+    let data_raw = if on_gpu {
+        #[cfg(feature = "cuda")]
+        { crate::cuda::inner::alloc_managed(data_size) }
+        #[cfg(not(feature = "cuda"))]
+        { crate::memory::checked_alloc_zeroed(data_size) }
+    } else {
+        crate::memory::checked_alloc_zeroed(data_size)
+    };
 
     let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
     let o_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.shape.add(i) }).collect();
@@ -826,7 +920,7 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         }
     }
 
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: 0, dtype: out_dtype, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: grad.device, dtype: out_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -942,6 +1036,12 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
     let inv_std_t = NslTensor::from_ptr(inv_std_ptr); // always f64
     let weight = NslTensor::from_ptr(weight_ptr);
 
+    let out_device = grad.device;
+    #[cfg(feature = "cuda")]
+    if out_device > 0 {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    }
+
     let in_dtype = input.dtype;
     let total = input.len as usize;
     let ndim = input.ndim as usize;
@@ -960,16 +1060,16 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
     };
 
     // grad_input: same shape as input (matches input dtype)
-    let dx_ptr = create_tensor_with_shape_dtype(
+    let dx_ptr = create_tensor_with_shape_dtype_device(
         &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
-        0.0, in_dtype,
+        0.0, in_dtype, out_device,
     );
     let dx = NslTensor::from_ptr(dx_ptr);
 
     // grad_weight and grad_bias: shape [N], match weight dtype
-    let dw_ptr = create_tensor_with_shape_dtype(&[n as i64], 0.0, weight.dtype);
+    let dw_ptr = create_tensor_with_shape_dtype_device(&[n as i64], 0.0, weight.dtype, out_device);
     let dw = NslTensor::from_ptr(dw_ptr);
-    let db_ptr = create_tensor_with_shape_dtype(&[n as i64], 0.0, weight.dtype);
+    let db_ptr = create_tensor_with_shape_dtype_device(&[n as i64], 0.0, weight.dtype, out_device);
     let db = NslTensor::from_ptr(db_ptr);
 
     let write_dx = |i: usize, val: f64| {
@@ -1032,6 +1132,12 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
     let rms_t = NslTensor::from_ptr(rms_ptr); // always f64
     let weight = NslTensor::from_ptr(weight_ptr);
 
+    let out_device = grad.device;
+    #[cfg(feature = "cuda")]
+    if out_device > 0 {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    }
+
     let in_dtype = input.dtype;
     let total = input.len as usize;
     let ndim = input.ndim as usize;
@@ -1050,14 +1156,14 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
     };
 
     // grad_input: same shape as input (matches input dtype)
-    let dx_ptr = create_tensor_with_shape_dtype(
+    let dx_ptr = create_tensor_with_shape_dtype_device(
         &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
-        0.0, in_dtype,
+        0.0, in_dtype, out_device,
     );
     let dx = NslTensor::from_ptr(dx_ptr);
 
     // grad_weight: shape [N], match weight dtype
-    let dw_ptr = create_tensor_with_shape_dtype(&[n as i64], 0.0, weight.dtype);
+    let dw_ptr = create_tensor_with_shape_dtype_device(&[n as i64], 0.0, weight.dtype, out_device);
     let dw = NslTensor::from_ptr(dw_ptr);
 
     let write_dx = |i: usize, val: f64| {
