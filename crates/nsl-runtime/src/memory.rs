@@ -47,7 +47,8 @@ pub(crate) fn checked_alloc(size: usize) -> *mut u8 {
     if size == 0 {
         // Return a properly aligned dangling pointer instead of null.
         // This is safe to pass to copy_nonoverlapping with count=0.
-        return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        // Use align=8 dangling pointer to match our Layout alignment.
+        return std::ptr::NonNull::<u64>::dangling().as_ptr() as *mut u8;
     }
     let layout = Layout::from_size_align(size, 8).unwrap();
     let ptr = unsafe { alloc(layout) };
@@ -65,7 +66,8 @@ pub(crate) fn checked_alloc_zeroed(size: usize) -> *mut u8 {
     if size == 0 {
         // Return a properly aligned dangling pointer instead of null.
         // This is safe to pass to copy_nonoverlapping with count=0.
-        return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        // Use align=8 dangling pointer to match our Layout alignment.
+        return std::ptr::NonNull::<u64>::dangling().as_ptr() as *mut u8;
     }
     let layout = Layout::from_size_align(size, 8).unwrap();
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -85,7 +87,8 @@ pub(crate) unsafe fn checked_realloc(ptr: *mut u8, old_size: usize, new_size: us
     }
     if new_size == 0 {
         unsafe { checked_free(ptr, old_size) };
-        return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        // Use align=8 dangling pointer to match our Layout alignment.
+        return std::ptr::NonNull::<u64>::dangling().as_ptr() as *mut u8;
     }
     let old_layout = Layout::from_size_align(old_size, 8).unwrap();
     #[cfg(test)]
