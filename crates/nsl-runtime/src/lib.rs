@@ -23,3 +23,17 @@ pub mod autodiff;
 pub mod checkpoint;
 pub mod tokenizer;
 pub mod quantize;
+
+// M18b: Interop modules (feature-gated)
+#[cfg(feature = "interop")]
+pub mod safetensors_io;
+#[cfg(feature = "interop")]
+pub mod huggingface;
+#[cfg(feature = "interop")]
+pub mod weight_map;
+#[cfg(feature = "interop")]
+pub mod trace;
+#[cfg(feature = "interop")]
+pub mod onnx;
+#[cfg(feature = "interop")]
+pub mod onnx_proto;
