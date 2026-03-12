@@ -519,13 +519,26 @@ fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
-    let out_strides: Vec<usize> = (0..ndim)
-        .map(|i| unsafe { *out.strides.add(i) } as usize)
-        .collect();
+    // Compute contiguous strides from shapes (safe for non-contiguous tensors)
+    let out_strides: Vec<usize> = {
+        let mut s = vec![1usize; ndim];
+        for d in (0..ndim.saturating_sub(1)).rev() {
+            s[d] = s[d + 1] * input_shape[d + 1] as usize;
+        }
+        s
+    };
 
-    let grad_strides: Vec<usize> = (0..grad.ndim as usize)
-        .map(|i| unsafe { *grad.strides.add(i) } as usize)
+    let grad_ndim = grad.ndim as usize;
+    let grad_shape: Vec<usize> = (0..grad_ndim)
+        .map(|i| unsafe { *grad.shape.add(i) } as usize)
         .collect();
+    let grad_strides: Vec<usize> = {
+        let mut s = vec![1usize; grad_ndim];
+        for d in (0..grad_ndim.saturating_sub(1)).rev() {
+            s[d] = s[d + 1] * grad_shape[d + 1];
+        }
+        s
+    };
 
     let total = out.len as usize;
     for flat_idx in 0..total {
@@ -572,19 +585,32 @@ fn scatter_grad_to_argmax(
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
-    let out_strides: Vec<usize> = (0..ndim)
-        .map(|i| unsafe { *out.strides.add(i) } as usize)
-        .collect();
+    // Compute contiguous strides from shapes (safe for non-contiguous tensors)
+    let out_strides: Vec<usize> = {
+        let mut s = vec![1usize; ndim];
+        for d in (0..ndim.saturating_sub(1)).rev() {
+            s[d] = s[d + 1] * input_shape[d + 1] as usize;
+        }
+        s
+    };
 
-    let grad_strides: Vec<usize> = (0..grad.ndim as usize)
-        .map(|i| unsafe { *grad.strides.add(i) } as usize)
+    let grad_ndim = grad.ndim as usize;
+    let grad_shape: Vec<usize> = (0..grad_ndim)
+        .map(|i| unsafe { *grad.shape.add(i) } as usize)
         .collect();
+    let grad_strides: Vec<usize> = {
+        let mut s = vec![1usize; grad_ndim];
+        for d in (0..grad_ndim.saturating_sub(1)).rev() {
+            s[d] = s[d + 1] * grad_shape[d + 1];
+        }
+        s
+    };
 
     let grad_total = grad.len as usize;
     for grad_flat in 0..grad_total {
         let mut remaining = grad_flat;
-        let mut grad_indices = vec![0usize; grad.ndim as usize];
-        for d in 0..grad.ndim as usize {
+        let mut grad_indices = vec![0usize; grad_ndim];
+        for d in 0..grad_ndim {
             grad_indices[d] = remaining / grad_strides[d];
             remaining %= grad_strides[d];
         }
@@ -1652,7 +1678,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let idx_t = crate::tensor::NslTensor::from_ptr(*saved_indices);
                     let vocab_size = unsafe { *w.shape.add(0) } as usize;
                     let embed_dim = unsafe { *w.shape.add(1) } as usize;
-                    let seq_len = unsafe { *idx_t.shape.add(0) } as usize;
+                    // Use total element count so 2D indices [batch, seq_len] are handled correctly
+                    let total_indices = idx_t.len as usize;
 
                     // Create zero gradient with same shape as weight [vocab_size, embed_dim]
                     let w_shape_list = tensor_shape(*saved_weight);
@@ -1664,7 +1691,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let grad_w_dtype = grad_w_t.dtype;
 
                     // Scatter-add: for each position i, add grad_out[i, :] to grad_w[idx[i], :]
-                    for i in 0..seq_len {
+                    for i in 0..total_indices {
                         let idx = if idx_t.dtype == 1 { (unsafe { *idx_t.data_f32().add(i) }) as usize }
                                   else { (unsafe { *idx_t.data_f64().add(i) }) as usize };
                         if idx < vocab_size {
