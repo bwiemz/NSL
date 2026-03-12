@@ -1231,13 +1231,31 @@ fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64
     crate::cpu::tensor_elementwise_op(a_ptr, b_ptr, op)
 }
 
+/// If `b` is on a different device than `a`, transfer `b` to `a`'s device.
+/// Returns `(effective_b_ptr, true)` if a transfer was made (caller must free),
+/// or `(b, false)` if no transfer was needed.
+fn reconcile_device(a: i64, b: i64) -> (i64, bool) {
+    let ta = unsafe { &*(a as *const NslTensor) };
+    let tb = unsafe { &*(b as *const NslTensor) };
+    if tb.device != ta.device {
+        (nsl_tensor_to_device(b, ta.device as i64), true)
+    } else {
+        (b, false)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
+    let (b, b_transferred) = reconcile_device(a, b);
     {
         let ta = unsafe { &*(a as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0"); }
+            {
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                if b_transferred { nsl_tensor_free(b); }
+                return result;
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
@@ -1245,6 +1263,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x + y);
+    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
     }
@@ -1259,11 +1278,16 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
+    let (b, b_transferred) = reconcile_device(a, b);
     {
         let ta = unsafe { &*(a as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0"); }
+            {
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
+                if b_transferred { nsl_tensor_free(b); }
+                return result;
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
@@ -1271,6 +1295,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x - y);
+    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
     }
@@ -1285,11 +1310,16 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
+    let (b, b_transferred) = reconcile_device(a, b);
     {
         let ta = unsafe { &*(a as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0"); }
+            {
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
+                if b_transferred { nsl_tensor_free(b); }
+                return result;
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
@@ -1297,6 +1327,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x * y);
+    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount += 1;
         NslTensor::from_ptr(b).refcount += 1;
@@ -1321,11 +1352,16 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
+    let (b, b_transferred) = reconcile_device(a, b);
     {
         let ta = unsafe { &*(a as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0"); }
+            {
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
+                if b_transferred { nsl_tensor_free(b); }
+                return result;
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
@@ -1333,6 +1369,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x / y);
+    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount += 1;
         NslTensor::from_ptr(b).refcount += 1;
@@ -1521,12 +1558,17 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
+    let (b_ptr, b_transferred) = reconcile_device(a_ptr, b_ptr);
     // GPU dispatch
     {
         let a = unsafe { &*(a_ptr as *const NslTensor) };
         if a.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_matmul_f32(a_ptr, b_ptr); }
+            {
+                let result = crate::cuda::gpu_matmul_f32(a_ptr, b_ptr);
+                if b_transferred { nsl_tensor_free(b_ptr); }
+                return result;
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
@@ -1708,6 +1750,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
         crate::trace::record_op(crate::trace::OpType::MatMul, vec![a_ptr, b_ptr], result, shape, rt.dtype, vec![]);
     }
+    if b_transferred { nsl_tensor_free(b_ptr); }
     result
 }
 
