@@ -222,6 +222,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Safetensors I/O (M18b)
     ("nsl_safetensors_load", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_safetensors_save", &[types::I64, types::I64, types::I64], None),
+    // HuggingFace Hub download + weight loading (M18b)
+    ("nsl_hf_load", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
