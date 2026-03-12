@@ -54,7 +54,7 @@ pub fn pointer_type() -> types::Type {
 pub fn is_float_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Float | Type::F64 | Type::F32 | Type::Fp16 | Type::Bf16
+        Type::Float | Type::F64 | Type::F32 | Type::Fp16 | Type::Bf16 | Type::Fp8E4m3 | Type::Fp8E5m2
     )
 }
 

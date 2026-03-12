@@ -52,7 +52,7 @@ fn link_gcc_multi(
 
     // Link CUDA driver library if available
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
-        let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
+        let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
             cmd.arg("-lcuda");

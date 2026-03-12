@@ -445,7 +445,8 @@ impl Compiler<'_> {
         builder.seal_block(then_bb);
         state.current_block = Some(then_bb);
         for s in &then_block.stmts { self.compile_stmt(builder, state, s)?; }
-        if !is_block_filled(builder, then_bb) { builder.ins().jump(merge_block, &[]); }
+        let current = state.current_block.unwrap_or(then_bb);
+        if !is_block_filled(builder, current) { builder.ins().jump(merge_block, &[]); }
 
         let mut current_else = next_bb;
         for (i, (elif_cond, elif_body)) in elif_clauses.iter().enumerate() {
@@ -466,7 +467,8 @@ impl Compiler<'_> {
             builder.seal_block(elif_then);
             state.current_block = Some(elif_then);
             for s in &elif_body.stmts { self.compile_stmt(builder, state, s)?; }
-            if !is_block_filled(builder, elif_then) { builder.ins().jump(merge_block, &[]); }
+            let current = state.current_block.unwrap_or(elif_then);
+            if !is_block_filled(builder, current) { builder.ins().jump(merge_block, &[]); }
 
             current_else = elif_next;
         }
@@ -476,7 +478,8 @@ impl Compiler<'_> {
             builder.seal_block(current_else);
             state.current_block = Some(current_else);
             for s in &else_body.stmts { self.compile_stmt(builder, state, s)?; }
-            if !is_block_filled(builder, current_else) { builder.ins().jump(merge_block, &[]); }
+            let current = state.current_block.unwrap_or(current_else);
+            if !is_block_filled(builder, current) { builder.ins().jump(merge_block, &[]); }
         } else if current_else != merge_block {
             builder.switch_to_block(current_else);
             builder.seal_block(current_else);
@@ -516,7 +519,8 @@ impl Compiler<'_> {
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
-        if !is_block_filled(builder, body_block) { builder.ins().jump(header_block, &[]); }
+        let current = state.current_block.unwrap_or(body_block);
+        if !is_block_filled(builder, current) { builder.ins().jump(header_block, &[]); }
 
         builder.seal_block(header_block);
         builder.switch_to_block(exit_block);
@@ -574,7 +578,8 @@ impl Compiler<'_> {
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
-        if !is_block_filled(builder, body_block) {
+        let current = state.current_block.unwrap_or(body_block);
+        if !is_block_filled(builder, current) {
             builder.ins().jump(header_block, &[]);
         }
 
@@ -682,7 +687,8 @@ impl Compiler<'_> {
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
-        if !is_block_filled(builder, body_block) {
+        let current = state.current_block.unwrap_or(body_block);
+        if !is_block_filled(builder, current) {
             builder.ins().jump(increment_block, &[]);
         }
 
@@ -769,7 +775,8 @@ impl Compiler<'_> {
         }
         state.loop_stack.pop();
 
-        if !is_block_filled(builder, body_block) {
+        let current = state.current_block.unwrap_or(body_block);
+        if !is_block_filled(builder, current) {
             builder.ins().jump(increment_block, &[]);
         }
 
@@ -835,7 +842,8 @@ impl Compiler<'_> {
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
-                        if !is_block_filled(builder, arm_block) {
+                        let current = state.current_block.unwrap_or(arm_block);
+                        if !is_block_filled(builder, current) {
                             builder.ins().jump(merge_block, &[]);
                         }
 
@@ -875,7 +883,8 @@ impl Compiler<'_> {
                     builder.seal_block(arm_block);
                     state.current_block = Some(arm_block);
                     for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
-                    if !is_block_filled(builder, arm_block) {
+                    let current = state.current_block.unwrap_or(arm_block);
+                    if !is_block_filled(builder, current) {
                         builder.ins().jump(merge_block, &[]);
                     }
 
@@ -903,7 +912,8 @@ impl Compiler<'_> {
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
-                        if !is_block_filled(builder, arm_block) {
+                        let current = state.current_block.unwrap_or(arm_block);
+                        if !is_block_filled(builder, current) {
                             builder.ins().jump(merge_block, &[]);
                         }
 
@@ -1519,7 +1529,8 @@ impl Compiler<'_> {
         }
 
         // ── 8. Increment epoch counter and loop back ────────────────────
-        if !is_block_filled(builder, body_block) {
+        let current = state.current_block.unwrap_or(body_block);
+        if !is_block_filled(builder, current) {
             builder.ins().jump(increment_block, &[]);
         }
 
