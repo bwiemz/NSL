@@ -234,6 +234,11 @@ pub fn build_onnx_model(graph: &TraceGraph) -> ModelProto {
     // graph-output name so ONNX runtimes can match them.  Without this the
     // nodes produce "node_N_out" but the graph output list references "output_0"
     // (or whatever name was registered), which is an invalid graph.
+    //
+    // LIMITATION: This remap does NOT update downstream node inputs that may
+    // reference the old name.  Currently safe because to_onnx() only supports
+    // single-output models where the output is always the last node.  For
+    // multi-output models, a full name_map update pass would be needed.
     for (ptr, name) in &graph.outputs {
         if let Some(&node_id) = graph.ptr_to_node.get(ptr) {
             if node_id < nodes.len() {

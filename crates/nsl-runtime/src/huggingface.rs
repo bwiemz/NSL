@@ -92,10 +92,20 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
             }
             if found_ptr == 0 {
                 eprintln!(
-                    "[nsl] hf_load: no weight found for field '{}' — skipping",
+                    "[nsl] hf_load error: no weight found for model field '{}'",
                     field_name
                 );
-                continue;
+                eprintln!("[nsl] available weights in safetensors file:");
+                let keys_list = crate::dict::nsl_dict_keys(dict_ptr);
+                let n_keys = crate::list::nsl_list_len(keys_list);
+                for k in 0..n_keys {
+                    let k_ptr = crate::list::nsl_list_get(keys_list, k);
+                    let k_str = unsafe { std::ffi::CStr::from_ptr(k_ptr as *const std::ffi::c_char) }
+                        .to_str()
+                        .unwrap_or("?");
+                    eprintln!("  - {}", k_str);
+                }
+                std::process::abort();
             }
             found_ptr
         };
