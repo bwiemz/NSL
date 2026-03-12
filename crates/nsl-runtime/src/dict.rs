@@ -62,8 +62,9 @@ impl NslDict {
                 e = next;
             }
         }
-        // Free old buckets array (not entries)
-        let _ = self.buckets; // leak old bucket array for now
+        // Free old buckets array (not entries — they've been re-linked into new_buckets)
+        let old_size = (self.num_buckets as usize) * std::mem::size_of::<*mut NslDictEntry>();
+        crate::memory::checked_free(self.buckets as *mut u8, old_size);
         self.buckets = new_buckets;
         self.num_buckets = new_cap;
     }

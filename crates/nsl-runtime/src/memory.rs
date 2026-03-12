@@ -24,7 +24,7 @@ pub extern "C" fn nsl_free(ptr: *mut u8) {
     }
 }
 
-/// Internal helper: allocate zeroed memory with given size
+/// Internal helper: allocate uninitialized memory with given size
 pub(crate) fn checked_alloc(size: usize) -> *mut u8 {
     if size == 0 {
         return std::ptr::null_mut();

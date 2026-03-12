@@ -236,9 +236,18 @@ impl Compiler<'_> {
         // Promote int → float if mixed types
         if is_float {
             if !left_is_float {
+                // fcvt_from_sint requires I32 or I64; widen sub-I32 ints first
+                let lhs_ty = builder.func.dfg.value_type(lhs);
+                if lhs_ty.bits() < 32 {
+                    lhs = builder.ins().sextend(cl_types::I64, lhs);
+                }
                 lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
             }
             if !right_is_float {
+                let rhs_ty = builder.func.dfg.value_type(rhs);
+                if rhs_ty.bits() < 32 {
+                    rhs = builder.ins().sextend(cl_types::I64, rhs);
+                }
                 rhs = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
             }
         }
@@ -251,12 +260,33 @@ impl Compiler<'_> {
             BinOp::Mul if is_float => Ok(builder.ins().fmul(lhs, rhs)),
             BinOp::Mul => Ok(builder.ins().imul(lhs, rhs)),
             BinOp::Div if is_float => Ok(builder.ins().fdiv(lhs, rhs)),
-            BinOp::Div => Ok(builder.ins().sdiv(lhs, rhs)),
+            BinOp::Div => {
+                // Guard against division by zero (SIGFPE on x86)
+                self.compile_divmod_guard(builder, state, rhs)?;
+                Ok(builder.ins().sdiv(lhs, rhs))
+            }
             BinOp::FloorDiv if is_float => {
                 let div = builder.ins().fdiv(lhs, rhs);
                 Ok(builder.ins().floor(div))
             }
-            BinOp::FloorDiv => Ok(builder.ins().sdiv(lhs, rhs)),
+            BinOp::FloorDiv => {
+                // Floor division: round toward negative infinity, not toward zero.
+                // sdiv truncates toward zero, so adjust when remainder is nonzero
+                // and operands have different signs.
+                self.compile_divmod_guard(builder, state, rhs)?;
+                let q = builder.ins().sdiv(lhs, rhs);
+                let prod = builder.ins().imul(q, rhs);
+                let rem = builder.ins().isub(lhs, prod);
+                // Check: remainder != 0 && (lhs ^ rhs) < 0
+                let rem_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, rem, 0);
+                let sign_bits = builder.ins().bxor(lhs, rhs);
+                let diff_sign = builder.ins().icmp_imm(IntCC::SignedLessThan, sign_bits, 0);
+                let needs_adjust = builder.ins().band(rem_nonzero, diff_sign);
+                let one = builder.ins().iconst(cl_types::I64, 1);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                let adjustment = builder.ins().select(needs_adjust, one, zero);
+                Ok(builder.ins().isub(q, adjustment))
+            }
             BinOp::Mod if is_float => {
                 // a % b = a - floor(a/b) * b
                 let div = builder.ins().fdiv(lhs, rhs);
@@ -264,7 +294,19 @@ impl Compiler<'_> {
                 let prod = builder.ins().fmul(floored, rhs);
                 Ok(builder.ins().fsub(lhs, prod))
             }
-            BinOp::Mod => Ok(builder.ins().srem(lhs, rhs)),
+            BinOp::Mod => {
+                // Python-style modulo: result has same sign as divisor.
+                // srem follows dividend sign, so adjust when result is nonzero
+                // and operands have different signs.
+                self.compile_divmod_guard(builder, state, rhs)?;
+                let r = builder.ins().srem(lhs, rhs);
+                let rem_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, r, 0);
+                let sign_bits = builder.ins().bxor(lhs, rhs);
+                let diff_sign = builder.ins().icmp_imm(IntCC::SignedLessThan, sign_bits, 0);
+                let needs_adjust = builder.ins().band(rem_nonzero, diff_sign);
+                let adjusted = builder.ins().iadd(r, rhs);
+                Ok(builder.ins().select(needs_adjust, adjusted, r))
+            }
             BinOp::Pow => self.compile_pow(builder, lhs, rhs, is_float),
 
             BinOp::Eq if is_float => Ok(builder.ins().fcmp(FloatCC::Equal, lhs, rhs)),
@@ -272,7 +314,9 @@ impl Compiler<'_> {
                 let fid = self.runtime_fns["nsl_str_eq"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[lhs, rhs]);
-                Ok(builder.inst_results(call)[0])
+                let result_i64 = builder.inst_results(call)[0];
+                // Narrow I64 result to I8 to match icmp return type
+                Ok(builder.ins().ireduce(cl_types::I8, result_i64))
             }
             BinOp::Eq => Ok(builder.ins().icmp(IntCC::Equal, lhs, rhs)),
             BinOp::NotEq if is_float => Ok(builder.ins().fcmp(FloatCC::NotEqual, lhs, rhs)),
@@ -280,10 +324,11 @@ impl Compiler<'_> {
                 let fid = self.runtime_fns["nsl_str_eq"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[lhs, rhs]);
-                let eq_val = builder.inst_results(call)[0];
-                // Invert: not-equal = 1 - eq
-                let one = builder.ins().iconst(cl_types::I64, 1);
-                Ok(builder.ins().isub(one, eq_val))
+                let eq_i64 = builder.inst_results(call)[0];
+                // Narrow to I8 and invert: not-equal = 1 - eq
+                let eq_i8 = builder.ins().ireduce(cl_types::I8, eq_i64);
+                let one = builder.ins().iconst(cl_types::I8, 1);
+                Ok(builder.ins().isub(one, eq_i8))
             }
             BinOp::NotEq => Ok(builder.ins().icmp(IntCC::NotEqual, lhs, rhs)),
             BinOp::Lt if is_float => Ok(builder.ins().fcmp(FloatCC::LessThan, lhs, rhs)),
@@ -336,6 +381,30 @@ impl Compiler<'_> {
         builder.seal_block(merge_block);
         state.current_block = Some(merge_block);
         Ok(builder.block_params(merge_block)[0])
+    }
+
+    /// Emit a runtime check that the integer divisor is non-zero.
+    /// On x86, `sdiv` / `srem` with divisor=0 causes SIGFPE (hardware fault).
+    fn compile_divmod_guard(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        divisor: Value,
+    ) -> Result<(), CodegenError> {
+        let ok_block = builder.create_block();
+        let trap_block = builder.create_block();
+
+        let is_zero = builder.ins().icmp_imm(IntCC::Equal, divisor, 0);
+        builder.ins().brif(is_zero, trap_block, &[], ok_block, &[]);
+
+        builder.switch_to_block(trap_block);
+        builder.seal_block(trap_block);
+        builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+        state.current_block = Some(ok_block);
+        Ok(())
     }
 
     fn compile_pow(
@@ -841,7 +910,10 @@ impl Compiler<'_> {
             let p_type = self.node_type(args[1].value.id).clone();
             let p_f = if is_float_type(&p_type) { p_val } else { builder.ins().fcvt_from_sint(cl_types::F64, p_val) };
             let training_val = self.compile_expr(builder, state, &args[2].value)?;
-            let training_i8 = builder.ins().ireduce(cl_types::I8, training_val);
+            let training_i8 = {
+                let vt = builder.func.dfg.value_type(training_val);
+                if vt == cl_types::I8 { training_val } else { builder.ins().ireduce(cl_types::I8, training_val) }
+            };
             return self.compile_call_by_name(builder, "nsl_tensor_dropout", &[tensor_val, p_f, training_i8]);
         }
         // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
@@ -1360,9 +1432,30 @@ impl Compiler<'_> {
             }
         };
 
+        // Widen sub-I64 integer values for nsl_print_int (expects I64),
+        // or widen F32 for nsl_print_float (expects F64)
+        let print_val = match rt_fn {
+            "nsl_print_int" => {
+                let vt = builder.func.dfg.value_type(val);
+                if vt.bits() < 64 && vt.is_int() {
+                    builder.ins().sextend(cl_types::I64, val)
+                } else {
+                    val
+                }
+            }
+            "nsl_print_float" => {
+                let vt = builder.func.dfg.value_type(val);
+                if vt == cl_types::F32 {
+                    builder.ins().fpromote(cl_types::F64, val)
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        };
         let fid = self.runtime_fns[rt_fn].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
-        builder.ins().call(fref, &[val]);
+        builder.ins().call(fref, &[print_val]);
         Ok(builder.ins().iconst(cl_types::I64, 0))
     }
 

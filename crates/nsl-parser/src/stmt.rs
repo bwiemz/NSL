@@ -341,13 +341,15 @@ fn parse_yield_stmt(p: &mut Parser) -> Stmt {
 /// Check whether an expression is a valid assignment target.
 fn is_valid_assign_target(expr: &nsl_ast::expr::Expr) -> bool {
     use nsl_ast::expr::ExprKind;
-    matches!(
-        &expr.kind,
+    match &expr.kind {
         ExprKind::Ident(_)
-            | ExprKind::MemberAccess { .. }
-            | ExprKind::Subscript { .. }
-            | ExprKind::SelfRef
-    )
+        | ExprKind::MemberAccess { .. }
+        | ExprKind::Subscript { .. } => true,
+        ExprKind::TupleLiteral(items) | ExprKind::ListLiteral(items) => {
+            items.iter().all(is_valid_assign_target)
+        }
+        _ => false,
+    }
 }
 
 fn parse_expr_or_assign(p: &mut Parser) -> Stmt {

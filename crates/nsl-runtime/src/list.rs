@@ -43,14 +43,16 @@ pub extern "C" fn nsl_list_push(list_ptr: i64, value: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_list_get(list_ptr: i64, index: i64) -> i64 {
     let list = NslList::from_ptr(list_ptr);
-    if index < 0 || index >= list.len {
+    // Support negative indices: -1 is last element, -2 is second to last, etc.
+    let actual = if index < 0 { index + list.len } else { index };
+    if actual < 0 || actual >= list.len {
         eprintln!(
             "nsl: list index out of bounds (index {}, length {})",
             index, list.len
         );
         std::process::abort();
     }
-    unsafe { *list.data.add(index as usize) }
+    unsafe { *list.data.add(actual as usize) }
 }
 
 #[no_mangle]
@@ -62,7 +64,8 @@ pub extern "C" fn nsl_list_len(list_ptr: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_list_set(list_ptr: i64, index: i64, value: i64) {
     let list = NslList::from_ptr(list_ptr);
-    if index < 0 || index >= list.len {
+    let actual = if index < 0 { index + list.len } else { index };
+    if actual < 0 || actual >= list.len {
         eprintln!(
             "nsl: list index out of bounds in assignment (index {}, length {})",
             index, list.len
@@ -70,7 +73,7 @@ pub extern "C" fn nsl_list_set(list_ptr: i64, index: i64, value: i64) {
         std::process::abort();
     }
     unsafe {
-        *list.data.add(index as usize) = value;
+        *list.data.add(actual as usize) = value;
     }
 }
 

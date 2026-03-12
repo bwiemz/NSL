@@ -257,6 +257,50 @@ fn parse_primary_pattern(p: &mut Parser) -> Pattern {
             }
         }
 
+        // Negative literal patterns: -1, -3.14
+        TokenKind::Minus => {
+            let start = p.advance().span;
+            match p.peek().clone() {
+                TokenKind::IntLiteral(v) => {
+                    let end = p.advance().span;
+                    let span = start.merge(end);
+                    Pattern {
+                        kind: PatternKind::Literal(Box::new(Expr {
+                            kind: ExprKind::IntLiteral(-v),
+                            span,
+                            id: p.next_node_id(),
+                        })),
+                        span,
+                        id: p.next_node_id(),
+                    }
+                }
+                TokenKind::FloatLiteral(v) => {
+                    let end = p.advance().span;
+                    let span = start.merge(end);
+                    Pattern {
+                        kind: PatternKind::Literal(Box::new(Expr {
+                            kind: ExprKind::FloatLiteral(-v),
+                            span,
+                            id: p.next_node_id(),
+                        })),
+                        span,
+                        id: p.next_node_id(),
+                    }
+                }
+                _ => {
+                    p.diagnostics.push(
+                        nsl_errors::Diagnostic::error("expected number after '-' in pattern")
+                            .with_label(start, "expected numeric literal"),
+                    );
+                    Pattern {
+                        kind: PatternKind::Wildcard,
+                        span: start,
+                        id: p.next_node_id(),
+                    }
+                }
+            }
+        }
+
         // Rest/spread: *name
         TokenKind::Star => {
             let start = p.advance().span;

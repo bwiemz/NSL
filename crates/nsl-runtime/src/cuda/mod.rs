@@ -106,6 +106,7 @@ pub(crate) mod inner {
 
     /// Free unified memory.
     pub(crate) fn free_managed(ptr: *mut c_void) {
+        ensure_context();
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);
             assert_eq!(

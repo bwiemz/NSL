@@ -38,7 +38,7 @@ impl Span {
     }
 
     pub fn merge(self, other: Span) -> Span {
-        debug_assert_eq!(self.file_id, other.file_id);
+        assert_eq!(self.file_id, other.file_id, "cannot merge spans from different files");
         Span {
             file_id: self.file_id,
             start: std::cmp::min(self.start, other.start),
@@ -47,7 +47,7 @@ impl Span {
     }
 
     pub fn len(&self) -> u32 {
-        self.end.0 - self.start.0
+        self.end.0.saturating_sub(self.start.0)
     }
 
     pub fn is_empty(&self) -> bool {
