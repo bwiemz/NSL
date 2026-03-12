@@ -301,7 +301,10 @@ impl Compiler<'_> {
                                 AssignOp::AddAssign => builder.ins().iadd(old_val, new_val),
                                 AssignOp::SubAssign => builder.ins().isub(old_val, new_val),
                                 AssignOp::MulAssign => builder.ins().imul(old_val, new_val),
-                                AssignOp::DivAssign => builder.ins().sdiv(old_val, new_val),
+                                AssignOp::DivAssign => {
+                                    self.compile_divmod_guard(builder, state, new_val)?;
+                                    builder.ins().sdiv(old_val, new_val)
+                                }
                                 _ => unreachable!(),
                             }
                         };
@@ -341,7 +344,20 @@ impl Compiler<'_> {
                                         (AssignOp::AddAssign, false) => builder.ins().iadd(old_val, new_val),
                                         (AssignOp::SubAssign, false) => builder.ins().isub(old_val, new_val),
                                         (AssignOp::MulAssign, false) => builder.ins().imul(old_val, new_val),
-                                        (AssignOp::DivAssign, false) => builder.ins().sdiv(old_val, new_val),
+                                        (AssignOp::DivAssign, false) => {
+                                            // Inline div-by-zero guard (can't call method due to borrow)
+                                            let ok_blk = builder.create_block();
+                                            let trap_blk = builder.create_block();
+                                            let is_zero = builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                            builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
+                                            builder.switch_to_block(trap_blk);
+                                            builder.seal_block(trap_blk);
+                                            builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                                            builder.switch_to_block(ok_blk);
+                                            builder.seal_block(ok_blk);
+                                            state.current_block = Some(ok_blk);
+                                            builder.ins().sdiv(old_val, new_val)
+                                        }
                                         _ => unreachable!(),
                                     }
                                 };
@@ -382,7 +398,20 @@ impl Compiler<'_> {
                                         (AssignOp::AddAssign, false) => builder.ins().iadd(old_val, new_val),
                                         (AssignOp::SubAssign, false) => builder.ins().isub(old_val, new_val),
                                         (AssignOp::MulAssign, false) => builder.ins().imul(old_val, new_val),
-                                        (AssignOp::DivAssign, false) => builder.ins().sdiv(old_val, new_val),
+                                        (AssignOp::DivAssign, false) => {
+                                            // Inline div-by-zero guard (can't call method due to borrow)
+                                            let ok_blk = builder.create_block();
+                                            let trap_blk = builder.create_block();
+                                            let is_zero = builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                            builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
+                                            builder.switch_to_block(trap_blk);
+                                            builder.seal_block(trap_blk);
+                                            builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                                            builder.switch_to_block(ok_blk);
+                                            builder.seal_block(ok_blk);
+                                            state.current_block = Some(ok_blk);
+                                            builder.ins().sdiv(old_val, new_val)
+                                        }
                                         _ => unreachable!(),
                                     }
                                 };

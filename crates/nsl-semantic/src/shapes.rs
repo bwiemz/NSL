@@ -66,6 +66,27 @@ pub fn check_matmul(lhs: &Shape, rhs: &Shape, op_span: Span) -> Result<Shape, Di
         )));
     }
 
+    // Verify batch dimensions are compatible
+    let l_batch = lhs.rank() - 2;
+    let r_batch = rhs.rank() - 2;
+    let min_batch = l_batch.min(r_batch);
+    for i in 0..min_batch {
+        let l_dim = &lhs.dims[l_batch - 1 - i];
+        let r_dim = &rhs.dims[r_batch - 1 - i];
+        if unify_dim(l_dim, r_dim).is_none() {
+            return Err(Diagnostic::error(format!(
+                "matmul batch dimensions don't match: {} vs {}",
+                fmt_shape(lhs),
+                fmt_shape(rhs)
+            ))
+            .with_label(op_span, format!(
+                "batch dim mismatch: {} vs {}",
+                fmt_dim(l_dim),
+                fmt_dim(r_dim)
+            )));
+        }
+    }
+
     // Result: [.., M, N] — take all but last from lhs, append last from rhs
     let mut result = lhs.dims[..lhs.rank() - 1].to_vec();
     result.push(rhs.dims[rhs.rank() - 1].clone());

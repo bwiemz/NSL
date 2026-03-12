@@ -137,6 +137,17 @@ impl<'a> TypeChecker<'a> {
                     Type::List(elem) => *elem.clone(),
                     Type::Dict(key, _val) => *key.clone(),
                     Type::Str => Type::Str,
+                    Type::Tuple(elems) => {
+                        // Iterating over a tuple: element type is union or first element
+                        elems.first().cloned().unwrap_or(Type::Unknown)
+                    }
+                    Type::FixedModelArray { element_model, .. } => {
+                        Type::Model {
+                            name: *element_model,
+                            fields: Vec::new(),
+                            methods: Vec::new(),
+                        }
+                    }
                     _ => Type::Unknown,
                 };
                 let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Loop);
@@ -250,9 +261,9 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                // Check type compatibility for plain assignment
-                if *op == AssignOp::Assign && !is_assignable(&value_ty, &target_ty) {
-                    if !target_ty.is_indeterminate() {
+                // Check type compatibility
+                if *op == AssignOp::Assign {
+                    if !is_assignable(&value_ty, &target_ty) && !target_ty.is_indeterminate() {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "type mismatch in assignment: expected {}, got {}",
@@ -260,6 +271,24 @@ impl<'a> TypeChecker<'a> {
                             ))
                             .with_label(value.span, "wrong type"),
                         );
+                    }
+                } else {
+                    // Compound assignment (+=, -=, *=, /=): both sides must be numeric
+                    let is_numeric = |ty: &Type| matches!(ty,
+                        Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8
+                        | Type::Uint8 | Type::Float | Type::F64 | Type::F32
+                        | Type::Tensor { .. } | Type::Unknown
+                    );
+                    if !is_numeric(&target_ty) || !is_numeric(&value_ty) {
+                        if !target_ty.is_indeterminate() && !value_ty.is_indeterminate() {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "invalid operand types for compound assignment: {} and {}",
+                                    display_type(&target_ty), display_type(&value_ty)
+                                ))
+                                .with_label(value.span, "invalid type for compound assignment"),
+                            );
+                        }
                     }
                 }
             }
@@ -672,7 +701,18 @@ impl<'a> TypeChecker<'a> {
 
     fn check_enum_def(&mut self, enum_def: &EnumDef) {
         let mut variants: Vec<(Symbol, Vec<Type>)> = Vec::new();
+        let mut seen_names: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for variant in &enum_def.variants {
+            if !seen_names.insert(variant.name) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "duplicate variant '{}' in enum '{}'",
+                        self.resolve_name(variant.name),
+                        self.resolve_name(enum_def.name),
+                    ))
+                    .with_label(variant.span, "duplicate variant"),
+                );
+            }
             let field_types: Vec<Type> =
                 variant.fields.iter().map(|t| self.resolve_type(t)).collect();
             variants.push((variant.name, field_types.clone()));

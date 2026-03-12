@@ -108,6 +108,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_set", &[types::I64, types::I64, types::F64], None),
     // Tensor shape ops
     ("nsl_tensor_shape", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_shape_dim", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_ndim", &[types::I64], Some(types::I64)),
     ("nsl_tensor_reshape", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_transpose", &[types::I64, types::I64, types::I64], Some(types::I64)),

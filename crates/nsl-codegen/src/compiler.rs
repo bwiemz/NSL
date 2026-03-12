@@ -1212,8 +1212,10 @@ impl<'a> Compiler<'a> {
                                 builder.ins().return_(&[]);
                             } else {
                                 let ret_type = sig.returns[0].value_type;
-                                let zero = if ret_type.is_float() {
+                                let zero = if ret_type == cl_types::F64 {
                                     builder.ins().f64const(0.0)
+                                } else if ret_type == cl_types::F32 {
+                                    builder.ins().f32const(0.0)
                                 } else {
                                     builder.ins().iconst(ret_type, 0)
                                 };

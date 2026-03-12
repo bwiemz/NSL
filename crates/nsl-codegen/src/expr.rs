@@ -385,7 +385,7 @@ impl Compiler<'_> {
 
     /// Emit a runtime check that the integer divisor is non-zero.
     /// On x86, `sdiv` / `srem` with divisor=0 causes SIGFPE (hardware fault).
-    fn compile_divmod_guard(
+    pub(crate) fn compile_divmod_guard(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
@@ -549,9 +549,17 @@ impl Compiler<'_> {
             if is_float_type(&arg_type) || is_int_type(&arg_type) {
                 let val = self.compile_expr(builder, state, &args[0].value)?;
                 let float_val = if is_float_type(&arg_type) {
-                    val
+                    if matches!(arg_type, Type::F32) {
+                        builder.ins().fpromote(cl_types::F64, val)
+                    } else {
+                        val
+                    }
                 } else {
-                    builder.ins().fcvt_from_sint(cl_types::F64, val)
+                    let widened = match &arg_type {
+                        Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, val),
+                        _ => val,
+                    };
+                    builder.ins().fcvt_from_sint(cl_types::F64, widened)
                 };
                 let rt_name = format!("nsl_{func_name}");
                 return self.compile_call_by_name(builder, &rt_name, &[float_val]);
@@ -580,9 +588,17 @@ impl Compiler<'_> {
             let val = self.compile_expr(builder, state, &args[0].value)?;
             let arg_type = self.node_type(args[0].value.id).clone();
             let float_val = if is_float_type(&arg_type) {
-                val
+                if matches!(arg_type, Type::F32) {
+                    builder.ins().fpromote(cl_types::F64, val)
+                } else {
+                    val
+                }
             } else {
-                builder.ins().fcvt_from_sint(cl_types::F64, val)
+                let widened = match &arg_type {
+                    Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, val),
+                    _ => val,
+                };
+                builder.ins().fcvt_from_sint(cl_types::F64, widened)
             };
             return self.compile_call_by_name(builder, "nsl_floor", &[float_val]);
         }
@@ -598,8 +614,28 @@ impl Compiler<'_> {
             let is_float = is_float_type(&a_type) || is_float_type(&b_type);
             let rt_name = format!("nsl_{}_{}", func_name, if is_float { "float" } else { "int" });
             if is_float {
-                let a_f = if is_float_type(&a_type) { a } else { builder.ins().fcvt_from_sint(cl_types::F64, a) };
-                let b_f = if is_float_type(&b_type) { b } else { builder.ins().fcvt_from_sint(cl_types::F64, b) };
+                let a_f = if matches!(a_type, Type::F32) {
+                    builder.ins().fpromote(cl_types::F64, a)
+                } else if is_float_type(&a_type) {
+                    a
+                } else {
+                    let w = match &a_type {
+                        Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, a),
+                        _ => a,
+                    };
+                    builder.ins().fcvt_from_sint(cl_types::F64, w)
+                };
+                let b_f = if matches!(b_type, Type::F32) {
+                    builder.ins().fpromote(cl_types::F64, b)
+                } else if is_float_type(&b_type) {
+                    b
+                } else {
+                    let w = match &b_type {
+                        Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, b),
+                        _ => b,
+                    };
+                    builder.ins().fcvt_from_sint(cl_types::F64, w)
+                };
                 return self.compile_call_by_name(builder, &rt_name, &[a_f, b_f]);
             }
             return self.compile_call_by_name(builder, &rt_name, &[a, b]);
@@ -1668,16 +1704,22 @@ impl Compiler<'_> {
         val: Value,
         ty: &Type,
     ) -> Result<Value, CodegenError> {
-        let rt_fn = match ty {
-            Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 => "nsl_int_to_str",
-            Type::Float | Type::F64 | Type::F32 => "nsl_float_to_str",
-            Type::Bool => "nsl_bool_to_str",
+        let (rt_fn, converted_val) = match ty {
+            Type::Int | Type::Int64 => ("nsl_int_to_str", val),
+            Type::Int32 | Type::Int16 | Type::Int8 => {
+                ("nsl_int_to_str", builder.ins().sextend(cl_types::I64, val))
+            }
+            Type::Float | Type::F64 => ("nsl_float_to_str", val),
+            Type::F32 => {
+                ("nsl_float_to_str", builder.ins().fpromote(cl_types::F64, val))
+            }
+            Type::Bool => ("nsl_bool_to_str", val),
             Type::Str => return Ok(val),
-            _ => "nsl_int_to_str",
+            _ => ("nsl_int_to_str", val),
         };
         let fid = self.runtime_fns[rt_fn].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
-        let call = builder.ins().call(fref, &[val]);
+        let call = builder.ins().call(fref, &[converted_val]);
         Ok(builder.inst_results(call)[0])
     }
 
@@ -1803,9 +1845,16 @@ impl Compiler<'_> {
 
         match target_type {
             "int" => match &src_type {
-                Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 => Ok(val),
-                Type::Float | Type::F64 | Type::F32 => {
+                Type::Int | Type::Int64 => Ok(val),
+                Type::Int32 => Ok(builder.ins().sextend(cl_types::I64, val)),
+                Type::Int16 => Ok(builder.ins().sextend(cl_types::I64, val)),
+                Type::Int8 => Ok(builder.ins().sextend(cl_types::I64, val)),
+                Type::Float | Type::F64 => {
                     Ok(builder.ins().fcvt_to_sint_sat(cl_types::I64, val))
+                }
+                Type::F32 => {
+                    let promoted = builder.ins().fpromote(cl_types::F64, val);
+                    Ok(builder.ins().fcvt_to_sint_sat(cl_types::I64, promoted))
                 }
                 Type::Bool => Ok(builder.ins().uextend(cl_types::I64, val)),
                 Type::Str => {
@@ -1817,9 +1866,14 @@ impl Compiler<'_> {
                 _ => Ok(val),
             },
             "float" => match &src_type {
-                Type::Float | Type::F64 | Type::F32 => Ok(val),
-                Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 => {
+                Type::Float | Type::F64 => Ok(val),
+                Type::F32 => Ok(builder.ins().fpromote(cl_types::F64, val)),
+                Type::Int | Type::Int64 => {
                     Ok(builder.ins().fcvt_from_sint(cl_types::F64, val))
+                }
+                Type::Int32 | Type::Int16 | Type::Int8 => {
+                    let widened = builder.ins().sextend(cl_types::I64, val);
+                    Ok(builder.ins().fcvt_from_sint(cl_types::F64, widened))
                 }
                 Type::Bool => {
                     let ext = builder.ins().uextend(cl_types::I64, val);
@@ -2506,8 +2560,10 @@ impl Compiler<'_> {
 
         // If last arm was not a wildcard, emit a default value for the no-match path
         if needs_default_block {
-            let default_val = if result_type.is_float() {
+            let default_val = if result_type == cl_types::F64 {
                 builder.ins().f64const(0.0)
+            } else if result_type == cl_types::F32 {
+                builder.ins().f32const(0.0)
             } else {
                 builder.ins().iconst(result_type, 0)
             };
@@ -2528,8 +2584,10 @@ impl Compiler<'_> {
         result_type: cl_types::Type,
     ) -> Result<Value, CodegenError> {
         if body.stmts.is_empty() {
-            let zero = if result_type.is_float() {
+            let zero = if result_type == cl_types::F64 {
                 builder.ins().f64const(0.0)
+            } else if result_type == cl_types::F32 {
+                builder.ins().f32const(0.0)
             } else {
                 builder.ins().iconst(result_type, 0)
             };

@@ -19,7 +19,7 @@ pub fn lex_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnostics:
 
     loop {
         match cursor.peek() {
-            None | Some('\n') => {
+            None | Some('\n') | Some('\r') => {
                 diagnostics.push(
                     Diagnostic::error("unterminated string literal")
                         .with_label(cursor.span_from(start), "string starts here"),

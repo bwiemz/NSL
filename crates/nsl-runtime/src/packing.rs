@@ -53,11 +53,13 @@ pub fn pack_batch(
         let offset = b * seq_len;
 
         // Labels: shifted by 1 within each sequence
-        for i in 0..seq_len - 1 {
-            labels[offset + i] = input_ids[offset + i + 1];
+        if seq_len > 0 {
+            for i in 0..seq_len - 1 {
+                labels[offset + i] = input_ids[offset + i + 1];
+            }
+            // Last position always gets -100
+            labels[offset + seq_len - 1] = -100;
         }
-        // Last position always gets -100
-        labels[offset + seq_len - 1] = -100;
 
         // Set -100 at EOS positions in labels
         for i in 0..seq_len {

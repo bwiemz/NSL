@@ -336,6 +336,19 @@ pub extern "C" fn nsl_tensor_shape(tensor_ptr: i64) -> i64 {
     list
 }
 
+/// Return the size of a specific dimension of a tensor.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+    if d >= ndim {
+        eprintln!("nsl: shape_dim dimension {} out of range for {}D tensor", dim, ndim);
+        std::process::abort();
+    }
+    unsafe { *tensor.shape.add(d) }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_ndim(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).ndim
@@ -1541,7 +1554,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     }
 
     let ndim = tensor.ndim as usize;
-    let d = dim as usize;
+    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
     if d >= ndim {
         eprintln!("nsl: sum_dim dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
@@ -1640,7 +1653,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
     }
 
     let ndim = tensor.ndim as usize;
-    let d = dim as usize;
+    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
     if d >= ndim {
         eprintln!("nsl: mean_dim dimension {} out of range for {}D tensor", dim, ndim);
         std::process::abort();
@@ -1682,7 +1695,7 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
     let input_shape = get_shape_vec(tensor);
     let keepdim_bool = keepdim != 0;
     let ndim = tensor.ndim as usize;
-    let d = dim as usize;
+    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
 
     if d >= ndim {
         eprintln!("nsl: reduce_max dimension {} out of range for {}D tensor", dim, ndim);
@@ -1768,7 +1781,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     let indices = NslTensor::from_ptr(indices_ptr);
     let input_shape = get_shape_vec(tensor);
     let ndim = tensor.ndim as usize;
-    let d = dim as usize;
+    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
 
     if d >= ndim {
         eprintln!("nsl: gather dimension {} out of range for {}D tensor", dim, ndim);
