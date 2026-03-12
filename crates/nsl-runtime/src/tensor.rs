@@ -3853,3 +3853,207 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
 
     panic!("GPU-to-GPU transfer not yet supported");
 }
+
+// ---------------------------------------------------------------------------
+// Slice assignment primitives (M19 data pipeline)
+// ---------------------------------------------------------------------------
+
+/// Describes one dimension of a slice assignment operation.
+#[repr(C)]
+pub struct NslSliceDim {
+    pub is_scalar: u8, // 1 = single index, 0 = range
+    pub start: i64,
+    pub end: i64, // ignored if is_scalar=1
+}
+
+/// Set a single element in a tensor by flat indices.
+/// `indices_ptr` points to an array of `i64` indices, one per dimension.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_set_element(
+    tensor_ptr: i64,
+    indices_ptr: i64,
+    num_indices: i64,
+    value: f64,
+) {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+    let n = num_indices as usize;
+
+    if n != ndim {
+        eprintln!(
+            "nsl: set_element: expected {} indices, got {}",
+            ndim, n
+        );
+        std::process::abort();
+    }
+
+    let strides = crate::cpu::get_strides_vec(tensor);
+    let mut offset: usize = 0;
+    for d in 0..ndim {
+        let idx = unsafe { *(indices_ptr as *const i64).add(d) } as usize;
+        let dim_size = unsafe { *tensor.shape.add(d) } as usize;
+        if idx >= dim_size {
+            eprintln!(
+                "nsl: set_element: index {} out of bounds for dim {} (size {})",
+                idx, d, dim_size
+            );
+            std::process::abort();
+        }
+        offset += idx * strides[d];
+    }
+
+    unsafe { *tensor.data_f64().add(offset) = value };
+}
+
+/// Assign `src` tensor into a slice of `target` tensor.
+/// `dims_ptr` points to an array of [`NslSliceDim`], one per dimension.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_slice_assign(
+    target_ptr: i64,
+    src_ptr: i64,
+    dims_ptr: i64,
+    num_dims: i64,
+) {
+    let target = NslTensor::from_ptr(target_ptr);
+    let src = NslTensor::from_ptr(src_ptr);
+    let ndim = num_dims as usize;
+    let dims =
+        unsafe { std::slice::from_raw_parts(dims_ptr as *const NslSliceDim, ndim) };
+    let target_strides = crate::cpu::get_strides_vec(target);
+    let target_shape = crate::cpu::get_shape_vec(target);
+
+    // Compute the slice region: for each dim, determine start..end range
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        let dim_size = target_shape[d] as usize;
+        if dims[d].is_scalar != 0 {
+            let idx = if dims[d].start < 0 {
+                (dim_size as i64 + dims[d].start) as usize
+            } else {
+                dims[d].start as usize
+            };
+            ranges.push((idx, idx + 1));
+        } else {
+            let start = if dims[d].start < 0 {
+                (dim_size as i64 + dims[d].start) as usize
+            } else {
+                dims[d].start as usize
+            };
+            let end = if dims[d].end < 0 {
+                (dim_size as i64 + dims[d].end) as usize
+            } else {
+                dims[d].end.min(dim_size as i64) as usize
+            };
+            ranges.push((start, end));
+        }
+    }
+
+    // Iterate over all positions in the slice and copy from src
+    let mut src_flat = 0usize;
+
+    fn recurse(
+        depth: usize,
+        ndim: usize,
+        ranges: &[(usize, usize)],
+        target: &NslTensor,
+        src: &NslTensor,
+        target_strides: &[usize],
+        target_offset: usize,
+        src_flat: &mut usize,
+    ) {
+        if depth == ndim {
+            if *src_flat < src.len as usize {
+                let val = unsafe { *src.data_f64().add(*src_flat) };
+                unsafe { *target.data_f64().add(target_offset) = val };
+                *src_flat += 1;
+            }
+            return;
+        }
+        let (start, end) = ranges[depth];
+        for i in start..end {
+            recurse(
+                depth + 1,
+                ndim,
+                ranges,
+                target,
+                src,
+                target_strides,
+                target_offset + i * target_strides[depth],
+                src_flat,
+            );
+        }
+    }
+
+    recurse(
+        0,
+        ndim,
+        &ranges,
+        target,
+        src,
+        &target_strides,
+        0,
+        &mut src_flat,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_element() {
+        // Create a 2x3 zero tensor
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 2);
+        crate::list::nsl_list_push(shape, 3);
+        let t = nsl_tensor_zeros(shape);
+        let indices: [i64; 2] = [1, 2];
+        nsl_tensor_set_element(t, indices.as_ptr() as i64, 2, 42.0);
+        let tensor = NslTensor::from_ptr(t);
+        // Element at [1, 2]: row 1 * 3 + col 2 = 5
+        assert_eq!(unsafe { *tensor.data_f64().add(5) }, 42.0);
+    }
+
+    #[test]
+    fn test_slice_assign() {
+        // Create a 2x4 zero tensor, assign [10,20,30] into [0, 0:3]
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 2);
+        crate::list::nsl_list_push(shape, 4);
+        let target = nsl_tensor_zeros(shape);
+
+        let src = create_tensor_with_shape_rs(&[3]);
+        let s = NslTensor::from_ptr(src);
+        unsafe {
+            *s.data_f64().add(0) = 10.0;
+            *s.data_f64().add(1) = 20.0;
+            *s.data_f64().add(2) = 30.0;
+        }
+
+        // Slice: [0, 0:3] => dim0: scalar index 0, dim1: range 0..3
+        let dims = [
+            NslSliceDim {
+                is_scalar: 1,
+                start: 0,
+                end: 0,
+            },
+            NslSliceDim {
+                is_scalar: 0,
+                start: 0,
+                end: 3,
+            },
+        ];
+        nsl_tensor_slice_assign(target, src, dims.as_ptr() as i64, 2);
+
+        let t = NslTensor::from_ptr(target);
+        assert_eq!(unsafe { *t.data_f64().add(0) }, 10.0); // [0,0]
+        assert_eq!(unsafe { *t.data_f64().add(1) }, 20.0); // [0,1]
+        assert_eq!(unsafe { *t.data_f64().add(2) }, 30.0); // [0,2]
+        assert_eq!(unsafe { *t.data_f64().add(3) }, 0.0); // [0,3] unchanged
+        assert_eq!(unsafe { *t.data_f64().add(4) }, 0.0); // [1,0] unchanged
+    }
+}
