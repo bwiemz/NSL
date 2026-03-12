@@ -35,6 +35,8 @@ pub(crate) fn checked_alloc(size: usize) -> *mut u8 {
         eprintln!("nsl: out of memory");
         std::process::abort();
     }
+    #[cfg(test)]
+    stats::cpu_alloc(size);
     ptr
 }
 
@@ -49,6 +51,8 @@ pub(crate) fn checked_alloc_zeroed(size: usize) -> *mut u8 {
         eprintln!("nsl: out of memory");
         std::process::abort();
     }
+    #[cfg(test)]
+    stats::cpu_alloc(size);
     ptr
 }
 
@@ -58,6 +62,11 @@ pub(crate) unsafe fn checked_realloc(ptr: *mut u8, old_size: usize, new_size: us
         return checked_alloc(new_size);
     }
     let old_layout = Layout::from_size_align(old_size, 8).unwrap();
+    #[cfg(test)]
+    {
+        stats::cpu_free(old_size);
+        stats::cpu_alloc(new_size);
+    }
     let new_ptr = unsafe { std::alloc::realloc(ptr, old_layout, new_size) };
     if new_ptr.is_null() {
         eprintln!("nsl: out of memory");
@@ -69,6 +78,8 @@ pub(crate) unsafe fn checked_realloc(ptr: *mut u8, old_size: usize, new_size: us
 /// Internal helper: free memory with known size
 pub(crate) unsafe fn checked_free(ptr: *mut u8, size: usize) {
     if !ptr.is_null() && size > 0 {
+        #[cfg(test)]
+        stats::cpu_free(size);
         let layout = Layout::from_size_align(size, 8).unwrap();
         unsafe { dealloc(ptr, layout) };
     }
