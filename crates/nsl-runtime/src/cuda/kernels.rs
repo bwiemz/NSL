@@ -858,6 +858,8 @@ pub(crate) const TANH_F32_PTX: &str = "\
     shl.b64 %rd5, %rd4, 2;\n\
     add.u64 %rd6, %rd1, %rd5;\n\
     ld.global.f32 %fs1, [%rd6];\n\
+    min.f32 %fs1, %fs1, 0f42300000;\n\
+    max.f32 %fs1, %fs1, 0fC2300000;\n\
     add.f32 %fs2, %fs1, %fs1;\n\
     mul.f32 %fs2, %fs2, 0f3FB8AA3B;\n\
     ex2.approx.f32 %fs2, %fs2;\n\
