@@ -125,14 +125,17 @@ fn parse_if_stmt(p: &mut Parser) -> Stmt {
     let then_block = p.parse_block();
 
     let mut elif_clauses = Vec::new();
+    p.skip_newlines();
     while p.at(&TokenKind::Elif) {
         p.advance();
         let cond = parse_expr(p);
         p.expect(&TokenKind::Colon);
         let block = p.parse_block();
         elif_clauses.push((cond, block));
+        p.skip_newlines();
     }
 
+    p.skip_newlines();
     let else_block = if p.at(&TokenKind::Else) {
         p.advance();
         p.expect(&TokenKind::Colon);
