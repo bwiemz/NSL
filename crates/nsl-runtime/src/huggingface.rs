@@ -193,29 +193,111 @@ pub extern "C" fn nsl_hf_load(
             std::process::abort();
         });
 
-        let local_path =
-            api.model(repo_id.to_string())
-                .get("model.safetensors")
-                .unwrap_or_else(|_e| {
-                    // Fallback: try pytorch_model.bin (not supported as safetensors, abort)
-                    eprintln!(
-                        "[nsl] hf_load: could not download 'model.safetensors' from '{}': {}",
-                        repo_id, _e
-                    );
+        let model_repo = api.model(repo_id.to_string());
+
+        let dict_ptr = match model_repo.get("model.safetensors") {
+            Ok(local_path) => {
+                // Single-file model
+                let path_str = local_path.to_str().unwrap_or_else(|| {
+                    eprintln!("[nsl] hf_load: downloaded path is not valid UTF-8");
+                    std::process::abort();
+                });
+                crate::safetensors_io::nsl_safetensors_load(
+                    path_str.as_ptr() as i64,
+                    path_str.len() as i64,
+                    device,
+                )
+            }
+            Err(_single_err) => {
+                // Fallback: try sharded model via index JSON
+                let index_path = model_repo
+                    .get("model.safetensors.index.json")
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "[nsl] hf_load: no model.safetensors or index found for '{}': {}",
+                            repo_id, e
+                        );
+                        std::process::abort();
+                    });
+
+                let index_content = std::fs::read_to_string(&index_path).unwrap_or_else(|e| {
+                    eprintln!("[nsl] hf_load: failed to read index JSON: {}", e);
                     std::process::abort();
                 });
 
-        let path_str = local_path.to_str().unwrap_or_else(|| {
-            eprintln!("[nsl] hf_load: downloaded path is not valid UTF-8");
-            std::process::abort();
-        });
+                let index_json: serde_json::Value =
+                    serde_json::from_str(&index_content).unwrap_or_else(|e| {
+                        eprintln!("[nsl] hf_load: failed to parse index JSON: {}", e);
+                        std::process::abort();
+                    });
 
-        // Load weights into an NslDict
-        let dict_ptr = crate::safetensors_io::nsl_safetensors_load(
-            path_str.as_ptr() as i64,
-            path_str.len() as i64,
-            device,
-        );
+                // Extract unique shard filenames from weight_map values
+                let weight_map = index_json
+                    .get("weight_map")
+                    .and_then(|v| v.as_object())
+                    .unwrap_or_else(|| {
+                        eprintln!("[nsl] hf_load: index JSON missing 'weight_map' object");
+                        std::process::abort();
+                    });
+
+                let mut shard_names: Vec<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                    .collect();
+                shard_names.sort();
+                shard_names.dedup();
+
+                eprintln!(
+                    "[nsl] hf_load: sharded model detected for '{}', downloading {} shard(s)...",
+                    repo_id,
+                    shard_names.len()
+                );
+
+                // Create a merged dict from all shards
+                let merged_dict = crate::dict::nsl_dict_new();
+
+                for shard_name in &shard_names {
+                    eprintln!("[nsl] hf_load: downloading shard '{}'...", shard_name);
+                    let shard_path =
+                        model_repo.get(shard_name).unwrap_or_else(|e| {
+                            eprintln!(
+                                "[nsl] hf_load: failed to download shard '{}': {}",
+                                shard_name, e
+                            );
+                            std::process::abort();
+                        });
+
+                    let shard_path_str = shard_path.to_str().unwrap_or_else(|| {
+                        eprintln!("[nsl] hf_load: shard path is not valid UTF-8");
+                        std::process::abort();
+                    });
+
+                    let shard_dict = crate::safetensors_io::nsl_safetensors_load(
+                        shard_path_str.as_ptr() as i64,
+                        shard_path_str.len() as i64,
+                        device,
+                    );
+
+                    // Merge shard tensors into the combined dict
+                    let keys_list_ptr = crate::dict::nsl_dict_keys(shard_dict);
+                    let keys_list = crate::list::NslList::from_ptr(keys_list_ptr);
+                    for i in 0..keys_list.len as usize {
+                        let key_i64 = unsafe { *keys_list.data.add(i) };
+                        let tensor_ptr =
+                            crate::dict::nsl_dict_get_str(shard_dict, key_i64);
+                        crate::dict::nsl_dict_set_str(merged_dict, key_i64, tensor_ptr);
+                    }
+                }
+
+                eprintln!(
+                    "[nsl] hf_load: loaded {} tensors from {} shard(s)",
+                    crate::dict::nsl_dict_len(merged_dict),
+                    shard_names.len()
+                );
+
+                merged_dict
+            }
+        };
 
         // Map weights into model struct using the metadata table
         let metadata_slice = unsafe {
