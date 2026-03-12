@@ -148,19 +148,21 @@ impl Compiler<'_> {
             }
 
             StmtKind::Break => {
-                if let Some(lc) = state.loop_stack.last() {
-                    builder.ins().jump(lc.exit_block, &[]);
-                } else {
-                    return Err(CodegenError::new("break outside loop"));
-                }
+                let exit = state.loop_stack.last()
+                    .map(|lc| lc.exit_block)
+                    .ok_or_else(|| CodegenError::new("break outside loop"))?;
+                // Free tensor temporaries from current loop iteration before jumping out
+                self.emit_loop_scope_cleanup(builder, state);
+                builder.ins().jump(exit, &[]);
             }
 
             StmtKind::Continue => {
-                if let Some(lc) = state.loop_stack.last() {
-                    builder.ins().jump(lc.continue_block, &[]);
-                } else {
-                    return Err(CodegenError::new("continue outside loop"));
-                }
+                let cont = state.loop_stack.last()
+                    .map(|lc| lc.continue_block)
+                    .ok_or_else(|| CodegenError::new("continue outside loop"))?;
+                // Free tensor temporaries from current loop iteration before restarting
+                self.emit_loop_scope_cleanup(builder, state);
+                builder.ins().jump(cont, &[]);
             }
 
             StmtKind::FnDef(fn_def) => {
@@ -473,6 +475,45 @@ impl Compiler<'_> {
         }
     }
 
+    /// Emit nsl_tensor_free calls for all tensor temporaries accumulated since the
+    /// current loop scope started. Used at break/continue points.
+    /// CRITICAL: Does NOT truncate tensor_temporaries — that only happens at natural scope exit.
+    fn emit_loop_scope_cleanup(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+    ) {
+        if let Some(&scope_start) = state.temp_scope_stack.last() {
+            for &temp in &state.tensor_temporaries[scope_start..] {
+                if let Some(block) = state.current_block {
+                    if is_block_filled(builder, block) {
+                        break;
+                    }
+                }
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
+            }
+        }
+    }
+
+    /// Emit cleanup AND truncate temporaries at natural loop exit.
+    fn cleanup_loop_scope(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+    ) {
+        if let Some(scope_start) = state.temp_scope_stack.pop() {
+            for &temp in &state.tensor_temporaries[scope_start..] {
+                if let Some(block) = state.current_block {
+                    if is_block_filled(builder, block) {
+                        break;
+                    }
+                }
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
+            }
+            state.tensor_temporaries.truncate(scope_start);
+        }
+    }
+
     /// Emit nsl_dataloader_stop + nsl_dataloader_free for all DataLoaders
     /// created in this scope. Called before function returns to prevent
     /// thread leaks and resource leaks.
@@ -587,12 +628,18 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
+        state.temp_scope_stack.push(state.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: header_block, exit_block });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
         let current = state.current_block.unwrap_or(body_block);
-        if !is_block_filled(builder, current) { builder.ins().jump(header_block, &[]); }
+        if !is_block_filled(builder, current) {
+            self.cleanup_loop_scope(builder, state);
+            builder.ins().jump(header_block, &[]);
+        } else {
+            state.temp_scope_stack.pop();
+        }
 
         builder.seal_block(header_block);
         builder.switch_to_block(exit_block);
@@ -646,13 +693,17 @@ impl Compiler<'_> {
             builder.def_var(var, val);
         }
 
+        state.temp_scope_stack.push(state.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: header_block, exit_block });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
+            self.cleanup_loop_scope(builder, state);
             builder.ins().jump(header_block, &[]);
+        } else {
+            state.temp_scope_stack.pop();
         }
 
         builder.seal_block(header_block);
@@ -760,13 +811,17 @@ impl Compiler<'_> {
         }
 
         // continue jumps to increment_block (not header) so counter is incremented
+        state.temp_scope_stack.push(state.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
+            self.cleanup_loop_scope(builder, state);
             builder.ins().jump(increment_block, &[]);
+        } else {
+            state.temp_scope_stack.pop();
         }
 
         // Increment block: counter++ then jump to header
@@ -846,6 +901,7 @@ impl Compiler<'_> {
         builder.def_var(elem_var, elem_ptr);
 
         // Compile body statements
+        state.temp_scope_stack.push(state.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
@@ -854,7 +910,10 @@ impl Compiler<'_> {
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
+            self.cleanup_loop_scope(builder, state);
             builder.ins().jump(increment_block, &[]);
+        } else {
+            state.temp_scope_stack.pop();
         }
 
         // Increment: counter++ then jump to header
@@ -923,6 +982,7 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
+        state.temp_scope_stack.push(state.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
@@ -931,7 +991,10 @@ impl Compiler<'_> {
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
+            self.cleanup_loop_scope(builder, state);
             builder.ins().jump(cleanup_block, &[]);
+        } else {
+            state.temp_scope_stack.pop();
         }
 
         // Cleanup: free the batch dict, then loop back to header

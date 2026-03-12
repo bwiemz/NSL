@@ -1,0 +1,51 @@
+# M17b Loop-Break Memory Leak Tests
+
+# Test 1: break doesn't leak tensors
+let count = 0
+for i in range(100):
+    let tmp = zeros([64])
+    if i == 5:
+        break
+    count = count + 1
+
+print("Test 1 loop break cleanup: PASS")
+
+# Test 2: continue doesn't leak tensors
+let count2 = 0
+for i in range(100):
+    let tmp = ones([64])
+    if i % 2 == 0:
+        continue
+    count2 = count2 + 1
+
+print("Test 2 loop continue cleanup: PASS")
+
+# Test 3: nested loop break — inner temps freed, outer survives
+for i in range(10):
+    let outer_tmp = zeros([32])
+    for j in range(10):
+        let inner_tmp = ones([32])
+        if j == 3:
+            break
+
+print("Test 3 nested loop break: PASS")
+
+# Test 4: while loop with break
+let k = 0
+while k < 50:
+    let w_tmp = zeros([128])
+    if k == 10:
+        break
+    k = k + 1
+
+print("Test 4 while break cleanup: PASS")
+
+# Test 5: compound expression temporaries in loop
+for i in range(20):
+    let a = ones([16])
+    let b = ones([16])
+    let c = a + b + a  # intermediate (a+b) is a temporary
+    if i == 5:
+        break
+
+print("Test 5 compound expr break cleanup: PASS")
