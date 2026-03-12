@@ -230,6 +230,18 @@ pub fn build_onnx_model(graph: &TraceGraph) -> ModelProto {
         name_map.insert(op.output_ptr, output_name);
     }
 
+    // Remap output names: rename the producing node's output to the registered
+    // graph-output name so ONNX runtimes can match them.  Without this the
+    // nodes produce "node_N_out" but the graph output list references "output_0"
+    // (or whatever name was registered), which is an invalid graph.
+    for (ptr, name) in &graph.outputs {
+        if let Some(&node_id) = graph.ptr_to_node.get(ptr) {
+            if node_id < nodes.len() {
+                nodes[node_id].output = vec![name.clone()];
+            }
+        }
+    }
+
     // Build graph outputs
     let graph_outputs: Vec<ValueInfoProto> = graph
         .outputs

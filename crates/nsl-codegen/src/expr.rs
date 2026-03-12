@@ -2709,8 +2709,16 @@ impl Compiler<'_> {
             } else {
                 // Leaf tensor field — determine transpose flag
                 // Weights in Linear-like layers need transposing (PyTorch stores [out, in],
-                // NSL expects [in, out]).  Bias fields are never transposed.
-                let needs_transpose = field.name == "weight";
+                // NSL expects [in, out]).  Bias fields and Embedding weights are never
+                // transposed.  A "Linear-like" layer is identified by having both a
+                // weight (or "w") field AND a bias (or "b") field.
+                let is_linear_like = {
+                    let names: Vec<&str> = layout.fields.iter().map(|f| f.name.as_str()).collect();
+                    (names.contains(&"w") && names.contains(&"b"))
+                        || (names.contains(&"weight") && names.contains(&"bias"))
+                };
+                let needs_transpose =
+                    is_linear_like && (field.name == "weight" || field.name == "w");
                 entries.push((field_path, abs_offset, needs_transpose));
             }
         }

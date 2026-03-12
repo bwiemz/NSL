@@ -12,10 +12,9 @@ crate-type = ["staticlib", "rlib"]
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 safetensors = { version = "0.4", optional = true }
-hf-hub = { version = "0.3", optional = true, features = ["tokio"] }
+hf-hub = { version = "0.3", optional = true }
 prost = { version = "0.13", optional = true }
 half = { version = "2.4", optional = true, features = ["std"] }
-bytemuck = { version = "1", optional = true, features = ["derive"] }
 regex-lite = { version = "0.1", optional = true }
 
 [dev-dependencies]
@@ -24,4 +23,4 @@ tempfile = "3"
 [features]
 default = []
 cuda = ["dep:cudarc"]
-interop = ["dep:safetensors", "dep:hf-hub", "dep:prost", "dep:half", "dep:bytemuck", "dep:regex-lite"]
+interop = ["dep:safetensors", "dep:hf-hub", "dep:prost", "dep:half", "dep:regex-lite"]
