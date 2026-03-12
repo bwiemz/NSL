@@ -20,6 +20,7 @@ pub struct KernelCompiler {
     next_u64: u32,
     next_f32: u32,
     next_pred: u32,
+    next_label: u32,
     /// Variable → (register_name, RegKind)
     var_regs: HashMap<String, (String, RegKind)>,
 }
@@ -32,6 +33,7 @@ impl KernelCompiler {
             next_u64: 0,
             next_f32: 0,
             next_pred: 0,
+            next_label: 0,
             var_regs: HashMap::new(),
         }
     }
@@ -152,8 +154,8 @@ impl KernelCompiler {
             StmtKind::Assign { target, value, .. } => {
                 self.compile_assign(target, value, interner);
             }
-            StmtKind::If { condition, then_block, else_block, .. } => {
-                self.compile_if(condition, then_block, else_block.as_ref(), interner);
+            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+                self.compile_if(condition, then_block, elif_clauses, else_block.as_ref(), interner);
             }
             _ => {} // Skip unsupported statements silently
         }
@@ -395,11 +397,12 @@ impl KernelCompiler {
         }
     }
 
-    /// Compile an if statement with predicate branching.
+    /// Compile an if/elif/else statement with predicate branching.
     fn compile_if(
         &mut self,
         cond: &Expr,
         then_block: &Block,
+        elif_clauses: &[(Expr, Block)],
         else_block: Option<&Block>,
         interner: &Interner,
     ) {
@@ -407,28 +410,57 @@ impl KernelCompiler {
 
         // Use pred register directly if it starts with %p (comparison result)
         if pred_reg.starts_with("%p") {
-            let label_id = self.next_pred;
-            self.next_pred += 1;
-            let else_label = format!("ELSE_{}", label_id);
+            let label_id = self.next_label;
+            self.next_label += 1;
             let end_label = format!("ENDIF_{}", label_id);
 
-            if else_block.is_some() {
-                self.emit(&format!("    @!{} bra {};\n", pred_reg, else_label));
+            // Determine where to branch if the initial condition is false
+            let first_false_label = if !elif_clauses.is_empty() {
+                format!("ELIF_{}_{}", label_id, 0)
+            } else if else_block.is_some() {
+                format!("ELSE_{}", label_id)
             } else {
-                self.emit(&format!("    @!{} bra {};\n", pred_reg, end_label));
+                end_label.clone()
+            };
+
+            self.emit(&format!("    @!{} bra {};\n", pred_reg, first_false_label));
+            self.compile_block(then_block, interner);
+            self.emit(&format!("    bra {};\n", end_label));
+
+            // Emit elif clauses
+            for (i, (elif_cond, elif_block)) in elif_clauses.iter().enumerate() {
+                self.emit(&format!("ELIF_{}_{}:\n", label_id, i));
+
+                let (elif_pred, _) = self.compile_expr(elif_cond, interner);
+                if elif_pred.starts_with("%p") {
+                    // Determine where to branch if this elif condition is false
+                    let next_false_label = if i + 1 < elif_clauses.len() {
+                        format!("ELIF_{}_{}", label_id, i + 1)
+                    } else if else_block.is_some() {
+                        format!("ELSE_{}", label_id)
+                    } else {
+                        end_label.clone()
+                    };
+
+                    self.emit(&format!("    @!{} bra {};\n", elif_pred, next_false_label));
+                    self.compile_block(elif_block, interner);
+                    self.emit(&format!("    bra {};\n", end_label));
+                } else {
+                    // Non-comparison elif condition -- compile body but skip branching
+                    self.compile_block(elif_block, interner);
+                    self.emit(&format!("    bra {};\n", end_label));
+                }
             }
 
-            self.compile_block(then_block, interner);
-
+            // Emit else block
             if let Some(else_blk) = else_block {
-                self.emit(&format!("    bra {};\n", end_label));
-                self.emit(&format!("{}:\n", else_label));
+                self.emit(&format!("ELSE_{}:\n", label_id));
                 self.compile_block(else_blk, interner);
             }
 
             self.emit(&format!("{}:\n", end_label));
         }
-        // If pred_reg doesn't start with %p, the condition wasn't a comparison —
+        // If pred_reg doesn't start with %p, the condition wasn't a comparison --
         // silently skip (handles unknown/unsupported conditions gracefully).
     }
 }
