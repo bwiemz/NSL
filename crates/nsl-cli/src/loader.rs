@@ -214,8 +214,9 @@ fn extract_enum_info(
             for (i, variant) in ed.variants.iter().enumerate() {
                 let vname = interner.resolve(variant.name.0).unwrap_or("<unknown>").to_string();
                 let tag = i as i64;
-                // Store both bare and qualified names
-                variants.insert(vname.clone(), tag);
+                // Only store qualified names for cross-module imports to avoid
+                // collisions when two modules export enums with the same variant name.
+                // The codegen adds bare names for locally-defined enums.
                 variants.insert(format!("{enum_name}.{vname}"), tag);
                 variant_list.push((vname, tag));
             }
