@@ -189,6 +189,7 @@ pub fn parse_quant_block_stmt(p: &mut Parser) -> Stmt {
                 nsl_errors::Diagnostic::error(format!("expected 'static', found '{text}'"))
                     .with_label(p.current_span(), "expected 'static'"),
             );
+            p.advance();
             QuantKind::Static
         }
     } else {
@@ -196,6 +197,7 @@ pub fn parse_quant_block_stmt(p: &mut Parser) -> Stmt {
             nsl_errors::Diagnostic::error(format!("expected 'static', found {}", p.peek()))
                 .with_label(p.current_span(), "expected 'static'"),
         );
+        p.advance();
         QuantKind::Static
     };
 

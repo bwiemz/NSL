@@ -275,7 +275,17 @@ fn parse_dim_expr(p: &mut Parser) -> DimExpr {
                             value: DimValue::Int(v),
                         }
                     }
-                    _ => DimExpr::Symbolic(sym.into()),
+                    _ => {
+                        p.diagnostics.push(
+                            nsl_errors::Diagnostic::error(format!(
+                                "expected string or integer after '=' in dimension, found {}",
+                                p.peek()
+                            ))
+                            .with_label(p.current_span(), "expected value"),
+                        );
+                        p.advance();
+                        DimExpr::Symbolic(sym.into())
+                    }
                 }
             } else {
                 DimExpr::Symbolic(sym.into())
