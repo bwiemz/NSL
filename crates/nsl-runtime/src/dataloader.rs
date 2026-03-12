@@ -315,8 +315,8 @@ pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
             if let Some(ptr) = buf.remove(&expected) {
                 break ptr;
             }
-            // Check if we should give up (stop_flag + workers done)
-            if dl.stop_flag.load(Ordering::SeqCst) && dl.worker_handles.iter().all(|h| h.is_finished()) {
+            // Check if we should give up (stop_flag set OR all workers finished)
+            if dl.stop_flag.load(Ordering::SeqCst) || dl.worker_handles.iter().all(|h| h.is_finished()) {
                 return 0;
             }
             buf = dl.condvar.wait(buf).unwrap();
