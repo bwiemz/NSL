@@ -1263,7 +1263,6 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x + y);
-    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
     }
@@ -1273,6 +1272,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
         let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
         crate::trace::record_op(crate::trace::OpType::Add, vec![a, b], result, shape, rt.dtype, vec![]);
     }
+    if b_transferred { nsl_tensor_free(b); }
     result
 }
 
@@ -1295,7 +1295,6 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x - y);
-    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
     }
@@ -1305,6 +1304,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
         let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
         crate::trace::record_op(crate::trace::OpType::Sub, vec![a, b], result, shape, rt.dtype, vec![]);
     }
+    if b_transferred { nsl_tensor_free(b); }
     result
 }
 
@@ -1327,7 +1327,6 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x * y);
-    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount += 1;
         NslTensor::from_ptr(b).refcount += 1;
@@ -1347,6 +1346,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
         let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
         crate::trace::record_op(crate::trace::OpType::Mul, vec![a, b], result, shape, rt.dtype, vec![]);
     }
+    if b_transferred { nsl_tensor_free(b); }
     result
 }
 
@@ -1369,7 +1369,6 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
     let a_shape = get_shape_vec(NslTensor::from_ptr(a));
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x / y);
-    if b_transferred { nsl_tensor_free(b); }
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount += 1;
         NslTensor::from_ptr(b).refcount += 1;
@@ -1389,6 +1388,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
         let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
         crate::trace::record_op(crate::trace::OpType::Div, vec![a, b], result, shape, rt.dtype, vec![]);
     }
+    if b_transferred { nsl_tensor_free(b); }
     result
 }
 

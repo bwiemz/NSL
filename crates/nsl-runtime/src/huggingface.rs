@@ -287,6 +287,8 @@ pub extern "C" fn nsl_hf_load(
                             crate::dict::nsl_dict_get_str(shard_dict, key_i64);
                         crate::dict::nsl_dict_set_str(merged_dict, key_i64, tensor_ptr);
                     }
+                    // Free the per-shard dict structure (values moved to merged_dict)
+                    crate::dict::nsl_dict_free(shard_dict);
                 }
 
                 eprintln!(
