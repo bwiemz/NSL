@@ -69,6 +69,20 @@ enum Cli {
         #[arg(long)]
         filter: Option<String>,
     },
+
+    /// Export model to ONNX or checkpoint to safetensors
+    Export {
+        /// Input file (.nsl for ONNX export, .nslm for safetensors conversion)
+        file: PathBuf,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Output format (onnx, safetensors) — inferred from extension if omitted
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 fn main() {
@@ -96,6 +110,13 @@ fn main() {
         }
         Cli::Test { file, filter } => {
             run_test(&file, filter.as_deref());
+        }
+        Cli::Export {
+            file,
+            output,
+            format,
+        } => {
+            run_export(&file, output.as_deref(), format.as_deref());
         }
     }
 }
@@ -698,5 +719,81 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
 
     if failed > 0 {
         process::exit(1);
+    }
+}
+
+fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&str>) {
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    // Determine export mode from format flag, output extension, or input extension
+    let mode = if let Some(fmt) = format {
+        fmt.to_lowercase()
+    } else if let Some(out) = output {
+        out.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+    } else {
+        match ext {
+            "nsl" => "onnx".to_string(),
+            "nslm" => "safetensors".to_string(),
+            _ => {
+                eprintln!(
+                    "error: cannot determine export format from '{}'.\n\
+                     Use --format onnx or --format safetensors, or provide an output path with --output.",
+                    file.display()
+                );
+                process::exit(1);
+            }
+        }
+    };
+
+    match mode.as_str() {
+        "onnx" => {
+            if ext != "nsl" {
+                eprintln!(
+                    "error: ONNX export requires an .nsl input file, got '{}'",
+                    file.display()
+                );
+                process::exit(1);
+            }
+            // The NSL file should contain an export_model() function (or similar)
+            // that calls to_onnx() internally. We just compile and run it.
+            println!("Exporting ONNX from {}", file.display());
+            run_run(file, &[]);
+        }
+        "safetensors" => {
+            if ext != "nslm" {
+                eprintln!(
+                    "error: safetensors conversion requires an .nslm input file, got '{}'",
+                    file.display()
+                );
+                process::exit(1);
+            }
+            let out_path = output.unwrap_or_else(|| {
+                // Will use the stem + .safetensors
+                std::path::Path::new("output.safetensors")
+            });
+            println!(
+                "Converting {} to safetensors format at {}",
+                file.display(),
+                out_path.display()
+            );
+            // TODO: implement NSLM → safetensors data conversion
+            // This requires parsing the NSLM binary header (magic + JSON + f64 data)
+            // and writing it in the safetensors format.
+            eprintln!("note: .nslm to safetensors conversion is not yet implemented");
+            process::exit(1);
+        }
+        other => {
+            eprintln!(
+                "error: unknown export format '{}'. Supported formats: onnx, safetensors",
+                other
+            );
+            process::exit(1);
+        }
     }
 }

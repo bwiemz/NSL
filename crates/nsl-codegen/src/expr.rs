@@ -1064,6 +1064,11 @@ impl Compiler<'_> {
             return self.compile_from_hf(builder, state, args);
         }
 
+        // ONNX export intrinsic: to_onnx(model, input, "output.onnx")
+        if func_name == "to_onnx" {
+            return self.compile_to_onnx(builder, state, args);
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();
@@ -2536,6 +2541,110 @@ impl Compiler<'_> {
             "nsl_kernel_launch",
             &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val],
         )
+    }
+
+    // ── to_onnx() compiler intrinsic ─────────────────────────────────
+
+    /// Compile a `to_onnx(model, input, "path.onnx")` call.
+    ///
+    /// Emits: trace_start → register_input → model.forward(input) →
+    ///        register_output → trace_stop → onnx_export.
+    fn compile_to_onnx(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        args: &[nsl_ast::expr::Arg],
+    ) -> Result<Value, CodegenError> {
+        if args.len() < 3 {
+            return Err(CodegenError::new(
+                "to_onnx() requires 3 arguments: to_onnx(model, input, \"output.onnx\")",
+            ));
+        }
+
+        // ── arg 0: model instance ────────────────────────────────────
+        let model_val = self.compile_expr(builder, state, &args[0].value)?;
+
+        let model_type = self.node_type(args[0].value.id).clone();
+        let model_name = match &model_type {
+            Type::Model { name, .. } => self.resolve_sym(*name).to_string(),
+            _ => {
+                return Err(CodegenError::new(
+                    "to_onnx(): first argument must be a model instance",
+                ));
+            }
+        };
+
+        // ── arg 1: input tensor ──────────────────────────────────────
+        let input_val = self.compile_expr(builder, state, &args[1].value)?;
+
+        // ── arg 2: output path string ────────────────────────────────
+        let path_val = self.compile_expr(builder, state, &args[2].value)?;
+
+        let path_str = match &args[2].value.kind {
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => {
+                return Err(CodegenError::new(
+                    "to_onnx(): third argument must be a string literal (output path)",
+                ));
+            }
+        };
+        let path_len_val = builder
+            .ins()
+            .iconst(cl_types::I64, path_str.len() as i64);
+
+        // ── 1. nsl_trace_start() ─────────────────────────────────────
+        self.compile_call_by_name(builder, "nsl_trace_start", &[])?;
+
+        // ── 2. nsl_trace_register_input(input, "input_0") ───────────
+        self.intern_string("input_0")?;
+        let input_name_ptr = self.compile_string_literal(builder, "input_0")?;
+        self.compile_call_by_name(
+            builder,
+            "nsl_trace_register_input",
+            &[input_val, input_name_ptr],
+        )?;
+
+        // ── 3. Call model's forward method ───────────────────────────
+        let mangled_forward = if let Some(methods) = self.model_methods.get(&model_name) {
+            methods
+                .get("forward")
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "to_onnx(): model '{model_name}' has no 'forward' method"
+                    ))
+                })?
+                .clone()
+        } else {
+            format!("__nsl_model_{model_name}_forward")
+        };
+
+        let result = self.compile_call_by_name(
+            builder,
+            &mangled_forward,
+            &[model_val, input_val],
+        )?;
+
+        // ── 4. nsl_trace_register_output(result, "output_0") ────────
+        self.intern_string("output_0")?;
+        let output_name_ptr = self.compile_string_literal(builder, "output_0")?;
+        self.compile_call_by_name(
+            builder,
+            "nsl_trace_register_output",
+            &[result, output_name_ptr],
+        )?;
+
+        // ── 5. let trace = nsl_trace_stop() ──────────────────────────
+        let trace = self.compile_call_by_name(builder, "nsl_trace_stop", &[])?;
+
+        // ── 6. nsl_onnx_export(trace, path_ptr, path_len) ───────────
+        self.compile_call_by_name(
+            builder,
+            "nsl_onnx_export",
+            &[trace, path_val, path_len_val],
+        )?;
+
+        // Return the forward result so callers can use the output
+        Ok(result)
     }
 
     // ── from_hf() compiler intrinsic ─────────────────────────────────
