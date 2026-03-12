@@ -200,8 +200,8 @@ impl<'a> TypeChecker<'a> {
                         if !is_assignable(&ty, expected) {
                             self.diagnostics.push(
                                 Diagnostic::error(format!(
-                                    "return type mismatch: expected {:?}, got {:?}",
-                                    expected, ty
+                                    "return type mismatch: expected {}, got {}",
+                                    display_type(expected), display_type(&ty)
                                 ))
                                 .with_label(expr.span, "wrong type"),
                             );
@@ -255,8 +255,8 @@ impl<'a> TypeChecker<'a> {
                     if !target_ty.is_indeterminate() {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
-                                "type mismatch in assignment: expected {:?}, got {:?}",
-                                target_ty, value_ty
+                                "type mismatch in assignment: expected {}, got {}",
+                                display_type(&target_ty), display_type(&value_ty)
                             ))
                             .with_label(value.span, "wrong type"),
                         );
@@ -551,10 +551,12 @@ impl<'a> TypeChecker<'a> {
             self.declare_symbol(param.name, param_ty, param.span, false, true);
         }
 
-        // Collect fields and methods
+        // Two-pass approach: first collect ALL fields and method signatures,
+        // then check method bodies with a complete `self` type.
         let mut fields: Vec<(Symbol, Type)> = Vec::new();
         let mut methods: Vec<(Symbol, Type)> = Vec::new();
 
+        // Pass 1: Collect fields and method signatures
         for member in &model_def.members {
             match member {
                 ModelMember::LayerDecl {
@@ -573,54 +575,62 @@ impl<'a> TypeChecker<'a> {
                 }
                 ModelMember::Method(fn_def) => {
                     let method_ty = self.build_fn_type(fn_def);
-                    methods.push((fn_def.name, method_ty.clone()));
-
-                    // Check method body with Method scope (has self)
-                    let method_scope =
-                        self.scopes.push_scope(self.current_scope, ScopeKind::Method);
-                    let prev_method = self.current_scope;
-                    let prev_return = self.current_return_type.take();
-                    self.current_scope = method_scope;
-
-                    // Declare self with model type
-                    let self_sym = Symbol(self.interner.get_or_intern_static("self"));
-                    let self_type = Type::Model {
-                        name: model_def.name,
-                        fields: fields.clone(),
-                        methods: Vec::new(),
-                    };
-                    self.declare_symbol(self_sym, self_type, fn_def.span, false, true);
-
-                    // Set return type
-                    if let Type::Function { ret, .. } = &method_ty {
-                        self.current_return_type = Some(*ret.clone());
-                    }
-
-                    // Declare params (skip self)
-                    for param in &fn_def.params {
-                        let name_str = self.resolve_name(param.name);
-                        if name_str == "self" {
-                            continue;
-                        }
-                        let param_ty = param
-                            .type_ann
-                            .as_ref()
-                            .map(|t| self.resolve_type(t))
-                            .unwrap_or(Type::Unknown);
-                        self.declare_symbol(param.name, param_ty, param.span, false, true);
-                        if let Some(default) = &param.default {
-                            self.check_expr(default);
-                        }
-                    }
-
-                    // Check method body
-                    for s in &fn_def.body.stmts {
-                        self.check_stmt(s);
-                    }
-
-                    self.current_scope = prev_method;
-                    self.current_return_type = prev_return;
+                    methods.push((fn_def.name, method_ty));
                 }
+            }
+        }
+
+        // Build complete self type with all fields and methods
+        let complete_self_type = Type::Model {
+            name: model_def.name,
+            fields: fields.clone(),
+            methods: methods.clone(),
+        };
+
+        // Pass 2: Check method bodies with complete self type
+        for member in &model_def.members {
+            if let ModelMember::Method(fn_def) = member {
+                let method_ty = self.build_fn_type(fn_def);
+
+                let method_scope =
+                    self.scopes.push_scope(self.current_scope, ScopeKind::Method);
+                let prev_method = self.current_scope;
+                let prev_return = self.current_return_type.take();
+                self.current_scope = method_scope;
+
+                // Declare self with complete model type
+                let self_sym = Symbol(self.interner.get_or_intern_static("self"));
+                self.declare_symbol(self_sym, complete_self_type.clone(), fn_def.span, false, true);
+
+                // Set return type
+                if let Type::Function { ret, .. } = &method_ty {
+                    self.current_return_type = Some(*ret.clone());
+                }
+
+                // Declare params (skip self)
+                for param in &fn_def.params {
+                    let name_str = self.resolve_name(param.name);
+                    if name_str == "self" {
+                        continue;
+                    }
+                    let param_ty = param
+                        .type_ann
+                        .as_ref()
+                        .map(|t| self.resolve_type(t))
+                        .unwrap_or(Type::Unknown);
+                    self.declare_symbol(param.name, param_ty, param.span, false, true);
+                    if let Some(default) = &param.default {
+                        self.check_expr(default);
+                    }
+                }
+
+                // Check method body
+                for s in &fn_def.body.stmts {
+                    self.check_stmt(s);
+                }
+
+                self.current_scope = prev_method;
+                self.current_return_type = prev_return;
             }
         }
 
@@ -673,7 +683,10 @@ impl<'a> TypeChecker<'a> {
             } else {
                 Type::Function {
                     params: field_types,
-                    ret: Box::new(Type::Unknown),
+                    ret: Box::new(Type::Enum {
+                        name: enum_def.name,
+                        variants: Vec::new(), // filled in later
+                    }),
                 }
             };
             self.declare_symbol(variant.name, variant_ty, variant.span, true, false);
@@ -709,7 +722,12 @@ impl<'a> TypeChecker<'a> {
             ImportItems::Named(items) => {
                 for item in items {
                     let local_name = item.alias.unwrap_or(item.name);
-                    let ty = self.import_types.get(&local_name).cloned().unwrap_or(Type::Unknown);
+                    // Look up by original name first (import_types is keyed by export name),
+                    // then fall back to alias name for compatibility.
+                    let ty = self.import_types.get(&item.name)
+                        .or_else(|| self.import_types.get(&local_name))
+                        .cloned()
+                        .unwrap_or(Type::Unknown);
                     self.declare_symbol(local_name, ty, item.span, true, false);
                 }
             }
@@ -723,7 +741,10 @@ impl<'a> TypeChecker<'a> {
             ImportItems::Named(items) => {
                 for item in items {
                     let local_name = item.alias.unwrap_or(item.name);
-                    let ty = self.import_types.get(&local_name).cloned().unwrap_or(Type::Unknown);
+                    let ty = self.import_types.get(&item.name)
+                        .or_else(|| self.import_types.get(&local_name))
+                        .cloned()
+                        .unwrap_or(Type::Unknown);
                     self.declare_symbol(local_name, ty, item.span, true, false);
                 }
             }
@@ -1115,7 +1136,7 @@ impl<'a> TypeChecker<'a> {
                 {
                     self.diagnostics.push(
                         Diagnostic::error("cannot operate on tensors on different devices")
-                            .with_label(span, format!("{:?} vs {:?}", ldev, rdev)),
+                            .with_label(span, format!("{} vs {}", display_device(ldev), display_device(rdev))),
                     );
                 }
                 match shapes::check_elementwise(ls, rs, span) {
@@ -1138,11 +1159,23 @@ impl<'a> TypeChecker<'a> {
             // String repeat
             (Type::Str, Type::Int) if matches!(op, BinOp::Mul) => Type::Str,
             (Type::Int, Type::Str) if matches!(op, BinOp::Mul) => Type::Str,
+            // Specific numeric types (e.g. f32 + f32, int32 + int32)
+            (l, r) if dtype_rank(l).0 > 0 && dtype_rank(r).0 > 0 => {
+                let (lf, lr) = dtype_rank(l);
+                let (rf, rr) = dtype_rank(r);
+                if lf == rf {
+                    // Same family: return the wider type
+                    if lr >= rr { l.clone() } else { r.clone() }
+                } else {
+                    // Mixed int/float: promote to float side
+                    if lf == 2 { l.clone() } else { r.clone() }
+                }
+            }
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(format!(
-                        "unsupported operand types for {:?}: {:?} and {:?}",
-                        op, lty, rty
+                        "unsupported operand types for {:?}: {} and {}",
+                        op, display_type(lty), display_type(rty)
                     ))
                     .with_label(span, "type error"),
                 );
@@ -1171,7 +1204,7 @@ impl<'a> TypeChecker<'a> {
                 {
                     self.diagnostics.push(
                         Diagnostic::error("matmul: device mismatch")
-                            .with_label(span, format!("{:?} vs {:?}", ldev, rdev)),
+                            .with_label(span, format!("{} vs {}", display_device(ldev), display_device(rdev))),
                     );
                 }
                 match shapes::check_matmul(ls, rs, span) {
@@ -1365,10 +1398,10 @@ impl<'a> TypeChecker<'a> {
                     if !is_assignable(arg_ty, param_ty) {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
-                                "argument {}: expected {:?}, got {:?}",
+                                "argument {}: expected {}, got {}",
                                 i + 1,
-                                param_ty,
-                                arg_ty
+                                display_type(param_ty),
+                                display_type(arg_ty)
                             ))
                             .with_label(args[i].span, "type mismatch"),
                         );
@@ -1383,7 +1416,7 @@ impl<'a> TypeChecker<'a> {
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error("expression is not callable")
-                        .with_label(span, format!("type {:?} is not callable", callee_ty)),
+                        .with_label(span, format!("type {} is not callable", display_type(&callee_ty))),
                 );
                 Type::Error
             }

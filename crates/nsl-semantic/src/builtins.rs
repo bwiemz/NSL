@@ -275,7 +275,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "dropout",
         Type::Function {
-            params: vec![tensor_ret.clone(), Type::Float, Type::Int],
+            params: vec![tensor_ret.clone(), Type::Float, Type::Bool],
             ret: Box::new(tensor_ret.clone()),
         },
     );

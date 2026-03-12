@@ -264,28 +264,31 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
         // Dtype: must match (dtype widening for tensors is a later feature)
         return vd == ad;
     }
-    // Numeric widening: int4 -> int8 -> int16 -> int32 -> int64
-    if dtype_rank(source) > 0 && dtype_rank(target) > 0 && dtype_rank(source) <= dtype_rank(target)
-    {
+    // Numeric widening: only within same family (int->int or float->float)
+    let (src_family, src_rank) = dtype_rank(source);
+    let (tgt_family, tgt_rank) = dtype_rank(target);
+    if src_family > 0 && tgt_family > 0 && src_family == tgt_family && src_rank <= tgt_rank {
         return true;
     }
     false
 }
 
-/// Returns a "rank" for numeric types used in widening checks. 0 = not numeric.
-fn dtype_rank(ty: &Type) -> u8 {
+/// Returns (family, rank) for numeric types. Family: 0=non-numeric, 1=int, 2=float.
+/// Widening is only allowed within the same family to prevent e.g. Int64 -> Fp8.
+pub fn dtype_rank(ty: &Type) -> (u8, u8) {
     match ty {
-        Type::Int4 => 1,
-        Type::Int8 => 2,
-        Type::Int16 => 3,
-        Type::Int32 => 4,
-        Type::Int64 | Type::Int => 5,
-        Type::Fp8E4m3 | Type::Fp8E5m2 => 6,
-        Type::Fp16 => 7,
-        Type::Bf16 => 8,
-        Type::F32 => 9,
-        Type::F64 | Type::Float => 10,
-        _ => 0,
+        Type::Int4 => (1, 1),
+        Type::Uint8 => (1, 2),
+        Type::Int8 => (1, 2),
+        Type::Int16 => (1, 3),
+        Type::Int32 => (1, 4),
+        Type::Int64 | Type::Int => (1, 5),
+        Type::Fp8E4m3 | Type::Fp8E5m2 => (2, 1),
+        Type::Fp16 => (2, 2),
+        Type::Bf16 => (2, 3),
+        Type::F32 => (2, 4),
+        Type::F64 | Type::Float => (2, 5),
+        _ => (0, 0),
     }
 }
 
@@ -419,7 +422,7 @@ fn display_dtype(dtype: &DType) -> String {
     }
 }
 
-fn display_device(device: &Device) -> String {
+pub fn display_device(device: &Device) -> String {
     match device {
         Device::Cpu => "cpu".into(),
         Device::Cuda(None) => "cuda".into(),
