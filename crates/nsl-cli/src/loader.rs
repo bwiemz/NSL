@@ -78,6 +78,21 @@ fn discover_imports(
                     alias: import_stmt.alias.unwrap(),
                 }));
             }
+            StmtKind::Import(import_stmt)
+                if matches!(import_stmt.items, ImportItems::Glob | ImportItems::Named(_)) =>
+            {
+                let resolved = resolver::resolve_import(
+                    &import_stmt.path,
+                    source_file,
+                    interner,
+                )?;
+                // Treat `import X.*` / `import X.{Y,Z}` like `from X import *` / `from X import {Y,Z}`
+                imports.push((resolved, ImportInfo::From(FromImportStmt {
+                    module_path: import_stmt.path.clone(),
+                    items: import_stmt.items.clone(),
+                    span: import_stmt.span,
+                })));
+            }
             _ => {}
         }
     }

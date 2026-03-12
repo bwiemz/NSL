@@ -771,7 +771,15 @@ impl<'a> TypeChecker<'a> {
                     self.declare_symbol(local_name, ty, item.span, true, false);
                 }
             }
-            ImportItems::Glob => {} // Can't declare specific names
+            ImportItems::Glob => {
+                // For glob imports, all import_types have been pre-populated by the loader
+                let entries: Vec<_> = self.import_types.iter()
+                    .map(|(sym, ty)| (*sym, ty.clone()))
+                    .collect();
+                for (sym, ty) in entries {
+                    self.declare_symbol(sym, ty, import.span, true, false);
+                }
+            }
         }
     }
 
