@@ -86,46 +86,59 @@ pub(crate) unsafe fn checked_free(ptr: *mut u8, size: usize) {
 }
 
 /// Allocation statistics for fuzz testing. Only compiled in test builds.
+/// Uses thread-local counters so parallel tests don't interfere with each other.
 #[cfg(test)]
 pub mod stats {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::Cell;
 
-    pub static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-    pub static FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
-    pub static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
-    pub static FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-    pub static CUDA_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-    pub static CUDA_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
-    pub static CUDA_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
-    pub static CUDA_FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+        static FREE_COUNT: Cell<usize> = const { Cell::new(0) };
+        static ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
+        static FREE_BYTES: Cell<usize> = const { Cell::new(0) };
+        static CUDA_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+        static CUDA_FREE_COUNT: Cell<usize> = const { Cell::new(0) };
+        static CUDA_ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
+        static CUDA_FREE_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
 
     pub fn reset() {
-        for counter in [
-            &ALLOC_COUNT, &FREE_COUNT, &ALLOC_BYTES, &FREE_BYTES,
-            &CUDA_ALLOC_COUNT, &CUDA_FREE_COUNT, &CUDA_ALLOC_BYTES, &CUDA_FREE_BYTES,
-        ] {
-            counter.store(0, Ordering::SeqCst);
-        }
+        ALLOC_COUNT.with(|c| c.set(0));
+        FREE_COUNT.with(|c| c.set(0));
+        ALLOC_BYTES.with(|c| c.set(0));
+        FREE_BYTES.with(|c| c.set(0));
+        CUDA_ALLOC_COUNT.with(|c| c.set(0));
+        CUDA_FREE_COUNT.with(|c| c.set(0));
+        CUDA_ALLOC_BYTES.with(|c| c.set(0));
+        CUDA_FREE_BYTES.with(|c| c.set(0));
     }
 
     pub fn cpu_alloc(size: usize) {
-        ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
-        ALLOC_BYTES.fetch_add(size, Ordering::SeqCst);
+        ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+        ALLOC_BYTES.with(|c| c.set(c.get() + size));
     }
 
     pub fn cpu_free(size: usize) {
-        FREE_COUNT.fetch_add(1, Ordering::SeqCst);
-        FREE_BYTES.fetch_add(size, Ordering::SeqCst);
+        FREE_COUNT.with(|c| c.set(c.get() + 1));
+        FREE_BYTES.with(|c| c.set(c.get() + size));
     }
 
     pub fn cuda_alloc(size: usize) {
-        CUDA_ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
-        CUDA_ALLOC_BYTES.fetch_add(size, Ordering::SeqCst);
+        CUDA_ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+        CUDA_ALLOC_BYTES.with(|c| c.set(c.get() + size));
     }
 
     pub fn cuda_free(size: usize) {
-        CUDA_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
-        CUDA_FREE_BYTES.fetch_add(size, Ordering::SeqCst);
+        CUDA_FREE_COUNT.with(|c| c.set(c.get() + 1));
+        CUDA_FREE_BYTES.with(|c| c.set(c.get() + size));
     }
+
+    pub fn alloc_count() -> usize { ALLOC_COUNT.with(|c| c.get()) }
+    pub fn free_count() -> usize { FREE_COUNT.with(|c| c.get()) }
+    pub fn alloc_bytes() -> usize { ALLOC_BYTES.with(|c| c.get()) }
+    pub fn free_bytes() -> usize { FREE_BYTES.with(|c| c.get()) }
+    pub fn cuda_alloc_count() -> usize { CUDA_ALLOC_COUNT.with(|c| c.get()) }
+    pub fn cuda_free_count() -> usize { CUDA_FREE_COUNT.with(|c| c.get()) }
+    pub fn cuda_alloc_bytes() -> usize { CUDA_ALLOC_BYTES.with(|c| c.get()) }
+    pub fn cuda_free_bytes() -> usize { CUDA_FREE_BYTES.with(|c| c.get()) }
 }

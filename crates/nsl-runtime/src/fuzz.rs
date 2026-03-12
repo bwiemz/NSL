@@ -451,14 +451,14 @@ impl FuzzState {
     }
 }
 
+/// Assert that allocation counters balance (allocs == frees).
+/// Thread-local counters mean no interference from parallel tests.
 #[cfg(test)]
 fn assert_counter_balance(seed: u64) {
-    use std::sync::atomic::Ordering;
-
-    let ac = stats::ALLOC_COUNT.load(Ordering::SeqCst);
-    let fc = stats::FREE_COUNT.load(Ordering::SeqCst);
-    let ab = stats::ALLOC_BYTES.load(Ordering::SeqCst);
-    let fb = stats::FREE_BYTES.load(Ordering::SeqCst);
+    let ac = stats::alloc_count();
+    let fc = stats::free_count();
+    let ab = stats::alloc_bytes();
+    let fb = stats::free_bytes();
 
     if ac != fc || ab != fb {
         panic!(
@@ -475,48 +475,39 @@ fn assert_counter_balance(seed: u64) {
     }
 }
 
-/// Mutex to serialize fuzz tests — global atomic counters are process-wide,
-/// so concurrent tests would produce false positives.
-#[cfg(test)]
-static FUZZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use crate::memory::stats;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_stats_counter_reset() {
-        let _guard = super::FUZZ_LOCK.lock().unwrap();
         stats::reset();
-        assert_eq!(stats::ALLOC_COUNT.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::FREE_COUNT.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::ALLOC_BYTES.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::FREE_BYTES.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::CUDA_ALLOC_COUNT.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::CUDA_FREE_COUNT.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::CUDA_ALLOC_BYTES.load(Ordering::SeqCst), 0);
-        assert_eq!(stats::CUDA_FREE_BYTES.load(Ordering::SeqCst), 0);
+        assert_eq!(stats::alloc_count(), 0);
+        assert_eq!(stats::free_count(), 0);
+        assert_eq!(stats::alloc_bytes(), 0);
+        assert_eq!(stats::free_bytes(), 0);
+        assert_eq!(stats::cuda_alloc_count(), 0);
+        assert_eq!(stats::cuda_free_count(), 0);
+        assert_eq!(stats::cuda_alloc_bytes(), 0);
+        assert_eq!(stats::cuda_free_bytes(), 0);
     }
 
     #[test]
     fn test_stats_track_alloc_free() {
-        let _guard = super::FUZZ_LOCK.lock().unwrap();
         stats::reset();
 
         let ptr = crate::memory::checked_alloc(256);
-        assert_eq!(stats::ALLOC_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(stats::ALLOC_BYTES.load(Ordering::SeqCst), 256);
-        assert_eq!(stats::FREE_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(stats::alloc_count(), 1);
+        assert_eq!(stats::alloc_bytes(), 256);
+        assert_eq!(stats::free_count(), 0);
 
         unsafe { crate::memory::checked_free(ptr, 256); }
-        assert_eq!(stats::FREE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(stats::FREE_BYTES.load(Ordering::SeqCst), 256);
+        assert_eq!(stats::free_count(), 1);
+        assert_eq!(stats::free_bytes(), 256);
     }
 
     #[test]
     fn test_tensor_lifecycle_counter_balance() {
-        let _guard = super::FUZZ_LOCK.lock().unwrap();
         use crate::tensor::{nsl_tensor_zeros, nsl_tensor_add, nsl_tensor_free};
         use crate::list::{nsl_list_new, nsl_list_push, nsl_list_free};
 
@@ -540,15 +531,7 @@ mod tests {
         nsl_list_free(shape);
         nsl_list_free(shape2);
 
-        let allocs = stats::ALLOC_COUNT.load(Ordering::SeqCst);
-        let frees = stats::FREE_COUNT.load(Ordering::SeqCst);
-        let alloc_bytes = stats::ALLOC_BYTES.load(Ordering::SeqCst);
-        let free_bytes = stats::FREE_BYTES.load(Ordering::SeqCst);
-
-        assert_eq!(allocs, frees,
-            "CPU alloc/free count mismatch: {} allocs, {} frees", allocs, frees);
-        assert_eq!(alloc_bytes, free_bytes,
-            "CPU alloc/free bytes mismatch: {} allocated, {} freed", alloc_bytes, free_bytes);
+        super::assert_counter_balance(0);
     }
 
     #[test]
@@ -569,7 +552,6 @@ mod tests {
 
     #[test]
     fn fuzz_memory_lifecycle() {
-        let _guard = super::FUZZ_LOCK.lock().unwrap();
         let num_seeds: u64 = 100;
         let ops_per_seed = 150;
 
@@ -589,7 +571,6 @@ mod tests {
 
     #[test]
     fn fuzz_tape_stress() {
-        let _guard = super::FUZZ_LOCK.lock().unwrap();
         let num_seeds: u64 = 50;
 
         for seed in 1000..1000 + num_seeds {
