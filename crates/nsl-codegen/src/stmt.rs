@@ -332,11 +332,16 @@ impl Compiler<'_> {
                                         obj_val,
                                         field.offset as i32,
                                     );
-                                    match op {
-                                        AssignOp::AddAssign => builder.ins().iadd(old_val, new_val),
-                                        AssignOp::SubAssign => builder.ins().isub(old_val, new_val),
-                                        AssignOp::MulAssign => builder.ins().imul(old_val, new_val),
-                                        AssignOp::DivAssign => builder.ins().sdiv(old_val, new_val),
+                                    let is_float = field.cl_type == cl_types::F64 || field.cl_type == cl_types::F32;
+                                    match (op, is_float) {
+                                        (AssignOp::AddAssign, true) => builder.ins().fadd(old_val, new_val),
+                                        (AssignOp::SubAssign, true) => builder.ins().fsub(old_val, new_val),
+                                        (AssignOp::MulAssign, true) => builder.ins().fmul(old_val, new_val),
+                                        (AssignOp::DivAssign, true) => builder.ins().fdiv(old_val, new_val),
+                                        (AssignOp::AddAssign, false) => builder.ins().iadd(old_val, new_val),
+                                        (AssignOp::SubAssign, false) => builder.ins().isub(old_val, new_val),
+                                        (AssignOp::MulAssign, false) => builder.ins().imul(old_val, new_val),
+                                        (AssignOp::DivAssign, false) => builder.ins().sdiv(old_val, new_val),
                                         _ => unreachable!(),
                                     }
                                 };
@@ -368,11 +373,16 @@ impl Compiler<'_> {
                                         obj_val,
                                         field.offset as i32,
                                     );
-                                    match op {
-                                        AssignOp::AddAssign => builder.ins().iadd(old_val, new_val),
-                                        AssignOp::SubAssign => builder.ins().isub(old_val, new_val),
-                                        AssignOp::MulAssign => builder.ins().imul(old_val, new_val),
-                                        AssignOp::DivAssign => builder.ins().sdiv(old_val, new_val),
+                                    let is_float = field.cl_type == cl_types::F64 || field.cl_type == cl_types::F32;
+                                    match (op, is_float) {
+                                        (AssignOp::AddAssign, true) => builder.ins().fadd(old_val, new_val),
+                                        (AssignOp::SubAssign, true) => builder.ins().fsub(old_val, new_val),
+                                        (AssignOp::MulAssign, true) => builder.ins().fmul(old_val, new_val),
+                                        (AssignOp::DivAssign, true) => builder.ins().fdiv(old_val, new_val),
+                                        (AssignOp::AddAssign, false) => builder.ins().iadd(old_val, new_val),
+                                        (AssignOp::SubAssign, false) => builder.ins().isub(old_val, new_val),
+                                        (AssignOp::MulAssign, false) => builder.ins().imul(old_val, new_val),
+                                        (AssignOp::DivAssign, false) => builder.ins().sdiv(old_val, new_val),
                                         _ => unreachable!(),
                                     }
                                 };

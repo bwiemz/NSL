@@ -236,9 +236,18 @@ impl Compiler<'_> {
         // Promote int → float if mixed types
         if is_float {
             if !left_is_float {
+                // fcvt_from_sint requires I32 or I64; widen sub-I32 ints first
+                let lhs_ty = builder.func.dfg.value_type(lhs);
+                if lhs_ty.bits() < 32 {
+                    lhs = builder.ins().sextend(cl_types::I64, lhs);
+                }
                 lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
             }
             if !right_is_float {
+                let rhs_ty = builder.func.dfg.value_type(rhs);
+                if rhs_ty.bits() < 32 {
+                    rhs = builder.ins().sextend(cl_types::I64, rhs);
+                }
                 rhs = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
             }
         }
@@ -305,7 +314,9 @@ impl Compiler<'_> {
                 let fid = self.runtime_fns["nsl_str_eq"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[lhs, rhs]);
-                Ok(builder.inst_results(call)[0])
+                let result_i64 = builder.inst_results(call)[0];
+                // Narrow I64 result to I8 to match icmp return type
+                Ok(builder.ins().ireduce(cl_types::I8, result_i64))
             }
             BinOp::Eq => Ok(builder.ins().icmp(IntCC::Equal, lhs, rhs)),
             BinOp::NotEq if is_float => Ok(builder.ins().fcmp(FloatCC::NotEqual, lhs, rhs)),
@@ -313,10 +324,11 @@ impl Compiler<'_> {
                 let fid = self.runtime_fns["nsl_str_eq"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[lhs, rhs]);
-                let eq_val = builder.inst_results(call)[0];
-                // Invert: not-equal = 1 - eq
-                let one = builder.ins().iconst(cl_types::I64, 1);
-                Ok(builder.ins().isub(one, eq_val))
+                let eq_i64 = builder.inst_results(call)[0];
+                // Narrow to I8 and invert: not-equal = 1 - eq
+                let eq_i8 = builder.ins().ireduce(cl_types::I8, eq_i64);
+                let one = builder.ins().iconst(cl_types::I8, 1);
+                Ok(builder.ins().isub(one, eq_i8))
             }
             BinOp::NotEq => Ok(builder.ins().icmp(IntCC::NotEqual, lhs, rhs)),
             BinOp::Lt if is_float => Ok(builder.ins().fcmp(FloatCC::LessThan, lhs, rhs)),
@@ -898,7 +910,10 @@ impl Compiler<'_> {
             let p_type = self.node_type(args[1].value.id).clone();
             let p_f = if is_float_type(&p_type) { p_val } else { builder.ins().fcvt_from_sint(cl_types::F64, p_val) };
             let training_val = self.compile_expr(builder, state, &args[2].value)?;
-            let training_i8 = builder.ins().ireduce(cl_types::I8, training_val);
+            let training_i8 = {
+                let vt = builder.func.dfg.value_type(training_val);
+                if vt == cl_types::I8 { training_val } else { builder.ins().ireduce(cl_types::I8, training_val) }
+            };
             return self.compile_call_by_name(builder, "nsl_tensor_dropout", &[tensor_val, p_f, training_i8]);
         }
         // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
@@ -1249,9 +1264,30 @@ impl Compiler<'_> {
             }
         };
 
+        // Widen sub-I64 integer values for nsl_print_int (expects I64),
+        // or widen F32 for nsl_print_float (expects F64)
+        let print_val = match rt_fn {
+            "nsl_print_int" => {
+                let vt = builder.func.dfg.value_type(val);
+                if vt.bits() < 64 && vt.is_int() {
+                    builder.ins().sextend(cl_types::I64, val)
+                } else {
+                    val
+                }
+            }
+            "nsl_print_float" => {
+                let vt = builder.func.dfg.value_type(val);
+                if vt == cl_types::F32 {
+                    builder.ins().fpromote(cl_types::F64, val)
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        };
         let fid = self.runtime_fns[rt_fn].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
-        builder.ins().call(fref, &[val]);
+        builder.ins().call(fref, &[print_val]);
         Ok(builder.ins().iconst(cl_types::I64, 0))
     }
 
