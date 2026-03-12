@@ -599,4 +599,78 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(Type::Void),
         },
     );
+
+    // Data pipeline intrinsics (M19)
+    def(
+        "load_jsonl",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(Type::List(Box::new(Type::Str))),
+        },
+    );
+    def(
+        "load_csv",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(Type::List(Box::new(Type::Str))),
+        },
+    );
+    def(
+        "load_mmap",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    def(
+        "DataLoader",
+        Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Unknown),
+        },
+    );
+
+    // Sampling intrinsics (M19)
+    def(
+        "topk",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()))),
+        },
+    );
+    def(
+        "multinomial",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    def(
+        "argmax",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    def(
+        "manual_seed",
+        Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "cumsum",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+    def(
+        "lt_scalar",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
 }
