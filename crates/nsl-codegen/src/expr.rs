@@ -433,7 +433,7 @@ impl Compiler<'_> {
         let val = self.compile_expr(builder, state, operand)?;
         let ty = self.node_type(operand.id).clone();
         match op {
-            UnaryOp::Neg if matches!(ty, Type::Tensor { .. }) => {
+            UnaryOp::Neg if ty.is_tensor() || ty.is_indeterminate() => {
                 self.compile_call_by_name(builder, "nsl_tensor_neg", &[val])
             }
             UnaryOp::Neg if is_float_type(&ty) => Ok(builder.ins().fneg(val)),
@@ -1118,9 +1118,17 @@ impl Compiler<'_> {
             let handle = self.compile_expr(builder, state, &args[0].value)?;
             let texts = self.compile_expr(builder, state, &args[1].value)?;
             let padding = self.compile_expr(builder, state, &args[2].value)?;
-            let padding_i8 = builder.ins().ireduce(cl_types::I8, padding);
+            let padding_i8 = if builder.func.dfg.value_type(padding) == cl_types::I8 {
+                padding
+            } else {
+                builder.ins().ireduce(cl_types::I8, padding)
+            };
             let truncation = self.compile_expr(builder, state, &args[3].value)?;
-            let truncation_i8 = builder.ins().ireduce(cl_types::I8, truncation);
+            let truncation_i8 = if builder.func.dfg.value_type(truncation) == cl_types::I8 {
+                truncation
+            } else {
+                builder.ins().ireduce(cl_types::I8, truncation)
+            };
             let max_len = self.compile_expr(builder, state, &args[4].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_encode_batch", &[handle, texts, padding_i8, truncation_i8, max_len]);
         }
@@ -1365,6 +1373,10 @@ impl Compiler<'_> {
             let config_gv = self.module.declare_data_in_func(config_data_id, builder.func);
             let config_ptr = builder.ins().symbol_value(pointer_type(), config_gv);
             let config_len = builder.ins().iconst(cl_types::I64, config_json.len() as i64);
+
+            // Ensure tensor is on CPU (DataLoader reads raw f64 data pointer)
+            let cpu_device = builder.ins().iconst(cl_types::I64, 0);
+            let data_val = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[data_val, cpu_device])?;
 
             // Read tensor .len field (offset 32: data:8 + shape:8 + strides:8 + ndim:8)
             let tensor_len = builder.ins().load(
@@ -1893,8 +1905,12 @@ impl Compiler<'_> {
                 Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 => {
                     Ok(builder.ins().icmp_imm(IntCC::NotEqual, val, 0))
                 }
-                Type::Float | Type::F64 | Type::F32 => {
+                Type::Float | Type::F64 => {
                     let zero = builder.ins().f64const(0.0);
+                    Ok(builder.ins().fcmp(FloatCC::NotEqual, val, zero))
+                }
+                Type::F32 => {
+                    let zero = builder.ins().f32const(0.0);
                     Ok(builder.ins().fcmp(FloatCC::NotEqual, val, zero))
                 }
                 _ => Ok(builder.ins().icmp_imm(IntCC::NotEqual, val, 0)),
@@ -2705,8 +2721,10 @@ impl Compiler<'_> {
                 BinOp::Sub => {
                     // scalar - tensor = neg(tensor) + scalar
                     let neg_tensor = self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
-                    state.tensor_temporaries.push(neg_tensor);
-                    self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[neg_tensor, scalar])?
+                    let result = self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[neg_tensor, scalar])?;
+                    // Free the intermediate neg_tensor (consumed by add_scalar)
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[neg_tensor])?;
+                    result
                 }
                 _ => return Err(CodegenError::new(format!("unsupported scalar-tensor op: {op:?}"))),
             };
@@ -3249,6 +3267,9 @@ impl Compiler<'_> {
             "nsl_hf_load",
             &[model_val, meta_ptr, meta_len_val, repo_val, repo_len_val, device_val],
         )?;
+
+        // Free the temporary ParamMeta array
+        self.compile_call_by_name(builder, "nsl_free", &[meta_ptr])?;
 
         // Return the model pointer so callers can chain: let m = from_hf("repo", m)
         Ok(model_val)

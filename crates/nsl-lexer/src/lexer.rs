@@ -129,7 +129,8 @@ impl<'a> Lexer<'a> {
                 if !self.line_continuation && !self.indent.in_brackets() {
                     self.push_token(TokenKind::Newline, start);
                 }
-                self.line_continuation = false;
+                // Note: line_continuation is cleared in process_line_indentation,
+                // not here, so it survives until the indentation check runs.
                 self.at_line_start = true;
             }
             '\r' => {
@@ -138,7 +139,6 @@ impl<'a> Lexer<'a> {
                 if !self.line_continuation && !self.indent.in_brackets() {
                     self.push_token(TokenKind::Newline, start);
                 }
-                self.line_continuation = false;
                 self.at_line_start = true;
             }
 
@@ -411,6 +411,7 @@ impl<'a> Lexer<'a> {
 
     fn process_line_indentation(&mut self) {
         if self.line_continuation {
+            self.line_continuation = false;
             // Skip indentation on continuation lines
             while self.cursor.peek() == Some(' ') {
                 self.cursor.advance();

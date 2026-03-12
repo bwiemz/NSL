@@ -937,7 +937,10 @@ impl<'a> Compiler<'a> {
 
             // Compile body expression
             let result = self.compile_expr(&mut builder, &mut state, &lambda.body)?;
-            builder.ins().return_(&[result]);
+            let current = state.current_block.unwrap_or(entry);
+            if !crate::types::is_block_filled(&builder, current) {
+                builder.ins().return_(&[result]);
+            }
             builder.finalize();
         }
 
@@ -1305,6 +1308,8 @@ impl<'a> Compiler<'a> {
 
             let current = state.current_block.unwrap_or(entry);
             if !crate::types::is_block_filled(&builder, current) {
+                // Stop and free any DataLoaders before implicit main() return
+                self.teardown_dataloaders(&mut builder, &mut state);
                 let zero = builder.ins().iconst(cl_types::I32, 0);
                 builder.ins().return_(&[zero]);
             }

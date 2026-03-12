@@ -1087,13 +1087,13 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Paren(inner) => self.check_expr(inner),
             ExprKind::Await(inner) => self.check_expr(inner),
             ExprKind::MatchExpr { subject, arms } => {
-                self.check_expr(subject);
+                let subject_ty = self.check_expr(subject);
                 let mut result_ty = Type::Unknown;
                 for arm in arms {
                     let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                     let prev = self.current_scope;
                     self.current_scope = scope;
-                    self.declare_pattern(&arm.pattern, &Type::Unknown);
+                    self.declare_pattern(&arm.pattern, &subject_ty);
                     if let Some(guard) = &arm.guard {
                         self.check_expr(guard);
                     }
@@ -1157,33 +1157,24 @@ impl<'a> TypeChecker<'a> {
             (Type::Float, Type::Float)
             | (Type::Int, Type::Float)
             | (Type::Float, Type::Int) => Type::Float,
-            // Tensor element-wise ops
-            (
-                Type::Tensor {
-                    shape: ls,
-                    dtype: ld,
-                    device: ldev,
-                },
-                Type::Tensor {
-                    shape: rs,
-                    dtype: rd,
-                    device: rdev,
-                },
-            ) => {
+            // Tensor element-wise ops (includes Param/Buffer)
+            (l, r) if l.is_tensor() && r.is_tensor() => {
+                let (ls, ld, ldev) = l.as_tensor_parts().unwrap();
+                let (rs, rd, rdev) = r.as_tensor_parts().unwrap();
                 if ldev != rdev
                     && !matches!(ldev, Device::Unknown)
                     && !matches!(rdev, Device::Unknown)
                 {
                     self.diagnostics.push(
                         Diagnostic::error("cannot operate on tensors on different devices")
-                            .with_label(span, format!("{} vs {}", display_device(ldev), display_device(rdev))),
+                            .with_label(span, format!("{} vs {}", display_device(&ldev), display_device(&rdev))),
                     );
                 }
                 match shapes::check_elementwise(ls, rs, span) {
                     Ok(result_shape) => Type::Tensor {
                         shape: result_shape,
                         dtype: wider_dtype(*ld, *rd),
-                        device: ldev.clone(),
+                        device: ldev,
                     },
                     Err(diag) => {
                         self.diagnostics.push(diag);
@@ -1191,9 +1182,9 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
-            // Scalar + tensor
-            (Type::Tensor { .. }, Type::Int | Type::Float) => lty.clone(),
-            (Type::Int | Type::Float, Type::Tensor { .. }) => rty.clone(),
+            // Scalar + tensor (includes Param/Buffer)
+            (l, Type::Int | Type::Float) if l.is_tensor() => lty.clone(),
+            (Type::Int | Type::Float, r) if r.is_tensor() => rty.clone(),
             // String concatenation
             (Type::Str, Type::Str) if matches!(op, BinOp::Add) => Type::Str,
             // String repeat
@@ -1225,33 +1216,23 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_matmul_op(&mut self, lty: &Type, rty: &Type, span: Span) -> Type {
-        match (lty, rty) {
-            (
-                Type::Tensor {
-                    shape: ls,
-                    dtype: ld,
-                    device: ldev,
-                },
-                Type::Tensor {
-                    shape: rs,
-                    dtype: rd,
-                    device: rdev,
-                },
-            ) => {
+        // Normalize Param/Buffer to Tensor for type-checking
+        match (lty.as_tensor_parts(), rty.as_tensor_parts()) {
+            (Some((ls, ld, ldev)), Some((rs, rd, rdev))) => {
                 if ldev != rdev
                     && !matches!(ldev, Device::Unknown)
                     && !matches!(rdev, Device::Unknown)
                 {
                     self.diagnostics.push(
                         Diagnostic::error("matmul: device mismatch")
-                            .with_label(span, format!("{} vs {}", display_device(ldev), display_device(rdev))),
+                            .with_label(span, format!("{} vs {}", display_device(&ldev), display_device(&rdev))),
                     );
                 }
                 match shapes::check_matmul(ls, rs, span) {
                     Ok(result_shape) => Type::Tensor {
                         shape: result_shape,
                         dtype: wider_dtype(*ld, *rd),
-                        device: ldev.clone(),
+                        device: ldev,
                     },
                     Err(diag) => {
                         self.diagnostics.push(diag);

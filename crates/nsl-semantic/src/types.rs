@@ -119,6 +119,17 @@ impl Type {
     pub fn is_indeterminate(&self) -> bool {
         matches!(self, Type::Error | Type::Unknown)
     }
+
+    /// Normalize Param/Buffer to Tensor for type-checking operations.
+    /// Returns (shape, dtype, device) if this is a tensor-family type.
+    pub fn as_tensor_parts(&self) -> Option<(&Shape, &DType, Device)> {
+        match self {
+            Type::Tensor { shape, dtype, device } => Some((shape, dtype, device.clone())),
+            Type::Param { shape, dtype } => Some((shape, dtype, Device::Unknown)),
+            Type::Buffer { shape, dtype } => Some((shape, dtype, Device::Unknown)),
+            _ => None,
+        }
+    }
 }
 
 /// Resolved dimension in a tensor shape.

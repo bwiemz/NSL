@@ -107,12 +107,16 @@ impl Compiler<'_> {
                     let val = self.compile_expr(builder, state, e)?;
                     // Free intermediate tensor temporaries before returning (keep return value)
                     self.free_tensor_temporaries(builder, state, Some(val));
+                    // Stop and free any DataLoaders created in this scope
+                    self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
                     if state.is_no_grad {
                         self.compile_call_by_name(builder, "nsl_tape_resume", &[])?;
                     }
                     builder.ins().return_(&[val]);
                 } else {
+                    // Stop and free any DataLoaders created in this scope
+                    self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
                     if state.is_no_grad {
                         self.compile_call_by_name(builder, "nsl_tape_resume", &[])?;
@@ -272,7 +276,12 @@ impl Compiler<'_> {
                     }
                     AssignOp::DivAssign => {
                         let old = builder.use_var(var);
-                        if is_float { builder.ins().fdiv(old, new_val) } else { builder.ins().sdiv(old, new_val) }
+                        if is_float {
+                            builder.ins().fdiv(old, new_val)
+                        } else {
+                            self.compile_divmod_guard(builder, state, new_val)?;
+                            builder.ins().sdiv(old, new_val)
+                        }
                     }
                 };
                 builder.def_var(var, final_val);
@@ -457,6 +466,26 @@ impl Compiler<'_> {
                 }
             }
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
+        }
+    }
+
+    /// Emit nsl_dataloader_stop + nsl_dataloader_free for all DataLoaders
+    /// created in this scope. Called before function returns to prevent
+    /// thread leaks and resource leaks.
+    pub(crate) fn teardown_dataloaders(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+    ) {
+        let loaders = std::mem::take(&mut state.dataloader_vars);
+        for dl in &loaders {
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let _ = self.compile_call_by_name(builder, "nsl_dataloader_stop", &[*dl]);
+            let _ = self.compile_call_by_name(builder, "nsl_dataloader_free", &[*dl]);
         }
     }
 
@@ -866,10 +895,11 @@ impl Compiler<'_> {
         builder.def_var(batch_var, zero);
         state.variables.insert(loop_var_sym, (batch_var, cl_types::I64));
 
-        // Create blocks: header, body, cleanup, exit
+        // Create blocks: header, body, cleanup, break_exit, exit
         let header_block = builder.create_block();
         let body_block = builder.create_block();
         let cleanup_block = builder.create_block();
+        let break_exit_block = builder.create_block();
         let exit_block = builder.create_block();
 
         builder.ins().jump(header_block, &[]);
@@ -883,11 +913,13 @@ impl Compiler<'_> {
         builder.ins().brif(is_null, exit_block, &[], body_block, &[]);
 
         // Body: compile loop body statements
+        // break → break_exit_block (frees batch, then stops DL)
+        // continue → cleanup_block (frees batch, loops back)
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
-        state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block });
+        state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
@@ -906,7 +938,16 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
         builder.ins().jump(header_block, &[]);
 
-        // Exit: reset the dataloader for potential next epoch
+        // Break exit: free the current batch dict, then stop the DataLoader
+        builder.switch_to_block(break_exit_block);
+        builder.seal_block(break_exit_block);
+        state.current_block = Some(break_exit_block);
+        let batch_to_free = builder.use_var(batch_var);
+        self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
+        self.compile_call_by_name(builder, "nsl_dataloader_stop", &[dl_val])?;
+        builder.ins().jump(exit_block, &[]);
+
+        // Exit (normal exhaustion): reset the dataloader for potential next epoch
         builder.seal_block(header_block);
         builder.switch_to_block(exit_block);
         builder.seal_block(exit_block);

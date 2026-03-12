@@ -192,7 +192,7 @@ fn release_tape_op_refs(ops: &[TapeOp]) {
             }
             TapeOp::Unsqueeze { .. } => {}
             TapeOp::Expand { .. } => {}
-            TapeOp::Stack { inputs, .. } => {
+            TapeOp::Stack { inputs, .. } | TapeOp::Cat { inputs, .. } => {
                 for &inp in inputs {
                     tensor_free(inp);
                 }

@@ -56,6 +56,8 @@ impl Compiler<'_> {
 
             let current = state.current_block.unwrap_or(entry);
             if !crate::types::is_block_filled(&builder, current) {
+                // Stop and free any DataLoaders before implicit function return
+                self.teardown_dataloaders(&mut builder, &mut state);
                 // @no_grad: resume tape before implicit return
                 if is_no_grad {
                     self.compile_call_by_name(&mut builder, "nsl_tape_resume", &[])?;

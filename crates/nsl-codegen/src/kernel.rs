@@ -310,7 +310,7 @@ impl KernelCompiler {
                                 BinOp::Add => "add.u64",
                                 BinOp::Sub => "sub.u64",
                                 BinOp::Mul => "mul.lo.u64",
-                                BinOp::Div => "div.u64",
+                                BinOp::Div => "div.s64",
                                 _ => unreachable!(),
                             };
                             self.emit(&format!("    {} {}, {}, {};\n", op_str, result, l_reg, r_reg));
@@ -327,9 +327,23 @@ impl KernelCompiler {
                             _ => unreachable!(),
                         };
                         if l_kind == RegKind::F32 || r_kind == RegKind::F32 {
+                            let l_f32 = if l_kind == RegKind::F32 {
+                                l_reg.clone()
+                            } else {
+                                let fs = self.alloc_f32();
+                                self.emit(&format!("    cvt.rn.f32.u64 {}, {};\n", fs, l_reg));
+                                fs
+                            };
+                            let r_f32 = if r_kind == RegKind::F32 {
+                                r_reg.clone()
+                            } else {
+                                let fs = self.alloc_f32();
+                                self.emit(&format!("    cvt.rn.f32.u64 {}, {};\n", fs, r_reg));
+                                fs
+                            };
                             self.emit(&format!(
                                 "    setp.{}.f32 {}, {}, {};\n",
-                                cmp_str, pred, l_reg, r_reg
+                                cmp_str, pred, l_f32, r_f32
                             ));
                         } else {
                             self.emit(&format!(

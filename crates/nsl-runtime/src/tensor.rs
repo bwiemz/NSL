@@ -1248,21 +1248,30 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
 
-    for i in 0..len as usize {
-        unsafe { *data.add(i) = *a.data_f64().add(i) + s };
-    }
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f32().add(i) + (s as f32) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = *a.data_f64().add(i) + s };
+        }
+        buf as *mut c_void
+    };
 
     let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+        data,
         shape,
         strides,
         ndim,
         len,
         refcount: 1,
-        device: 0,
-        dtype: 0,
+        device: a.device,
+        dtype: a.dtype,
         owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
