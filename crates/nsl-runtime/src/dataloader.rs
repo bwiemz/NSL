@@ -207,10 +207,12 @@ fn build_simple_batch(
     let mut labels = vec![0i64; total];
     for b in 0..batch_size {
         let base = b * seq_len;
-        for i in 0..seq_len - 1 {
-            labels[base + i] = input_ids[base + i + 1];
+        if seq_len > 0 {
+            for i in 0..seq_len - 1 {
+                labels[base + i] = input_ids[base + i + 1];
+            }
+            labels[base + seq_len - 1] = -100;
         }
-        labels[base + seq_len - 1] = -100;
     }
 
     // Build standard causal mask (lower-triangular)

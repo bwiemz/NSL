@@ -137,6 +137,17 @@ impl<'a> TypeChecker<'a> {
                     Type::List(elem) => *elem.clone(),
                     Type::Dict(key, _val) => *key.clone(),
                     Type::Str => Type::Str,
+                    Type::Tuple(elems) => {
+                        // Iterating over a tuple: element type is union or first element
+                        elems.first().cloned().unwrap_or(Type::Unknown)
+                    }
+                    Type::FixedModelArray { element_model, .. } => {
+                        Type::Model {
+                            name: *element_model,
+                            fields: Vec::new(),
+                            methods: Vec::new(),
+                        }
+                    }
                     _ => Type::Unknown,
                 };
                 let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Loop);
@@ -672,7 +683,18 @@ impl<'a> TypeChecker<'a> {
 
     fn check_enum_def(&mut self, enum_def: &EnumDef) {
         let mut variants: Vec<(Symbol, Vec<Type>)> = Vec::new();
+        let mut seen_names: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for variant in &enum_def.variants {
+            if !seen_names.insert(variant.name) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "duplicate variant '{}' in enum '{}'",
+                        self.resolve_name(variant.name),
+                        self.resolve_name(enum_def.name),
+                    ))
+                    .with_label(variant.span, "duplicate variant"),
+                );
+            }
             let field_types: Vec<Type> =
                 variant.fields.iter().map(|t| self.resolve_type(t)).collect();
             variants.push((variant.name, field_types.clone()));

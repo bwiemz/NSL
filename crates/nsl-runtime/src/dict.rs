@@ -194,6 +194,9 @@ pub extern "C" fn nsl_dict_free(dict_ptr: i64) {
         while !entry.is_null() {
             let e = unsafe { &*entry };
             let next = e.next;
+            // Free the key string allocated by copy_cstr
+            let key_bytes = unsafe { CStr::from_ptr(e.key as *const c_char) }.to_bytes_with_nul();
+            unsafe { crate::memory::checked_free(e.key, key_bytes.len()) };
             // Free value (tensor pointer) via refcount decrement
             crate::tensor::nsl_tensor_free(e.value);
             // Free the entry struct itself

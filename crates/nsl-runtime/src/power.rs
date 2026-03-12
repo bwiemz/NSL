@@ -25,12 +25,11 @@ pub extern "C" fn nsl_pow_int(base: i64, exp: i64) -> i64 {
         if e > 1 {
             match b.checked_mul(b) {
                 Some(v) => b = v,
-                None if e & 1 == 0 => {
-                    // Will overflow on next multiply with result
+                None => {
+                    // b² overflowed — the final result cannot fit in i64.
                     eprintln!("nsl: integer overflow in exponentiation ({} ** {})", base, exp);
                     std::process::abort();
                 }
-                None => b = 0, // won't be used since e <= 1 after this shift
             }
         }
         e >>= 1;
