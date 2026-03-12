@@ -1427,8 +1427,13 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             }
             TapeOp::Div { a, b, out, saved_a, saved_b, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
-                    // d/da(a/b) = g / b
+                    // Clone g upfront for both grad_a and grad_b computations.
+                    // Must happen before any accumulate_grad call, which may free g
+                    // if *a == *out (the gradient for *out is g itself).
                     let g_clone1 = tensor_clone(g);
+                    let g_clone2 = tensor_clone(g);
+
+                    // d/da(a/b) = g / b
                     let grad_a_full = tensor_div(g_clone1, *saved_b);
                     tensor_free(g_clone1);
                     let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
@@ -1436,7 +1441,6 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *a, grad_a);
 
                     // d/db(a/b) = -g * a / b^2
-                    let g_clone2 = tensor_clone(g);
                     let neg_g = tensor_neg(g_clone2);
                     tensor_free(g_clone2);
                     let neg_ga = tensor_mul(neg_g, *saved_a);
