@@ -224,6 +224,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_safetensors_save", &[types::I64, types::I64, types::I64], None),
     // HuggingFace Hub download + weight loading (M18b)
     ("nsl_hf_load", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    // Trace infrastructure for ONNX export (M18b Task 7)
+    ("nsl_trace_start", &[], None),
+    ("nsl_trace_register_input", &[types::I64, types::I64], None),
+    ("nsl_trace_register_output", &[types::I64, types::I64], None),
+    ("nsl_trace_stop", &[], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
