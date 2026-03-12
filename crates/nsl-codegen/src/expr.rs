@@ -1059,6 +1059,11 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_qtensor_shape", &[qt_val]);
         }
 
+        // HuggingFace model loading intrinsic: from_hf("repo_id", model_var)
+        if func_name == "from_hf" {
+            return self.compile_from_hf(builder, state, args);
+        }
+
         // Check if it's a known function or variable holding a function pointer
         if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();
@@ -2531,5 +2536,226 @@ impl Compiler<'_> {
             "nsl_kernel_launch",
             &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val],
         )
+    }
+
+    // ── from_hf() compiler intrinsic ─────────────────────────────────
+
+    /// Walk a model's struct layout tree and collect a flat list of
+    /// `(field_path, byte_offset, needs_transpose)` entries for every leaf
+    /// tensor field.  Nested models and fixed-size model arrays are expanded
+    /// recursively using `struct_layouts` and `model_field_types`.
+    fn generate_param_metadata(
+        &self,
+        model_name: &str,
+        prefix: &str,
+        base_offset: usize,
+    ) -> Vec<(String, usize, bool)> {
+        let mut entries = Vec::new();
+
+        let layout = match self.struct_layouts.get(model_name) {
+            Some(l) => l.clone(),
+            None => return entries,
+        };
+        let field_types = self
+            .model_field_types
+            .get(model_name)
+            .cloned()
+            .unwrap_or_default();
+
+        for field in &layout.fields {
+            let field_path = if prefix.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{}.{}", prefix, field.name)
+            };
+            let abs_offset = base_offset + field.offset;
+
+            if let Some(type_marker) = field_types.get(&field.name) {
+                if type_marker.starts_with('[') {
+                    // Fixed array like "[TransformerBlock;6]"
+                    // Parse element type and count from "[ElemType;N]"
+                    let inner = &type_marker[1..type_marker.len() - 1]; // strip [ ]
+                    if let Some((elem_type, count_str)) = inner.rsplit_once(';') {
+                        let count: usize = count_str.trim().parse().unwrap_or(0);
+                        // Determine element size from the element type's struct layout
+                        let elem_size = self
+                            .struct_layouts
+                            .get(elem_type)
+                            .map(|l| l.total_size)
+                            .unwrap_or(8);
+                        for i in 0..count {
+                            let indexed_path = format!("{}[{}]", field_path, i);
+                            let indexed_offset = abs_offset + i * elem_size;
+                            let sub =
+                                self.generate_param_metadata(elem_type, &indexed_path, indexed_offset);
+                            entries.extend(sub);
+                        }
+                    }
+                } else {
+                    // Nested model (e.g., "Linear", "Attention")
+                    let sub =
+                        self.generate_param_metadata(type_marker, &field_path, abs_offset);
+                    entries.extend(sub);
+                }
+            } else {
+                // Leaf tensor field — determine transpose flag
+                // Weights in Linear-like layers need transposing (PyTorch stores [out, in],
+                // NSL expects [in, out]).  Bias fields are never transposed.
+                let needs_transpose = field.name == "weight";
+                entries.push((field_path, abs_offset, needs_transpose));
+            }
+        }
+
+        entries
+    }
+
+    /// Compile a `from_hf("repo/id", model_var)` call.
+    ///
+    /// 1. Resolve the model variable's type at compile time.
+    /// 2. Walk the model's field tree to produce a flat `ParamMeta` table.
+    /// 3. Emit code to allocate + populate the table at runtime.
+    /// 4. Call `nsl_hf_load(model_ptr, meta_ptr, meta_len, repo_ptr, repo_len, device)`.
+    /// 5. Return the model pointer.
+    fn compile_from_hf(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        args: &[nsl_ast::expr::Arg],
+    ) -> Result<Value, CodegenError> {
+        if args.len() < 2 {
+            return Err(CodegenError::new(
+                "from_hf() requires at least 2 arguments: from_hf(\"repo/id\", model)",
+            ));
+        }
+
+        // ── arg 0: repo_id string ───────────────────────────────────
+        let repo_val = self.compile_expr(builder, state, &args[0].value)?;
+
+        // Extract the string literal for length calculation
+        let repo_str = match &args[0].value.kind {
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => {
+                return Err(CodegenError::new(
+                    "from_hf(): first argument must be a string literal (repo ID)",
+                ));
+            }
+        };
+        let repo_len_val =
+            builder
+                .ins()
+                .iconst(cl_types::I64, repo_str.len() as i64);
+
+        // ── arg 1: model variable ───────────────────────────────────
+        let model_val = self.compile_expr(builder, state, &args[1].value)?;
+
+        let model_type = self.node_type(args[1].value.id).clone();
+        let model_name = match &model_type {
+            Type::Model { name, .. } => self.resolve_sym(*name).to_string(),
+            _ => {
+                return Err(CodegenError::new(
+                    "from_hf(): second argument must be a model instance",
+                ));
+            }
+        };
+
+        // ── optional arg 2: device (default 0 = CPU) ───────────────
+        let device_val = if args.len() > 2 {
+            self.compile_expr(builder, state, &args[2].value)?
+        } else {
+            builder.ins().iconst(cl_types::I64, 0)
+        };
+
+        // ── generate compile-time param metadata ────────────────────
+        let meta_entries = self.generate_param_metadata(&model_name, "", 0);
+        let meta_count = meta_entries.len();
+
+        if meta_count == 0 {
+            return Err(CodegenError::new(format!(
+                "from_hf(): model '{model_name}' has no parameter fields"
+            )));
+        }
+
+        // Each ParamMeta entry is 40 bytes (5 x i64):
+        //   [0]  name_ptr   (i64)
+        //   [8]  offset     (i64)
+        //   [16] shape_ptr  (i64) — 0 for now
+        //   [24] ndim       (i64) — 0 for now
+        //   [32] transpose  (i64) — 0 or 1
+        let entry_size: usize = 40;
+        let total_bytes = meta_count * entry_size;
+
+        // Allocate the ParamMeta array at runtime
+        let alloc_size = builder.ins().iconst(cl_types::I64, total_bytes as i64);
+        let meta_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
+
+        // Populate each entry
+        for (i, (field_path, byte_offset, transpose)) in meta_entries.iter().enumerate() {
+            let base = (i * entry_size) as i32;
+
+            // Intern the field path string and get a pointer to it
+            let name_data_id = self.intern_string(field_path)?;
+            let gv = self.module.declare_data_in_func(name_data_id, builder.func);
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+
+            // offset 0: name_ptr
+            builder.ins().store(
+                MemFlags::trusted(),
+                name_ptr,
+                meta_ptr,
+                cranelift_codegen::ir::immediates::Offset32::new(base),
+            );
+
+            // offset 8: byte_offset into model struct
+            let offset_val = builder.ins().iconst(cl_types::I64, *byte_offset as i64);
+            builder.ins().store(
+                MemFlags::trusted(),
+                offset_val,
+                meta_ptr,
+                cranelift_codegen::ir::immediates::Offset32::new(base + 8),
+            );
+
+            // offset 16: shape_ptr (0 for now)
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            builder.ins().store(
+                MemFlags::trusted(),
+                zero,
+                meta_ptr,
+                cranelift_codegen::ir::immediates::Offset32::new(base + 16),
+            );
+
+            // offset 24: ndim (0 for now)
+            let zero2 = builder.ins().iconst(cl_types::I64, 0);
+            builder.ins().store(
+                MemFlags::trusted(),
+                zero2,
+                meta_ptr,
+                cranelift_codegen::ir::immediates::Offset32::new(base + 24),
+            );
+
+            // offset 32: transpose flag
+            let transpose_val =
+                builder
+                    .ins()
+                    .iconst(cl_types::I64, if *transpose { 1 } else { 0 });
+            builder.ins().store(
+                MemFlags::trusted(),
+                transpose_val,
+                meta_ptr,
+                cranelift_codegen::ir::immediates::Offset32::new(base + 32),
+            );
+        }
+
+        // ── call nsl_hf_load ────────────────────────────────────────
+        let meta_len_val = builder.ins().iconst(cl_types::I64, meta_count as i64);
+
+        // nsl_hf_load(model_ptr, meta_ptr, meta_len, repo_id_ptr, repo_id_len, device)
+        self.compile_call_by_name(
+            builder,
+            "nsl_hf_load",
+            &[model_val, meta_ptr, meta_len_val, repo_val, repo_len_val, device_val],
+        )?;
+
+        // Return the model pointer so callers can chain: let m = from_hf("repo", m)
+        Ok(model_val)
     }
 }
