@@ -78,7 +78,11 @@ impl NslTensor {
     fn total_elements(shape: *const i64, ndim: i64) -> i64 {
         let mut total: i64 = 1;
         for i in 0..ndim as usize {
-            total *= unsafe { *shape.add(i) };
+            let dim = unsafe { *shape.add(i) };
+            total = total.checked_mul(dim).unwrap_or_else(|| {
+                eprintln!("nsl: tensor shape overflow — dimensions too large");
+                std::process::abort();
+            });
         }
         total
     }
@@ -171,14 +175,8 @@ pub extern "C" fn nsl_tensor_full(shape_list: i64, value: f64) -> i64 {
 pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
     let ptr = tensor_from_shape_list(shape_list, 0.0);
     let tensor = NslTensor::from_ptr(ptr);
-    // Simple LCG random number generator (no external deps)
-    let mut seed: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(12345);
     for i in 0..tensor.len as usize {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let val = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        let val = crate::sampling::rng_f64();
         unsafe { *tensor.data_f64().add(i) = val };
     }
     ptr
@@ -188,20 +186,12 @@ pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
 pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
     let ptr = tensor_from_shape_list(shape_list, 0.0);
     let tensor = NslTensor::from_ptr(ptr);
-    // Box-Muller transform: generate N(0,1) from uniform samples
-    let mut seed: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(12345);
-
+    // Box-Muller transform: generate N(0,1) from uniform samples using seeded RNG
     let len = tensor.len as usize;
     let mut i = 0;
     while i + 1 < len {
-        // Generate two uniform (0,1) samples via LCG
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let u1 = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-15); // avoid log(0)
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let u2 = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        let u1 = crate::sampling::rng_f64().max(1e-15); // avoid log(0)
+        let u2 = crate::sampling::rng_f64();
 
         let mag = (-2.0 * u1.ln()).sqrt();
         let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
@@ -214,16 +204,13 @@ pub extern "C" fn nsl_tensor_randn(shape_list: i64) -> i64 {
     }
     // If odd number of elements, generate one more pair and use first
     if i < len {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let u1 = ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-15);
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let u2 = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        let u1 = crate::sampling::rng_f64().max(1e-15);
+        let u2 = crate::sampling::rng_f64();
 
         let mag = (-2.0 * u1.ln()).sqrt();
         let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
         unsafe { *tensor.data_f64().add(i) = z0 };
     }
-    let _ = seed; // suppress unused warning
     ptr
 }
 
@@ -3458,15 +3445,8 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 
     let scale = 1.0 / (1.0 - p);
 
-    // Simple LCG random number generator
-    let mut seed: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(12345);
-
     for i in 0..len {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let rand_val = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        let rand_val = crate::sampling::rng_f64();
         let keep = if rand_val >= p { 1.0 } else { 0.0 };
         unsafe {
             *mask_data.add(i) = keep;

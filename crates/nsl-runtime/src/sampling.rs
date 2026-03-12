@@ -26,6 +26,11 @@ pub extern "C" fn nsl_manual_seed(seed: i64) {
     });
 }
 
+/// Generate a uniform random f64 in [0, 1) using the thread-local seeded RNG.
+pub fn rng_f64() -> f64 {
+    RNG.with(|r| r.borrow_mut().gen::<f64>())
+}
+
 // ---------------------------------------------------------------------------
 // topk
 // ---------------------------------------------------------------------------
