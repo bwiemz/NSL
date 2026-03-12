@@ -171,14 +171,18 @@ impl Compiler<'_> {
                 let func_id = self.module
                     .declare_function(&unique_name, cranelift_module::Linkage::Local, &sig)
                     .map_err(|e| CodegenError::new(format!("failed to declare nested fn '{base_name}': {e}")))?;
-                // Temporarily insert under base_name for compile_fn_def lookup, then remove
+                // Temporarily insert under base_name for compile_fn_def lookup, then restore
+                let prev_entry = self.functions.remove(&base_name);
                 self.functions.insert(base_name.clone(), (func_id, sig.clone()));
 
                 // Compile the nested function body
                 self.compile_fn_def(fn_def)?;
 
-                // Remove temp entry; the function is accessed via local variable binding below
+                // Remove temp entry and restore any previous function with the same name
                 self.functions.remove(&base_name);
+                if let Some(prev) = prev_entry {
+                    self.functions.insert(base_name, prev);
+                }
 
                 // Bind function name as a variable holding the function pointer
                 let func_ref = self.module.declare_func_in_func(func_id, builder.func);

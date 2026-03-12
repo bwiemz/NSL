@@ -234,6 +234,7 @@ impl KernelCompiler {
                         "sync_threads" => {
                             self.emit("    bar.sync 0;\n");
                             let rd = self.alloc_u64();
+                            self.emit(&format!("    mov.u64 {}, 0;\n", rd));
                             (rd, RegKind::U64)
                         }
                         _ => {
