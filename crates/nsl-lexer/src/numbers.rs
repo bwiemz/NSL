@@ -28,15 +28,14 @@ fn lex_hex(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnostic
     cursor.advance(); // 'x' or 'X'
 
     let digits = eat_digits(cursor, |c| c.is_ascii_hexdigit());
-    if digits.is_empty() {
+    let clean: String = digits.chars().filter(|c| *c != '_').collect();
+    if clean.is_empty() {
         diagnostics.push(
             Diagnostic::error("expected hex digits after '0x'")
                 .with_label(cursor.span_from(start), "here"),
         );
         return TokenKind::Error("invalid hex literal".into());
     }
-
-    let clean: String = digits.chars().filter(|c| *c != '_').collect();
     match i64::from_str_radix(&clean, 16) {
         Ok(v) => TokenKind::IntLiteral(v),
         Err(_) => {
@@ -54,15 +53,14 @@ fn lex_octal(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnost
     cursor.advance(); // 'o' or 'O'
 
     let digits = eat_digits(cursor, |c| matches!(c, '0'..='7'));
-    if digits.is_empty() {
+    let clean: String = digits.chars().filter(|c| *c != '_').collect();
+    if clean.is_empty() {
         diagnostics.push(
             Diagnostic::error("expected octal digits after '0o'")
                 .with_label(cursor.span_from(start), "here"),
         );
         return TokenKind::Error("invalid octal literal".into());
     }
-
-    let clean: String = digits.chars().filter(|c| *c != '_').collect();
     match i64::from_str_radix(&clean, 8) {
         Ok(v) => TokenKind::IntLiteral(v),
         Err(_) => {
@@ -80,15 +78,14 @@ fn lex_binary(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnos
     cursor.advance(); // 'b' or 'B'
 
     let digits = eat_digits(cursor, |c| matches!(c, '0' | '1'));
-    if digits.is_empty() {
+    let clean: String = digits.chars().filter(|c| *c != '_').collect();
+    if clean.is_empty() {
         diagnostics.push(
             Diagnostic::error("expected binary digits after '0b'")
                 .with_label(cursor.span_from(start), "here"),
         );
         return TokenKind::Error("invalid binary literal".into());
     }
-
-    let clean: String = digits.chars().filter(|c| *c != '_').collect();
     match i64::from_str_radix(&clean, 2) {
         Ok(v) => TokenKind::IntLiteral(v),
         Err(_) => {
