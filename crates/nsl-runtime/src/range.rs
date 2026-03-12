@@ -2,6 +2,10 @@ use crate::list::{nsl_list_new, nsl_list_push};
 
 #[no_mangle]
 pub extern "C" fn nsl_range(start: i64, stop: i64, step: i64) -> i64 {
+    if step == 0 {
+        eprintln!("nsl: range() step argument must not be zero");
+        std::process::abort();
+    }
     let list = nsl_list_new();
     if step > 0 {
         let mut i = start;

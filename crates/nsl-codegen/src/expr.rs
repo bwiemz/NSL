@@ -251,12 +251,33 @@ impl Compiler<'_> {
             BinOp::Mul if is_float => Ok(builder.ins().fmul(lhs, rhs)),
             BinOp::Mul => Ok(builder.ins().imul(lhs, rhs)),
             BinOp::Div if is_float => Ok(builder.ins().fdiv(lhs, rhs)),
-            BinOp::Div => Ok(builder.ins().sdiv(lhs, rhs)),
+            BinOp::Div => {
+                // Guard against division by zero (SIGFPE on x86)
+                self.compile_divmod_guard(builder, state, rhs)?;
+                Ok(builder.ins().sdiv(lhs, rhs))
+            }
             BinOp::FloorDiv if is_float => {
                 let div = builder.ins().fdiv(lhs, rhs);
                 Ok(builder.ins().floor(div))
             }
-            BinOp::FloorDiv => Ok(builder.ins().sdiv(lhs, rhs)),
+            BinOp::FloorDiv => {
+                // Floor division: round toward negative infinity, not toward zero.
+                // sdiv truncates toward zero, so adjust when remainder is nonzero
+                // and operands have different signs.
+                self.compile_divmod_guard(builder, state, rhs)?;
+                let q = builder.ins().sdiv(lhs, rhs);
+                let prod = builder.ins().imul(q, rhs);
+                let rem = builder.ins().isub(lhs, prod);
+                // Check: remainder != 0 && (lhs ^ rhs) < 0
+                let rem_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, rem, 0);
+                let sign_bits = builder.ins().bxor(lhs, rhs);
+                let diff_sign = builder.ins().icmp_imm(IntCC::SignedLessThan, sign_bits, 0);
+                let needs_adjust = builder.ins().band(rem_nonzero, diff_sign);
+                let one = builder.ins().iconst(cl_types::I64, 1);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                let adjustment = builder.ins().select(needs_adjust, one, zero);
+                Ok(builder.ins().isub(q, adjustment))
+            }
             BinOp::Mod if is_float => {
                 // a % b = a - floor(a/b) * b
                 let div = builder.ins().fdiv(lhs, rhs);
@@ -264,7 +285,19 @@ impl Compiler<'_> {
                 let prod = builder.ins().fmul(floored, rhs);
                 Ok(builder.ins().fsub(lhs, prod))
             }
-            BinOp::Mod => Ok(builder.ins().srem(lhs, rhs)),
+            BinOp::Mod => {
+                // Python-style modulo: result has same sign as divisor.
+                // srem follows dividend sign, so adjust when result is nonzero
+                // and operands have different signs.
+                self.compile_divmod_guard(builder, state, rhs)?;
+                let r = builder.ins().srem(lhs, rhs);
+                let rem_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, r, 0);
+                let sign_bits = builder.ins().bxor(lhs, rhs);
+                let diff_sign = builder.ins().icmp_imm(IntCC::SignedLessThan, sign_bits, 0);
+                let needs_adjust = builder.ins().band(rem_nonzero, diff_sign);
+                let adjusted = builder.ins().iadd(r, rhs);
+                Ok(builder.ins().select(needs_adjust, adjusted, r))
+            }
             BinOp::Pow => self.compile_pow(builder, lhs, rhs, is_float),
 
             BinOp::Eq if is_float => Ok(builder.ins().fcmp(FloatCC::Equal, lhs, rhs)),
@@ -336,6 +369,30 @@ impl Compiler<'_> {
         builder.seal_block(merge_block);
         state.current_block = Some(merge_block);
         Ok(builder.block_params(merge_block)[0])
+    }
+
+    /// Emit a runtime check that the integer divisor is non-zero.
+    /// On x86, `sdiv` / `srem` with divisor=0 causes SIGFPE (hardware fault).
+    fn compile_divmod_guard(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        divisor: Value,
+    ) -> Result<(), CodegenError> {
+        let ok_block = builder.create_block();
+        let trap_block = builder.create_block();
+
+        let is_zero = builder.ins().icmp_imm(IntCC::Equal, divisor, 0);
+        builder.ins().brif(is_zero, trap_block, &[], ok_block, &[]);
+
+        builder.switch_to_block(trap_block);
+        builder.seal_block(trap_block);
+        builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+        state.current_block = Some(ok_block);
+        Ok(())
     }
 
     fn compile_pow(
