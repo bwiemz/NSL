@@ -229,6 +229,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_trace_register_input", &[types::I64, types::I64], None),
     ("nsl_trace_register_output", &[types::I64, types::I64], None),
     ("nsl_trace_stop", &[], Some(types::I64)),
+    // ONNX export (M18b Tasks 9-10)
+    ("nsl_onnx_export", &[types::I64, types::I64, types::I64], None),
 ];
 
 /// Declare all runtime functions as imports in the module.
