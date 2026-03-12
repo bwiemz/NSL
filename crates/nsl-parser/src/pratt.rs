@@ -56,7 +56,8 @@ pub fn infix_binding_power(op: &TokenKind) -> Option<(u8, u8)> {
 /// Returns ((), right_bp) for prefix operators.
 pub fn prefix_binding_power(op: &TokenKind) -> Option<u8> {
     match op {
-        TokenKind::Minus => Some(27),
+        // Unary minus binds looser than ** (l_bp=25) so -a**b = -(a**b), matching Python
+        TokenKind::Minus => Some(24),
         // `not` must bind tighter than `and` (lbp=6) and `or` (lbp=4) but looser
         // than comparisons (lbp=10), matching Python's precedence:
         // `not a and b` → `(not a) and b`; `not a < b` → `not (a < b)`
