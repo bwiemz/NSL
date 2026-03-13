@@ -378,9 +378,17 @@ fn run_build_standalone(
 
     let sidecar_path = output_path.with_extension("nslweights");
 
+    // Pass only the filename (not full path) to codegen — the runtime resolves
+    // the sidecar relative to the executable, so absolute paths would break
+    // portability when the binary is moved.
+    let sidecar_name = sidecar_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "model.nslweights".to_string());
+
     let config = nsl_codegen::StandaloneConfig {
         embedded,
-        sidecar_path: sidecar_path.display().to_string(),
+        sidecar_path: sidecar_name,
     };
 
     // 6. Compile with standalone config

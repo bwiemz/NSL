@@ -40,11 +40,6 @@ impl WeightData {
     }
 }
 
-// SAFETY: the embedded slice is &'static, and Mmap is effectively read-only
-// shared memory — both are safe to share across threads.
-unsafe impl Send for WeightData {}
-unsafe impl Sync for WeightData {}
-
 /// Holds the parsed header index and the byte source.
 pub struct WeightProvider {
     data: WeightData,
@@ -159,6 +154,13 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
 /// `data_len` is the total byte length of the .nslweights blob.
 #[no_mangle]
 pub extern "C" fn nsl_standalone_init_embedded(data_ptr: i64, data_len: i64) {
+    if data_ptr <= 0 || data_len <= 0 {
+        eprintln!(
+            "nsl: weight_provider: invalid embedded data (ptr={}, len={})",
+            data_ptr, data_len
+        );
+        std::process::abort();
+    }
     let raw: &'static [u8] =
         unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len as usize) };
 
@@ -183,6 +185,13 @@ pub extern "C" fn nsl_standalone_init_embedded(data_ptr: i64, data_len: i64) {
 ///   3. `$NSL_WEIGHTS_PATH` environment variable
 #[no_mangle]
 pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_path_len: i64) {
+    if compiled_path_ptr <= 0 || compiled_path_len <= 0 {
+        eprintln!(
+            "nsl: weight_provider: invalid sidecar path (ptr={}, len={})",
+            compiled_path_ptr, compiled_path_len
+        );
+        std::process::abort();
+    }
     let compiled_path_str = unsafe {
         let slice = std::slice::from_raw_parts(
             compiled_path_ptr as *const u8,

@@ -181,7 +181,7 @@ const NSLW_VERSION: u32 = 1;
 /// JSON header format: `{"tensors":[{"name":"...","shape":[...],"dtype":"f64","offset":0,"nbytes":...},...]}`
 pub fn serialize_nslweights(tensors: &[WeightTensor]) -> Vec<u8> {
     // Build JSON header entries while tracking per-tensor byte offsets.
-    let mut entries: Vec<String> = Vec::with_capacity(tensors.len());
+    let mut params: Vec<serde_json::Value> = Vec::with_capacity(tensors.len());
     let mut data_offset: u64 = 0;
 
     for t in tensors {
@@ -190,18 +190,18 @@ pub fn serialize_nslweights(tensors: &[WeightTensor]) -> Vec<u8> {
             WeightDtype::F32 => "f32",
             WeightDtype::F64 => "f64",
         };
-        let shape_json = {
-            let parts: Vec<String> = t.shape.iter().map(|d| d.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        };
-        entries.push(format!(
-            r#"{{"name":"{}","shape":{},"dtype":"{}","offset":{},"nbytes":{}}}"#,
-            t.name, shape_json, dtype_str, data_offset, nbytes
-        ));
+        params.push(serde_json::json!({
+            "name": t.name,
+            "shape": t.shape,
+            "dtype": dtype_str,
+            "offset": data_offset,
+            "nbytes": nbytes,
+        }));
         data_offset += nbytes;
     }
 
-    let header = format!(r#"{{"params":[{}]}}"#, entries.join(","));
+    let header = serde_json::to_string(&serde_json::json!({ "params": params }))
+        .expect("JSON serialization cannot fail for this structure");
     let header_bytes = header.as_bytes();
     let header_size = header_bytes.len() as u64;
 
