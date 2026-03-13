@@ -83,6 +83,11 @@ fn link_gcc_multi(
         cmd.arg("-ldl");
     }
 
+    // macOS: inject platform version since Cranelift object files lack LC_BUILD_VERSION
+    if cfg!(target_os = "macos") {
+        cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
+    }
+
     // Link CUDA driver library if available
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
