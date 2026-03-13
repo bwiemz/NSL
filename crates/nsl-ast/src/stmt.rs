@@ -115,6 +115,9 @@ pub enum StmtKind {
     /// dataset Name("id"): ...
     DatasetDef(DatasetDef),
 
+    /// datatype Name: ...
+    DatatypeDef(DatatypeDef),
+
     /// @decorator(args) \n stmt
     Decorated {
         decorators: Vec<Decorator>,

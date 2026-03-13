@@ -107,3 +107,47 @@ pub struct DatasetDef {
     pub body: Vec<Stmt>,
     pub span: Span,
 }
+
+/// Custom datatype definition: `datatype Ternary158:`
+#[derive(Debug, Clone, Serialize)]
+pub struct DatatypeDef {
+    pub name: Symbol,
+    pub bits: Option<u8>,
+    pub block_size: Option<u32>,
+    pub methods: Vec<DatatypeMethod>,
+    pub ptx_blocks: Vec<DatatypePtxBlock>,
+    pub span: Span,
+}
+
+/// A method inside a datatype block (e.g., @pack, @unpack)
+#[derive(Debug, Clone, Serialize)]
+pub struct DatatypeMethod {
+    pub kind: DatatypeMethodKind,
+    pub params: Vec<Param>,
+    pub return_type: Option<TypeExpr>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DatatypeMethodKind {
+    Pack,
+    Unpack,
+    BackwardPack,
+    Arithmetic,
+}
+
+/// PTX escape hatch: @pack_ptx(ptx="...")
+#[derive(Debug, Clone, Serialize)]
+pub struct DatatypePtxBlock {
+    pub kind: DatatypePtxKind,
+    pub ptx_source: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DatatypePtxKind {
+    PackPtx,
+    UnpackPtx,
+    ArithmeticPtx,
+}
