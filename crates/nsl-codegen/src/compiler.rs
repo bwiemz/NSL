@@ -37,6 +37,15 @@ pub struct PendingLambda {
     pub captures: Vec<(Symbol, cl_types::Type)>,
 }
 
+/// Configuration for standalone export codegen.
+pub struct StandaloneConfig {
+    /// If true, weights are embedded in the binary via linker symbols.
+    /// If false, weights are loaded at runtime from the sidecar path.
+    pub embedded: bool,
+    /// Path to the `.nslweights` sidecar file (used when `embedded == false`).
+    pub sidecar_path: String,
+}
+
 pub struct Compiler<'a> {
     pub module: ObjectModule,
     pub interner: &'a Interner,
@@ -78,6 +87,8 @@ pub struct Compiler<'a> {
     pub imported_model_names: HashSet<String>,
     /// Custom dtype name → numeric id (starting at 256). Populated by compile_datatype_defs.
     pub custom_dtype_ids: HashMap<String, u16>,
+    /// Configuration for standalone export (set by `compile_standalone()`).
+    pub(crate) standalone_config: Option<StandaloneConfig>,
     func_index: u32,
 }
 
@@ -139,6 +150,7 @@ impl<'a> Compiler<'a> {
             model_var_types: HashMap::new(),
             imported_model_names: HashSet::new(),
             custom_dtype_ids: HashMap::new(),
+            standalone_config: None,
             func_index: 0,
         })
     }
@@ -1788,6 +1800,33 @@ pub fn compile(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
+    compiler.compile_pending_lambdas()?;
+    compiler.finalize()
+}
+
+/// Compile for standalone export: like `compile()` but uses `compile_standalone_main()`
+/// which initialises the weight provider and standalone arg parser before user code.
+pub fn compile_standalone(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    config: StandaloneConfig,
+    dump_ir: bool,
+) -> Result<Vec<u8>, CodegenError> {
+    let mut compiler = Compiler::new(interner, type_map)?;
+    compiler.dump_ir = dump_ir;
+    compiler.standalone_config = Some(config);
+    compiler.intern_string("")?;
+    compiler.collect_strings(&ast.stmts)?;
+    compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_structs(&ast.stmts)?;
+    compiler.collect_models(&ast.stmts)?;
+    compiler.declare_runtime_functions()?;
+    compiler.declare_user_functions(&ast.stmts)?;
+    compiler.compile_datatype_defs(&ast.stmts)?;
+    compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_user_functions(&ast.stmts)?;
+    compiler.compile_standalone_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     compiler.finalize()
 }
