@@ -1,5 +1,7 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use crate::autodiff;
 use crate::list::{nsl_list_new, nsl_list_push, NslList};
@@ -43,6 +45,84 @@ pub const DTYPE_F32: u16 = 1;
 // Custom dtype IDs start at 256
 pub const DTYPE_CUSTOM_START: u16 = 256;
 
+/// Metadata for a user-defined custom datatype
+pub struct CustomDtypeInfo {
+    pub id: u16,
+    pub name: String,
+    pub bit_width: u8,
+    pub block_size: u32,           // 0 = element-wise, >0 = block format
+    pub element_size: usize,       // bytes per packed ELEMENT (ceil(bits/8))
+    pub packed_block_size: usize,  // bytes per packed BLOCK — 0 for element-wise
+    pub pack_fn: Option<*const c_void>,
+    pub unpack_fn: Option<*const c_void>,
+}
+
+// SAFETY: function pointers are set once at startup, read-only after.
+unsafe impl Send for CustomDtypeInfo {}
+unsafe impl Sync for CustomDtypeInfo {}
+
+/// Registry uses OnceLock — initialized once at startup, read-only after.
+static CUSTOM_DTYPE_REGISTRY: OnceLock<HashMap<u16, CustomDtypeInfo>> = OnceLock::new();
+
+fn get_registry() -> &'static HashMap<u16, CustomDtypeInfo> {
+    CUSTOM_DTYPE_REGISTRY.get().expect("custom dtype registry not initialized")
+}
+
+thread_local! {
+    static STAGING_REGISTRY: std::cell::RefCell<HashMap<u16, CustomDtypeInfo>>
+        = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Register a custom datatype. Called by codegen-generated init code at startup.
+/// All params are i64 to match Cranelift calling convention.
+#[no_mangle]
+pub extern "C" fn nsl_register_custom_dtype(
+    id: i64,
+    name_ptr: i64,
+    name_len: i64,
+    bit_width: i64,
+    block_size: i64,
+    packed_block_size: i64,
+    pack_fn: i64,
+    unpack_fn: i64,
+) {
+    let id = id as u16;
+    let bit_width = bit_width as u8;
+    let block_size = block_size as u32;
+    let packed_block_size = packed_block_size as u32;
+    let name_ptr = name_ptr as *const u8;
+    let pack_fn = pack_fn as *const c_void;
+    let unpack_fn = unpack_fn as *const c_void;
+
+    let name = unsafe {
+        let slice = std::slice::from_raw_parts(name_ptr, name_len as usize);
+        String::from_utf8_lossy(slice).into_owned()
+    };
+    let info = CustomDtypeInfo {
+        id,
+        name,
+        bit_width,
+        block_size,
+        element_size: ((bit_width as usize + 7) / 8),
+        packed_block_size: if block_size > 0 { packed_block_size as usize } else { 0 },
+        pack_fn: if pack_fn.is_null() { None } else { Some(pack_fn) },
+        unpack_fn: if unpack_fn.is_null() { None } else { Some(unpack_fn) },
+    };
+
+    STAGING_REGISTRY.with(|r| r.borrow_mut().insert(id, info));
+}
+
+/// Called once after all registrations. Moves staging → OnceLock.
+#[no_mangle]
+pub extern "C" fn nsl_finalize_dtype_registry() {
+    STAGING_REGISTRY.with(|r| {
+        let entries = std::mem::take(&mut *r.borrow_mut());
+        if !entries.is_empty() {
+            let _ = CUSTOM_DTYPE_REGISTRY.set(entries);
+        }
+    });
+}
+
 impl NslTensor {
     pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
         unsafe { &mut *(ptr as *mut NslTensor) }
@@ -63,8 +143,11 @@ impl NslTensor {
     #[inline]
     pub(crate) fn element_size(&self) -> usize {
         match self.dtype {
-            0 => std::mem::size_of::<f64>(),
-            1 => std::mem::size_of::<f32>(),
+            DTYPE_F64 => std::mem::size_of::<f64>(),
+            DTYPE_F32 => std::mem::size_of::<f32>(),
+            id if id >= DTYPE_CUSTOM_START => {
+                get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
+            }
             _ => panic!("unknown dtype {}", self.dtype),
         }
     }
@@ -4662,6 +4745,197 @@ pub extern "C" fn nsl_tensor_slice_assign(
         0,
         &mut src_flat,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Custom dtype pack/unpack conversion FFI (Task 7)
+// ---------------------------------------------------------------------------
+
+/// Helper: clone shape/strides arrays for new tensor ownership
+fn clone_shape(src: *mut i64, ndim: usize) -> *mut i64 {
+    let bytes = ndim * std::mem::size_of::<i64>();
+    let dst = checked_alloc(bytes) as *mut i64;
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, ndim); }
+    dst
+}
+
+/// Convert a tensor to a custom dtype by calling the registered pack function.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_custom_dtype(
+    tensor_ptr: i64,
+    target_dtype_id: i64,
+) -> i64 {
+    let target_dtype_id = target_dtype_id as u16;
+    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let registry = get_registry();
+
+    let info = match registry.get(&target_dtype_id) {
+        Some(info) => info,
+        None => {
+            eprintln!("nsl: unknown custom dtype id {target_dtype_id}");
+            return tensor_ptr;
+        }
+    };
+
+    let pack_fn = match info.pack_fn {
+        Some(f) => f,
+        None => {
+            eprintln!("nsl: custom dtype '{}' has no pack function", info.name);
+            return tensor_ptr;
+        }
+    };
+
+    let num_elements = tensor.len as usize;
+
+    if info.block_size == 0 {
+        // Element-wise: pack_fn signature: extern "C" fn(f64) -> i64
+        let pack: extern "C" fn(f64) -> i64 = unsafe { std::mem::transmute(pack_fn) };
+
+        let packed_bytes = num_elements * info.element_size;
+        let packed_data = checked_alloc_zeroed(packed_bytes) as *mut u8;
+
+        let src = tensor.data as *const f64;
+        for i in 0..num_elements {
+            let val = unsafe { *src.add(i) };
+            let packed_val = pack(val);
+            let dst = unsafe { packed_data.add(i * info.element_size) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &packed_val as *const i64 as *const u8,
+                    dst,
+                    info.element_size,
+                );
+            }
+        }
+
+        let shape_ptr = clone_shape(tensor.shape, tensor.ndim as usize);
+        let strides_ptr = clone_shape(tensor.strides, tensor.ndim as usize);
+
+        let result = Box::new(NslTensor {
+            data: packed_data as *mut c_void,
+            shape: shape_ptr,
+            strides: strides_ptr,
+            ndim: tensor.ndim,
+            len: tensor.len,
+            refcount: 1,
+            device: tensor.device,
+            dtype: target_dtype_id,
+            owns_data: 1,
+        });
+        Box::into_raw(result) as i64
+    } else {
+        // Block-wise
+        let block_sz = info.block_size as usize;
+        let innermost = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
+
+        if innermost % block_sz != 0 {
+            eprintln!("nsl: tensor dim {} not divisible by block_size {}", innermost, block_sz);
+            return tensor_ptr;
+        }
+
+        let num_blocks = num_elements / block_sz;
+        let pbs = info.packed_block_size;
+        let packed_bytes = num_blocks * pbs;
+        let packed_data = checked_alloc_zeroed(packed_bytes) as *mut u8;
+
+        // Block pack_fn: extern "C" fn(*const f64, i64, *mut u8)
+        let pack: extern "C" fn(*const f64, i64, *mut u8) =
+            unsafe { std::mem::transmute(pack_fn) };
+
+        let src = tensor.data as *const f64;
+        for b in 0..num_blocks {
+            let block_ptr = unsafe { src.add(b * block_sz) };
+            let dst = unsafe { packed_data.add(b * pbs) };
+            pack(block_ptr, block_sz as i64, dst);
+        }
+
+        let shape_ptr = clone_shape(tensor.shape, tensor.ndim as usize);
+        let strides_ptr = clone_shape(tensor.strides, tensor.ndim as usize);
+
+        let result = Box::new(NslTensor {
+            data: packed_data as *mut c_void,
+            shape: shape_ptr,
+            strides: strides_ptr,
+            ndim: tensor.ndim,
+            len: tensor.len,
+            refcount: 1,
+            device: tensor.device,
+            dtype: target_dtype_id,
+            owns_data: 1,
+        });
+        Box::into_raw(result) as i64
+    }
+}
+
+/// Convert a custom-dtype tensor back to f64.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
+    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+
+    if tensor.dtype < DTYPE_CUSTOM_START {
+        return tensor_ptr;
+    }
+
+    let registry = get_registry();
+    let info = match registry.get(&tensor.dtype) {
+        Some(info) => info,
+        None => return tensor_ptr,
+    };
+
+    let unpack_fn = match info.unpack_fn {
+        Some(f) => f,
+        None => {
+            eprintln!("nsl: custom dtype '{}' has no unpack function", info.name);
+            return tensor_ptr;
+        }
+    };
+
+    let num_elements = tensor.len as usize;
+    let out_data = checked_alloc_zeroed(num_elements * 8) as *mut f64;
+
+    if info.block_size == 0 {
+        let unpack: extern "C" fn(i64) -> f64 = unsafe { std::mem::transmute(unpack_fn) };
+        let src = tensor.data as *const u8;
+        for i in 0..num_elements {
+            let mut packed_val: i64 = 0;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(i * info.element_size),
+                    &mut packed_val as *mut i64 as *mut u8,
+                    info.element_size,
+                );
+            }
+            unsafe { *out_data.add(i) = unpack(packed_val); }
+        }
+    } else {
+        let block_sz = info.block_size as usize;
+        let num_blocks = num_elements / block_sz;
+        let pbs = info.packed_block_size;
+        let unpack: extern "C" fn(*const u8, i64, *mut f64) =
+            unsafe { std::mem::transmute(unpack_fn) };
+        let src = tensor.data as *const u8;
+        for b in 0..num_blocks {
+            let packed_ptr = unsafe { src.add(b * pbs) };
+            let dst = unsafe { out_data.add(b * block_sz) };
+            unpack(packed_ptr, block_sz as i64, dst);
+        }
+    }
+
+    let shape_ptr = clone_shape(tensor.shape, tensor.ndim as usize);
+    let strides_ptr = clone_shape(tensor.strides, tensor.ndim as usize);
+
+    let result = Box::new(NslTensor {
+        data: out_data as *mut c_void,
+        shape: shape_ptr,
+        strides: strides_ptr,
+        ndim: tensor.ndim,
+        len: tensor.len,
+        refcount: 1,
+        device: tensor.device,
+        dtype: DTYPE_F64,
+        owns_data: 1,
+    });
+    Box::into_raw(result) as i64
 }
 
 // ---------------------------------------------------------------------------
