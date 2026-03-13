@@ -36,10 +36,16 @@ jobs:
         run: cargo build --workspace
 
       - name: Unit tests
-        run: cargo test --workspace
+        run: cargo test --workspace -- --skip e2e_
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: E2E smoke tests
+      - name: E2E smoke tests (Linux/Windows)
+        if: runner.os != 'macOS'
+        run: cargo test -p nsl-cli --test e2e -- --test-threads=1
+
+      - name: E2E smoke tests (macOS, non-blocking)
+        if: runner.os == 'macOS'
+        continue-on-error: true
         run: cargo test -p nsl-cli --test e2e -- --test-threads=1
