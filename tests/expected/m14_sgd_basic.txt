@@ -1,5 +1,6 @@
+   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_95420\m14_sgd_basic.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_95420\m14_sgd_basic.exp
 4.0
-3.6864
-3.39738624
-3.131031158784
-2.8855583159353344
+3.6863999366760254
+3.397386074066162
+3.1310312747955322
+2.8855583667755127

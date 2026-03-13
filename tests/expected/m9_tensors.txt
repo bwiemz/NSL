@@ -1,3 +1,4 @@
+   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_89796\m9_tensors.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_89796\m9_tensors.exp
 tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
 tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
 tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])

@@ -1,2 +1,3 @@
+   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_75596\m12_no_grad.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_75596\m12_no_grad.exp
 3.0
 tensor([0.0, 0.0, 0.0])

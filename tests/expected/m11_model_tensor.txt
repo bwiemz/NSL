@@ -1,1 +1,2 @@
+   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_88920\m11_model_tensor.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_88920\m11_model_tensor.exp
 tensor([[3.0, 3.0, 3.0, 3.0], [3.0, 3.0, 3.0, 3.0]])

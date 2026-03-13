@@ -1,3 +1,4 @@
+   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_88400\m10_shape_check.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_88400\m10_shape_check.exp
 tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]])
 tensor([[4.0, 4.0], [4.0, 4.0], [4.0, 4.0]])
 tensor([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])

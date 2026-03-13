@@ -1,2 +1,3 @@
+   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_90972\m12_grad_matmul.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_90972\m12_grad_matmul.exp
 24.0
 tensor([[2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0]])
