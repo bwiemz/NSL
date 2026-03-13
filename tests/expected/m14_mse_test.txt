@@ -1,2 +1,1 @@
-   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_95436\m14_mse_test.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_95436\m14_mse_test.exp
 1.0

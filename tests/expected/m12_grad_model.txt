@@ -1,3 +1,2 @@
-   Creating library C:\Users\bwiem\AppData\Local\Temp\nsl_run_82784\m12_grad_model.lib and object C:\Users\bwiem\AppData\Local\Temp\nsl_run_82784\m12_grad_model.exp
 24.0
 tensor([[2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0]])

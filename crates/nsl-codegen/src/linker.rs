@@ -77,7 +77,7 @@ fn link_gcc_multi(
     }
     cmd.arg(runtime_lib);
 
-    if !cfg!(target_os = "windows") {
+    if cfg!(target_os = "linux") {
         cmd.arg("-lm");
         cmd.arg("-lpthread");
         cmd.arg("-ldl");

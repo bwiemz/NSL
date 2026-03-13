@@ -72,8 +72,16 @@ fn normalize_paths(text: &str) -> String {
     result
 }
 
+/// Strip MSVC linker noise ("Creating library ... and object ...") from output.
+fn strip_linker_noise(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("Creating library"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn normalize(text: &str) -> String {
-    normalize_paths(&normalize_floats(text))
+    normalize_paths(&normalize_floats(&strip_linker_noise(text)))
 }
 
 fn workspace_root() -> std::path::PathBuf {
@@ -95,6 +103,13 @@ fn run_example(name: &str) -> String {
         .current_dir(&root)
         .output()
         .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        panic!(
+            "nsl run failed for '{}' (exit {:?}):\nstderr: {}",
+            name, output.status.code(), stderr
+        );
+    }
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
