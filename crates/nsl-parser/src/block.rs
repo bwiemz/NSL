@@ -1,5 +1,7 @@
 use nsl_ast::block::*;
+use nsl_ast::decl::Param;
 use nsl_ast::stmt::{Stmt, StmtKind};
+use nsl_ast::types::TypeExpr;
 use nsl_lexer::TokenKind;
 
 use crate::expr::{parse_args, parse_expr};
@@ -572,4 +574,195 @@ pub fn parse_dataset_def_stmt(p: &mut Parser) -> Stmt {
         span,
         id: p.next_node_id(),
     }
+}
+
+pub fn parse_datatype_def_stmt(p: &mut Parser) -> Stmt {
+    let start = p.current_span();
+    p.advance(); // consume 'datatype'
+
+    let (name, _) = p.expect_ident();
+    p.expect(&TokenKind::Colon);
+    p.skip_newlines();
+    p.expect(&TokenKind::Indent);
+    p.skip_newlines();
+
+    let mut bits: Option<u8> = None;
+    let mut block_size: Option<u32> = None;
+    let mut methods: Vec<DatatypeMethod> = Vec::new();
+    let mut ptx_blocks: Vec<DatatypePtxBlock> = Vec::new();
+
+    while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+        p.skip_newlines();
+        if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
+            break;
+        }
+
+        // Check for @decorator
+        if p.at(&TokenKind::At) {
+            let dec_start = p.current_span();
+            p.advance(); // consume @
+
+            let (dec_sym, _) = p.expect_ident();
+            let dec_name = p.interner.resolve(dec_sym.0).unwrap_or("").to_string();
+
+            match dec_name.as_str() {
+                "pack" | "unpack" => {
+                    let kind = if dec_name == "pack" {
+                        DatatypeMethodKind::Pack
+                    } else {
+                        DatatypeMethodKind::Unpack
+                    };
+                    let (params, return_type, body) = parse_datatype_method_body(p);
+                    methods.push(DatatypeMethod {
+                        kind,
+                        params,
+                        return_type,
+                        body,
+                        span: dec_start.merge(p.prev_span()),
+                    });
+                }
+                "backward" => {
+                    // @backward @pack compound decorator
+                    p.expect(&TokenKind::At);
+                    let (inner_sym, _) = p.expect_ident();
+                    let inner_name = p.interner.resolve(inner_sym.0).unwrap_or("").to_string();
+                    if inner_name != "pack" {
+                        p.diagnostics.push(
+                            nsl_errors::Diagnostic::error("expected @pack after @backward")
+                                .with_label(p.prev_span(), "expected @pack"),
+                        );
+                    }
+                    let (params, return_type, body) = parse_datatype_method_body(p);
+                    methods.push(DatatypeMethod {
+                        kind: DatatypeMethodKind::BackwardPack,
+                        params,
+                        return_type,
+                        body,
+                        span: dec_start.merge(p.prev_span()),
+                    });
+                }
+                "pack_ptx" | "unpack_ptx" | "arithmetic_ptx" => {
+                    let kind = match dec_name.as_str() {
+                        "pack_ptx" => DatatypePtxKind::PackPtx,
+                        "unpack_ptx" => DatatypePtxKind::UnpackPtx,
+                        "arithmetic_ptx" => DatatypePtxKind::ArithmeticPtx,
+                        _ => unreachable!(),
+                    };
+                    p.expect(&TokenKind::LeftParen);
+                    let (_key_sym, _) = p.expect_ident(); // "ptx"
+                    p.expect(&TokenKind::Eq);
+                    // Read string literal via peek + match
+                    let ptx_source = if let TokenKind::StringLiteral(s) = p.peek().clone() {
+                        p.advance();
+                        s
+                    } else {
+                        p.diagnostics.push(
+                            nsl_errors::Diagnostic::error("expected PTX string literal")
+                                .with_label(p.current_span(), "expected string"),
+                        );
+                        String::new()
+                    };
+                    p.expect(&TokenKind::RightParen);
+                    p.skip_newlines();
+                    ptx_blocks.push(DatatypePtxBlock {
+                        kind,
+                        ptx_source,
+                        span: dec_start.merge(p.prev_span()),
+                    });
+                }
+                other => {
+                    p.diagnostics.push(
+                        nsl_errors::Diagnostic::error(format!(
+                            "unknown datatype decorator @{other}; expected @pack, @unpack, \
+                             @backward, @pack_ptx, @unpack_ptx, or @arithmetic_ptx"
+                        ))
+                        .with_label(dec_start, "unknown decorator"),
+                    );
+                }
+            }
+        } else if let TokenKind::Ident(sym) = p.peek().clone() {
+            // Metadata: bits: N, block_size: N
+            let ident = p.interner.resolve(sym).unwrap_or("").to_string();
+            match ident.as_str() {
+                "bits" => {
+                    p.advance();
+                    p.expect(&TokenKind::Colon);
+                    if let TokenKind::IntLiteral(v) = p.peek().clone() {
+                        bits = Some(v as u8);
+                        p.advance();
+                    }
+                    p.expect_end_of_stmt();
+                }
+                "block_size" => {
+                    p.advance();
+                    p.expect(&TokenKind::Colon);
+                    if let TokenKind::IntLiteral(v) = p.peek().clone() {
+                        block_size = Some(v as u32);
+                        p.advance();
+                    }
+                    p.expect_end_of_stmt();
+                }
+                _ => {
+                    p.diagnostics.push(
+                        nsl_errors::Diagnostic::error(format!(
+                            "unexpected '{ident}' in datatype block; \
+                             expected 'bits', 'block_size', or a @decorator"
+                        ))
+                        .with_label(p.current_span(), "unexpected"),
+                    );
+                    p.advance();
+                }
+            }
+        } else {
+            p.advance(); // skip unknown token
+        }
+
+        p.skip_newlines();
+    }
+
+    p.eat(&TokenKind::Dedent);
+
+    let span = start.merge(p.prev_span());
+    Stmt {
+        kind: StmtKind::DatatypeDef(DatatypeDef {
+            name,
+            bits,
+            block_size,
+            methods,
+            ptx_blocks,
+            span,
+        }),
+        span,
+        id: p.next_node_id(),
+    }
+}
+
+/// Parse datatype method body: (params) -> return_type: \n INDENT body DEDENT
+fn parse_datatype_method_body(p: &mut Parser) -> (Vec<Param>, Option<TypeExpr>, Vec<Stmt>) {
+    p.expect(&TokenKind::LeftParen);
+    let params = crate::decl::parse_params(p);
+    p.expect(&TokenKind::RightParen);
+
+    let return_type = if p.eat(&TokenKind::Arrow) {
+        Some(crate::types::parse_type(p))
+    } else {
+        None
+    };
+
+    p.expect(&TokenKind::Colon);
+    p.skip_newlines();
+    p.expect(&TokenKind::Indent);
+
+    let mut body = Vec::new();
+    while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+        p.skip_newlines();
+        if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
+            break;
+        }
+        body.push(crate::stmt::parse_stmt(p));
+        p.skip_newlines();
+    }
+    p.eat(&TokenKind::Dedent);
+
+    (params, return_type, body)
 }

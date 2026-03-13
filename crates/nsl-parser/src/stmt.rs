@@ -38,6 +38,7 @@ pub fn parse_stmt(p: &mut Parser) -> Stmt {
         TokenKind::Kernel => crate::block::parse_kernel_def_stmt(p),
         TokenKind::Tokenizer => crate::block::parse_tokenizer_def_stmt(p),
         TokenKind::Dataset => crate::block::parse_dataset_def_stmt(p),
+        TokenKind::Datatype => crate::block::parse_datatype_def_stmt(p),
         TokenKind::Pub | TokenKind::Priv => parse_visibility_prefixed(p),
         _ => parse_expr_or_assign(p),
     }
