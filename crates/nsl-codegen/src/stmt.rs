@@ -208,6 +208,10 @@ impl Compiler<'_> {
             | StmtKind::Import(_) | StmtKind::FromImport(_)
             | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_) => {}
 
+            StmtKind::DatatypeDef(_) => {
+                // M23: custom datatype codegen — implemented in Task 9
+            }
+
             StmtKind::KernelDef(_) => {
                 // Kernels are compiled in the compile_kernels pass (before functions).
             }

@@ -477,6 +477,9 @@ impl<'a> TypeChecker<'a> {
                 // that aren't general variable assignments.
                 self.declare_symbol(ds.name, Type::Unknown, ds.span, true, false);
             }
+            StmtKind::DatatypeDef(_) => {
+                // M23: custom datatype validation — implemented in Task 8
+            }
         }
     }
 
