@@ -810,15 +810,12 @@ impl<'a> Compiler<'a> {
 
                 // Compile each method as a standalone Cranelift function
                 for method in &def.methods {
-                    let (fn_suffix, compile_it) = match method.kind {
-                        DatatypeMethodKind::Pack => ("pack", true),
-                        DatatypeMethodKind::Unpack => ("unpack", true),
-                        DatatypeMethodKind::BackwardPack => ("backward_pack", true),
-                        DatatypeMethodKind::Arithmetic => ("arithmetic", true),
+                    let fn_suffix = match method.kind {
+                        DatatypeMethodKind::Pack => "pack",
+                        DatatypeMethodKind::Unpack => "unpack",
+                        DatatypeMethodKind::BackwardPack => "backward_pack",
+                        DatatypeMethodKind::Arithmetic => "arithmetic",
                     };
-                    if !compile_it {
-                        continue;
-                    }
 
                     let fn_name = format!("__nsl_dtype_{}_{}", dtype_name, fn_suffix);
                     let is_block_mode = def.block_size.unwrap_or(0) > 0;

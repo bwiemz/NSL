@@ -525,7 +525,6 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     // Dtype identifier constants (M23 BYOD) — used in .to(f32), .to(f64) etc.
     def("f32", Type::Int);
     def("f64", Type::Int);
-    def("float", Type::Int);
 
     // Higher-order functions
     def(

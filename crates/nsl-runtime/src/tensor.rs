@@ -65,7 +65,9 @@ unsafe impl Sync for CustomDtypeInfo {}
 static CUSTOM_DTYPE_REGISTRY: OnceLock<HashMap<u16, CustomDtypeInfo>> = OnceLock::new();
 
 fn get_registry() -> &'static HashMap<u16, CustomDtypeInfo> {
-    CUSTOM_DTYPE_REGISTRY.get().expect("custom dtype registry not initialized")
+    static EMPTY: std::sync::LazyLock<HashMap<u16, CustomDtypeInfo>> =
+        std::sync::LazyLock::new(HashMap::new);
+    CUSTOM_DTYPE_REGISTRY.get().unwrap_or(&EMPTY)
 }
 
 thread_local! {
@@ -3104,6 +3106,10 @@ fn print_tensor_recursive(
             if i > 0 { print!(", "); }
             let val = match dtype {
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
+                d if d >= DTYPE_CUSTOM_START => {
+                    print!("?");
+                    continue;
+                }
                 _ => unsafe { *(data as *const f64).add(i * stride) },
             };
             print_float_value(val);
