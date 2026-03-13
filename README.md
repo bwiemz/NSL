@@ -140,7 +140,32 @@ let result = c.to(cpu)  # each element = 3.0
 - `nsl test` CLI with process isolation (each test in separate process)
 - Filter tests with `--filter`
 
-## Building
+## Installation
+
+### From GitHub Releases (recommended)
+
+Download the latest release for your platform from
+[GitHub Releases](https://github.com/bwiemz/NSL/releases).
+
+Extract the archive to a permanent location and add `bin/` to your PATH:
+
+```bash
+# Linux/macOS
+tar xzf nsl-v0.1.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.1.0-<target>/bin:$PATH"
+```
+
+> **Important:** Do not separate the `nsl` binary from the `lib/` directory.
+> The compiler needs `lib/libnsl_runtime.a` for linking and `lib/stdlib/`
+> for standard library imports.
+
+### Prerequisites
+
+- **Linux/macOS:** A C compiler (`gcc`, `clang`, or `cc`) -- usually pre-installed
+- **Windows:** [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) (MSVC `link.exe`)
+- **GPU (optional):** NVIDIA CUDA Toolkit for GPU features
+
+### From Source
 
 Requires Rust (stable).
 
@@ -148,14 +173,34 @@ Requires Rust (stable).
 cargo build -p nsl-cli
 ```
 
+## Quick Start
+
+```bash
+nsl init myproject
+cd myproject
+nsl run main.nsl
+```
+
 ## Usage
 
 ```bash
 # Run an NSL program
-cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl
+nsl run examples/hello.nsl
 
-# Run with verbose output
-cargo run -p nsl-cli -- run --dump-ir examples/hello.nsl
+# Compile to native executable
+nsl build examples/hello.nsl
+
+# Type-check without running
+nsl check examples/hello.nsl
+
+# Format code
+nsl fmt examples/*.nsl
+
+# Run tests
+nsl test tests/m15_test.nsl
+
+# Check version
+nsl --version
 ```
 
 ## Project Structure
@@ -215,28 +260,15 @@ cargo run -p nsl-cli --features cuda -- run tests/m17_kernel_test.nsl
 cargo run -p nsl-cli --features cuda -- run tests/m17_gpu_training_test.nsl
 ```
 
-## Development Status
+## Known Limitations
 
-NSL is in active development. Current milestone progress:
-
-| Milestone | Description | Status |
-|-----------|-------------|--------|
-| M9 | Rust runtime + tensor foundation | Complete |
-| M10 | Compile-time tensor shape checking | Complete |
-| M11 | `model` keyword + codegen | Complete |
-| M12 | `grad` keyword + tape-based autodiff | Complete |
-| M13 | Import system + multi-file compilation | Complete |
-| M14 | Training DSL + optimizers + schedulers | Complete |
-| M15 | NN stdlib + tokenization + test framework | Complete |
-| M16 | Quantization foundations (`quant static` block) | Complete |
-| M17 | GPU/CUDA + `kernel` keyword | Complete |
-| M18a | Transformer foundations (tensor ops + model composition) | Complete |
-| M18b | Interop (safetensors, HuggingFace loading, ONNX export) | Complete |
-| M19 | Data pipeline + inference sampling | Complete |
-| M20 | v0.1 release (full GPT-2 pipeline) | Planned |
-| M21 | Advanced quantization (FP8, activation quant) | Planned |
-| M22 | Algorithmic quantization (QAT, GPTQ, AWQ) | Planned |
+- No package manager or dependency resolution
+- No PyTorch FFI (`to_torch`/`from_torch`) -- use HF loading + ONNX export instead
+- No distributed multi-GPU training (DDP)
+- No REPL
+- CUDA required for GPU features (no ROCm/Metal yet)
+- Windows requires Visual Studio Build Tools for linking
 
 ## License
 
-APACHE 2.0
+Apache 2.0
