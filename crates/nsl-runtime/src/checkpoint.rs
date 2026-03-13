@@ -101,11 +101,15 @@ pub extern "C" fn nsl_model_save(
 /// Load model parameters from .nslm binary format into existing tensors.
 #[no_mangle]
 pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr: i64) {
+    let tensors = NslList::from_ptr(param_tensors_ptr);
+    if crate::weight_provider::try_load_from_provider(tensors) {
+        return;
+    }
+
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8_unchecked(slice)
     };
-    let tensors = NslList::from_ptr(param_tensors_ptr);
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
