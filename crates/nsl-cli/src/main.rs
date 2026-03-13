@@ -343,14 +343,115 @@ fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: b
 }
 
 fn run_build_standalone(
-    _file: &std::path::Path,
-    _output: Option<&std::path::Path>,
-    _weights: &std::path::Path,
-    _embed_mode: standalone::EmbedMode,
-    _embed_threshold: u64,
+    file: &std::path::Path,
+    output: Option<&std::path::Path>,
+    weights: &std::path::Path,
+    embed_mode: standalone::EmbedMode,
+    embed_threshold: u64,
 ) {
-    eprintln!("standalone build: TODO");
-    process::exit(1);
+    // 1. Read weights from safetensors
+    let tensors = standalone::read_safetensors(weights).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+
+    // 2. Serialize to .nslweights format
+    let nslweights_data = standalone::serialize_nslweights(&tensors);
+
+    // 3. Decide embed vs sidecar
+    let embedded = match embed_mode {
+        standalone::EmbedMode::Always => true,
+        standalone::EmbedMode::Never => false,
+        standalone::EmbedMode::Auto => (nslweights_data.len() as u64) <= embed_threshold,
+    };
+
+    // 4. Run frontend (lex, parse, semantic analysis)
+    let file_pb = file.to_path_buf();
+    let (interner, parse_result, analysis) = frontend(&file_pb);
+
+    // 5. Determine output path
+    let output_path = if let Some(out) = output {
+        out.to_path_buf()
+    } else {
+        nsl_codegen::linker::default_output_path(file)
+    };
+
+    let sidecar_path = output_path.with_extension("nslweights");
+
+    let config = nsl_codegen::StandaloneConfig {
+        embedded,
+        sidecar_path: sidecar_path.display().to_string(),
+    };
+
+    // 6. Compile with standalone config
+    let obj_bytes = nsl_codegen::compile_standalone(
+        &parse_result.module,
+        &interner,
+        &analysis.type_map,
+        config,
+        false,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("codegen error: {e}");
+        process::exit(1);
+    });
+
+    // 7. Write main object file
+    let temp_dir = std::env::temp_dir().join(format!("nsl_standalone_{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        eprintln!("error: could not create temp dir: {e}");
+        process::exit(1);
+    }
+
+    let main_obj_path = temp_dir.join("main.o");
+    if let Err(e) = std::fs::write(&main_obj_path, &obj_bytes) {
+        eprintln!("error: could not write object file: {e}");
+        process::exit(1);
+    }
+
+    let mut obj_paths: Vec<PathBuf> = vec![main_obj_path];
+
+    // 8. Handle embedded weights or sidecar
+    if embedded {
+        // Create weight object containing the nslweights data
+        let weight_obj_bytes = nsl_codegen::create_weight_object(&nslweights_data).unwrap_or_else(|e| {
+            eprintln!("error: could not create weight object: {e}");
+            process::exit(1);
+        });
+        let weight_obj_path = temp_dir.join("weights.o");
+        if let Err(e) = std::fs::write(&weight_obj_path, &weight_obj_bytes) {
+            eprintln!("error: could not write weight object file: {e}");
+            process::exit(1);
+        }
+        obj_paths.push(weight_obj_path);
+    } else {
+        // Write sidecar .nslweights file
+        standalone::write_nslweights_sidecar_raw(&nslweights_data, &sidecar_path).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(1);
+        });
+    }
+
+    // 9. Link all objects
+    match nsl_codegen::linker::link_multi(&obj_paths, &output_path) {
+        Ok(()) => {
+            // 10. Clean up temp object files
+            for obj in &obj_paths {
+                let _ = std::fs::remove_file(obj);
+            }
+            let _ = std::fs::remove_dir(&temp_dir);
+
+            println!("Built {} (standalone{})", output_path.display(),
+                if embedded { ", weights embedded" } else { ", sidecar weights" });
+            if !embedded {
+                println!("  Sidecar: {}", sidecar_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("link error: {e}");
+            process::exit(1);
+        }
+    }
 }
 
 fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
