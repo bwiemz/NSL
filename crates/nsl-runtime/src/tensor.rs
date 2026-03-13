@@ -31,9 +31,17 @@ pub struct NslTensor {
     pub(crate) len: i64,
     pub(crate) refcount: i64,
     pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
-    pub(crate) dtype: u8,           // 0 = f64, 1 = f32
+    pub(crate) dtype: u16,          // 0 = f64, 1 = f32; 256+ = custom user-defined dtypes
     pub(crate) owns_data: u8,       // 1 = heap-owned (free on drop), 0 = borrowed/mmap
 }
+
+// Built-in dtype IDs (match existing u8 values)
+pub const DTYPE_F64: u16 = 0;
+pub const DTYPE_F32: u16 = 1;
+// Future: FP16=2, BF16=3, INT8=4, etc.
+
+// Custom dtype IDs start at 256
+pub const DTYPE_CUSTOM_START: u16 = 256;
 
 impl NslTensor {
     pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
@@ -279,7 +287,7 @@ fn create_scalar_tensor(value: f64) -> i64 {
 }
 
 /// Create a 0-d scalar tensor with dtype-aware storage (dtype=0 → f64, dtype=1 → f32).
-fn create_scalar_tensor_dtype(value: f64, dtype: u8) -> i64 {
+fn create_scalar_tensor_dtype(value: f64, dtype: u16) -> i64 {
     if dtype == 1 {
         create_scalar_tensor(value)
     } else {
@@ -1659,7 +1667,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
     }
 
     // Dispatch based on dtype (use f32 if either input is f32)
-    let out_dtype: u8 = if a.dtype == 1 || b.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = if a.dtype == 1 || b.dtype == 1 { 1 } else { 0 };
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let raw_data = checked_alloc_zeroed((len as usize) * elem_size);
 
@@ -2996,7 +3004,7 @@ fn print_float_value(v: f64) {
 
 fn print_tensor_recursive(
     data: *const u8,
-    dtype: u8,
+    dtype: u16,
     shape: *mut i64,
     strides: *mut i64,
     ndim: i64,
@@ -4107,7 +4115,7 @@ pub extern "C" fn nsl_tensor_conv2d(
     let w_out = (w + 2 * pw - kw) / sw + 1;
 
     let in_dtype = input.dtype;
-    let out_dtype: u8 = if in_dtype == 1 || weight.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = if in_dtype == 1 || weight.dtype == 1 { 1 } else { 0 };
 
     let out_len = n * c_out * h_out * w_out;
     let out_shape = checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
@@ -4338,7 +4346,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     }
 
     let in_dtype = tensor.dtype;
-    let out_dtype: u8 = if in_dtype == 1 || bias.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = if in_dtype == 1 || bias.dtype == 1 { 1 } else { 0 };
 
     // Output shape: same as tensor [rows, cols]
     let out_ndim: i64 = 2;

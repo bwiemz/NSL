@@ -54,7 +54,7 @@ pub struct TraceOp {
     pub input_ptrs: Vec<i64>,
     pub output_ptr: i64,
     pub output_shape: Vec<i64>,
-    pub output_dtype: u8,
+    pub output_dtype: u16,
     pub attributes: Vec<(String, AttrValue)>,
 }
 
@@ -93,7 +93,7 @@ pub fn record_op(
     input_ptrs: Vec<i64>,
     output_ptr: i64,
     output_shape: Vec<i64>,
-    output_dtype: u8,
+    output_dtype: u16,
     attributes: Vec<(String, AttrValue)>,
 ) {
     if !is_tracing() {

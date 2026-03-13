@@ -19,7 +19,7 @@ unsafe fn str_from_ptr_len(ptr: i64, len: i64) -> String {
 }
 
 /// Create an NslTensor with manually specified data pointer, length, dtype, and ownership.
-fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u8, owns_data: u8) -> i64 {
+fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u16, owns_data: u8) -> i64 {
     let shape_ptr = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
     unsafe { *shape_ptr = len };
     let strides = NslTensor::compute_strides(shape_ptr, 1);

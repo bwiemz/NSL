@@ -276,7 +276,7 @@ pub(crate) fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
 
 /// Helper: create a tensor with a given shape and dtype (Rust slice).
 /// dtype=0 → f64, dtype=1 → f32
-pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u8) -> i64 {
+pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i64 {
     let ndim = shape.len() as i64;
     let mut total: i64 = 1;
     for &s in shape {

@@ -265,7 +265,7 @@ fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
 }
 
 /// Create a tensor with the given shape, filled with `fill`, and a specified dtype.
-fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u8) -> i64 {
+fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u16) -> i64 {
     use crate::memory::checked_alloc_zeroed;
     use crate::tensor::NslTensor;
 
@@ -315,7 +315,7 @@ fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u8) -> i64 {
 
 /// Like `create_tensor_with_shape_dtype` but allocates data in unified CUDA memory when device > 0.
 /// This allows CPU code to populate the tensor while the result is accessible on GPU.
-fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u8, device: u8) -> i64 {
+fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u16, device: u8) -> i64 {
     use crate::memory::checked_alloc_zeroed;
     use crate::tensor::NslTensor;
 
