@@ -4788,16 +4788,23 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(
     let num_elements = tensor.len as usize;
 
     if info.block_size == 0 {
-        // Element-wise: pack_fn signature: extern "C" fn(f64) -> i64
-        let pack: extern "C" fn(f64) -> i64 = unsafe { std::mem::transmute(pack_fn) };
+        // Element-wise: pack_fn signature: extern "C" fn(i64) -> i64
+        // The f64 value is passed as raw i64 bits to avoid calling-convention
+        // issues with floating-point registers on Windows.
+        let pack: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(pack_fn) };
 
         let packed_bytes = num_elements * info.element_size;
         let packed_data = checked_alloc_zeroed(packed_bytes);
 
-        let src = tensor.data as *const f64;
         for i in 0..num_elements {
-            let val = unsafe { *src.add(i) };
-            let packed_val = pack(val);
+            // Read element as f64 regardless of source dtype (promote f32→f64 if needed)
+            let val: f64 = if tensor.dtype == 1 {
+                unsafe { *(tensor.data as *const f32).add(i) as f64 }
+            } else {
+                unsafe { *(tensor.data as *const f64).add(i) }
+            };
+            let val_bits = val.to_bits() as i64;
+            let packed_val = pack(val_bits);
             let dst = unsafe { packed_data.add(i * info.element_size) };
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -4894,7 +4901,9 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
     let out_data = checked_alloc_zeroed(num_elements * 8) as *mut f64;
 
     if info.block_size == 0 {
-        let unpack: extern "C" fn(i64) -> f64 = unsafe { std::mem::transmute(unpack_fn) };
+        // Element-wise: unpack_fn signature: extern "C" fn(i64) -> i64
+        // Returns f64 bits as i64 to avoid floating-point register issues.
+        let unpack: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(unpack_fn) };
         let src = tensor.data as *const u8;
         for i in 0..num_elements {
             let mut packed_val: i64 = 0;
@@ -4905,7 +4914,8 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
                     info.element_size,
                 );
             }
-            unsafe { *out_data.add(i) = unpack(packed_val); }
+            let result_bits = unpack(packed_val);
+            unsafe { *out_data.add(i) = f64::from_bits(result_bits as u64); }
         }
     } else {
         let block_sz = info.block_size as usize;

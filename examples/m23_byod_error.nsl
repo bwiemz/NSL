@@ -1,0 +1,20 @@
+# M23 BYOD: Error/edge case test
+# Tests basic pack without unpack roundtrip
+
+datatype CpuOnly:
+    bits: 4
+
+    @pack(value: f32) -> uint8:
+        if value > 0.0:
+            return 1
+        else:
+            return 0
+
+    @unpack(packed: uint8) -> f32:
+        return 0.0
+
+let x = ones([4]) * 0.5
+let packed = x.to(CpuOnly)
+let unpacked = packed.to(f32)
+print(unpacked)
+print("done")

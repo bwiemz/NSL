@@ -821,35 +821,73 @@ impl<'a> Compiler<'a> {
                     }
 
                     let fn_name = format!("__nsl_dtype_{}_{}", dtype_name, fn_suffix);
+                    let is_block_mode = def.block_size.unwrap_or(0) > 0;
 
-                    // Build signature from method params and return type
+                    // Build signature using the runtime's calling convention, NOT the
+                    // NSL-level type annotations.  The runtime transmutes function
+                    // pointers to a fixed ABI:
+                    //   element-wise  pack:   extern "C" fn(f64) -> i64
+                    //   element-wise  unpack: extern "C" fn(i64) -> f64
+                    //   block-wise    pack:   extern "C" fn(*const f64, i64, *mut u8)
+                    //   block-wise    unpack: extern "C" fn(*const u8, i64, *mut f64)
                     let mut sig = self.module.make_signature();
                     sig.call_conv = self.call_conv;
-                    for param in &method.params {
-                        let cl_type = if let Some(ref type_ann) = param.type_ann {
-                            match &type_ann.kind {
-                                TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
-                                _ => cl_types::I64,
+
+                    match (method.kind, is_block_mode) {
+                        (DatatypeMethodKind::Pack, false) => {
+                            // element-wise pack: fn(i64) -> i64
+                            // Runtime passes f64 bits as i64 and expects packed i64 back.
+                            // The body bitcasts i64→f64 so the user-visible param is float.
+                            sig.params.push(AbiParam::new(cl_types::I64));
+                            sig.returns.push(AbiParam::new(cl_types::I64));
+                        }
+                        (DatatypeMethodKind::Unpack, false) => {
+                            // element-wise unpack: fn(i64) -> i64
+                            // Runtime passes packed i64, expects f64 bits as i64 back.
+                            sig.params.push(AbiParam::new(cl_types::I64));
+                            sig.returns.push(AbiParam::new(cl_types::I64));
+                        }
+                        (DatatypeMethodKind::Pack, true) => {
+                            // block-wise pack: fn(*const f64, i64, *mut u8) -> void
+                            sig.params.push(AbiParam::new(cl_types::I64)); // ptr to f64 block
+                            sig.params.push(AbiParam::new(cl_types::I64)); // block size
+                            sig.params.push(AbiParam::new(cl_types::I64)); // ptr to output
+                        }
+                        (DatatypeMethodKind::Unpack, true) => {
+                            // block-wise unpack: fn(*const u8, i64, *mut f64) -> void
+                            sig.params.push(AbiParam::new(cl_types::I64)); // ptr to packed
+                            sig.params.push(AbiParam::new(cl_types::I64)); // block size
+                            sig.params.push(AbiParam::new(cl_types::I64)); // ptr to output
+                        }
+                        _ => {
+                            // BackwardPack, Arithmetic — use AST annotations as before
+                            for param in &method.params {
+                                let cl_type = if let Some(ref type_ann) = param.type_ann {
+                                    match &type_ann.kind {
+                                        TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
+                                        _ => cl_types::I64,
+                                    }
+                                } else {
+                                    cl_types::I64
+                                };
+                                sig.params.push(AbiParam::new(cl_type));
                             }
-                        } else {
-                            cl_types::I64
-                        };
-                        sig.params.push(AbiParam::new(cl_type));
-                    }
-                    if let Some(ref ret_type) = method.return_type {
-                        match &ret_type.kind {
-                            TypeExprKind::Named(sym) => {
-                                let rname = self.resolve_sym(*sym);
-                                if rname != "void" {
-                                    sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                            if let Some(ref ret_type) = method.return_type {
+                                match &ret_type.kind {
+                                    TypeExprKind::Named(sym) => {
+                                        let rname = self.resolve_sym(*sym);
+                                        if rname != "void" {
+                                            sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                                        }
+                                    }
+                                    _ => { sig.returns.push(AbiParam::new(cl_types::I64)); }
                                 }
                             }
-                            _ => { sig.returns.push(AbiParam::new(cl_types::I64)); }
                         }
                     }
 
                     let func_id = self.module
-                        .declare_function(&fn_name, Linkage::Local, &sig)
+                        .declare_function(&fn_name, Linkage::Export, &sig)
                         .map_err(|e| CodegenError::new(format!(
                             "failed to declare dtype method '{fn_name}': {e}"
                         )))?;
@@ -865,6 +903,7 @@ impl<'a> Compiler<'a> {
                     {
                         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
                         let mut state = crate::context::FuncState::new();
+                        state.in_dtype_method = true;
 
                         let entry = builder.create_block();
                         builder.append_block_params_for_function_params(entry);
@@ -872,19 +911,34 @@ impl<'a> Compiler<'a> {
                         builder.seal_block(entry);
                         state.current_block = Some(entry);
 
-                        // Bind parameters
+                        // Bind parameters.
+                        // For element-wise pack: CL param is i64 (f64 bits), user expects f64.
+                        //   Bitcast i64→f64 and declare the variable as F64.
+                        // For element-wise unpack: CL param is i64, user expects i64. Direct bind.
+                        // For block-wise: all params are i64 pointers/sizes. Direct bind.
+                        let is_elem_pack = !is_block_mode && method.kind == DatatypeMethodKind::Pack;
                         for (i, param) in method.params.iter().enumerate() {
+                            if i >= sig.params.len() { break; }
                             let param_val = builder.block_params(entry)[i];
-                            let cl_type = if i < sig.params.len() {
-                                sig.params[i].value_type
+                            if is_elem_pack && i == 0 {
+                                // Bitcast i64 → f64 for the value parameter
+                                let f64_val = builder.ins().bitcast(cl_types::F64, MemFlags::new(), param_val);
+                                let var = state.new_variable();
+                                builder.declare_var(var, cl_types::F64);
+                                builder.def_var(var, f64_val);
+                                state.variables.insert(param.name, (var, cl_types::F64));
                             } else {
-                                cl_types::I64
-                            };
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_type);
-                            builder.def_var(var, param_val);
-                            state.variables.insert(param.name, (var, cl_type));
+                                let cl_type = sig.params[i].value_type;
+                                let var = state.new_variable();
+                                builder.declare_var(var, cl_type);
+                                builder.def_var(var, param_val);
+                                state.variables.insert(param.name, (var, cl_type));
+                            }
                         }
+
+                        // Mark unpack methods so return statements bitcast f64→i64
+                        let is_elem_unpack = !is_block_mode && method.kind == DatatypeMethodKind::Unpack;
+                        state.dtype_unpack_ret_bitcast = is_elem_unpack;
 
                         // Compile body statements
                         for body_stmt in &method.body {

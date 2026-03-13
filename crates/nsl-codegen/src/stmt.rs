@@ -104,7 +104,7 @@ impl Compiler<'_> {
 
             StmtKind::Return(expr) => {
                 if let Some(e) = expr {
-                    let val = self.compile_expr(builder, state, e)?;
+                    let mut val = self.compile_expr(builder, state, e)?;
                     // Free intermediate tensor temporaries before returning (keep return value)
                     self.free_tensor_temporaries(builder, state, Some(val));
                     // Stop and free any DataLoaders created in this scope
@@ -112,6 +112,13 @@ impl Compiler<'_> {
                     // @no_grad: resume tape before explicit return
                     if state.is_no_grad {
                         self.compile_call_by_name(builder, "nsl_tape_resume", &[])?;
+                    }
+                    // In element-wise unpack methods, bitcast f64→i64 for the return value
+                    if state.dtype_unpack_ret_bitcast {
+                        let vt = builder.func.dfg.value_type(val);
+                        if vt == cranelift_codegen::ir::types::F64 {
+                            val = builder.ins().bitcast(cranelift_codegen::ir::types::I64, cranelift_codegen::ir::MemFlags::new(), val);
+                        }
                     }
                     builder.ins().return_(&[val]);
                 } else {

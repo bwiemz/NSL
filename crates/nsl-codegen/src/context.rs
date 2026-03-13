@@ -43,6 +43,12 @@ pub struct FuncState {
     /// Stack of scope markers into tensor_temporaries, pushed on loop entry, popped on exit.
     /// Used to emit cleanup at break/continue without corrupting compiler state.
     pub temp_scope_stack: Vec<usize>,
+    /// True when compiling a custom datatype method body (pack/unpack).
+    /// Disables the "both indeterminate types → tensor" heuristic for binary ops.
+    pub in_dtype_method: bool,
+    /// True when compiling an element-wise unpack method body.
+    /// Return statements should bitcast f64→i64 before returning.
+    pub dtype_unpack_ret_bitcast: bool,
 }
 
 impl Default for FuncState {
@@ -62,6 +68,8 @@ impl FuncState {
             tensor_temporaries: Vec::new(),
             dataloader_vars: Vec::new(),
             temp_scope_stack: Vec::new(),
+            in_dtype_method: false,
+            dtype_unpack_ret_bitcast: false,
         }
     }
 

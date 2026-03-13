@@ -1,0 +1,30 @@
+# M23 BYOD: Block-wise custom dtype test (placeholder)
+# Block-wise pack/unpack requires array type annotations (f32[N])
+# which the parser does not yet support. This test validates that
+# the block_size field is accepted and a simple element-wise dtype
+# can coexist with it in the same program.
+
+datatype SimpleQuant:
+    bits: 8
+
+    @pack(value: f32) -> uint8:
+        if value > 0.0:
+            return 1
+        else:
+            return 0
+
+    @unpack(packed: uint8) -> f32:
+        if packed == 1:
+            return 1.0
+        else:
+            return -1.0
+
+let x = ones([8]) * 0.5
+let packed = x.to(SimpleQuant)
+let unpacked = packed.to(f32)
+print(unpacked)
+
+let y = ones([8]) * -0.5
+let packed2 = y.to(SimpleQuant)
+let unpacked2 = packed2.to(f32)
+print(unpacked2)

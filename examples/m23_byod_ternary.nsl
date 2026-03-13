@@ -1,0 +1,38 @@
+# M23 BYOD: Ternary element-wise custom dtype
+# Maps values to {-1, 0, +1} based on thresholds
+datatype Ternary:
+    bits: 2
+
+    @pack(value: f32) -> uint8:
+        if value > 0.5:
+            return 1
+        elif value < -0.5:
+            return 2
+        else:
+            return 0
+
+    @unpack(packed: uint8) -> f32:
+        if packed == 1:
+            return 1.0
+        elif packed == 2:
+            return -1.0
+        else:
+            return 0.0
+
+# Test 1: positive values (> 0.5 → 1 → 1.0)
+let pos = ones([4]) * 0.8
+let packed_pos = pos.to(Ternary)
+let unp_pos = packed_pos.to(f32)
+print(unp_pos)
+
+# Test 2: near-zero values (→ 0 → 0.0)
+let zero = zeros([4])
+let packed_zero = zero.to(Ternary)
+let unp_zero = packed_zero.to(f32)
+print(unp_zero)
+
+# Test 3: negative values (< -0.5 → 2 → -1.0)
+let neg = ones([4]) * -0.8
+let packed_neg = neg.to(Ternary)
+let unp_neg = packed_neg.to(f32)
+print(unp_neg)

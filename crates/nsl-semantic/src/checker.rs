@@ -1631,6 +1631,14 @@ impl<'a> TypeChecker<'a> {
                         params: vec![],
                         ret: Box::new(Type::Float),
                     },
+                    "to" => Type::Function {
+                        params: vec![Type::Int],
+                        ret: Box::new(Type::Tensor {
+                            shape: crate::types::Shape::unknown(),
+                            dtype: crate::types::DType::Unknown,
+                            device: crate::types::Device::Unknown,
+                        }),
+                    },
                     _ => Type::Unknown,    // tensor methods
                 }
             }

@@ -180,3 +180,18 @@ fn e2e_m14_sgd_basic() {
 fn e2e_m14_mse_test() {
     assert_output_matches("m14_mse_test");
 }
+
+#[test]
+fn e2e_m23_byod_ternary() {
+    assert_output_matches("m23_byod_ternary");
+}
+
+#[test]
+fn e2e_m23_byod_block() {
+    assert_output_matches("m23_byod_block");
+}
+
+#[test]
+fn e2e_m23_byod_error() {
+    assert_output_matches("m23_byod_error");
+}

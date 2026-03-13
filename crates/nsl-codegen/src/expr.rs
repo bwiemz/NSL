@@ -224,17 +224,26 @@ impl Compiler<'_> {
         //  - The op is MatMul (@ is tensor-only)
         //  - The other operand is a tensor
         //  - Both operands are indeterminate (likely from .to(device) or other runtime returns)
-        let both_indeterminate = left_type.is_indeterminate() && right_type.is_indeterminate();
+        // Exception: inside datatype method bodies, indeterminate types are always scalars
+        //   (the semantic checker does not descend into method bodies).
+        let both_indeterminate = left_type.is_indeterminate() && right_type.is_indeterminate()
+            && !state.in_dtype_method;
         let left_is_tensor = left_type.is_tensor()
-            || (left_type.is_indeterminate() && (matches!(op, BinOp::MatMul) || right_type.is_tensor() || both_indeterminate));
+            || (left_type.is_indeterminate() && !state.in_dtype_method
+                && (matches!(op, BinOp::MatMul) || right_type.is_tensor() || both_indeterminate));
         let right_is_tensor = right_type.is_tensor()
-            || (right_type.is_indeterminate() && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
+            || (right_type.is_indeterminate() && !state.in_dtype_method
+                && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
             return self.compile_tensor_binary_op(builder, state, lhs, rhs, op, left_is_tensor, right_is_tensor);
         }
 
-        let left_is_float = is_float_type(&left_type);
-        let right_is_float = is_float_type(&right_type);
+        // When semantic type is Unknown (e.g., inside dtype method bodies), fall back
+        // to checking the Cranelift value type to determine float vs int.
+        let left_is_float = is_float_type(&left_type)
+            || (left_type.is_indeterminate() && builder.func.dfg.value_type(lhs).is_float());
+        let right_is_float = is_float_type(&right_type)
+            || (right_type.is_indeterminate() && builder.func.dfg.value_type(rhs).is_float());
         let is_float = left_is_float || right_is_float;
 
         // Promote int → float if mixed types
@@ -242,17 +251,25 @@ impl Compiler<'_> {
             if !left_is_float {
                 // fcvt_from_sint requires I32 or I64; widen sub-I32 ints first
                 let lhs_ty = builder.func.dfg.value_type(lhs);
-                if lhs_ty.bits() < 32 {
+                if lhs_ty.is_float() {
+                    // Already float (detected by CL type), no conversion needed
+                } else if lhs_ty.bits() < 32 {
                     lhs = builder.ins().sextend(cl_types::I64, lhs);
+                    lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
+                } else {
+                    lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
                 }
-                lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
             }
             if !right_is_float {
                 let rhs_ty = builder.func.dfg.value_type(rhs);
-                if rhs_ty.bits() < 32 {
+                if rhs_ty.is_float() {
+                    // Already float (detected by CL type), no conversion needed
+                } else if rhs_ty.bits() < 32 {
                     rhs = builder.ins().sextend(cl_types::I64, rhs);
+                    rhs = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
+                } else {
+                    rhs = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
                 }
-                rhs = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
             }
         }
 
@@ -437,10 +454,12 @@ impl Compiler<'_> {
         let val = self.compile_expr(builder, state, operand)?;
         let ty = self.node_type(operand.id).clone();
         match op {
-            UnaryOp::Neg if ty.is_tensor() || ty.is_indeterminate() => {
+            UnaryOp::Neg if ty.is_tensor() || (ty.is_indeterminate() && !state.in_dtype_method) => {
                 self.compile_call_by_name(builder, "nsl_tensor_neg", &[val])
             }
-            UnaryOp::Neg if is_float_type(&ty) => Ok(builder.ins().fneg(val)),
+            UnaryOp::Neg if is_float_type(&ty) || builder.func.dfg.value_type(val).is_float() => {
+                Ok(builder.ins().fneg(val))
+            }
             UnaryOp::Neg => Ok(builder.ins().ineg(val)),
             UnaryOp::Not => Ok(builder.ins().icmp_imm(IntCC::Equal, val, 0)),
         }
