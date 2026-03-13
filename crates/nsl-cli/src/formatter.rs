@@ -233,6 +233,21 @@ fn fix_operator_spacing(line: &str) -> String {
             continue;
         }
 
+        // Handle `->` (return type arrow) — keep as single token with spaces around
+        if ch == '-' && i + 1 < n && chars[i + 1] == '>' {
+            ensure_space_before(&mut out);
+            out.push('-');
+            out.push('>');
+            i += 2;
+            while i < n && chars[i] == ' ' {
+                i += 1;
+            }
+            if i < n {
+                out.push(' ');
+            }
+            continue;
+        }
+
         // Two-char operators
         let two_char_op: Option<&str> = if i + 1 < n {
             let two = &line[char_byte_pos(line, i)..char_byte_pos(line, i + 2).min(line.len())];
