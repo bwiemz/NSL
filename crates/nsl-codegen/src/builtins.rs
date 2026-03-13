@@ -261,6 +261,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_finalize_dtype_registry", &[], None),
     ("nsl_tensor_to_custom_dtype", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_from_custom_dtype", &[types::I64], Some(types::I64)),
+    // Standalone weight provider and arg parser (M24)
+    ("nsl_standalone_init_embedded",     &[types::I64, types::I64],                                     None),
+    ("nsl_standalone_init_sidecar",      &[types::I64, types::I64],                                     None),
+    ("nsl_standalone_has_weights",       &[],                                                            Some(types::I64)),
+    ("nsl_standalone_args_init",         &[types::I64, types::I64],                                     None),
+    ("nsl_standalone_arg_str",           &[types::I64, types::I64],                                     Some(types::I64)),
+    ("nsl_standalone_arg_str_default",   &[types::I64, types::I64, types::I64, types::I64],             Some(types::I64)),
+    ("nsl_standalone_arg_int",           &[types::I64, types::I64],                                     Some(types::I64)),
+    ("nsl_standalone_arg_int_default",   &[types::I64, types::I64, types::I64],                         Some(types::I64)),
+    ("nsl_standalone_arg_float",         &[types::I64, types::I64],                                     Some(types::I64)),
+    ("nsl_standalone_arg_float_default", &[types::I64, types::I64, types::I64],                         Some(types::I64)),
+    ("nsl_standalone_args_finish",       &[],                                                            None),
 ];
 
 /// Declare all runtime functions as imports in the module.
