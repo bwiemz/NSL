@@ -163,3 +163,73 @@ pub fn read_safetensors(path: &Path) -> Result<Vec<WeightTensor>, String> {
 
     Ok(result)
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: .nslweights format serialization
+// ---------------------------------------------------------------------------
+
+const NSLW_MAGIC: &[u8; 4] = b"NSLW";
+const NSLW_VERSION: u32 = 1;
+
+/// Serialize a list of weight tensors into the .nslweights binary format.
+///
+/// Layout:
+///   [magic: 4 bytes] [version: u32 LE] [header_size: u64 LE]
+///   [JSON header: header_size bytes] [padding to 64-byte alignment]
+///   [raw tensor data concatenated]
+///
+/// JSON header format: `{"tensors":[{"name":"...","shape":[...],"dtype":"f64","offset":0,"nbytes":...},...]}`
+pub fn serialize_nslweights(tensors: &[WeightTensor]) -> Vec<u8> {
+    // Build JSON header entries while tracking per-tensor byte offsets.
+    let mut entries: Vec<String> = Vec::with_capacity(tensors.len());
+    let mut data_offset: u64 = 0;
+
+    for t in tensors {
+        let nbytes = t.data.len() as u64;
+        let dtype_str = match t.dtype {
+            WeightDtype::F32 => "f32",
+            WeightDtype::F64 => "f64",
+        };
+        let shape_json = {
+            let parts: Vec<String> = t.shape.iter().map(|d| d.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        };
+        entries.push(format!(
+            r#"{{"name":"{}","shape":{},"dtype":"{}","offset":{},"nbytes":{}}}"#,
+            t.name, shape_json, dtype_str, data_offset, nbytes
+        ));
+        data_offset += nbytes;
+    }
+
+    let header = format!(r#"{{"tensors":[{}]}}"#, entries.join(","));
+    let header_bytes = header.as_bytes();
+    let header_size = header_bytes.len() as u64;
+
+    // Fixed prefix: 4 (magic) + 4 (version) + 8 (header_size) = 16 bytes.
+    let total_before_pad = 16 + header_bytes.len();
+    let padding = (64 - (total_before_pad % 64)) % 64;
+
+    let total_data: usize = tensors.iter().map(|t| t.data.len()).sum();
+    let mut out = Vec::with_capacity(total_before_pad + padding + total_data);
+
+    out.extend_from_slice(NSLW_MAGIC);
+    out.extend_from_slice(&NSLW_VERSION.to_le_bytes());
+    out.extend_from_slice(&header_size.to_le_bytes());
+    out.extend_from_slice(header_bytes);
+
+    // Padding zeros to reach 64-byte alignment.
+    out.resize(out.len() + padding, 0u8);
+
+    // Raw tensor data concatenated in header order.
+    for t in tensors {
+        out.extend_from_slice(&t.data);
+    }
+
+    out
+}
+
+/// Write raw .nslweights bytes to a sidecar file at the given path.
+pub fn write_nslweights_sidecar_raw(data: &[u8], path: &Path) -> Result<(), String> {
+    std::fs::write(path, data)
+        .map_err(|e| format!("write_nslweights_sidecar_raw: cannot write {:?}: {}", path, e))
+}
