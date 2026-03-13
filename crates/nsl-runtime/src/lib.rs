@@ -38,6 +38,12 @@ pub mod onnx;
 #[cfg(feature = "interop")]
 pub mod onnx_proto;
 
+// Stubs for interop FFI symbols when feature is disabled.
+// The codegen always declares these as external imports, so the linker
+// needs them even if the program never calls interop functions.
+#[cfg(not(feature = "interop"))]
+mod interop_stubs;
+
 pub mod sampling;
 pub mod data_source;
 pub mod packing;
