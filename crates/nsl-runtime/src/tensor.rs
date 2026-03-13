@@ -222,6 +222,7 @@ fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
 
 /// Helper: create a tensor from a shape list, filling data with a given value (f64, dtype=0).
 /// Used for operations that explicitly require double precision.
+#[allow(dead_code)]
 fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
     let list = NslList::from_ptr(shape_list);
     let ndim = list.len;
@@ -1040,7 +1041,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         autodiff::maybe_record(autodiff::TapeOp::Stack {
             inputs: ptrs,
             out: out_ptr,
-            dim: dim as i64,
+            dim,
         });
     }
 
@@ -1098,8 +1099,8 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     // Compute output
     let out_ndim = target_ndim as i64;
     let out_shape_ptr = checked_alloc(target_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..target_ndim {
-        unsafe { *out_shape_ptr.add(i) = target_shape[i] };
+    for (i, &s) in target_shape.iter().enumerate().take(target_ndim) {
+        unsafe { *out_shape_ptr.add(i) = s };
     }
     let out_strides = NslTensor::compute_strides(out_shape_ptr, out_ndim);
     let out_len = NslTensor::total_elements(out_shape_ptr, out_ndim);
@@ -1767,6 +1768,7 @@ fn get_strides_vec(tensor: &NslTensor) -> Vec<usize> {
 }
 
 /// Helper: create a tensor with a given shape (Rust slice).
+#[allow(dead_code)]
 fn create_tensor_with_shape_rs(shape: &[i64]) -> i64 {
     crate::cpu::create_tensor_with_shape_rs(shape)
 }
@@ -1857,7 +1859,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
         // Compute output flat index (skip or collapse the reduced dim)
         let mut out_flat = 0usize;
         let mut oi = 0usize;
-        for dd in 0..ndim {
+        for (dd, &idx) in indices.iter().enumerate().take(ndim) {
             if dd == d {
                 if keepdim_bool {
                     // dim is kept as size 1, index=0
@@ -1865,7 +1867,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
                 }
                 continue;
             }
-            out_flat += indices[dd] * out_strides[oi];
+            out_flat += idx * out_strides[oi];
             oi += 1;
         }
 
@@ -2032,14 +2034,14 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
         // Compute output flat index
         let mut out_flat = 0usize;
         let mut oi = 0usize;
-        for dd in 0..ndim {
+        for (dd, &idx) in indices.iter().enumerate().take(ndim) {
             if dd == d {
                 if keepdim_bool {
                     oi += 1;
                 }
                 continue;
             }
-            out_flat += indices[dd] * out_strides[oi];
+            out_flat += idx * out_strides[oi];
             oi += 1;
         }
 
@@ -3409,7 +3411,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         autodiff::maybe_record(autodiff::TapeOp::Slice {
             a: tensor_ptr,
             out: out_ptr,
-            dim: dim,
+            dim,
             start: s,
             input_shape,
         });
@@ -3477,7 +3479,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let data: *mut c_void = if out_dtype == 1 {
         let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let mut cat_offset: usize = 0;
-        for t_idx in 0..num_tensors {
+        for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
             let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
             let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..t.len as usize {
@@ -3494,13 +3496,13 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
                 }
                 unsafe { *buf.add(out_offset) = *t.data_f32().add(flat) };
             }
-            cat_offset += split_sizes[t_idx] as usize;
+            cat_offset += sz as usize;
         }
         buf as *mut c_void
     } else {
         let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
         let mut cat_offset: usize = 0;
-        for t_idx in 0..num_tensors {
+        for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
             let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
             let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..t.len as usize {
@@ -3517,7 +3519,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
                 }
                 unsafe { *buf.add(out_offset) = *t.data_f64().add(flat) };
             }
-            cat_offset += split_sizes[t_idx] as usize;
+            cat_offset += sz as usize;
         }
         buf as *mut c_void
     };
@@ -3555,7 +3557,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         autodiff::maybe_record(autodiff::TapeOp::Cat {
             inputs: input_ptrs,
             out: out_ptr,
-            dim: dim,
+            dim,
             split_sizes,
         });
     }
@@ -3635,7 +3637,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         unsafe {
             std::ptr::copy_nonoverlapping(
                 (weight.data as *const u8).add((idx * embed_dim) * elem_size),
-                (out_data_raw as *mut u8).add(i * embed_dim * elem_size),
+                out_data_raw.add(i * embed_dim * elem_size),
                 embed_dim * elem_size,
             );
         }
@@ -4411,6 +4413,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         return tensor_ptr;
     }
 
+    #[allow(unused_variables)]
     let len = t.len as usize;
 
     if t.device == 0 && target > 0 {
@@ -4532,7 +4535,7 @@ pub extern "C" fn nsl_tensor_set_element(
 
     let strides = crate::cpu::get_strides_vec(tensor);
     let mut offset: usize = 0;
-    for d in 0..ndim {
+    for (d, &stride) in strides.iter().enumerate().take(ndim) {
         let idx = unsafe { *(indices_ptr as *const i64).add(d) } as usize;
         let dim_size = unsafe { *tensor.shape.add(d) } as usize;
         if idx >= dim_size {
@@ -4542,7 +4545,7 @@ pub extern "C" fn nsl_tensor_set_element(
             );
             std::process::abort();
         }
-        offset += idx * strides[d];
+        offset += idx * stride;
     }
 
     if tensor.dtype == 1 {
@@ -4598,6 +4601,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
     // Iterate over all positions in the slice and copy from src
     let mut src_flat = 0usize;
 
+    #[allow(clippy::too_many_arguments)]
     fn recurse(
         depth: usize,
         ndim: usize,

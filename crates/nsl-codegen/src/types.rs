@@ -8,7 +8,7 @@ pub fn is_block_filled(builder: &FunctionBuilder, block: ir::Block) -> bool {
         .func
         .layout
         .last_inst(block)
-        .map_or(false, |inst| builder.func.dfg.insts[inst].opcode().is_terminator())
+        .is_some_and(|inst| builder.func.dfg.insts[inst].opcode().is_terminator())
 }
 
 /// Map an NSL semantic type to a Cranelift IR type.

@@ -1243,7 +1243,7 @@ impl Compiler<'_> {
             let dim_val = if args.len() > 2 {
                 self.compile_expr(builder, state, &args[2].value)?
             } else {
-                builder.ins().iconst(cl_types::I64, -1i64 as i64)
+                builder.ins().iconst(cl_types::I64, -1_i64)
             };
             return self.compile_call_by_name(builder, "nsl_tensor_topk", &[tensor_val, k_val, dim_val]);
         }
@@ -1261,7 +1261,7 @@ impl Compiler<'_> {
             let dim_val = if args.len() > 1 {
                 self.compile_expr(builder, state, &args[1].value)?
             } else {
-                builder.ins().iconst(cl_types::I64, -1i64 as i64)
+                builder.ins().iconst(cl_types::I64, -1_i64)
             };
             return self.compile_call_by_name(builder, "nsl_tensor_argmax", &[tensor_val, dim_val]);
         }
@@ -2666,6 +2666,7 @@ impl Compiler<'_> {
 
     // ── Tensor operations ──────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_tensor_binary_op(
         &mut self,
         builder: &mut FunctionBuilder,

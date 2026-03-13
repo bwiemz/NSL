@@ -176,13 +176,8 @@ impl<'a> Parser<'a> {
 
     /// Consume newlines and doc comments (skip over them).
     pub fn skip_newlines(&mut self) {
-        loop {
-            match self.peek() {
-                TokenKind::Newline | TokenKind::DocComment(_) => {
-                    self.advance();
-                }
-                _ => break,
-            }
+        while let TokenKind::Newline | TokenKind::DocComment(_) = self.peek() {
+            self.advance();
         }
     }
 

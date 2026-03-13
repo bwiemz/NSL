@@ -45,6 +45,12 @@ pub struct FuncState {
     pub temp_scope_stack: Vec<usize>,
 }
 
+impl Default for FuncState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FuncState {
     pub fn new() -> Self {
         FuncState {

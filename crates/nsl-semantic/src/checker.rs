@@ -279,8 +279,8 @@ impl<'a> TypeChecker<'a> {
                         | Type::Uint8 | Type::Float | Type::F64 | Type::F32
                         | Type::Tensor { .. } | Type::Unknown
                     );
-                    if !is_numeric(&target_ty) || !is_numeric(&value_ty) {
-                        if !target_ty.is_indeterminate() && !value_ty.is_indeterminate() {
+                    if (!is_numeric(&target_ty) || !is_numeric(&value_ty))
+                        && !target_ty.is_indeterminate() && !value_ty.is_indeterminate() {
                             self.diagnostics.push(
                                 Diagnostic::error(format!(
                                     "invalid operand types for compound assignment: {} and {}",
@@ -288,7 +288,6 @@ impl<'a> TypeChecker<'a> {
                                 ))
                                 .with_label(value.span, "invalid type for compound assignment"),
                             );
-                        }
                     }
                 }
             }
@@ -1285,18 +1284,16 @@ impl<'a> TypeChecker<'a> {
                     return Type::List(Box::new(Type::Tuple(vec![Type::Int, *elem_ty.clone()])));
                 }
             }
-            if name == "zip" {
-                if arg_types.len() >= 2 {
-                    let a = match &arg_types[0] {
-                        Type::List(t) => *t.clone(),
-                        _ => Type::Unknown,
-                    };
-                    let b = match &arg_types[1] {
-                        Type::List(t) => *t.clone(),
-                        _ => Type::Unknown,
-                    };
-                    return Type::List(Box::new(Type::Tuple(vec![a, b])));
-                }
+            if name == "zip" && arg_types.len() >= 2 {
+                let a = match &arg_types[0] {
+                    Type::List(t) => *t.clone(),
+                    _ => Type::Unknown,
+                };
+                let b = match &arg_types[1] {
+                    Type::List(t) => *t.clone(),
+                    _ => Type::Unknown,
+                };
+                return Type::List(Box::new(Type::Tuple(vec![a, b])));
             }
 
             // Tensor creation shape inference
@@ -1505,7 +1502,7 @@ impl<'a> TypeChecker<'a> {
                     Diagnostic::error(format!("module has no export `{name}`"))
                         .with_label(span, "not found in module"),
                 );
-                return Type::Error;
+                Type::Error
             }
             Type::Struct { fields, .. } => {
                 if let Some((_, field_ty)) = fields.iter().find(|(name, _)| *name == member) {

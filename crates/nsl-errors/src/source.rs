@@ -34,7 +34,7 @@ impl SourceMap {
         let labels: Vec<_> = diag
             .labels
             .iter()
-            .map(|label| convert_label(label))
+            .map(convert_label)
             .collect();
         cs_diag = cs_diag.with_labels(labels);
 

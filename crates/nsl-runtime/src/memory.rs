@@ -25,6 +25,8 @@ pub extern "C" fn nsl_alloc(size: i64) -> *mut u8 {
     ptr
 }
 
+// Safety: pointer was allocated by nsl_alloc; caller must not use it after free.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn nsl_free(ptr: *mut u8) {
     if ptr.is_null() {

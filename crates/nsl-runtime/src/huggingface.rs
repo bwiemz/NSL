@@ -111,7 +111,7 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
         };
 
         // Validate shape if compile-time constraints are present
-        if meta.shape_ptr != std::ptr::null() && meta.ndim > 0 {
+        if !meta.shape_ptr.is_null() && meta.ndim > 0 {
             let tensor = NslTensor::from_ptr(tensor_ptr);
             if tensor.ndim != meta.ndim {
                 eprintln!(

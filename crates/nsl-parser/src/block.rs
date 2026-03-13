@@ -101,7 +101,7 @@ pub fn parse_train_block_stmt(p: &mut Parser) -> Stmt {
 
         // Generic statement inside train block
         let stmt = crate::stmt::parse_stmt(p);
-        sections.push(TrainSection::Stmt(stmt));
+        sections.push(TrainSection::Stmt(Box::new(stmt)));
     }
 
     p.eat(&TokenKind::Dedent);

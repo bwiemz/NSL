@@ -100,7 +100,7 @@ fn normalize_tabs(input: &str) -> String {
 fn strip_trailing_whitespace(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     for line in input.lines() {
-        result.push_str(line.trim_end_matches(|c| c == ' ' || c == '\t'));
+        result.push_str(line.trim_end_matches([' ', '\t']));
         result.push('\n');
     }
     if !input.is_empty() && !input.ends_with('\n') {

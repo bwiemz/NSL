@@ -25,6 +25,12 @@ pub struct KernelCompiler {
     var_regs: HashMap<String, (String, RegKind)>,
 }
 
+impl Default for KernelCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KernelCompiler {
     pub fn new() -> Self {
         KernelCompiler {

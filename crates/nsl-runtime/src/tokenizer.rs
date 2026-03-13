@@ -27,7 +27,7 @@ enum TokenizerKind {
     /// Trivial byte tokenizer: token ID == byte value, vocab size 256.
     Byte,
     /// Full HuggingFace tokenizer.
-    HuggingFace(Tokenizer),
+    HuggingFace(Box<Tokenizer>),
 }
 
 /// Box a `TokenizerKind` and return its raw pointer as i64.
@@ -184,7 +184,7 @@ pub extern "C" fn nsl_bpe_train(
         std::process::abort();
     }
 
-    store_tokenizer(TokenizerKind::HuggingFace(tokenizer))
+    store_tokenizer(TokenizerKind::HuggingFace(Box::new(tokenizer)))
 }
 
 /// Load a tokenizer from a JSON file.
@@ -197,7 +197,7 @@ pub extern "C" fn nsl_bpe_train(
 pub extern "C" fn nsl_tokenizer_load(path_ptr: i64) -> i64 {
     let path = unsafe { cstr_to_str(path_ptr) };
     match Tokenizer::from_file(path) {
-        Ok(tok) => store_tokenizer(TokenizerKind::HuggingFace(tok)),
+        Ok(tok) => store_tokenizer(TokenizerKind::HuggingFace(Box::new(tok))),
         Err(e) => {
             eprintln!("nsl: failed to load tokenizer from '{path}': {e}");
             std::process::abort();

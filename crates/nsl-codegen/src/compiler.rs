@@ -859,6 +859,7 @@ impl<'a> Compiler<'a> {
             self.compile_fn_def(fn_def)?;
         }
 
+        #[allow(clippy::type_complexity)]
         let layouts: Vec<(String, Vec<(cl_types::Type, usize)>, usize)> = self
             .struct_layouts.iter()
             .filter(|(name, _)| !self.model_methods.contains_key(*name) && !self.imported_model_names.contains(*name))
@@ -880,7 +881,7 @@ impl<'a> Compiler<'a> {
             })
             .collect();
         for md in &model_defs {
-            self.compile_model_constructor(&md)?;
+            self.compile_model_constructor(md)?;
         }
         self.compile_model_methods(stmts)?;
 

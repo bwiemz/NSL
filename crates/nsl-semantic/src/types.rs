@@ -396,12 +396,12 @@ pub fn display_type(ty: &Type) -> String {
         Type::List(inner) => format!("list<{}>", display_type(inner)),
         Type::Dict(k, v) => format!("dict<{}, {}>", display_type(k), display_type(v)),
         Type::Tuple(elems) => {
-            let inner: Vec<String> = elems.iter().map(|t| display_type(t)).collect();
+            let inner: Vec<String> = elems.iter().map(display_type).collect();
             format!("({})", inner.join(", "))
         }
         Type::Optional(inner) => format!("{}?", display_type(inner)),
         Type::Function { params, ret } => {
-            let ps: Vec<String> = params.iter().map(|t| display_type(t)).collect();
+            let ps: Vec<String> = params.iter().map(display_type).collect();
             format!("({}) -> {}", ps.join(", "), display_type(ret))
         }
         Type::QuantizedTensor => "QuantizedTensor".into(),

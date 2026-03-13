@@ -30,7 +30,7 @@ pub extern "C" fn nsl_read_file(path: i64) -> i64 {
 pub extern "C" fn nsl_write_file(path: i64, content: i64) {
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
     let content_str = unsafe { as_cstr(content) }.to_str().unwrap_or("");
-    if let Err(_) = std::fs::write(path_str, content_str) {
+    if std::fs::write(path_str, content_str).is_err() {
         eprintln!("nsl: could not open file '{}' for writing", path_str);
         std::process::abort();
     }
@@ -48,7 +48,7 @@ pub extern "C" fn nsl_append_file(path: i64, content: i64) {
             std::process::abort();
         }
     };
-    if let Err(_) = file.write_all(content_str.as_bytes()) {
+    if file.write_all(content_str.as_bytes()).is_err() {
         eprintln!("nsl: could not write to file '{}'", path_str);
         std::process::abort();
     }

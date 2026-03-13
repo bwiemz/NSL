@@ -362,7 +362,7 @@ fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dum
 }
 
 /// Multi-file build with module system.
-fn run_build_multi(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
+fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
     let mut source_map = SourceMap::new();
     let mut interner = Interner::new();
 
@@ -662,8 +662,8 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
     };
 
     if tests.is_empty() {
-        if filter.is_some() {
-            eprintln!("no tests match filter '{}'", filter.unwrap());
+        if let Some(f) = filter {
+            eprintln!("no tests match filter '{f}'");
         } else {
             eprintln!("no @test functions found");
         }

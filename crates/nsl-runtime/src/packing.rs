@@ -24,6 +24,8 @@ pub struct PackedBatch {
 /// attention mask that prevents cross-document attention.
 ///
 /// Returns `None` when not enough tokens remain (epoch end).
+// Safety: caller must ensure `data` points to a valid array of at least `data_len` elements.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn pack_batch(
     data: *const f64,
     data_len: usize,

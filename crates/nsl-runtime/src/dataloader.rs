@@ -19,6 +19,8 @@ use crate::tensor::NslTensor;
 // Config
 // ---------------------------------------------------------------------------
 
+// Fields are reserved for future use (parallelism, memory-pinning, etc.)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct DataLoaderConfig {
     batch_size: usize,

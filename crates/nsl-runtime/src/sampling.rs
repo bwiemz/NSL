@@ -91,9 +91,9 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
             .map(|i| (read_val(i), i))
             .collect();
         pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for j in 0..k {
-            write_val(j, pairs[j].0);
-            unsafe { *idx_data.add(j) = pairs[j].1 as f64; }
+        for (j, &(val, orig_idx)) in pairs.iter().enumerate().take(k) {
+            write_val(j, val);
+            unsafe { *idx_data.add(j) = orig_idx as f64; }
         }
     } else {
         // nD case: iterate over slices perpendicular to dim d
@@ -127,10 +127,10 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
                 out_base += outer_coords[oi] * out_strides[od];
             }
             let out_dim_stride = out_strides[d];
-            for j in 0..k {
+            for (j, &(val, orig_idx)) in pairs.iter().enumerate().take(k) {
                 let out_offset = out_base + j * out_dim_stride;
-                write_val(out_offset, pairs[j].0);
-                unsafe { *idx_data.add(out_offset) = pairs[j].1 as f64; }
+                write_val(out_offset, val);
+                unsafe { *idx_data.add(out_offset) = orig_idx as f64; }
             }
         }
     }

@@ -107,7 +107,7 @@ fn alloc_qtensor(
 
     // Data buffer size: INT8 = 1 byte/elem, INT4 = ceil(total/2) bytes
     let data_bytes = match dtype {
-        DTYPE_INT4 => (total + 1) / 2,
+        DTYPE_INT4 => total.div_ceil(2),
         DTYPE_INT8 => total,
         _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
     };
@@ -148,7 +148,7 @@ pub extern "C" fn nsl_qtensor_free(ptr: i64) {
     let total = total_elements(qt.shape, qt.ndim) as usize;
 
     let data_bytes = match qt.dtype {
-        DTYPE_INT4 => (total + 1) / 2,
+        DTYPE_INT4 => total.div_ceil(2),
         DTYPE_INT8 => total,
         _ => { eprintln!("nsl: unknown quantization dtype {}", qt.dtype); std::process::abort(); }
     };
@@ -190,7 +190,7 @@ pub extern "C" fn nsl_qtensor_release(ptr: i64) {
 fn int4_pack(data: *mut u8, index: usize, value: u8) {
     let byte_idx = index / 2;
     unsafe {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             // Low nibble
             *data.add(byte_idx) |= value & 0x0F;
         } else {
@@ -206,7 +206,7 @@ fn int4_unpack(data: *const u8, index: usize) -> u8 {
     let byte_idx = index / 2;
     unsafe {
         let byte = *data.add(byte_idx);
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             byte & 0x0F
         } else {
             (byte >> 4) & 0x0F
@@ -309,8 +309,8 @@ pub extern "C" fn nsl_qtensor_quantize(
                 *qt_ref.scale = scale;
                 *qt_ref.zero_point = zp;
             }
-            for i in 0..total {
-                let q = quantize_val(src[i], scale, zp, qmin, qmax);
+            for (i, &val) in src.iter().enumerate().take(total) {
+                let q = quantize_val(val, scale, zp, qmin, qmax);
                 match dtype {
                     DTYPE_INT4 => int4_pack(qt_ref.data, i, q),
                     DTYPE_INT8 => unsafe { *qt_ref.data.add(i) = q },
@@ -367,7 +367,7 @@ pub extern "C" fn nsl_qtensor_quantize(
             let axis = gran_axis as usize;
             let axis_size = unsafe { *tensor.shape.add(axis) } as usize;
             let gs = group_size as usize;
-            let num_groups = (axis_size + gs - 1) / gs;
+            let num_groups = axis_size.div_ceil(gs);
 
             let mut inner_size: usize = 1;
             for d in (axis + 1)..(ndim as usize) {
@@ -485,7 +485,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
             let axis = qt.gran_axis as usize;
             let axis_size = unsafe { *qt.shape.add(axis) } as usize;
             let gs = qt.group_size as usize;
-            let num_groups = (axis_size + gs - 1) / gs;
+            let num_groups = axis_size.div_ceil(gs);
             let mut inner_size: usize = 1;
             for d in (axis + 1)..(ndim as usize) {
                 inner_size *= unsafe { *qt.shape.add(d) } as usize;

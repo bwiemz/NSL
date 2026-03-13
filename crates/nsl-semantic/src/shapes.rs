@@ -166,7 +166,7 @@ pub fn fmt_shape(s: &Shape) -> String {
     if s.rank() == 0 {
         return "[?]".into();
     }
-    let dims: Vec<String> = s.dims.iter().map(|d| fmt_dim(d)).collect();
+    let dims: Vec<String> = s.dims.iter().map(fmt_dim).collect();
     format!("[{}]", dims.join(", "))
 }
 

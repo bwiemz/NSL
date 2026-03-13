@@ -259,6 +259,7 @@ fn accumulate_grad(grads: &mut HashMap<i64, i64>, key: i64, grad_tensor: i64) {
 }
 
 /// Create a tensor with the given shape, filled with zeros (f64, dtype=0).
+#[allow(dead_code)]
 fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
     create_tensor_with_shape_dtype(shape, fill, 0)
 }
@@ -274,7 +275,7 @@ fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u8) -> i64 {
         total *= s;
     }
 
-    let shape_ptr = crate::memory::checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
         unsafe { *shape_ptr.add(i) = s };
     }
@@ -299,7 +300,7 @@ fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u8) -> i64 {
     };
 
     let tensor = Box::new(NslTensor {
-        data: data_raw as *mut c_void,
+        data: data_raw,
         shape: shape_ptr,
         strides,
         ndim,
@@ -328,7 +329,7 @@ fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u8, de
         total *= s;
     }
 
-    let shape_ptr = crate::memory::checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
         unsafe { *shape_ptr.add(i) = s };
     }
@@ -403,7 +404,7 @@ fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
     let total: i64 = shape.iter().product();
     assert_eq!(total, tensor.len, "reshape_to_shape: size mismatch {} vs {}", total, tensor.len);
 
-    let shape_ptr = crate::memory::checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
         unsafe { *shape_ptr.add(i) = s; }
     }
@@ -411,7 +412,7 @@ fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
 
     let data_size = (total as usize) * tensor.element_size();
     let data = crate::memory::checked_alloc(data_size);
-    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data as *mut u8, data_size); }
+    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size); }
 
     let new_tensor = Box::new(NslTensor {
         data: data as *mut std::ffi::c_void,
@@ -472,9 +473,9 @@ fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
     if orig_ndim < grad_ndim {
         let res = NslTensor::from_ptr(result);
         // Reshape to orig_shape
-        let new_shape = checked_alloc(orig_ndim * std::mem::size_of::<i64>()) as *mut i64;
-        for i in 0..orig_ndim {
-            unsafe { *new_shape.add(i) = orig_shape[i] };
+        let new_shape = checked_alloc(std::mem::size_of_val(orig_shape)) as *mut i64;
+        for (i, &s) in orig_shape.iter().enumerate().take(orig_ndim) {
+            unsafe { *new_shape.add(i) = s };
         }
         let new_strides = NslTensor::compute_strides(new_shape, orig_ndim as i64);
         let mut total: i64 = 1;
@@ -484,7 +485,7 @@ fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
         // Copy data (byte-level copy, preserves dtype)
         let elem_size = res.element_size();
         let new_data_raw = checked_alloc((total as usize) * elem_size);
-        unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw as *mut u8, (total as usize) * elem_size) };
+        unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw, (total as usize) * elem_size) };
         let out = Box::new(NslTensor {
             data: new_data_raw as *mut c_void,
             shape: new_shape,
@@ -551,11 +552,11 @@ fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i
 
         let mut grad_idx = 0usize;
         let mut gi = 0usize;
-        for d in 0..ndim {
+        for (d, &idx) in indices.iter().enumerate().take(ndim) {
             if d == dim {
                 continue;
             }
-            grad_idx += indices[d] * grad_strides[gi];
+            grad_idx += idx * grad_strides[gi];
             gi += 1;
         }
 
@@ -607,7 +608,7 @@ fn scatter_grad_to_argmax(
     };
 
     let grad_total = grad.len as usize;
-    for grad_flat in 0..grad_total {
+    for (grad_flat, &max_idx) in argmax.iter().enumerate().take(grad_total) {
         let mut remaining = grad_flat;
         let mut grad_indices = vec![0usize; grad_ndim];
         for d in 0..grad_ndim {
@@ -615,15 +616,13 @@ fn scatter_grad_to_argmax(
             remaining %= grad_strides[d];
         }
 
-        let max_idx = argmax[grad_flat];
-
         let mut out_offset = 0usize;
         let mut gi = 0usize;
-        for d in 0..ndim {
+        for (d, &os) in out_strides.iter().enumerate().take(ndim) {
             if d == dim {
-                out_offset += max_idx * out_strides[d];
+                out_offset += max_idx * os;
             } else {
-                out_offset += grad_indices[gi] * out_strides[d];
+                out_offset += grad_indices[gi] * os;
                 gi += 1;
             }
         }
@@ -669,10 +668,8 @@ fn scatter_gather_grad(
         let mut out_offset = 0usize;
         if input_shape.len() == 2 && dim == 1 {
             out_offset = b * out_strides[0] + idx * out_strides[1];
-        } else {
-            if dim == 0 {
-                out_offset = idx * out_strides[0] + b * out_strides[1];
-            }
+        } else if dim == 0 {
+            out_offset = idx * out_strides[0] + b * out_strides[1];
         }
         if grad_dtype == 1 {
             let g_val = unsafe { *grad.data_f32().add(b) };
@@ -945,7 +942,7 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         }
     }
 
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: 1, device: grad.device, dtype: out_dtype, owns_data: 1 });
+    let t = Box::new(NslTensor { data: data_raw, shape, strides, ndim, len: len as i64, refcount: 1, device: grad.device, dtype: out_dtype, owns_data: 1 });
     Box::into_raw(t) as i64
 }
 
@@ -1374,15 +1371,13 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
 
     let grad_len = grad.len as usize;
     if grad_dtype == 1 {
-        for i in 0..grad_len {
+        for (i, &idx) in argmax.iter().enumerate().take(grad_len) {
             let g_val = unsafe { *grad.data_f32().add(i) };
-            let idx = argmax[i];
             unsafe { *out.data_f32().add(idx) += g_val };
         }
     } else {
-        for i in 0..grad_len {
+        for (i, &idx) in argmax.iter().enumerate().take(grad_len) {
             let g_val = unsafe { *grad.data_f64().add(i) };
-            let idx = argmax[i];
             unsafe { *out.data_f64().add(idx) += g_val };
         }
     }

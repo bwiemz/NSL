@@ -47,6 +47,12 @@ pub struct ScopeMap {
     scopes: Vec<Scope>,
 }
 
+impl Default for ScopeMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScopeMap {
     pub fn new() -> Self {
         let root = Scope {

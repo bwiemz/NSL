@@ -15,6 +15,7 @@ use nsl_ast::expr::ExprKind;
 use crate::resolver;
 
 /// Data for a single parsed and analyzed module.
+#[allow(dead_code)] // Fields reserved for future tooling (LSP, debugger, etc.)
 pub struct ModuleData {
     pub path: PathBuf,
     pub ast: Module,
@@ -214,6 +215,7 @@ fn extract_exports(
 }
 
 /// Extract enum info from an analyzed module's AST + types for codegen import.
+#[allow(clippy::type_complexity)]
 fn extract_enum_info(
     stmts: &[Stmt],
     interner: &Interner,
@@ -443,6 +445,7 @@ fn inject_alias_import(
 }
 
 /// Topological sort of modules. Dependencies come before dependents.
+#[allow(clippy::type_complexity)]
 fn topological_sort(
     entry: &PathBuf,
     parsed: &HashMap<PathBuf, (Module, Vec<(PathBuf, ImportInfo)>)>,
@@ -451,6 +454,7 @@ fn topological_sort(
     let mut visited = HashSet::new();
     let mut in_stack = HashSet::new();
 
+    #[allow(clippy::type_complexity)]
     fn visit(
         path: &PathBuf,
         parsed: &HashMap<PathBuf, (Module, Vec<(PathBuf, ImportInfo)>)>,

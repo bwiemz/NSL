@@ -32,9 +32,8 @@ pub fn lex_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnostics:
             }
             Some('\\') => {
                 cursor.advance(); // consume backslash
-                match lex_escape(cursor, start, diagnostics) {
-                    Some(ch) => value.push(ch),
-                    None => {} // error already reported
+                if let Some(ch) = lex_escape(cursor, start, diagnostics) {
+                    value.push(ch); // None = error already reported
                 }
             }
             Some(c) => {
@@ -69,9 +68,8 @@ fn lex_triple_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnosti
             }
             Some('\\') => {
                 cursor.advance();
-                match lex_escape(cursor, start, diagnostics) {
-                    Some(ch) => value.push(ch),
-                    None => {}
+                if let Some(ch) = lex_escape(cursor, start, diagnostics) {
+                    value.push(ch);
                 }
             }
             Some(c) => {

@@ -27,7 +27,7 @@ pub enum TrainSection {
     },
     Callbacks(Vec<CallbackDef>),
     Distribute(Expr),
-    Stmt(Stmt),
+    Stmt(Box<Stmt>),
 }
 
 #[derive(Debug, Clone, Serialize)]

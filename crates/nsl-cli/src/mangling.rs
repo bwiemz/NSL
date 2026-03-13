@@ -44,6 +44,7 @@ pub fn mangle(prefix: &str, name: &str) -> String {
 /// Demangle a mangled symbol for error messages.
 /// `nsl_math__clamp` → `nsl.math.clamp`.
 /// If no `__` separator, return as-is.
+#[allow(dead_code)] // Utility for debugging and future tooling
 pub fn demangle(mangled: &str) -> String {
     match mangled.split_once("__") {
         Some((prefix, name)) => {

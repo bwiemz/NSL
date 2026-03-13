@@ -62,8 +62,8 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
     }
 
     let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..out_ndim {
-        unsafe { *shape.add(i) = out_shape_vec[i] };
+    for (i, &s) in out_shape_vec.iter().enumerate().take(out_ndim) {
+        unsafe { *shape.add(i) = s };
     }
     let strides = NslTensor::compute_strides(shape, out_ndim as i64);
     let data = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
@@ -94,18 +94,17 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         let mut a_idx: usize = 0;
         let mut b_idx: usize = 0;
         for d in 0..out_ndim {
-            let _dim_size = out_shape_vec[d] as usize;
             let coord = rem / {
                 let mut p = 1usize;
-                for dd in (d + 1)..out_ndim {
-                    p *= out_shape_vec[dd] as usize;
+                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
+                    p *= sv as usize;
                 }
                 p
             };
             rem %= {
                 let mut p = 1usize;
-                for dd in (d + 1)..out_ndim {
-                    p *= out_shape_vec[dd] as usize;
+                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
+                    p *= sv as usize;
                 }
                 p
             };
@@ -174,8 +173,8 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
     }
 
     let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..out_ndim {
-        unsafe { *shape.add(i) = out_shape_vec[i] };
+    for (i, &s) in out_shape_vec.iter().enumerate().take(out_ndim) {
+        unsafe { *shape.add(i) = s };
     }
     let strides = NslTensor::compute_strides(shape, out_ndim as i64);
     let data = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
@@ -224,15 +223,15 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         for d in 0..out_ndim {
             let coord = rem / {
                 let mut p = 1usize;
-                for dd in (d + 1)..out_ndim {
-                    p *= out_shape_vec[dd] as usize;
+                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
+                    p *= sv as usize;
                 }
                 p
             };
             rem %= {
                 let mut p = 1usize;
-                for dd in (d + 1)..out_ndim {
-                    p *= out_shape_vec[dd] as usize;
+                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
+                    p *= sv as usize;
                 }
                 p
             };
@@ -285,7 +284,7 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u8) -> i64
     }
 
     let shape_ptr =
-        checked_alloc(shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+        checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
         unsafe { *shape_ptr.add(i) = s };
     }

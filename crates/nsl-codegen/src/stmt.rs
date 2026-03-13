@@ -237,9 +237,9 @@ impl Compiler<'_> {
             }
 
             _ => {
-                return Err(CodegenError::new(format!(
-                    "unsupported statement in M3 codegen"
-                )));
+                return Err(CodegenError::new(
+                    "unsupported statement in M3 codegen".to_string()
+                ));
             }
         }
         Ok(())
@@ -841,6 +841,7 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_for_model_array(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1123,7 +1124,7 @@ impl Compiler<'_> {
                 }
                 PatternKind::Constructor { path, .. } => {
                     // Enum variant via path: e.g., Activation.ReLU → check tag
-                    let variant_name = if path.len() >= 1 {
+                    let variant_name = if !path.is_empty() {
                         self.resolve_sym(*path.last().unwrap()).to_string()
                     } else {
                         return Err(CodegenError::new("empty constructor path in match"));
