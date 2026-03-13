@@ -48,6 +48,7 @@ pub mod sampling;
 pub mod data_source;
 pub mod packing;
 pub mod dataloader;
+pub mod weight_provider;
 
 #[cfg(test)]
 mod fuzz;
