@@ -14,7 +14,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+authors = ["Brandon Wiemer"]
+repository = "https://github.com/bwiemz/NSL"
+homepage = "https://github.com/bwiemz/NSL"
 
 [workspace.dependencies]
 nsl-errors = { path = "crates/nsl-errors" }
