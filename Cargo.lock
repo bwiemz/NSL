@@ -1051,6 +1051,7 @@ dependencies = [
  "nsl-lexer",
  "nsl-parser",
  "nsl-semantic",
+ "safetensors",
  "serde_json",
 ]
 

@@ -5,7 +5,7 @@
 //! and skips file I/O entirely when a provider is active.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // NSLW file format constants
 const NSLW_MAGIC: &[u8; 4] = b"NSLW";
@@ -338,4 +338,372 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
     }
 
     true
+}
+
+// ── Standalone CLI arg parser ────────────────────────────────────────────────
+
+/// Runtime state for parsing CLI arguments in standalone executables.
+struct ArgState {
+    /// All argv strings (argv[0] is program name, rest are arguments).
+    args: Vec<String>,
+    /// Tracks which args have been consumed (by index into `args`).
+    consumed: Vec<bool>,
+    /// The program name (argv[0]).
+    program_name: String,
+    /// Registered parameter names (for --help generation).
+    param_names: Vec<String>,
+    /// Registered parameter types (for --help generation).
+    param_types: Vec<String>,
+    /// Registered parameter default values (empty string = required).
+    param_defaults: Vec<String>,
+}
+
+static ARG_STATE: OnceLock<Mutex<ArgState>> = OnceLock::new();
+
+fn arg_state_global() -> &'static Mutex<ArgState> {
+    ARG_STATE.get_or_init(|| {
+        Mutex::new(ArgState {
+            args: Vec::new(),
+            consumed: Vec::new(),
+            program_name: String::new(),
+            param_names: Vec::new(),
+            param_types: Vec::new(),
+            param_defaults: Vec::new(),
+        })
+    })
+}
+
+/// Print usage summary to stderr.
+fn print_usage(state: &ArgState) {
+    let prog = if state.program_name.is_empty() {
+        "<program>"
+    } else {
+        &state.program_name
+    };
+    let mut usage = format!("Usage: {}", prog);
+    for i in 0..state.param_names.len() {
+        let name = &state.param_names[i];
+        let default = &state.param_defaults[i];
+        if default.is_empty() {
+            usage.push_str(&format!(" --{} <{}>", name, &state.param_types[i]));
+        } else {
+            usage.push_str(&format!(" [--{} <{}>]", name, &state.param_types[i]));
+        }
+    }
+    eprintln!("{}", usage);
+    if !state.param_names.is_empty() {
+        eprintln!();
+        eprintln!("Options:");
+        for i in 0..state.param_names.len() {
+            let name = &state.param_names[i];
+            let ty = &state.param_types[i];
+            let default = &state.param_defaults[i];
+            if default.is_empty() {
+                eprintln!("  --{:<20} {} (required)", name, ty);
+            } else {
+                eprintln!("  --{:<20} {} (default: {})", name, ty, default);
+            }
+        }
+    }
+    eprintln!("  --{:<20} Show this help message", "help");
+}
+
+/// If --help or -h is present in the args, print usage and exit(0).
+fn check_help_flag(state: &ArgState) {
+    for arg in &state.args {
+        if arg == "--help" || arg == "-h" {
+            print_usage(state);
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Extract a name from (name_ptr, name_len) pair using raw pointer arithmetic.
+///
+/// # Safety
+/// `name_ptr` must point to `name_len` valid UTF-8 bytes for the duration of
+/// the call.
+unsafe fn name_from_parts(name_ptr: i64, name_len: i64) -> String {
+    let slice = std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
+    // SAFETY: caller guarantees valid UTF-8
+    std::str::from_utf8_unchecked(slice).to_string()
+}
+
+/// Find `--<name> <value>` in args.  Returns (value, index_of_flag) on success.
+fn find_arg<'a>(state: &'a ArgState, name: &str) -> Option<(&'a str, usize)> {
+    let flag = format!("--{}", name);
+    for i in 0..state.args.len() {
+        if state.args[i] == flag {
+            if i + 1 < state.args.len() {
+                return Some((&state.args[i + 1], i));
+            }
+            // Flag present but no value
+            eprintln!("nsl: --{} requires a value", name);
+            print_usage(state);
+            std::process::exit(1);
+        }
+    }
+    None
+}
+
+/// Mark `--<name> <value>` (two slots) as consumed.
+fn consume_arg(state: &mut ArgState, flag_idx: usize) {
+    if flag_idx < state.consumed.len() {
+        state.consumed[flag_idx] = true;
+    }
+    if flag_idx + 1 < state.consumed.len() {
+        state.consumed[flag_idx + 1] = true;
+    }
+}
+
+/// Register a parameter in the state's help metadata.
+fn register_param(state: &mut ArgState, name: &str, ty: &str, default: &str) {
+    // Avoid duplicate registration (codegen may call helpers more than once in
+    // some edge cases, though in practice each param is initialized once).
+    if !state.param_names.contains(&name.to_string()) {
+        state.param_names.push(name.to_string());
+        state.param_types.push(ty.to_string());
+        state.param_defaults.push(default.to_string());
+    }
+}
+
+// ── FFI: init / finish ───────────────────────────────────────────────────────
+
+/// Initialize the standalone arg parser from C `main`'s argc/argv.
+///
+/// `argc` is the argument count; `argv` is a `*const *const u8` (array of
+/// NUL-terminated C strings) cast to i64.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_args_init(argc: i64, argv: i64) {
+    let argv_ptr = argv as *const *const u8;
+    let mut args: Vec<String> = Vec::with_capacity(argc as usize);
+
+    for i in 0..argc as usize {
+        let ptr = unsafe { *argv_ptr.add(i) };
+        let cstr = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char) };
+        let s = cstr.to_str().unwrap_or("").to_string();
+        args.push(s);
+    }
+
+    let consumed = vec![false; args.len()];
+    // argv[0] is always the program name
+    let program_name = args.first().cloned().unwrap_or_default();
+
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    state.args = args;
+    state.consumed = consumed;
+    state.program_name = program_name;
+    state.param_names.clear();
+    state.param_types.clear();
+    state.param_defaults.clear();
+}
+
+/// Check for --help/-h and warn about unrecognized arguments.
+///
+/// Call this after all `nsl_standalone_arg_*` helpers have run.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_args_finish() {
+    let mutex = arg_state_global();
+    let state = mutex.lock().unwrap();
+
+    // If --help/-h is present, print usage and exit.
+    check_help_flag(&state);
+
+    // Warn about any unconsumed arguments (skip argv[0] which is the program name).
+    for i in 1..state.args.len() {
+        if !state.consumed[i] {
+            let arg = &state.args[i];
+            // Only warn about flag-looking tokens; skip values that follow unknown flags
+            if arg.starts_with('-') {
+                eprintln!(
+                    "nsl: warning: unrecognized argument '{}' (use --help for usage)",
+                    arg
+                );
+            }
+        }
+    }
+}
+
+// ── FFI: string args ─────────────────────────────────────────────────────────
+
+/// Parse a required `--<name> <value>` string argument.
+///
+/// Returns an NslString pointer (i64) via `nsl_str_from_rust`.
+/// Exits with usage if the argument is missing.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_arg_str(name_ptr: i64, name_len: i64) -> i64 {
+    let name = unsafe { name_from_parts(name_ptr, name_len) };
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    register_param(&mut state, &name, "string", "");
+
+    match find_arg(&state, &name) {
+        Some((val, flag_idx)) => {
+            let val = val.to_string();
+            consume_arg(&mut state, flag_idx);
+            drop(state);
+            crate::string::nsl_str_from_rust(&val)
+        }
+        None => {
+            check_help_flag(&state);
+            eprintln!("nsl: missing required argument --{}", name);
+            print_usage(&state);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse an optional `--<name> <value>` string argument with a default value.
+///
+/// Returns an NslString pointer (i64).
+#[no_mangle]
+pub extern "C" fn nsl_standalone_arg_str_default(
+    name_ptr: i64,
+    name_len: i64,
+    default_ptr: i64,
+    default_len: i64,
+) -> i64 {
+    let name = unsafe { name_from_parts(name_ptr, name_len) };
+    let default_val = unsafe {
+        let slice = std::slice::from_raw_parts(default_ptr as *const u8, default_len as usize);
+        std::str::from_utf8_unchecked(slice).to_string()
+    };
+
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    register_param(&mut state, &name, "string", &default_val);
+
+    match find_arg(&state, &name) {
+        Some((val, flag_idx)) => {
+            let val = val.to_string();
+            consume_arg(&mut state, flag_idx);
+            drop(state);
+            crate::string::nsl_str_from_rust(&val)
+        }
+        None => {
+            drop(state);
+            crate::string::nsl_str_from_rust(&default_val)
+        }
+    }
+}
+
+// ── FFI: int args ─────────────────────────────────────────────────────────────
+
+/// Parse a required `--<name> <value>` integer argument.
+///
+/// Exits with usage if the argument is missing or cannot be parsed as i64.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_arg_int(name_ptr: i64, name_len: i64) -> i64 {
+    let name = unsafe { name_from_parts(name_ptr, name_len) };
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    register_param(&mut state, &name, "int", "");
+
+    match find_arg(&state, &name) {
+        Some((val, flag_idx)) => {
+            let parsed = val.parse::<i64>().unwrap_or_else(|_| {
+                eprintln!("nsl: --{} requires an integer value, got '{}'", name, val);
+                print_usage(&state);
+                std::process::exit(1);
+            });
+            consume_arg(&mut state, flag_idx);
+            parsed
+        }
+        None => {
+            check_help_flag(&state);
+            eprintln!("nsl: missing required argument --{}", name);
+            print_usage(&state);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse an optional `--<name> <value>` integer argument with a default value.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_arg_int_default(
+    name_ptr: i64,
+    name_len: i64,
+    default_val: i64,
+) -> i64 {
+    let name = unsafe { name_from_parts(name_ptr, name_len) };
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    register_param(&mut state, &name, "int", &default_val.to_string());
+
+    match find_arg(&state, &name) {
+        Some((val, flag_idx)) => {
+            let parsed = val.parse::<i64>().unwrap_or_else(|_| {
+                eprintln!("nsl: --{} requires an integer value, got '{}'", name, val);
+                print_usage(&state);
+                std::process::exit(1);
+            });
+            consume_arg(&mut state, flag_idx);
+            parsed
+        }
+        None => default_val,
+    }
+}
+
+// ── FFI: float args ───────────────────────────────────────────────────────────
+
+/// Parse a required `--<name> <value>` float argument.
+///
+/// Returns the f64 value's raw bits as i64 (use `f64::from_bits(result as u64)`
+/// on the receiving side).  Exits with usage if missing or unparseable.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_arg_float(name_ptr: i64, name_len: i64) -> i64 {
+    let name = unsafe { name_from_parts(name_ptr, name_len) };
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    register_param(&mut state, &name, "float", "");
+
+    match find_arg(&state, &name) {
+        Some((val, flag_idx)) => {
+            let parsed = val.parse::<f64>().unwrap_or_else(|_| {
+                eprintln!("nsl: --{} requires a float value, got '{}'", name, val);
+                print_usage(&state);
+                std::process::exit(1);
+            });
+            consume_arg(&mut state, flag_idx);
+            parsed.to_bits() as i64
+        }
+        None => {
+            check_help_flag(&state);
+            eprintln!("nsl: missing required argument --{}", name);
+            print_usage(&state);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse an optional `--<name> <value>` float argument with a default value.
+///
+/// `default_bits` is the default f64 value encoded as its raw bits cast to i64
+/// (i.e., `f64::to_bits(default) as i64`).  Returns f64 bits as i64.
+#[no_mangle]
+pub extern "C" fn nsl_standalone_arg_float_default(
+    name_ptr: i64,
+    name_len: i64,
+    default_bits: i64,
+) -> i64 {
+    let name = unsafe { name_from_parts(name_ptr, name_len) };
+    let default_f = f64::from_bits(default_bits as u64);
+
+    let mutex = arg_state_global();
+    let mut state = mutex.lock().unwrap();
+    register_param(&mut state, &name, "float", &default_f.to_string());
+
+    match find_arg(&state, &name) {
+        Some((val, flag_idx)) => {
+            let parsed = val.parse::<f64>().unwrap_or_else(|_| {
+                eprintln!("nsl: --{} requires a float value, got '{}'", name, val);
+                print_usage(&state);
+                std::process::exit(1);
+            });
+            consume_arg(&mut state, flag_idx);
+            parsed.to_bits() as i64
+        }
+        None => default_bits,
+    }
 }
