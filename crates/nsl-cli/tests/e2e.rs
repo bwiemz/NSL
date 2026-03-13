@@ -195,3 +195,194 @@ fn e2e_m23_byod_block() {
 fn e2e_m23_byod_error() {
     assert_output_matches("m23_byod_error");
 }
+
+// ---------------------------------------------------------------------------
+// M24 standalone export tests
+// ---------------------------------------------------------------------------
+
+/// Create a small safetensors file with a 4x3 weight matrix and a 3-element bias vector.
+/// Returns the path to the created file.
+fn create_small_safetensors(dir: &std::path::Path) -> std::path::PathBuf {
+    use safetensors::Dtype;
+    use std::collections::HashMap;
+
+    // "weight": shape [4,3], f64, values 1.0..=12.0
+    let weight_data: Vec<f64> = (1..=12).map(|i| i as f64).collect();
+    let weight_bytes: Vec<u8> = weight_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // "bias": shape [3], f64, values 0.1, 0.2, 0.3
+    let bias_data: Vec<f64> = vec![0.1, 0.2, 0.3];
+    let bias_bytes: Vec<u8> = bias_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let weight_view =
+        safetensors::tensor::TensorView::new(Dtype::F64, vec![4, 3], &weight_bytes).unwrap();
+    let bias_view =
+        safetensors::tensor::TensorView::new(Dtype::F64, vec![3], &bias_bytes).unwrap();
+
+    let mut tensors: HashMap<String, safetensors::tensor::TensorView<'_>> = HashMap::new();
+    tensors.insert("bias".to_string(), bias_view);
+    tensors.insert("weight".to_string(), weight_view);
+
+    let serialized = safetensors::tensor::serialize(&tensors, &None).unwrap();
+    let path = dir.join("weights.safetensors");
+    std::fs::write(&path, &serialized).unwrap();
+    path
+}
+
+#[test]
+fn e2e_m24_standalone_embedded() {
+    let root = workspace_root();
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let weights_path = create_small_safetensors(tmp.path());
+    let example_path = root.join("examples/m24_standalone_small.nsl");
+
+    let exe_name = if cfg!(target_os = "windows") {
+        "m24_embedded.exe"
+    } else {
+        "m24_embedded"
+    };
+    let exe_path = tmp.path().join(exe_name);
+
+    // 1. Build standalone with embedded weights (default auto mode, small file)
+    let build_output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "build", "--standalone"])
+        .arg("-w")
+        .arg(&weights_path)
+        .arg("-o")
+        .arg(&exe_path)
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl build --standalone");
+
+    let build_stderr = String::from_utf8_lossy(&build_output.stderr);
+    let build_stdout = String::from_utf8_lossy(&build_output.stdout);
+    assert!(
+        build_output.status.success(),
+        "nsl build --standalone failed (exit {:?}):\nstdout: {}\nstderr: {}",
+        build_output.status.code(),
+        build_stdout,
+        build_stderr
+    );
+
+    // Verify the build message mentions "weights embedded"
+    assert!(
+        build_stdout.contains("weights embedded"),
+        "Expected 'weights embedded' in build output, got: {}",
+        build_stdout
+    );
+
+    // 2. Run the standalone binary
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("failed to execute standalone binary");
+
+    let run_stderr = String::from_utf8_lossy(&run_output.stderr);
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        run_output.status.success(),
+        "standalone binary failed (exit {:?}):\nstdout: {}\nstderr: {}",
+        run_output.status.code(),
+        run_stdout,
+        run_stderr
+    );
+
+    // 3. Compare output against expected baseline
+    let expected = normalize(&expected_output("m24_standalone_small"));
+    let actual = normalize(&run_stdout);
+    assert_eq!(
+        actual.trim(),
+        expected.trim(),
+        "Standalone embedded output mismatch"
+    );
+}
+
+#[test]
+fn e2e_m24_standalone_sidecar() {
+    let root = workspace_root();
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let weights_path = create_small_safetensors(tmp.path());
+    let example_path = root.join("examples/m24_standalone_small.nsl");
+
+    let exe_name = if cfg!(target_os = "windows") {
+        "m24_sidecar.exe"
+    } else {
+        "m24_sidecar"
+    };
+    let exe_path = tmp.path().join(exe_name);
+    let sidecar_path = tmp.path().join("m24_sidecar.nslweights");
+
+    // 1. Build standalone with sidecar weights (--embed-weights=never)
+    let build_output = Command::new(env!("CARGO"))
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "nsl-cli",
+            "--",
+            "build",
+            "--standalone",
+            "--embed-weights=never",
+        ])
+        .arg("-w")
+        .arg(&weights_path)
+        .arg("-o")
+        .arg(&exe_path)
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl build --standalone --embed-weights=never");
+
+    let build_stderr = String::from_utf8_lossy(&build_output.stderr);
+    let build_stdout = String::from_utf8_lossy(&build_output.stdout);
+    assert!(
+        build_output.status.success(),
+        "nsl build --standalone --embed-weights=never failed (exit {:?}):\nstdout: {}\nstderr: {}",
+        build_output.status.code(),
+        build_stdout,
+        build_stderr
+    );
+
+    // Verify build message mentions "sidecar weights"
+    assert!(
+        build_stdout.contains("sidecar weights"),
+        "Expected 'sidecar weights' in build output, got: {}",
+        build_stdout
+    );
+
+    // Verify both binary and .nslweights sidecar file exist
+    assert!(
+        exe_path.exists(),
+        "Standalone binary not found at {}",
+        exe_path.display()
+    );
+    assert!(
+        sidecar_path.exists(),
+        "Sidecar .nslweights file not found at {}",
+        sidecar_path.display()
+    );
+
+    // 2. Run the standalone binary
+    let run_output = Command::new(&exe_path)
+        .output()
+        .expect("failed to execute standalone binary (sidecar)");
+
+    let run_stderr = String::from_utf8_lossy(&run_output.stderr);
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        run_output.status.success(),
+        "standalone sidecar binary failed (exit {:?}):\nstdout: {}\nstderr: {}",
+        run_output.status.code(),
+        run_stdout,
+        run_stderr
+    );
+
+    // 3. Compare output against expected baseline
+    let expected = normalize(&expected_output("m24_standalone_small"));
+    let actual = normalize(&run_stdout);
+    assert_eq!(
+        actual.trim(),
+        expected.trim(),
+        "Standalone sidecar output mismatch"
+    );
+}

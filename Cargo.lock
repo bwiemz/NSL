@@ -1053,6 +1053,7 @@ dependencies = [
  "nsl-semantic",
  "safetensors",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,0 +1,15 @@
+# M24 Standalone Export Test
+# A simple model with weight and bias tensors for standalone build testing.
+
+model TinyModel():
+    weight: Tensor = ones([4, 3])
+    bias: Tensor = zeros([3])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight + self.bias
+
+let m = TinyModel()
+let x = ones([2, 4])
+let y = m.forward(x)
+print(y)
+print(y.sum())

@@ -201,7 +201,7 @@ pub fn serialize_nslweights(tensors: &[WeightTensor]) -> Vec<u8> {
         data_offset += nbytes;
     }
 
-    let header = format!(r#"{{"tensors":[{}]}}"#, entries.join(","));
+    let header = format!(r#"{{"params":[{}]}}"#, entries.join(","));
     let header_bytes = header.as_bytes();
     let header_size = header_bytes.len() as u64;
 
