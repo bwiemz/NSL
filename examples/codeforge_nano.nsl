@@ -1,0 +1,135 @@
+# CodeForge Nano — Proof of Concept
+# A simplified transformer language model written in NeuralScript
+#
+# Architecture (inspired by CodeForge 150M, adapted to NSL constraints):
+#   - Token embedding (byte-level vocab)
+#   - Single transformer block:
+#       Pre-norm (RMSNorm) → Single-head Attention → Residual
+#       Pre-norm (RMSNorm) → SwiGLU FFN → Residual
+#   - Final RMSNorm → Linear projection to vocab
+#   - Cross-entropy loss for next-token prediction
+#
+# Simplifications vs full CodeForge:
+#   - Single attention head (no GQA/MHA — reshape/unsqueeze not yet in NSL)
+#   - No RoPE (complex position encoding needs ops not yet available)
+#   - No causal mask (masked_fill not yet available — bidirectional for now)
+#   - Flat parameter layout (no nested model composition)
+#   - Byte-level tokenizer (256 vocab, no BPE needed)
+
+from nsl.nn.losses import cross_entropy
+
+# ─── Hyperparameters ───
+const VOCAB_SIZE = 256      # byte-level
+const DIM = 64              # model dimension
+const FFN_HIDDEN = 170      # ~2.667 * DIM (matches CodeForge's ffn_hidden_mult)
+const SEQ_LEN = 32          # short sequences for CPU proof-of-concept
+const EPOCHS = 50
+const LR = 0.001
+const WARMUP = 5
+const NORM_EPS = 0.00001
+
+# ─── Tokenize training data ───
+let tok = byte_tokenizer_new()
+let text = "def hello():\n    print('Hello, world!')\n\ndef add(a, b):\n    return a + b\n"
+let tokens = tokenizer_encode(tok, text)
+
+# Next-token prediction: input = tokens[:-1], target = tokens[1:]
+let input_ids = tensor_slice(tokens, 0, 0, SEQ_LEN)
+let target_ids = tensor_slice(tokens, 0, 1, SEQ_LEN + 1)
+
+# ─── CodeForge Nano Model ───
+# Flat parameter model — all weights are direct tensor fields
+# This mirrors CodeForge's architecture:
+#   Embedding → [RMSNorm → Attn → Add → RMSNorm → FFN → Add] → RMSNorm → Head
+
+model CodeForgeNano:
+    # Token embedding: [vocab_size, dim]
+    embed_w: Tensor = randn([256, 64])
+
+    # --- Transformer Block (single layer) ---
+
+    # Attention pre-norm (RMSNorm)
+    attn_norm_w: Tensor = ones([64])
+
+    # Single-head attention projections Q, K, V, O
+    wq: Tensor = randn([64, 64])
+    wk: Tensor = randn([64, 64])
+    wv: Tensor = randn([64, 64])
+    wo: Tensor = randn([64, 64])
+
+    # FFN pre-norm (RMSNorm)
+    ffn_norm_w: Tensor = ones([64])
+
+    # SwiGLU FFN: gate and up projections, then down projection
+    # SwiGLU(x) = (silu(x @ W_gate) * (x @ W_up)) @ W_down
+    w_gate: Tensor = randn([170, 64])
+    w_up: Tensor = randn([170, 64])
+    w_down: Tensor = randn([64, 170])
+
+    # Final norm before LM head (RMSNorm)
+    final_norm_w: Tensor = ones([64])
+
+    # Language model head: projects back to vocab
+    lm_head_w: Tensor = randn([256, 64])
+    lm_head_b: Tensor = zeros([256])
+
+    fn forward(self, x: Tensor) - > Tensor:
+        # --- Embedding ---
+        let h = embedding_lookup(self.embed_w, x)
+
+        # --- Transformer Block ---
+
+        # Pre-norm attention
+        let normed = rmsnorm(h, self.attn_norm_w, 0.00001)
+
+        # Single-head self-attention: Q @ K^T / sqrt(d) -> softmax -> @ V
+        let q = normed @ self.wq.transpose(0, 1)
+        let k = normed @ self.wk.transpose(0, 1)
+        let v = normed @ self.wv.transpose(0, 1)
+
+        let scale = sqrt(full([1], 64.0))
+        let k_t = k.transpose(-2, -1)
+        let attn_scores = softmax(q @ k_t / scale, -1)
+        let attn_out = attn_scores @ v
+
+        # Output projection + residual
+        let attn_proj = attn_out @ self.wo.transpose(0, 1)
+        h = h + attn_proj
+
+        # Pre-norm SwiGLU FFN
+        let ffn_in = rmsnorm(h, self.ffn_norm_w, 0.00001)
+
+        # SwiGLU: silu(x @ W_gate) * (x @ W_up), then down-project
+        let gate = silu(ffn_in @ self.w_gate.transpose(0, 1))
+        let up = ffn_in @ self.w_up.transpose(0, 1)
+        let ffn_out = (gate * up) @ self.w_down.transpose(0, 1)
+
+        # FFN residual
+        h = h + ffn_out
+
+        # --- LM Head ---
+        let final_h = rmsnorm(h, self.final_norm_w, 0.00001)
+        return bias_add(final_h @ self.lm_head_w.transpose(0, 1), self.lm_head_b)
+
+# ─── Instantiate ───
+let m = CodeForgeNano()
+print("CodeForge Nano initialized")
+print("Architecture: Embed -> [RMSNorm -> Attn -> RMSNorm -> SwiGLU] -> RMSNorm -> Head")
+print(f"Parameters: vocab={VOCAB_SIZE}, dim={DIM}, ffn_hidden={FFN_HIDDEN}")
+print(f"Training: seq_len={SEQ_LEN}, epochs={EPOCHS}, lr={LR}")
+
+# ─── Train ───
+print("Training (next-token prediction on Python code):")
+
+train(model = m, epochs = 50):
+    optimizer: AdamW(lr = 0.001, weight_decay = 0.01)
+    scheduler: warmup_cosine(warmup_steps = 5, total_steps = 50, min_lr = 0.0001)
+    step(batch):
+        let logits = m.forward(input_ids)
+        let loss = cross_entropy(logits, target_ids)
+    callbacks:
+        on_epoch(epoch, loss):
+            print(loss)
+
+print("Training complete!")
+print("CodeForge Nano proof-of-concept finished.")

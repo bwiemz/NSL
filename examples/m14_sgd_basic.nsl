@@ -10,8 +10,8 @@ let m = Linear()
 let x = ones([4, 2])
 let y = zeros([4, 1])
 
-train(model=m, epochs=5):
-    optimizer: SGD(lr=0.01)
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
     step(batch):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y)

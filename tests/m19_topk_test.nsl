@@ -14,12 +14,12 @@ let top_idx = result["indices"]
 print("topk: PASS")
 
 # Test softmax + multinomial
-let probs = softmax(top_vals, dim=-1)
+let probs = softmax(top_vals, dim = -1)
 let sampled = multinomial(probs, 1)
 print("multinomial: PASS")
 
 # Test argmax
-let greedy = argmax(logits, dim=-1)
+let greedy = argmax(logits, dim = -1)
 print("argmax: PASS")
 
 # Test deterministic RNG

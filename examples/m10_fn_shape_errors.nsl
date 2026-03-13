@@ -1,5 +1,5 @@
 # Function with shape-annotated parameters
-fn bad_add(a: Tensor<[3, 4], f64>, b: Tensor<[5, 6], f64>) -> Tensor<[3, 4], f64>:
+fn bad_add(a: Tensor < [3, 4], f64 > , b: Tensor < [5, 6], f64 > ) -> Tensor < [3, 4], f64 > :
     return a + b
 
 let r = bad_add(zeros([3, 4]), zeros([5, 6]))

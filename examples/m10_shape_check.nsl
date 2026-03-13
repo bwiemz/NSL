@@ -19,7 +19,7 @@ let d = a * 2
 print(d)
 
 # Type annotations
-let w: Tensor<[4, 2], f64> = ones([4, 2])
+let w: Tensor < [4, 2], f64 > = ones([4, 2])
 print(w)
 
 # Reshape with known shape

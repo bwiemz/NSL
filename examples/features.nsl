@@ -86,7 +86,7 @@ struct Point:
     x: float
     y: float
 
-let p = Point(x=1.0, y=2.0)
+let p = Point(x = 1.0, y = 2.0)
 print(p.x)
 p.x = 5.0
 print(p.x)

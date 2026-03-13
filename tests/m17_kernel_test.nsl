@@ -15,7 +15,7 @@ let gb = b.to(cuda)
 let gc = c.to(cuda)
 
 # Launch kernel: 4 blocks x 256 threads = 1024 threads
-vec_add(ga, gb, gc, grid=4, block=256)
+vec_add(ga, gb, gc, grid = 4, block = 256)
 
 # Transfer result back to CPU and verify
 let result = gc.to(cpu)

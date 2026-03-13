@@ -1,5 +1,5 @@
 # Symbolic dimensions in function signatures
-fn matmul_check(a: Tensor<[3, 4], f64>, b: Tensor<[4, 2], f64>) -> Tensor<[3, 2], f64>:
+fn matmul_check(a: Tensor < [3, 4], f64 > , b: Tensor < [4, 2], f64 > ) -> Tensor < [3, 2], f64 > :
     return a @ b
 
 let result = matmul_check(ones([3, 4]), ones([4, 2]))

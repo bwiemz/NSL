@@ -4,14 +4,14 @@ import math
 from collections import {OrderedDict, defaultdict}
 
 # Tensor type
-let weights: Tensor<[768, 3072], fp16, cuda> = zeros([768, 3072])
+let weights: Tensor < [768, 3072], fp16, cuda > = zeros([768, 3072])
 
 # Model definition
 model MLP(in_features: int, out_features: int):
     linear1: Linear = Linear(in_features, out_features * 4)
     linear2: Linear = Linear(out_features * 4, out_features)
 
-    fn forward(self, x: Tensor<[B, in_features], fp16>) -> Tensor<[B, out_features], fp16>:
+    fn forward(self, x: Tensor < [B, in_features], fp16 > ) -> Tensor < [B, out_features], fp16 > :
         let h = self.linear1(x) |> relu
         return self.linear2(h)
 
@@ -28,7 +28,7 @@ enum Activation:
     SiLU
 
 # Pattern matching
-fn activate(x: Tensor<[_], fp32>, act: Activation) -> Tensor<[_], fp32>:
+fn activate(x: Tensor < [_], fp32 > , act: Activation) -> Tensor < [_], fp32 > :
     match act:
         case ReLU:
             return relu(x)

@@ -41,8 +41,8 @@ let m = TinyLM()
 
 # --- Train ---
 print("Training TinyLM (next-token prediction):")
-train(model=m, epochs=20):
-    optimizer: Adam(lr=0.01)
+train(model = m, epochs = 20):
+    optimizer: Adam(lr = 0.01)
     step(batch):
         let logits = m.forward(input_ids)
         let loss = cross_entropy(logits, target_ids)

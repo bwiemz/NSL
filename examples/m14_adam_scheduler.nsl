@@ -10,9 +10,9 @@ let m = Linear()
 let x = ones([4, 2])
 let y = zeros([4, 1])
 
-train(model=m, epochs=10):
-    optimizer: AdamW(lr=0.01, weight_decay=0.01)
-    scheduler: warmup_cosine(warmup_steps=3, total_steps=10, min_lr=0.001)
+train(model = m, epochs = 10):
+    optimizer: AdamW(lr = 0.01, weight_decay = 0.01)
+    scheduler: warmup_cosine(warmup_steps = 3, total_steps = 10, min_lr = 0.001)
     step(batch):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y)
