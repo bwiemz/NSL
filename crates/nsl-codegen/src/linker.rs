@@ -6,6 +6,45 @@ use crate::error::CodegenError;
 /// Path to the pre-built nsl-runtime static library, set at compile time by build.rs.
 const RUNTIME_LIB_PATH: &str = env!("NSL_RUNTIME_LIB_PATH");
 
+/// Find the runtime library, searching multiple locations for toolchain distribution.
+fn find_runtime_lib() -> Result<PathBuf, CodegenError> {
+    // 1. Check env var override (for custom installations)
+    if let Ok(path) = std::env::var("NSL_RUNTIME_LIB_PATH_OVERRIDE") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    // 2. Check relative to executable: <exe>/../lib/ (toolchain distribution)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(toolchain_dir) = bin_dir.parent() {
+                let lib_dir = toolchain_dir.join("lib");
+                let lib_name = if cfg!(windows) {
+                    "nsl_runtime.lib"
+                } else {
+                    "libnsl_runtime.a"
+                };
+                let lib_path = lib_dir.join(lib_name);
+                if lib_path.exists() {
+                    return Ok(lib_path);
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to compile-time path (cargo build scenario)
+    let compile_time = PathBuf::from(RUNTIME_LIB_PATH);
+    if compile_time.exists() {
+        return Ok(compile_time);
+    }
+
+    Err(CodegenError::new(
+        "nsl-runtime static library not found. Ensure the lib/ directory is next to bin/.".to_string(),
+    ))
+}
+
 /// Link a single object file into an executable (backward compatible).
 pub fn link(obj_path: &Path, output_path: &Path) -> Result<(), CodegenError> {
     link_multi(&[obj_path.to_path_buf()], output_path)
@@ -13,13 +52,7 @@ pub fn link(obj_path: &Path, output_path: &Path) -> Result<(), CodegenError> {
 
 /// Link multiple object files into an executable.
 pub fn link_multi(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), CodegenError> {
-    let runtime_lib = PathBuf::from(RUNTIME_LIB_PATH);
-    if !runtime_lib.exists() {
-        return Err(CodegenError::new(format!(
-            "nsl-runtime static library not found at: {}",
-            runtime_lib.display()
-        )));
-    }
+    let runtime_lib = find_runtime_lib()?;
 
     if cfg!(target_os = "windows") {
         link_msvc_multi(obj_paths, output_path, &runtime_lib)
