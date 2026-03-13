@@ -1,8 +1,11 @@
 [package]
 name = "nsl-ast"
+description = "Abstract syntax tree types for NeuralScript"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 nsl-errors.workspace = true

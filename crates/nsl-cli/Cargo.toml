@@ -1,8 +1,13 @@
 [package]
 name = "nsl-cli"
+description = "NeuralScript Language Toolchain CLI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords = ["ml", "compiler", "tensor", "neural-network", "language"]
+categories = ["compilers", "science"]
 
 [[bin]]
 name = "nsl"
