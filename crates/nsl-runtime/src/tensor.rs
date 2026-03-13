@@ -103,7 +103,7 @@ pub extern "C" fn nsl_register_custom_dtype(
         name,
         bit_width,
         block_size,
-        element_size: ((bit_width as usize + 7) / 8),
+        element_size: (bit_width as usize).div_ceil(8),
         packed_block_size: if block_size > 0 { packed_block_size as usize } else { 0 },
         pack_fn: if pack_fn.is_null() { None } else { Some(pack_fn) },
         unpack_fn: if unpack_fn.is_null() { None } else { Some(unpack_fn) },
@@ -4792,7 +4792,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(
         let pack: extern "C" fn(f64) -> i64 = unsafe { std::mem::transmute(pack_fn) };
 
         let packed_bytes = num_elements * info.element_size;
-        let packed_data = checked_alloc_zeroed(packed_bytes) as *mut u8;
+        let packed_data = checked_alloc_zeroed(packed_bytes);
 
         let src = tensor.data as *const f64;
         for i in 0..num_elements {
@@ -4828,7 +4828,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(
         let block_sz = info.block_size as usize;
         let innermost = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
 
-        if innermost % block_sz != 0 {
+        if !innermost.is_multiple_of(block_sz) {
             eprintln!("nsl: tensor dim {} not divisible by block_size {}", innermost, block_sz);
             return tensor_ptr;
         }
@@ -4836,7 +4836,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(
         let num_blocks = num_elements / block_sz;
         let pbs = info.packed_block_size;
         let packed_bytes = num_blocks * pbs;
-        let packed_data = checked_alloc_zeroed(packed_bytes) as *mut u8;
+        let packed_data = checked_alloc_zeroed(packed_bytes);
 
         // Block pack_fn: extern "C" fn(*const f64, i64, *mut u8)
         let pack: extern "C" fn(*const f64, i64, *mut u8) =

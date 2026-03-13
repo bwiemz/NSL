@@ -256,6 +256,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_dataloader_free", &[types::I64], None),
     // Packing efficiency (M19)
     ("nsl_packing_efficiency", &[types::I64], Some(types::F64)),
+    // Custom dtype registry (M23)
+    ("nsl_register_custom_dtype", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], None),
+    ("nsl_finalize_dtype_registry", &[], None),
+    ("nsl_tensor_to_custom_dtype", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_from_custom_dtype", &[types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

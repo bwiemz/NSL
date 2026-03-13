@@ -10,6 +10,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectModule, ObjectBuilder};
 
+use nsl_ast::block::DatatypeMethodKind;
 use nsl_ast::decl::ModelMember;
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::stmt::{Stmt, StmtKind};
@@ -75,6 +76,8 @@ pub struct Compiler<'a> {
     /// Names of models imported from other modules (not defined locally).
     /// These have struct layouts but should NOT generate struct ctors.
     pub imported_model_names: HashSet<String>,
+    /// Custom dtype name → numeric id (starting at 256). Populated by compile_datatype_defs.
+    pub custom_dtype_ids: HashMap<String, u16>,
     func_index: u32,
 }
 
@@ -135,6 +138,7 @@ impl<'a> Compiler<'a> {
             model_field_types: HashMap::new(),
             model_var_types: HashMap::new(),
             imported_model_names: HashSet::new(),
+            custom_dtype_ids: HashMap::new(),
             func_index: 0,
         })
     }
@@ -795,6 +799,209 @@ impl<'a> Compiler<'a> {
         result
     }
 
+    // ── Compile custom datatype definitions (before kernels) ──
+
+    pub fn compile_datatype_defs(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        for stmt in stmts {
+            if let StmtKind::DatatypeDef(def) = &stmt.kind {
+                let dtype_name = self.resolve_sym(def.name).to_string();
+                let id = 256u16 + self.custom_dtype_ids.len() as u16;
+                self.custom_dtype_ids.insert(dtype_name.clone(), id);
+
+                // Compile each method as a standalone Cranelift function
+                for method in &def.methods {
+                    let (fn_suffix, compile_it) = match method.kind {
+                        DatatypeMethodKind::Pack => ("pack", true),
+                        DatatypeMethodKind::Unpack => ("unpack", true),
+                        DatatypeMethodKind::BackwardPack => ("backward_pack", true),
+                        DatatypeMethodKind::Arithmetic => ("arithmetic", true),
+                    };
+                    if !compile_it {
+                        continue;
+                    }
+
+                    let fn_name = format!("__nsl_dtype_{}_{}", dtype_name, fn_suffix);
+
+                    // Build signature from method params and return type
+                    let mut sig = self.module.make_signature();
+                    sig.call_conv = self.call_conv;
+                    for param in &method.params {
+                        let cl_type = if let Some(ref type_ann) = param.type_ann {
+                            match &type_ann.kind {
+                                TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
+                                _ => cl_types::I64,
+                            }
+                        } else {
+                            cl_types::I64
+                        };
+                        sig.params.push(AbiParam::new(cl_type));
+                    }
+                    if let Some(ref ret_type) = method.return_type {
+                        match &ret_type.kind {
+                            TypeExprKind::Named(sym) => {
+                                let rname = self.resolve_sym(*sym);
+                                if rname != "void" {
+                                    sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                                }
+                            }
+                            _ => { sig.returns.push(AbiParam::new(cl_types::I64)); }
+                        }
+                    }
+
+                    let func_id = self.module
+                        .declare_function(&fn_name, Linkage::Local, &sig)
+                        .map_err(|e| CodegenError::new(format!(
+                            "failed to declare dtype method '{fn_name}': {e}"
+                        )))?;
+                    self.functions.insert(fn_name.clone(), (func_id, sig.clone()));
+
+                    // Compile the method body
+                    let mut ctx = Context::for_function(Function::with_name_signature(
+                        UserFuncName::user(0, self.next_func_index()),
+                        sig.clone(),
+                    ));
+                    let mut fn_builder_ctx = FunctionBuilderContext::new();
+
+                    {
+                        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+                        let mut state = crate::context::FuncState::new();
+
+                        let entry = builder.create_block();
+                        builder.append_block_params_for_function_params(entry);
+                        builder.switch_to_block(entry);
+                        builder.seal_block(entry);
+                        state.current_block = Some(entry);
+
+                        // Bind parameters
+                        for (i, param) in method.params.iter().enumerate() {
+                            let param_val = builder.block_params(entry)[i];
+                            let cl_type = if i < sig.params.len() {
+                                sig.params[i].value_type
+                            } else {
+                                cl_types::I64
+                            };
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_type);
+                            builder.def_var(var, param_val);
+                            state.variables.insert(param.name, (var, cl_type));
+                        }
+
+                        // Compile body statements
+                        for body_stmt in &method.body {
+                            self.compile_stmt(&mut builder, &mut state, body_stmt)?;
+                        }
+
+                        // Implicit return if not already terminated
+                        let current = state.current_block.unwrap_or(entry);
+                        if !crate::types::is_block_filled(&builder, current) {
+                            if sig.returns.is_empty() {
+                                builder.ins().return_(&[]);
+                            } else {
+                                let ret_type = sig.returns[0].value_type;
+                                if ret_type == cl_types::F64 {
+                                    let zero = builder.ins().f64const(0.0);
+                                    builder.ins().return_(&[zero]);
+                                } else if ret_type == cl_types::F32 {
+                                    let zero = builder.ins().f32const(0.0);
+                                    builder.ins().return_(&[zero]);
+                                } else {
+                                    let zero = builder.ins().iconst(ret_type, 0);
+                                    builder.ins().return_(&[zero]);
+                                }
+                            }
+                        }
+
+                        builder.finalize();
+                    }
+
+                    if self.dump_ir {
+                        eprintln!("--- IR: dtype method '{fn_name}' ---\n{}", ctx.func.display());
+                    }
+
+                    self.module
+                        .define_function(func_id, &mut ctx)
+                        .map_err(|e| CodegenError::new(format!(
+                            "failed to define dtype method '{fn_name}': {e}"
+                        )))?;
+                }
+
+                // Intern the dtype name string for registration calls
+                self.intern_string(&dtype_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit registration calls for all custom dtypes into a function being built.
+    /// Must be called inside a builder context (e.g., in compile_main).
+    pub fn emit_dtype_registration(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        stmts: &[Stmt],
+    ) -> Result<(), CodegenError> {
+        for stmt in stmts {
+            if let StmtKind::DatatypeDef(def) = &stmt.kind {
+                let dtype_name = self.resolve_sym(def.name).to_string();
+                let id = match self.custom_dtype_ids.get(&dtype_name) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+                let bit_width = def.bits.unwrap_or(0) as i64;
+                let block_size = def.block_size.unwrap_or(0) as i64;
+
+                // Compute packed_block_size from block_size and bit_width
+                let packed_block_size = if block_size > 0 {
+                    (block_size * bit_width + 7) / 8
+                } else {
+                    0i64
+                };
+
+                // Get function pointers for pack/unpack
+                let pack_fn_name = format!("__nsl_dtype_{}_pack", dtype_name);
+                let unpack_fn_name = format!("__nsl_dtype_{}_unpack", dtype_name);
+
+                let pack_addr = if let Some((fid, _)) = self.functions.get(&pack_fn_name) {
+                    let fref = self.module.declare_func_in_func(*fid, builder.func);
+                    builder.ins().func_addr(cl_types::I64, fref)
+                } else {
+                    builder.ins().iconst(cl_types::I64, 0)
+                };
+                let unpack_addr = if let Some((fid, _)) = self.functions.get(&unpack_fn_name) {
+                    let fref = self.module.declare_func_in_func(*fid, builder.func);
+                    builder.ins().func_addr(cl_types::I64, fref)
+                } else {
+                    builder.ins().iconst(cl_types::I64, 0)
+                };
+
+                // Get name data pointer and length
+                let name_data_id = self.string_pool[&dtype_name];
+                let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
+                let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+                let name_len = builder.ins().iconst(cl_types::I64, dtype_name.len() as i64);
+
+                let id_val = builder.ins().iconst(cl_types::I64, id as i64);
+                let bw_val = builder.ins().iconst(cl_types::I64, bit_width);
+                let bs_val = builder.ins().iconst(cl_types::I64, block_size);
+                let pbs_val = builder.ins().iconst(cl_types::I64, packed_block_size);
+
+                // Call nsl_register_custom_dtype(id, name_ptr, name_len, bit_width, block_size, packed_block_size, pack_fn, unpack_fn)
+                let reg_id = self.runtime_fns["nsl_register_custom_dtype"].0;
+                let reg_ref = self.module.declare_func_in_func(reg_id, builder.func);
+                builder.ins().call(reg_ref, &[id_val, name_ptr, name_len, bw_val, bs_val, pbs_val, pack_addr, unpack_addr]);
+            }
+        }
+
+        // Call nsl_finalize_dtype_registry() after all registrations
+        if self.custom_dtype_ids.is_empty() {
+            return Ok(());
+        }
+        let fin_id = self.runtime_fns["nsl_finalize_dtype_registry"].0;
+        let fin_ref = self.module.declare_func_in_func(fin_id, builder.func);
+        builder.ins().call(fin_ref, &[]);
+
+        Ok(())
+    }
+
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
     pub fn compile_kernels(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
@@ -1305,6 +1512,9 @@ impl<'a> Compiler<'a> {
             let init_ref = self.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[argc_val, argv_val]);
 
+            // Register custom dtypes before user code runs
+            self.emit_dtype_registration(&mut builder, stmts)?;
+
             for stmt in &top_level {
                 self.compile_stmt(&mut builder, &mut state, stmt)?;
             }
@@ -1523,6 +1733,7 @@ pub fn compile(
     compiler.collect_models(&ast.stmts)?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
@@ -1547,6 +1758,7 @@ pub fn compile_test(
     compiler.collect_models(&ast.stmts)?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
@@ -1602,6 +1814,7 @@ pub fn compile_module_with_imports(
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+    compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
@@ -1649,6 +1862,7 @@ pub fn compile_entry(
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+    compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;

@@ -42,6 +42,10 @@ impl Compiler<'_> {
                     if name == "cpu" {
                         return Ok(builder.ins().iconst(cl_types::I64, 0));
                     }
+                    // Check if it's a custom dtype constant (for .to(CustomDtype) etc.)
+                    if let Some(dtype_id) = self.resolve_custom_dtype(&name) {
+                        return Ok(builder.ins().iconst(cl_types::I64, dtype_id as i64));
+                    }
                     // Check if it's an enum variant
                     if let Some(tag) = self.lookup_enum_variant_tag(&name) {
                         Ok(builder.ins().iconst(cl_types::I64, tag))
@@ -1445,6 +1449,11 @@ impl Compiler<'_> {
         }
     }
 
+    /// Look up a custom dtype name in the registry and return its numeric id.
+    fn resolve_custom_dtype(&self, name: &str) -> Option<u16> {
+        self.custom_dtype_ids.get(name).copied()
+    }
+
     fn compile_print_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2808,8 +2817,22 @@ impl Compiler<'_> {
             "item" => self.compile_call_by_name(builder, "nsl_tensor_item", &[obj_val]),
             "to" => {
                 if args.len() != 1 {
-                    return Err(CodegenError::new("to() takes exactly 1 argument (device)"));
+                    return Err(CodegenError::new("to() takes exactly 1 argument (device or dtype)"));
                 }
+                // Check if the argument is a custom dtype name
+                if let ExprKind::Ident(arg_sym) = &args[0].value.kind {
+                    let arg_name = self.resolve_sym(*arg_sym).to_string();
+                    if let Some(dtype_id) = self.resolve_custom_dtype(&arg_name) {
+                        // .to(CustomDtype) — convert to custom dtype
+                        let id_val = builder.ins().iconst(cl_types::I64, dtype_id as i64);
+                        return self.compile_call_by_name(builder, "nsl_tensor_to_custom_dtype", &[obj_val, id_val]);
+                    }
+                    // .to(f32) / .to(f64) — convert from custom dtype back to standard
+                    if matches!(arg_name.as_str(), "f32" | "f64" | "float") {
+                        return self.compile_call_by_name(builder, "nsl_tensor_from_custom_dtype", &[obj_val]);
+                    }
+                }
+                // Fall through: device transfer (.to(cuda), .to(cpu), etc.)
                 let device_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_to_device", &[obj_val, device_val])
             }

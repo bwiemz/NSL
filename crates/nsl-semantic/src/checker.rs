@@ -15,6 +15,7 @@ use nsl_lexer::Interner;
 const DTYPE_CUSTOM_START: u16 = 256;
 
 /// Semantic metadata for a user-defined `datatype` block.
+#[allow(dead_code)]
 struct CustomDtypeSemanticInfo {
     dtype_id: u16,
     bit_width: u8,
