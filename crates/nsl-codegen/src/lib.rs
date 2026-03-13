@@ -6,8 +6,10 @@ pub mod expr;
 pub mod func;
 pub mod kernel;
 pub mod linker;
+pub mod standalone;
 pub mod stmt;
 pub mod types;
 
 pub use compiler::{compile, compile_entry, compile_module, compile_module_with_imports, compile_test};
 pub use error::CodegenError;
+pub use standalone::create_weight_object;
