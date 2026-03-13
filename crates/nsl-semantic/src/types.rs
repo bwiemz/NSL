@@ -181,6 +181,8 @@ pub enum DType {
     Int4,
     Uint8,
     Bool,
+    /// Custom user-defined datatype (M23 BYOD)
+    Custom(u16),  // runtime dtype ID (256+)
     Unknown,
 }
 
@@ -337,6 +339,7 @@ fn dtype_to_rank(d: DType) -> u8 {
         DType::Bf16 => 8,
         DType::F32 => 9,
         DType::F64 => 10,
+        DType::Custom(_) => 0,  // custom dtypes don't participate in widening
         DType::Unknown => 0,
     }
 }
@@ -429,6 +432,7 @@ fn display_dtype(dtype: &DType) -> String {
         DType::Int4 => "int4".into(),
         DType::Uint8 => "uint8".into(),
         DType::Bool => "bool".into(),
+        DType::Custom(id) => format!("custom:{}", id),
         DType::Unknown => "?".into(),
     }
 }

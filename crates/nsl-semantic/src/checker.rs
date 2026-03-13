@@ -11,6 +11,20 @@ use nsl_ast::{Module, NodeId, Symbol};
 use nsl_errors::{Diagnostic, Span};
 use nsl_lexer::Interner;
 
+/// Custom dtype IDs start at 256 to avoid collision with built-in dtype codes.
+const DTYPE_CUSTOM_START: u16 = 256;
+
+/// Semantic metadata for a user-defined `datatype` block.
+struct CustomDtypeSemanticInfo {
+    dtype_id: u16,
+    bit_width: u8,
+    block_size: Option<u32>,
+    has_pack: bool,
+    has_unpack: bool,
+    has_pack_ptx: bool,
+    has_unpack_ptx: bool,
+}
+
 use crate::resolve::TypeResolver;
 use crate::scope::*;
 use crate::shapes;
@@ -28,6 +42,8 @@ pub struct TypeChecker<'a> {
     current_return_type: Option<Type>,
     /// Pre-resolved types for imported symbols (from other modules).
     import_types: HashMap<Symbol, Type>,
+    /// Registry of user-defined `datatype` blocks validated in this module.
+    custom_datatypes: HashMap<String, CustomDtypeSemanticInfo>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -40,6 +56,7 @@ impl<'a> TypeChecker<'a> {
             current_scope: ScopeId::ROOT,
             current_return_type: None,
             import_types: HashMap::new(),
+            custom_datatypes: HashMap::new(),
         }
     }
 
@@ -86,6 +103,9 @@ impl<'a> TypeChecker<'a> {
                 }
                 StmtKind::TraitDef(trait_def) => {
                     self.declare_symbol(trait_def.name, Type::Unknown, stmt.span, true, false);
+                }
+                StmtKind::DatatypeDef(def) => {
+                    self.declare_symbol(def.name, Type::Unknown, stmt.span, true, false);
                 }
                 StmtKind::Decorated { stmt, .. } => {
                     // Recurse into the inner stmt for pre-declaration
@@ -477,8 +497,49 @@ impl<'a> TypeChecker<'a> {
                 // that aren't general variable assignments.
                 self.declare_symbol(ds.name, Type::Unknown, ds.span, true, false);
             }
-            StmtKind::DatatypeDef(_) => {
-                // M23: custom datatype validation — implemented in Task 8
+            StmtKind::DatatypeDef(def) => {
+                if def.bits.is_none() {
+                    self.diagnostics.push(
+                        Diagnostic::error("datatype block must declare 'bits'")
+                            .with_label(def.span, "missing 'bits' declaration"),
+                    );
+                }
+
+                let has_pack = def.methods.iter().any(|m| m.kind == DatatypeMethodKind::Pack);
+                let has_unpack = def.methods.iter().any(|m| m.kind == DatatypeMethodKind::Unpack);
+                if !has_pack {
+                    self.diagnostics.push(
+                        Diagnostic::error("datatype block must define @pack method")
+                            .with_label(def.span, "missing @pack"),
+                    );
+                }
+                if !has_unpack {
+                    self.diagnostics.push(
+                        Diagnostic::error("datatype block must define @unpack method")
+                            .with_label(def.span, "missing @unpack"),
+                    );
+                }
+
+                if let Some(bs) = def.block_size {
+                    if bs == 0 {
+                        self.diagnostics.push(
+                            Diagnostic::error("block_size must be > 0")
+                                .with_label(def.span, "zero block_size"),
+                        );
+                    }
+                }
+
+                let id = DTYPE_CUSTOM_START + self.custom_datatypes.len() as u16;
+                let name = self.interner.resolve(def.name.0).unwrap_or("?").to_string();
+                self.custom_datatypes.insert(name, CustomDtypeSemanticInfo {
+                    dtype_id: id,
+                    bit_width: def.bits.unwrap_or(8),
+                    block_size: def.block_size,
+                    has_pack,
+                    has_unpack,
+                    has_pack_ptx: def.ptx_blocks.iter().any(|b| b.kind == DatatypePtxKind::PackPtx),
+                    has_unpack_ptx: def.ptx_blocks.iter().any(|b| b.kind == DatatypePtxKind::UnpackPtx),
+                });
             }
         }
     }
