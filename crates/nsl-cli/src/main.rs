@@ -2,6 +2,7 @@ mod formatter;
 mod loader;
 mod mangling;
 mod resolver;
+mod standalone;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -59,6 +60,22 @@ enum Cli {
         /// Print the Cranelift IR for each function
         #[arg(long)]
         dump_ir: bool,
+
+        /// Produce a zero-dependency standalone bundle (requires -w/--weights)
+        #[arg(long)]
+        standalone: bool,
+
+        /// Path to the model weights file to bundle with the standalone executable
+        #[arg(short = 'w', long)]
+        weights: Option<PathBuf>,
+
+        /// Weight embedding strategy: auto, always, never (default: auto)
+        #[arg(long, default_value = "auto")]
+        embed_weights: String,
+
+        /// Size threshold in bytes above which auto mode streams weights instead of embedding (default: 256 MiB)
+        #[arg(long, default_value_t = 268_435_456)]
+        embed_threshold: u64,
     },
 
     /// Run @test functions in an NSL file
@@ -118,8 +135,39 @@ fn main() {
             output,
             emit_obj,
             dump_ir,
+            standalone,
+            weights,
+            embed_weights,
+            embed_threshold,
         } => {
-            run_build(&file, output, emit_obj, dump_ir);
+            if standalone {
+                if weights.is_none() {
+                    eprintln!("error: --standalone requires -w/--weights <path>");
+                    process::exit(1);
+                }
+                let embed_mode = match embed_weights.to_lowercase().as_str() {
+                    "auto" => standalone::EmbedMode::Auto,
+                    "always" => standalone::EmbedMode::Always,
+                    "never" => standalone::EmbedMode::Never,
+                    other => {
+                        eprintln!(
+                            "error: unknown --embed-weights value '{}'. \
+                             Expected: auto, always, never",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+                run_build_standalone(
+                    &file,
+                    output.as_deref(),
+                    weights.as_deref().unwrap(),
+                    embed_mode,
+                    embed_threshold,
+                );
+            } else {
+                run_build(&file, output, emit_obj, dump_ir);
+            }
         }
         Cli::Run { file, args } => {
             run_run(&file, &args);
@@ -292,6 +340,17 @@ fn needs_multi_file(file: &PathBuf) -> bool {
 
 fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool) {
     run_build_inner(file, output, emit_obj, dump_ir, false);
+}
+
+fn run_build_standalone(
+    _file: &std::path::Path,
+    _output: Option<&std::path::Path>,
+    _weights: &std::path::Path,
+    _embed_mode: standalone::EmbedMode,
+    _embed_threshold: u64,
+) {
+    eprintln!("standalone build: TODO");
+    process::exit(1);
 }
 
 fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
