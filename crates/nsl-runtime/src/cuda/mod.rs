@@ -137,6 +137,83 @@ pub(crate) mod inner {
         }
     }
 
+    /// Allocate device-only memory (not accessible from host without explicit copy).
+    pub(crate) fn alloc_device(size_bytes: usize) -> *mut c_void {
+        ensure_context();
+        unsafe {
+            let mut ptr: CUdeviceptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemAlloc_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+            ptr as *mut c_void
+        }
+    }
+
+    /// Free device-only memory allocated with `alloc_device`.
+    pub(crate) fn free_device(ptr: *mut c_void) {
+        ensure_context();
+        unsafe {
+            let result = cuMemFree_v2(ptr as CUdeviceptr);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemFree_v2 (device) failed: {:?}",
+                result
+            );
+        }
+    }
+
+    /// Allocate pinned (page-locked) host memory for fast DMA transfers.
+    pub(crate) fn alloc_pinned(size_bytes: usize) -> *mut c_void {
+        ensure_context();
+        unsafe {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let result = cuMemAllocHost_v2(&mut ptr, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemAllocHost_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+            ptr
+        }
+    }
+
+    /// Free pinned host memory allocated with `alloc_pinned`.
+    pub(crate) fn free_pinned(ptr: *mut c_void) {
+        ensure_context();
+        unsafe {
+            let result = cuMemFreeHost(ptr);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemFreeHost failed: {:?}",
+                result
+            );
+        }
+    }
+
+    /// Copy `size_bytes` bytes from host memory to device memory.
+    pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        ensure_context();
+        unsafe {
+            let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyHtoD_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+        }
+    }
+
     /// Prefetch memory to device. Best-effort: silently ignores NOT_SUPPORTED.
     pub(crate) fn prefetch_to_device(ptr: *mut c_void, size_bytes: usize, device_id: i32) {
         let state = state();
@@ -722,6 +799,52 @@ DONE:
         inner::free_managed(a);
         inner::free_managed(b);
         inner::free_managed(c);
+    }
+
+    #[test]
+    fn test_alloc_free_device() {
+        // Allocate 1024 bytes of device-only memory and free it — no crash expected.
+        let ptr = inner::alloc_device(1024);
+        assert!(!ptr.is_null(), "alloc_device returned null");
+        inner::free_device(ptr);
+    }
+
+    #[test]
+    fn test_alloc_free_pinned() {
+        // Allocate 256 bytes of pinned host memory, write/read CPU-side, then free.
+        let ptr = inner::alloc_pinned(256);
+        assert!(!ptr.is_null(), "alloc_pinned returned null");
+
+        // Write and read back on the CPU side (pinned memory is host-accessible).
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, 256) };
+        for (i, byte) in slice.iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+        for (i, &byte) in slice.iter().enumerate() {
+            assert_eq!(byte, (i % 256) as u8, "pinned memory mismatch at byte {}", i);
+        }
+
+        inner::free_pinned(ptr);
+    }
+
+    #[test]
+    fn test_memcpy_htod() {
+        // Copy host data into device memory and free — verifies the copy doesn't crash.
+        let host_data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let size_bytes = host_data.len() * std::mem::size_of::<f32>();
+
+        let dev_ptr = inner::alloc_device(size_bytes);
+        assert!(!dev_ptr.is_null(), "alloc_device returned null");
+
+        inner::memcpy_htod(dev_ptr, host_data.as_ptr() as *const std::ffi::c_void, size_bytes);
+
+        // Sync to ensure transfer is complete before freeing.
+        unsafe {
+            let sync = cudarc::driver::sys::cuCtxSynchronize();
+            assert_eq!(sync as u32, 0, "cuCtxSynchronize after memcpy_htod failed");
+        }
+
+        inner::free_device(dev_ptr);
     }
 
     #[test]
