@@ -213,7 +213,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_ones_like", &[types::I64], Some(types::I64)),
     // GPU runtime functions (M17)
     ("nsl_cuda_init", &[], Some(types::I64)),
-    ("nsl_kernel_launch", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kernel_launch", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_to_device", &[types::I64, types::I64], Some(types::I64)),
     // Shape manipulation ops (M18a)
     ("nsl_tensor_unsqueeze", &[types::I64, types::I64], Some(types::I64)),

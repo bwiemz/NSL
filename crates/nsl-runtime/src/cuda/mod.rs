@@ -696,6 +696,7 @@ pub extern "C" fn nsl_cuda_init() -> i64 {
 /// - `block_x/y/z`: block dimensions
 /// - `args_ptr`: pointer to array of `*mut c_void` (pointers to argument values)
 /// - `num_args`: number of arguments
+/// - `shared_mem_bytes`: bytes of dynamic shared memory per block
 ///
 /// Returns 0 (CUDA_SUCCESS) on success, non-zero CUDA error code on failure.
 #[no_mangle]
@@ -710,6 +711,7 @@ pub extern "C" fn nsl_kernel_launch(
     block_z: i64,
     args_ptr: i64,
     num_args: i64,
+    shared_mem_bytes: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -721,14 +723,14 @@ pub extern "C" fn nsl_kernel_launch(
             name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
-            args_slice, 0,
+            args_slice, shared_mem_bytes as u32,
         );
         result as i64
     }
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
-        let _ = (block_x, block_y, block_z, args_ptr, num_args);
+        let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }

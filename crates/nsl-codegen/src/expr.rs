@@ -2985,10 +2985,11 @@ impl Compiler<'_> {
             // No tensor args — pass null pointer and 0 count
             let null_ptr = builder.ins().iconst(cl_types::I64, 0);
             let num_args_val = builder.ins().iconst(cl_types::I64, 0);
+            let shared_mem = builder.ins().iconst(cl_types::I64, 0);
             return self.compile_call_by_name(
                 builder,
                 "nsl_kernel_launch",
-                &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, null_ptr, num_args_val],
+                &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, null_ptr, num_args_val, shared_mem],
             );
         }
 
@@ -3006,13 +3007,15 @@ impl Compiler<'_> {
 
         let args_ptr = builder.ins().stack_addr(cl_types::I64, ss, 0);
         let num_args_val = builder.ins().iconst(cl_types::I64, num_args as i64);
+        let shared_mem = builder.ins().iconst(cl_types::I64, 0);
 
         // Call nsl_kernel_launch(ptx_ptr, name_ptr, grid_x, grid_y, grid_z,
-        //                        block_x, block_y, block_z, args_ptr, num_args)
+        //                        block_x, block_y, block_z, args_ptr, num_args,
+        //                        shared_mem_bytes)
         self.compile_call_by_name(
             builder,
             "nsl_kernel_launch",
-            &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val],
+            &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val, shared_mem],
         )
     }
 
