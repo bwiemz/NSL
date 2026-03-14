@@ -294,6 +294,25 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Kernel profiler (M26) — flush is NOT registered here (Rust-only atexit call)
     ("nsl_kernel_profiler_start", &[],                                                         None),
     ("nsl_kernel_profiler_stop",  &[],                                                         None),
+    // FlashAttention-2 launch wrappers (M27)
+    ("nsl_flash_attention", &[
+        types::I64, types::I64, types::I64, types::I64, types::I64,  // q, k, v, out, scale
+        types::I64, types::I64, types::I64, types::I64,              // batch, heads, seq_len, head_dim
+        types::I64, types::I64, types::I64, types::I64,              // block_table, k_pool, v_pool, block_size
+        types::I64, types::I64,                                       // cos, sin (RoPE)
+        types::I64, types::I64,                                       // seq_ids, seq_lens (M29-ready)
+        types::I64,                                                   // shared_mem_bytes
+        types::I64, types::I64,                                       // ptx_ptr, name_ptr
+        types::I64, types::I64,                                       // block_q, block_kv
+    ], Some(types::I64)),
+    ("nsl_rope_cache_write", &[
+        types::I64, types::I64,                                       // k_projected, v_projected
+        types::I64, types::I64, types::I64,                          // cos, sin, positions
+        types::I64, types::I64, types::I64,                          // k_pool, v_pool, block_table
+        types::I64, types::I64,                                       // seq_ids, seq_lens (M29-ready)
+        types::I64, types::I64, types::I64, types::I64,              // num_tokens, num_heads, head_dim, block_size
+        types::I64, types::I64,                                       // ptx_ptr, name_ptr
+    ], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
