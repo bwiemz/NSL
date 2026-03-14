@@ -211,14 +211,14 @@ mod tests {
         // mask is [4][4], flattened row-major
 
         // mask[0][0] = 0.0 (same doc, causal: j<=i)
-        assert_eq!(batch.mask[0 * 4 + 0], 0.0);
+        assert_eq!(batch.mask[0], 0.0);
 
         // mask[1][0] = 0.0, mask[1][1] = 0.0 (same doc, causal)
-        assert_eq!(batch.mask[1 * 4 + 0], 0.0);
-        assert_eq!(batch.mask[1 * 4 + 1], 0.0);
+        assert_eq!(batch.mask[4], 0.0);
+        assert_eq!(batch.mask[4 + 1], 0.0);
 
         // mask[3][0] = -1e9, mask[3][1] = -1e9, mask[3][2] = -1e9 (cross-doc)
-        assert_eq!(batch.mask[3 * 4 + 0], -1e9);
+        assert_eq!(batch.mask[3 * 4], -1e9);
         assert_eq!(batch.mask[3 * 4 + 1], -1e9);
         assert_eq!(batch.mask[3 * 4 + 2], -1e9);
 

@@ -491,7 +491,7 @@ mod tests {
         let result = read_1d(nsl_tensor_multinomial(probs, 4));
         assert_eq!(result.len(), 4);
         for &idx in &result {
-            assert!(idx >= 0.0 && idx < 3.0);
+            assert!((0.0..3.0).contains(&idx));
         }
     }
 
