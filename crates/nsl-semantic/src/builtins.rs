@@ -786,4 +786,19 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(Type::Int),
         },
     );
+    // Kernel profiler builtins (M26)
+    def(
+        "kernel_profiler_start",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "kernel_profiler_stop",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Void),
+        },
+    );
 }

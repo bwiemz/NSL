@@ -291,6 +291,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_profiler_stop",       &[],                                                           None),
     ("nsl_profiler_dump",       &[types::I64, types::I64],                                     None),
     ("nsl_profiler_peak",       &[],                                                           Some(types::I64)),
+    // Kernel profiler (M26) — flush is NOT registered here (Rust-only atexit call)
+    ("nsl_kernel_profiler_start", &[],                                                         None),
+    ("nsl_kernel_profiler_stop",  &[],                                                         None),
 ];
 
 /// Declare all runtime functions as imports in the module.
