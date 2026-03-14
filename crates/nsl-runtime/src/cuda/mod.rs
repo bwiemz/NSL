@@ -269,6 +269,7 @@ pub(crate) mod inner {
         grid: [i64; 3],
         block: [i64; 3],
         args: &[*mut c_void],
+        shared_mem_bytes: u32,
     ) -> CUresult {
         let state = state();
         let func = {
@@ -314,7 +315,7 @@ pub(crate) mod inner {
                 func,
                 grid[0] as u32, grid[1] as u32, grid[2] as u32,
                 block[0] as u32, block[1] as u32, block[2] as u32,
-                0, std::ptr::null_mut(),
+                shared_mem_bytes, std::ptr::null_mut(),
                 kernel_args.as_mut_ptr(), std::ptr::null_mut(),
             )
         };
@@ -378,7 +379,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args,
+        [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
@@ -415,7 +416,7 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args,
+        [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
@@ -485,7 +486,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         "nsl_matmul_f32\0".as_ptr(),
         [grid_x, grid_y, 1],
         [block, block, 1],
-        &args,
+        &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU matmul kernel failed: {}", result as u32);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
@@ -525,7 +526,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args,
+        [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
@@ -569,7 +570,7 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args,
+        [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU backward kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
     #[allow(unused_unsafe)]
@@ -661,7 +662,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let result = inner::kernel_launch(
         kernels::CLAMP_BACKWARD_F32_PTX.as_ptr(),
         "nsl_clamp_backward_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args,
+        [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU clamp_backward kernel failed: {}", result as u32);
     #[allow(unused_unsafe)]
@@ -720,7 +721,7 @@ pub extern "C" fn nsl_kernel_launch(
             name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
-            args_slice,
+            args_slice, 0,
         );
         result as i64
     }
@@ -820,7 +821,7 @@ DONE:
             "vec_add\0".as_ptr(),
             [grid_size, 1, 1],
             [block_size, 1, 1],
-            &args.map(|p| p),
+            &args.map(|p| p), 0,
         );
         assert_eq!(result as u32, 0, "kernel launch failed");
 
