@@ -113,9 +113,16 @@ Each thread block produces one tile of the output matrix (`block_q` rows).
    bar.sync 0    // FENCE 2: ensure ALL warps finished reading K before SRAM is overwritten
 
    // Phase 3: Online softmax — S transforms to P in-place in registers
-   new_max = max(row_max, row_max_of_S)
+   //
+   // Warp-level reductions: mma.sync distributes row fragments across threads
+   // within a warp. row_max and row_sum require cross-thread reduction via
+   // shfl.sync.bfly (butterfly shuffle) — log2(warp_size) steps per reduction.
+   // This is the ONLY correct reduction pattern; shared memory reduction would
+   // require an extra bar.sync and waste SRAM.
+   //
+   new_max = max(row_max, warp_reduce_max(row_max_of_S))  // shfl.sync.bfly
    correction = exp(old_max - new_max)       // always <= 1.0, no overflow
-   row_sum = row_sum * correction + sum(exp(S - new_max))
+   row_sum = row_sum * correction + warp_reduce_sum(exp(S - new_max))  // shfl.sync.bfly
    O_acc = O_acc * correction                // rescale previous accumulation
    P = exp(S - new_max)                      // overwrites S registers in-place
    // P never touches SRAM — stays in registers as the A operand for Phase 5
@@ -290,7 +297,7 @@ model Transformer:
 
 **Lowering rules:**
 - When the compiler sees `scaled_dot_product_attention()` inside a function decorated with `@flash_attention`, it lowers directly to the FlashAttention PTX dispatch.
-- Without `@flash_attention`, `scaled_dot_product_attention` compiles to naive `softmax((Q @ K.T) * scale) @ V` — mathematically explicit, no silent transformations.
+- Without `@flash_attention`, `scaled_dot_product_attention` compiles to naive attention. When `causal=true`, the naive path injects a causal mask (upper triangle set to `-inf`) before softmax: `softmax(apply_causal_mask((Q @ K.T) * scale)) @ V`. When `causal=false`, the mask is omitted: `softmax((Q @ K.T) * scale) @ V`. This ensures the naive fallback is numerically equivalent to the FlashAttention path in both modes.
 - The decorators determine which variant flags are set: `@paged_kv` → `paged=true`, `@rope` → `rope_q=true` + `rope_style`, `@gqa(groups=N)` → `gqa_group_size=N`.
 
 ### 7.2 Compile-Time Flow (`nsl build`)
@@ -338,6 +345,8 @@ pub extern "C" fn nsl_rope_cache_write(
     positions_ptr: *mut c_void,
     k_pool_ptr: *mut c_void, v_pool_ptr: *mut c_void,
     block_table_ptr: *mut c_void,
+    // Ragged batch params (M29-ready) — thread needs seq_id for block table lookup
+    seq_ids_ptr: *mut c_void, seq_lens_ptr: *mut c_void,
     num_tokens: i64, num_heads: i64, head_dim: i64, block_size: i64,
 ) -> i64
 ```
