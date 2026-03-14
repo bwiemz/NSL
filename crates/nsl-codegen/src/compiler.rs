@@ -25,6 +25,15 @@ use crate::context::{FuncState, StructField, StructLayout};
 use crate::error::CodegenError;
 use crate::types::{nsl_type_to_cl, pointer_type};
 
+/// Compile-time context for FlashAttention PTX dispatch.
+/// Populated by `compile_flash_attention_kernels()` when a `@flash_attention`-decorated
+/// function is found, consumed by `compile_flash_attention_call()` in expr.rs.
+pub struct FlashAttentionCompileContext {
+    pub ptx_data_id: DataId,
+    pub name_data_id: DataId,
+    pub config: crate::flash_attention::FlashAttentionConfig,
+}
+
 /// A lambda body to be compiled after the current function.
 pub struct PendingLambda {
     pub name: String,
@@ -93,6 +102,9 @@ pub struct Compiler<'a> {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Compiler configuration flags (--no-autotune, --autotune-fresh, etc.)
     pub compile_options: crate::CompileOptions,
+    /// FlashAttention compile context: set during compile_flash_attention_kernels(),
+    /// consumed by compile_flash_attention_call() when lowering scaled_dot_product_attention.
+    pub flash_attention_context: Option<FlashAttentionCompileContext>,
     func_index: u32,
 }
 
@@ -157,6 +169,7 @@ impl<'a> Compiler<'a> {
             standalone_config: None,
             paged_kv_configs: HashMap::new(),
             compile_options: crate::CompileOptions::default(),
+            flash_attention_context: None,
             func_index: 0,
         })
     }
@@ -1323,6 +1336,206 @@ impl<'a> Compiler<'a> {
         Ok(params)
     }
 
+    // ── FlashAttention kernel synthesis ──────────────────────────────
+
+    /// Walk function definitions for `@flash_attention` decorator, synthesize PTX,
+    /// embed it in .rodata, and store the `FlashAttentionCompileContext`.
+    pub fn compile_flash_attention_kernels(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        for stmt in stmts {
+            let decorators = match &stmt.kind {
+                StmtKind::Decorated { decorators, stmt } => {
+                    if matches!(&stmt.kind, StmtKind::FnDef(_)) {
+                        decorators
+                    } else {
+                        continue;
+                    }
+                }
+                // Check model layer declarations for @flash_attention
+                // (model methods with decorators are stored on LayerDecl members)
+                StmtKind::ModelDef(md) => {
+                    for member in &md.members {
+                        if let ModelMember::LayerDecl { decorators, .. } = member {
+                            if let Some(ctx) = self.try_build_flash_context(decorators)? {
+                                self.flash_attention_context = Some(ctx);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+
+            if let Some(ctx) = self.try_build_flash_context(decorators)? {
+                self.flash_attention_context = Some(ctx);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Try to build a `FlashAttentionCompileContext` from a set of decorators.
+    /// Returns `None` if `@flash_attention` is not present.
+    fn try_build_flash_context(
+        &mut self,
+        decorators: &[Decorator],
+    ) -> Result<Option<FlashAttentionCompileContext>, CodegenError> {
+        let has_flash = decorators.iter().any(|d| {
+            d.name.len() == 1
+                && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+        });
+        if !has_flash {
+            return Ok(None);
+        }
+
+        // Extract variant flags from sibling decorators
+        let mut causal = true; // default
+        let mut paged = false;
+        let mut rope_q = false;
+        let mut rope_style = crate::flash_attention::RopeStyle::HalfSplit;
+        let mut gqa_group_size: u32 = 1;
+
+        for deco in decorators {
+            if deco.name.len() != 1 {
+                continue;
+            }
+            let dname = self.interner.resolve(deco.name[0].0).unwrap_or("");
+            match dname {
+                "flash_attention" => {
+                    // Extract causal= arg if present
+                    if let Some(ref args) = deco.args {
+                        for arg in args {
+                            let aname = arg
+                                .name
+                                .as_ref()
+                                .and_then(|s| self.interner.resolve(s.0))
+                                .unwrap_or("");
+                            if aname == "causal" {
+                                if let ExprKind::BoolLiteral(b) = arg.value.kind {
+                                    causal = b;
+                                }
+                            }
+                        }
+                    }
+                }
+                "paged_kv" => {
+                    paged = true;
+                }
+                "rope" => {
+                    rope_q = true;
+                    if let Some(ref args) = deco.args {
+                        for arg in args {
+                            let aname = arg
+                                .name
+                                .as_ref()
+                                .and_then(|s| self.interner.resolve(s.0))
+                                .unwrap_or("");
+                            if aname == "style" {
+                                if let ExprKind::StringLiteral(ref s) = arg.value.kind {
+                                    if s == "adjacent" {
+                                        rope_style = crate::flash_attention::RopeStyle::Adjacent;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "gqa" => {
+                    if let Some(ref args) = deco.args {
+                        for arg in args {
+                            let aname = arg
+                                .name
+                                .as_ref()
+                                .and_then(|s| self.interner.resolve(s.0))
+                                .unwrap_or("");
+                            if aname == "groups" {
+                                if let ExprKind::IntLiteral(v) = arg.value.kind {
+                                    gqa_group_size = v as u32;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let config = crate::flash_attention::FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64, // default; runtime extracts actual head_dim from tensor shape
+            causal,
+            paged,
+            rope_q,
+            rope_style,
+            gqa_group_size,
+        };
+
+        // Synthesize PTX
+        let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);
+        let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+
+        // Embed PTX bytes in .rodata
+        let ptx_data_id = self
+            .module
+            .declare_data(
+                &format!("__nsl_flash_ptx_{}", kernel_name),
+                cranelift_module::Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare flash PTX data for '{}': {e}",
+                    kernel_name
+                ))
+            })?;
+        let mut data_desc = DataDescription::new();
+        data_desc.define(ptx_bytes.into_boxed_slice());
+        self.module
+            .define_data(ptx_data_id, &data_desc)
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define flash PTX data for '{}': {e}",
+                    kernel_name
+                ))
+            })?;
+
+        // Embed kernel name (null-terminated) in .rodata
+        let mut name_bytes = kernel_name.as_bytes().to_vec();
+        name_bytes.push(0);
+        let name_data_id = self
+            .module
+            .declare_data(
+                &format!("__nsl_flash_name_{}", kernel_name),
+                cranelift_module::Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare flash name data for '{}': {e}",
+                    kernel_name
+                ))
+            })?;
+        let mut name_desc = DataDescription::new();
+        name_desc.define(name_bytes.into_boxed_slice());
+        self.module
+            .define_data(name_data_id, &name_desc)
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define flash name data for '{}': {e}",
+                    kernel_name
+                ))
+            })?;
+
+        Ok(Some(FlashAttentionCompileContext {
+            ptx_data_id,
+            name_data_id,
+            config,
+        }))
+    }
+
     // ── Pass 2: Compile function bodies ─────────────────────────────
 
     pub fn compile_user_functions(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
@@ -2024,6 +2237,7 @@ pub fn compile(
     compiler.declare_user_functions(&ast.stmts)?;
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
@@ -2051,6 +2265,7 @@ pub fn compile_standalone(
     compiler.declare_user_functions(&ast.stmts)?;
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_standalone_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
@@ -2076,6 +2291,7 @@ pub fn compile_test(
     compiler.declare_user_functions(&ast.stmts)?;
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     let test_fns = compiler.test_fns.clone();
@@ -2132,6 +2348,7 @@ pub fn compile_module_with_imports(
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     compiler.finalize()
@@ -2180,6 +2397,7 @@ pub fn compile_entry(
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;

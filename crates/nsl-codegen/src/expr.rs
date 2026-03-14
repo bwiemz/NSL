@@ -1089,6 +1089,60 @@ impl Compiler<'_> {
             let seq_len_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len_val]);
         }
+        // M27: scaled_dot_product_attention(Q, K, V, scale, causal=false)
+        // Naive path: softmax((Q @ K.T) * scale [+ causal_mask]) @ V
+        // Flash path: PTX dispatch via nsl_flash_attention when @flash_attention decorator is present
+        if func_name == "scaled_dot_product_attention" && !self.functions.contains_key(&func_name) {
+            if args.len() < 4 {
+                return Err(CodegenError::new(
+                    "scaled_dot_product_attention() requires at least 4 arguments (Q, K, V, scale)",
+                ));
+            }
+
+            let q_val = self.compile_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_expr(builder, state, &args[1].value)?;
+            let v_val = self.compile_expr(builder, state, &args[2].value)?;
+            let scale_val = self.compile_expr(builder, state, &args[3].value)?;
+
+            // Check for causal named arg
+            let mut causal = false;
+            if args.len() > 4 {
+                for arg in &args[4..] {
+                    if let Some(name_sym) = arg.name {
+                        let name = self.resolve_sym(name_sym).to_string();
+                        if name == "causal" {
+                            if let ExprKind::BoolLiteral(b) = arg.value.kind {
+                                causal = b;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check if the enclosing function has @flash_attention decorator
+            if self.flash_attention_context.is_some() {
+                return self.compile_flash_attention_call(builder, q_val, k_val, v_val, scale_val);
+            }
+
+            // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
+            let k_t = self.compile_call_by_name(builder, "nsl_tensor_transpose", &[k_val])?;
+            let scores = self.compile_call_by_name(builder, "nsl_tensor_matmul", &[q_val, k_t])?;
+            let scaled = self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
+
+            let masked = if causal {
+                let dim_neg2 = builder.ins().iconst(cl_types::I64, -2i64 as i64);
+                let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
+                let mask = self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
+                self.compile_call_by_name(builder, "nsl_tensor_add", &[scaled, mask])?
+            } else {
+                scaled
+            };
+
+            let dim_neg1 = builder.ins().iconst(cl_types::I64, -1i64 as i64);
+            let attn_weights = self.compile_call_by_name(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
+            return self.compile_call_by_name(builder, "nsl_tensor_matmul", &[attn_weights, v_val]);
+        }
+
         // sum/mean with dim args — overload: sum(tensor) or sum(tensor, dim, keepdim)
         if matches!(func_name.as_str(), "sum" | "mean") {
             if args.len() == 1 {
@@ -3017,6 +3071,77 @@ impl Compiler<'_> {
             "nsl_kernel_launch",
             &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val, shared_mem],
         )
+    }
+
+    // ── FlashAttention PTX dispatch ─────────────────────────────────
+
+    /// Compile a `scaled_dot_product_attention` call to the FlashAttention PTX path.
+    /// This is called when `flash_attention_context` is set (i.e., the enclosing function
+    /// has a `@flash_attention` decorator).
+    fn compile_flash_attention_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        q_val: Value,
+        k_val: Value,
+        v_val: Value,
+        scale_val: Value,
+    ) -> Result<Value, CodegenError> {
+        let ctx = self
+            .flash_attention_context
+            .as_ref()
+            .ok_or_else(|| CodegenError::new("flash_attention_context not set"))?;
+
+        let ptx_data_id = ctx.ptx_data_id;
+        let name_data_id = ctx.name_data_id;
+        let block_q = ctx.config.block_q;
+        let block_kv = ctx.config.block_kv;
+        let shmem_bytes = crate::flash_attention::shared_mem_bytes(&ctx.config) as i64;
+
+        // Allocate output tensor (same shape as Q)
+        let out_val = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[q_val])?;
+
+        // Get PTX and name pointers from .rodata
+        let ptx_gv = self.module.declare_data_in_func(ptx_data_id, builder.func);
+        let ptx_ptr = builder.ins().symbol_value(pointer_type(), ptx_gv);
+        let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
+        let name_ptr = builder.ins().symbol_value(pointer_type(), name_gv);
+
+        let block_q_val = builder.ins().iconst(cl_types::I64, block_q);
+        let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv);
+        let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes);
+
+        let null = builder.ins().iconst(cl_types::I64, 0);
+
+        // Extract tensor dimensions: Q is [batch, heads, seq_len, head_dim]
+        let dim0 = builder.ins().iconst(cl_types::I64, 0);
+        let dim1 = builder.ins().iconst(cl_types::I64, 1);
+        let dim2 = builder.ins().iconst(cl_types::I64, 2);
+        let dim3 = builder.ins().iconst(cl_types::I64, 3);
+        let batch = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim0])?;
+        let heads = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim1])?;
+        let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim2])?;
+        let head_dim = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
+
+        // nsl_flash_attention(
+        //   q, k, v, out, scale,
+        //   batch, heads, seq_len, head_dim,
+        //   block_table, k_pool, v_pool, block_size,  // paged params (null for now)
+        //   cos, sin,                                   // RoPE params (null for now)
+        //   seq_ids, seq_lens,                          // M29-ready
+        //   shared_mem_bytes,
+        //   ptx_ptr, name_ptr,
+        //   block_q, block_kv,
+        // )
+        self.compile_call_by_name(builder, "nsl_flash_attention", &[
+            q_val, k_val, v_val, out_val, scale_val,
+            batch, heads, seq_len, head_dim,
+            null, null, null, null, // paged params (null for now)
+            null, null,             // RoPE params (null for now)
+            null, null,             // seq_ids, seq_lens (M29-ready)
+            shmem_val,
+            ptx_ptr, name_ptr,
+            block_q_val, block_kv_val,
+        ])
     }
 
     // ── to_onnx() compiler intrinsic ─────────────────────────────────
