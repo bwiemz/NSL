@@ -122,6 +122,15 @@ impl BlockAllocator {
     /// Return a block to the free list.  The block contents are NOT zeroed.
     pub fn free(&mut self, id: BlockId) {
         debug_assert!((id as usize) < self.num_blocks, "BlockId out of range");
+        debug_assert!(
+            !self.free_list.contains(&id),
+            "double-free of BlockId {}",
+            id
+        );
+        debug_assert!(
+            self.allocated_count > 0,
+            "free() called but allocated_count is 0"
+        );
         self.free_list.push(id);
         self.allocated_count -= 1;
     }

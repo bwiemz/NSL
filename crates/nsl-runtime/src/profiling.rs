@@ -122,7 +122,8 @@ pub fn profiler_record_free(block_id: u32, seq_id: u64) {
             seq_id,
         });
     PROFILER.total_frees.fetch_add(1, Ordering::Relaxed);
-    PROFILER.current_blocks.fetch_sub(1, Ordering::Relaxed);
+    let prev = PROFILER.current_blocks.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "profiler current_blocks underflow");
 }
 
 /// Return the peak number of simultaneously-allocated blocks.

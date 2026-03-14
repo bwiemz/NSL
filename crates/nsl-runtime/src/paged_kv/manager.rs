@@ -414,8 +414,14 @@ pub extern "C" fn nsl_kv_cache_seq_len(handle: i64, seq_id: i64) -> i64 {
 
 /// Return a raw pointer to the block-ID array for the given sequence.
 ///
-/// The pointer is valid only while the lock is held and no mutations occur.
-/// The caller must use [`nsl_kv_cache_seq_num_blocks`] to determine the length.
+/// # Safety
+/// The returned pointer points into the internal `Vec<BlockId>`.  The Mutex
+/// guard is released when this function returns, so the pointer is only
+/// safe to dereference while no concurrent mutations (append_token,
+/// free_sequence) occur.  In single-threaded NSL programs this is always
+/// satisfied.  The caller must use [`nsl_kv_cache_seq_num_blocks`] to
+/// determine the length, and must NOT store this pointer across calls that
+/// mutate the same sequence.
 #[no_mangle]
 pub extern "C" fn nsl_kv_cache_seq_blocks(handle: i64, seq_id: i64) -> i64 {
     let mgr = unsafe { from_handle(handle) };

@@ -560,7 +560,7 @@ impl Compiler<'_> {
             "kv_cache_free_seq" | "kv_cache_seq_len" |
             "kv_cache_seq_blocks" | "kv_cache_seq_num_blocks" |
             "kv_cache_utilization" | "kv_cache_destroy" |
-            "profiler_start" | "profiler_stop" | "profiler_dump" | "profiler_peak")
+            "profiler_start" | "profiler_stop" | "profiler_peak")
         {
             let mut arg_vals = Vec::new();
             for arg in args {
