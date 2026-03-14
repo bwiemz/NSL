@@ -50,6 +50,7 @@ pub mod packing;
 pub mod dataloader;
 pub mod weight_provider;
 pub mod paged_kv;
+pub mod profiling;
 
 #[cfg(test)]
 mod fuzz;
