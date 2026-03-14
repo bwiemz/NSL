@@ -52,6 +52,7 @@ pub mod weight_provider;
 pub mod paged_kv;
 pub mod profiling;
 pub mod kernel_profiler;
+pub mod flash_attention;
 
 #[cfg(test)]
 mod fuzz;
