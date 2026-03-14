@@ -82,12 +82,60 @@ pub extern "C" fn nsl_kernel_profiler_stop() {
     KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
 }
 
+/// Pop the next (start, stop) event pair from the pool.
+/// Lock-pop-unlock pattern: single lock acquisition, extract event pair, unlock.
+/// Returns None if profiler disabled or pool exhausted.
+///
+/// Lock ordering: always lock event_pool FIRST (contains pool + cursor).
+/// This is consistent with flush/destroy which also lock event_pool first.
+pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
+    if !kernel_profiler_enabled() {
+        return None;
+    }
+
+    // Single lock: pool and cursor accessed together to avoid ordering issues
+    let pool = KERNEL_PROFILER.event_pool.lock().unwrap();
+    let mut cursor = KERNEL_PROFILER.pool_cursor.lock().unwrap();
+
+    if *cursor >= pool.len() {
+        eprintln!(
+            "[nsl] kernel profiler: event pool exhausted ({} events recorded), flushing and recycling",
+            pool.len()
+        );
+        return None;
+    }
+
+    let idx = *cursor;
+    let (start, stop) = pool[idx];
+    *cursor += 1;
+    drop(cursor);
+    drop(pool);
+    // Locks dropped — CUDA calls happen outside lock
+
+    Some((start, stop, idx))
+}
+
+/// Record a completed kernel trace. Lock-push-unlock pattern.
+pub(crate) fn kernel_profiler_push_trace(name: &str, grid: [u32; 3], block: [u32; 3]) {
+    let cursor = *KERNEL_PROFILER.pool_cursor.lock().unwrap();
+    KERNEL_PROFILER.traces.lock().unwrap().push(KernelTrace {
+        pool_idx: cursor - 1, // points to the event pair just used
+        name: name.to_string(),
+        grid,
+        block,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Tests share global KERNEL_PROFILER state and must not run concurrently.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_profiler_enable_disable() {
+        let _guard = TEST_LOCK.lock().unwrap();
         // Reset state
         KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
 
@@ -96,5 +144,59 @@ mod tests {
         assert!(kernel_profiler_enabled());
         nsl_kernel_profiler_stop();
         assert!(!kernel_profiler_enabled());
+    }
+
+    #[test]
+    fn test_pool_cursor_advancement() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Reset state
+        nsl_kernel_profiler_stop();
+        *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 0;
+        KERNEL_PROFILER.traces.lock().unwrap().clear();
+        // Pre-fill pool with dummy handles (no GPU needed)
+        {
+            let mut pool = KERNEL_PROFILER.event_pool.lock().unwrap();
+            pool.clear();
+            for i in 0..10u64 {
+                pool.push((i * 2, i * 2 + 1));
+            }
+        }
+        KERNEL_PROFILER.enabled.store(true, Ordering::Relaxed);
+
+        // Pop events — should advance cursor
+        let events = kernel_profiler_pop_events();
+        assert!(events.is_some());
+        assert_eq!(*KERNEL_PROFILER.pool_cursor.lock().unwrap(), 1);
+
+        // Push trace
+        kernel_profiler_push_trace("test_kernel", [1, 1, 1], [256, 1, 1]);
+        assert_eq!(KERNEL_PROFILER.traces.lock().unwrap().len(), 1);
+        assert_eq!(
+            KERNEL_PROFILER.traces.lock().unwrap()[0].name,
+            "test_kernel"
+        );
+
+        nsl_kernel_profiler_stop();
+    }
+
+    #[test]
+    fn test_pool_exhaustion_returns_none() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        nsl_kernel_profiler_stop();
+        *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 0;
+        {
+            let mut pool = KERNEL_PROFILER.event_pool.lock().unwrap();
+            pool.clear();
+            pool.push((100, 101)); // Only 1 pair
+        }
+        KERNEL_PROFILER.enabled.store(true, Ordering::Relaxed);
+
+        let first = kernel_profiler_pop_events();
+        assert!(first.is_some());
+
+        let second = kernel_profiler_pop_events();
+        assert!(second.is_none()); // Pool exhausted
+
+        nsl_kernel_profiler_stop();
     }
 }
