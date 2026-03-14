@@ -84,6 +84,7 @@ impl KvCacheManager {
         if let Some(mut pt) = self.page_tables.remove(&seq_id) {
             let blocks = pt.drain_blocks();
             for block_id in blocks {
+                crate::profiling::profiler_record_free(block_id, seq_id);
                 self.allocator.free(block_id);
             }
         }
@@ -107,6 +108,7 @@ impl KvCacheManager {
         if pt.needs_new_block() {
             let block_id = self.allocator.alloc().ok_or("KV-cache out of blocks")?;
             pt.push_block(block_id);
+            crate::profiling::profiler_record_alloc(block_id, seq_id);
         }
 
         Ok(pt.append_token())

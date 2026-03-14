@@ -286,6 +286,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_kv_cache_seq_num_blocks", &[types::I64, types::I64],                                 Some(types::I64)),
     ("nsl_kv_cache_utilization", &[types::I64],                                                Some(types::F64)),
     ("nsl_kv_cache_destroy",    &[types::I64],                                                 None),
+    // Memory profiler (M25)
+    ("nsl_profiler_start",      &[types::I64],                                                 None),
+    ("nsl_profiler_stop",       &[],                                                           None),
+    ("nsl_profiler_dump",       &[types::I64, types::I64],                                     None),
+    ("nsl_profiler_peak",       &[],                                                           Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

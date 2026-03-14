@@ -677,4 +677,113 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(tensor_ret.clone()),
         },
     );
+
+    // Paged KV-cache functions (M25)
+    def(
+        "kv_cache_init",
+        Type::Function {
+            params: vec![Type::Int, Type::Int, Type::Int, Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_init_gpu",
+        Type::Function {
+            params: vec![Type::Int, Type::Int, Type::Int, Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_alloc_seq",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_append",
+        Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_k_ptr",
+        Type::Function {
+            params: vec![Type::Int, Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_v_ptr",
+        Type::Function {
+            params: vec![Type::Int, Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_free_seq",
+        Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "kv_cache_seq_len",
+        Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_seq_blocks",
+        Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_seq_num_blocks",
+        Type::Function {
+            params: vec![Type::Int, Type::Int],
+            ret: Box::new(Type::Int),
+        },
+    );
+    def(
+        "kv_cache_utilization",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Float),
+        },
+    );
+    def(
+        "kv_cache_destroy",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Void),
+        },
+    );
+
+    // Memory profiler functions (M25)
+    def(
+        "profiler_start",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "profiler_stop",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "profiler_peak",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+        },
+    );
 }

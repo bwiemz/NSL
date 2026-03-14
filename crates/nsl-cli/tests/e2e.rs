@@ -386,3 +386,110 @@ fn e2e_m24_standalone_sidecar() {
         "Standalone sidecar output mismatch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M25 Paged KV-cache and memory profiling tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m25_paged_kv() {
+    assert_output_matches("m25_paged_kv");
+}
+
+#[test]
+fn e2e_m25_profiling() {
+    let root = workspace_root();
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let example_path = root.join("examples/m25_profiling.nsl");
+
+    // Build the NSL program to a temp binary first.
+    let exe_name = if cfg!(target_os = "windows") {
+        "m25_profiling.exe"
+    } else {
+        "m25_profiling"
+    };
+    let exe_path = tmp.path().join(exe_name);
+
+    let build_output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "build", "-o"])
+        .arg(&exe_path)
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to build m25_profiling.nsl");
+
+    let build_stderr = String::from_utf8_lossy(&build_output.stderr);
+    assert!(
+        build_output.status.success(),
+        "nsl build failed:\nstderr: {}",
+        build_stderr
+    );
+
+    // Run the compiled binary from the temp dir with NSL_PROFILE_MEMORY=1.
+    // The atexit handler will write memory_profile.json in the CWD.
+    let output = Command::new(&exe_path)
+        .env("NSL_PROFILE_MEMORY", "1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to execute profiling binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "profiling binary failed (exit {:?}):\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        stdout,
+        stderr,
+    );
+
+    // Verify stdout matches expected baseline.
+    let expected = normalize(&expected_output("m25_profiling"));
+    let actual = normalize(&stdout);
+    assert_eq!(
+        actual.trim(),
+        expected.trim(),
+        "Profiling test output mismatch"
+    );
+
+    // Verify memory_profile.json was created by the atexit handler.
+    let profile_path = tmp.path().join("memory_profile.json");
+    assert!(
+        profile_path.exists(),
+        "memory_profile.json not found — atexit handler may not have fired. stderr: {}",
+        stderr,
+    );
+
+    // Parse and validate the JSON content.
+    let json_str = std::fs::read_to_string(&profile_path)
+        .expect("failed to read memory_profile.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json_str).expect("memory_profile.json is not valid JSON");
+
+    // Check traceEvents array exists and has events.
+    let events = parsed["traceEvents"]
+        .as_array()
+        .expect("traceEvents should be an array");
+    assert!(
+        !events.is_empty(),
+        "traceEvents should contain alloc/free events"
+    );
+
+    // Verify metadata has expected fields.
+    let meta = &parsed["metadata"];
+    assert!(
+        meta["peak_blocks"].as_u64().unwrap_or(0) > 0,
+        "peak_blocks should be > 0, got: {}",
+        meta["peak_blocks"]
+    );
+    assert!(
+        meta["total_allocs"].as_u64().unwrap_or(0) > 0,
+        "total_allocs should be > 0, got: {}",
+        meta["total_allocs"]
+    );
+    assert!(
+        meta["total_frees"].as_u64().unwrap_or(0) > 0,
+        "total_frees should be > 0, got: {}",
+        meta["total_frees"]
+    );
+}

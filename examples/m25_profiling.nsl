@@ -1,0 +1,17 @@
+# M25 Memory Profiling Test
+# Exercises KV cache with profiling enabled (via --profile-memory flag).
+
+let cache = kv_cache_init(8, 4, 2, 4, 1)
+
+# Allocate a sequence and append tokens (triggers block allocs)
+let seq = kv_cache_alloc_seq(cache)
+kv_cache_append(cache, seq)
+kv_cache_append(cache, seq)
+kv_cache_append(cache, seq)
+kv_cache_append(cache, seq)
+kv_cache_append(cache, seq)
+
+# Free the sequence (triggers block frees)
+kv_cache_free_seq(cache, seq)
+kv_cache_destroy(cache)
+print("profiling done")

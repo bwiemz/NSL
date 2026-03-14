@@ -1,0 +1,45 @@
+# M25 Paged KV-Cache Test
+# Tests multi-sequence management with block allocation and freeing.
+
+# Create a KV cache: 8 blocks, block_size=4, num_heads=2, head_dim=4, num_layers=1
+let cache = kv_cache_init(8, 4, 2, 4, 1)
+
+# Allocate two sequences
+let seq_a = kv_cache_alloc_seq(cache)
+let seq_b = kv_cache_alloc_seq(cache)
+print(seq_a)
+print(seq_b)
+
+# Append 3 tokens to seq_a
+kv_cache_append(cache, seq_a)
+kv_cache_append(cache, seq_a)
+kv_cache_append(cache, seq_a)
+
+# Append 5 tokens to seq_b
+kv_cache_append(cache, seq_b)
+kv_cache_append(cache, seq_b)
+kv_cache_append(cache, seq_b)
+kv_cache_append(cache, seq_b)
+kv_cache_append(cache, seq_b)
+
+# Check token counts
+let len_a = kv_cache_seq_len(cache, seq_a)
+let len_b = kv_cache_seq_len(cache, seq_b)
+print(len_a)
+print(len_b)
+
+# Check block counts (block_size=4: 3 tokens = 1 block, 5 tokens = 2 blocks)
+let blocks_a = kv_cache_seq_num_blocks(cache, seq_a)
+let blocks_b = kv_cache_seq_num_blocks(cache, seq_b)
+print(blocks_a)
+print(blocks_b)
+
+# Free seq_a, verify seq_b still intact
+kv_cache_free_seq(cache, seq_a)
+let len_b_after = kv_cache_seq_len(cache, seq_b)
+print(len_b_after)
+
+# Clean up
+kv_cache_free_seq(cache, seq_b)
+kv_cache_destroy(cache)
+print("done")
