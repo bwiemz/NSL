@@ -7,6 +7,7 @@ use cranelift_module::{DataId, Linkage, Module};
 use nsl_ast::expr::{Expr, ExprKind, FStringPart, SubscriptKind};
 use nsl_ast::operator::{BinOp, UnaryOp};
 use nsl_ast::pattern::PatternKind;
+use nsl_ast::Symbol;
 use nsl_semantic::types::Type;
 
 use crate::compiler::Compiler;
@@ -21,6 +22,11 @@ impl Compiler<'_> {
         state: &mut FuncState,
         expr: &Expr,
     ) -> Result<Value, CodegenError> {
+        // Auto-fusion: check for fusible chains before normal dispatch
+        if let Some(fused_result) = self.try_auto_fuse(builder, state, expr)? {
+            return Ok(fused_result);
+        }
+
         match &expr.kind {
             ExprKind::IntLiteral(n) => Ok(builder.ins().iconst(cl_types::I64, *n)),
             ExprKind::FloatLiteral(f) => Ok(builder.ins().f64const(*f)),
@@ -3353,12 +3359,24 @@ impl Compiler<'_> {
         &mut self,
         _builder: &mut FunctionBuilder,
         state: &mut FuncState,
-        _expr: &Expr,
+        expr: &Expr,
     ) -> Result<Option<Value>, CodegenError> {
         if state.in_fuse_bypass {
             return Ok(None); // Prevent infinite recursion
         }
-        // Full implementation in Tasks 11-12 — for now, always fall through
-        Ok(None)
+
+        let interner = self.interner;
+        let resolve = |sym: Symbol| -> Option<String> {
+            interner.resolve(sym.0).map(|s| s.to_string())
+        };
+
+        if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve) {
+            // Fusible chain detected: ops={ops:?}, inputs={inputs.len()}
+            // For now, fall through to unfused compilation (always correct).
+            // TODO(M26): emit training branch + fused kernel launch for auto-fusion
+            let _ = (ops, inputs); // suppress unused warnings
+        }
+
+        Ok(None) // Fall through to normal compilation
     }
 }
