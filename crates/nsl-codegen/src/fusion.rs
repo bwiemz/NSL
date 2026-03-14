@@ -2,6 +2,10 @@
 //! Synthesizes single PTX kernels from chains of elementwise ops.
 //! let-binding = hard fusion barrier (no DAG infrastructure).
 
+use nsl_ast::expr::{Expr, ExprKind};
+use nsl_ast::operator::{BinOp, UnaryOp};
+use nsl_ast::Symbol;
+
 /// A chain of elementwise operations that can be fused into a single PTX kernel.
 pub struct FusedKernel {
     /// Names of ops in the chain (e.g., ["add", "relu"])
@@ -383,6 +387,80 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
     bytes
 }
 
+/// Analyze an expression tree and extract a fusible elementwise chain.
+/// Returns the op names and input expressions if fusion is profitable.
+/// let-binding = hard fusion barrier (only inline expressions are fused).
+pub fn analyze_fusible_chain<'a, F>(
+    expr: &'a Expr,
+    resolve_name: &F,
+) -> Option<(Vec<String>, Vec<&'a Expr>)>
+where
+    F: Fn(Symbol) -> Option<String>,
+{
+    let mut ops = Vec::new();
+    let mut inputs = Vec::new();
+    collect_fusible_ops(expr, &mut ops, &mut inputs, resolve_name);
+
+    if ops.len() < 2 {
+        return None;
+    }
+
+    Some((ops, inputs))
+}
+
+fn collect_fusible_ops<'a, F>(
+    expr: &'a Expr,
+    ops: &mut Vec<String>,
+    inputs: &mut Vec<&'a Expr>,
+    resolve_name: &F,
+) where
+    F: Fn(Symbol) -> Option<String>,
+{
+    match &expr.kind {
+        ExprKind::BinaryOp { left, op, right } => {
+            let op_name = match op {
+                BinOp::Add => "add",
+                BinOp::Sub => "sub",
+                BinOp::Mul => "mul",
+                BinOp::Div => "div",
+                BinOp::Pow => "pow",
+                _ => {
+                    inputs.push(expr);
+                    return;
+                }
+            };
+            collect_fusible_ops(left, ops, inputs, resolve_name);
+            collect_fusible_ops(right, ops, inputs, resolve_name);
+            ops.push(op_name.to_string());
+        }
+        ExprKind::UnaryOp { op, operand } if matches!(op, UnaryOp::Neg) => {
+            collect_fusible_ops(operand, ops, inputs, resolve_name);
+            ops.push("neg".to_string());
+        }
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Ident(name_sym) = &callee.kind {
+                if let Some(name) = resolve_name(*name_sym) {
+                    if is_fusible_op(&name) {
+                        if name == "clamp" && args.len() != 1 {
+                            inputs.push(expr);
+                            return;
+                        }
+                        if args.len() == 1 {
+                            collect_fusible_ops(&args[0].value, ops, inputs, resolve_name);
+                            ops.push(name);
+                            return;
+                        }
+                    }
+                }
+            }
+            inputs.push(expr);
+        }
+        _ => {
+            inputs.push(expr);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +564,70 @@ mod tests {
         let kernel = result.unwrap();
         assert_eq!(kernel.name, "fused_mul_add_relu");
         assert_eq!(kernel.op_chain.len(), 3);
+    }
+
+    #[test]
+    fn test_analyze_fusible_chain_add_relu() {
+        use nsl_ast::expr::*;
+        use nsl_ast::operator::BinOp;
+        use nsl_ast::{NodeId, Span, Symbol};
+        use string_interner::StringInterner;
+
+        let mut interner = StringInterner::default();
+        let sym_x = Symbol(interner.get_or_intern("x"));
+        let sym_b = Symbol(interner.get_or_intern("b"));
+        let sym_relu = Symbol(interner.get_or_intern("relu"));
+
+        let x = Expr { kind: ExprKind::Ident(sym_x), span: Span::dummy(), id: NodeId::dummy() };
+        let b = Expr { kind: ExprKind::Ident(sym_b), span: Span::dummy(), id: NodeId::dummy() };
+        let add = Expr {
+            kind: ExprKind::BinaryOp { left: Box::new(x), op: BinOp::Add, right: Box::new(b) },
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let relu_name = Expr { kind: ExprKind::Ident(sym_relu), span: Span::dummy(), id: NodeId::dummy() };
+        let relu_arg = Arg { name: None, value: add, span: Span::dummy() };
+        let relu_call = Expr {
+            kind: ExprKind::Call { callee: Box::new(relu_name), args: vec![relu_arg] },
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+
+        let resolve = |sym: Symbol| -> Option<String> {
+            interner.resolve(sym.0).map(|s| s.to_string())
+        };
+
+        let result = analyze_fusible_chain(&relu_call, &resolve);
+        assert!(result.is_some());
+        let (ops, inputs): (Vec<String>, Vec<&Expr>) = result.unwrap();
+        assert_eq!(ops, vec!["add", "relu"]);
+        assert_eq!(inputs.len(), 2);
+    }
+
+    #[test]
+    fn test_single_op_not_fused() {
+        use nsl_ast::expr::*;
+        use nsl_ast::{NodeId, Span, Symbol};
+        use string_interner::StringInterner;
+
+        let mut interner = StringInterner::default();
+        let sym_x = Symbol(interner.get_or_intern("x"));
+        let sym_relu = Symbol(interner.get_or_intern("relu"));
+
+        let x = Expr { kind: ExprKind::Ident(sym_x), span: Span::dummy(), id: NodeId::dummy() };
+        let relu_name = Expr { kind: ExprKind::Ident(sym_relu), span: Span::dummy(), id: NodeId::dummy() };
+        let relu_arg = Arg { name: None, value: x, span: Span::dummy() };
+        let relu_call = Expr {
+            kind: ExprKind::Call { callee: Box::new(relu_name), args: vec![relu_arg] },
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+
+        let resolve = |sym: Symbol| -> Option<String> {
+            interner.resolve(sym.0).map(|s| s.to_string())
+        };
+
+        let result = analyze_fusible_chain(&relu_call, &resolve);
+        assert!(result.is_none());
     }
 }

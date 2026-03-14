@@ -49,6 +49,9 @@ pub struct FuncState {
     /// True when compiling an element-wise unpack method body.
     /// Return statements should bitcast f64→i64 before returning.
     pub dtype_unpack_ret_bitcast: bool,
+    /// True when compiling an expression via the unfused (training) path inside try_auto_fuse.
+    /// Prevents infinite recursion when compile_expr re-enters try_auto_fuse.
+    pub in_fuse_bypass: bool,
 }
 
 impl Default for FuncState {
@@ -70,6 +73,7 @@ impl FuncState {
             temp_scope_stack: Vec::new(),
             in_dtype_method: false,
             dtype_unpack_ret_bitcast: false,
+            in_fuse_bypass: false,
         }
     }
 

@@ -1071,6 +1071,7 @@ dependencies = [
  "nsl-runtime",
  "nsl-semantic",
  "serde_json",
+ "string-interner",
  "target-lexicon 0.12.16",
 ]
 

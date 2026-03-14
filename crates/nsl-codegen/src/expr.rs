@@ -3345,4 +3345,20 @@ impl Compiler<'_> {
         // Return the model pointer so callers can chain: let m = from_hf("repo", m)
         Ok(model_val)
     }
+
+    /// Attempt auto-fusion on an expression. Called from compile_expr() before
+    /// normal dispatch for BinaryOp and Call nodes.
+    /// Returns Ok(Some(val)) if fused, Ok(None) to fall through to normal compile.
+    fn try_auto_fuse(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        _expr: &Expr,
+    ) -> Result<Option<Value>, CodegenError> {
+        if state.in_fuse_bypass {
+            return Ok(None); // Prevent infinite recursion
+        }
+        // Full implementation in Tasks 11-12 — for now, always fall through
+        Ok(None)
+    }
 }
