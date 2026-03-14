@@ -41,10 +41,12 @@ pub fn cartesian_product(params: &TuningParams) -> Vec<Variant> {
 }
 
 /// Select the middle value from each parameter range (`--no-autotune` fallback).
+/// Panics if any parameter has an empty values list (semantic checker prevents this).
 pub fn select_middle_values(params: &TuningParams) -> Variant {
     params
         .iter()
         .map(|(name, values)| {
+            assert!(!values.is_empty(), "autotune param '{}' has empty value list", name);
             let mid_idx = values.len() / 2;
             (name.clone(), values[mid_idx])
         })

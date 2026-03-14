@@ -178,6 +178,10 @@ fn main() {
                 return;
             }
 
+            // TODO(M26-followup): Wire CompileOptions through run_build_inner → compile()
+            // so --no-autotune and --autotune-fresh reach the Compiler. Currently the
+            // autotune benchmarking harness is deferred (always uses middle-value fallback),
+            // so these flags are effectively no-ops until GPU benchmarking is activated.
             let _compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,

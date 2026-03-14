@@ -88,6 +88,12 @@ pub fn try_synthesize_fused(op_chain: &[&str], num_inputs: usize) -> Option<Fuse
 /// Each input is loaded once from global memory, all ops are register-to-register,
 /// output is stored once to global memory.
 ///
+/// KNOWN LIMITATION: Binary ops always use register %f1 as RHS. This is correct
+/// for 2-input chains (e.g., `relu(x + b)`) but incorrect for 3+ input chains
+/// where different binary ops consume different inputs (e.g., `(x + b) - c`).
+/// This must be fixed before enabling the fused kernel launch path — tracked as
+/// part of the GPU activation follow-up.
+///
 /// **ISA correctness:** `ex2.approx.f32` computes base-2 exp, so natural exp requires
 /// multiplying by log2(e) ~ 1.4427 first. Similarly, `lg2.approx.f32` computes base-2
 /// log, so natural log requires multiplying by ln(2) ~ 0.6931 after.

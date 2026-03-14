@@ -145,6 +145,9 @@ pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
 }
 
 /// Record a completed kernel trace. Lock-push-unlock pattern.
+/// Lock ordering note: this only locks pool_cursor then traces (not event_pool).
+/// This is safe because push_trace is only called after pop_events has already
+/// released its locks, and flush holds all locks exclusively during teardown.
 #[allow(dead_code)] // called from cuda/mod.rs kernel_launch
 pub(crate) fn kernel_profiler_push_trace(name: &str, grid: [u32; 3], block: [u32; 3]) {
     let cursor = *KERNEL_PROFILER.pool_cursor.lock().unwrap();
