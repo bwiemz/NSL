@@ -183,7 +183,11 @@ for b in 0..num_blocks_per_tile:
 
 One page table lookup per physical block (every `block_size` tokens), not per token.
 
-### 5.3 Block Table GPU Sync
+### 5.3 KV Pool Element Type
+
+M25's paged pools are f32-backed (`block_stride` uses `sizeof(f32)`). FlashAttention kernels operate on f16 for SRAM efficiency. The paged load path widens f32→f16 is unnecessary — the pools already store f32, and the kernel widens to f32 for accumulation anyway. The PTX loads with `ld.global.f32`, accumulates in f32, and narrows to f16 only on final output store (`cvt.f16.f32`). No dtype conversion needed at the pool boundary.
+
+### 5.4 Block Table GPU Sync
 
 The block table is small — for a 4096-token sequence with `block_size=16`: 256 entries × 4 bytes = 1KB. Synced to GPU once per sequence via pinned host memory + `cuMemcpyHtoD`.
 
