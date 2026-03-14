@@ -347,6 +347,77 @@ impl<'a> TypeChecker<'a> {
                                 );
                             }
                         }
+
+                        if dname == "fuse" {
+                            match &stmt.kind {
+                                StmtKind::FnDef(_) => {
+                                    // Valid target — further validation in codegen
+                                }
+                                StmtKind::KernelDef(_) => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@fuse cannot be applied to kernel blocks (kernel blocks are already single PTX kernels)")
+                                            .with_label(deco.span, "invalid @fuse target")
+                                    );
+                                }
+                                StmtKind::ModelDef(_) => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@fuse cannot be applied to model methods; extract the fusible logic into a standalone fn")
+                                            .with_label(deco.span, "invalid @fuse target")
+                                    );
+                                }
+                                _ => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@fuse can only be applied to fn declarations")
+                                            .with_label(deco.span, "invalid @fuse target")
+                                    );
+                                }
+                            }
+                        }
+
+                        if dname == "autotune" {
+                            match &stmt.kind {
+                                StmtKind::KernelDef(_) => {
+                                    // Valid target — validate args are lists of integers
+                                    if let Some(ref args) = deco.args {
+                                        for arg in args {
+                                            if let Some(ref name_sym) = arg.name {
+                                                let _aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                                // Each arg value must be a list literal of integers
+                                                match &arg.value.kind {
+                                                    ExprKind::ListLiteral(items) => {
+                                                        for item in items {
+                                                            if !matches!(item.kind, ExprKind::IntLiteral(_)) {
+                                                                self.diagnostics.push(
+                                                                    Diagnostic::error("@autotune parameter values must be integer literals")
+                                                                        .with_label(item.span, "expected integer")
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        self.diagnostics.push(
+                                                            Diagnostic::error("@autotune parameters must be lists of integers (e.g., [64, 128, 256])")
+                                                                .with_label(arg.span, "expected list")
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        self.diagnostics.push(
+                                            Diagnostic::error("@autotune requires at least one tuning parameter")
+                                                .with_label(deco.span, "missing parameters")
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@autotune can only be applied to kernel blocks")
+                                            .with_label(deco.span, "invalid @autotune target")
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 self.check_stmt(stmt);
