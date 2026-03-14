@@ -84,14 +84,38 @@ This anchors the GPU timeline to the CPU timeline via a single reference point r
 
 ### Integration with `cuda/mod.rs`
 
-`kernel_launch()` gains a 4-line check at the call site:
+The profiler is integrated *inside* `kernel_launch()`, not wrapping it externally. The existing `kernel_launch()` holds a `Mutex<CudaState>` for module cache lookup, function lookup, launch, and synchronize. The profiler event recording is injected between the lock-protected phases:
+
 ```rust
-if kernel_profiler_enabled() {
-    kernel_profiler_record(name, grid, block, stream);
+fn kernel_launch(...) {
+    let state = CUDA_STATE.lock();
+    let module = state.get_or_load_module(ptx);
+    let func = state.get_function(module, name);
+    drop(state);  // release lock before CUDA calls
+
+    // Profiler: record start event (no lock held)
+    let events = if kernel_profiler_enabled() {
+        Some(kernel_profiler_pop_events())  // lock-pop-unlock on profiler mutex
+    } else { None };
+
+    if let Some((start, _)) = &events {
+        cuEventRecord(*start, stream);
+    }
+
+    cuLaunchKernel(func, ...);  // no lock held
+
+    if let Some((_, stop)) = &events {
+        cuEventRecord(*stop, stream);
+        kernel_profiler_push_trace(name, grid, block);  // lock-push-unlock
+    }
+
+    // NOTE: existing cuCtxSynchronize removed — see "Per-Launch Sync Removal" below
 }
 ```
 
-The `record` function wraps around the actual `cuLaunchKernel` call — it records the start event before launch and stop event after.
+**Per-Launch Sync Removal:** The existing `kernel_launch()` calls `cuCtxSynchronize()` after every launch. This was added in M17 for correctness during initial GPU bring-up. M26 removes this per-launch sync as a prerequisite change — it is safe because unified memory (`cuMemAllocManaged`) provides coherence guarantees, and the profiler's `flush()` performs a single sync at program end. This is a significant performance improvement independent of profiling. Without removing it, the "zero-sync overhead" profiling design is moot since every launch already syncs.
+
+**Stream parameter:** In M26, `stream` is always `null_mut()` (CUDA default stream / stream 0). The parameter exists in the profiler API for forward-compatibility with M30's multi-stream scheduling. All events (including `gpu_base_event`) are recorded on the default stream, guaranteeing monotonic timestamp alignment.
 
 ### Output Format
 
@@ -140,7 +164,10 @@ fn gelu_approx(x: Tensor<[N], f32>) -> Tensor<[N], f32>:
 ```
 
 **Compiler behavior:**
-- Semantic checker validates `@fuse` on `fn` declarations only (not `model`, not `kernel`)
+- Semantic checker validates `@fuse` placement: allowed on `fn` declarations only
+- `@fuse` on a `kernel` block → compile error: `"@fuse cannot be applied to kernel blocks (kernel blocks are already single PTX kernels)"`
+- `@fuse` on a `model` method → compile error: `"@fuse cannot be applied to model methods; extract the fusible logic into a standalone fn"`
+- `@fuse` on any other target → compile error: `"@fuse can only be applied to fn declarations"`
 - Verifies all ops in the function body are in the fusible set (see below)
 - If a non-fusible op is found, emit compile error: `"@fuse function contains non-fusible operation: matmul"`
 - Codegen synthesizes a single PTX kernel for the entire function body
@@ -202,7 +229,9 @@ else:
     let out = launch_fused_add_relu(matmul_res, b)
 ```
 
-The `try_fuse_expr` codegen pass emits this branch. Training correctness is preserved; inference gets full fusion speed.
+The `try_fuse_expr` codegen pass emits this branch as a standard Cranelift `brif`/merge-block pattern — the same infrastructure already used for `match` expressions and `if/else` in the existing codegen. Both branches produce a tensor pointer that merges at the join block. No novel control-flow infrastructure required.
+
+Training correctness is preserved; inference gets full fusion speed.
 
 **Fix for explicit @fuse — backward annotation required:**
 - If `@fuse fn foo()` is called during training and no `@backward(foo)` exists → runtime panic: `"@fuse function 'foo' called during training without @backward annotation"`
@@ -210,6 +239,8 @@ The `try_fuse_expr` codegen pass emits this branch. Training correctness is pres
 - Inference path always uses the fused kernel regardless
 
 ### PTX Synthesis for Fused Kernels
+
+**Dtype:** Fused kernels are GPU-only and operate exclusively on f32 (dtype=1). Tensors that arrive via `.to(device)` are already converted to f32 by the M17 device transfer logic. The PTX synthesizer emits `.f32` instructions unconditionally. If a future milestone adds GPU f16/bf16 support, the fusion PTX generator would need dtype dispatch, but for M26 f32-only is correct.
 
 Thread ID = flat element index: `tid = blockIdx.x * blockDim.x + threadIdx.x`
 
@@ -226,6 +257,7 @@ Final result: `st.global.f32 [output_ptr + tid * 4], %result_reg`
 - **Semantic validation:** `crates/nsl-semantic/src/checker.rs` — validate `@fuse` decorator placement and fusible-op constraint
 - **Fusion pass:** `crates/nsl-codegen/src/fusion.rs` — `try_fuse_expr(expr) -> Option<FusedKernel>` walks expr tree, collects fusible chain, returns `None` if chain length is 1
 - **Integration:** `crates/nsl-codegen/src/expr.rs` — when compiling tensor expressions, call `try_fuse_expr` first; if fusion succeeds, emit fused kernel instead of per-op dispatch
+- **Fused kernel naming:** Auto-fused kernels are named by concatenating the fused ops: `"fused_add_relu"`, `"fused_mul_add_sigmoid"`. Explicit `@fuse` kernels use the function name: `"fused_gelu_approx"`. These names appear in profiler traces and error messages.
 
 ---
 
@@ -299,6 +331,11 @@ Hash kernel AST body (NOT PTX) -> check .nsl-cache/autotune/
 
 Critical: the cache key hashes the **AST**, not the PTX. This allows the compiler to check the cache *before* any PTX compilation. On cache hit, only the winning variant's PTX is generated — 17 out of 18 compilations are skipped entirely.
 
+**AST hashing strategy:** The hash must be computed over the *semantic content* of the kernel body, not its syntactic representation:
+- `Span` fields (source locations) are **excluded** — reformatting source code must not invalidate the cache
+- `Symbol` fields (string interner indices) are **resolved to string values** before hashing — interner indices are assigned fresh each compilation session and are not stable across runs
+- The hash walks the AST in canonical order, serializing node types, resolved symbol names, literal values, and operator kinds into a deterministic byte sequence, then SHA-256s the result
+
 The SM count is queried via `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)` and included in the cache key to differentiate laptop vs desktop silicon with identical device names.
 
 **Cache value** (`.nsl-cache/autotune/<kernel_name>_<hash>.json`):
@@ -339,6 +376,8 @@ The warmup cost is paid once per cache miss. Subsequent builds with unchanged ke
 This avoids the "display GPU trap": many ML researchers run a cheap GPU in slot 0 (driving monitors) and a compute GPU in slot 1. Hardcoding device 0 would autotune for the wrong GPU.
 
 Note: cudarc's `dynamic-linking` feature automatically respects `CUDA_VISIBLE_DEVICES`, so `CUDA_VISIBLE_DEVICES=1 nsl build` also works (device 1 becomes logical device 0).
+
+**CUDA context isolation:** The autotune benchmarking harness creates its own CUDA context on the selected device, separate from the runtime's global `CUDA_STATE` (which hardcodes device 0 in `state()`). The harness calls `cuDeviceGet(&mut dev, autotune_device_index)` and `cuDevicePrimaryCtxRetain` directly, without touching the runtime singleton. This ensures autotune can benchmark on a different device than the runtime default without modifying `CUDA_STATE`.
 
 ### Graceful Variant Failure
 
@@ -384,6 +423,12 @@ Use **median** (not mean) of the 10 measured iterations. Median rejects outlier 
 
 Fine-grained control is essential: the memory profiler generates ~70 events per run, but the kernel profiler generates hundreds of thousands (one per kernel launch). A user debugging a memory leak doesn't want a 500MB trace file.
 
+**Profile merge strategy:** When `--profile` (both) is used, the CLI layer is responsible for merging:
+1. Memory profiler dumps its events to a temp buffer via `nsl_profiler_dump`
+2. Kernel profiler dumps its events to a temp buffer via `nsl_kernel_profiler_flush`
+3. CLI merges both `traceEvents` arrays into a single `profile.json` file
+When only one profiler is active, it writes directly to `profile.json`. This keeps both profiler modules independent — neither knows about the other.
+
 ### Autotune Flags
 
 | Flag | Effect |
@@ -410,7 +455,7 @@ Fine-grained control is essential: the memory profiler generates ~70 events per 
 | `crates/nsl-semantic/src/builtins.rs` | Register kernel profiler FFI functions |
 | `crates/nsl-codegen/src/builtins.rs` | Declare kernel profiler Cranelift imports |
 | `crates/nsl-codegen/src/expr.rs` | Call `try_fuse_expr` before per-op dispatch |
-| `crates/nsl-codegen/src/compiler.rs` | @autotune variant generation in `compile_kernels()` |
+| `crates/nsl-codegen/src/compiler.rs` | @autotune variant generation in `compile_kernels()` — must unwrap `StmtKind::Decorated` nodes to find `@autotune` on `KernelDef` |
 | `crates/nsl-cli/src/main.rs` | New CLI flags |
 
 ---
