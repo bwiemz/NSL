@@ -163,6 +163,35 @@ pub extern "C" fn nsl_profiler_start(total_blocks: i64) {
 
     // Enable last so early events aren't recorded before reset completes.
     PROFILER.enabled.store(true, Ordering::Release);
+
+    // Register at-exit handler to auto-dump the profile on program exit.
+    // Uses a one-shot flag so we only register once even if start() is called
+    // multiple times.
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if !REGISTERED.swap(true, Ordering::SeqCst) {
+        extern "C" fn dump_on_exit() {
+            if PROFILER.enabled.load(Ordering::Relaxed) {
+                PROFILER.enabled.store(false, Ordering::Release);
+
+                let path = "memory_profile.json";
+                let path_bytes = path.as_bytes();
+                nsl_profiler_dump(path_bytes.as_ptr(), path_bytes.len() as i64);
+
+                let peak = PROFILER.peak_blocks.load(Ordering::Relaxed);
+                eprintln!(
+                    "nsl: memory profile written to {} (peak: {} blocks)",
+                    path, peak
+                );
+            }
+        }
+        // SAFETY: dump_on_exit is an extern "C" fn with the correct atexit signature.
+        extern "C" {
+            fn atexit(callback: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(dump_on_exit);
+        }
+    }
 }
 
 /// Stop the profiler.

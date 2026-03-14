@@ -15,6 +15,11 @@ static ARGS: Mutex<(i32, ArgvPtr)> = Mutex::new((0, ArgvPtr(std::ptr::null())));
 pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     let mut args = ARGS.lock().unwrap();
     *args = (argc, ArgvPtr(argv as *const *const c_char));
+
+    // Auto-start memory profiler when NSL_PROFILE_MEMORY env var is set.
+    if std::env::var("NSL_PROFILE_MEMORY").is_ok() {
+        crate::profiling::nsl_profiler_start(0);
+    }
 }
 
 #[no_mangle]

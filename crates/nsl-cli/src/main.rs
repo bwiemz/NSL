@@ -39,6 +39,10 @@ enum Cli {
         /// Path to the .nsl file
         file: PathBuf,
 
+        /// Enable memory profiling (writes memory_profile.json on exit)
+        #[arg(long)]
+        profile_memory: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -169,8 +173,8 @@ fn main() {
                 run_build(&file, output, emit_obj, dump_ir);
             }
         }
-        Cli::Run { file, args } => {
-            run_run(&file, &args);
+        Cli::Run { file, args, profile_memory } => {
+            run_run(&file, &args, profile_memory);
         }
         Cli::Test { file, filter } => {
             run_test(&file, filter.as_deref());
@@ -767,7 +771,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
     }
 }
 
-fn run_run(file: &PathBuf, program_args: &[String]) {
+fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool) {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
@@ -789,8 +793,12 @@ fn run_run(file: &PathBuf, program_args: &[String]) {
     run_build_inner(file, Some(exe_path.clone()), false, false, true);
 
     // Execute the compiled program
-    let status = std::process::Command::new(&exe_path)
-        .args(program_args)
+    let mut cmd = std::process::Command::new(&exe_path);
+    cmd.args(program_args);
+    if profile_memory {
+        cmd.env("NSL_PROFILE_MEMORY", "1");
+    }
+    let status = cmd
         .status()
         .unwrap_or_else(|e| {
             eprintln!("error: could not execute '{}': {e}", exe_path.display());
@@ -953,7 +961,7 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
             // The NSL file should contain an export_model() function (or similar)
             // that calls to_onnx() internally. We just compile and run it.
             println!("Exporting ONNX from {}", file.display());
-            run_run(file, &[]);
+            run_run(file, &[], false);
         }
         "safetensors" => {
             if ext != "nslm" {
