@@ -14,3 +14,10 @@ pub mod types;
 pub use compiler::{compile, compile_entry, compile_module, compile_module_with_imports, compile_test, compile_standalone, StandaloneConfig};
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
+
+/// Compiler configuration flags passed from CLI.
+#[derive(Default, Clone)]
+pub struct CompileOptions {
+    pub no_autotune: bool,
+    pub autotune_fresh: bool,
+}

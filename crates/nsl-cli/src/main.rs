@@ -88,6 +88,18 @@ enum Cli {
         /// Size threshold in bytes above which auto mode streams weights instead of embedding (default: 256 MiB)
         #[arg(long, default_value_t = 268_435_456)]
         embed_threshold: u64,
+
+        /// Skip @autotune benchmarking; use middle values from each parameter range
+        #[arg(long)]
+        no_autotune: bool,
+
+        /// Re-run all @autotune benchmarks, ignoring cached results
+        #[arg(long)]
+        autotune_fresh: bool,
+
+        /// Delete the autotune cache directory and exit
+        #[arg(long)]
+        autotune_clean: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -151,7 +163,26 @@ fn main() {
             weights,
             embed_weights,
             embed_threshold,
+            no_autotune,
+            autotune_fresh,
+            autotune_clean,
         } => {
+            if autotune_clean {
+                let cache_dir = std::path::Path::new(".nsl-cache/autotune");
+                if cache_dir.exists() {
+                    std::fs::remove_dir_all(cache_dir).ok();
+                    eprintln!("[nsl] autotune cache cleaned");
+                } else {
+                    eprintln!("[nsl] no autotune cache to clean");
+                }
+                return;
+            }
+
+            let _compile_opts = nsl_codegen::CompileOptions {
+                no_autotune,
+                autotune_fresh,
+            };
+
             if standalone {
                 if weights.is_none() {
                     eprintln!("error: --standalone requires -w/--weights <path>");

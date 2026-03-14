@@ -91,6 +91,8 @@ pub struct Compiler<'a> {
     pub(crate) standalone_config: Option<StandaloneConfig>,
     /// Models with @paged_kv: model_name -> (num_blocks, block_size, num_heads, head_dim, num_layers)
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
+    /// Compiler configuration flags (--no-autotune, --autotune-fresh, etc.)
+    pub compile_options: crate::CompileOptions,
     func_index: u32,
 }
 
@@ -154,6 +156,7 @@ impl<'a> Compiler<'a> {
             custom_dtype_ids: HashMap::new(),
             standalone_config: None,
             paged_kv_configs: HashMap::new(),
+            compile_options: crate::CompileOptions::default(),
             func_index: 0,
         })
     }
