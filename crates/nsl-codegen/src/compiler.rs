@@ -11,7 +11,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectModule, ObjectBuilder};
 
 use nsl_ast::block::DatatypeMethodKind;
-use nsl_ast::decl::{FnDef, ModelMember};
+use nsl_ast::decl::{Decorator, FnDef, ModelMember};
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::stmt::{Stmt, StmtKind};
 use nsl_ast::types::TypeExprKind;
@@ -1186,46 +1186,141 @@ impl<'a> Compiler<'a> {
 
     pub fn compile_kernels(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
         for stmt in stmts {
-            if let StmtKind::KernelDef(kernel) = &stmt.kind {
-                let ptx_bytes = crate::kernel::KernelCompiler::compile(kernel, self.interner);
-                let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+            match &stmt.kind {
+                StmtKind::KernelDef(kernel) => {
+                    self.compile_single_kernel(kernel)?;
+                }
+                StmtKind::Decorated { decorators, stmt: inner } => {
+                    if let StmtKind::KernelDef(kernel) = &inner.kind {
+                        let has_autotune = decorators.iter().any(|d| {
+                            d.name.len() == 1
+                                && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
+                        });
 
-                // Embed PTX bytes in .rodata
-                let ptx_data_id = self.module
-                    .declare_data(
-                        &format!("__nsl_ptx_{}", kernel_name),
-                        cranelift_module::Linkage::Local,
-                        false,
-                        false,
-                    )
-                    .map_err(|e| CodegenError::new(format!("failed to declare PTX data for kernel '{}': {e}", kernel_name)))?;
-                let mut data_desc = cranelift_module::DataDescription::new();
-                data_desc.define(ptx_bytes.into_boxed_slice());
-                self.module
-                    .define_data(ptx_data_id, &data_desc)
-                    .map_err(|e| CodegenError::new(format!("failed to define PTX data for kernel '{}': {e}", kernel_name)))?;
+                        if has_autotune {
+                            let params = self.extract_autotune_params(decorators)?;
+                            let kernel_name = self.interner.resolve(kernel.name.0)
+                                .unwrap_or("unknown")
+                                .to_string();
 
-                // Embed kernel name (null-terminated) in .rodata
-                let mut name_bytes = kernel_name.as_bytes().to_vec();
-                name_bytes.push(0);
-                let name_data_id = self.module
-                    .declare_data(
-                        &format!("__nsl_ptx_name_{}", kernel_name),
-                        cranelift_module::Linkage::Local,
-                        false,
-                        false,
-                    )
-                    .map_err(|e| CodegenError::new(format!("failed to declare name data for kernel '{}': {e}", kernel_name)))?;
-                let mut name_desc = cranelift_module::DataDescription::new();
-                name_desc.define(name_bytes.into_boxed_slice());
-                self.module
-                    .define_data(name_data_id, &name_desc)
-                    .map_err(|e| CodegenError::new(format!("failed to define name data for kernel '{}': {e}", kernel_name)))?;
+                            if self.compile_options.no_autotune {
+                                eprintln!(
+                                    "[nsl] autotune: --no-autotune, using middle values for {}",
+                                    kernel_name
+                                );
+                            }
 
-                self.kernel_ptx_data.insert(kernel_name, (ptx_data_id, name_data_id));
+                            // For now, always use middle-value fallback.
+                            // TODO(M26): add GPU benchmarking path when CUDA is available.
+                            let _fallback = crate::autotune::select_middle_values(&params);
+
+                            // Compile the kernel normally (constant substitution deferred to M26)
+                            self.compile_single_kernel(kernel)?;
+                        } else {
+                            self.compile_single_kernel(kernel)?;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
+    }
+
+    /// Compile a single kernel definition: generate PTX and embed in .rodata.
+    fn compile_single_kernel(
+        &mut self,
+        kernel: &nsl_ast::block::KernelDef,
+    ) -> Result<(), CodegenError> {
+        let ptx_bytes = crate::kernel::KernelCompiler::compile(kernel, self.interner);
+        let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+
+        // Embed PTX bytes in .rodata
+        let ptx_data_id = self.module
+            .declare_data(
+                &format!("__nsl_ptx_{}", kernel_name),
+                cranelift_module::Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| CodegenError::new(format!(
+                "failed to declare PTX data for kernel '{}': {e}", kernel_name
+            )))?;
+        let mut data_desc = cranelift_module::DataDescription::new();
+        data_desc.define(ptx_bytes.into_boxed_slice());
+        self.module
+            .define_data(ptx_data_id, &data_desc)
+            .map_err(|e| CodegenError::new(format!(
+                "failed to define PTX data for kernel '{}': {e}", kernel_name
+            )))?;
+
+        // Embed kernel name (null-terminated) in .rodata
+        let mut name_bytes = kernel_name.as_bytes().to_vec();
+        name_bytes.push(0);
+        let name_data_id = self.module
+            .declare_data(
+                &format!("__nsl_ptx_name_{}", kernel_name),
+                cranelift_module::Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| CodegenError::new(format!(
+                "failed to declare name data for kernel '{}': {e}", kernel_name
+            )))?;
+        let mut name_desc = cranelift_module::DataDescription::new();
+        name_desc.define(name_bytes.into_boxed_slice());
+        self.module
+            .define_data(name_data_id, &name_desc)
+            .map_err(|e| CodegenError::new(format!(
+                "failed to define name data for kernel '{}': {e}", kernel_name
+            )))?;
+
+        self.kernel_ptx_data.insert(kernel_name, (ptx_data_id, name_data_id));
+        Ok(())
+    }
+
+    /// Extract tuning parameters from @autotune decorator arguments.
+    ///
+    /// Expected form: `@autotune(block_size=[64, 128, 256], warps=[2, 4, 8])`
+    /// Returns a list of (parameter_name, candidate_values) pairs.
+    fn extract_autotune_params(
+        &self,
+        decorators: &[Decorator],
+    ) -> Result<crate::autotune::TuningParams, CodegenError> {
+        let autotune_deco = decorators
+            .iter()
+            .find(|d| {
+                d.name.len() == 1
+                    && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
+            })
+            .ok_or_else(|| CodegenError::new("@autotune decorator not found".to_string()))?;
+
+        let mut params = Vec::new();
+        if let Some(ref args) = autotune_deco.args {
+            for arg in args {
+                let name = arg
+                    .name
+                    .as_ref()
+                    .and_then(|s| self.interner.resolve(s.0))
+                    .unwrap_or("unnamed")
+                    .to_string();
+                let values = match &arg.value.kind {
+                    ExprKind::ListLiteral(items) => items
+                        .iter()
+                        .filter_map(|item| {
+                            if let ExprKind::IntLiteral(v) = &item.kind {
+                                Some(*v)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    _ => vec![],
+                };
+                params.push((name, values));
+            }
+        }
+        Ok(params)
     }
 
     // ── Pass 2: Compile function bodies ─────────────────────────────
