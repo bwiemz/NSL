@@ -1,0 +1,18 @@
+# M27: Paged FlashAttention — decorator validation test
+# Tests that @flash_attention and @paged_kv decorators parse correctly
+# (actual GPU execution gated behind cuda feature)
+
+from nsl.nn import scaled_dot_product_attention
+
+model TestTransformer:
+    @paged_kv(num_blocks=32, block_size=16, num_heads=4, head_dim=16, num_layers=1)
+    k_cache: str
+
+    @flash_attention(causal=true)
+    @paged_kv(block_size=16)
+    fn attention(self, Q, K, V) -> Tensor:
+        let scale = 1.0 / sqrt(float(Q.shape[-1]))
+        return scaled_dot_product_attention(Q, K, V, scale, causal=true)
+
+let m = TestTransformer()
+print("Paged FlashAttention model created OK")

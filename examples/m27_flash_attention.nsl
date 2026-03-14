@@ -1,0 +1,20 @@
+# M27: FlashAttention-2 — basic test
+# Without @flash_attention decorator, uses naive softmax path
+
+from nsl.nn import scaled_dot_product_attention
+
+let Q = Tensor.randn([1, 4, 8, 16])  # [batch, heads, seq_len, head_dim]
+let K = Tensor.randn([1, 4, 8, 16])
+let V = Tensor.randn([1, 4, 8, 16])
+
+let scale = 1.0 / sqrt(16.0)
+
+# Naive path: softmax((Q @ K.T) * scale) @ V
+let out = scaled_dot_product_attention(Q, K, V, scale)
+print("Shape:", out.shape)
+print("FlashAttention naive path OK")
+
+# Causal variant
+let out_causal = scaled_dot_product_attention(Q, K, V, scale, causal=true)
+print("Causal shape:", out_causal.shape)
+print("FlashAttention causal naive path OK")

@@ -512,3 +512,22 @@ fn e2e_m26_fuse() {
 fn e2e_m26_autotune() {
     assert_output_matches("m26_autotune");
 }
+
+// ---------------------------------------------------------------------------
+// M27: FlashAttention-2
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m27_flash_attention() {
+    assert_output_matches("m27_flash_attention");
+}
+
+#[test]
+fn e2e_m27_paged_attention() {
+    assert_output_matches("m27_paged_attention");
+}
+
+#[test]
+fn e2e_m27_rope_gqa() {
+    assert_output_matches("m27_rope_gqa");
+}
