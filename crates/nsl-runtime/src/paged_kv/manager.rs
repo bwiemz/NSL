@@ -5,6 +5,7 @@
 //! during autoregressive generation.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::paged_kv::block_alloc::BlockAllocator;
 use crate::paged_kv::page_table::PageTable;
@@ -288,4 +289,165 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "all block IDs should be distinct");
     }
+}
+
+// ── FFI exports ─────────────────────────────────────────────────────────────
+
+/// Convert handle (i64) back to `&Mutex<KvCacheManager>`.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`nsl_kv_cache_init`] or
+/// [`nsl_kv_cache_init_gpu`].
+unsafe fn from_handle(handle: i64) -> &'static Mutex<KvCacheManager> {
+    &*(handle as *const Mutex<KvCacheManager>)
+}
+
+/// Create a new CPU-backed KV-cache manager and return an opaque handle.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_init(
+    num_blocks: i64,
+    block_size: i64,
+    num_heads: i64,
+    head_dim: i64,
+    num_layers: i64,
+) -> i64 {
+    let mgr = KvCacheManager::new(
+        num_blocks as usize,
+        block_size as usize,
+        num_heads as usize,
+        head_dim as usize,
+        num_layers as usize,
+    );
+    let boxed = Box::new(Mutex::new(mgr));
+    Box::into_raw(boxed) as i64
+}
+
+/// Create a new GPU-backed KV-cache manager and return an opaque handle.
+/// Falls back to CPU if the `cuda` feature is not enabled.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_init_gpu(
+    num_blocks: i64,
+    block_size: i64,
+    num_heads: i64,
+    head_dim: i64,
+    num_layers: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let mgr = KvCacheManager::new_gpu(
+            num_blocks as usize,
+            block_size as usize,
+            num_heads as usize,
+            head_dim as usize,
+            num_layers as usize,
+        );
+        let boxed = Box::new(Mutex::new(mgr));
+        Box::into_raw(boxed) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        eprintln!(
+            "nsl: nsl_kv_cache_init_gpu called but CUDA feature is disabled, falling back to CPU"
+        );
+        nsl_kv_cache_init(num_blocks, block_size, num_heads, head_dim, num_layers)
+    }
+}
+
+/// Allocate a new sequence and return its [`SeqId`].
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_alloc_seq(handle: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let mut guard = mgr.lock().unwrap();
+    guard.alloc_sequence() as i64
+}
+
+/// Append a token to a sequence. Returns `(block_id << 32) | offset` on
+/// success, or `-1` if the block pool is exhausted.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_append(handle: i64, seq_id: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let mut guard = mgr.lock().unwrap();
+    match guard.append_token(seq_id as u64) {
+        Ok((block_id, offset)) => ((block_id as i64) << 32) | (offset as i64),
+        Err(e) => {
+            eprintln!("nsl: kv_cache_append failed: {}", e);
+            -1
+        }
+    }
+}
+
+/// Return the K-cache pointer for a given `(seq_id, block_id)`.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_k_ptr(handle: i64, seq_id: i64, block_id: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let guard = mgr.lock().unwrap();
+    let (k, _) = guard.get_kv_ptrs(seq_id as u64, block_id as u32);
+    k as i64
+}
+
+/// Return the V-cache pointer for a given `(seq_id, block_id)`.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_v_ptr(handle: i64, seq_id: i64, block_id: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let guard = mgr.lock().unwrap();
+    let (_, v) = guard.get_kv_ptrs(seq_id as u64, block_id as u32);
+    v as i64
+}
+
+/// Free all blocks for a sequence and remove its page table.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_free_seq(handle: i64, seq_id: i64) {
+    let mgr = unsafe { from_handle(handle) };
+    let mut guard = mgr.lock().unwrap();
+    guard.free_sequence(seq_id as u64);
+}
+
+/// Return the number of tokens appended to the given sequence.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_seq_len(handle: i64, seq_id: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let guard = mgr.lock().unwrap();
+    guard.seq_token_count(seq_id as u64) as i64
+}
+
+/// Return a raw pointer to the block-ID array for the given sequence.
+///
+/// The pointer is valid only while the lock is held and no mutations occur.
+/// The caller must use [`nsl_kv_cache_seq_num_blocks`] to determine the length.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_seq_blocks(handle: i64, seq_id: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let guard = mgr.lock().unwrap();
+    guard.seq_block_ids(seq_id as u64).as_ptr() as i64
+}
+
+/// Return the number of physical blocks allocated for the given sequence.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_seq_num_blocks(handle: i64, seq_id: i64) -> i64 {
+    let mgr = unsafe { from_handle(handle) };
+    let guard = mgr.lock().unwrap();
+    guard.seq_block_ids(seq_id as u64).len() as i64
+}
+
+/// Return the fraction of blocks currently in use, in `[0.0, 1.0]`.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_utilization(handle: i64) -> f64 {
+    let mgr = unsafe { from_handle(handle) };
+    let guard = mgr.lock().unwrap();
+    guard.utilization()
+}
+
+/// Destroy a KV-cache manager, freeing all memory.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`nsl_kv_cache_init`] and
+/// must not be used after this call.
+#[no_mangle]
+pub extern "C" fn nsl_kv_cache_destroy(handle: i64) {
+    if handle == 0 {
+        return;
+    }
+    // Reconstruct the Box and let it drop, which runs BlockAllocator::drop
+    // to free the backing memory pools.
+    let _ = unsafe { Box::from_raw(handle as *mut Mutex<KvCacheManager>) };
 }
