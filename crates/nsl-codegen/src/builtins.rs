@@ -273,6 +273,19 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_standalone_arg_float",         &[types::I64, types::I64],                                     Some(types::I64)),
     ("nsl_standalone_arg_float_default", &[types::I64, types::I64, types::I64],                         Some(types::I64)),
     ("nsl_standalone_args_finish",       &[],                                                            None),
+    // Paged KV-cache (M25)
+    ("nsl_kv_cache_init",       &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_cache_init_gpu",   &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_cache_alloc_seq",  &[types::I64],                                                 Some(types::I64)),
+    ("nsl_kv_cache_append",     &[types::I64, types::I64],                                     Some(types::I64)),
+    ("nsl_kv_cache_k_ptr",      &[types::I64, types::I64, types::I64],                         Some(types::I64)),
+    ("nsl_kv_cache_v_ptr",      &[types::I64, types::I64, types::I64],                         Some(types::I64)),
+    ("nsl_kv_cache_free_seq",   &[types::I64, types::I64],                                     None),
+    ("nsl_kv_cache_seq_len",    &[types::I64, types::I64],                                     Some(types::I64)),
+    ("nsl_kv_cache_seq_blocks", &[types::I64, types::I64],                                     Some(types::I64)),
+    ("nsl_kv_cache_seq_num_blocks", &[types::I64, types::I64],                                 Some(types::I64)),
+    ("nsl_kv_cache_utilization", &[types::I64],                                                Some(types::F64)),
+    ("nsl_kv_cache_destroy",    &[types::I64],                                                 None),
 ];
 
 /// Declare all runtime functions as imports in the module.
