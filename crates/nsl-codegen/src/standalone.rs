@@ -4,7 +4,6 @@
 /// separate object files that carry weight data independently of the compiled
 /// NSL program object.  Also contains `compile_standalone_main()` which generates
 /// the entry-point main() for standalone binaries (weight init + arg parser).
-
 use cranelift_codegen::ir::{types as cl_types, AbiParam, Function, InstBuilder, MemFlags, UserFuncName};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};

@@ -157,7 +157,7 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
         match *op {
             "add" => {
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
-                let rhs = if op_idx == 0 { 1 } else { 1 };
+                let rhs = 1;
                 ptx.push_str(&format!(
                     "    add.f32 %f{}, %f{}, %f{};\n",
                     out_reg, lhs, rhs
@@ -433,7 +433,7 @@ fn collect_fusible_ops<'a, F>(
             collect_fusible_ops(right, ops, inputs, resolve_name);
             ops.push(op_name.to_string());
         }
-        ExprKind::UnaryOp { op, operand } if matches!(op, UnaryOp::Neg) => {
+        ExprKind::UnaryOp { op: UnaryOp::Neg, operand } => {
             collect_fusible_ops(operand, ops, inputs, resolve_name);
             ops.push("neg".to_string());
         }

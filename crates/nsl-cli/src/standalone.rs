@@ -19,6 +19,7 @@ pub struct WeightTensor {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // F32 variant reserved for future safetensors reading
 pub enum WeightDtype {
     F32,
     F64,

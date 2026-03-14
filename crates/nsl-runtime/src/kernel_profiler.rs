@@ -9,6 +9,7 @@ use std::time::Instant;
 
 /// A recorded kernel launch trace (event indices + metadata).
 pub(crate) struct KernelTrace {
+    #[allow(dead_code)] // used by flush_traces_gpu (cuda feature)
     pub pool_idx: usize,
     pub name: String,
     pub grid: [u32; 3],
@@ -23,7 +24,9 @@ pub(crate) struct KernelProfiler {
     pub pool_cursor: Mutex<usize>,
     // GPU event pool and base event are stored as raw u64 handles
     // (CUevent is a pointer, stored as u64 for Send+Sync safety)
+    #[allow(dead_code)] // used when cuda feature enabled
     pub event_pool: Mutex<Vec<(u64, u64)>>, // (start_event, stop_event) pairs
+    #[allow(dead_code)] // used when cuda feature enabled
     pub gpu_base_event: Mutex<u64>,
 }
 
@@ -50,6 +53,7 @@ pub fn kernel_profiler_enabled() -> bool {
     KERNEL_PROFILER.enabled.load(Ordering::Relaxed)
 }
 
+#[allow(dead_code)] // used in cuda feature gate block
 const EVENT_POOL_SIZE: usize = 4096;
 
 /// Initialize the kernel profiler. Allocates event pool on GPU if available.
@@ -112,6 +116,7 @@ extern "C" fn kernel_profiler_atexit() {
 ///
 /// Lock ordering: always lock event_pool FIRST (contains pool + cursor).
 /// This is consistent with flush/destroy which also lock event_pool first.
+#[allow(dead_code)] // called from cuda/mod.rs kernel_launch
 pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
     if !kernel_profiler_enabled() {
         return None;
@@ -140,6 +145,7 @@ pub(crate) fn kernel_profiler_pop_events() -> Option<(u64, u64, usize)> {
 }
 
 /// Record a completed kernel trace. Lock-push-unlock pattern.
+#[allow(dead_code)] // called from cuda/mod.rs kernel_launch
 pub(crate) fn kernel_profiler_push_trace(name: &str, grid: [u32; 3], block: [u32; 3]) {
     let cursor = *KERNEL_PROFILER.pool_cursor.lock().unwrap();
     KERNEL_PROFILER.traces.lock().unwrap().push(KernelTrace {
