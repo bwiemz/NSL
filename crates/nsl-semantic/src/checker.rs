@@ -656,14 +656,80 @@ impl<'a> TypeChecker<'a> {
                     name,
                     type_ann,
                     init,
+                    decorators,
                     span,
-                    ..
                 } => {
                     let ty = self.resolve_type(type_ann);
                     self.declare_symbol(*name, ty.clone(), *span, false, false);
                     fields.push((*name, ty));
                     if let Some(init_expr) = init {
                         self.check_expr(init_expr);
+                    }
+                    for deco in decorators {
+                        if deco.name.len() == 1 {
+                            let dname = self
+                                .interner
+                                .resolve(deco.name[0].0)
+                                .unwrap_or("")
+                                .to_string();
+                            if dname == "paged_kv" {
+                                if let Some(ref args) = deco.args {
+                                    for arg in args {
+                                        if let Some(ref name_sym) = arg.name {
+                                            let aname = self
+                                                .interner
+                                                .resolve(name_sym.0)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            match aname.as_str() {
+                                                "block_size" | "num_blocks" | "num_heads"
+                                                | "head_dim" | "num_layers" => {
+                                                    if let ExprKind::IntLiteral(n) =
+                                                        &arg.value.kind
+                                                    {
+                                                        if *n <= 0 {
+                                                            self.diagnostics.push(
+                                                                Diagnostic::error(format!(
+                                                                    "@paged_kv: {} must be a positive integer",
+                                                                    aname
+                                                                ))
+                                                                .with_label(
+                                                                    arg.span,
+                                                                    "must be > 0",
+                                                                ),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        self.diagnostics.push(
+                                                            Diagnostic::error(format!(
+                                                                "@paged_kv: {} must be an integer literal",
+                                                                aname
+                                                            ))
+                                                            .with_label(
+                                                                arg.span,
+                                                                "expected integer",
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error(format!(
+                                                            "@paged_kv: unknown argument '{}'",
+                                                            aname
+                                                        ))
+                                                        .with_label(
+                                                            arg.span,
+                                                            "unknown argument",
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 ModelMember::Method(fn_def) => {
