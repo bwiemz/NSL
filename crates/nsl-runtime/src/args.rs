@@ -20,6 +20,11 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     if std::env::var("NSL_PROFILE_MEMORY").is_ok() {
         crate::profiling::nsl_profiler_start(0);
     }
+
+    // Auto-start kernel profiler when NSL_PROFILE_KERNELS env var is set.
+    if std::env::var("NSL_PROFILE_KERNELS").is_ok() {
+        crate::kernel_profiler::nsl_kernel_profiler_start();
+    }
 }
 
 #[no_mangle]

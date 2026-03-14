@@ -43,6 +43,14 @@ enum Cli {
         #[arg(long)]
         profile_memory: bool,
 
+        /// Enable kernel profiling (writes kernel_profile.json on exit)
+        #[arg(long)]
+        profile_kernels: bool,
+
+        /// Enable all profilers and merge into profile.json
+        #[arg(long)]
+        profile: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -173,8 +181,8 @@ fn main() {
                 run_build(&file, output, emit_obj, dump_ir);
             }
         }
-        Cli::Run { file, args, profile_memory } => {
-            run_run(&file, &args, profile_memory);
+        Cli::Run { file, args, profile_memory, profile_kernels, profile } => {
+            run_run(&file, &args, profile_memory, profile_kernels, profile);
         }
         Cli::Test { file, filter } => {
             run_test(&file, filter.as_deref());
@@ -771,7 +779,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
     }
 }
 
-fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool) {
+fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool) {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
@@ -795,8 +803,11 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool) {
     // Execute the compiled program
     let mut cmd = std::process::Command::new(&exe_path);
     cmd.args(program_args);
-    if profile_memory {
+    if profile_memory || profile {
         cmd.env("NSL_PROFILE_MEMORY", "1");
+    }
+    if profile_kernels || profile {
+        cmd.env("NSL_PROFILE_KERNELS", "1");
     }
     let status = cmd
         .status()
@@ -804,6 +815,11 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool) {
             eprintln!("error: could not execute '{}': {e}", exe_path.display());
             process::exit(1);
         });
+
+    // Merge profile traces before exiting (process::exit won't return)
+    if profile {
+        merge_profile_traces("memory_profile.json", "kernel_profile.json", "profile.json");
+    }
 
     // Clean up
     let _ = std::fs::remove_file(&exe_path);
@@ -961,7 +977,7 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
             // The NSL file should contain an export_model() function (or similar)
             // that calls to_onnx() internally. We just compile and run it.
             println!("Exporting ONNX from {}", file.display());
-            run_run(file, &[], false);
+            run_run(file, &[], false, false, false);
         }
         "safetensors" => {
             if ext != "nslm" {
@@ -1039,6 +1055,47 @@ fn run_fmt(files: &[String], check: bool) {
     if errors > 0 {
         process::exit(1);
     }
+}
+
+fn merge_profile_traces(memory_path: &str, kernel_path: &str, output_path: &str) {
+    let mem_json = std::fs::read_to_string(memory_path).unwrap_or_default();
+    let kern_json = std::fs::read_to_string(kernel_path).unwrap_or_default();
+
+    let mem_events = extract_trace_events(&mem_json).unwrap_or_default();
+    let kern_events = extract_trace_events(&kern_json).unwrap_or_default();
+
+    let merged = format!(
+        r#"{{"traceEvents":[{}{}{}],"metadata":{{"merged":true}}}}"#,
+        mem_events,
+        if !mem_events.is_empty() && !kern_events.is_empty() { "," } else { "" },
+        kern_events,
+    );
+
+    std::fs::write(output_path, &merged).ok();
+    std::fs::remove_file(memory_path).ok();
+    std::fs::remove_file(kernel_path).ok();
+    eprintln!("[nsl] merged profile written to {}", output_path);
+}
+
+fn extract_trace_events(json: &str) -> Option<String> {
+    let start = json.find("\"traceEvents\":")? + "\"traceEvents\":".len();
+    let bracket_start = json[start..].find('[')? + start;
+    let mut depth = 0;
+    let mut bracket_end = bracket_start;
+    for (i, ch) in json[bracket_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    bracket_end = bracket_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(json[bracket_start + 1..bracket_end].to_string())
 }
 
 fn run_init(name: &str) {

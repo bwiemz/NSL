@@ -31,6 +31,12 @@ pub(crate) struct KernelProfiler {
 unsafe impl Send for KernelProfiler {}
 unsafe impl Sync for KernelProfiler {}
 
+static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+extern "C" {
+    fn atexit(f: extern "C" fn()) -> i32;
+}
+
 pub(crate) static KERNEL_PROFILER: KernelProfiler = KernelProfiler {
     enabled: AtomicBool::new(false),
     cpu_start_time: Mutex::new(None),
@@ -50,6 +56,13 @@ const EVENT_POOL_SIZE: usize = 4096;
 #[no_mangle]
 pub extern "C" fn nsl_kernel_profiler_start() {
     KERNEL_PROFILER.enabled.store(true, Ordering::Relaxed);
+
+    if !ATEXIT_REGISTERED.swap(true, Ordering::Relaxed) {
+        unsafe {
+            atexit(kernel_profiler_atexit);
+        }
+    }
+
     *KERNEL_PROFILER.cpu_start_time.lock().unwrap() = Some(Instant::now());
     *KERNEL_PROFILER.traces.lock().unwrap() = Vec::new();
     *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 0;
@@ -81,6 +94,16 @@ pub extern "C" fn nsl_kernel_profiler_start() {
 #[no_mangle]
 pub extern "C" fn nsl_kernel_profiler_stop() {
     KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
+}
+
+extern "C" fn kernel_profiler_atexit() {
+    if kernel_profiler_enabled() {
+        let path = "kernel_profile.json";
+        let ptr = path.as_ptr();
+        let len = path.len() as i64;
+        unsafe { nsl_kernel_profiler_flush(ptr, len); }
+        eprintln!("[nsl] kernel profile written to {}", path);
+    }
 }
 
 /// Pop the next (start, stop) event pair from the pool.
