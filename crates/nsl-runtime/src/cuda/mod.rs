@@ -239,6 +239,28 @@ pub(crate) mod inner {
         }
     }
 
+    // === cuEvent wrappers for kernel profiler ===
+
+    pub unsafe fn cu_event_create(event: *mut u64) {
+        cuEventCreate(event as *mut CUevent, 0); // CU_EVENT_DEFAULT = 0
+    }
+
+    pub unsafe fn cu_event_record(event: u64, stream: *mut std::ffi::c_void) {
+        cuEventRecord(event as CUevent, stream as CUstream);
+    }
+
+    pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) {
+        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent);
+    }
+
+    pub unsafe fn cu_event_destroy(event: u64) {
+        cuEventDestroy_v2(event as CUevent);
+    }
+
+    pub unsafe fn cu_ctx_synchronize() {
+        cuCtxSynchronize();
+    }
+
     /// Launch a PTX kernel. `ptx_ptr` and `name_ptr` must point to null-terminated C strings.
     /// `args` is a slice of pointers to argument values (as required by `cuLaunchKernel`).
     pub(crate) fn kernel_launch(
@@ -249,59 +271,75 @@ pub(crate) mod inner {
         args: &[*mut c_void],
     ) -> CUresult {
         let state = state();
-        let mut guard = state.lock().unwrap();
-        unsafe { cuCtxSetCurrent(guard.context); }
+        let func = {
+            let mut guard = state.lock().unwrap();
+            unsafe { cuCtxSetCurrent(guard.context); }
 
-        // Cache modules by PTX pointer address (stable .rodata addresses)
-        let cache_key = ptx_ptr as usize;
-        let module = if let Some(m) = guard.module_cache.get(&cache_key) {
-            *m
+            // Cache modules by PTX pointer address (stable .rodata addresses)
+            let cache_key = ptx_ptr as usize;
+            let module = if let Some(m) = guard.module_cache.get(&cache_key) {
+                *m
+            } else {
+                let mut module: CUmodule = std::ptr::null_mut();
+                let res = unsafe { cuModuleLoadData(&mut module, ptx_ptr as *const c_void) };
+                if res != CUresult::CUDA_SUCCESS { return res; }
+                guard.module_cache.insert(cache_key, module);
+                module
+            };
+
+            let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
+            let mut func: CUfunction = std::ptr::null_mut();
+            let res = unsafe { cuModuleGetFunction(&mut func, module, name.as_ptr()) };
+            if res != CUresult::CUDA_SUCCESS { return res; }
+
+            func
+        }; // guard dropped here — no lock held for CUDA calls
+
+        // Profiler: pop event pair (lock-pop-unlock on profiler mutex)
+        let profiler_events = if crate::kernel_profiler::kernel_profiler_enabled() {
+            crate::kernel_profiler::kernel_profiler_pop_events()
         } else {
-            let mut module: CUmodule = std::ptr::null_mut();
-            unsafe {
-                let result = cuModuleLoadData(&mut module, ptx_ptr as *const c_void);
-                if result != CUresult::CUDA_SUCCESS {
-                    return result;
-                }
-            }
-            guard.module_cache.insert(cache_key, module);
-            module
+            None
         };
 
-        let mut func: CUfunction = std::ptr::null_mut();
-        unsafe {
-            let result = cuModuleGetFunction(&mut func, module, name_ptr as *const i8);
-            if result != CUresult::CUDA_SUCCESS {
-                return result;
-            }
+        // Record start event before launch
+        if let Some((start, _, _)) = &profiler_events {
+            unsafe { cuEventRecord(*start as CUevent, std::ptr::null_mut()); }
         }
 
-        // cuLaunchKernel expects an array of pointers to argument values.
-        // The caller passes exactly that, so we just need a mutable copy of the slice.
+        // Launch kernel (no lock held)
         let mut kernel_args: Vec<*mut c_void> = args.to_vec();
-
-        unsafe {
-            let result = cuLaunchKernel(
+        let res = unsafe {
+            cuLaunchKernel(
                 func,
-                grid[0] as u32,
-                grid[1] as u32,
-                grid[2] as u32,
-                block[0] as u32,
-                block[1] as u32,
-                block[2] as u32,
-                0,                          // shared memory bytes
-                std::ptr::null_mut(),       // default stream
-                kernel_args.as_mut_ptr(),
-                std::ptr::null_mut(),       // no extra
+                grid[0] as u32, grid[1] as u32, grid[2] as u32,
+                block[0] as u32, block[1] as u32, block[2] as u32,
+                0, std::ptr::null_mut(),
+                kernel_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+
+        // Record stop event after launch
+        if let Some((_, stop, _)) = &profiler_events {
+            unsafe { cuEventRecord(*stop as CUevent, std::ptr::null_mut()); }
+            // Push trace (lock-push-unlock on profiler mutex)
+            let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
+            let name_str = name.to_str().unwrap_or("unknown");
+            crate::kernel_profiler::kernel_profiler_push_trace(
+                name_str,
+                [grid[0] as u32, grid[1] as u32, grid[2] as u32],
+                [block[0] as u32, block[1] as u32, block[2] as u32],
             );
-            if result != CUresult::CUDA_SUCCESS {
-                return result;
-            }
-            // Synchronize to ensure kernel completed before host reads results
-            cuCtxSynchronize()
         }
+
+        // NOTE: cuCtxSynchronize removed — unified memory provides coherence,
+        // profiler flush performs single sync at program end
+        res
     }
 }
+
+#[cfg(feature = "cuda")]
+pub(crate) use inner::{cu_event_create, cu_event_record, cu_event_elapsed_time, cu_event_destroy, cu_ctx_synchronize};
 
 // === GPU op helpers ===
 
@@ -343,6 +381,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
         [grid, 1, 1], [block, 1, 1], &args,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
     out_ptr as i64
 }
 
@@ -379,6 +418,7 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
         [grid, 1, 1], [block, 1, 1], &args,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
     out_ptr as i64
 }
 
@@ -448,6 +488,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         &args,
     );
     assert_eq!(result as u32, 0, "GPU matmul kernel failed: {}", result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
     out_ptr as i64
 }
@@ -487,6 +528,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
         [grid, 1, 1], [block, 1, 1], &args,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
     out_ptr as i64
 }
 
