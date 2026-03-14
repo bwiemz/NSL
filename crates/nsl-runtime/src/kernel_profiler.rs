@@ -2,6 +2,7 @@
 //! Records cuEvent pairs around kernel launches, resolves timestamps
 //! at flush time with a single cuCtxSynchronize. Zero sync during execution.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -126,6 +127,135 @@ pub(crate) fn kernel_profiler_push_trace(name: &str, grid: [u32; 3], block: [u32
     });
 }
 
+/// CPU-only flush: writes traces with monotonically increasing synthetic timestamps.
+/// Used in tests and when GPU events are not available.
+pub(crate) fn flush_traces_cpu_fallback(path: &str) {
+    let traces = KERNEL_PROFILER.traces.lock().unwrap();
+
+    let mut events = Vec::new();
+    for (i, trace) in traces.iter().enumerate() {
+        let ts = (i as f64) * 100.0; // synthetic 100us spacing from t=0
+        events.push(format!(
+            r#"{{"name":"{}","ph":"X","ts":{:.1},"dur":50.0,"pid":0,"tid":1,"args":{{"grid":[{},{},{}],"block":[{},{},{}]}}}}"#,
+            trace.name, ts,
+            trace.grid[0], trace.grid[1], trace.grid[2],
+            trace.block[0], trace.block[1], trace.block[2],
+        ));
+    }
+
+    let total_launches = traces.len();
+    let json = format!(
+        r#"{{"traceEvents":[{}],"metadata":{{"total_kernel_launches":{},"profiler_mode":"cpu_fallback"}}}}"#,
+        events.join(","),
+        total_launches,
+    );
+
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(json.as_bytes());
+    }
+}
+
+/// GPU flush: resolves cuEventElapsedTime for all traces, writes Chrome tracing JSON.
+/// Consumes the event pool (calls cuEventDestroy on all events).
+#[cfg(feature = "cuda")]
+pub(crate) fn flush_traces_gpu(path: &str) {
+    use crate::cuda;
+
+    KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
+
+    unsafe { cuda::cu_ctx_synchronize(); }
+
+    let traces: Vec<KernelTrace> = {
+        let mut guard = KERNEL_PROFILER.traces.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+    let pool: Vec<(u64, u64)> = {
+        KERNEL_PROFILER.event_pool.lock().unwrap().clone()
+    };
+    let base_event = *KERNEL_PROFILER.gpu_base_event.lock().unwrap();
+    let cpu_start = 0.0f64;
+
+    let mut events_json = Vec::new();
+    let mut total_kernel_time_ms = 0.0f64;
+
+    for trace in traces.iter() {
+        if trace.pool_idx >= pool.len() { continue; }
+        let (start_event, stop_event) = pool[trace.pool_idx];
+
+        let mut duration_ms: f32 = 0.0;
+        let mut offset_ms: f32 = 0.0;
+        unsafe {
+            cuda::cu_event_elapsed_time(&mut duration_ms, start_event, stop_event);
+            cuda::cu_event_elapsed_time(&mut offset_ms, base_event, start_event);
+        }
+
+        let ts_us = cpu_start + (offset_ms as f64) * 1000.0;
+        let dur_us = (duration_ms as f64) * 1000.0;
+        total_kernel_time_ms += duration_ms as f64;
+
+        events_json.push(format!(
+            r#"{{"name":"{}","ph":"X","ts":{:.1},"dur":{:.1},"pid":0,"tid":1,"args":{{"grid":[{},{},{}],"block":[{},{},{}]}}}}"#,
+            trace.name, ts_us, dur_us,
+            trace.grid[0], trace.grid[1], trace.grid[2],
+            trace.block[0], trace.block[1], trace.block[2],
+        ));
+    }
+
+    let total_launches = traces.len();
+    let json = format!(
+        r#"{{"traceEvents":[{}],"metadata":{{"total_kernel_launches":{},"total_kernel_time_ms":{:.2}}}}}"#,
+        events_json.join(","),
+        total_launches,
+        total_kernel_time_ms,
+    );
+
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(json.as_bytes());
+    }
+
+    destroy_event_pool();
+}
+
+/// Destroy all cuEvents in the pool and the base event.
+#[cfg(feature = "cuda")]
+fn destroy_event_pool() {
+    let mut pool = KERNEL_PROFILER.event_pool.lock().unwrap();
+    for (start, stop) in pool.drain(..) {
+        unsafe {
+            crate::cuda::cu_event_destroy(start);
+            crate::cuda::cu_event_destroy(stop);
+        }
+    }
+    let base = *KERNEL_PROFILER.gpu_base_event.lock().unwrap();
+    if base != 0 {
+        unsafe { crate::cuda::cu_event_destroy(base); }
+        *KERNEL_PROFILER.gpu_base_event.lock().unwrap() = 0;
+    }
+    *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 0;
+}
+
+/// FFI flush entry point. Calls GPU path if available, CPU fallback otherwise.
+/// # Safety
+/// `path_ptr` must point to valid UTF-8 bytes of length `path_len`.
+#[no_mangle]
+pub unsafe extern "C" fn nsl_kernel_profiler_flush(path_ptr: *const u8, path_len: i64) {
+    let path = if path_ptr.is_null() || path_len <= 0 {
+        "kernel_profile.json".to_string()
+    } else {
+        let bytes = std::slice::from_raw_parts(path_ptr, path_len as usize);
+        std::str::from_utf8(bytes).unwrap_or("kernel_profile.json").to_string()
+    };
+
+    #[cfg(feature = "cuda")]
+    {
+        flush_traces_gpu(&path);
+        return;
+    }
+
+    #[allow(unreachable_code)]
+    flush_traces_cpu_fallback(&path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +327,49 @@ mod tests {
         let second = kernel_profiler_pop_events();
         assert!(second.is_none()); // Pool exhausted
 
+        nsl_kernel_profiler_stop();
+    }
+
+    #[test]
+    fn test_flush_produces_valid_json() {
+        use std::io::Read;
+        let _lock = TEST_LOCK.lock().unwrap();
+
+        nsl_kernel_profiler_stop();
+        *KERNEL_PROFILER.cpu_start_time.lock().unwrap() = Some(Instant::now());
+        KERNEL_PROFILER.traces.lock().unwrap().clear();
+        {
+            let mut pool = KERNEL_PROFILER.event_pool.lock().unwrap();
+            pool.clear();
+            for i in 0..4u64 {
+                pool.push((i * 2, i * 2 + 1));
+            }
+        }
+        KERNEL_PROFILER.enabled.store(true, Ordering::Relaxed);
+
+        // Simulate 2 kernel traces (without actual GPU events)
+        // push_trace reads cursor and uses cursor-1 as pool_idx,
+        // so set cursor to simulate post-pop state
+        *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 1;
+        kernel_profiler_push_trace("matmul_256", [4, 1, 1], [256, 1, 1]);
+        *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 2;
+        kernel_profiler_push_trace("fused_relu_add", [4, 1, 1], [256, 1, 1]);
+
+        // Flush to temp file (CPU-only mode, no cuEventElapsedTime)
+        let tmp = std::env::temp_dir().join("test_kernel_profiler.json");
+        let path_str = tmp.to_str().unwrap();
+        flush_traces_cpu_fallback(path_str);
+
+        // Verify JSON
+        let mut contents = String::new();
+        std::fs::File::open(&tmp).unwrap().read_to_string(&mut contents).unwrap();
+        assert!(contents.contains("traceEvents"));
+        assert!(contents.contains("matmul_256"));
+        assert!(contents.contains("fused_relu_add"));
+        assert!(contents.contains("\"ph\":\"X\""));
+        assert!(contents.contains("\"tid\":1"));
+
+        std::fs::remove_file(&tmp).ok();
         nsl_kernel_profiler_stop();
     }
 }
