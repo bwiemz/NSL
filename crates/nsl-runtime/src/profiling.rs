@@ -176,7 +176,8 @@ pub extern "C" fn nsl_profiler_start(total_blocks: i64) {
 
                 let path = "memory_profile.json";
                 let path_bytes = path.as_bytes();
-                nsl_profiler_dump(path_bytes.as_ptr(), path_bytes.len() as i64);
+                // SAFETY: path_bytes is a valid UTF-8 slice from a string literal.
+                unsafe { nsl_profiler_dump(path_bytes.as_ptr(), path_bytes.len() as i64) };
 
                 let peak = PROFILER.peak_blocks.load(Ordering::Relaxed);
                 eprintln!(
@@ -202,11 +203,14 @@ pub extern "C" fn nsl_profiler_stop() {
 }
 
 /// Dump profiling data as Chrome tracing JSON to the file at `path_ptr`.
+///
+/// # Safety
+/// `path_ptr` must point to `path_len` valid bytes of UTF-8 text.
 #[no_mangle]
-pub extern "C" fn nsl_profiler_dump(path_ptr: *const u8, path_len: i64) {
-    let path_str = unsafe {
+pub unsafe extern "C" fn nsl_profiler_dump(path_ptr: *const u8, path_len: i64) {
+    let path_str = {
         let slice = std::slice::from_raw_parts(path_ptr, path_len as usize);
-        std::str::from_utf8_unchecked(slice)
+        std::str::from_utf8(slice).unwrap_or("memory_profile.json")
     };
 
     let events = PROFILER.events.lock().unwrap();
@@ -359,7 +363,8 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let path_bytes = path_str.as_bytes();
 
-        nsl_profiler_dump(path_bytes.as_ptr(), path_bytes.len() as i64);
+        // SAFETY: path_bytes is a valid UTF-8 slice from a known-good path.
+        unsafe { nsl_profiler_dump(path_bytes.as_ptr(), path_bytes.len() as i64) };
 
         let content = std::fs::read_to_string(&path).expect("dump file should exist");
         // Verify it's valid JSON.
