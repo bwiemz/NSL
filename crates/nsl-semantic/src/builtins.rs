@@ -359,6 +359,20 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // M27: scaled_dot_product_attention(Q, K, V, scale, causal=true) -> tensor
+    def(
+        "scaled_dot_product_attention",
+        Type::Function {
+            params: vec![
+                tensor_ret.clone(),  // Q
+                tensor_ret.clone(),  // K
+                tensor_ret.clone(),  // V
+                Type::Float,         // scale
+            ],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // Tokenizer functions (M15)
     def(
         "byte_tokenizer_new",

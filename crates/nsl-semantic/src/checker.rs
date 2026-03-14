@@ -374,6 +374,135 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        if dname == "flash_attention" {
+                            match &stmt.kind {
+                                StmtKind::FnDef(_) => {
+                                    // Valid target — validate optional args
+                                    if let Some(ref args) = deco.args {
+                                        for arg in args {
+                                            if let Some(ref name_sym) = arg.name {
+                                                let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                                if aname == "causal" {
+                                                    if !matches!(arg.value.kind, ExprKind::BoolLiteral(_)) {
+                                                        self.diagnostics.push(
+                                                            Diagnostic::error("@flash_attention 'causal' argument must be a bool literal")
+                                                                .with_label(arg.span, "expected bool")
+                                                        );
+                                                    }
+                                                } else {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error(format!("@flash_attention unknown argument '{}'", aname))
+                                                            .with_label(arg.span, "unknown argument")
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@flash_attention can only be applied to fn declarations")
+                                            .with_label(deco.span, "invalid @flash_attention target")
+                                    );
+                                }
+                            }
+                        }
+
+                        if dname == "rope" {
+                            // @rope requires @flash_attention on the same function
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@rope requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            // Validate optional args
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname == "style" {
+                                            if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                                                if s != "half_split" && s != "adjacent" {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error("@rope 'style' must be \"half_split\" or \"adjacent\"")
+                                                            .with_label(arg.span, "invalid style")
+                                                    );
+                                                }
+                                            } else {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error("@rope 'style' argument must be a string literal")
+                                                        .with_label(arg.span, "expected string")
+                                                );
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!("@rope unknown argument '{}'", aname))
+                                                    .with_label(arg.span, "unknown argument")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if dname == "gqa" {
+                            // @gqa requires @flash_attention on the same function
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@gqa requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            // Validate required 'groups' arg
+                            if let Some(ref args) = deco.args {
+                                let mut found_groups = false;
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname == "groups" {
+                                            found_groups = true;
+                                            if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                if *n <= 0 {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error("@gqa 'groups' must be a positive integer")
+                                                            .with_label(arg.span, "must be > 0")
+                                                    );
+                                                }
+                                            } else {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error("@gqa 'groups' argument must be an integer literal")
+                                                        .with_label(arg.span, "expected integer")
+                                                );
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!("@gqa unknown argument '{}'", aname))
+                                                    .with_label(arg.span, "unknown argument")
+                                            );
+                                        }
+                                    }
+                                }
+                                if !found_groups {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@gqa requires 'groups' argument")
+                                            .with_label(deco.span, "missing 'groups'")
+                                    );
+                                }
+                            } else {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@gqa requires 'groups' argument")
+                                        .with_label(deco.span, "missing 'groups'")
+                                );
+                            }
+                        }
+
                         if dname == "autotune" {
                             match &stmt.kind {
                                 StmtKind::KernelDef(_) => {
@@ -410,9 +539,53 @@ impl<'a> TypeChecker<'a> {
                                         );
                                     }
                                 }
+                                StmtKind::FnDef(_) => {
+                                    // Valid if @flash_attention is also present
+                                    let has_flash = decorators.iter().any(|d| {
+                                        d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                                    });
+                                    if !has_flash {
+                                        self.diagnostics.push(
+                                            Diagnostic::error("@autotune on fn requires @flash_attention")
+                                                .with_label(deco.span, "requires @flash_attention")
+                                        );
+                                    } else {
+                                        // Validate args same as kernel blocks
+                                        if let Some(ref args) = deco.args {
+                                            for arg in args {
+                                                if let Some(ref name_sym) = arg.name {
+                                                    let _aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                                    match &arg.value.kind {
+                                                        ExprKind::ListLiteral(items) => {
+                                                            for item in items {
+                                                                if !matches!(item.kind, ExprKind::IntLiteral(_)) {
+                                                                    self.diagnostics.push(
+                                                                        Diagnostic::error("@autotune parameter values must be integer literals")
+                                                                            .with_label(item.span, "expected integer")
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        _ => {
+                                                            self.diagnostics.push(
+                                                                Diagnostic::error("@autotune parameters must be lists of integers (e.g., [64, 128, 256])")
+                                                                    .with_label(arg.span, "expected list")
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error("@autotune requires at least one tuning parameter")
+                                                    .with_label(deco.span, "missing parameters")
+                                            );
+                                        }
+                                    }
+                                }
                                 _ => {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@autotune can only be applied to kernel blocks")
+                                        Diagnostic::error("@autotune can only be applied to kernel blocks or @flash_attention functions")
                                             .with_label(deco.span, "invalid @autotune target")
                                     );
                                 }
