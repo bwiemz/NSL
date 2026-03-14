@@ -232,7 +232,7 @@ impl Compiler<'_> {
             }
 
             StmtKind::Decorated { decorators, stmt } => {
-                // Check for @no_grad on nested function definitions
+                // Check for @no_grad and @fuse on nested function definitions
                 if let StmtKind::FnDef(fn_def) = &stmt.kind {
                     for d in decorators {
                         if d.name.len() == 1 {
@@ -240,6 +240,11 @@ impl Compiler<'_> {
                             if dname == "no_grad" {
                                 let fname = self.resolve_sym(fn_def.name).to_string();
                                 self.no_grad_fns.insert(fname);
+                            } else if dname == "fuse" {
+                                // Validate that the body contains only fusible elementwise ops
+                                self.validate_fuse_body(fn_def)?;
+                                // TODO(M26): emit training branch + fused kernel launch for @fuse fn
+                                // For now, compile normally (unfused path is always correct).
                             }
                         }
                     }

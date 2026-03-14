@@ -11,7 +11,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectModule, ObjectBuilder};
 
 use nsl_ast::block::DatatypeMethodKind;
-use nsl_ast::decl::ModelMember;
+use nsl_ast::decl::{FnDef, ModelMember};
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::stmt::{Stmt, StmtKind};
 use nsl_ast::types::TypeExprKind;
@@ -192,6 +192,83 @@ impl<'a> Compiler<'a> {
             "bf16" | "fp16" => cl_types::F32,
             _ => cl_types::I64,
         }
+    }
+
+    // ── @fuse fn validation ─────────────────────────────────────────
+
+    /// Validate that a `@fuse`-decorated function body contains only fusible
+    /// elementwise operations, let bindings, and return statements.
+    pub fn validate_fuse_body(&self, fn_def: &FnDef) -> Result<(), CodegenError> {
+        for stmt in &fn_def.body.stmts {
+            match &stmt.kind {
+                StmtKind::Return(Some(expr)) => {
+                    self.validate_fusible_expr(expr)?;
+                }
+                StmtKind::Return(None) => {
+                    // bare return is OK (no-op)
+                }
+                StmtKind::Expr(expr) => {
+                    self.validate_fusible_expr(expr)?;
+                }
+                StmtKind::VarDecl { value: Some(expr), .. } => {
+                    self.validate_fusible_expr(expr)?;
+                }
+                StmtKind::ModelDef(_) => {
+                    return Err(CodegenError::new(
+                        "model blocks cannot appear inside @fuse fn".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(CodegenError::new(
+                        "@fuse function body must contain only fusible expressions and let bindings"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively validate that an expression tree contains only fusible ops.
+    fn validate_fusible_expr(&self, expr: &Expr) -> Result<(), CodegenError> {
+        match &expr.kind {
+            ExprKind::BinaryOp { left, op, right } => {
+                if !crate::fusion::is_fusible_binop(&format!("{:?}", op)) {
+                    return Err(CodegenError::new(format!(
+                        "@fuse: non-fusible binary op {:?} (only Add/Sub/Mul/Div/Pow allowed)",
+                        op
+                    )));
+                }
+                self.validate_fusible_expr(left)?;
+                self.validate_fusible_expr(right)?;
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(sym) = &callee.kind {
+                    let name = self.resolve_sym(*sym);
+                    if !crate::fusion::is_fusible_op(name) {
+                        return Err(CodegenError::new(format!(
+                            "@fuse: non-fusible function call '{}' (only elementwise ops allowed)",
+                            name
+                        )));
+                    }
+                }
+                for arg in args {
+                    self.validate_fusible_expr(&arg.value)?;
+                }
+            }
+            ExprKind::Ident(_) | ExprKind::FloatLiteral(_) | ExprKind::IntLiteral(_) => {
+                // Leaf nodes: always OK
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                self.validate_fusible_expr(operand)?;
+            }
+            _ => {
+                return Err(CodegenError::new(
+                    "@fuse: unsupported expression in fused function body".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     // ── Pass 0: Collect string literals ─────────────────────────────
