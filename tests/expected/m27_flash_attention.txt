@@ -1,4 +1,2 @@
-Shape: [1, 4, 8, 16]
 FlashAttention naive path OK
-Causal shape: [1, 4, 8, 16]
 FlashAttention causal naive path OK

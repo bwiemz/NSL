@@ -1125,12 +1125,14 @@ impl Compiler<'_> {
             }
 
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
-            let k_t = self.compile_call_by_name(builder, "nsl_tensor_transpose", &[k_val])?;
+            let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
+            let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
+            let k_t = self.compile_call_by_name(builder, "nsl_tensor_transpose", &[k_val, dim_m2, dim_m1])?;
             let scores = self.compile_call_by_name(builder, "nsl_tensor_matmul", &[q_val, k_t])?;
             let scaled = self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
 
             let masked = if causal {
-                let dim_neg2 = builder.ins().iconst(cl_types::I64, -2i64 as i64);
+                let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
                 let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
                 let mask = self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
                 self.compile_call_by_name(builder, "nsl_tensor_add", &[scaled, mask])?
@@ -1138,7 +1140,7 @@ impl Compiler<'_> {
                 scaled
             };
 
-            let dim_neg1 = builder.ins().iconst(cl_types::I64, -1i64 as i64);
+            let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let attn_weights = self.compile_call_by_name(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
             return self.compile_call_by_name(builder, "nsl_tensor_matmul", &[attn_weights, v_val]);
         }

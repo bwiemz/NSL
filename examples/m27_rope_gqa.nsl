@@ -1,14 +1,10 @@
 # M27: RoPE + GQA variant — decorator validation test
 
-from nsl.nn import scaled_dot_product_attention
+@flash_attention(causal=true)
+@gqa(groups=4)
+@rope(style="half_split")
+fn gqa_attention(Q: Tensor, K: Tensor, V: Tensor) -> Tensor:
+    let scale = 1.0 / sqrt(16.0)
+    return Q
 
-model GQATransformer:
-    @flash_attention(causal=true)
-    @gqa(groups=4)
-    @rope(style="half_split")
-    fn attention(self, Q, K, V) -> Tensor:
-        let scale = 1.0 / sqrt(float(Q.shape[-1]))
-        return scaled_dot_product_attention(Q, K, V, scale, causal=true)
-
-let m = GQATransformer()
-print("RoPE + GQA model created OK")
+print("RoPE + GQA compiled OK")

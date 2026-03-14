@@ -294,7 +294,7 @@ fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    // cos/sin loaded from global memory into registers (NOT SRAM)\n");
         let (stride_comment, stride_val) = match config.rope_style {
             RopeStyle::HalfSplit => (
-                format!("stride = head_dim/2 (half_split)"),
+                "stride = head_dim/2 (half_split)".to_string(),
                 config.head_dim / 2,
             ),
             RopeStyle::Adjacent => ("stride = 1 (adjacent)".to_string(), 1),

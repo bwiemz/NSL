@@ -360,6 +360,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     );
 
     // M27: scaled_dot_product_attention(Q, K, V, scale, causal=true) -> tensor
+    // 5th param (causal bool) is optional — semantic checker allows fewer args than declared
     def(
         "scaled_dot_product_attention",
         Type::Function {
@@ -368,6 +369,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
                 tensor_ret.clone(),  // K
                 tensor_ret.clone(),  // V
                 Type::Float,         // scale
+                Type::Unknown,       // causal (optional, makes it variadic)
             ],
             ret: Box::new(tensor_ret.clone()),
         },
