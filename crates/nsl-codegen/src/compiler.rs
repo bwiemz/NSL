@@ -1391,6 +1391,7 @@ impl<'a> Compiler<'a> {
         // Extract variant flags from sibling decorators
         let mut causal = true; // default
         let mut paged = false;
+        let mut paged_block_size: i64 = 16; // default @paged_kv block_size
         let mut rope_q = false;
         let mut rope_style = crate::flash_attention::RopeStyle::HalfSplit;
         let mut gqa_group_size: u32 = 1;
@@ -1420,6 +1421,21 @@ impl<'a> Compiler<'a> {
                 }
                 "paged_kv" => {
                     paged = true;
+                    // Extract block_size from @paged_kv args (default 16)
+                    if let Some(ref args) = deco.args {
+                        for arg in args {
+                            let aname = arg
+                                .name
+                                .as_ref()
+                                .and_then(|s| self.interner.resolve(s.0))
+                                .unwrap_or("");
+                            if aname == "block_size" {
+                                if let ExprKind::IntLiteral(v) = arg.value.kind {
+                                    paged_block_size = v;
+                                }
+                            }
+                        }
+                    }
                 }
                 "rope" => {
                     rope_q = true;
@@ -1460,22 +1476,212 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let config = crate::flash_attention::FlashAttentionConfig {
-            block_q: 64,
-            block_kv: 64,
-            head_dim: 64, // default; runtime extracts actual head_dim from tensor shape
-            causal,
-            paged,
-            rope_q,
-            rope_style,
-            gqa_group_size,
-        };
+        // ── @autotune handling for FlashAttention ──────────────────────
+        //
+        // When @autotune(block_q=[32, 64, 128], block_kv=[32, 64]) is present
+        // alongside @flash_attention, we generate |block_q| x |block_kv| PTX
+        // variants. Each variant's shared memory is validated against the 48KB
+        // sm_52 limit. When paged, block_kv must be a multiple of block_size.
+        // The "primary" context uses the middle-value fallback (or the single
+        // default when @autotune is absent).
 
-        // Synthesize PTX
-        let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);
-        let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+        let has_autotune = decorators.iter().any(|d| {
+            d.name.len() == 1
+                && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
+        });
 
-        // Embed PTX bytes in .rodata
+        let default_head_dim: i64 = 64; // runtime extracts actual head_dim from tensor shape
+
+        if has_autotune {
+            let params = self.extract_autotune_params(decorators)?;
+
+            // Extract block_q and block_kv lists from autotune params
+            let block_q_values: Vec<i64> = params
+                .iter()
+                .find(|(name, _)| name == "block_q")
+                .map(|(_, vals)| vals.clone())
+                .unwrap_or_else(|| vec![64]);
+            let block_kv_values: Vec<i64> = params
+                .iter()
+                .find(|(name, _)| name == "block_kv")
+                .map(|(_, vals)| vals.clone())
+                .unwrap_or_else(|| vec![64]);
+
+            // Build tuning params for Cartesian product and middle-value selection
+            let tune_params: crate::autotune::TuningParams = vec![
+                ("block_q".to_string(), block_q_values.clone()),
+                ("block_kv".to_string(), block_kv_values.clone()),
+            ];
+
+            if self.compile_options.no_autotune {
+                eprintln!(
+                    "[nsl] autotune: --no-autotune, using middle values for flash_attention"
+                );
+            }
+
+            // Generate all (block_q, block_kv) combinations
+            let variants = crate::autotune::cartesian_product(&tune_params);
+
+            // Validate and synthesize PTX for each variant
+            for variant in &variants {
+                let bq = variant.iter().find(|(n, _)| n == "block_q").map(|(_, v)| *v).unwrap_or(64);
+                let bkv = variant.iter().find(|(n, _)| n == "block_kv").map(|(_, v)| *v).unwrap_or(64);
+
+                let test_config = crate::flash_attention::FlashAttentionConfig {
+                    block_q: bq,
+                    block_kv: bkv,
+                    head_dim: default_head_dim,
+                    causal,
+                    paged,
+                    rope_q,
+                    rope_style,
+                    gqa_group_size,
+                };
+
+                // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
+                let shmem = crate::flash_attention::shared_mem_bytes(&test_config);
+                if shmem > 49152 {
+                    return Err(CodegenError::new(format!(
+                        "@autotune variant (block_q={}, block_kv={}) requires {}KB shared memory, exceeds 48KB limit for sm_52",
+                        test_config.block_q, test_config.block_kv, shmem / 1024
+                    )));
+                }
+
+                // Paged block_kv alignment validation
+                if paged && bkv % paged_block_size != 0 {
+                    return Err(CodegenError::new(format!(
+                        "@autotune block_kv={} is not a multiple of @paged_kv block_size={}",
+                        bkv, paged_block_size
+                    )));
+                }
+
+                // Synthesize and embed PTX for this variant
+                let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&test_config);
+                let variant_kernel_name = crate::flash_attention::flash_attention_kernel_name(&test_config);
+                self.embed_flash_ptx(&variant_kernel_name, ptx_bytes)?;
+            }
+
+            // Select the middle values as the primary config (fallback / default dispatch)
+            let fallback = crate::autotune::select_middle_values(&tune_params);
+            let primary_bq = fallback.iter().find(|(n, _)| n == "block_q").map(|(_, v)| *v).unwrap_or(64);
+            let primary_bkv = fallback.iter().find(|(n, _)| n == "block_kv").map(|(_, v)| *v).unwrap_or(64);
+
+            let config = crate::flash_attention::FlashAttentionConfig {
+                block_q: primary_bq,
+                block_kv: primary_bkv,
+                head_dim: default_head_dim,
+                causal,
+                paged,
+                rope_q,
+                rope_style,
+                gqa_group_size,
+            };
+
+            let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+
+            // The primary variant's PTX was already embedded in the loop above.
+            // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
+            let (ptx_data_id, name_data_id) = self
+                .kernel_ptx_data
+                .get(&format!("flash_{}", kernel_name))
+                .copied()
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "primary flash variant '{}' not found after autotune embedding",
+                        kernel_name
+                    ))
+                })?;
+
+            Ok(Some(FlashAttentionCompileContext {
+                ptx_data_id,
+                name_data_id,
+                config,
+            }))
+        } else {
+            // No @autotune — single-config path (original behaviour)
+            let config = crate::flash_attention::FlashAttentionConfig {
+                block_q: 64,
+                block_kv: 64,
+                head_dim: default_head_dim,
+                causal,
+                paged,
+                rope_q,
+                rope_style,
+                gqa_group_size,
+            };
+
+            let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);
+            let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+
+            // Embed PTX bytes in .rodata
+            let ptx_data_id = self
+                .module
+                .declare_data(
+                    &format!("__nsl_flash_ptx_{}", kernel_name),
+                    cranelift_module::Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to declare flash PTX data for '{}': {e}",
+                        kernel_name
+                    ))
+                })?;
+            let mut data_desc = DataDescription::new();
+            data_desc.define(ptx_bytes.into_boxed_slice());
+            self.module
+                .define_data(ptx_data_id, &data_desc)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to define flash PTX data for '{}': {e}",
+                        kernel_name
+                    ))
+                })?;
+
+            // Embed kernel name (null-terminated) in .rodata
+            let mut name_bytes = kernel_name.as_bytes().to_vec();
+            name_bytes.push(0);
+            let name_data_id = self
+                .module
+                .declare_data(
+                    &format!("__nsl_flash_name_{}", kernel_name),
+                    cranelift_module::Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to declare flash name data for '{}': {e}",
+                        kernel_name
+                    ))
+                })?;
+            let mut name_desc = DataDescription::new();
+            name_desc.define(name_bytes.into_boxed_slice());
+            self.module
+                .define_data(name_data_id, &name_desc)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to define flash name data for '{}': {e}",
+                        kernel_name
+                    ))
+                })?;
+
+            Ok(Some(FlashAttentionCompileContext {
+                ptx_data_id,
+                name_data_id,
+                config,
+            }))
+        }
+    }
+
+    /// Embed a FlashAttention PTX variant in .rodata and record its DataIds
+    /// in `kernel_ptx_data` under the key `flash_{kernel_name}`.
+    fn embed_flash_ptx(
+        &mut self,
+        kernel_name: &str,
+        ptx_bytes: Vec<u8>,
+    ) -> Result<(DataId, DataId), CodegenError> {
         let ptx_data_id = self
             .module
             .declare_data(
@@ -1501,7 +1707,6 @@ impl<'a> Compiler<'a> {
                 ))
             })?;
 
-        // Embed kernel name (null-terminated) in .rodata
         let mut name_bytes = kernel_name.as_bytes().to_vec();
         name_bytes.push(0);
         let name_data_id = self
@@ -1529,11 +1734,9 @@ impl<'a> Compiler<'a> {
                 ))
             })?;
 
-        Ok(Some(FlashAttentionCompileContext {
-            ptx_data_id,
-            name_data_id,
-            config,
-        }))
+        self.kernel_ptx_data
+            .insert(format!("flash_{}", kernel_name), (ptx_data_id, name_data_id));
+        Ok((ptx_data_id, name_data_id))
     }
 
     // ── Pass 2: Compile function bodies ─────────────────────────────
