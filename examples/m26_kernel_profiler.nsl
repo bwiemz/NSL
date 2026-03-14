@@ -1,0 +1,9 @@
+# M26 E2E: Kernel profiler test
+# Tests basic tensor operations that would be profiled by the kernel profiler.
+
+let x = zeros([4, 4])
+let y = ones([4, 4])
+let z = x + y
+let w = relu(z)
+print(w)
+print("done")

@@ -1,0 +1,9 @@
+# M26 E2E: @autotune build test
+# Tests that @autotune decorator on a kernel block compiles successfully.
+
+@autotune(block_size=[64, 128, 256])
+kernel simple_scale(data: Tensor, scale: f32) -> Tensor:
+    let tid = thread_id()
+    data[tid] = data[tid] * scale
+
+print("autotune_ok")

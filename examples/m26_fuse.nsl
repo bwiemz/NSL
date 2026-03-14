@@ -1,0 +1,12 @@
+# M26 E2E: Elementwise fusion test
+# Tests that @fuse decorator is accepted on a fn with fusible ops.
+
+@fuse
+fn add_relu(x: Tensor, b: Tensor) -> Tensor:
+    return relu(x + b)
+
+let x = ones([8])
+let b = ones([8])
+let y = add_relu(x, b)
+print(y)
+print("done")

@@ -493,3 +493,22 @@ fn e2e_m25_profiling() {
         meta["total_frees"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// M26 @autotune, @fuse, and kernel profiler tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m26_kernel_profiler() {
+    assert_output_matches("m26_kernel_profiler");
+}
+
+#[test]
+fn e2e_m26_fuse() {
+    assert_output_matches("m26_fuse");
+}
+
+#[test]
+fn e2e_m26_autotune() {
+    assert_output_matches("m26_autotune");
+}
