@@ -34,7 +34,7 @@ NeuralScript is an ahead-of-time compiler. PTX synthesis happens at `nsl build` 
 
 | Kernel | Purpose | Shared Memory | SRAM Budget |
 |--------|---------|---------------|-------------|
-| `flash_attention_2` | Standard tiled attention, contiguous KV | Q tile + K tile | `(block_q + block_kv) * head_dim * sizeof(f16)` |
+| `flash_attention_2` | Standard tiled attention, contiguous KV | Q tile + K/V tile (shared) | `(block_q + block_kv) * head_dim * sizeof(f16)` |
 | `paged_flash_attention` | Same algorithm, paged KV via block table | Q tile + K tile | Same |
 | `rope_cache_write` | RoPE rotation + paged cache write | None (elementwise) | N/A |
 | `flash_attention_rope` | Attention with Q-only RoPE in registers | Q tile + K tile | Same (cos/sin in registers, not SRAM) |
@@ -72,6 +72,8 @@ fn kernel_launch(
 ```
 
 All existing callers pass `shared_mem_bytes: 0` (backward compatible). The FlashAttention launch wrappers pass `(block_q + block_kv) * head_dim * sizeof(f16)`.
+
+**Propagation:** The `extern "C" fn nsl_kernel_launch()` FFI wrapper (called from Cranelift-generated code for user-defined `kernel` blocks) must also gain a `shared_mem_bytes` parameter and forward it to `inner::kernel_launch()`. All ~8 internal call sites (`gpu_elementwise_binary`, `gpu_elementwise_unary`, `gpu_matmul_f32`, `gpu_scalar_op`, backward helpers, clamp_backward, `nsl_kernel_launch`, tests) are updated to pass `0` for backward compatibility.
 
 ---
 
@@ -162,6 +164,8 @@ Example: if `block_size=16`, valid `block_kv` values are `[16, 32, 64]`. This gu
 
 ### 5.2 Paged K/V Tile Loading
 
+M25's `BlockAllocator` maintains **separate K and V pools** (`k_pool` and `v_pool`), each with layout `[num_heads, block_size, head_dim]` per physical block. `block_stride = num_heads * block_size * head_dim * sizeof(f32)` covers all heads within one block. The FlashAttention kernel receives `k_pool_ptr` and `v_pool_ptr` as separate arguments, consistent with M25's `get_kv_ptrs()` API.
+
 The inner loop Phases 1 and 4 replace contiguous loads with block-table-driven loads:
 
 ```
@@ -172,6 +176,7 @@ for b in 0..num_blocks_per_tile:
 
     // ALL threads cooperatively load from SAME physical block
     // Coalesced 128-byte transactions — consecutive elements
+    // block_stride includes all heads; index by specific head within block
     src = k_pool + physical_id * block_stride + head * block_size * head_dim
     shmem_K[b * block_size : (b+1) * block_size][:] = src[0 : block_size][:]
 ```
@@ -215,7 +220,7 @@ Runs **once per new token batch, before attention**. Two steps:
    - Writes rotated K directly into paged K pool
    - Same scatter-write for V (no rotation, just paged placement)
 
-**Grid:** `(ceil(head_dim/2), num_heads, num_tokens)` — 3D grid where `blockIdx.z` is the token index. Handles both decode (`num_tokens = batch_size`) and prefill (`num_tokens = batch_size * seq_len`) in a single launch. No host-side token loop.
+**Grid:** `(num_tokens, num_heads, ceil(head_dim/2))` — 3D grid where `blockIdx.x` is the token index. Token dimension is on `blockIdx.x` (supports up to 2^31-1) rather than `blockIdx.z` (limited to 65535) to handle large prefill batches (e.g., batch=128 × seq_len=2048 = 262144 tokens). Handles both decode (`num_tokens = batch_size`) and prefill (`num_tokens = batch_size * seq_len`) in a single launch. No host-side token loop.
 
 ### 6.2 RoPE Interleaving Styles
 
@@ -317,7 +322,7 @@ pub extern "C" fn nsl_flash_attention(
 ) -> i64
 ```
 
-This wrapper internally builds the args array and calls `kernel_launch()`.
+This wrapper internally builds the args array and calls `kernel_launch()`. Note: `gqa_group_size` is absent from this signature because it is baked into the PTX template as a compile-time literal (Section 6.4). The Cranelift IR passes the pre-selected PTX `.rodata` pointer directly — the runtime does not need to choose between PTX variants. All variant flags (`paged`, `rope_q`, `gqa_group_size`, `causal`, `rope_style`) are resolved at compile time and encoded into the specific PTX string that gets embedded.
 
 Similarly for `rope_cache_write`:
 
@@ -347,6 +352,7 @@ Extensions to `crates/nsl-semantic/src/checker.rs`:
 - `@rope`: valid on `fn` decorated with `@flash_attention`. Args: `style: str` (default "half_split", valid values "half_split" | "adjacent").
 - `@gqa`: valid on `fn` decorated with `@flash_attention`. Args: `groups: int` (required, must be > 0).
 - `@paged_kv` + `@autotune` interaction: if both present, validate `block_kv` values are multiples of `block_size`.
+- **Decorator order:** The semantic checker accepts decorators in any order. It collects all decorators on a function and validates them as a set, not a sequence.
 
 ---
 
@@ -362,6 +368,8 @@ fn attention(self, Q, K, V) -> Tensor:
 ```
 
 The `@autotune` decorator on a `@flash_attention` function generates `|block_q| × |block_kv|` PTX variants (e.g., 3 × 2 = 6). Each variant has different shared memory requirements and parallelism characteristics.
+
+**Semantic checker change:** The existing `@autotune` validation (M26) restricts it to `kernel` blocks only. This must be relaxed to also accept `fn` declarations decorated with `@flash_attention`. The error message for other `fn` targets remains: `"@autotune can only be applied to kernel blocks or @flash_attention functions"`.
 
 ### 8.2 Shared Memory Validation
 
@@ -416,7 +424,12 @@ Verify paged variant produces identical output to contiguous variant:
 
 ### 10.6 Stubbed GPU Path
 
-Same pattern as M26: compile-time validation is real; GPU kernel launch paths are explicitly deferred with TODO markers until CUDA hardware is available for testing. The unfused `scaled_dot_product_attention` naive path always executes correctly. E2E tests validate the naive path and the compile-time validation.
+Same pattern as M26. What is fully implemented vs stubbed:
+
+- **Fully implemented:** PTX string synthesis (`flash_attention.rs` in codegen), all 5 kernel variant templates, online softmax math, shared memory layout, `.rodata` embedding, semantic checker validation, decorator lowering, `scaled_dot_product_attention` naive fallback path.
+- **Stubbed (TODO markers):** The `cuLaunchKernel` invocation inside the `extern "C"` launch wrappers in the runtime. These wrappers compute grid/block/args correctly but gate the actual launch behind `#[cfg(feature = "cuda")]` with a fallback to the naive attention path.
+
+E2E tests validate the naive fallback path and compile-time validation (decorator errors, `@autotune` shared memory limits, `@paged_kv` block_kv alignment).
 
 ---
 
