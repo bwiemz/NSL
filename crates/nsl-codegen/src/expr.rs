@@ -552,6 +552,23 @@ impl Compiler<'_> {
         if matches!(func_name.as_str(), "map" | "filter") {
             return self.compile_higher_order_call(builder, state, &func_name, args);
         }
+        // Paged KV cache builtins (M25) — dispatch nsl_kv_cache_* and nsl_profiler_*
+        if matches!(func_name.as_str(),
+            "kv_cache_init" | "kv_cache_init_gpu" |
+            "kv_cache_alloc_seq" | "kv_cache_append" |
+            "kv_cache_k_ptr" | "kv_cache_v_ptr" |
+            "kv_cache_free_seq" | "kv_cache_seq_len" |
+            "kv_cache_seq_blocks" | "kv_cache_seq_num_blocks" |
+            "kv_cache_utilization" | "kv_cache_destroy" |
+            "profiler_start" | "profiler_stop" | "profiler_dump" | "profiler_peak")
+        {
+            let mut arg_vals = Vec::new();
+            for arg in args {
+                arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+            }
+            let rt_name = format!("nsl_{func_name}");
+            return self.compile_call_by_name(builder, &rt_name, &arg_vals);
+        }
         // Direct runtime builtins: enumerate, zip, sorted, reversed
         if matches!(func_name.as_str(), "enumerate" | "zip" | "sorted" | "reversed") {
             let mut arg_vals = Vec::new();

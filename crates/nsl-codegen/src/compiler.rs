@@ -89,6 +89,8 @@ pub struct Compiler<'a> {
     pub custom_dtype_ids: HashMap<String, u16>,
     /// Configuration for standalone export (set by `compile_standalone()`).
     pub(crate) standalone_config: Option<StandaloneConfig>,
+    /// Models with @paged_kv: model_name -> (num_blocks, block_size, num_heads, head_dim, num_layers)
+    pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     func_index: u32,
 }
 
@@ -151,6 +153,7 @@ impl<'a> Compiler<'a> {
             imported_model_names: HashSet::new(),
             custom_dtype_ids: HashMap::new(),
             standalone_config: None,
+            paged_kv_configs: HashMap::new(),
             func_index: 0,
         })
     }
@@ -506,6 +509,40 @@ impl<'a> Compiler<'a> {
                             let type_name = self.resolve_sym(*type_sym).to_string();
                             if self.struct_layouts.contains_key(&type_name) {
                                 field_type_map.insert(field_name, type_name);
+                            }
+                        }
+                    }
+                }
+
+                // Check for @paged_kv decorator on any member
+                for member in &md.members {
+                    if let nsl_ast::decl::ModelMember::LayerDecl { decorators, .. } = member {
+                        for deco in decorators {
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "paged_kv" {
+                                let mut block_size: i64 = 16;
+                                let mut num_blocks: i64 = 1024;
+                                let mut num_heads: i64 = 1;
+                                let mut head_dim: i64 = 64;
+                                let mut num_layers: i64 = 1;
+                                if let Some(ref args) = deco.args {
+                                    for arg in args {
+                                        if let Some(ref name_sym) = arg.name {
+                                            let aname = self.resolve_sym(*name_sym).to_string();
+                                            if let nsl_ast::expr::ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                match aname.as_str() {
+                                                    "block_size" => block_size = *n,
+                                                    "num_blocks" => num_blocks = *n,
+                                                    "num_heads" => num_heads = *n,
+                                                    "head_dim" => head_dim = *n,
+                                                    "num_layers" => num_layers = *n,
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let model_name = self.resolve_sym(md.name).to_string();
+                                self.paged_kv_configs.insert(model_name, (num_blocks, block_size, num_heads, head_dim, num_layers));
                             }
                         }
                     }
@@ -1395,6 +1432,20 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
+            }
+
+            // M25: Initialize paged KV cache if model has @paged_kv
+            if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) = self.paged_kv_configs.get(&model_name) {
+                let init_id = self.runtime_fns["nsl_kv_cache_init"].0;
+                let init_ref = self.module.declare_func_in_func(init_id, builder.func);
+                let nb = builder.ins().iconst(cl_types::I64, num_blocks);
+                let bs = builder.ins().iconst(cl_types::I64, block_size);
+                let nh = builder.ins().iconst(cl_types::I64, num_heads);
+                let hd = builder.ins().iconst(cl_types::I64, head_dim);
+                let nl = builder.ins().iconst(cl_types::I64, num_layers);
+                let call = builder.ins().call(init_ref, &[nb, bs, nh, hd, nl]);
+                // Store the handle — for now just discard it (the handle is returned by init)
+                let _handle = builder.inst_results(call)[0];
             }
 
             builder.ins().return_(&[ptr]);
