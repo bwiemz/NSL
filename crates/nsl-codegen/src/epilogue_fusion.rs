@@ -167,9 +167,9 @@ fn resolve_broadcast_dim(graph: &FusionGraph, matmul_id: NodeId, bias_id: NodeId
         (Some(mm), Some(bias)) if mm.len() == 2 => {
             // [M, N] + [N] or [1, N] -> broadcast_dim = 0
             // [M, N] + [M, 1] -> broadcast_dim = 1
-            if bias.len() == 1 && bias[0] == mm[1] {
-                0 // row broadcast
-            } else if bias.len() == 2 && bias[0] == 1 && bias[1] == mm[1] {
+            if (bias.len() == 1 && bias[0] == mm[1])
+                || (bias.len() == 2 && bias[0] == 1 && bias[1] == mm[1])
+            {
                 0 // row broadcast
             } else if bias.len() == 2 && bias[0] == mm[0] && bias[1] == 1 {
                 1 // col broadcast

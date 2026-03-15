@@ -40,6 +40,12 @@ pub struct FusionGraph {
     pub name_to_node: HashMap<String, NodeId>,
 }
 
+impl Default for FusionGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FusionGraph {
     /// Create a new empty graph.
     pub fn new() -> Self {
