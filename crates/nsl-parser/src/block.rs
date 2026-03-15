@@ -737,6 +737,129 @@ pub fn parse_datatype_def_stmt(p: &mut Parser) -> Stmt {
     }
 }
 
+pub fn parse_serve_block_stmt(p: &mut Parser) -> Stmt {
+    let start = p.current_span();
+    p.advance(); // consume 'serve'
+
+    let (name, _) = p.expect_ident();
+
+    p.expect(&TokenKind::Colon);
+    p.skip_newlines();
+    p.expect(&TokenKind::Indent);
+    p.skip_newlines();
+
+    let mut config = Vec::new();
+    let mut endpoints = Vec::new();
+
+    while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+        p.skip_newlines();
+        if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
+            break;
+        }
+
+        // @endpoint decorator followed by fn
+        if p.at(&TokenKind::At) {
+            let ep = parse_endpoint_def(p);
+            endpoints.push(ep);
+            continue;
+        }
+
+        // fn without @endpoint — still treat as endpoint
+        if p.at(&TokenKind::Fn) {
+            let ep = parse_endpoint_fn(p);
+            endpoints.push(ep);
+            continue;
+        }
+
+        // Config entry: key [: Type] = expr  OR  key: expr
+        let entry = parse_serve_config_entry(p);
+        config.push(entry);
+    }
+
+    p.eat(&TokenKind::Dedent);
+
+    let span = start.merge(p.prev_span());
+    Stmt {
+        kind: StmtKind::ServeBlock(nsl_ast::block::ServeBlock {
+            name,
+            config,
+            endpoints,
+            span,
+        }),
+        span,
+        id: p.next_node_id(),
+    }
+}
+
+fn parse_serve_config_entry(p: &mut Parser) -> nsl_ast::block::ServeConfigEntry {
+    let start = p.current_span();
+    let (key, _) = p.expect_ident();
+
+    p.expect(&TokenKind::Colon);
+
+    // Check if next is a type annotation followed by `=`
+    let mut type_ann = None;
+    if let TokenKind::Ident(_) = p.peek().clone() {
+        if matches!(p.peek_at(1), &TokenKind::Eq) {
+            type_ann = Some(crate::types::parse_type(p));
+            p.expect(&TokenKind::Eq);
+        }
+    }
+
+    let value = parse_expr(p);
+    p.expect_end_of_stmt();
+
+    let span = start.merge(p.prev_span());
+    nsl_ast::block::ServeConfigEntry {
+        key,
+        type_ann,
+        value,
+        span,
+    }
+}
+
+fn parse_endpoint_def(p: &mut Parser) -> nsl_ast::block::EndpointDef {
+    p.advance(); // consume @
+    let (dec_sym, dec_span) = p.expect_ident();
+    let dec_str = p.interner.resolve(dec_sym.0).unwrap_or("").to_string();
+    if dec_str != "endpoint" {
+        p.diagnostics.push(
+            nsl_errors::Diagnostic::error(format!("expected @endpoint, got @{dec_str}"))
+                .with_label(dec_span, "expected @endpoint"),
+        );
+    }
+    p.skip_newlines();
+    parse_endpoint_fn(p)
+}
+
+fn parse_endpoint_fn(p: &mut Parser) -> nsl_ast::block::EndpointDef {
+    let start = p.current_span();
+    p.expect(&TokenKind::Fn);
+    let (name, _) = p.expect_ident();
+
+    p.expect(&TokenKind::LeftParen);
+    let params = crate::decl::parse_params(p);
+    p.expect(&TokenKind::RightParen);
+
+    let return_type = if p.eat(&TokenKind::Arrow) {
+        Some(crate::types::parse_type(p))
+    } else {
+        None
+    };
+
+    p.expect(&TokenKind::Colon);
+    let body = p.parse_block();
+
+    let span = start.merge(p.prev_span());
+    nsl_ast::block::EndpointDef {
+        name,
+        params,
+        return_type,
+        body,
+        span,
+    }
+}
+
 /// Parse datatype method body: (params) -> return_type: \n INDENT body DEDENT
 fn parse_datatype_method_body(p: &mut Parser) -> (Vec<Param>, Option<TypeExpr>, Vec<Stmt>) {
     p.expect(&TokenKind::LeftParen);
@@ -765,4 +888,23 @@ fn parse_datatype_method_body(p: &mut Parser) -> (Vec<Param>, Option<TypeExpr>, 
     p.eat(&TokenKind::Dedent);
 
     (params, return_type, body)
+}
+
+#[cfg(test)]
+mod serve_tests {
+    #[test]
+    fn parse_serve_block() {
+        let source = "serve Inference:\n    max_batch: 32\n    kv_blocks: 2048\n\n    @endpoint\n    fn generate(prompt: str) -> str:\n        return prompt\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let file_id = nsl_errors::FileId(0);
+        let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
+        let result = crate::parse(&tokens, &mut interner);
+        assert_eq!(result.module.stmts.len(), 1);
+        if let nsl_ast::stmt::StmtKind::ServeBlock(sb) = &result.module.stmts[0].kind {
+            assert_eq!(sb.config.len(), 2);
+            assert_eq!(sb.endpoints.len(), 1);
+        } else {
+            panic!("Expected ServeBlock");
+        }
+    }
 }

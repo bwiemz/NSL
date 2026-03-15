@@ -151,3 +151,30 @@ pub enum DatatypePtxKind {
     UnpackPtx,
     ArithmeticPtx,
 }
+
+/// serve Name:
+///     config entries + @endpoint functions
+#[derive(Debug, Clone, Serialize)]
+pub struct ServeBlock {
+    pub name: Symbol,
+    pub config: Vec<ServeConfigEntry>,
+    pub endpoints: Vec<EndpointDef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServeConfigEntry {
+    pub key: Symbol,
+    pub type_ann: Option<TypeExpr>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointDef {
+    pub name: Symbol,
+    pub params: Vec<Param>,
+    pub return_type: Option<TypeExpr>,
+    pub body: Block,
+    pub span: Span,
+}

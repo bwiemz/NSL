@@ -36,6 +36,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "tokenizer" => Some(TokenKind::Tokenizer),
         "dataset" => Some(TokenKind::Dataset),
         "datatype" => Some(TokenKind::Datatype),
+        "serve" => Some(TokenKind::Serve),
 
         // Module system
         "import" => Some(TokenKind::Import),

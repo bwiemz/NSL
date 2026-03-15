@@ -108,6 +108,9 @@ impl<'a> TypeChecker<'a> {
                 StmtKind::DatatypeDef(def) => {
                     self.declare_symbol(def.name, Type::Unknown, stmt.span, true, false);
                 }
+                StmtKind::ServeBlock(_) => {
+                    // No top-level pre-declaration needed for serve blocks
+                }
                 StmtKind::Decorated { stmt, .. } => {
                     // Recurse into the inner stmt for pre-declaration
                     self.collect_top_level_decls(std::slice::from_ref(stmt));
@@ -786,6 +789,7 @@ impl<'a> TypeChecker<'a> {
                     has_unpack_ptx: def.ptx_blocks.iter().any(|b| b.kind == DatatypePtxKind::UnpackPtx),
                 });
             }
+            StmtKind::ServeBlock(serve) => self.check_serve_block(serve),
         }
     }
 
@@ -1258,6 +1262,32 @@ impl<'a> TypeChecker<'a> {
             self.diagnostics.push(
                 Diagnostic::warning("train block missing 'step' section")
                     .with_label(train.span, "expected a step(batch): section"),
+            );
+        }
+    }
+
+    fn check_serve_block(&mut self, serve: &nsl_ast::block::ServeBlock) {
+        for entry in &serve.config {
+            if let Some(ref type_ann) = entry.type_ann {
+                self.resolve_type(type_ann);
+            }
+            self.check_expr(&entry.value);
+        }
+        for endpoint in &serve.endpoints {
+            for param in &endpoint.params {
+                if let Some(ref type_ann) = param.type_ann {
+                    self.resolve_type(type_ann);
+                }
+            }
+            if let Some(ref ret_type) = endpoint.return_type {
+                self.resolve_type(ret_type);
+            }
+            self.check_block(&endpoint.body, ScopeKind::Block);
+        }
+        if serve.endpoints.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error("serve block must define at least one @endpoint function")
+                    .with_label(serve.span, "no endpoints defined"),
             );
         }
     }

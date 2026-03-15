@@ -118,6 +118,9 @@ pub enum StmtKind {
     /// datatype Name: ...
     DatatypeDef(DatatypeDef),
 
+    /// serve Name: ...
+    ServeBlock(ServeBlock),
+
     /// @decorator(args) \n stmt
     Decorated {
         decorators: Vec<Decorator>,

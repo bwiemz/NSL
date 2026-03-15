@@ -219,6 +219,10 @@ impl Compiler<'_> {
                 // M23: custom datatype codegen — implemented in Task 9
             }
 
+            StmtKind::ServeBlock(serve) => {
+                self.compile_serve_block(builder, state, serve)?;
+            }
+
             StmtKind::KernelDef(_) => {
                 // Kernels are compiled in the compile_kernels pass (before functions).
             }
@@ -258,6 +262,15 @@ impl Compiler<'_> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn compile_serve_block(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _state: &mut FuncState,
+        _serve: &nsl_ast::block::ServeBlock,
+    ) -> Result<(), CodegenError> {
         Ok(())
     }
 
