@@ -105,6 +105,12 @@ pub struct Compiler<'a> {
     /// FlashAttention compile context: set during compile_flash_attention_kernels(),
     /// consumed by compile_flash_attention_call() when lowering scaled_dot_product_attention.
     pub flash_attention_context: Option<FlashAttentionCompileContext>,
+    /// M30: Sharded layers — "ModelName.layer_name" → ShardInfo
+    pub shard_configs: HashMap<String, crate::tensor_parallel::ShardInfo>,
+    /// M30: Activation distribution states (for future all-reduce insertion)
+    pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
+    /// M30: Tensor parallelism world size (number of devices)
+    pub world_size: usize,
     func_index: u32,
 }
 
@@ -170,6 +176,9 @@ impl<'a> Compiler<'a> {
             paged_kv_configs: HashMap::new(),
             compile_options: crate::CompileOptions::default(),
             flash_attention_context: None,
+            shard_configs: HashMap::new(),
+            activation_states: HashMap::new(),
+            world_size: 1,
             func_index: 0,
         })
     }
@@ -607,10 +616,22 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
-                // Check for @paged_kv decorator on any member
+                // Check for @paged_kv and @shard decorators on members
                 for member in &md.members {
-                    if let nsl_ast::decl::ModelMember::LayerDecl { decorators, .. } = member {
+                    if let nsl_ast::decl::ModelMember::LayerDecl { name: field_sym, decorators, .. } = member {
                         for deco in decorators {
+                            // M30: @shard decorator extraction
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "shard" {
+                                if let Some(info) = crate::tensor_parallel::extract_shard_decorator(
+                                    &[deco.clone()],
+                                    &|sym| self.resolve_sym(sym),
+                                ) {
+                                    let model_name = self.resolve_sym(md.name).to_string();
+                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                    self.shard_configs.insert(layer_key, info);
+                                }
+                            }
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "paged_kv" {
                                 let mut block_size: i64 = 16;
                                 let mut num_blocks: i64 = 1024;

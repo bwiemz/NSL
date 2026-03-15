@@ -12,6 +12,7 @@ pub mod kernel;
 pub mod linker;
 pub mod serve;
 pub mod standalone;
+pub mod tensor_parallel;
 pub mod stmt;
 pub mod types;
 

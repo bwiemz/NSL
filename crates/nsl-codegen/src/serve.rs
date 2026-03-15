@@ -16,6 +16,11 @@ impl Compiler<'_> {
         state: &mut FuncState,
         serve: &ServeBlock,
     ) -> Result<(), CodegenError> {
+        // M30: Initialize tensor parallelism if multi-device
+        if self.world_size > 1 {
+            self.compile_call_by_name(builder, "nsl_tp_init", &[])?;
+        }
+
         // Extract config values with defaults
         let mut max_batch: i64 = 32;
         let mut max_seq_len: i64 = 4096;
@@ -72,6 +77,11 @@ impl Compiler<'_> {
 
         // Emit: nsl_serve_destroy()
         self.compile_call_by_name(builder, "nsl_serve_destroy", &[])?;
+
+        // M30: Tear down tensor parallelism if multi-device
+        if self.world_size > 1 {
+            self.compile_call_by_name(builder, "nsl_tp_destroy", &[])?;
+        }
 
         Ok(())
     }

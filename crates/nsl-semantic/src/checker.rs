@@ -920,6 +920,63 @@ impl<'a> TypeChecker<'a> {
                                 .resolve(deco.name[0].0)
                                 .unwrap_or("")
                                 .to_string();
+                            // M30: @shard decorator validation
+                            if dname == "shard" {
+                                if let Some(ref args) = deco.args {
+                                    for arg in args {
+                                        if let Some(ref name_sym) = arg.name {
+                                            let aname = self
+                                                .interner
+                                                .resolve(name_sym.0)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            match aname.as_str() {
+                                                "dim" => {
+                                                    if let ExprKind::IntLiteral(n) =
+                                                        &arg.value.kind
+                                                    {
+                                                        if *n < 0 {
+                                                            self.diagnostics.push(
+                                                                Diagnostic::error(
+                                                                    "@shard: dim must be a non-negative integer"
+                                                                        .to_string(),
+                                                                )
+                                                                .with_label(
+                                                                    arg.span,
+                                                                    "must be >= 0",
+                                                                ),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        self.diagnostics.push(
+                                                            Diagnostic::error(
+                                                                "@shard: dim must be an integer literal"
+                                                                    .to_string(),
+                                                            )
+                                                            .with_label(
+                                                                arg.span,
+                                                                "expected integer",
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error(format!(
+                                                            "@shard: unknown argument '{}'",
+                                                            aname
+                                                        ))
+                                                        .with_label(
+                                                            arg.span,
+                                                            "unknown argument",
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if dname == "paged_kv" {
                                 if let Some(ref args) = deco.args {
                                     for arg in args {

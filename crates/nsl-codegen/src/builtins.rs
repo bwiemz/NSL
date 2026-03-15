@@ -326,6 +326,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_serve_completed_count",  &[],                         Some(types::I64)),
     ("nsl_serve_preempt",          &[types::I64],                      Some(types::I64)),
     ("nsl_serve_destroy",          &[],                         Some(types::I64)),
+    // --- M30: Tensor parallelism ---
+    ("nsl_tp_init", &[], Some(types::I64)),
+    ("nsl_tp_rank", &[], Some(types::I64)),
+    ("nsl_tp_world_size", &[], Some(types::I64)),
+    ("nsl_tp_all_reduce_sum", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tp_all_gather", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tp_broadcast", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tp_barrier", &[], Some(types::I64)),
+    ("nsl_tp_destroy", &[], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
