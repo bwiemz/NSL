@@ -21,17 +21,23 @@ use crate::tensor::{
     nsl_tensor_sum_dim,
     nsl_tensor_transpose as tensor_transpose,
     nsl_tensor_zeros as tensor_zeros,
-    nsl_tensor_ones,
 };
 
-/// Create a ones tensor from a shape slice (avoids dereferencing a raw tensor pointer).
-fn ones_from_shape(shape: &[i64]) -> i64 {
-    let shape_list = crate::list::nsl_list_new();
-    for &dim in shape {
-        crate::list::nsl_list_push(shape_list, dim);
+/// Create a ones tensor from a shape slice with a given dtype.
+/// Avoids dereferencing a raw tensor pointer (safe for freed inputs).
+fn ones_from_shape(shape: &[i64], dtype: u16) -> i64 {
+    let result = crate::cpu::create_tensor_with_shape_rs_dtype(shape, dtype);
+    // Fill with 1.0
+    let t = crate::tensor::NslTensor::from_ptr(result);
+    if dtype == 1 {
+        for i in 0..t.len as usize {
+            unsafe { *t.data_f32().add(i) = 1.0 };
+        }
+    } else {
+        for i in 0..t.len as usize {
+            unsafe { *t.data_f64().add(i) = 1.0 };
+        }
     }
-    let result = nsl_tensor_ones(shape_list);
-    crate::list::nsl_list_free(shape_list);
     result
 }
 
@@ -1540,7 +1546,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     if *dim == -1 {
                         // Global reduction: g is scalar, broadcast to input shape
                         let scalar_val = tensor_item(g);
-                        let ones = ones_from_shape(input_shape);
+                        let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
+                        let ones = ones_from_shape(input_shape, g_dtype);
                         let grad_a = tensor_mul_scalar(ones, scalar_val);
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1556,7 +1563,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     if *dim == -1 {
                         // Global reduction
                         let scalar_val = tensor_item(g);
-                        let ones = ones_from_shape(input_shape);
+                        let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
+                        let ones = ones_from_shape(input_shape, g_dtype);
                         let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64));
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1824,6 +1832,10 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
                     // grad for bias = sum over batch dim (rows)
                     let g_t = crate::tensor::NslTensor::from_ptr(g);
+                    if g_t.ndim < 2 {
+                        eprintln!("nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
+                        std::process::abort();
+                    }
                     let rows = unsafe { *g_t.shape.add(0) } as usize;
                     let cols = unsafe { *g_t.shape.add(1) } as usize;
 

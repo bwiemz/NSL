@@ -154,6 +154,21 @@ impl NslTensor {
         }
     }
 
+    /// Total byte size of the data buffer, accounting for block-packed custom dtypes.
+    #[inline]
+    pub(crate) fn data_byte_size(&self) -> usize {
+        if self.dtype >= DTYPE_CUSTOM_START {
+            if let Some(info) = get_registry().get(&self.dtype) {
+                if info.block_size > 0 && info.packed_block_size > 0 {
+                    let num_blocks = (self.len as usize)
+                        .div_ceil(info.block_size as usize);
+                    return num_blocks * info.packed_block_size;
+                }
+            }
+        }
+        (self.len as usize) * self.element_size()
+    }
+
     pub(crate) fn compute_strides(shape: *const i64, ndim: i64) -> *mut i64 {
         let n = ndim as usize;
         let strides = checked_alloc(n * std::mem::size_of::<i64>()) as *mut i64;
@@ -3229,7 +3244,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 
     tensor.refcount -= 1;
     if tensor.refcount <= 0 {
-        let data_size = (tensor.len as usize) * tensor.element_size();
+        let data_size = tensor.data_byte_size();
         let shape_size = (tensor.ndim as usize) * std::mem::size_of::<i64>();
         let strides_size = shape_size;
 
