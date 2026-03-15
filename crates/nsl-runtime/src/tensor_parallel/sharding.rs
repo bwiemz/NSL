@@ -27,7 +27,7 @@ pub fn compute_shard_slice(
         ndim = shape.len(),
     );
     assert!(
-        shape[shard_dim] % world_size == 0,
+        shape[shard_dim].is_multiple_of(world_size),
         "shape[{shard_dim}] ({dim_size}) must be divisible by world_size ({world_size})",
         dim_size = shape[shard_dim],
     );

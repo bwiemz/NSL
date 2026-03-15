@@ -186,7 +186,7 @@ impl CollectiveBackend for SimulatedBackend {
 
         // Single-rank fast path: just copy.
         if self.world_size == 1 {
-            if sendbuf != recvbuf as *const c_void {
+            if !std::ptr::eq(sendbuf, recvbuf) {
                 unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes); }
             }
             return 0;
@@ -245,7 +245,7 @@ impl CollectiveBackend for SimulatedBackend {
 
         // Single-rank fast path.
         if self.world_size == 1 {
-            if sendbuf != recvbuf as *const c_void {
+            if !std::ptr::eq(sendbuf, recvbuf) {
                 unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes); }
             }
             return 0;

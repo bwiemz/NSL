@@ -623,7 +623,7 @@ impl<'a> Compiler<'a> {
                             // M30: @shard decorator extraction
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "shard" {
                                 if let Some(info) = crate::tensor_parallel::extract_shard_decorator(
-                                    &[deco.clone()],
+                                    std::slice::from_ref(deco),
                                     &|sym| self.resolve_sym(sym),
                                 ) {
                                     let model_name = self.resolve_sym(md.name).to_string();
