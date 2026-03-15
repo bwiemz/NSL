@@ -109,6 +109,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor shape ops
     ("nsl_tensor_shape", &[types::I64], Some(types::I64)),
     ("nsl_tensor_shape_dim", &[types::I64, types::I64], Some(types::I64)),
+    // M28: Dynamic shape assertions
+    ("nsl_tensor_assert_dim", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_assert_dim_bound", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_ndim", &[types::I64], Some(types::I64)),
     ("nsl_tensor_reshape", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_transpose", &[types::I64, types::I64, types::I64], Some(types::I64)),

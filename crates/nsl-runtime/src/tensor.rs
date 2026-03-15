@@ -583,6 +583,69 @@ pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
     unsafe { *tensor.shape.add(d) }
 }
 
+/// Assert that tensor dimension `dim_index` equals `expected_value`.
+/// Called by codegen to enforce symbolic dimension unification at runtime.
+/// If `expected_value` is -1, this is a "record" call — returns the actual dim value.
+/// Otherwise, asserts equality and aborts on mismatch.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expected_value: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+    let dim_idx = if dim_index < 0 {
+        (ndim as i64 + dim_index) as usize
+    } else {
+        dim_index as usize
+    };
+    if dim_idx >= ndim {
+        eprintln!(
+            "nsl: assert_dim: dimension index {} out of range for rank-{} tensor",
+            dim_index, ndim
+        );
+        std::process::abort();
+    }
+    let actual = unsafe { *tensor.shape.add(dim_idx) };
+    if expected_value == -1 {
+        return actual;
+    }
+    if actual != expected_value {
+        eprintln!(
+            "nsl: dimension mismatch: expected dim[{}] = {}, got {}",
+            dim_index, expected_value, actual
+        );
+        std::process::abort();
+    }
+    actual
+}
+
+/// Assert that a tensor dimension does not exceed an upper bound.
+/// Used for `Bounded` dimensions (e.g., `SeqLen < 4096`).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_assert_dim_bound(tensor_ptr: i64, dim_index: i64, upper_bound: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+    let dim_idx = if dim_index < 0 {
+        (ndim as i64 + dim_index) as usize
+    } else {
+        dim_index as usize
+    };
+    if dim_idx >= ndim {
+        eprintln!(
+            "nsl: assert_dim_bound: dimension index {} out of range for rank-{} tensor",
+            dim_index, ndim
+        );
+        std::process::abort();
+    }
+    let actual = unsafe { *tensor.shape.add(dim_idx) };
+    if actual > upper_bound {
+        eprintln!(
+            "nsl: dimension bound exceeded: dim[{}] = {} exceeds upper bound {}",
+            dim_index, actual, upper_bound
+        );
+        std::process::abort();
+    }
+    actual
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_ndim(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).ndim
