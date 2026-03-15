@@ -1,0 +1,13 @@
+# M28: Dynamic shapes — symbolic dimensions resolve at runtime
+
+fn process(x: Tensor<[Batch, 4], f64>) -> Tensor:
+    return x
+
+# Call with different batch sizes
+let a = randn([2, 4])
+let b = randn([5, 4])
+
+let out_a = process(a)
+let out_b = process(b)
+
+print("Dynamic shapes OK")

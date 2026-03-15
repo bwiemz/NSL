@@ -531,3 +531,22 @@ fn e2e_m27_paged_attention() {
 fn e2e_m27_rope_gqa() {
     assert_output_matches("m27_rope_gqa");
 }
+
+// ---------------------------------------------------------------------------
+// M28: Dynamic shapes & ragged tensors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m28_dynamic_shapes() {
+    assert_output_matches("m28_dynamic_shapes");
+}
+
+#[test]
+fn e2e_m28_bounded_dims() {
+    assert_output_matches("m28_bounded_dims");
+}
+
+#[test]
+fn e2e_m28_dim_unification() {
+    assert_output_matches("m28_dim_unification");
+}

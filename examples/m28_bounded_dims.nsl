@@ -1,0 +1,11 @@
+# M28: Bounded dimensions — compile-time upper bound, runtime checked
+
+fn attend(Q: Tensor<[Batch, SeqLen < 4096, 64], f64>, K: Tensor<[Batch, SeqLen < 4096, 64], f64>) -> Tensor:
+    return Q
+
+# Call within bounds
+let q = randn([2, 512, 64])
+let k = randn([2, 512, 64])
+let out = attend(q, k)
+
+print("Bounded dims OK")

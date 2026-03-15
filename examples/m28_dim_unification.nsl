@@ -1,0 +1,10 @@
+# M28: Symbolic dim unification — same symbol must match across params
+
+fn add_tensors(a: Tensor<[N, 4], f64>, b: Tensor<[N, 4], f64>) -> Tensor:
+    return a + b
+
+let x = randn([3, 4])
+let y = randn([3, 4])
+let result = add_tensors(x, y)
+
+print("Dim unification OK")
