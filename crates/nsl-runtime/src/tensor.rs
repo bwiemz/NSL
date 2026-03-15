@@ -673,27 +673,20 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         std::process::abort();
     }
 
-    // Create a new tensor that shares data (increment refcount)
-    tensor.refcount += 1;
     let strides = NslTensor::compute_strides(new_shape, new_ndim);
 
     let new_tensor = Box::new(NslTensor {
-        data: tensor.data,
+        data: std::ptr::null_mut(), // placeholder, overwritten below with deep-copied data
         shape: new_shape,
         strides,
         ndim: new_ndim,
         len: new_len,
-        refcount: 1, // new wrapper has its own refcount
+        refcount: 1,
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
     });
-    // Note: shared data means we need to be careful with free.
-    // For M9, we just deep copy the data to keep it simple.
     let result = Box::into_raw(new_tensor) as i64;
-
-    // Actually, let's deep copy to avoid shared ownership complexity in M9
-    tensor.refcount -= 1;
     let result_tensor = NslTensor::from_ptr(result);
 
     // Device/dtype-aware copy
@@ -3203,7 +3196,14 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 
     let elem_size = tensor.element_size();
     let data_size = (len as usize) * elem_size;
-    let data = checked_alloc(data_size);
+    let data = if tensor.device > 0 {
+        #[cfg(feature = "cuda")]
+        { crate::cuda::inner::alloc_managed(data_size) as *mut u8 }
+        #[cfg(not(feature = "cuda"))]
+        { checked_alloc(data_size) }
+    } else {
+        checked_alloc(data_size)
+    };
     unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size) };
 
     let result = Box::new(NslTensor {
