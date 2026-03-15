@@ -8,6 +8,7 @@ pub mod func;
 pub mod dynamic_shapes;
 pub mod flash_attention;
 pub mod fusion;
+pub mod fusion_graph;
 pub mod kernel;
 pub mod linker;
 pub mod serve;
