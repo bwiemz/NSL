@@ -1174,6 +1174,7 @@ dependencies = [
  "nsl-ast",
  "nsl-errors",
  "nsl-lexer",
+ "nsl-parser",
  "string-interner",
 ]
 

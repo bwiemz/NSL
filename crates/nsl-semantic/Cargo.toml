@@ -14,3 +14,4 @@ nsl-ast.workspace = true
 
 [dev-dependencies]
 string-interner.workspace = true
+nsl-parser.workspace = true
