@@ -51,6 +51,10 @@ enum Cli {
         #[arg(long)]
         profile: bool,
 
+        /// Number of GPUs for tensor parallelism (spawns N processes)
+        #[arg(long, default_value = "1")]
+        devices: u32,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -216,8 +220,80 @@ fn main() {
                 run_build(&file, output, emit_obj, dump_ir);
             }
         }
-        Cli::Run { file, args, profile_memory, profile_kernels, profile } => {
-            run_run(&file, &args, profile_memory, profile_kernels, profile);
+        Cli::Run { file, args, profile_memory, profile_kernels, profile, devices } => {
+            if devices > 1 {
+                // Build-then-spawn SPMD: spawn N children, each runs the same program
+                let exe = std::env::current_exe().expect("could not find current executable");
+
+                // Create shared memory file for SimulatedBackend
+                let shm_size = 64 + devices as usize * 64 * 1024 * 1024; // header + 64MB per rank
+                let shm_path = std::env::temp_dir().join(format!(
+                    "nsl_tp_{}_{}.shm",
+                    devices,
+                    std::process::id()
+                ));
+                {
+                    let f = std::fs::File::create(&shm_path).expect("failed to create shm file");
+                    f.set_len(shm_size as u64).expect("failed to set shm size");
+                    // Zero the header by mapping and dropping
+                    let mmap = unsafe { memmap2::MmapMut::map_mut(&f).unwrap() };
+                    drop(mmap);
+                }
+
+                let mut children = Vec::new();
+                for rank in 0..devices {
+                    let mut cmd = std::process::Command::new(&exe);
+                    cmd.arg("run")
+                        .arg(&file)
+                        .env("NSL_LOCAL_RANK", rank.to_string())
+                        .env("NSL_WORLD_SIZE", devices.to_string())
+                        .env("NSL_SIMULATED_TP", "1")
+                        .env("NSL_TP_SHM_PATH", shm_path.to_str().unwrap());
+
+                    // Forward profiling flags
+                    if profile_memory || profile {
+                        cmd.env("NSL_PROFILE_MEMORY", "1");
+                    }
+                    if profile_kernels || profile {
+                        cmd.env("NSL_PROFILE_KERNELS", "1");
+                    }
+
+                    // Pass through program args
+                    if !args.is_empty() {
+                        cmd.arg("--").args(&args);
+                    }
+
+                    // Only rank 0 gets stdout
+                    if rank > 0 {
+                        cmd.stdout(std::process::Stdio::null());
+                    }
+                    cmd.stderr(std::process::Stdio::inherit());
+
+                    let child = cmd.spawn().unwrap_or_else(|e| {
+                        panic!("failed to spawn rank {}: {}", rank, e);
+                    });
+                    children.push((rank, child));
+                }
+
+                // Wait for all children
+                let mut failed = false;
+                for (rank, mut child) in children {
+                    let status = child.wait().expect("failed to wait on child");
+                    if !status.success() {
+                        eprintln!("rank {} exited with: {}", rank, status);
+                        failed = true;
+                    }
+                }
+
+                // Cleanup shared memory
+                let _ = std::fs::remove_file(&shm_path);
+
+                if failed {
+                    std::process::exit(1);
+                }
+            } else {
+                run_run(&file, &args, profile_memory, profile_kernels, profile);
+            }
         }
         Cli::Test { file, filter } => {
             run_test(&file, filter.as_deref());
