@@ -1093,6 +1093,7 @@ name = "nsl-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "memmap2",
  "nsl-ast",
  "nsl-codegen",
  "nsl-errors",
