@@ -111,7 +111,7 @@ fn node_bytes(node: &FusionNode) -> u64 {
 }
 ```
 
-The `DType::byte_width()` method already exists in the semantic types module. The fusion report aggregates bytes saved across all eliminated intermediates in a fused chain: for an epilogue chain eliminating N intermediate nodes, total savings = `sum(node_bytes(n) * 2 for n in eliminated)` (one write + one read per eliminated materialization).
+M31 adds a `byte_width(&self) -> usize` method to `nsl_semantic::types::DType` (mapping F64→8, F32→4, Fp16→2, Bf16→2, etc.). This is a small addition to the semantic crate — analogous to the runtime's `dtype_byte_width()` but operating on the compile-time `DType` enum. The fusion report aggregates bytes saved across all eliminated intermediates in a fused chain: for an epilogue chain eliminating N intermediate nodes, total savings = `sum(node_bytes(n) * 2 for n in eliminated)` (one write + one read per eliminated materialization).
 
 ### Construction
 
@@ -313,9 +313,9 @@ This prevents the corruption case where `reduce_max(x, dim=0)` and `reduce_sum(x
 Following the M27 FlashAttention playbook, reduction kernels use **hand-written parameterized PTX string templates** — not the general-purpose `KernelCompiler` from `kernel.rs`. The `KernelCompiler` was built for 1D/2D elementwise ops and cannot synthesize two-pass loop structures, block synchronization (`bar.sync`), or warp-level butterfly shuffles (`shfl.sync.down.b32`).
 
 ```rust
-fn synthesize_fused_softmax_ptx(hidden_dim: usize, dtype: DtypeId) -> Vec<u8> { ... }
-fn synthesize_fused_layernorm_ptx(hidden_dim: usize, has_affine: bool, eps: f32, dtype: DtypeId) -> Vec<u8> { ... }
-fn synthesize_fused_rmsnorm_ptx(hidden_dim: usize, has_affine: bool, eps: f32, dtype: DtypeId) -> Vec<u8> { ... }
+fn synthesize_fused_softmax_ptx(hidden_dim: usize, dtype: DType) -> Vec<u8> { ... }
+fn synthesize_fused_layernorm_ptx(hidden_dim: usize, has_affine: bool, eps: f32, dtype: DType) -> Vec<u8> { ... }
+fn synthesize_fused_rmsnorm_ptx(hidden_dim: usize, has_affine: bool, eps: f32, dtype: DType) -> Vec<u8> { ... }
 ```
 
 Each template is parameterized by:
@@ -337,7 +337,7 @@ If the user writes `softmax(x)` as a single builtin call rather than the expande
 
 ### Naive Softmax Diagnostic
 
-When the compiler detects and replaces naive softmax, it emits a warning on stderr:
+When the compiler detects and replaces naive softmax, it **unconditionally** emits a warning on stderr (regardless of `--fusion-report`). This is a correctness fix, not just an optimization — the warning is non-suppressible:
 
 ```
 warning: numerically unstable softmax replaced with safe max-subtraction form
@@ -393,7 +393,7 @@ fn debug_forward(x, W):
 
 The DAG builder marks `@no_fuse` nodes as fusion barriers. The node's output must materialize to global memory regardless of consumer count.
 
-**AST integration:** The `VarDecl` variant in `StmtKind` already has a `decorators: Vec<Decorator>` field, but the semantic checker's decorator validation loop currently only handles decorators on `FnDef`, `ModelDef`, and `KernelDef`. M31 must extend the checker to validate `@no_fuse` on `VarDecl` statements — accepting it as valid and rejecting any other decorator on let-bindings. The codegen's DAG builder then reads `VarDecl.decorators` to detect `@no_fuse`.
+**AST integration:** In the NSL AST, decorators are handled via `StmtKind::Decorated { decorators, stmt }` which wraps any inner statement. A `@no_fuse` let-binding is represented as `Decorated { decorators: [@no_fuse], stmt: VarDecl { ... } }`. The semantic checker's decorator validation loop currently only handles `Decorated` wrapping `FnDef`, `ModelDef`, and `KernelDef`. M31 must extend the checker to also accept `Decorated` wrapping `VarDecl` — validating that only `@no_fuse` is allowed (rejecting any other decorator on let-bindings). The codegen's DAG builder checks for the `Decorated` wrapper around `VarDecl` statements to detect `@no_fuse`.
 
 ### `@fuse_graph` as Logging Gate
 
