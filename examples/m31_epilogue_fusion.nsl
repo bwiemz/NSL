@@ -1,0 +1,14 @@
+# M31: Epilogue fusion test
+# matmul + bias + relu should be detected as fusible
+
+fn forward(x: Tensor, w: Tensor, bias: Tensor) -> Tensor:
+    let mm = x @ w
+    let biased = mm + bias
+    let out = relu(biased)
+    return out
+
+let x = zeros([4, 8])
+let w = ones([8, 4])
+let b = zeros([4])
+let result = forward(x, w, b)
+print("epilogue fusion OK")

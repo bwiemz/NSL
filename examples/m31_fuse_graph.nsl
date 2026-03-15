@@ -1,0 +1,12 @@
+# M31: @fuse_graph decorator test
+
+@fuse_graph
+fn fused_forward(x: Tensor, w: Tensor) -> Tensor:
+    let mm = x @ w
+    let out = relu(mm)
+    return out
+
+let x = zeros([4, 8])
+let w = ones([8, 4])
+let result = fused_forward(x, w)
+print("fuse_graph OK")

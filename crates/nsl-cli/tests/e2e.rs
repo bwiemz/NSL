@@ -588,3 +588,22 @@ fn e2e_m30_shard_validation() {
 fn e2e_m30_gqa_replication() {
     assert_output_matches("m30_gqa_replication");
 }
+
+// ---------------------------------------------------------------------------
+// M31: Graph-level operator fusion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m31_epilogue_fusion() {
+    assert_output_matches("m31_epilogue_fusion");
+}
+
+#[test]
+fn e2e_m31_reduction_fusion() {
+    assert_output_matches("m31_reduction_fusion");
+}
+
+#[test]
+fn e2e_m31_fuse_graph() {
+    assert_output_matches("m31_fuse_graph");
+}

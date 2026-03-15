@@ -1,0 +1,14 @@
+# M31: Reduction fusion test
+# softmax pattern should be detected
+
+fn my_softmax(x: Tensor) -> Tensor:
+    let mx = reduce_max(x, -1, 1)
+    let shifted = x - mx
+    let e = exp(shifted)
+    let s = sum(e, -1, 1)
+    let out = e / s
+    return out
+
+let x = ones([4, 8])
+let result = my_softmax(x)
+print("reduction fusion OK")
