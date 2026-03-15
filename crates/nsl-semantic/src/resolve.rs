@@ -1,5 +1,5 @@
 use nsl_ast::expr::{Expr, ExprKind};
-use nsl_ast::types::{DeviceExpr, DimExpr, DimValue, TypeExpr, TypeExprKind};
+use nsl_ast::types::{DeviceExpr, DimExpr as AstDimExpr, DimValue, TypeExpr, TypeExprKind};
 use nsl_ast::Symbol;
 use nsl_errors::{Diagnostic, Span};
 use nsl_lexer::Interner;
@@ -172,17 +172,17 @@ impl<'a> TypeResolver<'a> {
         }
     }
 
-    fn resolve_shape(&self, dims: &[DimExpr]) -> Shape {
+    fn resolve_shape(&self, dims: &[AstDimExpr]) -> Shape {
         Shape {
             dims: dims.iter().map(|d| self.resolve_dim(d)).collect(),
         }
     }
 
-    fn resolve_dim(&self, dim: &DimExpr) -> Dim {
+    fn resolve_dim(&self, dim: &AstDimExpr) -> Dim {
         match dim {
-            DimExpr::Concrete(n) => Dim::Concrete(*n),
-            DimExpr::Symbolic(sym) => Dim::Symbolic(*sym),
-            DimExpr::Named { name, value } => {
+            AstDimExpr::Concrete(n) => Dim::Concrete(*n),
+            AstDimExpr::Symbolic(sym) => Dim::Symbolic(*sym),
+            AstDimExpr::Named { name, value } => {
                 let size = match value {
                     DimValue::Int(n) => Dim::Concrete(*n),
                     DimValue::String(_) => Dim::Wildcard,
@@ -192,7 +192,10 @@ impl<'a> TypeResolver<'a> {
                     size: Box::new(size),
                 }
             }
-            DimExpr::Wildcard => Dim::Wildcard,
+            AstDimExpr::Bounded { name, upper_bound } => {
+                Dim::Bounded { name: *name, upper_bound: *upper_bound }
+            }
+            AstDimExpr::Wildcard => Dim::Wildcard,
         }
     }
 
