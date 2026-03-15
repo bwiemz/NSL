@@ -337,6 +337,613 @@ fn try_match_rmsnorm(graph: &FusionGraph, mul_node: NodeId) -> Option<ReductionM
     })
 }
 
+// ─── PTX synthesis helpers ────────────────────────────────────────────────────
+
+/// Emit warp-level shuffle-down reduction for a single f32 register `%freg`.
+/// Uses shuttle registers %rs0/%rs1 to comply with PTX ISA (.b32 only for shfl).
+fn emit_warp_reduce_f32(buf: &mut Vec<u8>, freg: &str, reduce_op: &str) {
+    for offset in [16u32, 8, 4, 2, 1] {
+        buf.extend_from_slice(
+            format!(
+                "    mov.b32 %rs0, {freg};\n\
+                 shfl.sync.down.b32 %rs1, %rs0, {offset}, 31, 0xFFFFFFFF;\n\
+                 mov.b32 %f_shfl, %rs1;\n\
+                 {reduce_op}.f32 {freg}, {freg}, %f_shfl;\n"
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// Emit cross-warp reduction via shared memory.
+/// tid in %r_tid, warp_id = tid>>5, lane_id = tid&31.
+/// After this, lane 0 of warp 0 holds the block-wide result in `%freg`.
+fn emit_crosswarp_reduce(buf: &mut Vec<u8>, freg: &str, reduce_op: &str, n_warps: u32) {
+    // Only lane 0 of each warp writes to shared mem
+    buf.extend_from_slice(
+        format!(
+            "    // cross-warp reduction into shared memory\n\
+             and.b32 %r_lane, %r_tid, 31;\n\
+             shr.u32 %r_warp, %r_tid, 5;\n\
+             setp.eq.u32 %p_lane0, %r_lane, 0;\n\
+             @%p_lane0 st.shared.f32 [%smem + %r_warp * 4], {freg};\n\
+             bar.sync 0;\n\
+             // Only threads 0..{n_warps} load; others load identity
+             setp.lt.u32 %p_warp_slot, %r_tid, {n_warps};\n\
+             @%p_warp_slot ld.shared.f32 {freg}, [%smem + %r_tid * 4];\n\
+             @!%p_warp_slot mov.f32 {freg}, 0.0;\n\
+             bar.sync 0;\n"
+        )
+        .as_bytes(),
+    );
+    // Warp 0 does a final warp reduce across the partial sums
+    emit_warp_reduce_f32(buf, freg, reduce_op);
+}
+
+/// Returns the store + optional dtype-convert instruction for a result in `%f_res`.
+fn emit_store_with_dtype(buf: &mut Vec<u8>, dtype: DType, out_ptr_reg: &str) {
+    match dtype {
+        DType::Fp16 | DType::Bf16 => {
+            buf.extend_from_slice(
+                format!(
+                    "    cvt.rn.f16.f32 %h_out, %f_res;\n\
+                     st.global.b16 [{out_ptr_reg}], %h_out;\n"
+                )
+                .as_bytes(),
+            );
+        }
+        _ => {
+            buf.extend_from_slice(
+                format!("    st.global.f32 [{out_ptr_reg}], %f_res;\n").as_bytes(),
+            );
+        }
+    }
+}
+
+// ─── Public PTX synthesis functions ──────────────────────────────────────────
+
+/// Synthesize a fused softmax PTX kernel for rows of `hidden_dim` elements.
+/// Two-pass: find max → exp(x-max) → sum → normalize.
+/// Returns null-terminated PTX bytes.
+pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
+    let block_size: u32 = 256.min(hidden_dim);
+    let n_warps: u32 = block_size / 32;
+    let elems_per_thread: u32 = hidden_dim.div_ceil(block_size);
+    let name = format!("fused_softmax_{hidden_dim}");
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    // PTX header
+    buf.extend_from_slice(
+        b".version 7.0\n\
+          .target sm_80\n\
+          .address_size 64\n\n",
+    );
+
+    // Kernel signature
+    buf.extend_from_slice(
+        format!(
+            ".visible .entry {name}(\n\
+             .param .u64 param_out,\n\
+             .param .u64 param_in,\n\
+             .param .u32 param_rows\n\
+             )\n{{\n"
+        )
+        .as_bytes(),
+    );
+
+    // Register declarations
+    buf.extend_from_slice(
+        format!(
+            "    .reg .u64 %rd<8>;\n\
+             .reg .u32 %r<16>;\n\
+             .reg .f32 %f<32>;\n\
+             .reg .f32 %f_shfl;\n\
+             .reg .f32 %f_res;\n\
+             .reg .b32 %rs<4>;\n\
+             .reg .pred %p<8>;\n\
+             .reg .pred %p_lane0;\n\
+             .reg .pred %p_warp_slot;\n\
+             .reg .u32 %r_tid;\n\
+             .reg .u32 %r_lane;\n\
+             .reg .u32 %r_warp;\n\
+             .reg .b16 %h_out;\n\
+             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
+        , smem_bytes = n_warps * 4)
+        .as_bytes(),
+    );
+
+    // Load params
+    buf.extend_from_slice(
+        b"    ld.param.u64 %rd0, [param_out];\n\
+          ld.param.u64 %rd1, [param_in];\n\
+          ld.param.u32 %r0, [param_rows];\n\
+          mov.u32 %r_tid, %tid.x;\n\
+          mov.u32 %r1, %ctaid.x;  // row index\n\n"
+    );
+
+    // Row bounds check
+    buf.extend_from_slice(
+        b"    setp.ge.u32 %p0, %r1, %r0;\n\
+          @%p0 ret;\n\n"
+    );
+
+    // Compute base pointers for this row
+    buf.extend_from_slice(
+        format!(
+            "    // in_ptr = param_in + row * hidden_dim * sizeof(f32)\n\
+             mul.wide.u32 %rd2, %r1, {row_bytes};\n\
+             add.u64 %rd3, %rd1, %rd2;  // in row base\n\
+             mul.wide.u32 %rd4, %r1, {row_bytes};\n\
+             add.u64 %rd5, %rd0, %rd4;  // out row base\n\n"
+        , row_bytes = hidden_dim * 4)
+        .as_bytes(),
+    );
+
+    // ── Pass 1: find row max ──────────────────────────────────────────────────
+    buf.extend_from_slice(b"    // Pass 1: find row max\n");
+    buf.extend_from_slice(b"    mov.f32 %f0, 0fFF800000;  // -inf\n");
+
+    for e in 0..elems_per_thread {
+        let _idx = format!("%r_tid + {}", e * block_size);
+        buf.extend_from_slice(
+            format!(
+                "    // element {e}\n\
+                 add.u32 %r2, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r2, {hidden_dim};\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 @!%p1 mov.f32 %f{fp}, 0fFF800000;\n\
+                 max.f32 %f0, %f0, %f{fp};\n"
+            , off = e * block_size, fp = e + 1)
+            .as_bytes(),
+        );
+    }
+
+    buf.extend_from_slice(b"\n    // Warp reduce max\n");
+    emit_warp_reduce_f32(&mut buf, "%f0", "max");
+    emit_crosswarp_reduce(&mut buf, "%f0", "max", n_warps);
+    // Broadcast row max to all threads
+    buf.extend_from_slice(
+        b"    // Broadcast max from thread 0 to all threads\n\
+          mov.b32 %rs0, %f0;\n\
+          shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
+          mov.b32 %f0, %rs1;\n\n"
+    );
+
+    // ── Pass 1b: exp(x - max) and sum ────────────────────────────────────────
+    buf.extend_from_slice(b"    // Pass 1b: exp(x - max) and accumulate sum\n");
+    buf.extend_from_slice(b"    mov.f32 %f16, 0f00000000;  // sum = 0\n");
+    // log2(e) constant: 0x3FB8AA3B
+    buf.extend_from_slice(b"    mov.f32 %f17, 0f3FB8AA3B;  // log2(e)\n");
+
+    for e in 0..elems_per_thread {
+        buf.extend_from_slice(
+            format!(
+                "    add.u32 %r2, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r2, {hidden_dim};\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 @!%p1 mov.f32 %f{fp}, 0fFF800000;\n\
+                 sub.f32 %f{fp}, %f{fp}, %f0;\n\
+                 mul.f32 %f{fp}, %f{fp}, %f17;\n\
+                 ex2.approx.f32 %f{fp}, %f{fp};\n\
+                 add.f32 %f16, %f16, %f{fp};\n"
+            , off = e * block_size, fp = e + 1)
+            .as_bytes(),
+        );
+    }
+
+    buf.extend_from_slice(b"\n    // Warp reduce sum\n");
+    emit_warp_reduce_f32(&mut buf, "%f16", "add");
+    emit_crosswarp_reduce(&mut buf, "%f16", "add", n_warps);
+    // Broadcast sum
+    buf.extend_from_slice(
+        b"    mov.b32 %rs0, %f16;\n\
+          shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
+          mov.b32 %f16, %rs1;\n"
+    );
+    // 1/sum
+    buf.extend_from_slice(b"    rcp.approx.f32 %f18, %f16;  // 1/sum\n\n");
+
+    // ── Pass 2: write output ──────────────────────────────────────────────────
+    buf.extend_from_slice(b"    // Pass 2: write output\n");
+    for e in 0..elems_per_thread {
+        buf.extend_from_slice(
+            format!(
+                "    add.u32 %r2, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r2, {hidden_dim};\n\
+                 // recompute exp(x-max)\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 @!%p1 mov.f32 %f{fp}, 0f00000000;\n\
+                 @%p1 sub.f32 %f{fp}, %f{fp}, %f0;\n\
+                 @%p1 mul.f32 %f{fp}, %f{fp}, %f17;\n\
+                 @%p1 ex2.approx.f32 %f{fp}, %f{fp};\n\
+                 mul.f32 %f_res, %f{fp}, %f18;\n\
+                 // compute output pointer\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd5, %rd6;\n"
+            , off = e * block_size, fp = e + 1)
+            .as_bytes(),
+        );
+        // Predicated store
+        buf.extend_from_slice(b"    @%p1 ");
+        emit_store_with_dtype(&mut buf, dtype, "%rd7");
+    }
+
+    buf.extend_from_slice(b"\n    ret;\n}\n");
+    buf.push(0); // null terminator
+    buf
+}
+
+/// Synthesize a fused layernorm PTX kernel using Welford's online algorithm.
+/// Returns null-terminated PTX bytes.
+pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64, dtype: DType) -> Vec<u8> {
+    let block_size: u32 = 256.min(hidden_dim);
+    let n_warps: u32 = block_size / 32;
+    let elems_per_thread: u32 = hidden_dim.div_ceil(block_size);
+    let name = format!("fused_layernorm_{hidden_dim}");
+    let eps_f32 = eps as f32;
+    let eps_bits = eps_f32.to_bits();
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    // PTX header
+    buf.extend_from_slice(
+        b".version 7.0\n\
+          .target sm_80\n\
+          .address_size 64\n\n",
+    );
+
+    // Kernel signature
+    buf.extend_from_slice(b".visible .entry ");
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(b"(\n.param .u64 param_out,\n.param .u64 param_in,\n");
+    if has_affine {
+        buf.extend_from_slice(b".param .u64 param_gamma,\n.param .u64 param_beta,\n");
+    }
+    buf.extend_from_slice(b".param .u32 param_rows\n)\n{\n");
+
+    // Register declarations
+    buf.extend_from_slice(
+        format!(
+            "    .reg .u64 %rd<16>;\n\
+             .reg .u32 %r<16>;\n\
+             .reg .f32 %f<32>;\n\
+             .reg .f32 %f_shfl;\n\
+             .reg .f32 %f_res;\n\
+             .reg .b32 %rs<4>;\n\
+             .reg .pred %p<8>;\n\
+             .reg .pred %p_lane0;\n\
+             .reg .pred %p_warp_slot;\n\
+             .reg .u32 %r_tid;\n\
+             .reg .u32 %r_lane;\n\
+             .reg .u32 %r_warp;\n\
+             .reg .b16 %h_out;\n\
+             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
+        , smem_bytes = n_warps * 8)  // 2 floats per warp: mean + M2
+        .as_bytes(),
+    );
+
+    // Load params
+    buf.extend_from_slice(
+        b"    ld.param.u64 %rd0, [param_out];\n\
+          ld.param.u64 %rd1, [param_in];\n"
+    );
+    if has_affine {
+        buf.extend_from_slice(
+            b"    ld.param.u64 %rd8, [param_gamma];\n\
+              ld.param.u64 %rd9, [param_beta];\n"
+        );
+    }
+    buf.extend_from_slice(
+        b"    ld.param.u32 %r0, [param_rows];\n\
+          mov.u32 %r_tid, %tid.x;\n\
+          mov.u32 %r1, %ctaid.x;\n\n"
+    );
+
+    // Row bounds check
+    buf.extend_from_slice(
+        b"    setp.ge.u32 %p0, %r1, %r0;\n\
+          @%p0 ret;\n\n"
+    );
+
+    // Row base pointers
+    buf.extend_from_slice(
+        format!(
+            "    mul.wide.u32 %rd2, %r1, {row_bytes};\n\
+             add.u64 %rd3, %rd1, %rd2;\n\
+             mul.wide.u32 %rd4, %r1, {row_bytes};\n\
+             add.u64 %rd5, %rd0, %rd4;\n\n"
+        , row_bytes = hidden_dim * 4)
+        .as_bytes(),
+    );
+
+    // ── Welford accumulation (simplified: compute mean + sum of squares) ──────
+    buf.extend_from_slice(b"    // Welford: accumulate mean and M2\n");
+    buf.extend_from_slice(b"    mov.f32 %f0, 0f00000000;  // mean\n");
+    buf.extend_from_slice(b"    mov.f32 %f1, 0f00000000;  // M2 (sum of (x-mean)^2)\n");
+    buf.extend_from_slice(b"    mov.u32 %r2, 0;            // count\n");
+
+    for e in 0..elems_per_thread {
+        buf.extend_from_slice(
+            format!(
+                "    add.u32 %r3, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r3, {hidden_dim};\n\
+                 mul.wide.u32 %rd6, %r3, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 @!%p1 mov.f32 %f{fp}, 0f00000000;\n\
+                 // Welford update: count++, delta = x - mean, mean += delta/count, M2 += delta*(x-mean_new)\n\
+                 @%p1 add.u32 %r2, %r2, 1;\n\
+                 @%p1 sub.f32 %f20, %f{fp}, %f0;\n\
+                 cvt.rn.f32.u32 %f21, %r2;\n\
+                 @%p1 rcp.approx.f32 %f22, %f21;\n\
+                 @%p1 mul.f32 %f23, %f20, %f22;\n\
+                 @%p1 add.f32 %f0, %f0, %f23;\n\
+                 @%p1 sub.f32 %f24, %f{fp}, %f0;\n\
+                 @%p1 mul.f32 %f24, %f20, %f24;\n\
+                 @%p1 add.f32 %f1, %f1, %f24;\n"
+            , off = e * block_size, fp = e + 2)
+            .as_bytes(),
+        );
+    }
+
+    // Warp reduce mean (sum partial means, then divide)
+    buf.extend_from_slice(b"\n    // Warp + cross-warp reduce mean\n");
+    emit_warp_reduce_f32(&mut buf, "%f0", "add");
+    emit_crosswarp_reduce(&mut buf, "%f0", "add", n_warps);
+    // Broadcast mean
+    buf.extend_from_slice(
+        b"    mov.b32 %rs0, %f0;\n\
+          shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
+          mov.b32 %f0, %rs1;\n"
+    );
+    // Divide by n_warps to get true mean
+    buf.extend_from_slice(
+        format!("    mul.f32 %f0, %f0, 0f{inv_warps:08X};\n\n", inv_warps = (1.0f32 / n_warps as f32).to_bits())
+        .as_bytes(),
+    );
+
+    // Warp reduce M2 (variance numerator)
+    buf.extend_from_slice(b"    // Warp + cross-warp reduce M2\n");
+    emit_warp_reduce_f32(&mut buf, "%f1", "add");
+    emit_crosswarp_reduce(&mut buf, "%f1", "add", n_warps);
+    buf.extend_from_slice(
+        b"    mov.b32 %rs0, %f1;\n\
+          shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
+          mov.b32 %f1, %rs1;\n"
+    );
+    // var = M2 / hidden_dim
+    buf.extend_from_slice(
+        format!("    mul.f32 %f1, %f1, 0f{inv_n:08X};  // var = M2/N\n", inv_n = (1.0f32 / hidden_dim as f32).to_bits())
+        .as_bytes(),
+    );
+    // var + eps
+    buf.extend_from_slice(
+        format!("    add.f32 %f1, %f1, 0f{eps_bits:08X};  // var + eps\n")
+        .as_bytes(),
+    );
+    // 1/sqrt(var+eps)
+    buf.extend_from_slice(b"    rsqrt.approx.f32 %f2, %f1;  // 1/sqrt(var+eps)\n\n");
+
+    // ── Write output ──────────────────────────────────────────────────────────
+    buf.extend_from_slice(b"    // Normalize and write output\n");
+    for e in 0..elems_per_thread {
+        buf.extend_from_slice(
+            format!(
+                "    add.u32 %r3, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r3, {hidden_dim};\n\
+                 mul.wide.u32 %rd6, %r3, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 // normalized = (x - mean) * rsqrt\n\
+                 @%p1 sub.f32 %f{fp}, %f{fp}, %f0;\n\
+                 @%p1 mul.f32 %f{fp}, %f{fp}, %f2;\n"
+            , off = e * block_size, fp = e + 2)
+            .as_bytes(),
+        );
+        if has_affine {
+            buf.extend_from_slice(
+                format!(
+                    "                 // affine: gamma * normalized + beta\n\
+                     add.u64 %rd10, %rd8, %rd6;\n\
+                     @%p1 ld.global.f32 %f28, [%rd10];\n\
+                     add.u64 %rd11, %rd9, %rd6;\n\
+                     @%p1 ld.global.f32 %f29, [%rd11];\n\
+                     @%p1 mul.f32 %f{fp}, %f{fp}, %f28;\n\
+                     @%p1 add.f32 %f{fp}, %f{fp}, %f29;\n"
+                , fp = e + 2)
+                .as_bytes(),
+            );
+        }
+        buf.extend_from_slice(
+            format!(
+                "    mov.f32 %f_res, %f{fp};\n\
+                 mul.wide.u32 %rd6, %r3, 4;\n\
+                 add.u64 %rd7, %rd5, %rd6;\n\
+                 @%p1 "
+            , fp = e + 2)
+            .as_bytes(),
+        );
+        emit_store_with_dtype(&mut buf, dtype, "%rd7");
+    }
+
+    buf.extend_from_slice(b"\n    ret;\n}\n");
+    buf.push(0);
+    buf
+}
+
+/// Synthesize a fused RMSNorm PTX kernel.
+/// Single-pass: accumulate x^2, reduce, rsqrt, normalize, optional gamma scale.
+/// Returns null-terminated PTX bytes.
+pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64, dtype: DType) -> Vec<u8> {
+    let block_size: u32 = 256.min(hidden_dim);
+    let n_warps: u32 = block_size / 32;
+    let elems_per_thread: u32 = hidden_dim.div_ceil(block_size);
+    let name = format!("fused_rmsnorm_{hidden_dim}");
+    let eps_f32 = eps as f32;
+    let eps_bits = eps_f32.to_bits();
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    // PTX header
+    buf.extend_from_slice(
+        b".version 7.0\n\
+          .target sm_80\n\
+          .address_size 64\n\n",
+    );
+
+    // Kernel signature
+    buf.extend_from_slice(b".visible .entry ");
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(b"(\n.param .u64 param_out,\n.param .u64 param_in,\n");
+    if has_affine {
+        buf.extend_from_slice(b".param .u64 param_gamma,\n");
+    }
+    buf.extend_from_slice(b".param .u32 param_rows\n)\n{\n");
+
+    // Register declarations
+    buf.extend_from_slice(
+        format!(
+            "    .reg .u64 %rd<12>;\n\
+             .reg .u32 %r<16>;\n\
+             .reg .f32 %f<32>;\n\
+             .reg .f32 %f_shfl;\n\
+             .reg .f32 %f_res;\n\
+             .reg .b32 %rs<4>;\n\
+             .reg .pred %p<8>;\n\
+             .reg .pred %p_lane0;\n\
+             .reg .pred %p_warp_slot;\n\
+             .reg .u32 %r_tid;\n\
+             .reg .u32 %r_lane;\n\
+             .reg .u32 %r_warp;\n\
+             .reg .b16 %h_out;\n\
+             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
+        , smem_bytes = n_warps * 4)
+        .as_bytes(),
+    );
+
+    // Load params
+    buf.extend_from_slice(
+        b"    ld.param.u64 %rd0, [param_out];\n\
+          ld.param.u64 %rd1, [param_in];\n"
+    );
+    if has_affine {
+        buf.extend_from_slice(b"    ld.param.u64 %rd8, [param_gamma];\n");
+    }
+    buf.extend_from_slice(
+        b"    ld.param.u32 %r0, [param_rows];\n\
+          mov.u32 %r_tid, %tid.x;\n\
+          mov.u32 %r1, %ctaid.x;\n\n"
+    );
+
+    // Row bounds check
+    buf.extend_from_slice(
+        b"    setp.ge.u32 %p0, %r1, %r0;\n\
+          @%p0 ret;\n\n"
+    );
+
+    // Row base pointers
+    buf.extend_from_slice(
+        format!(
+            "    mul.wide.u32 %rd2, %r1, {row_bytes};\n\
+             add.u64 %rd3, %rd1, %rd2;\n\
+             mul.wide.u32 %rd4, %r1, {row_bytes};\n\
+             add.u64 %rd5, %rd0, %rd4;\n\n"
+        , row_bytes = hidden_dim * 4)
+        .as_bytes(),
+    );
+
+    // ── Pass 1: accumulate x^2 ────────────────────────────────────────────────
+    buf.extend_from_slice(b"    // Accumulate sum of squares\n");
+    buf.extend_from_slice(b"    mov.f32 %f0, 0f00000000;  // sum_sq\n");
+
+    for e in 0..elems_per_thread {
+        buf.extend_from_slice(
+            format!(
+                "    add.u32 %r2, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r2, {hidden_dim};\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 @!%p1 mov.f32 %f{fp}, 0f00000000;\n\
+                 mul.f32 %f{sq}, %f{fp}, %f{fp};\n\
+                 add.f32 %f0, %f0, %f{sq};\n"
+            , off = e * block_size, fp = e + 1, sq = e + elems_per_thread + 1)
+            .as_bytes(),
+        );
+    }
+
+    // Warp + cross-warp reduce sum_sq
+    buf.extend_from_slice(b"\n    // Warp + cross-warp reduce sum_sq\n");
+    emit_warp_reduce_f32(&mut buf, "%f0", "add");
+    emit_crosswarp_reduce(&mut buf, "%f0", "add", n_warps);
+    buf.extend_from_slice(
+        b"    mov.b32 %rs0, %f0;\n\
+          shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
+          mov.b32 %f0, %rs1;\n"
+    );
+
+    // mean_sq = sum_sq / hidden_dim
+    buf.extend_from_slice(
+        format!("    mul.f32 %f0, %f0, 0f{inv_n:08X};  // mean_sq = sum_sq / N\n", inv_n = (1.0f32 / hidden_dim as f32).to_bits())
+        .as_bytes(),
+    );
+    // mean_sq + eps
+    buf.extend_from_slice(
+        format!("    add.f32 %f0, %f0, 0f{eps_bits:08X};  // mean_sq + eps\n")
+        .as_bytes(),
+    );
+    // 1/sqrt(mean_sq + eps)
+    buf.extend_from_slice(b"    rsqrt.approx.f32 %f16, %f0;  // 1/sqrt(mean_sq+eps)\n\n");
+
+    // ── Pass 2: normalize and write ───────────────────────────────────────────
+    buf.extend_from_slice(b"    // Normalize and write output\n");
+    for e in 0..elems_per_thread {
+        buf.extend_from_slice(
+            format!(
+                "    add.u32 %r2, %r_tid, {off};\n\
+                 setp.lt.u32 %p1, %r2, {hidden_dim};\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd3, %rd6;\n\
+                 @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
+                 @%p1 mul.f32 %f{fp}, %f{fp}, %f16;\n"
+            , off = e * block_size, fp = e + 1)
+            .as_bytes(),
+        );
+        if has_affine {
+            buf.extend_from_slice(
+                format!(
+                    "                 // scale by gamma\n\
+                     add.u64 %rd9, %rd8, %rd6;\n\
+                     @%p1 ld.global.f32 %f28, [%rd9];\n\
+                     @%p1 mul.f32 %f{fp}, %f{fp}, %f28;\n"
+                , fp = e + 1)
+                .as_bytes(),
+            );
+        }
+        buf.extend_from_slice(
+            format!(
+                "    mov.f32 %f_res, %f{fp};\n\
+                 mul.wide.u32 %rd6, %r2, 4;\n\
+                 add.u64 %rd7, %rd5, %rd6;\n\
+                 @%p1 "
+            , fp = e + 1)
+            .as_bytes(),
+        );
+        emit_store_with_dtype(&mut buf, dtype, "%rd7");
+    }
+
+    buf.extend_from_slice(b"\n    ret;\n}\n");
+    buf.push(0);
+    buf
+}
+
 /// Mark all nodes in detected reduction matches as fused.
 pub fn apply_reduction_fusion(graph: &mut FusionGraph, matches: &[ReductionMatch], base_kernel_id: FusedKernelId) {
     for (i, m) in matches.iter().enumerate() {
@@ -537,5 +1144,59 @@ mod tests {
         let matches = detect_reduction_patterns(&g);
         let softmax_matches: Vec<_> = matches.iter().filter(|m| m.pattern == "softmax").collect();
         assert_eq!(softmax_matches.len(), 0);
+    }
+
+    #[test]
+    fn test_synthesize_softmax_ptx() {
+        let ptx = synthesize_fused_softmax_ptx(1024, DType::Fp16);
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        assert!(ptx_str.contains(".entry fused_softmax_1024"));
+        // Two-pass structure
+        assert!(ptx_str.contains("shfl.sync.down.b32"));
+        assert!(ptx_str.contains("bar.sync"));
+        // Must have exp and div
+        assert!(ptx_str.contains("ex2.approx.f32"));
+        assert!(ptx_str.contains("rcp.approx.f32") || ptx_str.contains("div.rn.f32"));
+        // Output dtype conversion
+        assert!(ptx_str.contains("cvt.rn.f16.f32"));
+    }
+
+    #[test]
+    fn test_synthesize_layernorm_ptx() {
+        let ptx = synthesize_fused_layernorm_ptx(768, true, 1e-5, DType::F32);
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        assert!(ptx_str.contains(".entry fused_layernorm_768"));
+        assert!(ptx_str.contains("shfl.sync.down.b32"));
+        assert!(ptx_str.contains("bar.sync"));
+        // Affine: gamma * normalized + beta
+        assert!(ptx_str.contains("param_gamma"));
+        assert!(ptx_str.contains("param_beta"));
+        // Must write output to global memory
+        assert!(ptx_str.contains("st.global"));
+    }
+
+    #[test]
+    fn test_synthesize_rmsnorm_ptx() {
+        let ptx = synthesize_fused_rmsnorm_ptx(768, true, 1e-5, DType::Fp16);
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        assert!(ptx_str.contains(".entry fused_rmsnorm_768"));
+        assert!(ptx_str.contains("shfl.sync.down.b32"));
+        // Output dtype conversion
+        assert!(ptx_str.contains("cvt.rn.f16.f32"));
+        // Must write output to global memory
+        assert!(ptx_str.contains("st.global"));
+    }
+
+    #[test]
+    fn test_softmax_f32_output_no_cvt() {
+        let ptx = synthesize_fused_softmax_ptx(256, DType::F32);
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        // f32 output — no dtype conversion needed
+        assert!(!ptx_str.contains("cvt.rn.f16.f32"));
+        assert!(ptx_str.contains("st.global.f32"));
     }
 }

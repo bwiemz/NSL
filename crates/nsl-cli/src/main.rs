@@ -104,6 +104,10 @@ enum Cli {
         /// Delete the autotune cache directory and exit
         #[arg(long)]
         autotune_clean: bool,
+
+        /// Show fusion optimization report on stderr
+        #[arg(long)]
+        fusion_report: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -170,6 +174,7 @@ fn main() {
             no_autotune,
             autotune_fresh,
             autotune_clean,
+            fusion_report,
         } => {
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -186,10 +191,13 @@ fn main() {
             // so --no-autotune and --autotune-fresh reach the Compiler. Currently the
             // autotune benchmarking harness is deferred (always uses middle-value fallback),
             // so these flags are effectively no-ops until GPU benchmarking is activated.
+            // NOTE: fusion_report_enabled is not yet wired to compile_entry().
+            // The --fusion-report flag is dormant until CompileOptions threading is completed.
             let _compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
                 world_size: 1, // Build cmd doesn't use --devices; TP world_size is always 1
+                fusion_report,
             };
 
             if standalone {

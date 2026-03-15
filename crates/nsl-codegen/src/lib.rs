@@ -11,6 +11,7 @@ pub mod fusion;
 pub mod fusion_graph;
 pub mod epilogue_fusion;
 pub mod reduction_fusion;
+pub mod fusion_report;
 pub mod kernel;
 pub mod linker;
 pub mod serve;
@@ -29,6 +30,7 @@ pub struct CompileOptions {
     pub no_autotune: bool,
     pub autotune_fresh: bool,
     pub world_size: usize,
+    pub fusion_report: bool,
 }
 
 impl Default for CompileOptions {
@@ -37,6 +39,7 @@ impl Default for CompileOptions {
             no_autotune: false,
             autotune_fresh: false,
             world_size: 1,
+            fusion_report: false,
         }
     }
 }
