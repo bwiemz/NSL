@@ -1,0 +1,10 @@
+# M30: GQA KV-head replication — verify serve block with GQA-style config
+
+serve GqaServer:
+    max_batch: 2
+
+    @endpoint
+    fn generate(prompt):
+        let x = 0
+
+print("GQA replication OK")

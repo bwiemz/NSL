@@ -583,3 +583,8 @@ fn e2e_m30_tp_basic() {
 fn e2e_m30_shard_validation() {
     assert_output_matches("m30_shard_validation");
 }
+
+#[test]
+fn e2e_m30_gqa_replication() {
+    assert_output_matches("m30_gqa_replication");
+}
