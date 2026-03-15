@@ -189,6 +189,7 @@ fn main() {
             let _compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
+                world_size: 1, // Build cmd doesn't use --devices; TP world_size is always 1
             };
 
             if standalone {

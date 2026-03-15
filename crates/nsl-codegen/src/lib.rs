@@ -21,8 +21,19 @@ pub use error::CodegenError;
 pub use standalone::create_weight_object;
 
 /// Compiler configuration flags passed from CLI.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct CompileOptions {
     pub no_autotune: bool,
     pub autotune_fresh: bool,
+    pub world_size: usize,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            no_autotune: false,
+            autotune_fresh: false,
+            world_size: 1,
+        }
+    }
 }
