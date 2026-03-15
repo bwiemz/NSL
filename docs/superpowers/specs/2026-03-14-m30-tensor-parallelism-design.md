@@ -41,13 +41,25 @@ No `executor.rs` — process spawning lives in the CLI crate.
 ```rust
 use std::ffi::c_void;
 
-pub enum NslDtype {
-    F32,
-    F16,
-    BF16,
-    I8,
-    I4,
-}
+/// Dtype uses the existing runtime u16 ID space (see tensor.rs):
+///   DTYPE_F64 = 0, DTYPE_F32 = 1
+/// Passed as i64 over FFI boundaries. The CollectiveBackend uses
+/// the raw u16 value to determine element byte width and to map
+/// to ncclDataType_t in the NcclBackend.
+pub type DtypeId = u16;
+
+pub const DTYPE_F64: DtypeId = 0;
+pub const DTYPE_F32: DtypeId = 1;
+pub const DTYPE_F16: DtypeId = 2;
+pub const DTYPE_BF16: DtypeId = 3;
+pub const DTYPE_I8: DtypeId = 4;
+pub const DTYPE_FP8: DtypeId = 5;
+// Custom BYOD dtypes start at 256
+
+/// Stream handle — `*mut c_void` unconditionally (opaque pointer).
+/// Resolves to CUstream inside #[cfg(feature = "cuda")] code.
+/// SimulatedBackend ignores this parameter.
+pub type StreamHandle = *mut c_void;
 
 pub trait CollectiveBackend: Send + Sync {
     fn all_reduce_sum(
@@ -55,8 +67,8 @@ pub trait CollectiveBackend: Send + Sync {
         sendbuf: *const c_void,
         recvbuf: *mut c_void,
         count: usize,
-        dtype: NslDtype,
-        stream: CUstream,
+        dtype: DtypeId,
+        stream: StreamHandle,
     ) -> i32;
 
     fn all_gather(
@@ -64,17 +76,17 @@ pub trait CollectiveBackend: Send + Sync {
         sendbuf: *const c_void,
         recvbuf: *mut c_void,
         send_count: usize,
-        dtype: NslDtype,
-        stream: CUstream,
+        dtype: DtypeId,
+        stream: StreamHandle,
     ) -> i32;
 
     fn broadcast(
         &self,
         buf: *mut c_void,
         count: usize,
-        dtype: NslDtype,
+        dtype: DtypeId,
         root_rank: i32,
-        stream: CUstream,
+        stream: StreamHandle,
     ) -> i32;
 
     fn barrier(&self) -> i32;
@@ -84,21 +96,24 @@ pub trait CollectiveBackend: Send + Sync {
 ```
 
 Key design decisions:
+- **Dtype uses existing `u16` ID space** from `tensor.rs` (`DTYPE_F64=0`, `DTYPE_F32=1`, etc.) — no new enum, avoids ID mismatch with existing runtime. Includes F64, FP8, and BYOD custom dtypes (256+).
+- **`StreamHandle = *mut c_void`** unconditionally — avoids compile failure on Windows where `CUstream` type doesn't exist. Cast to real `CUstream` only inside `#[cfg(feature = "cuda")]` blocks.
 - `*const c_void` for sendbuf (read-only), `*mut c_void` for recvbuf — correct mutability semantics
-- `NslDtype` parameter instead of hardcoded `f32` — supports FP16, quantized KV-caches
-- `CUstream` parameter on all collective calls — enables future compute/communication overlap (M34 Ring Attention). M30 passes `0` (default stream) everywhere.
 - `all_reduce_sum` supports in-place (same pointer for send/recv, same output size)
 - `all_gather` is **out-of-place only** — recvbuf must be `world_size * send_count` elements. In-place would corrupt adjacent GPU memory.
+- `reduce_scatter` intentionally omitted — M30 uses `all_reduce` for row-parallel and `all_gather` for LM head. `reduce_scatter + all_gather` is an optimization for compute/communication overlap, deferred to M34.
 
 ### SimulatedBackend
 
 For Windows/testing. All ranks run as separate OS processes sharing the same physical GPU(s).
 
 - Uses shared-memory (file-backed mmap) for cross-process communication
-- `all_reduce_sum`: each process writes its data to a shared accumulation region, last to arrive copies reduced result to all
-- `all_gather`: each process writes its shard to its slot in a shared buffer, barrier, then all read the full result
-- `broadcast`: root writes, barrier, others read
-- `barrier`: counter-based — processes increment a shared atomic, spin until count == world_size
+- **Shared memory path convention:** `{TEMP}/nsl_tp_{world_size}_{pid_of_parent}.shm` — parent PID ensures isolation between concurrent runs. Parent creates the file before spawning children; children open it by reading `NSL_TP_SHM_PATH` env var. Cleaned up by parent after all children exit.
+- **Shared memory layout:** Header (generation counter, arrival counter, world_size) + per-rank data slots. Total size: `header(64B) + world_size * max_collective_bytes`. `max_collective_bytes` is the largest tensor that will pass through a collective — conservatively set to 64MB for M30 (sufficient for LM head logits at batch=256, vocab=128K, f32).
+- `all_reduce_sum`: each process writes its data to its rank slot, increments arrival counter. Last to arrive performs the reduction across all slots and writes result to slot 0, then increments generation counter. All processes spin on generation counter, then copy result from slot 0 to their recvbuf. Double-buffering via generation counter (even/odd) prevents use-after-overwrite between consecutive collectives.
+- `all_gather`: each process writes its shard to its rank slot, barrier, then all read the full concatenated result from slots 0..world_size
+- `broadcast`: root writes to slot 0, barrier, others read from slot 0
+- `barrier`: generation-based — processes increment arrival counter, spin until count == world_size, then increment generation
 
 ### SPMD Execution Model
 
@@ -118,16 +133,22 @@ Thread-local rank/world_size exposed via FFI: `nsl_tp_rank() -> i64`, `nsl_tp_wo
 ### Mmap-Based Loading
 
 ```rust
+/// The Rust-side API. rank and world_size are read from env vars
+/// internally (NSL_LOCAL_RANK, NSL_WORLD_SIZE), matching the SPMD model.
 pub fn load_sharded_weight(
     mmap: &Mmap,           // memory-mapped safetensors file
     tensor_name: &str,     // e.g. "layers.0.attn.q_proj.weight"
     shape: &[usize],       // full tensor shape
     shard_dim: usize,      // which dim to split
-    rank: i32,
-    world_size: i32,
-    dtype: NslDtype,
+    dtype: DtypeId,
 ) -> NslTensor  // normal tensor, just smaller
 ```
+
+**Mmap lifecycle:**
+- `nsl_tp_mmap_open(path_ptr, path_len) -> i64` — opens and mmaps the safetensors file, returns opaque handle. Called once per process at model load time.
+- `nsl_tp_load_sharded_weight(mmap_handle, name_ptr, name_len, shape_ptr, ndims, shard_dim, dtype) -> i64` — loads this rank's slice from the mmap. Rank/world_size read from env internally.
+- `nsl_tp_mmap_close(mmap_handle) -> i64` — unmaps the file after all weights are loaded to GPU.
+- The mmap handle is kept alive between `open` and `close`. After `close`, GPU memory holds the weight data independently.
 
 **How it works:**
 1. Process mmaps the safetensors file (virtual memory, near-zero RSS)
@@ -207,31 +228,57 @@ The compiler tracks the distributed state of intermediate tensors throughout the
 
 | Function | Signature | Notes |
 |---|---|---|
-| `nsl_tp_init` | `(world_size, rank) -> i64` | Init collective backend for this process |
-| `nsl_tp_rank` | `() -> i64` | Process rank from env |
-| `nsl_tp_world_size` | `() -> i64` | Total device count from env |
-| `nsl_tp_load_sharded_weight` | `(mmap, name, shape, shard_dim, dtype) -> i64` | Load this rank's weight slice via mmap |
+| `nsl_tp_init` | `() -> i64` | Reads `NSL_LOCAL_RANK`, `NSL_WORLD_SIZE`, `NSL_SIMULATED_TP` from env. Inits collective backend. |
+| `nsl_tp_rank` | `() -> i64` | Returns this process's rank (cached from env at init) |
+| `nsl_tp_world_size` | `() -> i64` | Returns total device count (cached from env at init) |
+| `nsl_tp_mmap_open` | `(path_ptr, path_len) -> i64` | Mmap a safetensors file, return opaque handle |
+| `nsl_tp_load_sharded_weight` | `(mmap_handle, name_ptr, name_len, shape_ptr, ndims, shard_dim, dtype) -> i64` | Load this rank's slice. Rank/world_size read internally. |
+| `nsl_tp_mmap_close` | `(mmap_handle) -> i64` | Unmap safetensors file after weights loaded to GPU |
 | `nsl_tp_all_reduce_sum` | `(sendbuf, recvbuf, count, dtype, stream) -> i64` | In-place OK (same ptr for send/recv) |
 | `nsl_tp_all_gather` | `(sendbuf, recvbuf, send_count, dtype, stream) -> i64` | Out-of-place — recvbuf = `world_size * send_count` |
 | `nsl_tp_broadcast` | `(buf, count, dtype, root_rank, stream) -> i64` | Root sends, others receive |
 | `nsl_tp_barrier` | `() -> i64` | Synchronize all ranks |
-| `nsl_tp_destroy` | `() -> i64` | Tear down collective backend |
+| `nsl_tp_destroy` | `() -> i64` | Tear down collective backend + shared memory |
 
-All collective FFI functions accept a `stream` parameter (`*mut c_void` representing `CUstream`). M30 passes `0` (default stream); the parameter exists for M34 (Ring Attention) compute/communication overlap.
+All collective FFI functions accept a `stream` parameter (`StreamHandle = *mut c_void`). M30 passes `null_mut()` (default stream); the parameter exists for M34 (Ring Attention) compute/communication overlap.
+
+**`nsl_tp_init` reads env vars internally** — the compiled code does not need to extract rank/world_size. This matches the SPMD model: each process is identical, differing only by environment.
+
+### Error Handling
+
+All FFI functions return `i64`: 0 = success, non-zero = error code. On non-zero return from any collective:
+- The process calls `nsl_panic` with the error message, aborting immediately
+- The parent CLI detects the non-zero exit code and kills all remaining child processes via `SIGTERM` (Unix) or `TerminateProcess` (Windows)
+- Parent reports which rank failed and the error code
+
+This prevents rank divergence (one rank fails while others hang waiting at the next collective).
+
+### Activation State Across Model Boundaries
+
+Activation states are tracked interprocedurally across model method calls. When the compiler compiles a nested model's `forward()` as a separate Cranelift function, the caller's `DistState` for the input is passed through the call boundary. The return value's `DistState` is determined by the last operation in the callee.
+
+For `@shard` on nested model members (e.g., `layers: [TransformerBlock; N]`): `@shard` is only valid on leaf layer declarations (Linear, Embedding). To shard all sub-layers of a `TransformerBlock`, each sub-layer must have its own `@shard` decorator. This keeps the decorator extraction logic simple and the shard semantics explicit.
+
+**Element-wise ops between identically-sharded tensors** (e.g., SwiGLU gate * up in MLP): valid — both operands have the same `Sharded{dim:1}` state, and the result preserves that state. The activation state rules apply: element-wise ops between `Sharded{dim:X}` and `Sharded{dim:X}` produce `Sharded{dim:X}`. Mismatched shard dims are a compile error.
 
 ### Codegen Flow
 
 ```
-nsl_tp_init(world_size, rank)
+nsl_tp_init()                                   // reads env vars internally
 
-// weight loading — each process loads only its shard via mmap
-nsl_tp_load_sharded_weight(mmap, "embed", [32000,8192], 0, F32)
-nsl_tp_load_sharded_weight(mmap, "q_proj", [8192,8192], 0, F32)
-nsl_tp_load_sharded_weight(mmap, "o_proj", [8192,8192], 1, F32)
+// mmap weight file once
+mmap = nsl_tp_mmap_open("model.safetensors")
+
+// weight loading — each process loads only its shard
+nsl_tp_load_sharded_weight(mmap, "embed", [32000,8192], 0, DTYPE_F32)
+nsl_tp_load_sharded_weight(mmap, "q_proj", [8192,8192], 0, DTYPE_F32)
+nsl_tp_load_sharded_weight(mmap, "o_proj", [8192,8192], 1, DTYPE_F32)
+
+nsl_tp_mmap_close(mmap)                        // weights on GPU, release mmap
 
 // forward pass:
 embed_out = lookup(tokens, embed_shard)        // vocab-parallel
-nsl_tp_all_reduce_sum(embed_out, embed_out, n, F32, 0)  // in-place
+nsl_tp_all_reduce_sum(embed_out, embed_out, n, DTYPE_F32, null)  // in-place
                                                 // state: Replicated
 
 q = matmul(x, q_proj_shard)                    // column-parallel
@@ -239,15 +286,15 @@ q = matmul(x, q_proj_shard)                    // column-parallel
 
 attn_out = attention(q, k, v)                  // per-GPU heads
 out = matmul(attn_out, o_proj_shard)           // row-parallel (input Sharded ✓)
-nsl_tp_all_reduce_sum(out, out, n, F32, 0)     // in-place reduce
+nsl_tp_all_reduce_sum(out, out, n, DTYPE_F32, null)  // in-place reduce
                                                 // state: Replicated
 
 norm_out = layer_norm(out)                     // replicated
 
 // LM head — out-of-place gather
 logit_shard = matmul(norm_out, lm_head_shard)  // column-parallel
-full_logits = alloc(batch * vocab * sizeof(F32))
-nsl_tp_all_gather(logit_shard, full_logits, shard_count, F32, 0)
+full_logits = alloc(batch * vocab * sizeof(f32))
+nsl_tp_all_gather(logit_shard, full_logits, shard_count, DTYPE_F32, null)
                                                 // state: Replicated
 
 nsl_tp_destroy()
@@ -282,11 +329,20 @@ nsl_kv_cache_init_gpu(num_blocks, block_size, my_kv_heads, head_dim, num_layers)
 
 No cross-GPU KV-cache communication during attention — PagedFlashAttention runs independently per process on its head subset.
 
+**No changes to M25 `KvCacheManager` or `BlockAllocator` are needed.** Each process is a regular single-GPU process with fewer heads — the existing API handles this naturally since `num_heads` is already a parameter.
+
 ### StepContext Broadcast (Page Table Synchronization)
 
 Rank 0 is the single source of truth for memory management. It broadcasts a packed `StepContext` — not bare token IDs — to ensure all ranks have identical page table state.
 
 ```rust
+// Fixed-size constants for StepContext. The struct is broadcast via shared
+// memory so its byte size must be deterministic and identical across processes.
+pub const MAX_BATCH: usize = 256;           // max concurrent sequences
+pub const MAX_TOTAL_TOKENS: usize = 32768;  // max tokens per step (prefill chunks + decodes)
+pub const MAX_BLOCK_UPDATES: usize = 4096;  // max new block allocations per step
+// Total struct size: ~330 KB (fits comfortably in shared memory)
+
 #[repr(C)]
 pub struct StepContext {
     pub num_sequences: i32,
@@ -390,6 +446,11 @@ o_proj: Linear(8192, 8192)
 - Validation: `shape[dim] % N == 0` using CLI-provided N
 - `@shard` without `--devices`: compile error `"@shard requires --devices flag"`
 
+**Edge cases:**
+- `--devices 1` with `@shard` decorators: shard with world_size=1 (each shard = full tensor). No collectives emitted. Zero overhead — code is equivalent to non-sharded. This makes `@shard`-annotated code portable.
+- `--devices N` without any `@shard` decorators: silently ignored. All N processes run the same replicated computation. No error — allows testing the SPMD launcher independently.
+- `--devices 0` or negative: CLI error before compilation.
+
 ### E2E Test Strategy
 
 Tests use `SimulatedBackend` (set via `NSL_SIMULATED_TP=1`):
@@ -398,7 +459,9 @@ Tests use `SimulatedBackend` (set via `NSL_SIMULATED_TP=1`):
 |---|---|
 | `m30_tp_basic.nsl` | `serve` block with `@shard` layers, `--devices 2`. Two simulated processes, collective calls via `SimulatedBackend`. Output matches single-device reference. |
 | `m30_shard_validation.nsl` | Compile-time error: `@shard(dim=0)` on layer with size not divisible by `--devices`. Expects compiler error message. |
+| `m30_activation_state_error.nsl` | Compile-time error: row-parallel Linear fed a replicated tensor. Expects `"expected sharded input"` error. |
 | `m30_gqa_replication.nsl` | 32 Q heads, 4 KV heads, `--devices 8`. KV replicated, Q sharded. No division-by-zero crash. |
+| `m30_serve_multi_step.nsl` | Multi-step serve loop with 2+ requests across `--devices 2`. Verifies StepContext broadcast and page table synchronization. |
 
 **Test harness** (`e2e.rs`):
 - New helper `run_nsl_multi(file, devices)` — parent compiles, spawns N children with `NSL_SIMULATED_TP=1`
