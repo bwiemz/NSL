@@ -4,6 +4,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
 
 use nsl_ast::decl::FnDef;
+use nsl_ast::types::{DimExpr as AstDimExpr, TypeExprKind};
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
@@ -41,6 +42,65 @@ impl Compiler<'_> {
                 builder.declare_var(var, cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(param.name, (var, cl_type));
+            }
+
+            // M28: emit runtime assertions for symbolic/bounded dimensions
+            for (i, param) in fn_def.params.iter().enumerate() {
+                let shape = match param.type_ann.as_ref().map(|t| &t.kind) {
+                    Some(TypeExprKind::Tensor { shape, .. })
+                    | Some(TypeExprKind::Param { shape, .. })
+                    | Some(TypeExprKind::Buffer { shape, .. }) => shape,
+                    _ => continue,
+                };
+                let param_val = builder.block_params(entry)[i];
+                for (dim_idx, dim_expr) in shape.iter().enumerate() {
+                    let dim_idx_val = builder.ins().iconst(cl_types::I64, dim_idx as i64);
+                    match dim_expr {
+                        AstDimExpr::Symbolic(sym) => {
+                            if !state.symbolic_dims.is_resolved(sym) {
+                                let neg1 = builder.ins().iconst(cl_types::I64, -1);
+                                let actual = self.compile_call_by_name(
+                                    &mut builder,
+                                    "nsl_tensor_assert_dim",
+                                    &[param_val, dim_idx_val, neg1],
+                                )?;
+                                state.symbolic_dims.resolve(*sym, actual);
+                            } else {
+                                let expected = state.symbolic_dims.get(sym).unwrap();
+                                self.compile_call_by_name(
+                                    &mut builder,
+                                    "nsl_tensor_assert_dim",
+                                    &[param_val, dim_idx_val, expected],
+                                )?;
+                            }
+                        }
+                        AstDimExpr::Bounded { name, upper_bound } => {
+                            if !state.symbolic_dims.is_resolved(name) {
+                                let neg1 = builder.ins().iconst(cl_types::I64, -1);
+                                let actual = self.compile_call_by_name(
+                                    &mut builder,
+                                    "nsl_tensor_assert_dim",
+                                    &[param_val, dim_idx_val, neg1],
+                                )?;
+                                state.symbolic_dims.resolve(*name, actual);
+                            } else {
+                                let expected = state.symbolic_dims.get(name).unwrap();
+                                self.compile_call_by_name(
+                                    &mut builder,
+                                    "nsl_tensor_assert_dim",
+                                    &[param_val, dim_idx_val, expected],
+                                )?;
+                            }
+                            let ub_val = builder.ins().iconst(cl_types::I64, *upper_bound);
+                            self.compile_call_by_name(
+                                &mut builder,
+                                "nsl_tensor_assert_dim_bound",
+                                &[param_val, dim_idx_val, ub_val],
+                            )?;
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // @no_grad: pause tape recording at function entry

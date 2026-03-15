@@ -52,6 +52,8 @@ pub struct FuncState {
     /// True when compiling an expression via the unfused (training) path inside try_auto_fuse.
     /// Prevents infinite recursion when compile_expr re-enters try_auto_fuse.
     pub in_fuse_bypass: bool,
+    /// Tracks resolved symbolic dimensions for M28 dynamic shapes assertions.
+    pub symbolic_dims: crate::dynamic_shapes::SymbolicDimTracker,
 }
 
 impl Default for FuncState {
@@ -74,6 +76,7 @@ impl FuncState {
             in_dtype_method: false,
             dtype_unpack_ret_bitcast: false,
             in_fuse_bypass: false,
+            symbolic_dims: crate::dynamic_shapes::SymbolicDimTracker::new(),
         }
     }
 
