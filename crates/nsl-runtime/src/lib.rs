@@ -54,6 +54,7 @@ pub mod profiling;
 pub mod kernel_profiler;
 pub mod flash_attention;
 pub mod serving;
+pub mod tensor_parallel;
 
 #[cfg(test)]
 mod fuzz;
