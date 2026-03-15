@@ -582,6 +582,12 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
 
 /// Synthesize a fused layernorm PTX kernel using Welford's online algorithm.
 /// Returns null-terminated PTX bytes.
+///
+/// TODO(M31-followup): The cross-warp Welford merge is simplified (adds means then
+/// divides by n_warps). This is only correct when every thread processes the same
+/// number of elements. For hidden_dim not divisible by block_size, use proper
+/// parallel Welford merge: combined_mean = (n1*m1 + n2*m2)/(n1+n2), or switch
+/// to sum-based reduction and divide by hidden_dim at the end.
 pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64, dtype: DType) -> Vec<u8> {
     let block_size: u32 = 256.min(hidden_dim);
     let n_warps: u32 = block_size / 32;

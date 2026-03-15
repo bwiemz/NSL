@@ -29,7 +29,7 @@ fn is_epilogue_eligible(op_name: &str) -> bool {
     matches!(
         op_name,
         "add" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh"
-            | "mul" | "clamp"
+            | "mul"
     )
 }
 

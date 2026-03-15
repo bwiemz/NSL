@@ -109,8 +109,11 @@ impl FusionGraph {
         }
     }
 
-    /// Check if a node can be fused into its producer.
-    pub fn is_fusible_into_producer(&self, node_id: NodeId) -> bool {
+    /// Check if a node is a single-consumer intermediate that can be eliminated
+    /// by fusing it into its sole downstream consumer's kernel.
+    /// Requires: exactly 1 consumer, not a graph output, not @no_fuse,
+    /// not FlashAttention, and not already claimed by a fusion pass.
+    pub fn is_single_consumer_intermediate(&self, node_id: NodeId) -> bool {
         let node = &self.nodes[node_id as usize];
         node.consumers.len() == 1
             && !node.is_graph_output
@@ -197,9 +200,9 @@ mod tests {
         g.build_consumers();
 
         assert_eq!(g.nodes[x as usize].consumers.len(), 2);
-        assert!(!g.is_fusible_into_producer(x)); // multi-consumer -> not fusible
-        assert!(g.is_fusible_into_producer(add)); // exactly 1 consumer -> fusible
-        assert!(!g.is_fusible_into_producer(sub)); // 0 consumers -> not fusible (no downstream to fuse into)
+        assert!(!g.is_single_consumer_intermediate(x)); // multi-consumer -> not fusible
+        assert!(g.is_single_consumer_intermediate(add)); // exactly 1 consumer -> fusible
+        assert!(!g.is_single_consumer_intermediate(sub)); // 0 consumers -> not fusible (no downstream to fuse into)
     }
 
     #[test]
@@ -211,7 +214,7 @@ mod tests {
         g.build_consumers();
 
         // relu is graph output — even with 0 consumers, is_fusible checks is_graph_output
-        assert!(!g.is_fusible_into_producer(relu));
+        assert!(!g.is_single_consumer_intermediate(relu));
     }
 
     #[test]
@@ -221,7 +224,7 @@ mod tests {
         let fa = g.add_node(FusionOp::FlashAttention, vec![x]);
         g.build_consumers();
 
-        assert!(!g.is_fusible_into_producer(fa));
+        assert!(!g.is_single_consumer_intermediate(fa));
     }
 
     #[test]
@@ -232,7 +235,7 @@ mod tests {
         g.mark_no_fuse(mm);
         g.build_consumers();
 
-        assert!(!g.is_fusible_into_producer(mm));
+        assert!(!g.is_single_consumer_intermediate(mm));
     }
 
     #[test]
@@ -283,11 +286,11 @@ mod tests {
         g.build_consumers();
 
         // Before marking as fused
-        assert!(g.is_fusible_into_producer(relu));
+        assert!(g.is_single_consumer_intermediate(relu));
 
         // After marking
         g.nodes[relu as usize].fused_into = Some(0);
-        assert!(!g.is_fusible_into_producer(relu));
+        assert!(!g.is_single_consumer_intermediate(relu));
     }
 
     #[test]
