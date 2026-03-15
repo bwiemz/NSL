@@ -569,3 +569,12 @@ fn e2e_m29_continuous_batch() {
 fn e2e_m29_preemption() {
     assert_output_matches("m29_preemption");
 }
+
+// ---------------------------------------------------------------------------
+// M30: Tensor parallelism
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m30_tp_basic() {
+    assert_output_matches("m30_tp_basic");
+}
