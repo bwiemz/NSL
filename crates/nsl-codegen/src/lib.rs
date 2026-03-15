@@ -5,6 +5,7 @@ pub mod context;
 pub mod error;
 pub mod expr;
 pub mod func;
+pub mod dynamic_shapes;
 pub mod flash_attention;
 pub mod fusion;
 pub mod kernel;
