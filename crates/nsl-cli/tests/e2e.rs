@@ -578,3 +578,8 @@ fn e2e_m29_preemption() {
 fn e2e_m30_tp_basic() {
     assert_output_matches("m30_tp_basic");
 }
+
+#[test]
+fn e2e_m30_shard_validation() {
+    assert_output_matches("m30_shard_validation");
+}

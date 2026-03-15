@@ -1,0 +1,10 @@
+# M30: @shard decorator validation — verify shard info extraction on model layers
+
+model ShardedModel:
+    @shard(dim=0)
+    layer: int = 0
+
+    fn forward(self, x):
+        let y = self.layer
+
+print("Shard validation OK")
