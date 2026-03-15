@@ -132,6 +132,17 @@ impl Type {
     }
 }
 
+/// Arithmetic expression over symbolic dimensions.
+/// Tracks how dimensions compose through reshape/concat/split.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DimExpr {
+    Sym(Symbol),
+    Lit(i64),
+    Add(Box<DimExpr>, Box<DimExpr>),
+    Mul(Box<DimExpr>, Box<DimExpr>),
+    Div(Box<DimExpr>, Box<DimExpr>),
+}
+
 /// Resolved dimension in a tensor shape.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dim {
@@ -141,6 +152,10 @@ pub enum Dim {
     Symbolic(Symbol),
     /// Named dimension with a label and optional concrete/symbolic size.
     Named { name: Symbol, size: Box<Dim> },
+    /// Bounded symbolic: resolved at runtime, with compile-time upper bound.
+    Bounded { name: Symbol, upper_bound: i64 },
+    /// Computed: arithmetic over other dims (e.g. from reshape).
+    Computed(Box<DimExpr>),
     /// Wildcard: unchecked.
     Wildcard,
 }
@@ -162,6 +177,11 @@ impl Shape {
 
     pub fn scalar() -> Self {
         Shape { dims: Vec::new() }
+    }
+
+    /// Returns true if any dimension is symbolic, bounded, or computed.
+    pub fn has_symbolic(&self) -> bool {
+        self.dims.iter().any(|d| matches!(d, Dim::Symbolic(_) | Dim::Bounded { .. } | Dim::Computed(_)))
     }
 }
 
