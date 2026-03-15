@@ -39,7 +39,7 @@ struct FusionNode {
     is_graph_output: bool,         // referenced by return — must materialize
     fused_into: Option<FusedKernelId>,  // None = unclaimed, Some = already fused
     shape: Option<Vec<usize>>,     // resolved from semantic type_map
-    dtype: Option<DtypeId>,        // resolved from semantic type_map
+    dtype: Option<nsl_semantic::types::DType>,  // resolved from semantic type_map
 }
 
 enum FusionOp {
@@ -100,16 +100,18 @@ Graph outputs must always materialize to global memory. A fused kernel that incl
 Each `FusionNode` caches resolved tensor shape and dtype from the semantic analysis phase (via `type_map` lookup during DAG construction). This enables the fusion report to compute bytes saved without re-deriving shapes:
 
 ```rust
-fn bytes_saved(node: &FusionNode) -> u64 {
+fn node_bytes(node: &FusionNode) -> u64 {
     match (&node.shape, &node.dtype) {
         (Some(shape), Some(dtype)) => {
             let elements: u64 = shape.iter().map(|&d| d as u64).product();
-            elements * dtype_byte_width(*dtype) as u64 * 2  // one write + one read eliminated
+            elements * dtype.byte_width() as u64  // size of one materialization
         }
         _ => 0,
     }
 }
 ```
+
+The `DType::byte_width()` method already exists in the semantic types module. The fusion report aggregates bytes saved across all eliminated intermediates in a fused chain: for an epilogue chain eliminating N intermediate nodes, total savings = `sum(node_bytes(n) * 2 for n in eliminated)` (one write + one read per eliminated materialization).
 
 ### Construction
 
@@ -150,6 +152,8 @@ enum EpilogueOp {
     Clamp { min_node: NodeId, max_node: NodeId },
 }
 ```
+
+**Note on activation eligibility:** Epilogue fusion uses its own eligibility check, separate from M26's `is_fusible_op()` in `fusion.rs`. The M26 list covers ops that the elementwise PTX synthesizer can generate. Epilogue fusion supports a different set — specifically `gelu` and `silu` which are NOT in M26's list (they require multi-instruction sequences like tanh approximation). The epilogue synthesizer emits these as inline f32 PTX sequences directly in the matmul kernel's output section. M26's `fusion.rs` is not modified to add gelu/silu — that would be a separate enhancement orthogonal to M31.
 
 ### Broadcast Dimension Resolution
 
@@ -327,6 +331,10 @@ Template structure:
 - **LayerNorm**: Welford's online algorithm for numerically stable mean+variance, then normalize + affine
 - **RMSNorm**: Single pass computes mean of squares, second pass normalizes and scales
 
+### Builtin `softmax()` / `layernorm()` Calls
+
+If the user writes `softmax(x)` as a single builtin call rather than the expanded form, the DAG builder categorizes it as `FusionOp::Reduction("softmax")`. The reduction pattern matcher recognizes single-node builtins as pre-matched patterns — they emit the same fused PTX template without needing to trace a multi-node subgraph. Similarly for `layernorm(x, gamma, beta, eps)` if added as a builtin.
+
 ### Naive Softmax Diagnostic
 
 When the compiler detects and replaces naive softmax, it emits a warning on stderr:
@@ -346,6 +354,8 @@ warning: numerically unstable softmax replaced with safe max-subtraction form
 ## Section 4: `@fuse_graph` Decorator & Fusion Report
 
 ### `@fuse_graph` Decorator
+
+**Relationship to `@fuse` (M26):** The existing `@fuse` decorator from M26 marks functions for elementwise-only fusion with validation that the function body contains only fusible pointwise ops (enforced by `validate_fuse_body()` in compiler.rs). `@fuse_graph` is a new, separate decorator that enables all three fusion strategies (reduction, epilogue, elementwise) without restricting the function body. `@fuse` remains as-is for backward compatibility — it guarantees the function is purely elementwise. `@fuse_graph` is the superset: it handles matmul, reductions, and elementwise ops. Both decorators cannot be applied to the same function (semantic error).
 
 User-decorated functions get all fusion strategies applied to their body:
 
@@ -382,6 +392,8 @@ fn debug_forward(x, W):
 ```
 
 The DAG builder marks `@no_fuse` nodes as fusion barriers. The node's output must materialize to global memory regardless of consumer count.
+
+**AST integration:** The `VarDecl` variant in `StmtKind` already has a `decorators: Vec<Decorator>` field, but the semantic checker's decorator validation loop currently only handles decorators on `FnDef`, `ModelDef`, and `KernelDef`. M31 must extend the checker to validate `@no_fuse` on `VarDecl` statements — accepting it as valid and rejecting any other decorator on let-bindings. The codegen's DAG builder then reads `VarDecl.decorators` to detect `@no_fuse`.
 
 ### `@fuse_graph` as Logging Gate
 
@@ -521,6 +533,12 @@ struct DynamicReductionDispatch {
 }
 ```
 
+**Runtime dispatch mechanism:** The compiler emits Cranelift IR that implements a runtime `switch` over the actual hidden_dim value (resolved from the symbolic dimension at runtime). Each case loads and launches the corresponding pre-compiled PTX variant via `cuModuleLoadData` + `cuLaunchKernel`. The dispatch is a Cranelift-level `br_table` (indirect branch table), not PTX-level branching — each variant is a complete, independent PTX module.
+
+When `fallback_unfused` is true and the runtime hidden_dim doesn't match any pre-compiled variant, the compiler emits the original unfused kernel calls (separate reduce_max, exp, reduce_sum, div for softmax) as the default branch. This guarantees correctness for any dimension while optimizing the common cases.
+
+All PTX variants are compiled and embedded at build time (AOT). There is no JIT compilation at runtime — the dispatch only selects which pre-built kernel to launch.
+
 ### File Structure
 
 **New files:**
@@ -538,8 +556,8 @@ struct DynamicReductionDispatch {
 |---|---|
 | `crates/nsl-codegen/src/lib.rs` | Module declarations, `fusion_report` in `CompileOptions` |
 | `crates/nsl-codegen/src/compiler.rs` | `fusion_events`, `fusion_barriers`, `fusion_report_enabled` fields; 3-pass fusion pipeline |
-| `crates/nsl-codegen/src/expr.rs` | `try_auto_fuse()` emits fused kernel launches from DAG |
-| `crates/nsl-codegen/src/fusion.rs` | Respect `fused_into` so M26 pass skips claimed nodes |
+| `crates/nsl-codegen/src/expr.rs` | M31 replaces M26's `try_auto_fuse()` with DAG-based fusion. The current M26 implementation (AST-walk, returns `Ok(None)`) is superseded by the DAG pipeline. The function becomes the entry point that: (1) builds a `FusionGraph` for the current function, (2) runs the 3-pass pipeline, (3) emits fused kernel launches for claimed subgraphs and falls through to normal codegen for unclaimed nodes. |
+| `crates/nsl-codegen/src/fusion.rs` | Respect `fused_into` so M26 elementwise pass (now pass 3) skips nodes claimed by reduction/epilogue passes. The existing M26 `analyze_fusible_chain()` + `try_synthesize_fused()` remain unchanged — they continue to handle generic pointwise chains. Note: the known M26 limitation (binary op register allocation incorrect for 3+ input chains) is orthogonal to M31 — epilogue fusion writes its own PTX and does not use M26's `synthesize_fused_ptx()`. |
 | `crates/nsl-semantic/src/checker.rs` | Validate `@fuse_graph` and `@no_fuse` decorators |
 | `crates/nsl-cli/src/main.rs` | `--fusion-report` flag, wire to `CompileOptions` |
 | `crates/nsl-cli/tests/e2e.rs` | M31 E2E test functions |
