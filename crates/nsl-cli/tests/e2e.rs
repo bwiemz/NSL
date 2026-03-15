@@ -550,3 +550,22 @@ fn e2e_m28_bounded_dims() {
 fn e2e_m28_dim_unification() {
     assert_output_matches("m28_dim_unification");
 }
+
+// ---------------------------------------------------------------------------
+// M29: Continuous batching & serving engine
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m29_serve_basic() {
+    assert_output_matches("m29_serve_basic");
+}
+
+#[test]
+fn e2e_m29_continuous_batch() {
+    assert_output_matches("m29_continuous_batch");
+}
+
+#[test]
+fn e2e_m29_preemption() {
+    assert_output_matches("m29_preemption");
+}

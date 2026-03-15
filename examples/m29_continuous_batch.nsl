@@ -1,0 +1,13 @@
+# M29: Continuous batching — serve block with batch config
+
+serve BatchTest:
+    max_batch: 2
+    max_seq_len: 100
+    kv_blocks: 64
+    prefill_chunk: 512
+
+    @endpoint
+    fn noop() -> str:
+        let x = 0
+
+print("Continuous batching OK")

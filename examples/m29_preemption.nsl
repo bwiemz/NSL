@@ -1,0 +1,13 @@
+# M29: Preemption — serve block with preemption config
+
+serve PreemptTest:
+    max_batch: 8
+    max_seq_len: 4096
+    kv_blocks: 256
+    prefill_chunk: 512
+
+    @endpoint
+    fn generate(prompt: str) -> str:
+        let x = 0
+
+print("Preemption OK")

@@ -1,0 +1,13 @@
+# M29: Basic serve block — verify parse, compile, and init/destroy lifecycle
+
+serve TestServer:
+    max_batch: 4
+    max_seq_len: 512
+    kv_blocks: 64
+    prefill_chunk: 128
+
+    @endpoint
+    fn process(prompt: str) -> str:
+        let x = 0
+
+print("Serve basic OK")
