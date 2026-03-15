@@ -611,6 +611,16 @@ mod tests {
     }
 
     #[test]
+    fn test_is_fusible_op_unchanged() {
+        // Verify M26 fusible ops list is unchanged
+        assert!(is_fusible_op("add"));
+        assert!(is_fusible_op("relu"));
+        assert!(!is_fusible_op("matmul"));
+        assert!(!is_fusible_op("gelu")); // NOT in M26 list (handled by epilogue)
+        assert!(!is_fusible_op("silu")); // NOT in M26 list
+    }
+
+    #[test]
     fn test_single_op_not_fused() {
         use nsl_ast::expr::*;
         use nsl_ast::{NodeId, Span, Symbol};
