@@ -10,6 +10,7 @@ pub mod flash_attention;
 pub mod fusion;
 pub mod kernel;
 pub mod linker;
+pub mod serve;
 pub mod standalone;
 pub mod stmt;
 pub mod types;

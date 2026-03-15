@@ -316,6 +316,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         types::I64, types::I64, types::I64, types::I64,              // num_tokens, num_heads, head_dim, block_size
         types::I64, types::I64,                                       // ptx_ptr, name_ptr
     ], Some(types::I64)),
+    // M29: Serving engine
+    ("nsl_serve_init",             &[types::I64, types::I64, types::I64, types::I64],       Some(types::I64)),
+    ("nsl_serve_enqueue",          &[types::I64, types::I64, types::I64, types::F64, types::F64],  Some(types::I64)),
+    ("nsl_serve_step",             &[],                         Some(types::I64)),
+    ("nsl_serve_record_token",     &[types::I64, types::I64],                 Some(types::I64)),
+    ("nsl_serve_drain_completed",  &[],                         Some(types::I64)),
+    ("nsl_serve_has_work",         &[],                         Some(types::I64)),
+    ("nsl_serve_completed_count",  &[],                         Some(types::I64)),
+    ("nsl_serve_preempt",          &[types::I64],                      Some(types::I64)),
+    ("nsl_serve_destroy",          &[],                         Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

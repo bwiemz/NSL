@@ -265,15 +265,6 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn compile_serve_block(
-        &mut self,
-        _builder: &mut FunctionBuilder,
-        _state: &mut FuncState,
-        _serve: &nsl_ast::block::ServeBlock,
-    ) -> Result<(), CodegenError> {
-        Ok(())
-    }
-
     fn compile_assign(
         &mut self,
         builder: &mut FunctionBuilder,
