@@ -111,6 +111,12 @@ pub struct Compiler<'a> {
     pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
     /// M30: Tensor parallelism world size (number of devices)
     pub world_size: usize,
+    /// M31: Collected fusion optimization events for --fusion-report
+    pub fusion_events: Vec<crate::fusion_report::FusionEvent>,
+    /// M31: Collected fusion barrier events for --fusion-report
+    pub fusion_barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
+    /// M31: Whether fusion event collection is enabled
+    pub fusion_report_enabled: bool,
     func_index: u32,
 }
 
@@ -179,6 +185,9 @@ impl<'a> Compiler<'a> {
             shard_configs: HashMap::new(),
             activation_states: HashMap::new(),
             world_size: 1,
+            fusion_events: Vec::new(),
+            fusion_barriers: Vec::new(),
+            fusion_report_enabled: false,
             func_index: 0,
         })
     }
@@ -198,6 +207,16 @@ impl<'a> Compiler<'a> {
         let idx = self.func_index;
         self.func_index += 1;
         idx
+    }
+
+    // NOTE: --fusion-report is dormant until CompileOptions is threaded through
+    // compile_entry(). The CLI flag and report formatting are complete, but
+    // fusion_report_enabled is never set to true. This is a known M26-followup gap.
+    // TODO(M31-followup): Wire compile_options.fusion_report to compiler.fusion_report_enabled
+
+    /// Enable fusion report collection (called when --fusion-report or @fuse_graph is present).
+    pub fn enable_fusion_report(&mut self) {
+        self.fusion_report_enabled = true;
     }
 
     /// Resolve a type name (from AST annotation) to a Cranelift type.
