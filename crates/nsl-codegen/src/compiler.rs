@@ -2644,5 +2644,9 @@ pub fn compile_entry(
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
+    // M31: Print fusion report if enabled
+    if compiler.fusion_report_enabled {
+        crate::fusion_report::print_fusion_report(&compiler.fusion_events, &compiler.fusion_barriers);
+    }
     compiler.finalize()
 }
