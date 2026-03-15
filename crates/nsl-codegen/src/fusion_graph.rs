@@ -289,4 +289,83 @@ mod tests {
         g.nodes[relu as usize].fused_into = Some(0);
         assert!(!g.is_fusible_into_producer(relu));
     }
+
+    #[test]
+    fn test_pass_ordering_reduction_before_epilogue() {
+        // Softmax pattern should be claimed by reduction pass,
+        // preventing the elementwise pass from stealing exp/div nodes.
+        use crate::epilogue_fusion::detect_epilogue_chains;
+        use crate::reduction_fusion::{detect_reduction_patterns, apply_reduction_fusion};
+
+        let mut g = FusionGraph::new();
+        let x = g.add_named_node("x".into(), FusionOp::Input, vec![]);
+        let rmax = g.add_node(FusionOp::Reduction("reduce_max".into()), vec![x]);
+        g.set_type_info(rmax, vec![1024], DType::F32);
+        let sub = g.add_node(FusionOp::Elementwise("sub".into()), vec![x, rmax]);
+        let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![sub]);
+        let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
+        g.set_type_info(rsum, vec![1024], DType::F32);
+        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+        g.mark_graph_output(div);
+        g.build_consumers();
+
+        // Pass 1: Reduction fusion claims the softmax nodes
+        let reduction_matches = detect_reduction_patterns(&g);
+        assert_eq!(reduction_matches.len(), 1);
+        apply_reduction_fusion(&mut g, &reduction_matches, 0);
+
+        // Pass 2: Epilogue fusion should find nothing (no matmul, and nodes are claimed)
+        let epilogue_chains = detect_epilogue_chains(&g);
+        assert_eq!(epilogue_chains.len(), 0);
+
+        // Verify claimed nodes
+        assert!(g.nodes[div as usize].fused_into.is_some());
+        assert!(g.nodes[exp as usize].fused_into.is_some());
+    }
+
+    #[test]
+    fn test_pass_ordering_mixed_graph() {
+        // Graph with matmul+relu feeding into softmax.
+        // Reduction claims softmax nodes (div, exp, rsum, sub, rmax).
+        // Epilogue then finds matmul+relu as a 1-op epilogue chain:
+        // relu is not claimed by reduction, so epilogue fusion captures it.
+        // The chain stops at relu (2 consumers: rmax + sub), but relu is still
+        // added as an Activation epilogue op before the consumer check halts iteration.
+        use crate::epilogue_fusion::detect_epilogue_chains;
+        use crate::reduction_fusion::{detect_reduction_patterns, apply_reduction_fusion};
+
+        let mut g = FusionGraph::new();
+        // Matmul + relu path
+        let a = g.add_named_node("A".into(), FusionOp::Input, vec![]);
+        let w = g.add_named_node("W".into(), FusionOp::Input, vec![]);
+        let mm = g.add_node(FusionOp::Matmul, vec![a, w]);
+        g.set_type_info(mm, vec![1024, 768], DType::F32);
+        let relu = g.add_node(FusionOp::Elementwise("relu".into()), vec![mm]);
+
+        // Softmax path (on relu output)
+        let rmax = g.add_node(FusionOp::Reduction("reduce_max".into()), vec![relu]);
+        g.set_type_info(rmax, vec![1024], DType::F32);
+        let sub = g.add_node(FusionOp::Elementwise("sub".into()), vec![relu, rmax]);
+        let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![sub]);
+        let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
+        g.set_type_info(rsum, vec![1024], DType::F32);
+        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+        g.mark_graph_output(div);
+        g.build_consumers();
+
+        // Pass 1: Reduction claims softmax nodes (div, exp, rsum, sub, rmax)
+        let red = detect_reduction_patterns(&g);
+        apply_reduction_fusion(&mut g, &red, 0);
+
+        // Pass 2: Epilogue finds matmul+relu (relu is unclaimed; 2 consumers halt
+        // iteration but relu is already collected as an Activation epilogue op).
+        let epi = detect_epilogue_chains(&g);
+        assert_eq!(epi.len(), 1);
+        assert_eq!(epi[0].matmul_node, mm);
+        assert_eq!(epi[0].output_node, relu);
+
+        // Softmax nodes remain claimed by reduction kernel 0
+        assert!(g.nodes[div as usize].fused_into.is_some());
+        assert!(g.nodes[exp as usize].fused_into.is_some());
+    }
 }

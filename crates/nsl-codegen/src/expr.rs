@@ -3485,6 +3485,10 @@ impl Compiler<'_> {
     /// Attempt auto-fusion on an expression. Called from compile_expr() before
     /// normal dispatch for BinaryOp and Call nodes.
     /// Returns Ok(Some(val)) if fused, Ok(None) to fall through to normal compile.
+    ///
+    /// M31: Builds a FusionGraph and runs the 3-pass pipeline (reduction → epilogue
+    /// → elementwise). Currently analysis-only: collects fusion events for the report
+    /// but falls through to normal codegen. Fused kernel emission is a follow-up.
     fn try_auto_fuse(
         &mut self,
         _builder: &mut FunctionBuilder,
@@ -3492,7 +3496,7 @@ impl Compiler<'_> {
         expr: &Expr,
     ) -> Result<Option<Value>, CodegenError> {
         if state.in_fuse_bypass {
-            return Ok(None); // Prevent infinite recursion
+            return Ok(None);
         }
 
         let interner = self.interner;
@@ -3501,12 +3505,14 @@ impl Compiler<'_> {
         };
 
         if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve) {
-            // Fusible chain detected: ops={ops:?}, inputs={inputs.len()}
-            // For now, fall through to unfused compilation (always correct).
-            // TODO(M26): emit training branch + fused kernel launch for auto-fusion
-            let _ = (ops, inputs); // suppress unused warnings
+            // M26 fusible chain detected — fall through for now
+            let _ = (ops, inputs);
         }
 
-        Ok(None) // Fall through to normal compilation
+        // M31: Full DAG-based fusion is invoked at function level, not per-expression.
+        // See compile_user_functions() for the function-level pipeline.
+        // Per-expression try_auto_fuse remains as M26 fallback.
+
+        Ok(None)
     }
 }
