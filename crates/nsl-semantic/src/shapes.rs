@@ -158,6 +158,34 @@ pub fn unify_dim(a: &Dim, b: &Dim) -> Option<Dim> {
         (Dim::Named { size, .. }, other) | (other, Dim::Named { size, .. }) => {
             unify_dim(size, other)
         }
+
+        // Bounded unifies with Concrete if value is within bound
+        (Dim::Bounded { upper_bound, .. }, Dim::Concrete(n))
+        | (Dim::Concrete(n), Dim::Bounded { upper_bound, .. }) => {
+            if *n <= *upper_bound { Some(Dim::Concrete(*n)) } else { None }
+        }
+
+        // Bounded unifies with same-named Symbolic → keeps bound
+        (Dim::Bounded { name: n1, upper_bound }, Dim::Symbolic(n2))
+        | (Dim::Symbolic(n2), Dim::Bounded { name: n1, upper_bound }) if n1 == n2 => {
+            Some(Dim::Bounded { name: *n1, upper_bound: *upper_bound })
+        }
+
+        // Bounded unifies with different Symbolic → None
+        (Dim::Bounded { .. }, Dim::Symbolic(_))
+        | (Dim::Symbolic(_), Dim::Bounded { .. }) => None,
+
+        // Two Bounded with same name → take tighter (smaller) bound
+        (Dim::Bounded { name: n1, upper_bound: u1 }, Dim::Bounded { name: n2, upper_bound: u2 })
+            if n1 == n2 => {
+            Some(Dim::Bounded { name: *n1, upper_bound: *u1.min(u2) })
+        }
+
+        // Two Bounded with different names → None
+        (Dim::Bounded { .. }, Dim::Bounded { .. }) => None,
+
+        // Computed: treat as Wildcard for now (runtime-checked)
+        (Dim::Computed(_), _) | (_, Dim::Computed(_)) => Some(Dim::Wildcard),
     }
 }
 
@@ -176,6 +204,8 @@ pub fn fmt_dim(d: &Dim) -> String {
         Dim::Symbolic(_) => "<symbolic>".into(),
         Dim::Named { .. } => "<named>".into(),
         Dim::Wildcard => "_".into(),
+        Dim::Bounded { upper_bound, .. } => format!("<{}", upper_bound),
+        Dim::Computed(_) => "<computed>".into(),
     }
 }
 
@@ -348,6 +378,45 @@ mod tests {
         assert_eq!(
             result.dims,
             vec![Dim::Concrete(3), Dim::Concrete(4)]
+        );
+    }
+
+    #[test]
+    fn unify_bounded_with_concrete() {
+        let sym = make_sym(10);
+        assert_eq!(
+            unify_dim(&Dim::Bounded { name: sym, upper_bound: 4096 }, &Dim::Concrete(512)),
+            Some(Dim::Concrete(512))
+        );
+    }
+
+    #[test]
+    fn unify_bounded_with_concrete_exceeds() {
+        let sym = make_sym(10);
+        assert_eq!(
+            unify_dim(&Dim::Bounded { name: sym, upper_bound: 4096 }, &Dim::Concrete(8192)),
+            None
+        );
+    }
+
+    #[test]
+    fn unify_bounded_with_symbolic() {
+        let sym = make_sym(10);
+        assert_eq!(
+            unify_dim(&Dim::Bounded { name: sym, upper_bound: 4096 }, &Dim::Symbolic(sym)),
+            Some(Dim::Bounded { name: sym, upper_bound: 4096 })
+        );
+    }
+
+    #[test]
+    fn unify_two_bounded_same_name() {
+        let sym = make_sym(10);
+        assert_eq!(
+            unify_dim(
+                &Dim::Bounded { name: sym, upper_bound: 4096 },
+                &Dim::Bounded { name: sym, upper_bound: 2048 }
+            ),
+            Some(Dim::Bounded { name: sym, upper_bound: 2048 })
         );
     }
 }
