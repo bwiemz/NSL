@@ -368,4 +368,67 @@ mod tests {
         assert!(g.nodes[div as usize].fused_into.is_some());
         assert!(g.nodes[exp as usize].fused_into.is_some());
     }
+
+    #[test]
+    fn test_full_pipeline_transformer_block() {
+        // Simulates a transformer attention block:
+        // matmul(Q, K^T) -> softmax -> matmul(attn, V) -> bias + relu
+        use crate::epilogue_fusion::{detect_epilogue_chains, apply_epilogue_fusion};
+        use crate::reduction_fusion::{detect_reduction_patterns, apply_reduction_fusion};
+
+        let mut g = FusionGraph::new();
+        let q = g.add_named_node("Q".into(), FusionOp::Input, vec![]);
+        let k = g.add_named_node("K".into(), FusionOp::Input, vec![]);
+        let v = g.add_named_node("V".into(), FusionOp::Input, vec![]);
+        let bias = g.add_named_node("bias".into(), FusionOp::Input, vec![]);
+        g.set_type_info(bias, vec![64], DType::F32);
+
+        // QK^T
+        let qk = g.add_node(FusionOp::Matmul, vec![q, k]);
+        g.set_type_info(qk, vec![32, 64, 64], DType::F32);
+
+        // Softmax(QK^T)
+        let rmax = g.add_node(FusionOp::Reduction("reduce_max".into()), vec![qk]);
+        g.set_type_info(rmax, vec![32, 64, 1], DType::F32);
+        let sub = g.add_node(FusionOp::Elementwise("sub".into()), vec![qk, rmax]);
+        let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![sub]);
+        let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
+        g.set_type_info(rsum, vec![32, 64, 1], DType::F32);
+        let div = g.add_node(FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+
+        // attn @ V
+        let av = g.add_node(FusionOp::Matmul, vec![div, v]);
+        g.set_type_info(av, vec![32, 64, 64], DType::F32);
+
+        // bias + relu
+        let add = g.add_node(FusionOp::Elementwise("add".into()), vec![av, bias]);
+        let relu = g.add_named_node("out".into(), FusionOp::Elementwise("relu".into()), vec![add]);
+        g.mark_graph_output(relu);
+        g.build_consumers();
+
+        // Pass 1: Reduction fusion
+        let red_matches = detect_reduction_patterns(&g);
+        let softmax_count = red_matches.iter().filter(|m| m.pattern == "softmax").count();
+        assert_eq!(softmax_count, 1);
+        apply_reduction_fusion(&mut g, &red_matches, 0);
+
+        // Pass 2: Epilogue fusion
+        let epi_chains = detect_epilogue_chains(&g);
+        // qk matmul has 2 consumers (rmax + sub) -> no epilogue
+        // av matmul has 1 consumer (add) -> should detect epilogue chain
+        assert_eq!(epi_chains.len(), 1);
+        assert_eq!(epi_chains[0].matmul_node, av);
+        apply_epilogue_fusion(&mut g, &epi_chains, 100);
+
+        // Verify: softmax nodes claimed by kernel 0, epilogue by kernel 100
+        assert!(g.nodes[rmax as usize].fused_into.is_some());
+        assert!(g.nodes[div as usize].fused_into.is_some());
+        assert_eq!(g.nodes[av as usize].fused_into, Some(100));
+        assert_eq!(g.nodes[add as usize].fused_into, Some(100));
+        assert_eq!(g.nodes[relu as usize].fused_into, Some(100));
+
+        // Unclaimed: q, k, v, bias (inputs), qk (matmul with multi-consumer)
+        assert!(g.nodes[q as usize].fused_into.is_none());
+        assert!(g.nodes[qk as usize].fused_into.is_none());
+    }
 }
