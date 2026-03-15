@@ -76,6 +76,8 @@ pub enum DimExpr {
     Symbolic(Symbol),
     /// Named dimension: batch="B", heads=12
     Named { name: Symbol, value: DimValue },
+    /// Bounded symbolic dimension: SeqLen < 4096
+    Bounded { name: Symbol, upper_bound: i64 },
     /// Wildcard: _
     Wildcard,
 }
