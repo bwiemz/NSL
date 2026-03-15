@@ -206,6 +206,21 @@ pub enum DType {
     Unknown,
 }
 
+impl DType {
+    /// Returns the size in bytes of one element of this dtype.
+    /// Custom and Unknown return 0 (size not known at compile time).
+    pub fn byte_width(&self) -> usize {
+        match self {
+            DType::F64 | DType::Int64 => 8,
+            DType::F32 | DType::Int32 => 4,
+            DType::Fp16 | DType::Bf16 | DType::Int16 => 2,
+            DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Uint8 | DType::Bool => 1,
+            DType::Int4 => 1, // sub-byte; round up
+            DType::Custom(_) | DType::Unknown => 0,
+        }
+    }
+}
+
 /// Resolved device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Device {
@@ -524,5 +539,37 @@ mod tests {
     fn wider_dtype_mixed() {
         assert_eq!(wider_dtype(DType::Fp16, DType::F32), DType::F32);
         assert_eq!(wider_dtype(DType::F32, DType::Fp16), DType::F32);
+    }
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::DType;
+
+    #[test]
+    fn test_byte_width_standard_types() {
+        assert_eq!(DType::F64.byte_width(), 8);
+        assert_eq!(DType::F32.byte_width(), 4);
+        assert_eq!(DType::Fp16.byte_width(), 2);
+        assert_eq!(DType::Bf16.byte_width(), 2);
+        assert_eq!(DType::Int64.byte_width(), 8);
+        assert_eq!(DType::Int32.byte_width(), 4);
+        assert_eq!(DType::Int16.byte_width(), 2);
+        assert_eq!(DType::Int8.byte_width(), 1);
+        assert_eq!(DType::Uint8.byte_width(), 1);
+        assert_eq!(DType::Bool.byte_width(), 1);
+    }
+
+    #[test]
+    fn test_byte_width_small_types() {
+        assert_eq!(DType::Fp8E4m3.byte_width(), 1);
+        assert_eq!(DType::Fp8E5m2.byte_width(), 1);
+        assert_eq!(DType::Int4.byte_width(), 1); // rounds up to 1 byte
+    }
+
+    #[test]
+    fn test_byte_width_special() {
+        assert_eq!(DType::Custom(256).byte_width(), 0);
+        assert_eq!(DType::Unknown.byte_width(), 0);
     }
 }
