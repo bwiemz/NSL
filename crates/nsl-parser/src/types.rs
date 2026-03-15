@@ -287,6 +287,28 @@ fn parse_dim_expr(p: &mut Parser) -> DimExpr {
                         DimExpr::Symbolic(sym.into())
                     }
                 }
+            } else if p.eat(&TokenKind::Lt) {
+                // Bounded dim: SeqLen < 4096
+                match p.peek().clone() {
+                    TokenKind::IntLiteral(v) => {
+                        p.advance();
+                        DimExpr::Bounded {
+                            name: sym.into(),
+                            upper_bound: v,
+                        }
+                    }
+                    _ => {
+                        p.diagnostics.push(
+                            nsl_errors::Diagnostic::error(format!(
+                                "expected integer literal after '<' in bounded dimension, found {}",
+                                p.peek()
+                            ))
+                            .with_label(p.current_span(), "expected integer"),
+                        );
+                        p.advance();
+                        DimExpr::Symbolic(sym.into())
+                    }
+                }
             } else {
                 DimExpr::Symbolic(sym.into())
             }
