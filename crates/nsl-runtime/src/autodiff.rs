@@ -21,7 +21,19 @@ use crate::tensor::{
     nsl_tensor_sum_dim,
     nsl_tensor_transpose as tensor_transpose,
     nsl_tensor_zeros as tensor_zeros,
+    nsl_tensor_ones,
 };
+
+/// Create a ones tensor from a shape slice (avoids dereferencing a raw tensor pointer).
+fn ones_from_shape(shape: &[i64]) -> i64 {
+    let shape_list = crate::list::nsl_list_new();
+    for &dim in shape {
+        crate::list::nsl_list_push(shape_list, dim);
+    }
+    let result = nsl_tensor_ones(shape_list);
+    crate::list::nsl_list_free(shape_list);
+    result
+}
 
 /// Operations recorded on the tape during forward passes inside `grad` blocks.
 #[allow(dead_code)]
@@ -1528,7 +1540,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     if *dim == -1 {
                         // Global reduction: g is scalar, broadcast to input shape
                         let scalar_val = tensor_item(g);
-                        let ones = ones_like(*a);
+                        let ones = ones_from_shape(input_shape);
                         let grad_a = tensor_mul_scalar(ones, scalar_val);
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1544,7 +1556,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     if *dim == -1 {
                         // Global reduction
                         let scalar_val = tensor_item(g);
-                        let ones = ones_like(*a);
+                        let ones = ones_from_shape(input_shape);
                         let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64));
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);

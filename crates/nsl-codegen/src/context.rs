@@ -54,6 +54,9 @@ pub struct FuncState {
     pub in_fuse_bypass: bool,
     /// Tracks resolved symbolic dimensions for M28 dynamic shapes assertions.
     pub symbolic_dims: crate::dynamic_shapes::SymbolicDimTracker,
+    /// True when compiling a train block step body (inside tape recording).
+    /// Suppresses freeing tensor temporaries since backward needs them alive.
+    pub in_tape_region: bool,
 }
 
 impl Default for FuncState {
@@ -77,6 +80,7 @@ impl FuncState {
             dtype_unpack_ret_bitcast: false,
             in_fuse_bypass: false,
             symbolic_dims: crate::dynamic_shapes::SymbolicDimTracker::new(),
+            in_tape_region: false,
         }
     }
 

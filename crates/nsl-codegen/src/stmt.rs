@@ -481,6 +481,12 @@ impl Compiler<'_> {
         keep: Option<Value>,
     ) {
         let temps = std::mem::take(&mut state.tensor_temporaries);
+        // When inside a tape-recorded region (train step body), the autodiff tape
+        // holds raw pointers to intermediate tensors (TapeOp `a`/`out` fields).
+        // Freeing them here causes use-after-free during backward.
+        if state.in_tape_region {
+            return;
+        }
         for temp in &temps {
             if Some(*temp) == keep {
                 continue;
@@ -1474,9 +1480,12 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
 
         // 7b. Compile step body stmts
+        // Suppress tensor temporary cleanup — tape holds raw pointers to intermediates.
+        state.in_tape_region = true;
         for stmt in &step_body.stmts {
             self.compile_stmt(builder, state, stmt)?;
         }
+        state.in_tape_region = false;
 
         // 7c. Find loss variable — look for "loss" in state.variables by name
         let loss_val = {

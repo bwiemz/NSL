@@ -3226,6 +3226,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
         return;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
     tensor.refcount -= 1;
     if tensor.refcount <= 0 {
         let data_size = (tensor.len as usize) * tensor.element_size();
