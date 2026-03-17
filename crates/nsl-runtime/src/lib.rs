@@ -56,6 +56,7 @@ pub mod flash_attention;
 pub mod serving;
 pub mod tensor_parallel;
 pub mod moe;
+pub mod speculative;
 
 #[cfg(test)]
 mod fuzz;
