@@ -138,21 +138,31 @@ M51 (Effect System) ←── (standalone)
 
 ---
 
-### M33: Speculative Decoding & Tree Attention
+### M33: Speculative Decoding & Tree Attention — COMPLETE (core + b)
 
 **Goal:** Use a small draft model to guess multiple tokens, then verify them in parallel with the large model — 2-3x latency reduction for autoregressive generation.
 
-**Key components:**
-- Copy-on-Write (CoW) page branching for M25's PageTable (tree of KV-states, not linear sequence)
-- Tree attention mask for M27's FlashAttention PTX (replaces standard causal mask)
-- Draft/verifier model compatibility checking at compile time (vocab size, hidden dim)
-- Rejection sampling with configurable acceptance threshold
-- Multi-draft support (Medusa-style parallel draft heads)
-- `@speculative(draft_model, num_tokens=5)` decorator
+**M33 COMPLETE (2026-03-17):**
+- Rejection sampling (greedy temp=0 + stochastic temp>0 with adjusted distribution)
+- Tree construction with DFS-timestamp O(1) ancestor checks + longest-path selection
+- CoW page branching (block refcounting, branch, copy-on-write, cleanup)
+- `@speculative` + `@medusa` decorator semantic validation + codegen extraction
+- `speculative_decode()` intrinsic: takes pre-computed draft/verifier logits, returns accepted tokens
+- `nsl_speculative_decode_step` FFI: full rejection sampling pipeline
+- Tree attention PTX: DFS ancestor-based masking in FlashAttention Phase 2
+- Scheduler `speculative_tokens` field for memory budget overhead
+- 8 FFI builtins registered, `tree_mask` config in FlashAttentionConfig
+- 19 unit tests + 3 E2E tests passing
 
-**Runtime additions:** `nsl_page_branch`, `nsl_page_cow_copy`, `nsl_tree_attention`, `nsl_speculative_verify`
+**Deferred — serve block auto-speculative loop:**
+- `@speculative` on `@endpoint` auto-transforming `autoregressive_decode` into draft→verify→accept loop
+- Requires serve block inference pipeline maturation (tokenizer integration, KV-cache decode management)
+- Core algorithms are ready; this is a codegen integration that builds on them
+
+**Runtime additions:** `nsl_page_branch`, `nsl_page_cow_copy`, `nsl_tree_attention`, `nsl_speculative_verify`, `nsl_speculative_decode_step`
 
 **Spec:** `docs/superpowers/specs/2026-03-15-m33-speculative-decoding-design.md`
+**Plan:** `docs/superpowers/plans/2026-03-17-m33-speculative-decoding-implementation.md`
 
 ---
 
