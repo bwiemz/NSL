@@ -25,6 +25,8 @@ pub struct FlashAttentionConfig {
     pub rope_q: bool,
     pub rope_style: RopeStyle,
     pub gqa_group_size: u32,
+    /// M33: Whether this attention uses a tree-structured causal mask for speculative decoding.
+    pub tree_mask: bool,
 }
 
 /// Generate PTX for the FlashAttention-2 kernel with the given configuration.
@@ -991,6 +993,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -1009,6 +1012,7 @@ mod tests {
             rope_q: true,
             rope_style: RopeStyle::Adjacent,
             gqa_group_size: 4,
+            tree_mask: false,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -1027,6 +1031,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         // (64 + 64) * 128 * 2 = 32768 bytes (32 KB)
         assert_eq!(shared_mem_bytes(&config), 32768);
@@ -1045,6 +1050,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         assert_eq!(shared_mem_bytes(&config), 49152);
         // This exceeds 48KB — the semantic checker should reject this combination
@@ -1061,6 +1067,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap(); // strip null
@@ -1084,6 +1091,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
         let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len()-1]).unwrap();
@@ -1107,6 +1115,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
@@ -1126,6 +1135,7 @@ mod tests {
             rope_q: true,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
+            tree_mask: false,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
@@ -1145,6 +1155,7 @@ mod tests {
             rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 4,
+            tree_mask: false,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();

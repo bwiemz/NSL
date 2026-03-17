@@ -1027,6 +1027,34 @@ impl<'a> TypeChecker<'a> {
                                     }
                                 }
                             }
+                            // M32: @moe decorator validation
+                            if dname == "moe" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::moe::validate_moe_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
+                            // M33: @speculative decorator validation
+                            if dname == "speculative" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::speculative::validate_speculative_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
                             if dname == "paged_kv" {
                                 if let Some(ref args) = deco.args {
                                     for arg in args {

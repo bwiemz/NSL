@@ -343,6 +343,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_moe_all_to_all", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_moe_aux_loss", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_moe_dispatch_full", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    // --- M33: Speculative decoding runtime functions ---
+    ("nsl_speculative_draft", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_speculative_verify", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_speculative_build_tree", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_speculative_verify_tree", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_page_branch", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_page_cow_copy", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tree_attention", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_speculative_cleanup", &[types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

@@ -109,6 +109,8 @@ pub struct Compiler<'a> {
     pub shard_configs: HashMap<String, crate::tensor_parallel::ShardInfo>,
     /// M32: MoE layer configs — "ModelName.layer_name" → MoeInfo
     pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
+    /// M33: Speculative decoding configs — "ModelName.layer_name" → SpeculativeInfo
+    pub speculative_configs: HashMap<String, crate::speculative::SpeculativeInfo>,
     /// M30: Activation distribution states (for future all-reduce insertion)
     pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
     /// M30: Tensor parallelism world size (number of devices)
@@ -186,6 +188,7 @@ impl<'a> Compiler<'a> {
             flash_attention_context: None,
             shard_configs: HashMap::new(),
             moe_configs: HashMap::new(),
+            speculative_configs: HashMap::new(),
             activation_states: HashMap::new(),
             world_size: 1,
             fusion_events: Vec::new(),
@@ -1591,6 +1594,7 @@ impl<'a> Compiler<'a> {
                     rope_q,
                     rope_style,
                     gqa_group_size,
+                    tree_mask: false,
                 };
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
@@ -1630,6 +1634,7 @@ impl<'a> Compiler<'a> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
+                tree_mask: false,
             };
 
             let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
@@ -1663,6 +1668,7 @@ impl<'a> Compiler<'a> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
+                tree_mask: false,
             };
 
             let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);

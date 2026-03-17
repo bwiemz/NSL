@@ -1,8 +1,10 @@
 pub mod builtins;
 pub mod checker;
+pub mod moe;
 pub mod resolve;
 pub mod scope;
 pub mod shapes;
+pub mod speculative;
 pub mod types;
 
 use std::collections::HashMap;
