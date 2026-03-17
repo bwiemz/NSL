@@ -126,4 +126,20 @@ mod tests {
         let w0 = result.expert_weights[0] + result.expert_weights[1];
         assert!((w0 - 1.0).abs() < 1e-5);
     }
+
+    #[test]
+    fn test_capacity_overflow_drops_tokens() {
+        let logits: Vec<f32> = vec![
+            5.0, 0.1,
+            4.0, 0.1,
+            3.0, 0.1,
+            2.0, 0.1,
+            1.0, 0.1,
+            0.5, 0.1,
+        ];
+        let result = route_topk(&logits, 6, 2, 1, 1.0);
+        let exp0_count = result.expert_boundaries[1] - result.expert_boundaries[0];
+        assert_eq!(exp0_count, 3, "expert 0 should have capacity-limited 3 tokens, got {}", exp0_count);
+        assert_eq!(result.total_assigned, 3, "total_assigned should be 3 (dropped 3)");
+    }
 }
