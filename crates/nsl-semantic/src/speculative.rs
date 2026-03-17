@@ -118,3 +118,64 @@ pub fn validate_speculative_decorator(
         tree_width,
     ))
 }
+
+/// Validate @medusa decorator arguments.
+/// Returns (num_heads, tree_width) or None on error.
+pub fn validate_medusa_decorator(
+    deco: &Decorator,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<(usize, usize)> {
+    let mut num_heads: Option<usize> = None;
+    let mut tree_width: usize = 1;
+
+    if let Some(ref args) = deco.args {
+        for arg in args {
+            if let Some(ref name_sym) = arg.name {
+                let aname = resolve_sym(*name_sym);
+                match aname.as_str() {
+                    "num_heads" => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            if *n < 1 {
+                                diagnostics.push(
+                                    Diagnostic::error("@medusa: num_heads must be >= 1".to_string())
+                                        .with_label(arg.span, "must be >= 1"),
+                                );
+                            } else {
+                                num_heads = Some(*n as usize);
+                            }
+                        }
+                    }
+                    "tree_width" => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            if *n < 1 {
+                                diagnostics.push(
+                                    Diagnostic::error("@medusa: tree_width must be >= 1".to_string())
+                                        .with_label(arg.span, "must be >= 1"),
+                                );
+                            } else {
+                                tree_width = *n as usize;
+                            }
+                        }
+                    }
+                    _ => {
+                        diagnostics.push(
+                            Diagnostic::error(format!("@medusa: unknown argument '{}'", aname))
+                                .with_label(arg.span, "unknown argument"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if num_heads.is_none() {
+        diagnostics.push(
+            Diagnostic::error("@medusa: num_heads is required".to_string())
+                .with_label(deco.span, "missing num_heads"),
+        );
+        return None;
+    }
+
+    Some((num_heads.unwrap(), tree_width))
+}

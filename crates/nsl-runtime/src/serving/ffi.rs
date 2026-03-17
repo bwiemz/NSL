@@ -25,6 +25,7 @@ pub extern "C" fn nsl_serve_init(
         max_seq_len: max_seq_len as usize,
         kv_blocks: kv_blocks as usize,
         prefill_chunk: prefill_chunk as usize,
+        speculative_tokens: 0,
     };
     let mut guard = SERVE_CTX.lock().unwrap();
     if guard.is_some() {

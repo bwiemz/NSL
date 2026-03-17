@@ -1055,6 +1055,20 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
+                            // M33b: @medusa decorator validation
+                            if dname == "medusa" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::speculative::validate_medusa_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
                             if dname == "paged_kv" {
                                 if let Some(ref args) = deco.args {
                                     for arg in args {

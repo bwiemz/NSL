@@ -8,6 +8,10 @@ pub struct SchedulerConfig {
     pub max_seq_len: usize,
     pub kv_blocks: usize,
     pub prefill_chunk: usize,
+    /// M33: Number of speculative tokens per decode step.
+    /// Each speculative request reserves this many extra KV-cache blocks
+    /// beyond its current length. 0 = no speculation (default).
+    pub speculative_tokens: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -17,6 +21,7 @@ impl Default for SchedulerConfig {
             max_seq_len: 4096,
             kv_blocks: 2048,
             prefill_chunk: 512,
+            speculative_tokens: 0,
         }
     }
 }
@@ -139,7 +144,7 @@ mod tests {
     #[test]
     fn scheduler_basic_lifecycle() {
         let config = SchedulerConfig {
-            max_batch: 2, max_seq_len: 100, kv_blocks: 64, prefill_chunk: 512,
+            max_batch: 2, max_seq_len: 100, kv_blocks: 64, prefill_chunk: 512, speculative_tokens: 0,
         };
         let mut sched = BatchScheduler::new(config);
 
@@ -177,7 +182,7 @@ mod tests {
     #[test]
     fn scheduler_chunked_prefill() {
         let config = SchedulerConfig {
-            max_batch: 4, max_seq_len: 4096, kv_blocks: 256, prefill_chunk: 3,
+            max_batch: 4, max_seq_len: 4096, kv_blocks: 256, prefill_chunk: 3, speculative_tokens: 0,
         };
         let mut sched = BatchScheduler::new(config);
 

@@ -71,6 +71,52 @@ pub fn extract_speculative_decorator<'a>(
     None
 }
 
+/// Compile-time info about Medusa multi-head speculation.
+#[derive(Debug, Clone)]
+pub struct MedusaInfo {
+    pub num_heads: usize,
+    pub tree_width: usize,
+}
+
+/// Extract @medusa decorator from a list of decorators.
+pub fn extract_medusa_decorator<'a>(
+    decorators: &[Decorator],
+    resolve_sym: &dyn Fn(Symbol) -> &'a str,
+) -> Option<MedusaInfo> {
+    for deco in decorators {
+        if deco.name.len() == 1 && resolve_sym(deco.name[0]) == "medusa" {
+            let mut num_heads: usize = 0;
+            let mut tree_width: usize = 1;
+
+            if let Some(ref args) = deco.args {
+                for arg in args {
+                    if let Some(name_sym) = arg.name {
+                        let name = resolve_sym(name_sym);
+                        match name {
+                            "num_heads" => {
+                                if let ExprKind::IntLiteral(v) = &arg.value.kind {
+                                    num_heads = *v as usize;
+                                }
+                            }
+                            "tree_width" => {
+                                if let ExprKind::IntLiteral(v) = &arg.value.kind {
+                                    tree_width = *v as usize;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if num_heads > 0 {
+                return Some(MedusaInfo { num_heads, tree_width });
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

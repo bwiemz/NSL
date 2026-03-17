@@ -65,10 +65,10 @@ pub fn synthesize_rope_cache_write_ptx(
 
 /// Compute the kernel name encoding variant flags and tile sizes.
 ///
-/// Format: `flash_attn_p{paged}_r{rope}_{style}_g{gqa}_c{causal}_q{block_q}_kv{block_kv}`
+/// Format: `flash_attn_p{paged}_r{rope}_{style}_g{gqa}_c{causal}_t{tree}_q{block_q}_kv{block_kv}`
 pub fn flash_attention_kernel_name(config: &FlashAttentionConfig) -> String {
     format!(
-        "flash_attn_p{}_r{}_{}_g{}_c{}_q{}_kv{}",
+        "flash_attn_p{}_r{}_{}_g{}_c{}_t{}_q{}_kv{}",
         config.paged as u8,
         config.rope_q as u8,
         match config.rope_style {
@@ -77,6 +77,7 @@ pub fn flash_attention_kernel_name(config: &FlashAttentionConfig) -> String {
         },
         config.gqa_group_size,
         config.causal as u8,
+        config.tree_mask as u8,
         config.block_q,
         config.block_kv,
     )
@@ -127,7 +128,11 @@ fn emit_flash_attention_entry(
     ptx.push_str("    .param .u64 sin_ptr,\n");
     // M29-ready ragged batch params
     ptx.push_str("    .param .u64 seq_ids_ptr,\n");
-    ptx.push_str("    .param .u64 seq_lens_ptr\n");
+    ptx.push_str("    .param .u64 seq_lens_ptr,\n");
+    // M33: Tree attention mask params (null/zero when tree_mask=false)
+    ptx.push_str("    .param .u64 dfs_enter_ptr,\n");
+    ptx.push_str("    .param .u64 dfs_exit_ptr,\n");
+    ptx.push_str("    .param .u64 num_tree_nodes\n");
 
     ptx.push_str(")\n");
     ptx.push_str("{\n");
@@ -199,6 +204,13 @@ fn emit_register_declarations(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .f32 %q_a, %q_b, %q_rot_a, %q_rot_b;\n");
     }
 
+    if config.tree_mask {
+        // M33: DFS enter/exit timestamps for O(1) ancestor checks
+        ptx.push_str("    .reg .u64 %dfs_enter_base, %dfs_exit_base, %num_tree_nodes;\n");
+        ptx.push_str("    .reg .u32 %dfs_q_enter, %dfs_q_exit, %dfs_k_enter, %dfs_k_exit;\n");
+        ptx.push_str("    .reg .pred %p_ancestor;\n");
+    }
+
     // O_acc registers: each thread accumulates a subset of the [block_q, head_dim] output tile
     // Total O_acc regs per thread = (block_q * head_dim) / blockDim.x
     // Example: block_q=64, head_dim=128, blockDim.x=128 → 64 registers
@@ -230,7 +242,12 @@ fn emit_param_loads(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    ld.param.u64 %rd14, [seq_ids_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd15, [seq_lens_ptr];\n");
 
-    let _ = config; // variant flags control which registers are USED, not loaded
+    // M33: Tree mask params (always loaded; only used when tree_mask=true)
+    if config.tree_mask {
+        ptx.push_str("    ld.param.u64 %dfs_enter_base, [dfs_enter_ptr];\n");
+        ptx.push_str("    ld.param.u64 %dfs_exit_base, [dfs_exit_ptr];\n");
+        ptx.push_str("    ld.param.u64 %num_tree_nodes, [num_tree_nodes];\n");
+    }
 }
 
 fn emit_index_computation(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -603,8 +620,39 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // S[i][j] *= scale  (mul.f32)\n");
     ptx.push_str("    mul.f32 %f0, %f0, %scale;\n");
 
-    // Causal masking on diagonal
-    if config.causal {
+    // Causal masking on diagonal (standard or tree)
+    if config.tree_mask {
+        // M33: Tree-structured causal mask.
+        // Node query_idx attends to node key_idx iff key_idx is an ancestor of query_idx.
+        // Ancestor check: dfs_enter[key] <= dfs_enter[query] AND dfs_exit[key] >= dfs_exit[query]
+        ptx.push_str("    // M33: Tree mask — ancestor check via DFS timestamps\n");
+        ptx.push_str("    cvt.u64.u32 %rd43, %r5;           // k_col as u64\n");
+        ptx.push_str("    add.u64 %rd43, %k_start, %rd43;   // key_idx = k_start + k_col\n");
+        ptx.push_str("    cvt.u64.u32 %rd44, %r4;           // q_row as u64\n");
+        ptx.push_str("    add.u64 %rd44, %rd16, %rd44;      // query_idx = q_start + q_row\n");
+        // Load dfs_enter[key_idx]
+        ptx.push_str("    mul.lo.u64 %rd45, %rd43, 4;       // key_idx * sizeof(i32)\n");
+        ptx.push_str("    add.u64 %rd45, %dfs_enter_base, %rd45;\n");
+        ptx.push_str("    ld.global.u32 %dfs_k_enter, [%rd45];\n");
+        // Load dfs_enter[query_idx]
+        ptx.push_str("    mul.lo.u64 %rd46, %rd44, 4;       // query_idx * sizeof(i32)\n");
+        ptx.push_str("    add.u64 %rd46, %dfs_enter_base, %rd46;\n");
+        ptx.push_str("    ld.global.u32 %dfs_q_enter, [%rd46];\n");
+        // Load dfs_exit[key_idx]
+        ptx.push_str("    mul.lo.u64 %rd47, %rd43, 4;\n");
+        ptx.push_str("    add.u64 %rd47, %dfs_exit_base, %rd47;\n");
+        ptx.push_str("    ld.global.u32 %dfs_k_exit, [%rd47];\n");
+        // Load dfs_exit[query_idx]
+        ptx.push_str("    mul.lo.u64 %rd48, %rd44, 4;\n");
+        ptx.push_str("    add.u64 %rd48, %dfs_exit_base, %rd48;\n");
+        ptx.push_str("    ld.global.u32 %dfs_q_exit, [%rd48];\n");
+        // Check: is key an ancestor of query?
+        // ancestor iff dfs_enter[key] <= dfs_enter[query] AND dfs_exit[key] >= dfs_exit[query]
+        ptx.push_str("    setp.gt.u32 %p1, %dfs_k_enter, %dfs_q_enter;  // key enters AFTER query → not ancestor\n");
+        ptx.push_str("    setp.lt.u32 %p_ancestor, %dfs_k_exit, %dfs_q_exit;  // key exits BEFORE query → not ancestor\n");
+        ptx.push_str("    or.pred %p1, %p1, %p_ancestor;    // either condition → mask out\n");
+        ptx.push_str("    @%p1 mov.f32 %f0, 0xFF800000;     // -inf for non-ancestor positions\n");
+    } else if config.causal {
         ptx.push_str("    // Partial causal mask on diagonal tile: S[i][j] = -inf where k_start+j > q_start+i\n");
         ptx.push_str("    cvt.u64.u32 %rd43, %r5;           // k_col as u64\n");
         ptx.push_str("    add.u64 %rd43, %k_start, %rd43;   // k_abs = k_start + k_col\n");
@@ -997,7 +1045,7 @@ mod tests {
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
-            "flash_attn_p0_r0_hs_g1_c1_q64_kv64"
+            "flash_attn_p0_r0_hs_g1_c1_t0_q64_kv64"
         );
     }
 
@@ -1016,7 +1064,7 @@ mod tests {
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
-            "flash_attn_p1_r1_adj_g4_c1_q128_kv32"
+            "flash_attn_p1_r1_adj_g4_c1_t0_q128_kv32"
         );
     }
 
@@ -1177,5 +1225,31 @@ mod tests {
         let ptx = synthesize_rope_cache_write_ptx(128, RopeStyle::Adjacent);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
         assert!(ptx_str.contains("adjacent"));
+    }
+
+    #[test]
+    fn test_tree_mask_variant() {
+        let config = FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: true,
+        };
+        let ptx = synthesize_flash_attention_ptx(&config);
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        // Verify tree mask params and DFS ancestor check are present
+        assert!(ptx_str.contains("dfs_enter_ptr"), "missing dfs_enter_ptr param");
+        assert!(ptx_str.contains("dfs_exit_ptr"), "missing dfs_exit_ptr param");
+        assert!(ptx_str.contains("num_tree_nodes"), "missing num_tree_nodes param");
+        assert!(ptx_str.contains("dfs_enter_base"), "missing DFS register load");
+        assert!(ptx_str.contains("Tree mask"), "missing tree mask comment");
+        // Verify tree_mask=true kernel name includes t1
+        let name = flash_attention_kernel_name(&config);
+        assert!(name.contains("_t1_"), "kernel name should contain _t1_ for tree_mask=true, got {}", name);
     }
 }
