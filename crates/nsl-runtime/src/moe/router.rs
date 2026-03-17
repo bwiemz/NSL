@@ -128,6 +128,33 @@ mod tests {
     }
 
     #[test]
+    fn test_aux_loss_gradient_direction() {
+        // Imbalanced routing should have higher aux_loss than balanced
+        let logits_imbalanced: Vec<f32> = vec![
+            10.0, 0.0,
+            9.0, 0.0,
+            8.0, 0.1,
+            7.0, 0.1,
+        ];
+        let result_imb = route_topk(&logits_imbalanced, 4, 2, 1, 2.0);
+        let coeff = 0.01f32;
+        let aux_loss_imb = coeff * (result_imb.importance_loss + result_imb.load_loss);
+
+        let logits_balanced: Vec<f32> = vec![
+            5.0, 0.0,
+            0.0, 5.0,
+            5.0, 0.0,
+            0.0, 5.0,
+        ];
+        let result_bal = route_topk(&logits_balanced, 4, 2, 1, 2.0);
+        let aux_loss_bal = coeff * (result_bal.importance_loss + result_bal.load_loss);
+
+        assert!(aux_loss_imb > aux_loss_bal,
+            "imbalanced loss ({}) should be greater than balanced loss ({})",
+            aux_loss_imb, aux_loss_bal);
+    }
+
+    #[test]
     fn test_capacity_overflow_drops_tokens() {
         let logits: Vec<f32> = vec![
             5.0, 0.1,

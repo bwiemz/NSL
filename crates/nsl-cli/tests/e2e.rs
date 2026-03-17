@@ -607,3 +607,35 @@ fn e2e_m31_reduction_fusion() {
 fn e2e_m31_fuse_graph() {
     assert_output_matches("m31_fuse_graph");
 }
+
+// ---------------------------------------------------------------------------
+// M32: Mixture of Experts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m32_moe_basic() {
+    assert_output_matches("m32_moe_basic");
+}
+
+// M32: MoE validation error — expected compile failure
+#[test]
+fn e2e_m32_moe_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m32_moe_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m32_moe_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("top_k") || stderr.contains("moe"),
+        "Expected MoE validation error in stderr, got: {}",
+        stderr
+    );
+}

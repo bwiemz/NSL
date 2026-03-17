@@ -1,0 +1,24 @@
+# Basic MoE forward pass
+
+model FFN:
+    up: Linear(4, 8)
+    down: Linear(8, 4)
+
+    fn forward(self, x: Tensor<[2, 4], f64>) -> Tensor<[2, 4], f64>:
+        let h = relu(self.up(x))
+        return self.down(h)
+
+model MoEModel:
+    @moe(num_experts=2, top_k=1, capacity_factor=1.5)
+    experts: [FFN; 2]
+    router: Linear(4, 2)
+
+    fn forward(self, x: Tensor<[2, 4], f64>) -> Tensor<[2, 4], f64>:
+        let logits = self.router(x)
+        let out = moe_dispatch(x, logits, self.experts)
+        return out
+
+let m = MoEModel()
+let x = ones([2, 4])
+let y = m.forward(x)
+print(shape(y))

@@ -1,0 +1,19 @@
+# MoE validation error: top_k must be 1 or 2
+
+model FFN:
+    up: Linear(4, 8)
+    down: Linear(8, 4)
+
+    fn forward(self, x: Tensor<[2, 4], f64>) -> Tensor<[2, 4], f64>:
+        return self.down(relu(self.up(x)))
+
+model BadMoE:
+    @moe(num_experts=4, top_k=4)
+    experts: [FFN; 4]
+    router: Linear(4, 4)
+
+    fn forward(self, x: Tensor<[2, 4], f64>) -> Tensor<[2, 4], f64>:
+        let logits = self.router(x)
+        return moe_dispatch(x, logits, self.experts)
+
+let m = BadMoE()
