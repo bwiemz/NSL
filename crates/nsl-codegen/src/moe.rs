@@ -68,3 +68,43 @@ pub fn extract_moe_decorator<'a>(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_moe_empty_decorators() {
+        let decorators: Vec<Decorator> = vec![];
+        let result = extract_moe_decorator(&decorators, &|_| "");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_moe_info_defaults() {
+        // Verify default values used when only num_experts is provided
+        let info = MoeInfo {
+            num_experts: 8,
+            top_k: 2,
+            capacity_factor: 1.25,
+            aux_loss_coeff: 0.01,
+        };
+        assert_eq!(info.num_experts, 8);
+        assert_eq!(info.top_k, 2);
+        assert!((info.capacity_factor - 1.25).abs() < 1e-6);
+        assert!((info.aux_loss_coeff - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_moe_info_clone() {
+        let info = MoeInfo {
+            num_experts: 4,
+            top_k: 1,
+            capacity_factor: 2.0,
+            aux_loss_coeff: 0.05,
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.num_experts, 4);
+        assert_eq!(cloned.top_k, 1);
+    }
+}
