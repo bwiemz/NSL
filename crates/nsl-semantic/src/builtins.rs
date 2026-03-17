@@ -817,4 +817,13 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(Type::Void),
         },
     );
+
+    // M32: MoE dispatch intrinsic
+    def(
+        "moe_dispatch",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
 }

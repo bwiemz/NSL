@@ -16,6 +16,7 @@ pub enum FusionOp {
     Reduction(String),
     View(String),
     FlashAttention,
+    MoEDispatch,   // M32: fusion barrier — never fuse into or out of
     Other,
 }
 
@@ -118,13 +119,13 @@ impl FusionGraph {
     /// Check if a node is a single-consumer intermediate that can be eliminated
     /// by fusing it into its sole downstream consumer's kernel.
     /// Requires: exactly 1 consumer, not a graph output, not @no_fuse,
-    /// not FlashAttention, and not already claimed by a fusion pass.
+    /// not FlashAttention, not MoEDispatch, and not already claimed by a fusion pass.
     pub fn is_single_consumer_intermediate(&self, node_id: NodeId) -> bool {
         let node = &self.nodes[node_id as usize];
         node.consumers.len() == 1
             && !node.is_graph_output
             && !node.no_fuse
-            && !matches!(node.op, FusionOp::FlashAttention)
+            && !matches!(node.op, FusionOp::FlashAttention | FusionOp::MoEDispatch)
             && node.fused_into.is_none()
     }
 
