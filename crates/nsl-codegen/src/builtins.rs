@@ -335,6 +335,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tp_broadcast", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tp_barrier", &[], Some(types::I64)),
     ("nsl_tp_destroy", &[], Some(types::I64)),
+    // --- M32: MoE runtime functions ---
+    ("nsl_moe_route", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_moe_scatter", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_expert_parallel_matmul", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_moe_gather", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_moe_all_to_all", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_moe_aux_loss", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_moe_dispatch_full", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

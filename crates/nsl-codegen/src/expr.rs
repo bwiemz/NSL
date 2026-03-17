@@ -1333,21 +1333,35 @@ impl Compiler<'_> {
 
         // ── M32: MoE dispatch intrinsic ──────────────────────────────
         if func_name == "moe_dispatch" {
-            // M32: MoE dispatch — for now, pass-through the input tensor.
-            // The full route->scatter->GEMM->gather pipeline will be wired
-            // when the codegen can access expert weight pointers from the model struct.
             if args.len() != 3 {
                 return Err(crate::error::CodegenError::new(
                     "moe_dispatch() takes 3 arguments (tokens, router_logits, experts)",
                 ));
             }
             let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
-            let _logits_val = self.compile_expr(builder, state, &args[1].value)?;
+            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
             let _experts_val = self.compile_expr(builder, state, &args[2].value)?;
-            // TODO(m32): Full pipeline will emit nsl_moe_route -> nsl_moe_scatter ->
-            // nsl_expert_parallel_matmul -> nsl_moe_gather sequence.
-            // For now, return input tensor unchanged (enables E2E test scaffolding).
-            return Ok(tokens_val);
+
+            // Look up MoE config from decorator extraction
+            let config = self.moe_configs.values().next().cloned();
+            let (num_experts, top_k, capacity_factor) = match config {
+                Some(info) => (info.num_experts, info.top_k, info.capacity_factor),
+                None => (8, 2, 1.25f32), // defaults
+            };
+
+            let num_experts_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
+            let top_k_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, top_k as i64);
+            let cap_bits = builder.ins().iconst(cranelift_codegen::ir::types::I64, capacity_factor.to_bits() as i64);
+
+            // Call nsl_moe_dispatch_full(tokens, logits, num_experts, top_k, capacity_factor_bits)
+            // Returns a new NslTensor with the MoE output
+            let result = self.compile_call_by_name(
+                builder,
+                "nsl_moe_dispatch_full",
+                &[tokens_val, logits_val, num_experts_val, top_k_val, cap_bits],
+            )?;
+
+            return Ok(result);
         }
 
         // ── M19: Sampling intrinsics ─────────────────────────────────
