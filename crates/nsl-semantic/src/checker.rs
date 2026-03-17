@@ -1069,6 +1069,20 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
+                            // M34: @context_parallel decorator validation
+                            if dname == "context_parallel" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::context_parallel::validate_context_parallel_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
                             if dname == "paged_kv" {
                                 if let Some(ref args) = deco.args {
                                     for arg in args {

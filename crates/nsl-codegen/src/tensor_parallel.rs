@@ -11,6 +11,7 @@ pub struct ShardInfo {
 pub enum DistState {
     Replicated,
     Sharded { dim: usize },
+    SeqPartitioned { ring_size: usize },
 }
 
 /// Extract @shard decorator from a list of decorators.

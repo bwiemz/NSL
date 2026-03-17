@@ -2,6 +2,7 @@ pub mod autotune;
 pub mod builtins;
 pub mod compiler;
 pub mod context;
+pub mod context_parallel;
 pub mod error;
 pub mod expr;
 pub mod func;

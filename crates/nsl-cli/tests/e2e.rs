@@ -676,3 +676,35 @@ fn e2e_m33_speculative_validation_error() {
 fn e2e_m33_speculative_decode() {
     assert_output_matches("m33_speculative_decode");
 }
+
+// ---------------------------------------------------------------------------
+// M34: Context Parallelism (Ring Attention)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m34_cp_basic() {
+    assert_output_matches("m34_cp_basic");
+}
+
+// M34: @context_parallel validation error — expected compile failure
+#[test]
+fn e2e_m34_cp_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m34_cp_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m34_cp_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("ring_size") || stderr.contains("context_parallel"),
+        "Expected context_parallel validation error in stderr, got: {}",
+        stderr
+    );
+}

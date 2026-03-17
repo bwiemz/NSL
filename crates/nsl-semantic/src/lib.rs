@@ -1,5 +1,6 @@
 pub mod builtins;
 pub mod checker;
+pub mod context_parallel;
 pub mod moe;
 pub mod resolve;
 pub mod scope;

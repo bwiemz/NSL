@@ -57,6 +57,7 @@ pub mod serving;
 pub mod tensor_parallel;
 pub mod moe;
 pub mod speculative;
+pub mod context_parallel;
 
 #[cfg(test)]
 mod fuzz;

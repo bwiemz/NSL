@@ -1,0 +1,8 @@
+# M34: @context_parallel validation error — missing ring_size
+
+model Bad:
+    @context_parallel()
+    layer: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x

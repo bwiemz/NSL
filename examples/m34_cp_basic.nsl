@@ -1,0 +1,13 @@
+# M34: Context parallelism — decorator validation test
+
+model Attention:
+    @context_parallel(ring_size=2)
+    layer: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+let m = Attention()
+let x = ones([4, 8])
+let y = m.forward(x)
+print(y)

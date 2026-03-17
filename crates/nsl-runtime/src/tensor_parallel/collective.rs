@@ -77,6 +77,24 @@ pub trait CollectiveBackend {
     /// Block until all ranks have reached this point.
     fn barrier(&self) -> i32;
 
+    /// Point-to-point send to a specific rank.
+    fn send(
+        &self,
+        sendbuf: *const c_void,
+        count: usize,
+        dtype_bytes: usize,
+        dst_rank: i32,
+    ) -> i32;
+
+    /// Point-to-point receive from a specific rank.
+    fn recv(
+        &self,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype_bytes: usize,
+        src_rank: i32,
+    ) -> i32;
+
     /// This process's rank (0-based).
     fn rank(&self) -> i32;
 
@@ -312,6 +330,60 @@ impl CollectiveBackend for SimulatedBackend {
         0
     }
 
+    fn send(
+        &self,
+        sendbuf: *const c_void,
+        count: usize,
+        dtype_bytes: usize,
+        _dst_rank: i32,
+    ) -> i32 {
+        let nbytes = count * dtype_bytes;
+
+        if self.world_size == 1 {
+            // Single-rank: write to our slot for later recv.
+            // Caller must ensure shm is allocated even for single-rank p2p.
+            if !self.shm_ptr.is_null() {
+                let slot = self.slot_ptr(self.rank, nbytes);
+                unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes); }
+            }
+            return 0;
+        }
+
+        // Multi-rank: write to our slot, barrier so receiver can read, barrier again to
+        // protect against slot reuse before receiver finishes.
+        let slot = self.slot_ptr(self.rank, nbytes);
+        unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes); }
+        self.spin_barrier(); // 1: data visible
+        self.spin_barrier(); // 2: receiver done reading
+        0
+    }
+
+    fn recv(
+        &self,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype_bytes: usize,
+        src_rank: i32,
+    ) -> i32 {
+        let nbytes = count * dtype_bytes;
+
+        if self.world_size == 1 {
+            // Single-rank: read from our slot (written by previous send).
+            if !self.shm_ptr.is_null() {
+                let slot = self.slot_ptr(src_rank, nbytes);
+                unsafe { std::ptr::copy_nonoverlapping(slot, recvbuf as *mut u8, nbytes); }
+            }
+            return 0;
+        }
+
+        // Multi-rank: barrier (wait for sender), read, barrier (signal done).
+        self.spin_barrier(); // 1: data visible
+        let slot = self.slot_ptr(src_rank, nbytes);
+        unsafe { std::ptr::copy_nonoverlapping(slot, recvbuf as *mut u8, nbytes); }
+        self.spin_barrier(); // 2: done reading
+        0
+    }
+
     fn rank(&self) -> i32 {
         self.rank
     }
@@ -518,6 +590,72 @@ mod tests {
 
         assert_eq!(out0, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(out1, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn simulated_backend_single_rank_send_recv() {
+        // Allocate a small shm region for single-rank p2p staging.
+        let slot_bytes = 4 * std::mem::size_of::<f32>();
+        let shm_len = DATA_OFFSET + slot_bytes;
+        let mut shm = vec![0u8; shm_len];
+        let shm_ptr = shm.as_mut_ptr();
+
+        let backend = SimulatedBackend::new(0, 1, shm_ptr, shm_len);
+        let send_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut recv_data = vec![0.0f32; 4];
+
+        let rc = backend.send(
+            send_data.as_ptr() as *const c_void,
+            4, std::mem::size_of::<f32>(), 0,
+        );
+        assert_eq!(rc, 0);
+
+        let rc = backend.recv(
+            recv_data.as_mut_ptr() as *mut c_void,
+            4, std::mem::size_of::<f32>(), 0,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(recv_data, send_data);
+    }
+
+    #[test]
+    fn simulated_backend_multi_rank_send_recv() {
+        let world_size = 2;
+        let count = 4;
+        let slot_bytes = count * std::mem::size_of::<f32>();
+        let shm_len = DATA_OFFSET + world_size * slot_bytes;
+        let mut shm = vec![0u8; shm_len];
+        let shm_ptr = shm.as_mut_ptr();
+
+        let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
+        hdr.generation.store(0, Ordering::Release);
+        hdr.arrival.store(0, Ordering::Release);
+
+        let b0 = SimulatedBackend::new(0, world_size as i32, shm_ptr, shm_len);
+        let b1 = SimulatedBackend::new(1, world_size as i32, shm_ptr, shm_len);
+
+        let send0: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let mut recv1: [f32; 4] = [0.0; 4];
+
+        // Rank 0 sends, rank 1 receives.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rc = b0.send(
+                    send0.as_ptr() as *const c_void,
+                    count, std::mem::size_of::<f32>(), 1,
+                );
+                assert_eq!(rc, 0);
+            });
+            s.spawn(|| {
+                let rc = b1.recv(
+                    recv1.as_mut_ptr() as *mut c_void,
+                    count, std::mem::size_of::<f32>(), 0,
+                );
+                assert_eq!(rc, 0);
+            });
+        });
+
+        assert_eq!(recv1, [1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]

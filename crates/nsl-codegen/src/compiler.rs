@@ -111,6 +111,10 @@ pub struct Compiler<'a> {
     pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
     /// M33: Speculative decoding configs — "ModelName.layer_name" → SpeculativeInfo
     pub speculative_configs: HashMap<String, crate::speculative::SpeculativeInfo>,
+    /// M34: Context parallelism configs — "ModelName.layer_name" → ContextParallelInfo
+    pub context_parallel_configs: HashMap<String, crate::context_parallel::ContextParallelInfo>,
+    /// M34: Ring size for context parallelism
+    pub cp_ring_size: usize,
     /// M30: Activation distribution states (for future all-reduce insertion)
     pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
     /// M30: Tensor parallelism world size (number of devices)
@@ -189,6 +193,8 @@ impl<'a> Compiler<'a> {
             shard_configs: HashMap::new(),
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
+            context_parallel_configs: HashMap::new(),
+            cp_ring_size: 1,
             activation_states: HashMap::new(),
             world_size: 1,
             fusion_events: Vec::new(),
@@ -667,6 +673,19 @@ impl<'a> Compiler<'a> {
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
                                     self.moe_configs.insert(layer_key, info);
+                                }
+                            }
+                            // M34: @context_parallel decorator extraction
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "context_parallel" {
+                                if let Some(info) = crate::context_parallel::extract_context_parallel_decorator(
+                                    std::slice::from_ref(deco),
+                                    &|sym| self.resolve_sym(sym),
+                                ) {
+                                    let model_name = self.resolve_sym(md.name).to_string();
+                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                    self.cp_ring_size = info.ring_size;
+                                    self.context_parallel_configs.insert(layer_key, info);
                                 }
                             }
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "paged_kv" {
