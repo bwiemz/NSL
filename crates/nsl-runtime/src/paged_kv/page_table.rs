@@ -110,6 +110,15 @@ impl PageTable {
         self.token_count = 0;
         std::mem::take(&mut self.entries)
     }
+
+    /// Shallow clone for CoW branching — shares block IDs with parent.
+    pub fn clone_shallow(&self) -> Self {
+        PageTable {
+            entries: self.entries.clone(),
+            token_count: self.token_count,
+            block_size: self.block_size,
+        }
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

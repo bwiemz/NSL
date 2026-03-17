@@ -33,6 +33,7 @@ pub struct BlockAllocator {
     /// Bytes per block: `num_heads * block_size * head_dim * size_of::<f32>()`.
     pub block_stride: usize,
     free_list: Vec<BlockId>,
+    refcounts: Vec<u32>,
     k_pool: *mut c_void,
     v_pool: *mut c_void,
     backend: PoolBackend,
@@ -70,6 +71,7 @@ impl BlockAllocator {
             head_dim,
             block_stride,
             free_list,
+            refcounts: vec![0; num_blocks],
             k_pool,
             v_pool,
             backend: PoolBackend::Cpu,
@@ -103,6 +105,7 @@ impl BlockAllocator {
             head_dim,
             block_stride,
             free_list,
+            refcounts: vec![0; num_blocks],
             k_pool,
             v_pool,
             backend: PoolBackend::Gpu,
@@ -116,23 +119,41 @@ impl BlockAllocator {
     pub fn alloc(&mut self) -> Option<BlockId> {
         let id = self.free_list.pop()?;
         self.allocated_count += 1;
+        self.refcounts[id as usize] = 1;
         Some(id)
     }
 
-    /// Return a block to the free list.  The block contents are NOT zeroed.
+    /// Return a block to the free list, respecting refcounts.
+    ///
+    /// If the block is shared (refcount > 1), only decrements the refcount.
+    /// If the block is exclusively owned (refcount <= 1), returns it to the pool.
     pub fn free(&mut self, id: BlockId) {
         debug_assert!((id as usize) < self.num_blocks, "BlockId out of range");
-        debug_assert!(
-            !self.free_list.contains(&id),
-            "double-free of BlockId {}",
-            id
-        );
+        let idx = id as usize;
+        if self.refcounts[idx] > 1 {
+            self.refcounts[idx] -= 1;
+            return; // shared block — just decrement, don't return to pool
+        }
+        // Original behavior for single-owner blocks
         debug_assert!(
             self.allocated_count > 0,
             "free() called but allocated_count is 0"
         );
+        self.refcounts[idx] = 0;
         self.free_list.push(id);
         self.allocated_count -= 1;
+    }
+
+    // ── Refcount helpers ───────────────────────────────────────────────────────
+
+    /// Increment refcount for CoW branching.
+    pub fn incref(&mut self, id: BlockId) {
+        self.refcounts[id as usize] += 1;
+    }
+
+    /// Get current refcount.
+    pub fn refcount(&self, id: BlockId) -> u32 {
+        self.refcounts[id as usize]
     }
 
     // ── Pointer accessors ─────────────────────────────────────────────────────
