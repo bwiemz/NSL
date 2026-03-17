@@ -826,4 +826,18 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(tensor_ret.clone()),
         },
     );
+
+    // M33: Speculative decode step intrinsic
+    def(
+        "speculative_decode",
+        Type::Function {
+            params: vec![
+                tensor_ret.clone(),  // draft_tokens
+                tensor_ret.clone(),  // draft_logits
+                tensor_ret.clone(),  // verifier_logits
+                Type::Int,           // vocab_size
+            ],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
 }

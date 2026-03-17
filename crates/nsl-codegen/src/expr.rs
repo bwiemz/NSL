@@ -1364,6 +1364,44 @@ impl Compiler<'_> {
             return Ok(result);
         }
 
+        // ── M33: Speculative decode step intrinsic ──────────────────
+        if func_name == "speculative_decode" {
+            // speculative_decode(draft_tokens, draft_logits, verifier_logits, vocab_size)
+            // Returns NslTensor of accepted token IDs.
+            if args.len() != 4 {
+                return Err(crate::error::CodegenError::new(
+                    "speculative_decode() takes 4 arguments (draft_tokens, draft_logits, verifier_logits, vocab_size)",
+                ));
+            }
+            let draft_tokens = self.compile_expr(builder, state, &args[0].value)?;
+            let draft_logits = self.compile_expr(builder, state, &args[1].value)?;
+            let verifier_logits = self.compile_expr(builder, state, &args[2].value)?;
+            let vocab_size = self.compile_expr(builder, state, &args[3].value)?;
+
+            // Get temperature from @speculative config, default 0.0
+            let config = self.speculative_configs.values().next().cloned();
+            let temperature = config.map(|c| c.temperature).unwrap_or(0.0f32);
+
+            // Get num_draft_tokens from draft_tokens tensor length
+            let draft_len = builder.ins().load(
+                cranelift_codegen::ir::types::I64,
+                cranelift_codegen::ir::MemFlags::trusted(),
+                draft_tokens,
+                cranelift_codegen::ir::immediates::Offset32::new(32), // NslTensor.len offset
+            );
+            let temp_bits = builder.ins().iconst(
+                cranelift_codegen::ir::types::I64,
+                temperature.to_bits() as i64,
+            );
+
+            let result = self.compile_call_by_name(
+                builder,
+                "nsl_speculative_decode_step",
+                &[draft_tokens, draft_logits, verifier_logits, draft_len, vocab_size, temp_bits],
+            )?;
+            return Ok(result);
+        }
+
         // ── M19: Sampling intrinsics ─────────────────────────────────
 
         // manual_seed(seed)

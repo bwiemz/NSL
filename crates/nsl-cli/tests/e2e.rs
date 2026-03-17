@@ -671,3 +671,8 @@ fn e2e_m33_speculative_validation_error() {
         stderr
     );
 }
+
+#[test]
+fn e2e_m33_speculative_decode() {
+    assert_output_matches("m33_speculative_decode");
+}

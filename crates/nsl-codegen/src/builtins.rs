@@ -352,6 +352,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_page_cow_copy", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tree_attention", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_speculative_cleanup", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_speculative_decode_step", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

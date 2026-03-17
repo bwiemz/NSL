@@ -1,0 +1,13 @@
+# M33: speculative_decode intrinsic — end-to-end test
+# Tests rejection sampling with uniform logits (all zeros).
+# With uniform logits, argmax = last index (vocab_size - 1) per Rust max_by.
+# Draft tokens are all zeros, verifier argmax is 3 (last of vocab_size=4).
+# Since 0 != 3, first token is rejected and replacement = 3.
+
+let draft_tokens = zeros([3])
+let draft_logits = zeros([3, 4])
+let verifier_logits = zeros([4, 4])
+
+# speculative_decode(draft_tokens, draft_logits, verifier_logits, vocab_size)
+let accepted = speculative_decode(draft_tokens, draft_logits, verifier_logits, 4)
+print(accepted)
