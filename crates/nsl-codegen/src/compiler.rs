@@ -107,6 +107,8 @@ pub struct Compiler<'a> {
     pub flash_attention_context: Option<FlashAttentionCompileContext>,
     /// M30: Sharded layers — "ModelName.layer_name" → ShardInfo
     pub shard_configs: HashMap<String, crate::tensor_parallel::ShardInfo>,
+    /// M32: MoE layer configs — "ModelName.layer_name" → MoeInfo
+    pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
     /// M30: Activation distribution states (for future all-reduce insertion)
     pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
     /// M30: Tensor parallelism world size (number of devices)
@@ -183,6 +185,7 @@ impl<'a> Compiler<'a> {
             compile_options: crate::CompileOptions::default(),
             flash_attention_context: None,
             shard_configs: HashMap::new(),
+            moe_configs: HashMap::new(),
             activation_states: HashMap::new(),
             world_size: 1,
             fusion_events: Vec::new(),
@@ -649,6 +652,18 @@ impl<'a> Compiler<'a> {
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
                                     self.shard_configs.insert(layer_key, info);
+                                }
+                            }
+                            // M32: @moe decorator extraction
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "moe" {
+                                if let Some(info) = crate::moe::extract_moe_decorator(
+                                    std::slice::from_ref(deco),
+                                    &|sym| self.resolve_sym(sym),
+                                ) {
+                                    let model_name = self.resolve_sym(md.name).to_string();
+                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                    self.moe_configs.insert(layer_key, info);
                                 }
                             }
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "paged_kv" {

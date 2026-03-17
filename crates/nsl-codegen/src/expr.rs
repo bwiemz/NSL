@@ -1331,6 +1331,25 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_safetensors_save", &[dict_val, path_val, path_len]);
         }
 
+        // ── M32: MoE dispatch intrinsic ──────────────────────────────
+        if func_name == "moe_dispatch" {
+            // M32: MoE dispatch — for now, pass-through the input tensor.
+            // The full route->scatter->GEMM->gather pipeline will be wired
+            // when the codegen can access expert weight pointers from the model struct.
+            if args.len() != 3 {
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch() takes 3 arguments (tokens, router_logits, experts)",
+                ));
+            }
+            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
+            let _logits_val = self.compile_expr(builder, state, &args[1].value)?;
+            let _experts_val = self.compile_expr(builder, state, &args[2].value)?;
+            // TODO(m32): Full pipeline will emit nsl_moe_route -> nsl_moe_scatter ->
+            // nsl_expert_parallel_matmul -> nsl_moe_gather sequence.
+            // For now, return input tensor unchanged (enables E2E test scaffolding).
+            return Ok(tokens_val);
+        }
+
         // ── M19: Sampling intrinsics ─────────────────────────────────
 
         // manual_seed(seed)
