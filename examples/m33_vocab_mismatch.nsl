@@ -1,0 +1,8 @@
+# M33: @speculative validation — num_tokens out of range
+
+model M:
+    @speculative(num_tokens=15)
+    layer: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x

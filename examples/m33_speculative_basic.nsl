@@ -1,0 +1,19 @@
+# M33: Speculative decoding — basic model compilation test
+
+model Verifier():
+    weight: Tensor = ones([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+model Draft():
+    weight: Tensor = ones([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+let v = Verifier()
+let d = Draft()
+let x = ones([2, 4])
+let y = v.forward(x)
+print(y)

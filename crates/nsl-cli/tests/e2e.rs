@@ -639,3 +639,35 @@ fn e2e_m32_moe_validation_error() {
         stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// M33: Speculative Decoding
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m33_speculative_basic() {
+    assert_output_matches("m33_speculative_basic");
+}
+
+// M33: @speculative validation error — expected compile failure
+#[test]
+fn e2e_m33_speculative_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m33_vocab_mismatch.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m33_vocab_mismatch, but it succeeded"
+    );
+    assert!(
+        stderr.contains("num_tokens") || stderr.contains("speculative"),
+        "Expected speculative validation error in stderr, got: {}",
+        stderr
+    );
+}
