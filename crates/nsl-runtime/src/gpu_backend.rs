@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn kernel_arg_variants() {
-        let args = vec![
+        let args = [
             KernelArg::Ptr(std::ptr::null_mut()),
             KernelArg::U32(256),
             KernelArg::F32(1.0),

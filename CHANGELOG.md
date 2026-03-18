@@ -4,6 +4,63 @@ All notable changes to NeuralScript will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.0] - 2026-03-18
+
+### Consolidation & Code Quality
+- **CLI flag wiring**: all CompileOptions (--no-autotune, --deterministic, --disable-fusion, --tape-ad, --trace-ops, --nan-analysis, --target) now flow from CLI to compiler
+- **Refactored hotspot files**: tensor.rs (5K→6 files), expr.rs (3.5K→6), compiler.rs (2.8K→7), checker.rs (2.6K→8), autodiff.rs (1.8K→3)
+- **Error handling**: replaced 14 panics in process spawning and FFI with graceful error codes
+- **Parser**: generic trait bounds now parsed (not enforced yet); if-expression limitations documented
+- **Deterministic scatter_add**: changed from silent null return to explicit abort with message
+- **E2E precision**: float comparison tightened from 4 to 6 decimal places
+- **Version**: workspace version aligned to release tags
+
+### Phase 8–9 Infrastructure (analysis + FFI complete, codegen wiring in progress)
+- **M45**: Tensor debugger — trace recording, NaN analysis, trace diffing, Chrome export
+- **M46**: Reproducibility — determinism checker, kernel variant selection, RNG tracking
+- **M48**: Multimodal — PatchEmbed, MelSpectrogram, cross_attention, modality classification
+- **M49**: Shape algebra — symbolic dimension solver (equality, divisibility, range proofs)
+- **M50**: Sparse tensors — NslSparseTensor, COO/CSR/CSC/BSR format dispatch
+
+## [0.7.0] - 2026-03-18
+
+### Phase 7: Distributed Training
+- **M38b**: Linear types codegen — ownership decisions for tensor lifetime
+- **M40b**: Source AD extraction — Wengert extraction from AST, backward context
+- **M43**: Pipeline parallelism — 1F1B/GPipe scheduling, 3D rank mapping, ZeRO sharding
+
+## [0.6.0] - 2026-03-18
+
+### Phase 6: Deployment & Portability
+- **M41**: Disaggregated inference — prefill/decode worker separation, KV transfer
+- **M47**: Multi-backend KIR — Kernel IR, PTX backend, GpuTarget, GpuBackend trait
+- **M39b**: vmap AST transform — VmapTransformer FnDef→FnDef rewriting
+- Snapshot testing (insta) and differential testing infrastructure
+
+## [0.5.0] - 2026-03-18
+
+### Phase 5: Inference Optimization
+- **M42**: KV-cache compression — INT8/INT4/FP8, sliding window, H2O eviction
+- **M44**: Constrained decoding — compiled FSM, token-level DFA, logit masking
+
+## [0.4.0] - 2026-03-18
+
+### Phase 4 continued
+- **M41**: Disaggregated inference (moved to Phase 6 delivery)
+
+## [0.3.0] - 2026-03-17
+
+### Phase 4: Scaling & Optimization (M32-M40)
+- **M32**: Mixture of Experts — @moe, top-k gating, capacity routing, aux loss
+- **M33**: Speculative Decoding — @speculative, tree attention, rejection sampling
+- **M34**: Ring Attention — @context_parallel, cross-GPU sequence parallelism
+- **M35**: FP8/AWQ/GPTQ quantization
+- **M36**: Memory planning — compile-time liveness analysis, slab allocation
+- **M37**: Roofline cost model — per-op FLOP/byte analysis
+- **M38a**: Linear types semantics — ownership checker, @shared
+- **M39a**: vmap analysis — batch tracking, shape rewriting, matmul classification
+- **M40a**: Source AD analysis — Wengert list, adjoint rules, dead gradient elimination
+
 ## [0.2.0] - 2026-03-15
 
 ### Production Inference & Optimization (M23-M31)

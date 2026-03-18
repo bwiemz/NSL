@@ -195,8 +195,8 @@ Extract the archive to a permanent location and add `bin/` to your PATH:
 
 ```bash
 # Linux/macOS
-tar xzf nsl-v0.7.0-<target>.tar.gz
-export PATH="$PWD/nsl-v0.7.0-<target>/bin:$PATH"
+tar xzf nsl-v0.8.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.8.0-<target>/bin:$PATH"
 ```
 
 > **Important:** Do not separate the `nsl` binary from the `lib/` directory.

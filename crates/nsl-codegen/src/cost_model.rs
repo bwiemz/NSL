@@ -393,15 +393,15 @@ mod tests {
     #[test]
     fn test_layernorm_cost() {
         let (flops, bread, _) = layernorm_cost(1, 2048, 4096, 2);
-        assert_eq!(flops, 8 * 1 * 2048 * 4096);
-        assert_eq!(bread, (1 * 2048 * 4096 + 2 * 4096) * 2);
+        assert_eq!(flops, 8 * 2048 * 4096);
+        assert_eq!(bread, (2048 * 4096 + 2 * 4096) * 2);
     }
 
     #[test]
     fn test_flash_attention_cost() {
         let (flops, bread, _) = flash_attention_cost(1, 32, 2048, 128, 2);
-        assert_eq!(flops, 4 * 1 * 32 * 2048 * 2048 * 128);
-        assert_eq!(bread, 1 * 32 * 3 * 2048 * 128 * 2);
+        assert_eq!(flops, 4 * 32 * 2048 * 2048 * 128);
+        assert_eq!(bread, 32 * 3 * 2048 * 128 * 2);
     }
 
     #[test]
@@ -413,9 +413,9 @@ mod tests {
     #[test]
     fn test_rmsnorm_cost() {
         let (flops, bread, bwrite) = rmsnorm_cost(1, 2048, 4096, 2);
-        assert_eq!(flops, 5 * 1 * 2048 * 4096);
-        assert_eq!(bread, (1 * 2048 * 4096 + 4096) * 2);
-        assert_eq!(bwrite, 1 * 2048 * 4096 * 2);
+        assert_eq!(flops, 5 * 2048 * 4096);
+        assert_eq!(bread, (2048 * 4096 + 4096) * 2);
+        assert_eq!(bwrite, 2048 * 4096 * 2);
     }
 
     #[test]
@@ -445,10 +445,10 @@ mod tests {
     #[test]
     fn test_conv2d_cost() {
         let (flops, _, bwrite) = conv2d_cost(1, 3, 32, 32, 16, 3, 3, 1, 1, 1, 1, 4);
-        let hout = (32 + 2 - 3) / 1 + 1;
-        let wout = (32 + 2 - 3) / 1 + 1;
-        assert_eq!(flops, 2 * 1 * 16 * hout * wout * 3 * 3 * 3);
-        assert_eq!(bwrite, 1 * 16 * hout * wout * 4);
+        let hout = (32 + 2 - 3) + 1;
+        let wout = (32 + 2 - 3) + 1;
+        assert_eq!(flops, 2 * 16 * hout * wout * 3 * 3 * 3);
+        assert_eq!(bwrite, 16 * hout * wout * 4);
     }
 
     #[test]

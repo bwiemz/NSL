@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn int4_per_group_roundtrip() {
         let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
-        let packed_len = (values.len() + 1) / 2;
+        let packed_len = values.len().div_ceil(2);
         let mut packed = vec![0u8; packed_len];
         let mut meta = KvBlockQuantMeta::default();
 

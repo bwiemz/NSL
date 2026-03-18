@@ -54,7 +54,7 @@ mod tests {
         // Just verify the symbols exist and are linkable
         let sum_fn: extern "C" fn(i64, i64, i64) -> i64 = nsl_tensor_reduce_sum_deterministic;
         let mean_fn: extern "C" fn(i64, i64, i64) -> i64 = nsl_tensor_reduce_mean_deterministic;
-        assert!(std::ptr::addr_of!(sum_fn) != std::ptr::null());
-        assert!(std::ptr::addr_of!(mean_fn) != std::ptr::null());
+        assert!(!std::ptr::addr_of!(sum_fn).is_null());
+        assert!(!std::ptr::addr_of!(mean_fn).is_null());
     }
 }

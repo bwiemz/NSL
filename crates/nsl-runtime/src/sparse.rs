@@ -193,9 +193,9 @@ mod tests {
 
     #[test]
     fn coo_construction_and_query() {
-        let rows = vec![0i64, 1, 2];
-        let cols = vec![0i64, 1, 2];
-        let vals = vec![1.0f64, 2.0, 3.0];
+        let rows = [0i64, 1, 2];
+        let cols = [0i64, 1, 2];
+        let vals = [1.0f64, 2.0, 3.0];
 
         let ptr = nsl_sparse_coo(
             rows.as_ptr() as i64, cols.as_ptr() as i64, vals.as_ptr() as i64,

@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn ffi_quantize_int8() {
-        let n = 2 * 1 * 4; // heads=2, tokens=1, dim=4
+        let n = 2 * 4; // heads=2, tokens=1, dim=4
         let k: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
         let v: Vec<f32> = (0..n).map(|i| i as f32 * -0.3).collect();
         let mut k_out = vec![0i8; n];
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(nsl_kv_h2o_init(4, 0, 1), -1); // double init
 
         // Accumulate scores
-        let scores = vec![5.0f32, 3.0, 1.0, 4.0, 0.5, 6.0];
+        let scores = [5.0f32, 3.0, 1.0, 4.0, 0.5, 6.0];
         let rc = nsl_kv_h2o_accumulate(0, scores.as_ptr() as i64, 6);
         assert_eq!(rc, 0);
 

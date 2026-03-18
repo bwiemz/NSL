@@ -220,7 +220,7 @@ mod tests {
         let result = validate_sparse_decorator(&deco, &resolver, &mut diags);
         // pattern is invalid, so pattern stays None -> missing pattern error too
         assert!(result.is_none());
-        assert!(diags.len() >= 1);
+        assert!(!diags.is_empty());
     }
 
     #[test]
