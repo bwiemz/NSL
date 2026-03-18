@@ -1,11 +1,8 @@
-use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::collections::{HashMap, HashSet};
 
 use crate::list::NslList;
-use crate::memory::checked_alloc;
 use crate::tensor::{
-    nsl_tensor_add as tensor_add,
     nsl_tensor_clone as tensor_clone,
     nsl_tensor_div as tensor_div,
     nsl_tensor_free as tensor_free,
@@ -14,696 +11,24 @@ use crate::tensor::{
     nsl_tensor_mul as tensor_mul,
     nsl_tensor_mul_scalar as tensor_mul_scalar,
     nsl_tensor_neg as tensor_neg,
-    nsl_tensor_ones_like,
-    nsl_tensor_select,
+    nsl_tensor_select as nsl_tensor_select,
     nsl_tensor_shape as tensor_shape,
     nsl_tensor_sign as tensor_sign,
-    nsl_tensor_sum_dim,
+    nsl_tensor_sum_dim as nsl_tensor_sum_dim,
     nsl_tensor_transpose as tensor_transpose,
     nsl_tensor_zeros as tensor_zeros,
+    NslTensor,
 };
 
-/// Create a ones tensor from a shape slice with a given dtype.
-/// Avoids dereferencing a raw tensor pointer (safe for freed inputs).
-fn ones_from_shape(shape: &[i64], dtype: u16) -> i64 {
-    let result = crate::cpu::create_tensor_with_shape_rs_dtype(shape, dtype);
-    // Fill with 1.0
-    let t = crate::tensor::NslTensor::from_ptr(result);
-    if dtype == 1 {
-        for i in 0..t.len as usize {
-            unsafe { *t.data_f32().add(i) = 1.0 };
-        }
-    } else {
-        for i in 0..t.len as usize {
-            unsafe { *t.data_f64().add(i) = 1.0 };
-        }
-    }
-    result
-}
-
-/// Operations recorded on the tape during forward passes inside `grad` blocks.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub enum TapeOp {
-    Add { a: i64, b: i64, out: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    Sub { a: i64, b: i64, out: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    Mul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    Div { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
-    MatMul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64 },
-    Neg { a: i64, out: i64 },
-    MulScalar { a: i64, scalar: f64, out: i64 },
-    AddScalar { a: i64, out: i64 },
-    Transpose { a: i64, out: i64, dim0: i64, dim1: i64 },
-    SumReduce { a: i64, out: i64, dim: i64, keepdim: bool, input_shape: Vec<i64> },
-    MeanReduce { a: i64, out: i64, dim: i64, keepdim: bool, num_elements: i64, input_shape: Vec<i64> },
-    ReduceMax { a: i64, out: i64, dim: i64, keepdim: bool, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
-    Gather { a: i64, out: i64, dim: i64, indices_ptr: i64, input_shape: Vec<i64> },
-    Exp { a: i64, out: i64, saved_out: i64 },
-    Log { a: i64, out: i64, saved_a: i64 },
-    Sqrt { a: i64, out: i64, saved_out: i64 },
-    Abs { a: i64, out: i64, saved_a: i64 },
-    Clamp { a: i64, out: i64, saved_a: i64, min_val: f64, max_val: f64 },
-    ReLU { a: i64, out: i64, saved_a: i64 },
-    GELU { a: i64, out: i64, saved_a: i64 },
-    SiLU { a: i64, out: i64, saved_a: i64 },
-    Sigmoid { a: i64, out: i64, saved_out: i64 },
-    Tanh { a: i64, out: i64, saved_out: i64 },
-    Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
-    Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
-    Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
-    EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
-    LayerNorm { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_mean: i64, saved_inv_std: i64, saved_weight: i64 },
-    RMSNorm { input: i64, weight: i64, out: i64, saved_input: i64, saved_rms: i64, saved_weight: i64 },
-    Dropout { a: i64, out: i64, saved_mask: i64, scale: f64 },
-    Conv2d { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_weight: i64, stride_h: usize, stride_w: usize, pad_h: usize, pad_w: usize },
-    MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
-    BiasAdd { tensor: i64, bias: i64, out: i64 },
-    Unsqueeze { input: i64, out: i64, input_shape: Vec<i64> },
-    Expand { input: i64, out: i64, original_shape: Vec<i64> },
-    Stack { inputs: Vec<i64>, out: i64, dim: i64 },
-}
-
-struct Tape {
-    ops: Vec<TapeOp>,
-    param_set: HashSet<i64>,
-    recording: bool,
-    pause_depth: i32,
-}
-
-impl Tape {
-    fn new() -> Self {
-        Tape {
-            ops: Vec::new(),
-            param_set: HashSet::new(),
-            recording: false,
-            pause_depth: 0,
-        }
-    }
-}
-
-thread_local! {
-    static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
-}
-
-/// Returns true if the tape is actively recording (started and not paused).
-pub fn is_recording() -> bool {
-    TAPE.with(|t| {
-        let tape = t.borrow();
-        tape.recording && tape.pause_depth == 0
-    })
-}
-
-/// Remove the last recorded op from the tape (used when a compound op replaces a sub-op).
-pub fn pop_last_op() {
-    TAPE.with(|t| {
-        t.borrow_mut().ops.pop();
-    });
-}
-
-/// Records an operation on the tape if recording is active.
-pub fn maybe_record(op: TapeOp) {
-    if !is_recording() {
-        return;
-    }
-    TAPE.with(|t| {
-        t.borrow_mut().ops.push(op);
-    });
-}
-
-/// Start recording operations on the tape.
-/// `param_list` is an i64 pointer to an NslList of tensor pointers that are parameters.
-#[no_mangle]
-pub extern "C" fn nsl_tape_start(param_list: i64) {
-    TAPE.with(|t| {
-        let mut tape = t.borrow_mut();
-        // Release any saved tensor refs from a previous tape session
-        // (prevents refcount leaks if tape_start is called without tape_stop)
-        release_tape_op_refs(&tape.ops);
-        tape.ops.clear();
-        tape.param_set.clear();
-        tape.recording = true;
-        tape.pause_depth = 0;
-
-        let list = NslList::from_ptr(param_list);
-        for i in 0..list.len as usize {
-            let tensor_ptr = unsafe { *list.data.add(i) };
-            tape.param_set.insert(tensor_ptr);
-        }
-    });
-}
-
-/// Release saved tensor refcounts held by tape ops.
-/// Must be called before clearing ops to prevent refcount leaks.
-fn release_tape_op_refs(ops: &[TapeOp]) {
-    for op in ops.iter() {
-        match op {
-            TapeOp::Mul { saved_a, saved_b, .. }
-            | TapeOp::Div { saved_a, saved_b, .. }
-            | TapeOp::MatMul { saved_a, saved_b, .. } => {
-                tensor_free(*saved_a);
-                tensor_free(*saved_b);
-            }
-            TapeOp::Exp { saved_out, .. }
-            | TapeOp::Sqrt { saved_out, .. }
-            | TapeOp::Sigmoid { saved_out, .. }
-            | TapeOp::Tanh { saved_out, .. }
-            | TapeOp::Softmax { saved_out, .. } => {
-                tensor_free(*saved_out);
-            }
-            TapeOp::Log { saved_a, .. }
-            | TapeOp::Abs { saved_a, .. }
-            | TapeOp::Clamp { saved_a, .. }
-            | TapeOp::ReLU { saved_a, .. }
-            | TapeOp::GELU { saved_a, .. }
-            | TapeOp::SiLU { saved_a, .. } => {
-                tensor_free(*saved_a);
-            }
-            TapeOp::Gather { indices_ptr, .. } => {
-                tensor_free(*indices_ptr);
-            }
-            TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
-                tensor_free(*saved_weight);
-                tensor_free(*saved_indices);
-            }
-            TapeOp::LayerNorm { saved_input, saved_mean, saved_inv_std, saved_weight, .. } => {
-                tensor_free(*saved_input);
-                tensor_free(*saved_mean);
-                tensor_free(*saved_inv_std);
-                tensor_free(*saved_weight);
-            }
-            TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
-                tensor_free(*saved_input);
-                tensor_free(*saved_rms);
-                tensor_free(*saved_weight);
-            }
-            TapeOp::Dropout { saved_mask, .. } => {
-                tensor_free(*saved_mask);
-            }
-            TapeOp::Conv2d { saved_input, saved_weight, .. } => {
-                tensor_free(*saved_input);
-                tensor_free(*saved_weight);
-            }
-            TapeOp::BiasAdd { tensor, bias, .. } => {
-                tensor_free(*tensor);
-                tensor_free(*bias);
-            }
-            TapeOp::Unsqueeze { .. } => {}
-            TapeOp::Expand { .. } => {}
-            TapeOp::Stack { inputs, .. } | TapeOp::Cat { inputs, .. } => {
-                for &inp in inputs {
-                    tensor_free(inp);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Stop recording and clean up saved tensor refcounts.
-/// This prevents memory leaks even if backward is never called.
-#[no_mangle]
-pub extern "C" fn nsl_tape_stop() {
-    TAPE.with(|t| {
-        let mut tape = t.borrow_mut();
-        tape.recording = false;
-        tape.pause_depth = 0;
-
-        release_tape_op_refs(&tape.ops);
-
-        tape.ops.clear();
-        tape.param_set.clear();
-    });
-}
-
-/// Pause recording (used by @no_grad). Increments pause depth.
-#[no_mangle]
-pub extern "C" fn nsl_tape_pause() {
-    TAPE.with(|t| {
-        t.borrow_mut().pause_depth += 1;
-    });
-}
-
-/// Resume recording after a pause. Decrements pause depth.
-#[no_mangle]
-pub extern "C" fn nsl_tape_resume() {
-    TAPE.with(|t| {
-        let mut tape = t.borrow_mut();
-        if tape.pause_depth > 0 {
-            tape.pause_depth -= 1;
-        }
-    });
-}
-
-/// Create a tensor of ones with the same shape and device as the given tensor.
-fn ones_like(tensor_ptr: i64) -> i64 {
-    nsl_tensor_ones_like(tensor_ptr)
-}
-
-/// Accumulate gradient: grads[key] += grad_tensor.
-/// If key doesn't exist yet, set it directly. If it does, add and free the old/input tensors.
-fn accumulate_grad(grads: &mut HashMap<i64, i64>, key: i64, grad_tensor: i64) {
-    if let Some(existing) = grads.get(&key) {
-        let old = *existing;
-        // Pause recording to avoid taping gradient computation ops
-        TAPE.with(|t| t.borrow_mut().pause_depth += 1);
-        let summed = tensor_add(old, grad_tensor);
-        TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
-        tensor_free(old);
-        tensor_free(grad_tensor);
-        grads.insert(key, summed);
-    } else {
-        grads.insert(key, grad_tensor);
-    }
-}
-
-/// Create a tensor with the given shape, filled with zeros (f64, dtype=0).
-#[allow(dead_code)]
-fn create_tensor_with_shape(shape: &[i64], fill: f64) -> i64 {
-    create_tensor_with_shape_dtype(shape, fill, 0)
-}
-
-/// Create a tensor with the given shape, filled with `fill`, and a specified dtype.
-fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u16) -> i64 {
-    use crate::memory::checked_alloc_zeroed;
-    use crate::tensor::NslTensor;
-
-    let ndim = shape.len() as i64;
-    let mut total: i64 = 1;
-    for &s in shape {
-        total *= s;
-    }
-
-    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
-    for (i, &s) in shape.iter().enumerate() {
-        unsafe { *shape_ptr.add(i) = s };
-    }
-    let strides = NslTensor::compute_strides(shape_ptr, ndim);
-
-    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
-    let data_size = (total as usize) * elem_size;
-    let data_raw: *mut c_void = if fill == 0.0 {
-        checked_alloc_zeroed(data_size) as *mut c_void
-    } else if dtype == 1 {
-        let data = crate::memory::checked_alloc(data_size) as *mut f32;
-        for i in 0..total as usize {
-            unsafe { *data.add(i) = fill as f32 };
-        }
-        data as *mut c_void
-    } else {
-        let data = crate::memory::checked_alloc(data_size) as *mut f64;
-        for i in 0..total as usize {
-            unsafe { *data.add(i) = fill };
-        }
-        data as *mut c_void
-    };
-
-    let tensor = Box::new(NslTensor {
-        data: data_raw,
-        shape: shape_ptr,
-        strides,
-        ndim,
-        len: total,
-        refcount: 1,
-        device: 0,
-        dtype,
-        owns_data: 1,
-    });
-    Box::into_raw(tensor) as i64
-}
-
-/// Like `create_tensor_with_shape_dtype` but allocates data in unified CUDA memory when device > 0.
-/// This allows CPU code to populate the tensor while the result is accessible on GPU.
-fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u16, device: u8) -> i64 {
-    use crate::memory::checked_alloc_zeroed;
-    use crate::tensor::NslTensor;
-
-    if device == 0 {
-        return create_tensor_with_shape_dtype(shape, fill, dtype);
-    }
-
-    let ndim = shape.len() as i64;
-    let mut total: i64 = 1;
-    for &s in shape {
-        total *= s;
-    }
-
-    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
-    for (i, &s) in shape.iter().enumerate() {
-        unsafe { *shape_ptr.add(i) = s };
-    }
-    let strides = NslTensor::compute_strides(shape_ptr, ndim);
-
-    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
-    let data_size = (total as usize) * elem_size;
-
-    let data_raw: *mut c_void = {
-        #[cfg(feature = "cuda")]
-        {
-            // Allocate in unified memory (zero-initialized via CUDA managed memory semantics).
-            // cuMemAllocManaged does not guarantee zero-init, so we zero it explicitly.
-            let ptr = crate::cuda::inner::alloc_managed(data_size);
-            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, data_size) };
-            if fill != 0.0 {
-                if dtype == 1 {
-                    let fptr = ptr as *mut f32;
-                    for i in 0..total as usize {
-                        unsafe { *fptr.add(i) = fill as f32 };
-                    }
-                } else {
-                    let fptr = ptr as *mut f64;
-                    for i in 0..total as usize {
-                        unsafe { *fptr.add(i) = fill };
-                    }
-                }
-            }
-            ptr
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            if fill == 0.0 {
-                checked_alloc_zeroed(data_size) as *mut c_void
-            } else if dtype == 1 {
-                let data = crate::memory::checked_alloc(data_size) as *mut f32;
-                for i in 0..total as usize {
-                    unsafe { *data.add(i) = fill as f32 };
-                }
-                data as *mut c_void
-            } else {
-                let data = crate::memory::checked_alloc(data_size) as *mut f64;
-                for i in 0..total as usize {
-                    unsafe { *data.add(i) = fill };
-                }
-                data as *mut c_void
-            }
-        }
-    };
-
-    let tensor = Box::new(NslTensor {
-        data: data_raw,
-        shape: shape_ptr,
-        strides,
-        ndim,
-        len: total,
-        refcount: 1,
-        device,
-        dtype,
-        owns_data: 1,
-    });
-    Box::into_raw(tensor) as i64
-}
-
-/// Reshape a tensor to the given shape by deep-copying its data with new shape metadata.
-/// The element count must match (panics otherwise).
-fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
-    use crate::tensor::NslTensor;
-
-    let tensor = NslTensor::from_ptr(tensor_ptr);
-    let ndim = shape.len() as i64;
-    let total: i64 = shape.iter().product();
-    assert_eq!(total, tensor.len, "reshape_to_shape: size mismatch {} vs {}", total, tensor.len);
-
-    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
-    for (i, &s) in shape.iter().enumerate() {
-        unsafe { *shape_ptr.add(i) = s; }
-    }
-    let strides = NslTensor::compute_strides(shape_ptr, ndim);
-
-    let data_size = (total as usize) * tensor.element_size();
-    let data = crate::memory::checked_alloc(data_size);
-    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size); }
-
-    let new_tensor = Box::new(NslTensor {
-        data: data as *mut std::ffi::c_void,
-        shape: shape_ptr,
-        strides,
-        ndim,
-        len: total,
-        refcount: 1,
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1,
-    });
-    Box::into_raw(new_tensor) as i64
-}
-
-/// Reduce a gradient to match the original input shape after broadcasting.
-/// If grad has shape [10, 256] but original input was [10, 1], sum along dim 1 with keepdim.
-/// If grad has ndim 2 but original was ndim 1, reduce and squeeze appropriately.
-fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i64 {
-    use crate::tensor::NslTensor;
-
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let grad_ndim = grad.ndim as usize;
-    let orig_ndim = orig_shape.len();
-
-    // Build the right-aligned original shape padded with 1s
-    let mut orig_padded = vec![1i64; grad_ndim];
-    for i in 0..orig_ndim {
-        orig_padded[grad_ndim - orig_ndim + i] = orig_shape[i];
-    }
-
-    // Check which dims were broadcast (orig was 1 but grad is > 1)
-    let grad_shape: Vec<i64> = (0..grad_ndim)
-        .map(|i| unsafe { *grad.shape.add(i) })
-        .collect();
-
-    // If shapes already match, return clone
-    if grad_shape == orig_shape {
-        return tensor_clone(grad_ptr);
-    }
-
-    let mut result = tensor_clone(grad_ptr);
-
-    // Sum along dimensions that were broadcast (where orig was 1 but grad > 1)
-    // We also need to handle leading dims that don't exist in orig (padded with 1)
-    for d in 0..grad_ndim {
-        if orig_padded[d] == 1 && grad_shape[d] > 1 {
-            let old = result;
-            // Sum along dim d, keepdim=true to maintain ndim
-            result = crate::tensor::nsl_tensor_sum_dim(result, d as i64, 1);
-            if old != grad_ptr {
-                tensor_free(old);
-            }
-        }
-    }
-
-    // If orig had fewer dims, squeeze the leading dims
-    if orig_ndim < grad_ndim {
-        let res = NslTensor::from_ptr(result);
-        // Reshape to orig_shape
-        let new_shape = checked_alloc(std::mem::size_of_val(orig_shape)) as *mut i64;
-        for (i, &s) in orig_shape.iter().enumerate().take(orig_ndim) {
-            unsafe { *new_shape.add(i) = s };
-        }
-        let new_strides = NslTensor::compute_strides(new_shape, orig_ndim as i64);
-        let mut total: i64 = 1;
-        for &s in orig_shape {
-            total *= s;
-        }
-        // Copy data (byte-level copy, preserves dtype)
-        let elem_size = res.element_size();
-        let new_data_raw = checked_alloc((total as usize) * elem_size);
-        unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw, (total as usize) * elem_size) };
-        let out = Box::new(NslTensor {
-            data: new_data_raw as *mut c_void,
-            shape: new_shape,
-            strides: new_strides,
-            ndim: orig_ndim as i64,
-            len: total,
-            refcount: 1,
-        device: 0,
-        dtype: res.dtype,
-        owns_data: 1,
-    });
-        let out_ptr = Box::into_raw(out) as i64;
-        if result != grad_ptr {
-            tensor_free(result);
-        }
-        return out_ptr;
-    }
-
-    result
-}
-
-/// Broadcast a gradient tensor along a reduced dimension back to input_shape.
-/// grad has the reduced shape; we need to expand it along `dim` to match input_shape.
-fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i64 {
-    use crate::tensor::NslTensor;
-
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let ndim = input_shape.len();
-    let grad_dtype = grad.dtype;
-
-    // Create output with input_shape, matching grad dtype
-    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
-    let out = NslTensor::from_ptr(out_ptr);
-
-    // Compute contiguous strides from shapes (safe for non-contiguous tensors)
-    let out_strides: Vec<usize> = {
-        let mut s = vec![1usize; ndim];
-        for d in (0..ndim.saturating_sub(1)).rev() {
-            s[d] = s[d + 1] * input_shape[d + 1] as usize;
-        }
-        s
-    };
-
-    let grad_ndim = grad.ndim as usize;
-    let grad_shape: Vec<usize> = (0..grad_ndim)
-        .map(|i| unsafe { *grad.shape.add(i) } as usize)
-        .collect();
-    let grad_strides: Vec<usize> = {
-        let mut s = vec![1usize; grad_ndim];
-        for d in (0..grad_ndim.saturating_sub(1)).rev() {
-            s[d] = s[d + 1] * grad_shape[d + 1];
-        }
-        s
-    };
-
-    let total = out.len as usize;
-    for flat_idx in 0..total {
-        let mut remaining = flat_idx;
-        let mut indices = vec![0usize; ndim];
-        for d in 0..ndim {
-            indices[d] = remaining / out_strides[d];
-            remaining %= out_strides[d];
-        }
-
-        let mut grad_idx = 0usize;
-        let mut gi = 0usize;
-        for (d, &idx) in indices.iter().enumerate().take(ndim) {
-            if d == dim {
-                continue;
-            }
-            grad_idx += idx * grad_strides[gi];
-            gi += 1;
-        }
-
-        if grad_dtype == 1 {
-            unsafe { *out.data_f32().add(flat_idx) = *grad.data_f32().add(grad_idx); }
-        } else {
-            unsafe { *out.data_f64().add(flat_idx) = *grad.data_f64().add(grad_idx); }
-        }
-    }
-
-    out_ptr
-}
-
-/// Scatter gradient to argmax positions for ReduceMax backward.
-fn scatter_grad_to_argmax(
-    grad_ptr: i64,
-    input_shape: &[i64],
-    dim: usize,
-    argmax: &[usize],
-) -> i64 {
-    use crate::tensor::NslTensor;
-
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let ndim = input_shape.len();
-    let grad_dtype = grad.dtype;
-    // Create zero output with input_shape, matching grad dtype
-    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
-    let out = NslTensor::from_ptr(out_ptr);
-
-    // Compute contiguous strides from shapes (safe for non-contiguous tensors)
-    let out_strides: Vec<usize> = {
-        let mut s = vec![1usize; ndim];
-        for d in (0..ndim.saturating_sub(1)).rev() {
-            s[d] = s[d + 1] * input_shape[d + 1] as usize;
-        }
-        s
-    };
-
-    let grad_ndim = grad.ndim as usize;
-    let grad_shape: Vec<usize> = (0..grad_ndim)
-        .map(|i| unsafe { *grad.shape.add(i) } as usize)
-        .collect();
-    let grad_strides: Vec<usize> = {
-        let mut s = vec![1usize; grad_ndim];
-        for d in (0..grad_ndim.saturating_sub(1)).rev() {
-            s[d] = s[d + 1] * grad_shape[d + 1];
-        }
-        s
-    };
-
-    let grad_total = grad.len as usize;
-    for (grad_flat, &max_idx) in argmax.iter().enumerate().take(grad_total) {
-        let mut remaining = grad_flat;
-        let mut grad_indices = vec![0usize; grad_ndim];
-        for d in 0..grad_ndim {
-            grad_indices[d] = remaining / grad_strides[d];
-            remaining %= grad_strides[d];
-        }
-
-        let mut out_offset = 0usize;
-        let mut gi = 0usize;
-        for (d, &os) in out_strides.iter().enumerate().take(ndim) {
-            if d == dim {
-                out_offset += max_idx * os;
-            } else {
-                out_offset += grad_indices[gi] * os;
-                gi += 1;
-            }
-        }
-
-        if grad_dtype == 1 {
-            let g_val = unsafe { *grad.data_f32().add(grad_flat) };
-            unsafe { *out.data_f32().add(out_offset) += g_val };
-        } else {
-            let g_val = unsafe { *grad.data_f64().add(grad_flat) };
-            unsafe { *out.data_f64().add(out_offset) += g_val };
-        }
-    }
-
-    out_ptr
-}
-
-/// Scatter gather gradient back to input shape.
-fn scatter_gather_grad(
-    grad_ptr: i64,
-    input_shape: &[i64],
-    dim: usize,
-    indices_ptr: i64,
-) -> i64 {
-    use crate::tensor::NslTensor;
-
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let indices = NslTensor::from_ptr(indices_ptr);
-    let grad_dtype = grad.dtype;
-
-    // Create zero gradient with input_shape, matching grad dtype
-    let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
-    let out = NslTensor::from_ptr(out_ptr);
-
-    let out_strides: Vec<usize> = (0..input_shape.len())
-        .map(|i| unsafe { *out.strides.add(i) } as usize)
-        .collect();
-    // For cross_entropy: input=[batch, classes], dim=1, indices=[batch]
-    // grad=[batch], output[b, indices[b]] += grad[b]
-    let batch = indices.len as usize;
-    for b in 0..batch {
-        let idx = if indices.dtype == 1 { (unsafe { *indices.data_f32().add(b) }) as usize }
-                  else { (unsafe { *indices.data_f64().add(b) }) as usize };
-        let mut out_offset = 0usize;
-        if input_shape.len() == 2 && dim == 1 {
-            out_offset = b * out_strides[0] + idx * out_strides[1];
-        } else if dim == 0 {
-            out_offset = idx * out_strides[0] + b * out_strides[1];
-        }
-        if grad_dtype == 1 {
-            let g_val = unsafe { *grad.data_f32().add(b) };
-            unsafe { *out.data_f32().add(out_offset) += g_val };
-        } else {
-            let g_val = unsafe { *grad.data_f64().add(b) };
-            unsafe { *out.data_f64().add(out_offset) += g_val };
-        }
-    }
-
-    out_ptr
-}
+use super::grad_utils::{
+    accumulate_grad, broadcast_grad_along_dim, create_tensor_with_shape_dtype,
+    create_tensor_with_shape_dtype_device, ones_like, reduce_grad_for_broadcast, reshape_to_shape,
+    scatter_gather_grad, scatter_grad_to_argmax,
+};
+use super::{ones_from_shape, TapeOp, TAPE};
 
 /// ReLU backward: grad * (input > 0 ? 1 : 0)
 fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
-    use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -739,7 +64,6 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 
 /// GELU backward: gelu'(x) = 0.5*(1+tanh(c*(x+0.044715*x^3))) + 0.5*x*sech^2(c*(x+0.044715*x^3))*c*(1+3*0.044715*x^2)
 fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
-    use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -786,7 +110,6 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 
 /// SiLU backward: sigmoid(x) * (1 + x * (1 - sigmoid(x)))
 fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
-    use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -826,7 +149,6 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 
 /// Sigmoid backward: out * (1 - out)
 fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
-    use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -862,7 +184,6 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
 
 /// Tanh backward: 1 - out^2
 fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
-    use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -898,7 +219,6 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
 
 /// Softmax backward: grad_input_i = output_i * (grad_i - sum(grad * output)) along dim
 fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
-    use crate::tensor::NslTensor;
     let grad = NslTensor::from_ptr(grad_ptr);
     let out = NslTensor::from_ptr(out_ptr);
     let on_gpu = grad.device > 0;
@@ -966,8 +286,6 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
 
 /// Slice backward: create zeros with input_shape, copy grad into the [start, start+slice_len) region along dim.
 fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) -> i64 {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
 
@@ -1008,8 +326,6 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
 
 /// Cat backward: split the gradient along the cat dim into pieces matching the original input sizes.
 fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = grad.ndim as usize;
     let grad_dtype = grad.dtype;
@@ -1068,8 +384,6 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
 ///   d_weight = sum(d_out * normalized, across batch)
 ///   d_bias = sum(d_out, across batch)
 fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr: i64, weight_ptr: i64) -> (i64, i64, i64) {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let mean_t = NslTensor::from_ptr(mean_ptr);   // always f64
@@ -1165,8 +479,6 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
 ///   d_x = weight * (d_out / rms - x * sum(d_out * x) / (N * rms^3))
 ///   d_weight = sum(d_out * (x / rms), across batch)
 fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64) -> (i64, i64) {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let rms_t = NslTensor::from_ptr(rms_ptr); // always f64
@@ -1244,8 +556,6 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 
 /// Dropout backward: grad_input = grad_output * mask * scale
 fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let mask = NslTensor::from_ptr(mask_ptr); // always f64
     let len = grad.len as usize;
@@ -1285,8 +595,6 @@ fn conv2d_backward(
     pad_h: usize,
     pad_w: usize,
 ) -> (i64, i64, i64) {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let weight = NslTensor::from_ptr(weight_ptr);
@@ -1380,8 +688,6 @@ fn conv2d_backward(
 
 /// MaxPool2d backward: scatter gradient to argmax positions
 fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i64 {
-    use crate::tensor::NslTensor;
-
     let grad = NslTensor::from_ptr(grad_ptr);
     let grad_dtype = grad.dtype;
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);

@@ -1,0 +1,182 @@
+mod access;
+mod advanced;
+mod binary_ops;
+mod calls;
+mod literals;
+
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::types as cl_types;
+use cranelift_codegen::ir::{InstBuilder, Value};
+use cranelift_frontend::FunctionBuilder;
+
+use nsl_ast::expr::{Expr, ExprKind};
+use nsl_ast::operator::UnaryOp;
+use crate::compiler::Compiler;
+use crate::context::FuncState;
+use crate::error::CodegenError;
+use crate::types::is_float_type;
+
+impl Compiler<'_> {
+    pub fn compile_expr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        expr: &Expr,
+    ) -> Result<Value, CodegenError> {
+        // Auto-fusion: check for fusible chains before normal dispatch
+        if let Some(fused_result) = self.try_auto_fuse(builder, state, expr)? {
+            return Ok(fused_result);
+        }
+
+        match &expr.kind {
+            ExprKind::IntLiteral(n) => Ok(builder.ins().iconst(cl_types::I64, *n)),
+            ExprKind::FloatLiteral(f) => Ok(builder.ins().f64const(*f)),
+            ExprKind::BoolLiteral(b) => {
+                Ok(builder.ins().iconst(cl_types::I8, if *b { 1 } else { 0 }))
+            }
+            ExprKind::StringLiteral(s) => self.compile_string_literal(builder, s),
+            ExprKind::NoneLiteral => Ok(builder.ins().iconst(cl_types::I64, 0)),
+
+            ExprKind::Ident(sym) => {
+                if let Some((var, _)) = state.variables.get(sym) {
+                    Ok(builder.use_var(*var))
+                } else {
+                    let name = self.resolve_sym(*sym).to_string();
+                    // Device constants for .to(device) calls
+                    if name == "cuda" {
+                        return Ok(builder.ins().iconst(cl_types::I64, 1));
+                    }
+                    if name == "cpu" {
+                        return Ok(builder.ins().iconst(cl_types::I64, 0));
+                    }
+                    // Check if it's a custom dtype constant (for .to(CustomDtype) etc.)
+                    if let Some(dtype_id) = self.resolve_custom_dtype(&name) {
+                        return Ok(builder.ins().iconst(cl_types::I64, dtype_id as i64));
+                    }
+                    // Check if it's an enum variant
+                    if let Some(tag) = self.lookup_enum_variant_tag(&name) {
+                        Ok(builder.ins().iconst(cl_types::I64, tag))
+                    } else {
+                        Err(CodegenError::new(format!(
+                            "undefined variable '{name}'"
+                        )))
+                    }
+                }
+            }
+
+            ExprKind::BinaryOp { left, op, right } => {
+                self.compile_binary_op(builder, state, left, *op, right, expr)
+            }
+            ExprKind::UnaryOp { op, operand } => {
+                self.compile_unary_op(builder, state, *op, operand)
+            }
+            ExprKind::Call { callee, args } => {
+                self.compile_call(builder, state, callee, args, expr)
+            }
+            ExprKind::MemberAccess { object, member } => {
+                self.compile_member_access(builder, state, object, *member, expr)
+            }
+            ExprKind::ListLiteral(elements) => {
+                self.compile_list_literal(builder, state, elements)
+            }
+            ExprKind::Subscript { object, index } => {
+                self.compile_subscript(builder, state, object, index)
+            }
+            ExprKind::ListComp { element, generators } => {
+                self.compile_list_comp(builder, state, element, generators)
+            }
+            ExprKind::Lambda { params, body } => {
+                self.compile_lambda(builder, state, params, body)
+            }
+            ExprKind::TupleLiteral(elements) => {
+                self.compile_tuple_literal(builder, state, elements)
+            }
+            ExprKind::DictLiteral(pairs) => {
+                self.compile_dict_literal(builder, state, pairs)
+            }
+            ExprKind::MatchExpr { subject, arms } => {
+                self.compile_match_expr(builder, state, subject, arms, expr)
+            }
+            ExprKind::Range { start, end, inclusive } => {
+                self.compile_range_expr(builder, state, start.as_deref(), end.as_deref(), *inclusive)
+            }
+            ExprKind::FString(parts) => self.compile_fstring(builder, state, parts),
+            ExprKind::Paren(inner) => self.compile_expr(builder, state, inner),
+            ExprKind::IfExpr { condition, then_expr, else_expr } => {
+                self.compile_if_expr(builder, state, condition, then_expr, else_expr, expr)
+            }
+            ExprKind::Pipe { left, right } => {
+                let left_val = self.compile_expr(builder, state, left)?;
+                match &right.kind {
+                    ExprKind::Ident(_) => {
+                        let func_name = self.expr_as_func_name(right);
+                        if let Some(name) = func_name {
+                            self.compile_call_by_name(builder, &name, &[left_val])
+                        } else {
+                            Err(CodegenError::new("pipe target is not a function"))
+                        }
+                    }
+                    ExprKind::Call { callee, args } => {
+                        let func_name = self.expr_as_func_name(callee);
+                        if let Some(name) = func_name {
+                            let mut arg_vals = vec![left_val];
+                            for arg in args {
+                                arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                            }
+                            self.compile_call_by_name(builder, &name, &arg_vals)
+                        } else {
+                            Err(CodegenError::new("pipe call target is not a function"))
+                        }
+                    }
+                    _ => Err(CodegenError::new("unsupported pipe target")),
+                }
+            }
+
+            ExprKind::SelfRef => {
+                // Find the "self" variable in state (set by model method compilation)
+                for (sym, (var, _ty)) in &state.variables {
+                    if self.resolve_sym(*sym) == "self" {
+                        return Ok(builder.use_var(*var));
+                    }
+                }
+                Err(CodegenError::new("`self` used outside of model method"))
+            }
+
+            ExprKind::Error => Ok(builder.ins().iconst(cl_types::I64, 0)),
+            _ => Err(CodegenError::new(format!(
+                "unsupported expression in M3 codegen: {:?}",
+                std::mem::discriminant(&expr.kind)
+            ))),
+        }
+    }
+
+    // ── Unary ops ───────────────────────────────────────────────────
+
+    fn compile_unary_op(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        op: UnaryOp,
+        operand: &Expr,
+    ) -> Result<Value, CodegenError> {
+        let val = self.compile_expr(builder, state, operand)?;
+        let ty = self.node_type(operand.id).clone();
+        match op {
+            UnaryOp::Neg if ty.is_tensor() || (ty.is_indeterminate() && !state.in_dtype_method) => {
+                self.compile_call_by_name(builder, "nsl_tensor_neg", &[val])
+            }
+            UnaryOp::Neg if is_float_type(&ty) || builder.func.dfg.value_type(val).is_float() => {
+                Ok(builder.ins().fneg(val))
+            }
+            UnaryOp::Neg => Ok(builder.ins().ineg(val)),
+            UnaryOp::Not => Ok(builder.ins().icmp_imm(IntCC::Equal, val, 0)),
+        }
+    }
+
+    pub fn expr_as_func_name(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(sym) => Some(self.resolve_sym(*sym).to_string()),
+            _ => None,
+        }
+    }
+}
