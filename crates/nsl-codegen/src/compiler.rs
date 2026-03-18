@@ -131,6 +131,8 @@ pub struct Compiler<'a> {
     pub fusion_barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
     /// M31: Whether fusion event collection is enabled
     pub fusion_report_enabled: bool,
+    /// M47: Disable all fusion optimizations for differential testing.
+    pub disable_fusion: bool,
     /// M35: Functions with @fp8_compute decorator
     pub fp8_compute_fns: HashSet<String>,
     /// M35: Model quantization configs — "ModelName" -> QuantConfig
@@ -249,6 +251,8 @@ impl<'a> Compiler<'a> {
             fusion_events: Vec::new(),
             fusion_barriers: Vec::new(),
             fusion_report_enabled: false,
+            // TODO: wire disable_fusion to skip fusion passes in compile pipeline
+            disable_fusion: false,
             fp8_compute_fns: HashSet::new(),
             quant_configs: HashMap::new(),
             slab_plan: None,
@@ -2554,6 +2558,49 @@ impl<'a> Compiler<'a> {
         self.module.define_function(main_id, &mut ctx)
             .map_err(|e| CodegenError::new(format!("failed to define test main: {e}")))?;
         Ok(())
+    }
+
+    /// M39b: Apply vmap AST transformations to produce batched function variants.
+    ///
+    /// For each function with a @vmap config, clones the FnDef, runs the
+    /// VmapTransformer, and returns the batched variants.
+    /// Must be called before compile_user_functions().
+    pub fn apply_vmap_transforms(&self, module: &nsl_ast::Module) -> Vec<nsl_ast::decl::FnDef> {
+        let mut batched_fns = Vec::new();
+
+        for stmt in &module.stmts {
+            let fn_def = match &stmt.kind {
+                StmtKind::FnDef(f) => Some(f),
+                StmtKind::Decorated { stmt, .. } => {
+                    if let StmtKind::FnDef(f) = &stmt.kind {
+                        Some(f)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(fn_def) = fn_def {
+                let name = self.resolve_sym(fn_def.name).to_string();
+                if let Some(config) = self.vmap_configs.get(&name).cloned() {
+                    let mut transformer = crate::vmap::VmapTransformer::new(
+                        self.interner,
+                        &config,
+                    );
+                    match transformer.transform(fn_def) {
+                        Ok(result) => {
+                            batched_fns.push(result.batched_fn);
+                        }
+                        Err(e) => {
+                            eprintln!("vmap transform error for '{}': {}", name, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        batched_fns
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {

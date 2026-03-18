@@ -23,6 +23,10 @@ pub mod memory_planner;
 pub mod ownership;
 pub mod reduction_fusion;
 pub mod fusion_report;
+pub mod gpu_target;
+pub mod kernel_ir;
+pub mod backend_ptx;
+pub mod kernel_lower;
 pub mod kernel;
 pub mod linker;
 pub mod serve;
@@ -51,6 +55,10 @@ pub struct CompileOptions {
     pub vram_budget: Option<u64>,
     /// M36: Print memory plan report to stderr
     pub memory_report: bool,
+    /// M47: GPU compilation target name.
+    pub target: String,
+    /// Disable all fusion optimizations (for differential testing baseline).
+    pub disable_fusion: bool,
 }
 
 impl Default for CompileOptions {
@@ -62,6 +70,8 @@ impl Default for CompileOptions {
             fusion_report: false,
             vram_budget: None,
             memory_report: false,
+            target: "cuda".to_string(),
+            disable_fusion: false,
         }
     }
 }

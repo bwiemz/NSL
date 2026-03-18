@@ -66,6 +66,8 @@ pub mod disaggregated;
 pub mod kv_compress;
 pub mod grammar;
 pub mod token_alignment;
+pub mod gpu_backend;
+pub mod vmap_runtime;
 
 #[cfg(test)]
 mod fuzz;

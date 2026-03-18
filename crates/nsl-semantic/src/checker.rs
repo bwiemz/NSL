@@ -1226,6 +1226,20 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
+                            // M47: @target decorator validation
+                            if dname == "target" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::target::validate_target_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
                         }
                     }
                 }

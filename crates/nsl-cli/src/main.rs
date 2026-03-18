@@ -79,6 +79,14 @@ enum Cli {
         #[arg(long, default_value = "1")]
         decode_workers: u32,
 
+        /// M47: GPU target backend (cuda, rocm, metal, webgpu)
+        #[arg(long, default_value = "cuda")]
+        target: String,
+
+        /// Disable all fusion optimizations (for differential testing)
+        #[arg(long)]
+        disable_fusion: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -144,6 +152,14 @@ enum Cli {
         /// M38a: Enable linear types ownership checking
         #[arg(long)]
         linear_types: bool,
+
+        /// M47: GPU target backend (cuda, rocm, metal, webgpu)
+        #[arg(long, default_value = "cuda")]
+        target: String,
+
+        /// Disable all fusion optimizations (for differential testing)
+        #[arg(long)]
+        disable_fusion: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -221,6 +237,8 @@ fn main() {
             vram_budget,
             memory_report,
             linear_types: _linear_types,
+            target,
+            disable_fusion,
         } => {
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -247,6 +265,8 @@ fn main() {
                 vram_budget: vram_budget.as_deref()
                     .and_then(nsl_codegen::memory_planner::parse_vram_budget),
                 memory_report,
+                target,
+                disable_fusion,
             };
 
             if standalone {
@@ -287,6 +307,8 @@ fn main() {
             devices,
             prefill_workers,
             decode_workers,
+            target: _target,
+            disable_fusion: _disable_fusion,
         } => {
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
