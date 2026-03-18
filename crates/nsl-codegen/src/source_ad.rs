@@ -5,6 +5,12 @@ use std::collections::{HashMap, HashSet};
 use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
 use crate::wengert::{OpId, PrimalOp, VarId, WengertList, WengertOp};
 
+// M40b: Wengert extraction from typed AST
+use nsl_ast::expr::ExprKind;
+use nsl_ast::operator::{BinOp, UnaryOp as AstUnaryOp};
+use nsl_ast::stmt::StmtKind;
+use nsl_lexer::Interner;
+
 // ---------------------------------------------------------------------------
 // Adjoint generation
 // ---------------------------------------------------------------------------
@@ -197,6 +203,298 @@ pub fn analyze_saved_tensors(
     saved
 }
 
+// ---------------------------------------------------------------------------
+// M40b: Wengert Extraction from AST
+// ---------------------------------------------------------------------------
+
+/// Extracts a WengertList from a sequence of AST statements.
+///
+/// Returns `Some(WengertList)` if the computation is fully static (no
+/// data-dependent control flow). Returns `None` if dynamic control flow
+/// is detected, signaling fallback to tape-based AD.
+pub struct WengertExtractor<'a> {
+    interner: &'a Interner,
+    list: WengertList,
+    /// Maps AST symbol -> WengertList VarId.
+    symbol_to_var: HashMap<nsl_ast::Symbol, VarId>,
+    /// Next VarId to allocate.
+    next_var: VarId,
+    /// Whether this computation graph is fully static.
+    is_static: bool,
+    /// Symbols that are model parameters (need gradients).
+    param_symbols: HashSet<nsl_ast::Symbol>,
+}
+
+impl<'a> WengertExtractor<'a> {
+    pub fn new(interner: &'a Interner) -> Self {
+        WengertExtractor {
+            interner,
+            list: WengertList {
+                ops: Vec::new(),
+                output: 0,
+                var_names: HashMap::new(),
+            },
+            symbol_to_var: HashMap::new(),
+            next_var: 0,
+            is_static: true,
+            param_symbols: HashSet::new(),
+        }
+    }
+
+    fn alloc_var(&mut self) -> VarId {
+        let id = self.next_var;
+        self.next_var += 1;
+        id
+    }
+
+    /// Register a parameter symbol (needs gradient).
+    pub fn register_param(&mut self, sym: nsl_ast::Symbol) {
+        let var = self.alloc_var();
+        self.symbol_to_var.insert(sym, var);
+        self.param_symbols.insert(sym);
+
+        let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+        self.list.var_names.insert(var, name.clone());
+        self.list.ops.push(WengertOp {
+            id: self.list.ops.len() as u32,
+            result: var,
+            op: PrimalOp::Param(name),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+    }
+
+    /// Register an input symbol (data, no gradient).
+    pub fn register_input(&mut self, sym: nsl_ast::Symbol) {
+        let var = self.alloc_var();
+        self.symbol_to_var.insert(sym, var);
+
+        let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+        self.list.var_names.insert(var, name.clone());
+        self.list.ops.push(WengertOp {
+            id: self.list.ops.len() as u32,
+            result: var,
+            op: PrimalOp::Input(name),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+    }
+
+    /// Extract statements into the Wengert list.
+    /// Returns false if dynamic control flow is detected.
+    pub fn extract_stmts(&mut self, stmts: &[nsl_ast::stmt::Stmt]) -> bool {
+        for stmt in stmts {
+            if !self.extract_stmt(stmt) {
+                self.is_static = false;
+                return false;
+            }
+        }
+        true
+    }
+
+    fn extract_stmt(&mut self, stmt: &nsl_ast::stmt::Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::VarDecl { pattern, value: Some(val), .. } => {
+                if let Some(var) = self.extract_expr(val) {
+                    if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
+                        self.symbol_to_var.insert(*sym, var);
+                        let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+                        self.list.var_names.insert(var, name);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+
+            StmtKind::Return(Some(expr)) => {
+                if let Some(var) = self.extract_expr(expr) {
+                    self.list.output = var;
+                    true
+                } else {
+                    false
+                }
+            }
+
+            StmtKind::Expr(expr) => {
+                self.extract_expr(expr).is_some()
+            }
+
+            // Dynamic control flow -> not static
+            StmtKind::While { .. } => {
+                self.is_static = false;
+                false
+            }
+
+            // For loops: could be static if range is compile-time known,
+            // but conservatively mark as dynamic for M40b
+            StmtKind::For { .. } => {
+                self.is_static = false;
+                false
+            }
+
+            // If statements: mark as dynamic (data-dependent branches)
+            // Shape-dependent ifs could be resolved at compile time, but
+            // that requires type-level analysis deferred to M40c
+            StmtKind::If { .. } => {
+                self.is_static = false;
+                false
+            }
+
+            // Other statements pass through (assign, decorated, etc.)
+            _ => true,
+        }
+    }
+
+    /// Extract an expression into a WengertOp, returning its VarId.
+    /// Returns None if the expression contains dynamic control flow.
+    fn extract_expr(&mut self, expr: &nsl_ast::expr::Expr) -> Option<VarId> {
+        match &expr.kind {
+            ExprKind::Ident(sym) => {
+                self.symbol_to_var.get(sym).copied()
+            }
+
+            ExprKind::BinaryOp { left, op, right } => {
+                let l = self.extract_expr(left)?;
+                let r = self.extract_expr(right)?;
+                let result = self.alloc_var();
+                let primal_op = match op {
+                    BinOp::Add => PrimalOp::Add,
+                    BinOp::Sub => PrimalOp::Sub,
+                    BinOp::Mul => PrimalOp::Mul,
+                    BinOp::Div => PrimalOp::Div,
+                    _ => return None, // Unsupported op for AD
+                };
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: primal_op,
+                    inputs: vec![l, r],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
+            ExprKind::UnaryOp { op, operand } => {
+                let input = self.extract_expr(operand)?;
+                let result = self.alloc_var();
+                let primal_op = match op {
+                    AstUnaryOp::Neg => PrimalOp::Neg,
+                    _ => return None,
+                };
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: primal_op,
+                    inputs: vec![input],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
+            ExprKind::Call { callee, args } => {
+                // Extract function name
+                let func_name = if let ExprKind::Ident(sym) = &callee.kind {
+                    self.interner.resolve(sym.0).unwrap_or("").to_string()
+                } else {
+                    return None; // Complex callee -- can't extract
+                };
+
+                // Extract arguments
+                let mut input_vars = Vec::new();
+                for arg in args {
+                    if let Some(var) = self.extract_expr(&arg.value) {
+                        input_vars.push(var);
+                    } else {
+                        return None;
+                    }
+                }
+
+                let result = self.alloc_var();
+                let primal_op = match func_name.as_str() {
+                    "relu" => PrimalOp::Relu,
+                    "sigmoid" => PrimalOp::Sigmoid,
+                    "tanh" => PrimalOp::Tanh,
+                    "exp" => PrimalOp::Exp,
+                    "log" => PrimalOp::Log,
+                    "sqrt" => PrimalOp::Sqrt,
+                    "matmul" => PrimalOp::Matmul,
+                    // Transpose and Softmax are struct variants requiring dim args --
+                    // fall back to tape for M40b; proper arg extraction in M40c
+                    "transpose" | "softmax" => return None,
+                    _ => return None, // Unknown function -- can't differentiate
+                };
+
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: primal_op,
+                    inputs: input_vars,
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
+            ExprKind::IntLiteral(v) => {
+                let result = self.alloc_var();
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: PrimalOp::Constant(*v as f64),
+                    inputs: vec![],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
+            ExprKind::FloatLiteral(v) => {
+                let result = self.alloc_var();
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: PrimalOp::Constant(*v),
+                    inputs: vec![],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
+            ExprKind::Paren(inner) => self.extract_expr(inner),
+
+            // Anything else we can't extract -> fallback
+            _ => None,
+        }
+    }
+
+    /// Finalize extraction. Returns the WengertList if the graph is static.
+    pub fn finalize(self) -> Option<WengertList> {
+        if self.is_static && !self.list.ops.is_empty() {
+            Some(self.list)
+        } else {
+            None
+        }
+    }
+
+    /// Check if the computation graph is static (no dynamic control flow).
+    pub fn is_static_graph(&self) -> bool {
+        self.is_static
+    }
+
+    /// Get the parameter VarIds (for gradient computation targets).
+    pub fn param_vars(&self) -> Vec<VarId> {
+        self.param_symbols.iter()
+            .filter_map(|sym| self.symbol_to_var.get(sym).copied())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +591,103 @@ mod tests {
             output: 10, var_names: HashMap::new(),
         };
         assert!(analyze_saved_tensors(&primal, &adjoint).is_empty());
+    }
+
+    // --- M40b: WengertExtractor tests ---
+
+    use nsl_ast::expr::ExprKind;
+    use nsl_ast::stmt::StmtKind;
+    use nsl_lexer::Interner;
+
+    #[test]
+    fn extract_simple_input() {
+        let mut interner = Interner::new();
+        // Pre-intern before borrowing into extractor
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let extractor = {
+            let mut ext = WengertExtractor::new(&interner);
+            ext.register_input(x_sym);
+            ext
+        };
+
+        assert!(extractor.is_static_graph());
+        let list = extractor.finalize();
+        assert!(list.is_some());
+        assert_eq!(list.unwrap().ops.len(), 1);
+    }
+
+    #[test]
+    fn extract_registers_params_and_inputs() {
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let w_sym = nsl_ast::Symbol(interner.get_or_intern("W"));
+
+        let extractor = {
+            let mut ext = WengertExtractor::new(&interner);
+            ext.register_input(x_sym);
+            ext.register_param(w_sym);
+            ext
+        };
+
+        let params = extractor.param_vars();
+        assert_eq!(params.len(), 1);
+        assert!(extractor.is_static_graph());
+    }
+
+    #[test]
+    fn extract_detects_dynamic_while() {
+        let interner = Interner::new();
+        let mut extractor = WengertExtractor::new(&interner);
+
+        let while_stmt = nsl_ast::stmt::Stmt {
+            kind: StmtKind::While {
+                condition: nsl_ast::expr::Expr {
+                    kind: ExprKind::BoolLiteral(true),
+                    span: nsl_errors::Span::dummy(),
+                    id: nsl_ast::NodeId(0),
+                },
+                body: nsl_ast::stmt::Block { stmts: vec![], span: nsl_errors::Span::dummy() },
+            },
+            span: nsl_errors::Span::dummy(),
+            id: nsl_ast::NodeId(1),
+        };
+
+        let result = extractor.extract_stmts(&[while_stmt]);
+        assert!(!result);
+        assert!(!extractor.is_static_graph());
+    }
+
+    #[test]
+    fn extract_detects_dynamic_for() {
+        let interner = Interner::new();
+        let mut extractor = WengertExtractor::new(&interner);
+
+        let for_stmt = nsl_ast::stmt::Stmt {
+            kind: StmtKind::For {
+                pattern: nsl_ast::pattern::Pattern {
+                    kind: nsl_ast::pattern::PatternKind::Wildcard,
+                    span: nsl_errors::Span::dummy(),
+                    id: nsl_ast::NodeId(0),
+                },
+                iterable: nsl_ast::expr::Expr {
+                    kind: ExprKind::IntLiteral(10),
+                    span: nsl_errors::Span::dummy(),
+                    id: nsl_ast::NodeId(0),
+                },
+                body: nsl_ast::stmt::Block { stmts: vec![], span: nsl_errors::Span::dummy() },
+            },
+            span: nsl_errors::Span::dummy(),
+            id: nsl_ast::NodeId(1),
+        };
+
+        let result = extractor.extract_stmts(&[for_stmt]);
+        assert!(!result);
+    }
+
+    #[test]
+    fn extractor_finalize_none_when_empty() {
+        let interner = Interner::new();
+        let extractor = WengertExtractor::new(&interner);
+        assert!(extractor.finalize().is_none());
     }
 }

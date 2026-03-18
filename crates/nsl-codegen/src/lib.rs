@@ -4,6 +4,7 @@ pub mod compiler;
 pub mod context;
 pub mod context_parallel;
 pub mod cost_model;
+pub mod deterministic_kernels;
 pub mod grammar_compiler;
 pub mod schema_convert;
 
@@ -16,6 +17,7 @@ pub mod fusion;
 pub mod fusion_graph;
 pub mod gpu_specs;
 pub mod moe;
+pub mod pipeline;
 pub mod moe_kernels;
 pub mod epilogue_fusion;
 pub mod fp8;
@@ -59,6 +61,14 @@ pub struct CompileOptions {
     pub target: String,
     /// Disable all fusion optimizations (for differential testing baseline).
     pub disable_fusion: bool,
+    /// M40b: Force tape-based AD (disable source-to-source AD).
+    pub tape_ad: bool,
+    /// M45: Enable tensor operation tracing.
+    pub trace_ops: bool,
+    /// M45: Enable compile-time NaN risk analysis.
+    pub nan_analysis: bool,
+    /// M46: Enable deterministic mode.
+    pub deterministic: bool,
 }
 
 impl Default for CompileOptions {
@@ -72,6 +82,10 @@ impl Default for CompileOptions {
             memory_report: false,
             target: "cuda".to_string(),
             disable_fusion: false,
+            tape_ad: false,
+            trace_ops: false,
+            nan_analysis: false,
+            deterministic: false,
         }
     }
 }

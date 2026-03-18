@@ -48,6 +48,14 @@ enum Cli {
         /// M38a: Enable linear types ownership checking
         #[arg(long)]
         linear_types: bool,
+
+        /// M45: Run compile-time NaN/Inf risk analysis
+        #[arg(long)]
+        nan_analysis: bool,
+
+        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        #[arg(long)]
+        deterministic: bool,
     },
 
     /// Compile and execute an NSL program
@@ -86,6 +94,26 @@ enum Cli {
         /// Disable all fusion optimizations (for differential testing)
         #[arg(long)]
         disable_fusion: bool,
+
+        /// Force tape-based AD (disable source-to-source AD)
+        #[arg(long)]
+        tape_ad: bool,
+
+        /// M45: Enable tensor operation tracing (writes .nsl.trace binary)
+        #[arg(long)]
+        trace_ops: bool,
+
+        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        #[arg(long)]
+        deterministic: bool,
+
+        /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
+        #[arg(long)]
+        distribute: Option<String>,
+
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        #[arg(long)]
+        zero_stage: Option<u32>,
 
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
@@ -160,6 +188,22 @@ enum Cli {
         /// Disable all fusion optimizations (for differential testing)
         #[arg(long)]
         disable_fusion: bool,
+
+        /// Force tape-based AD (disable source-to-source AD)
+        #[arg(long)]
+        tape_ad: bool,
+
+        /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
+        #[arg(long)]
+        distribute: Option<String>,
+
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        #[arg(long)]
+        zero_stage: Option<u32>,
+
+        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        #[arg(long)]
+        deterministic: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -215,11 +259,17 @@ fn main() {
             gpu: _gpu,
             trace: _trace,
             linear_types: _linear_types,
+            nan_analysis: _nan_analysis,
+            deterministic: _deterministic,
         } => {
             run_check(&file, dump_tokens, dump_ast, dump_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
             // M38a: --linear-types parsed but dormant until ownership checker
             // is wired through the compilation pipeline.
+            // M45: --nan-analysis parsed but dormant until NaN analysis is wired
+            // through the check pipeline.
+            // M46: --deterministic parsed but dormant until determinism checker
+            // is wired through the check pipeline.
         }
         Cli::Build {
             file,
@@ -239,6 +289,10 @@ fn main() {
             linear_types: _linear_types,
             target,
             disable_fusion,
+            tape_ad: _tape_ad,
+            distribute: _distribute,
+            zero_stage: _zero_stage,
+            deterministic: _deterministic,
         } => {
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -267,6 +321,10 @@ fn main() {
                 memory_report,
                 target,
                 disable_fusion,
+                tape_ad: _tape_ad,
+                trace_ops: false,
+                nan_analysis: false,
+                deterministic: _deterministic,
             };
 
             if standalone {
@@ -309,6 +367,11 @@ fn main() {
             decode_workers,
             target: _target,
             disable_fusion: _disable_fusion,
+            tape_ad: _tape_ad,
+            trace_ops: _trace_ops,
+            deterministic: _deterministic,
+            distribute: _distribute,
+            zero_stage: _zero_stage,
         } => {
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

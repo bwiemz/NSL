@@ -68,6 +68,12 @@ pub mod grammar;
 pub mod token_alignment;
 pub mod gpu_backend;
 pub mod vmap_runtime;
+pub mod backward_context;
+pub mod pipeline;
+pub mod zero;
+pub mod tensor_trace;
+pub mod trace_diff;
+pub mod deterministic_ops;
 
 #[cfg(test)]
 mod fuzz;

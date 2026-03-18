@@ -397,6 +397,41 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_grammar_destroy", &[], Some(types::I64)),
     // --- M39b: vmap runtime ---
     ("nsl_vmap_check_batch", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // --- M40b: Backward context for source-to-source AD ---
+    ("nsl_backward_ctx_new", &[types::I64], Some(types::I64)),
+    ("nsl_backward_ctx_save", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_backward_ctx_load", &[types::I64], Some(types::I64)),
+    ("nsl_backward_ctx_free", &[], Some(types::I64)),
+    // --- M43: Pipeline parallelism ---
+    ("nsl_pipeline_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_pipeline_send", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_pipeline_recv", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_pipeline_send_grad", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_pipeline_recv_grad", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_pipeline_barrier", &[], Some(types::I64)),
+    ("nsl_pipeline_destroy", &[], Some(types::I64)),
+    // --- M43: ZeRO optimizer ---
+    ("nsl_zero_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_zero_partition", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_zero_reduce_grads", &[], Some(types::I64)),
+    ("nsl_zero_step", &[types::I64], Some(types::I64)),
+    ("nsl_zero_destroy", &[], Some(types::I64)),
+    // --- M43: Gradient accumulation ---
+    ("nsl_grad_accumulate_add", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_grad_zero", &[types::I64], Some(types::I64)),
+    ("nsl_grad_all_reduce", &[types::I64, types::I64], Some(types::I64)),
+    // --- M46: Deterministic kernel variants ---
+    ("nsl_tensor_reduce_sum_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_reduce_mean_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_scatter_add_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // --- M45: Tensor debugger trace ---
+    ("nsl_trace_init", &[], Some(types::I64)),
+    ("nsl_trace_record_op", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_trace_suppress", &[], Some(types::I64)),
+    ("nsl_trace_unsuppress", &[], Some(types::I64)),
+    ("nsl_trace_breakpoint", &[], Some(types::I64)),
+    ("nsl_trace_flush", &[], Some(types::I64)),
+    ("nsl_trace_destroy", &[], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
