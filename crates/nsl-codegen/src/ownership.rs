@@ -78,6 +78,94 @@ impl OwnershipLowering {
     pub fn mark_shared(&mut self, sym: Symbol) {
         self.shared_bindings.insert(sym);
     }
+
+    /// Determine the ownership action(s) for a tensor binding at a specific usage site.
+    ///
+    /// `sym`: the binding being used
+    /// `is_consuming`: true if this use consumes (moves) the tensor
+    /// `backward_access`: if inside a `grad` block, the tape op name for backward classification
+    /// `debug_mode`: whether to emit poison values after moves
+    pub fn decide(
+        &self,
+        sym: &Symbol,
+        is_consuming: bool,
+        backward_access: Option<&str>,
+        debug_mode: bool,
+    ) -> Vec<OwnershipDecision> {
+        let mut decisions = Vec::new();
+
+        // @shared bindings always use refcount management
+        if self.shared_bindings.contains(sym) {
+            decisions.push(OwnershipDecision::RefcountManaged);
+            return decisions;
+        }
+
+        // Borrowed bindings need no ownership action
+        if self.active_borrows.contains_key(sym) {
+            decisions.push(OwnershipDecision::BorrowedNoAction);
+            return decisions;
+        }
+
+        // Linear binding being consumed
+        if self.linear_bindings.contains(sym) && is_consuming {
+            // Check if the autodiff tape needs this tensor's data
+            if let Some(op_name) = backward_access {
+                use nsl_semantic::ownership_autodiff::{classify_backward_access, BackwardAccess};
+                let access = classify_backward_access(op_name);
+                match access {
+                    BackwardAccess::ShapeOnly => {
+                        // Safe to free immediately — backward only needs shape
+                        decisions.push(OwnershipDecision::FreeAtConsumption);
+                    }
+                    BackwardAccess::DataRequired => {
+                        // Tape saved_* holds a reference — don't free
+                        decisions.push(OwnershipDecision::TapeHoldsReference);
+                    }
+                    BackwardAccess::AuxDataRequired => {
+                        // Aux data is owned by tape, input tensor can be freed
+                        decisions.push(OwnershipDecision::FreeAtConsumption);
+                    }
+                }
+            } else {
+                // Not in grad block — always free at consumption
+                decisions.push(OwnershipDecision::FreeAtConsumption);
+            }
+
+            // Debug mode: poison the source slot
+            if debug_mode {
+                decisions.push(OwnershipDecision::PoisonAfterMove);
+            }
+
+            return decisions;
+        }
+
+        // Linear binding NOT being consumed (e.g., borrowed use)
+        if self.linear_bindings.contains(sym) {
+            decisions.push(OwnershipDecision::BorrowedNoAction);
+            return decisions;
+        }
+
+        // Default: refcount managed (no ownership info available)
+        decisions.push(OwnershipDecision::RefcountManaged);
+        decisions
+    }
+}
+
+/// Decision for how to handle a tensor at a usage site.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnershipDecision {
+    /// Tensor is linear and being consumed — emit nsl_tensor_free at this point.
+    /// No refcount inc/dec needed.
+    FreeAtConsumption,
+    /// Tensor is linear but used in a DataRequired autodiff op — tape holds reference,
+    /// do NOT free early. The tape's saved_* field keeps it alive.
+    TapeHoldsReference,
+    /// Tensor is @shared — use normal refcount inc/dec (current behavior).
+    RefcountManaged,
+    /// Tensor is borrowed — no ownership action needed (caller retains ownership).
+    BorrowedNoAction,
+    /// Debug mode: after consumption, zero the source pointer slot for null-on-reuse detection.
+    PoisonAfterMove,
 }
 
 #[cfg(test)]
@@ -141,5 +229,126 @@ mod tests {
         assert!(!ownership.is_shared(&x));
         assert!(!ownership.is_linear(&y));
         assert!(ownership.is_shared(&y));
+    }
+
+    // --- M38b: OwnershipDecision + decide() tests ---
+
+    #[test]
+    fn linear_consuming_no_grad_frees() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+
+        let decisions = lowering.decide(&x, true, None, false);
+        assert_eq!(decisions, vec![OwnershipDecision::FreeAtConsumption]);
+    }
+
+    #[test]
+    fn linear_consuming_shape_only_op_frees() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+
+        let decisions = lowering.decide(&x, true, Some("Add"), false);
+        assert_eq!(decisions, vec![OwnershipDecision::FreeAtConsumption]);
+    }
+
+    #[test]
+    fn linear_consuming_data_required_op_tape_holds() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+
+        let decisions = lowering.decide(&x, true, Some("MatMul"), false);
+        assert_eq!(decisions, vec![OwnershipDecision::TapeHoldsReference]);
+    }
+
+    #[test]
+    fn linear_consuming_debug_adds_poison() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+
+        let decisions = lowering.decide(&x, true, None, true);
+        assert_eq!(decisions, vec![
+            OwnershipDecision::FreeAtConsumption,
+            OwnershipDecision::PoisonAfterMove,
+        ]);
+    }
+
+    #[test]
+    fn shared_always_refcounted() {
+        let mut interner = Interner::new();
+        let w = make_sym(&mut interner, "W");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_shared(w);
+
+        let decisions = lowering.decide(&w, true, None, false);
+        assert_eq!(decisions, vec![OwnershipDecision::RefcountManaged]);
+    }
+
+    #[test]
+    fn borrowed_no_action() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let b = make_sym(&mut interner, "ref_x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.active_borrows.insert(x, BorrowKind::Immutable { borrower: b });
+
+        let decisions = lowering.decide(&x, false, None, false);
+        assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
+    }
+
+    #[test]
+    fn elide_refcount_for_linear() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let w = make_sym(&mut interner, "W");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+        lowering.mark_shared(w);
+
+        assert!(lowering.should_elide_refcount(&x));
+        assert!(!lowering.should_elide_refcount(&w));
+        assert!(lowering.should_free_at_consumption(&x));
+        assert!(!lowering.should_free_at_consumption(&w));
+    }
+
+    #[test]
+    fn mark_linear_and_shared() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let w = make_sym(&mut interner, "W");
+        let mut lowering = OwnershipLowering::new();
+
+        lowering.mark_linear(x);
+        lowering.mark_shared(w);
+
+        assert!(lowering.linear_bindings.contains(&x));
+        assert!(lowering.shared_bindings.contains(&w));
+    }
+
+    #[test]
+    fn autodiff_classify_coverage() {
+        use nsl_semantic::ownership_autodiff::{classify_backward_access, BackwardAccess};
+        assert_eq!(classify_backward_access("Add"), BackwardAccess::ShapeOnly);
+        assert_eq!(classify_backward_access("MatMul"), BackwardAccess::DataRequired);
+        assert_eq!(classify_backward_access("Dropout"), BackwardAccess::AuxDataRequired);
+        assert_eq!(classify_backward_access("UnknownOp"), BackwardAccess::DataRequired);
+    }
+
+    #[test]
+    fn linear_non_consuming_is_borrow() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+
+        let decisions = lowering.decide(&x, false, None, false);
+        assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
     }
 }
