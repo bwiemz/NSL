@@ -6,6 +6,7 @@ pub mod fp8;
 pub mod grammar;
 pub mod kv_compress;
 pub mod moe;
+pub mod multimodal;
 pub mod nan_analysis;
 pub mod ownership;
 pub mod pipeline;

@@ -38,6 +38,7 @@ pub mod standalone;
 pub mod tensor_parallel;
 pub mod stmt;
 pub mod types;
+pub mod multimodal;
 pub mod vmap;
 pub mod wengert;
 pub mod ad_rules;

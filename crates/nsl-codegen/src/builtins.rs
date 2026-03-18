@@ -424,6 +424,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_reduce_sum_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_reduce_mean_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_scatter_add_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // --- M48: Multimodal primitives ---
+    ("nsl_patch_embed", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_mel_spectrogram", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_cross_attention", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_image_resize", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_image_normalize", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_stft", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_audio_resample", &[types::I64, types::I64, types::I64], Some(types::I64)),
     // --- M45: Tensor debugger trace ---
     ("nsl_trace_init", &[], Some(types::I64)),
     ("nsl_trace_record_op", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),

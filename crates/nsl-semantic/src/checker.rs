@@ -1251,6 +1251,20 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
+                            // M48: @multimodal decorator validation
+                            if dname == "multimodal" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::multimodal::validate_multimodal_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
                             // M47: @target decorator validation
                             if dname == "target" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
