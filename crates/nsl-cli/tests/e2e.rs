@@ -708,3 +708,127 @@ fn e2e_m34_cp_validation_error() {
         stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// M35: FP8 Compute & Sub-Byte Quantization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m35_fp8_basic() {
+    assert_output_matches("m35_fp8_basic");
+}
+
+// M35: @fp8_compute validation error — expected compile failure
+#[test]
+fn e2e_m35_fp8_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m35_fp8_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m35_fp8_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("fp8_compute") || stderr.contains("unknown argument"),
+        "Expected fp8_compute validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M36: Compile-Time Memory Planning
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m36_slab_basic() {
+    assert_output_matches("m36_slab_basic");
+}
+
+// ---------------------------------------------------------------------------
+// M37: Compile-Time Roofline & Cost Model
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m37_perf_budget_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m37_perf_budget_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m37_perf_budget_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("perf_budget") || stderr.contains("unknown argument"),
+        "Expected perf_budget validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M38a: Linear Types Semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m38_shared_basic() {
+    assert_output_matches("m38_shared_basic");
+}
+
+#[test]
+fn e2e_m38_shared_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m38_shared_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m38_shared_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("shared") || stderr.contains("let-binding"),
+        "Expected @shared validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M39: Automatic Batching (vmap)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_m39_vmap_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m39_vmap_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m39_vmap_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("vmap") || stderr.contains("unknown argument"),
+        "Expected vmap validation error in stderr, got: {}",
+        stderr
+    );
+}

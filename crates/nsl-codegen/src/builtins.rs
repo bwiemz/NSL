@@ -360,6 +360,23 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_ring_send_recv", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_sequence_gather", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_cp_destroy", &[types::I64], Some(types::I64)),
+    // --- M35: FP8 compute ---
+    ("nsl_fp8_cast", &[types::I64, types::I64, types::F64], Some(types::I64)),
+    ("nsl_fp8_matmul", &[types::I64, types::I64, types::F64, types::F64], Some(types::I64)),
+    ("nsl_fp8_compute_scale", &[types::I64, types::I64], Some(types::F64)),
+    ("nsl_fp8_update_calibration", &[types::I64, types::I64, types::F64], Some(types::F64)),
+    // --- M35: AWQ 4-bit quantization ---
+    ("nsl_awq_quantize", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_awq_matmul", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_awq_free", &[types::I64], None),
+    // --- M35: GPTQ quantization ---
+    ("nsl_gptq_quantize", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_gptq_matmul", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_gptq_free", &[types::I64], None),
+    // --- M36: Memory planning slab ---
+    ("nsl_slab_alloc", &[types::I64], Some(types::I64)),
+    ("nsl_slab_free", &[types::I64, types::I64], None),
+    ("nsl_slab_offset", &[types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

@@ -40,7 +40,11 @@ pub struct NslTensor {
 // Built-in dtype IDs (match existing u8 values)
 pub const DTYPE_F64: u16 = 0;
 pub const DTYPE_F32: u16 = 1;
-// Future: FP16=2, BF16=3, INT8=4, etc.
+pub const DTYPE_FP16: u16 = 2;
+pub const DTYPE_BF16: u16 = 3;
+pub const DTYPE_INT8: u16 = 4;
+pub const DTYPE_FP8E4M3: u16 = 5;
+pub const DTYPE_FP8E5M2: u16 = 6;
 
 // Custom dtype IDs start at 256
 pub const DTYPE_CUSTOM_START: u16 = 256;
@@ -3273,6 +3277,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
             if !tensor.strides.is_null() {
                 checked_free(tensor.strides as *mut u8, strides_size);
             }
+            // Clean up FP8 scale entry if this tensor was registered
+            crate::fp8::remove_fp8_scale(tensor_ptr);
             // Free the NslTensor struct itself
             drop(Box::from_raw(tensor as *mut NslTensor));
         }

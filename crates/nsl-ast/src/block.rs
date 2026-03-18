@@ -67,6 +67,9 @@ pub enum QuantKind {
 pub enum QuantDtype {
     Int8,
     Int4,
+    Awq4,
+    Gptq4,
+    Gptq8,
 }
 
 #[derive(Debug, Clone, Serialize)]

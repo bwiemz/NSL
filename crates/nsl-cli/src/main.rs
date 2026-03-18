@@ -32,6 +32,22 @@ enum Cli {
         /// Print the inferred type map
         #[arg(long)]
         dump_types: bool,
+
+        /// M37: Run roofline performance analysis
+        #[arg(long)]
+        perf: bool,
+
+        /// M37: Target GPU for performance analysis (e.g., "H100", "A100-PCIe")
+        #[arg(long)]
+        gpu: Option<String>,
+
+        /// M37: Write Chrome tracing JSON to file
+        #[arg(long)]
+        trace: Option<String>,
+
+        /// M38a: Enable linear types ownership checking
+        #[arg(long)]
+        linear_types: bool,
     },
 
     /// Compile and execute an NSL program
@@ -108,6 +124,18 @@ enum Cli {
         /// Show fusion optimization report on stderr
         #[arg(long)]
         fusion_report: bool,
+
+        /// M36: VRAM budget (e.g., "8GB", "512MB") — fail if plan exceeds
+        #[arg(long)]
+        vram_budget: Option<String>,
+
+        /// M36: Print memory plan report
+        #[arg(long)]
+        memory_report: bool,
+
+        /// M38a: Enable linear types ownership checking
+        #[arg(long)]
+        linear_types: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -159,8 +187,15 @@ fn main() {
             dump_tokens,
             dump_ast,
             dump_types,
+            perf: _perf,
+            gpu: _gpu,
+            trace: _trace,
+            linear_types: _linear_types,
         } => {
             run_check(&file, dump_tokens, dump_ast, dump_types);
+            // M37: --perf, --gpu, --trace flags parsed but dormant.
+            // M38a: --linear-types parsed but dormant until ownership checker
+            // is wired through the compilation pipeline.
         }
         Cli::Build {
             file,
@@ -175,6 +210,9 @@ fn main() {
             autotune_fresh,
             autotune_clean,
             fusion_report,
+            vram_budget,
+            memory_report,
+            linear_types: _linear_types,
         } => {
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -198,6 +236,9 @@ fn main() {
                 autotune_fresh,
                 world_size: 1, // Build cmd doesn't use --devices; TP world_size is always 1
                 fusion_report,
+                vram_budget: vram_budget.as_deref()
+                    .and_then(nsl_codegen::memory_planner::parse_vram_budget),
+                memory_report,
             };
 
             if standalone {

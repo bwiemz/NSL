@@ -1,0 +1,5 @@
+# M39: @vmap validation error — unknown argument
+
+@vmap(unknown_arg=42)
+fn bad(x: Tensor) -> Tensor:
+    return x

@@ -1,0 +1,13 @@
+# M35: FP8 compute — decorator validation test
+
+model FP8Model:
+    @fp8_compute
+    weight: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+let m = FP8Model()
+let x = ones([2, 4])
+let y = m.forward(x)
+print(y)

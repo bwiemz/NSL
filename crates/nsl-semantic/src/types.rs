@@ -219,6 +219,11 @@ impl DType {
             DType::Custom(_) | DType::Unknown => 0,
         }
     }
+
+    /// Returns true if this is an FP8 dtype (E4M3 or E5M2).
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, DType::Fp8E4m3 | DType::Fp8E5m2)
+    }
 }
 
 /// Resolved device.

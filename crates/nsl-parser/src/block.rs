@@ -240,10 +240,13 @@ pub fn parse_quant_block_stmt(p: &mut Parser) -> Stmt {
                         match dtype_text.as_str() {
                             "int4" => { p.advance(); default_dtype = Some(QuantDtype::Int4); }
                             "int8" => { p.advance(); default_dtype = Some(QuantDtype::Int8); }
+                            "awq4" => { p.advance(); default_dtype = Some(QuantDtype::Awq4); }
+                            "gptq4" => { p.advance(); default_dtype = Some(QuantDtype::Gptq4); }
+                            "gptq8" => { p.advance(); default_dtype = Some(QuantDtype::Gptq8); }
                             _ => {
                                 p.diagnostics.push(
                                     nsl_errors::Diagnostic::error(format!(
-                                        "expected 'int4' or 'int8', found '{dtype_text}'"
+                                        "expected quant dtype (int4, int8, awq4, gptq4, gptq8), found '{dtype_text}'"
                                     ))
                                     .with_label(p.current_span(), "expected quant dtype"),
                                 );

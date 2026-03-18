@@ -23,6 +23,9 @@ pub mod autodiff;
 pub mod checkpoint;
 pub mod tokenizer;
 pub mod quantize;
+pub mod fp8;
+pub mod awq;
+pub mod gptq;
 
 // M18b: Interop modules (feature-gated)
 #[cfg(feature = "interop")]
@@ -58,6 +61,7 @@ pub mod tensor_parallel;
 pub mod moe;
 pub mod speculative;
 pub mod context_parallel;
+pub mod slab;
 
 #[cfg(test)]
 mod fuzz;

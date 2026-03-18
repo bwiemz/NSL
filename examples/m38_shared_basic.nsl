@@ -1,0 +1,6 @@
+# M38a: @shared annotation — basic test
+
+@shared
+let x = ones([2, 3])
+let y = x + x
+print(y)

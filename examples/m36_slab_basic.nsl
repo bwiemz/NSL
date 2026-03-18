@@ -1,0 +1,10 @@
+# M36: Memory planning — basic tensor lifecycle test
+
+let a = ones([2, 3])
+let b = zeros([2, 3])
+let c = a + b
+print(c)
+
+let d = ones([3, 2])
+let e = c @ d
+print(e)

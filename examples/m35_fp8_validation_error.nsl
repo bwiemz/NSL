@@ -1,0 +1,8 @@
+# M35: @fp8_compute validation error — unknown argument
+
+model Bad:
+    @fp8_compute(unknown_arg=42)
+    weight: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x

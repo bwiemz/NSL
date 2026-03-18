@@ -1,0 +1,256 @@
+//! M40: Reverse-mode AD rules — maps each primal operation to its adjoint computation.
+
+use crate::wengert::{PrimalOp, VarId, WengertOp};
+
+/// Primitive and compound backward operations used in adjoint expressions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdjointExpr {
+    MulElementwise(VarId, VarId),
+    MatmulTransposeLeft(VarId, VarId),
+    MatmulTransposeRight(VarId, VarId),
+    Scale(VarId, f64),
+    Negate(VarId),
+    Broadcast(VarId),
+    ScaleBroadcast(VarId, f64),
+    Transpose(VarId, usize, usize),
+    Reshape(VarId),
+    Identity(VarId),
+    // Compound backward rules (multi-step, lowered to op sequences in M40b)
+    ExpBackward(VarId, VarId),
+    ReluBackward(VarId, VarId),
+    SigmoidBackward(VarId, VarId),
+    TanhBackward(VarId, VarId),
+    LogBackward(VarId, VarId),
+    SqrtBackward(VarId, VarId),
+    DivNumeratorBackward(VarId, VarId),
+    DivDenominatorBackward(VarId, VarId, VarId),
+}
+
+/// A single input-adjoint pair from applying an AD rule.
+#[derive(Debug, Clone)]
+pub struct InputAdjoint {
+    pub input_var: VarId,
+    pub expr: AdjointExpr,
+}
+
+/// Apply the reverse-mode AD rule for a primal operation.
+pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
+    match &op.op {
+        PrimalOp::Add => vec![
+            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::Identity(output_bar) },
+            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::Identity(output_bar) },
+        ],
+        PrimalOp::Sub => vec![
+            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::Identity(output_bar) },
+            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::Negate(output_bar) },
+        ],
+        PrimalOp::Mul => vec![
+            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::MulElementwise(output_bar, op.inputs[1]) },
+            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::MulElementwise(output_bar, op.inputs[0]) },
+        ],
+        PrimalOp::Div => vec![
+            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::DivNumeratorBackward(output_bar, op.inputs[1]) },
+            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::DivDenominatorBackward(output_bar, op.inputs[0], op.inputs[1]) },
+        ],
+        PrimalOp::Neg => vec![
+            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::Negate(output_bar) },
+        ],
+        PrimalOp::Relu => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::ReluBackward(output_bar, op.inputs[0]),
+        }],
+        PrimalOp::Sigmoid => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::SigmoidBackward(output_bar, op.result),
+        }],
+        PrimalOp::Tanh => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::TanhBackward(output_bar, op.result),
+        }],
+        PrimalOp::Exp => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::ExpBackward(output_bar, op.result),
+        }],
+        PrimalOp::Log => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::LogBackward(output_bar, op.inputs[0]),
+        }],
+        PrimalOp::Sqrt => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::SqrtBackward(output_bar, op.result),
+        }],
+        PrimalOp::Matmul => vec![
+            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::MatmulTransposeLeft(output_bar, op.inputs[1]) },
+            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::MatmulTransposeRight(op.inputs[0], output_bar) },
+        ],
+        PrimalOp::Transpose { dim0, dim1 } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::Transpose(output_bar, *dim0, *dim1),
+        }],
+        PrimalOp::Sum { .. } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::Broadcast(output_bar),
+        }],
+        PrimalOp::Mean { .. } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::ScaleBroadcast(output_bar, 1.0),
+        }],
+        PrimalOp::Reshape { .. } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::Reshape(output_bar),
+        }],
+        _ => vec![],
+    }
+}
+
+/// What a backward rule needs saved from the forward pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SavedRequirement {
+    Nothing,
+    Inputs,
+    Output,
+}
+
+/// Determine which variables an AD rule needs saved from the forward pass.
+pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
+    match op {
+        PrimalOp::Add | PrimalOp::Sub | PrimalOp::Neg
+        | PrimalOp::Transpose { .. } | PrimalOp::Reshape { .. }
+        | PrimalOp::Sum { .. } | PrimalOp::Mean { .. }
+        | PrimalOp::Broadcast => SavedRequirement::Nothing,
+        PrimalOp::Mul | PrimalOp::Div | PrimalOp::Matmul
+        | PrimalOp::Relu | PrimalOp::Log | PrimalOp::Abs
+        | PrimalOp::Gelu | PrimalOp::Silu => SavedRequirement::Inputs,
+        PrimalOp::Sigmoid | PrimalOp::Tanh | PrimalOp::Exp
+        | PrimalOp::Sqrt | PrimalOp::Softmax { .. } => SavedRequirement::Output,
+        _ => SavedRequirement::Nothing,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wengert::WengertOp;
+
+    fn make_op(result: VarId, op: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
+        WengertOp { id: 0, result, op, inputs, saved_for_backward: false, checkpointed: false }
+    }
+
+    #[test]
+    fn test_add_rule() {
+        let op = make_op(2, PrimalOp::Add, vec![0, 1]);
+        let adj = apply_ad_rule(&op, 100);
+        assert_eq!(adj.len(), 2);
+        assert!(matches!(adj[0].expr, AdjointExpr::Identity(100)));
+        assert!(matches!(adj[1].expr, AdjointExpr::Identity(100)));
+    }
+
+    #[test]
+    fn test_sub_rule() {
+        let op = make_op(2, PrimalOp::Sub, vec![0, 1]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::Identity(100)));
+        assert!(matches!(adj[1].expr, AdjointExpr::Negate(100)));
+    }
+
+    #[test]
+    fn test_mul_rule() {
+        let op = make_op(2, PrimalOp::Mul, vec![0, 1]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::MulElementwise(100, 1)));
+        assert!(matches!(adj[1].expr, AdjointExpr::MulElementwise(100, 0)));
+    }
+
+    #[test]
+    fn test_matmul_rule() {
+        let op = make_op(2, PrimalOp::Matmul, vec![0, 1]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::MatmulTransposeLeft(100, 1)));
+        assert!(matches!(adj[1].expr, AdjointExpr::MatmulTransposeRight(0, 100)));
+    }
+
+    #[test]
+    fn test_relu_backward() {
+        let op = make_op(1, PrimalOp::Relu, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert_eq!(adj.len(), 1);
+        assert!(matches!(adj[0].expr, AdjointExpr::ReluBackward(100, 0)));
+    }
+
+    #[test]
+    fn test_sigmoid_backward() {
+        let op = make_op(1, PrimalOp::Sigmoid, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::SigmoidBackward(100, 1)));
+    }
+
+    #[test]
+    fn test_tanh_backward() {
+        let op = make_op(1, PrimalOp::Tanh, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::TanhBackward(100, 1)));
+    }
+
+    #[test]
+    fn test_log_backward() {
+        let op = make_op(1, PrimalOp::Log, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::LogBackward(100, 0)));
+    }
+
+    #[test]
+    fn test_sqrt_backward() {
+        let op = make_op(1, PrimalOp::Sqrt, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::SqrtBackward(100, 1)));
+    }
+
+    #[test]
+    fn test_div_backward() {
+        let op = make_op(2, PrimalOp::Div, vec![0, 1]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::DivNumeratorBackward(100, 1)));
+        assert!(matches!(adj[1].expr, AdjointExpr::DivDenominatorBackward(100, 0, 1)));
+    }
+
+    #[test]
+    fn test_sum_broadcasts() {
+        let op = make_op(1, PrimalOp::Sum { dim: Some(0) }, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::Broadcast(100)));
+    }
+
+    #[test]
+    fn test_mean_scale_broadcasts() {
+        let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::ScaleBroadcast(100, _)));
+    }
+
+    #[test]
+    fn test_transpose_rule() {
+        let op = make_op(1, PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::Transpose(100, 0, 1)));
+    }
+
+    #[test]
+    fn test_saved_nothing() {
+        assert_eq!(saved_for_backward(&PrimalOp::Add), SavedRequirement::Nothing);
+        assert_eq!(saved_for_backward(&PrimalOp::Transpose { dim0: 0, dim1: 1 }), SavedRequirement::Nothing);
+    }
+
+    #[test]
+    fn test_saved_inputs() {
+        assert_eq!(saved_for_backward(&PrimalOp::Mul), SavedRequirement::Inputs);
+        assert_eq!(saved_for_backward(&PrimalOp::Matmul), SavedRequirement::Inputs);
+        assert_eq!(saved_for_backward(&PrimalOp::Relu), SavedRequirement::Inputs);
+    }
+
+    #[test]
+    fn test_saved_output() {
+        assert_eq!(saved_for_backward(&PrimalOp::Sigmoid), SavedRequirement::Output);
+        assert_eq!(saved_for_backward(&PrimalOp::Tanh), SavedRequirement::Output);
+        assert_eq!(saved_for_backward(&PrimalOp::Exp), SavedRequirement::Output);
+    }
+}

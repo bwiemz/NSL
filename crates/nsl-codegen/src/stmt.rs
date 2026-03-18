@@ -1963,6 +1963,9 @@ impl Compiler<'_> {
         // 3. Compute dtype/granularity integer codes for the runtime call
         let dtype_code: i64 = match quant.default_dtype {
             Some(QuantDtype::Int4) => 1,
+            Some(QuantDtype::Awq4) => 2,
+            Some(QuantDtype::Gptq4) => 3,
+            Some(QuantDtype::Gptq8) => 4,
             Some(QuantDtype::Int8) | None => 0,
         };
         let (gran_code, axis_val, gs_val): (i64, i64, i64) = match &quant.default_granularity {

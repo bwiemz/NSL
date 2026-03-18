@@ -1,0 +1,8 @@
+# M37: @perf_budget validation error — unknown argument
+
+model Bad:
+    @perf_budget(unknown_arg=42)
+    weight: int = 0
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x

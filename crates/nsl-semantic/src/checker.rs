@@ -427,6 +427,36 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // M38a: @shared annotation — valid on let-bindings
+                        if dname == "shared" {
+                            match &stmt.kind {
+                                StmtKind::VarDecl { .. } => {
+                                    // Valid — tensor will be marked Shared in ownership pass
+                                }
+                                _ => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@shared can only be applied to let-bindings")
+                                            .with_label(deco.span, "invalid @shared target")
+                                    );
+                                }
+                            }
+                        }
+
+                        // M39: @vmap decorator validation
+                        if dname == "vmap" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner
+                                    .resolve(s.0)
+                                    .unwrap_or("")
+                                    .to_string()
+                            };
+                            crate::vmap::validate_vmap_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         if dname == "flash_attention" {
                             match &stmt.kind {
                                 StmtKind::FnDef(_) => {
@@ -1078,6 +1108,34 @@ impl<'a> TypeChecker<'a> {
                                         .to_string()
                                 };
                                 crate::context_parallel::validate_context_parallel_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
+                            // M35: @fp8_compute decorator validation
+                            if dname == "fp8_compute" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::fp8::validate_fp8_compute_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
+                            // M37: @perf_budget decorator validation
+                            if dname == "perf_budget" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::perf_budget::validate_perf_budget_decorator(
                                     deco,
                                     &resolve,
                                     &mut self.diagnostics,

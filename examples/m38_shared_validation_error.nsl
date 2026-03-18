@@ -1,0 +1,5 @@
+# M38a: @shared validation error — invalid target (fn instead of let)
+
+@shared
+fn bad() -> int:
+    return 0

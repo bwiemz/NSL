@@ -125,7 +125,28 @@ pub struct Compiler<'a> {
     pub fusion_barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
     /// M31: Whether fusion event collection is enabled
     pub fusion_report_enabled: bool,
+    /// M35: Functions with @fp8_compute decorator
+    pub fp8_compute_fns: HashSet<String>,
+    /// M35: Model quantization configs — "ModelName" -> QuantConfig
+    pub quant_configs: HashMap<String, QuantConfig>,
+    /// M36: Computed memory plan for slab allocation (None if planning disabled/empty)
+    pub slab_plan: Option<crate::memory_planner::SlabPlan>,
+    /// M38b: Whether --linear-types flag is active
+    pub linear_types_enabled: bool,
+    /// M38b: Per-function ownership metadata from semantic pass
+    pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
+    /// M39: Functions with @vmap decorator and their batch configuration
+    pub vmap_configs: HashMap<String, crate::vmap::VmapConfig>,
+    /// M40: Source-to-source AD enabled (default true; --tape-ad forces tape-only)
+    pub source_ad_enabled: bool,
     func_index: u32,
+}
+
+/// Quantization configuration for a model.
+#[derive(Debug, Clone)]
+pub struct QuantConfig {
+    pub dtype: String,     // "awq4", "gptq4", "gptq8"
+    pub group_size: i64,
 }
 
 /// Mangle a function name with a module prefix for unique Cranelift symbols.
@@ -200,6 +221,13 @@ impl<'a> Compiler<'a> {
             fusion_events: Vec::new(),
             fusion_barriers: Vec::new(),
             fusion_report_enabled: false,
+            fp8_compute_fns: HashSet::new(),
+            quant_configs: HashMap::new(),
+            slab_plan: None,
+            linear_types_enabled: false,
+            ownership_info: HashMap::new(),
+            vmap_configs: HashMap::new(),
+            source_ad_enabled: true,
             func_index: 0,
         })
     }
@@ -772,6 +800,8 @@ impl<'a> Compiler<'a> {
                             self.no_grad_fns.insert(raw_name.clone());
                         } else if dname == "test" {
                             self.test_fns.push(raw_name.clone());
+                        } else if dname == "fp8_compute" {
+                            self.fp8_compute_fns.insert(raw_name.clone());
                         }
                     }
                 }

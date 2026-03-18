@@ -1,12 +1,17 @@
 pub mod builtins;
 pub mod checker;
 pub mod context_parallel;
+pub mod fp8;
 pub mod moe;
+pub mod ownership;
+pub mod ownership_autodiff;
+pub mod perf_budget;
 pub mod resolve;
 pub mod scope;
 pub mod shapes;
 pub mod speculative;
 pub mod types;
+pub mod vmap;
 
 use std::collections::HashMap;
 

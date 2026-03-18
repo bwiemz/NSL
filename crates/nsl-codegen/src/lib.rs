@@ -3,6 +3,8 @@ pub mod builtins;
 pub mod compiler;
 pub mod context;
 pub mod context_parallel;
+pub mod cost_model;
+
 pub mod error;
 pub mod expr;
 pub mod func;
@@ -10,19 +12,27 @@ pub mod dynamic_shapes;
 pub mod flash_attention;
 pub mod fusion;
 pub mod fusion_graph;
+pub mod gpu_specs;
 pub mod moe;
 pub mod moe_kernels;
 pub mod epilogue_fusion;
+pub mod fp8;
+pub mod memory_planner;
+pub mod ownership;
 pub mod reduction_fusion;
 pub mod fusion_report;
 pub mod kernel;
 pub mod linker;
 pub mod serve;
 pub mod speculative;
+pub mod source_ad;
 pub mod standalone;
 pub mod tensor_parallel;
 pub mod stmt;
 pub mod types;
+pub mod vmap;
+pub mod wengert;
+pub mod ad_rules;
 
 pub use compiler::{compile, compile_entry, compile_module, compile_module_with_imports, compile_test, compile_standalone, StandaloneConfig};
 pub use error::CodegenError;
@@ -35,6 +45,10 @@ pub struct CompileOptions {
     pub autotune_fresh: bool,
     pub world_size: usize,
     pub fusion_report: bool,
+    /// M36: VRAM budget in bytes (None = no limit, Some(n) = fail if plan exceeds n)
+    pub vram_budget: Option<u64>,
+    /// M36: Print memory plan report to stderr
+    pub memory_report: bool,
 }
 
 impl Default for CompileOptions {
@@ -44,6 +58,8 @@ impl Default for CompileOptions {
             autotune_fresh: false,
             world_size: 1,
             fusion_report: false,
+            vram_budget: None,
+            memory_report: false,
         }
     }
 }

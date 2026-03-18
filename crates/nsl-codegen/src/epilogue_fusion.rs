@@ -13,10 +13,20 @@ pub enum EpilogueOp {
     Clamp { min_node: NodeId, max_node: NodeId },
 }
 
+/// Matmul variant for epilogue fusion dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatmulKind {
+    Standard,
+    Fp8 { a_scale: f32, b_scale: f32 },
+    Awq4 { group_size: usize },
+    Gptq { group_size: usize, bits: usize },
+}
+
 /// A detected matmul + elementwise epilogue chain.
 #[derive(Debug, Clone)]
 pub struct EpilogueChain {
     pub matmul_node: NodeId,
+    pub matmul_kind: MatmulKind,
     pub epilogue_ops: Vec<EpilogueOp>,
     pub output_node: NodeId,
     pub eliminated_nodes: Vec<NodeId>,
@@ -151,6 +161,7 @@ fn trace_epilogue_chain(graph: &FusionGraph, matmul_id: NodeId) -> Option<Epilog
     let output_node = *eliminated.last().unwrap();
     Some(EpilogueChain {
         matmul_node: matmul_id,
+        matmul_kind: MatmulKind::Standard,
         epilogue_ops,
         output_node,
         eliminated_nodes: eliminated,
