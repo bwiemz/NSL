@@ -4,3 +4,9 @@
 *.exe
 *.o
 .worktrees/
+desktop.ini
+
+# Spec and plan docs (tracked locally, not in repo)
+docs/superpowers/specs/
+docs/superpowers/plans/
+docs/plans/
