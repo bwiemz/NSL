@@ -200,7 +200,10 @@ impl KvTransferBackend for SharedMemBackend {
             v_data: v_slice,
         };
 
-        let mut guard = self.buffers.lock().unwrap();
+        let mut guard = match self.buffers.lock() {
+            Ok(g) => g,
+            Err(_) => return -1, // mutex poisoned
+        };
         guard.push(transfer);
         0
     }
@@ -217,7 +220,10 @@ impl KvTransferBackend for SharedMemBackend {
         // Returns -2 on timeout to distinguish from other errors.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
         loop {
-            let mut guard = self.buffers.lock().unwrap();
+            let mut guard = match self.buffers.lock() {
+                Ok(g) => g,
+                Err(_) => return -1, // mutex poisoned
+            };
             if let Some(pos) = guard.iter().position(|t| t.source_rank == source_rank && t.target_rank == self.rank) {
                 let transfer = guard.remove(pos);
                 *header = transfer.header;
@@ -257,7 +263,10 @@ impl KvTransferBackend for SharedMemBackend {
         k_data: *mut c_void,
         v_data: *mut c_void,
     ) -> i32 {
-        let mut guard = self.buffers.lock().unwrap();
+        let mut guard = match self.buffers.lock() {
+            Ok(g) => g,
+            Err(_) => return -1, // mutex poisoned
+        };
         if let Some(pos) = guard.iter().position(|t| t.target_rank == self.rank) {
             let transfer = guard.remove(pos);
             *header = transfer.header;
@@ -309,7 +318,10 @@ struct KvTransferContext {
 /// Returns 0 on success, -1 if already initialized.
 #[no_mangle]
 pub extern "C" fn nsl_kv_transfer_init(backend_id: i64, rank: i64) -> i64 {
-    let mut guard = KV_TRANSFER_CTX.lock().unwrap();
+    let mut guard = match KV_TRANSFER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
     if guard.is_some() {
         return -1;
     }
@@ -336,8 +348,14 @@ pub extern "C" fn nsl_kv_transfer_send(
     k_data_ptr: i64,
     v_data_ptr: i64,
 ) -> i64 {
-    let guard = KV_TRANSFER_CTX.lock().unwrap();
-    let ctx = guard.as_ref().expect("nsl_kv_transfer_init not called");
+    let guard = match KV_TRANSFER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let ctx = match guard.as_ref() {
+        Some(c) => c,
+        None => return -2, // not initialized
+    };
 
     let header = unsafe { &*(header_ptr as *const KvTransferHeader) };
     let entries = if entries_ptr != 0 && header.num_blocks > 0 {
@@ -374,8 +392,14 @@ pub extern "C" fn nsl_kv_transfer_recv(
     k_data_out_ptr: i64,
     v_data_out_ptr: i64,
 ) -> i64 {
-    let guard = KV_TRANSFER_CTX.lock().unwrap();
-    let ctx = guard.as_ref().expect("nsl_kv_transfer_init not called");
+    let guard = match KV_TRANSFER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let ctx = match guard.as_ref() {
+        Some(c) => c,
+        None => return -2, // not initialized
+    };
 
     let header = unsafe { &mut *(header_out_ptr as *mut KvTransferHeader) };
     let mut entries = Vec::new();
@@ -393,7 +417,10 @@ pub extern "C" fn nsl_kv_transfer_recv(
 /// Destroy the KV transfer context.
 #[no_mangle]
 pub extern "C" fn nsl_kv_transfer_destroy() -> i64 {
-    let mut guard = KV_TRANSFER_CTX.lock().unwrap();
+    let mut guard = match KV_TRANSFER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
     *guard = None;
     0
 }

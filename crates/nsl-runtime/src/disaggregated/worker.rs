@@ -39,7 +39,10 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
         _ => return -1,
     };
 
-    let mut guard = WORKER_CTX.lock().unwrap();
+    let mut guard = match WORKER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
     if guard.is_some() {
         return -1;
     }
@@ -67,9 +70,17 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
 pub extern "C" fn nsl_disagg_prefill_loop(_config_ptr: i64) -> i64 {
     // Verify role (brief lock, then release)
     {
-        let guard = WORKER_CTX.lock().unwrap();
-        let ctx = guard.as_ref().expect("nsl_disagg_worker_init not called");
-        assert_eq!(ctx.role, WorkerRole::Prefill, "prefill_loop called on non-prefill worker");
+        let guard = match WORKER_CTX.lock() {
+            Ok(g) => g,
+            Err(_) => return -1, // mutex poisoned
+        };
+        let ctx = match guard.as_ref() {
+            Some(c) => c,
+            None => return -2, // not initialized
+        };
+        if ctx.role != WorkerRole::Prefill {
+            return -3; // wrong role
+        }
     }
 
     // In a full implementation, this would:
@@ -96,9 +107,17 @@ pub extern "C" fn nsl_disagg_prefill_loop(_config_ptr: i64) -> i64 {
 pub extern "C" fn nsl_disagg_decode_loop(_config_ptr: i64) -> i64 {
     // Verify role (brief lock, then release)
     {
-        let guard = WORKER_CTX.lock().unwrap();
-        let ctx = guard.as_ref().expect("nsl_disagg_worker_init not called");
-        assert_eq!(ctx.role, WorkerRole::Decode, "decode_loop called on non-decode worker");
+        let guard = match WORKER_CTX.lock() {
+            Ok(g) => g,
+            Err(_) => return -1, // mutex poisoned
+        };
+        let ctx = match guard.as_ref() {
+            Some(c) => c,
+            None => return -2, // not initialized
+        };
+        if ctx.role != WorkerRole::Decode {
+            return -3; // wrong role
+        }
     }
 
     // In a full implementation, this would:
@@ -114,7 +133,10 @@ pub extern "C" fn nsl_disagg_decode_loop(_config_ptr: i64) -> i64 {
 /// Destroy the worker context.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_worker_destroy() -> i64 {
-    let mut guard = WORKER_CTX.lock().unwrap();
+    let mut guard = match WORKER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
     *guard = None;
     0
 }

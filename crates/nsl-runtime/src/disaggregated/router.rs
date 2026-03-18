@@ -278,7 +278,10 @@ pub extern "C" fn nsl_disagg_init(
     max_batch: i64,
     kv_blocks: i64,
 ) -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
     if guard.is_some() {
         return -1;
     }
@@ -296,32 +299,56 @@ pub extern "C" fn nsl_disagg_init(
 /// Enqueue a request to the router. Returns the request ID.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_enqueue() -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_mut().expect("nsl_disagg_init not called");
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_mut() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.enqueue_request() as i64
 }
 
 /// Select a prefill worker for the next request. Returns the worker rank, or -1 if none.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_select_prefill() -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_mut().expect("nsl_disagg_init not called");
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_mut() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.select_prefill_worker().map(|r| r as i64).unwrap_or(-1)
 }
 
 /// Select a decode worker. Returns the worker rank, or -1 if none.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_select_decode(kv_blocks_needed: i64) -> i64 {
-    let guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_ref().expect("nsl_disagg_init not called");
+    let guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_ref() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.select_decode_worker(kv_blocks_needed as u32).map(|r| r as i64).unwrap_or(-1)
 }
 
 /// Mark a request as prefilling on the given worker.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_mark_prefilling(request_id: i64, prefill_rank: i64) -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_mut().expect("nsl_disagg_init not called");
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_mut() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.mark_prefilling(request_id as u64, prefill_rank as i32);
     0
 }
@@ -329,8 +356,14 @@ pub extern "C" fn nsl_disagg_mark_prefilling(request_id: i64, prefill_rank: i64)
 /// Mark a request as decoding on the given worker, reserving kv_blocks_used blocks.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_mark_decoding(request_id: i64, decode_rank: i64, kv_blocks_used: i64) -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_mut().expect("nsl_disagg_init not called");
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_mut() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.mark_decoding(request_id as u64, decode_rank as i32, kv_blocks_used as u32);
     0
 }
@@ -338,8 +371,14 @@ pub extern "C" fn nsl_disagg_mark_decoding(request_id: i64, decode_rank: i64, kv
 /// Record a generated token for a request.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_record_token(request_id: i64, _token_id: i64) -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_mut().expect("nsl_disagg_init not called");
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_mut() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.record_token(request_id as u64);
     0
 }
@@ -347,8 +386,14 @@ pub extern "C" fn nsl_disagg_record_token(request_id: i64, _token_id: i64) -> i6
 /// Mark a request as complete.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_mark_complete(request_id: i64, total_tokens: i64) -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_mut().expect("nsl_disagg_init not called");
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_mut() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.mark_complete(request_id as u64, total_tokens as u32);
     0
 }
@@ -356,31 +401,52 @@ pub extern "C" fn nsl_disagg_mark_complete(request_id: i64, total_tokens: i64) -
 /// Returns the number of queued requests.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_queued_count() -> i64 {
-    let guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_ref().expect("nsl_disagg_init not called");
+    let guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_ref() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.queued_count() as i64
 }
 
 /// Returns the number of active (in-flight) requests.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_active_count() -> i64 {
-    let guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_ref().expect("nsl_disagg_init not called");
+    let guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_ref() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.active_request_count() as i64
 }
 
 /// Returns the number of completed requests.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_completed_count() -> i64 {
-    let guard = DISAGG_CTX.lock().unwrap();
-    let router = guard.as_ref().expect("nsl_disagg_init not called");
+    let guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
+    let router = match guard.as_ref() {
+        Some(r) => r,
+        None => return -2, // not initialized
+    };
     router.completed_count() as i64
 }
 
 /// Destroy the disaggregated router context.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_destroy() -> i64 {
-    let mut guard = DISAGG_CTX.lock().unwrap();
+    let mut guard = match DISAGG_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1, // mutex poisoned
+    };
     *guard = None;
     0
 }

@@ -539,7 +539,19 @@ fn parse_type_params(p: &mut Parser) -> Vec<TypeParam> {
     while !p.at(&TokenKind::Gt) && !p.at(&TokenKind::Eof) {
         let param_start = p.current_span();
         let (name, _) = p.expect_ident();
-        let bounds = Vec::new(); // TODO: parse trait bounds
+
+        // Parse optional trait bounds: `T: Clone + Debug`
+        // Trait bounds are parsed but not yet enforced by the semantic checker.
+        let mut bounds = Vec::new();
+        if p.eat(&TokenKind::Colon) {
+            // Parse first bound (a type expression, e.g. `Clone` or `Comparable<T>`)
+            bounds.push(parse_type(p));
+            // Parse additional bounds separated by `+`
+            while p.eat(&TokenKind::Plus) {
+                bounds.push(parse_type(p));
+            }
+        }
+
         params.push(TypeParam {
             name,
             bounds,

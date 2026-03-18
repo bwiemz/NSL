@@ -411,43 +411,68 @@ fn main() {
                 let total_workers = 1 + prefill_workers + decode_workers;
 
                 // Spawn router (rank 0)
-                let router_child = std::process::Command::new(&binary_path)
+                let router_child = match std::process::Command::new(&binary_path)
                     .env("NSL_ROLE", "router")
                     .env("NSL_LOCAL_RANK", "0")
                     .env("NSL_WORLD_SIZE", format!("{}", total_workers))
                     .stderr(std::process::Stdio::inherit())
                     .spawn()
-                    .expect("failed to spawn router process");
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[nsl] failed to spawn router process: {e}");
+                        std::process::exit(1);
+                    }
+                };
                 children.push(("router:0", router_child));
 
                 // Spawn prefill workers
                 for i in 0..prefill_workers {
-                    let child = std::process::Command::new(&binary_path)
+                    let child = match std::process::Command::new(&binary_path)
                         .env("NSL_ROLE", "prefill")
                         .env("NSL_LOCAL_RANK", format!("{}", i))
                         .env("NSL_WORLD_SIZE", format!("{}", total_workers))
                         .stderr(std::process::Stdio::inherit())
                         .spawn()
-                        .expect("failed to spawn prefill worker");
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to spawn prefill worker {i}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                     children.push(("prefill", child));
                 }
 
                 // Spawn decode workers
                 for i in 0..decode_workers {
-                    let child = std::process::Command::new(&binary_path)
+                    let child = match std::process::Command::new(&binary_path)
                         .env("NSL_ROLE", "decode")
                         .env("NSL_LOCAL_RANK", format!("{}", i))
                         .env("NSL_WORLD_SIZE", format!("{}", total_workers))
                         .stderr(std::process::Stdio::inherit())
                         .spawn()
-                        .expect("failed to spawn decode worker");
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to spawn decode worker {i}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                     children.push(("decode", child));
                 }
 
                 // Wait for all processes
                 let mut exit_code = 0;
                 for (name, mut child) in children {
-                    let status = child.wait().expect("failed to wait on child");
+                    let status = match child.wait() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to wait on {name}: {e}");
+                            exit_code = 1;
+                            continue;
+                        }
+                    };
                     if !status.success() {
                         eprintln!("[nsl] {} exited with {}", name, status);
                         exit_code = 1;
@@ -461,7 +486,13 @@ fn main() {
                 std::process::exit(exit_code);
             } else if devices > 1 {
                 // Build-then-spawn SPMD: spawn N children, each runs the same program
-                let exe = std::env::current_exe().expect("could not find current executable");
+                let exe = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[nsl] could not find current executable: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
                 // Create shared memory file for SimulatedBackend
                 let shm_size = 64 + devices as usize * 64 * 1024 * 1024; // header + 64MB per rank
@@ -471,10 +502,25 @@ fn main() {
                     std::process::id()
                 ));
                 {
-                    let f = std::fs::File::create(&shm_path).expect("failed to create shm file");
-                    f.set_len(shm_size as u64).expect("failed to set shm size");
+                    let f = match std::fs::File::create(&shm_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to create shm file: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = f.set_len(shm_size as u64) {
+                        eprintln!("[nsl] failed to set shm size: {e}");
+                        std::process::exit(1);
+                    }
                     // Zero the header by mapping and dropping
-                    let mmap = unsafe { memmap2::MmapMut::map_mut(&f).unwrap() };
+                    let mmap = match unsafe { memmap2::MmapMut::map_mut(&f) } {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to mmap shm file: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                     drop(mmap);
                 }
 
@@ -486,7 +532,7 @@ fn main() {
                         .env("NSL_LOCAL_RANK", rank.to_string())
                         .env("NSL_WORLD_SIZE", devices.to_string())
                         .env("NSL_SIMULATED_TP", "1")
-                        .env("NSL_TP_SHM_PATH", shm_path.to_str().unwrap());
+                        .env("NSL_TP_SHM_PATH", shm_path.to_str().unwrap_or(""));
 
                     // Forward profiling flags
                     if profile_memory || profile {
@@ -507,18 +553,29 @@ fn main() {
                     }
                     cmd.stderr(std::process::Stdio::inherit());
 
-                    let child = cmd.spawn().unwrap_or_else(|e| {
-                        panic!("failed to spawn rank {}: {}", rank, e);
-                    });
+                    let child = match cmd.spawn() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to spawn rank {rank}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                     children.push((rank, child));
                 }
 
                 // Wait for all children
                 let mut failed = false;
                 for (rank, mut child) in children {
-                    let status = child.wait().expect("failed to wait on child");
+                    let status = match child.wait() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[nsl] failed to wait on rank {rank}: {e}");
+                            failed = true;
+                            continue;
+                        }
+                    };
                     if !status.success() {
-                        eprintln!("rank {} exited with: {}", rank, status);
+                        eprintln!("[nsl] rank {} exited with: {}", rank, status);
                         failed = true;
                     }
                 }

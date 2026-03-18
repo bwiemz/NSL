@@ -634,26 +634,15 @@ fn parse_if_expr(p: &mut Parser) -> Expr {
     p.advance(); // consume 'if'
     let condition = parse_expr(p);
 
-    // Check for ternary syntax: "expr if cond else expr" is parsed elsewhere.
-    // This is "if cond then expr else expr" form.
-    // If we don't see 'then', fall back to a block-less if (error).
-    // Actually, in expression context, we support: if cond then expr else expr
-    // But this conflicts with if-statement. This will only be called from expression context.
-
-    // For now, expect the expression form: we already consumed 'if', so:
-    // if condition then then_expr else else_expr
-    // But the spec doesn't use 'then' keyword... let's check:
-    // The spec says: if cond then expr else expr
-    // But 'then' is not in the keyword list. Let's treat it as an identifier.
-    // Actually let's support the Pythonic ternary: value_if_true if condition else value_if_false
-    // But we already consumed 'if'. So this is: if condition: ... which is a statement.
-    // In expression position, we need: if cond then expr else expr
-    // For now, let's require 'else' after condition
+    // Parse the then-branch block (colon + indented body).
     p.expect(&TokenKind::Colon);
     let then_block = p.parse_block();
-    // Wrap block's last expression as the then_expr
-    // This is complex — for now, just return error
-    // TODO: Proper if-expression support
+
+    // Extract the last expression from the then-block as the if-expression's value.
+    // KNOWN LIMITATION: If the block is empty or the last statement is not an expression,
+    // we produce `NoneLiteral` as a placeholder. This means `if cond: pass` silently
+    // evaluates to `None` rather than being a type error. A future semantic pass should
+    // reject if-expressions whose branches don't yield a value.
     let then_expr = if let Some(last) = then_block.stmts.last() {
         if let nsl_ast::stmt::StmtKind::Expr(e) = &last.kind {
             e.clone()
@@ -672,6 +661,13 @@ fn parse_if_expr(p: &mut Parser) -> Expr {
         }
     };
 
+    // Parse the else-branch if present.
+    // KNOWN LIMITATION: If-expressions used as values (e.g., `let x = if cond: a else: b`)
+    // require an else branch to be well-typed, but the parser currently accepts a missing
+    // else clause and fills in `NoneLiteral`. This is intentional at the parser level:
+    // if-statements (not used as values) legitimately omit `else`. Distinguishing the two
+    // contexts requires type information, so enforcement is deferred to the semantic checker.
+    // TODO(semantic): Reject if-expressions in value position that lack an else branch.
     let else_expr = if p.eat(&TokenKind::Else) {
         p.expect(&TokenKind::Colon);
         let else_block = p.parse_block();
