@@ -4,6 +4,8 @@ pub mod compiler;
 pub mod context;
 pub mod context_parallel;
 pub mod cost_model;
+pub mod grammar_compiler;
+pub mod schema_convert;
 
 pub mod error;
 pub mod expr;
