@@ -62,6 +62,10 @@ pub mod moe;
 pub mod speculative;
 pub mod context_parallel;
 pub mod slab;
+pub mod disaggregated;
+pub mod kv_compress;
+pub mod grammar;
+pub mod token_alignment;
 
 #[cfg(test)]
 mod fuzz;

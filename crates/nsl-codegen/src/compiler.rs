@@ -119,6 +119,12 @@ pub struct Compiler<'a> {
     pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
     /// M30: Tensor parallelism world size (number of devices)
     pub world_size: usize,
+    /// M41: Whether this serve block uses disaggregated inference.
+    pub disaggregated: bool,
+    /// M41: Number of prefill workers (from serve config).
+    pub prefill_workers: usize,
+    /// M41: Number of decode workers (from serve config).
+    pub decode_workers: usize,
     /// M31: Collected fusion optimization events for --fusion-report
     pub fusion_events: Vec<crate::fusion_report::FusionEvent>,
     /// M31: Collected fusion barrier events for --fusion-report
@@ -139,6 +145,10 @@ pub struct Compiler<'a> {
     pub vmap_configs: HashMap<String, crate::vmap::VmapConfig>,
     /// M40: Source-to-source AD enabled (default true; --tape-ad forces tape-only)
     pub source_ad_enabled: bool,
+    /// M42: Per-model KV compression policies from @kv_compress decorators.
+    pub kv_compress_policies: HashMap<String, Vec<KvCompressPolicy>>,
+    /// M44: Compiled grammar FSMs from @grammar decorators and generate() schema= args.
+    pub grammar_configs: HashMap<String, GrammarInfo>,
     func_index: u32,
 }
 
@@ -147,6 +157,21 @@ pub struct Compiler<'a> {
 pub struct QuantConfig {
     pub dtype: String,     // "awq4", "gptq4", "gptq8"
     pub group_size: i64,
+}
+
+/// M44: Codegen-side grammar configuration.
+pub struct GrammarInfo {
+    pub start_rule: String,
+    pub grammar_source: String, // "json_schema", "bnf", "regex"
+}
+
+/// M42: Codegen-side KV compression config.
+pub struct KvCompressPolicy {
+    pub method: String,
+    pub scheme: u8,
+    pub window: usize,
+    pub sinks: usize,
+    pub budget: usize,
 }
 
 /// Mangle a function name with a module prefix for unique Cranelift symbols.
@@ -218,6 +243,9 @@ impl<'a> Compiler<'a> {
             cp_ring_size: 1,
             activation_states: HashMap::new(),
             world_size: 1,
+            disaggregated: false,
+            prefill_workers: 1,
+            decode_workers: 1,
             fusion_events: Vec::new(),
             fusion_barriers: Vec::new(),
             fusion_report_enabled: false,
@@ -228,6 +256,8 @@ impl<'a> Compiler<'a> {
             ownership_info: HashMap::new(),
             vmap_configs: HashMap::new(),
             source_ad_enabled: true,
+            kv_compress_policies: HashMap::new(),
+            grammar_configs: HashMap::new(),
             func_index: 0,
         })
     }

@@ -71,6 +71,14 @@ enum Cli {
         #[arg(long, default_value = "1")]
         devices: u32,
 
+        /// M41: Number of prefill workers for disaggregated inference
+        #[arg(long, default_value = "1")]
+        prefill_workers: u32,
+
+        /// M41: Number of decode workers for disaggregated inference
+        #[arg(long, default_value = "1")]
+        decode_workers: u32,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -270,8 +278,94 @@ fn main() {
                 run_build(&file, output, emit_obj, dump_ir);
             }
         }
-        Cli::Run { file, args, profile_memory, profile_kernels, profile, devices } => {
-            if devices > 1 {
+        Cli::Run {
+            file,
+            args,
+            profile_memory,
+            profile_kernels,
+            profile,
+            devices,
+            prefill_workers,
+            decode_workers,
+        } => {
+            // M41: Disaggregated inference — spawn router + prefill + decode workers.
+            // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
+            if prefill_workers > 1 || decode_workers > 1 {
+                // Build to a temp directory first, then spawn worker processes
+                let temp_dir =
+                    std::env::temp_dir().join(format!("nsl_disagg_{}", std::process::id()));
+                if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+                    eprintln!("error: could not create temp dir: {e}");
+                    process::exit(1);
+                }
+
+                let stem = file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("program");
+                let exe_name = if cfg!(target_os = "windows") {
+                    format!("{stem}.exe")
+                } else {
+                    stem.to_string()
+                };
+                let binary_path = temp_dir.join(&exe_name);
+
+                // Build the binary
+                run_build_inner(&file, Some(binary_path.clone()), false, false, true);
+
+                let mut children: Vec<(&str, std::process::Child)> = Vec::new();
+                let total_workers = 1 + prefill_workers + decode_workers;
+
+                // Spawn router (rank 0)
+                let router_child = std::process::Command::new(&binary_path)
+                    .env("NSL_ROLE", "router")
+                    .env("NSL_LOCAL_RANK", "0")
+                    .env("NSL_WORLD_SIZE", format!("{}", total_workers))
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .expect("failed to spawn router process");
+                children.push(("router:0", router_child));
+
+                // Spawn prefill workers
+                for i in 0..prefill_workers {
+                    let child = std::process::Command::new(&binary_path)
+                        .env("NSL_ROLE", "prefill")
+                        .env("NSL_LOCAL_RANK", format!("{}", i))
+                        .env("NSL_WORLD_SIZE", format!("{}", total_workers))
+                        .stderr(std::process::Stdio::inherit())
+                        .spawn()
+                        .expect("failed to spawn prefill worker");
+                    children.push(("prefill", child));
+                }
+
+                // Spawn decode workers
+                for i in 0..decode_workers {
+                    let child = std::process::Command::new(&binary_path)
+                        .env("NSL_ROLE", "decode")
+                        .env("NSL_LOCAL_RANK", format!("{}", i))
+                        .env("NSL_WORLD_SIZE", format!("{}", total_workers))
+                        .stderr(std::process::Stdio::inherit())
+                        .spawn()
+                        .expect("failed to spawn decode worker");
+                    children.push(("decode", child));
+                }
+
+                // Wait for all processes
+                let mut exit_code = 0;
+                for (name, mut child) in children {
+                    let status = child.wait().expect("failed to wait on child");
+                    if !status.success() {
+                        eprintln!("[nsl] {} exited with {}", name, status);
+                        exit_code = 1;
+                    }
+                }
+
+                // Cleanup
+                let _ = std::fs::remove_file(&binary_path);
+                let _ = std::fs::remove_dir(&temp_dir);
+
+                std::process::exit(exit_code);
+            } else if devices > 1 {
                 // Build-then-spawn SPMD: spawn N children, each runs the same program
                 let exe = std::env::current_exe().expect("could not find current executable");
 

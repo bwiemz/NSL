@@ -1198,6 +1198,34 @@ impl<'a> TypeChecker<'a> {
                                     }
                                 }
                             }
+                            // M42: @kv_compress decorator validation
+                            if dname == "kv_compress" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::kv_compress::validate_kv_compress_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
+                            // M44: @grammar decorator validation
+                            if dname == "grammar" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::grammar::validate_grammar_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
                         }
                     }
                 }
@@ -1510,6 +1538,74 @@ impl<'a> TypeChecker<'a> {
                 Diagnostic::error("serve block must define at least one @endpoint function")
                     .with_label(serve.span, "no endpoints defined"),
             );
+        }
+
+        // M41: Validate disaggregated inference config if present
+        self.check_disaggregated_serve(serve);
+    }
+
+    /// M41: Validate disaggregated inference configuration in a serve block.
+    ///
+    /// Checks that `prefill_workers >= 1`, `decode_workers >= 1`,
+    /// `kv_transfer` is a recognized backend, and `drain_timeout_ms >= 0`.
+    fn check_disaggregated_serve(&mut self, serve: &nsl_ast::block::ServeBlock) {
+        let mut _prefill_workers = 1i64;
+        let mut _decode_workers = 1i64;
+        let mut _kv_transfer: Option<String> = None;
+
+        for entry in &serve.config {
+            let key = self.resolve_name(entry.key);
+            match key.as_str() {
+                "prefill_workers" => {
+                    if let ExprKind::IntLiteral(v) = &entry.value.kind {
+                        _prefill_workers = *v;
+                        if *v < 1 {
+                            self.diagnostics.push(
+                                Diagnostic::error("prefill_workers must be >= 1")
+                                    .with_label(entry.value.span, "invalid worker count"),
+                            );
+                        }
+                    }
+                }
+                "decode_workers" => {
+                    if let ExprKind::IntLiteral(v) = &entry.value.kind {
+                        _decode_workers = *v;
+                        if *v < 1 {
+                            self.diagnostics.push(
+                                Diagnostic::error("decode_workers must be >= 1")
+                                    .with_label(entry.value.span, "invalid worker count"),
+                            );
+                        }
+                    }
+                }
+                "kv_transfer" => {
+                    if let ExprKind::StringLiteral(s) = &entry.value.kind {
+                        let valid = ["rdma", "nvlink", "tcp", "shared_mem", "auto"];
+                        if !valid.contains(&s.as_str()) {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "unknown kv_transfer backend '{}', expected one of: {}",
+                                    s,
+                                    valid.join(", ")
+                                ))
+                                .with_label(entry.value.span, "invalid backend"),
+                            );
+                        }
+                        _kv_transfer = Some(s.clone());
+                    }
+                }
+                "drain_timeout_ms" => {
+                    if let ExprKind::IntLiteral(v) = &entry.value.kind {
+                        if *v < 0 {
+                            self.diagnostics.push(
+                                Diagnostic::error("drain_timeout_ms must be >= 0")
+                                    .with_label(entry.value.span, "negative timeout"),
+                            );
+                        }
+                    }
+                }
+                _ => {} // other config entries validated elsewhere
+            }
         }
     }
 
