@@ -176,6 +176,9 @@ let result = c.to(cpu)  # each element = 3.0
 - **Tensor debugger** — binary trace recording with NaN sentinel, compile-time NaN risk analysis, trace diffing, Chrome export
 - **Reproducibility mode** — `--deterministic` with compile-time non-determinism detection, deterministic kernel variants, RNG seed tracking
 
+### Multimodal & DX (v0.7.0)
+- **Multimodal primitives** — `PatchEmbed` (vision), `MelSpectrogram` (audio), `cross_attention`, mel filterbank as compile-time constant, `@multimodal` decorator, modality classification, image/audio preprocessing builtins
+
 ### Test Framework
 - `@test` decorator marks functions as test cases
 - `assert_eq`, `assert_close` for value and tensor assertions
@@ -193,8 +196,8 @@ Extract the archive to a permanent location and add `bin/` to your PATH:
 
 ```bash
 # Linux/macOS
-tar xzf nsl-v0.6.0-<target>.tar.gz
-export PATH="$PWD/nsl-v0.6.0-<target>/bin:$PATH"
+tar xzf nsl-v0.7.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.7.0-<target>/bin:$PATH"
 ```
 
 > **Important:** Do not separate the `nsl` binary from the `lib/` directory.
@@ -311,7 +314,7 @@ cargo run -p nsl-cli --features cuda -- run tests/m17_gpu_training_test.nsl
 - Source AD backward Cranelift emission and vmap call-site dispatch in progress
 - Pipeline parallelism train block codegen (actual 1F1B loop emission) in progress
 - Tensor debugger TUI (`nsl debug`) and GPU stats kernel deferred
-- 668 unit tests passing, clippy clean
+- 678 unit tests passing, clippy clean
 
 ## License
 
