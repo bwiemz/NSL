@@ -133,6 +133,30 @@ let result = c.to(cpu)  # each element = 3.0
 - Mixed-precision matmul (`nsl_qtensor_matmul_mixed`)
 - Model monomorphization: compiler synthesizes quantized model type
 - Glob-based `exclude` patterns to keep specific layers in full precision
+- **FP8 compute** — `@fp8_compute` decorator, E4M3/E5M2 scale management, FP8 Tensor Core matmul (v0.3.0)
+- **AWQ 4-bit** — `quant { dtype: awq4 }` with in-register dequantize-in-GEMM (v0.3.0)
+- **GPTQ 4-bit/8-bit** — `quant { dtype: gptq4 }` with Hessian-based optimal quantization (v0.3.0)
+
+### Production Inference (v0.2.0)
+- **Custom datatypes** — `datatype` block for user-defined numeric formats with PTX escape hatch
+- **Standalone export** — `nsl build --standalone` for zero-dependency inference binaries
+- **PagedAttention** — paged KV-cache with block allocation and CoW branching
+- **FlashAttention-2** — tiled attention with RoPE/GQA fusion and paged variant
+- **Dynamic shapes** — `Dim::Bounded` symbolic dimensions with stride-based codegen
+- **Continuous batching** — `serve` block DSL with chunked prefill and preemption
+- **Tensor parallelism** — `@shard` decorator with NCCL-backed all-reduce
+- **Graph-level fusion** — epilogue fusion, reduction fusion, `@fuse_graph` decorator
+- **`@autotune`** — build-time kernel parameter tuning with persistent cache
+
+### Scaling & Optimization (v0.3.0)
+- **Mixture of Experts** — `@moe` decorator with top-k gating, capacity-based routing, aux loss
+- **Speculative decoding** — `@speculative` with tree attention, rejection sampling, Medusa heads
+- **Ring attention** — `@context_parallel` for cross-GPU sequence parallelism
+- **Memory planning** — compile-time tensor liveness analysis, interference graph, slab allocation
+- **Roofline cost model** — per-operation FLOP/byte analysis with GPU database (A100, H100, RTX-4090, etc.)
+- **Linear types** — ownership checker for use-after-move detection, `@shared` escape hatch
+- **vmap** — `@vmap` automatic batching with compile-time AST transformation
+- **Source-to-source AD** — Wengert list extraction, reverse-mode adjoint rules, dead gradient elimination
 
 ### Test Framework
 - `@test` decorator marks functions as test cases
@@ -151,8 +175,8 @@ Extract the archive to a permanent location and add `bin/` to your PATH:
 
 ```bash
 # Linux/macOS
-tar xzf nsl-v0.1.0-<target>.tar.gz
-export PATH="$PWD/nsl-v0.1.0-<target>/bin:$PATH"
+tar xzf nsl-v0.3.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.3.0-<target>/bin:$PATH"
 ```
 
 > **Important:** Do not separate the `nsl` binary from the `lib/` directory.
@@ -262,12 +286,11 @@ cargo run -p nsl-cli --features cuda -- run tests/m17_gpu_training_test.nsl
 
 ## Known Limitations
 
-- No package manager or dependency resolution
-- No PyTorch FFI (`to_torch`/`from_torch`) -- use HF loading + ONNX export instead
-- No distributed multi-GPU training (DDP)
 - No REPL
 - CUDA required for GPU features (no ROCm/Metal yet)
 - Windows requires Visual Studio Build Tools for linking
+- `--linear-types`, `--vram-budget`, `--perf` CLI flags are parsed but not yet wired through the compilation pipeline (infrastructure complete, wiring in progress)
+- Source-to-source AD and vmap AST rewriting are infrastructure-only (analysis libraries complete, codegen integration in progress)
 
 ## License
 
