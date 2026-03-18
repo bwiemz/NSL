@@ -151,6 +151,12 @@ pub struct Compiler<'a> {
     pub kv_compress_policies: HashMap<String, Vec<KvCompressPolicy>>,
     /// M44: Compiled grammar FSMs from @grammar decorators and generate() schema= args.
     pub grammar_configs: HashMap<String, GrammarInfo>,
+    /// M43: Pipeline parallelism configuration.
+    pub pipeline_config: Option<crate::pipeline::PipelineConfig>,
+    /// M43: 3D parallelism configuration.
+    pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
+    /// M43: ZeRO optimizer sharding stage.
+    pub zero_stage: Option<u8>,
     func_index: u32,
 }
 
@@ -262,6 +268,9 @@ impl<'a> Compiler<'a> {
             source_ad_enabled: true,
             kv_compress_policies: HashMap::new(),
             grammar_configs: HashMap::new(),
+            pipeline_config: None,
+            parallelism_config: None,
+            zero_stage: None,
             func_index: 0,
         })
     }

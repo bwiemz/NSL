@@ -457,6 +457,17 @@ impl<'a> TypeChecker<'a> {
                             );
                         }
 
+                        // M45: @no_trace and @trace_breakpoint — valid on FnDef only
+                        if dname == "no_trace" || dname == "trace_breakpoint" {
+                            // These decorators are valid on FnDef only — no args needed
+                            // No validation logic required (just recognized and passed through)
+                        }
+
+                        // M46: @deterministic — recognized here, validation in determinism.rs pass
+                        if dname == "deterministic" {
+                            // Recognized — validation happens in determinism.rs pass
+                        }
+
                         if dname == "flash_attention" {
                             match &stmt.kind {
                                 StmtKind::FnDef(_) => {
@@ -1207,6 +1218,20 @@ impl<'a> TypeChecker<'a> {
                                         .to_string()
                                 };
                                 crate::kv_compress::validate_kv_compress_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
+                            // M43: @pipeline decorator validation
+                            if dname == "pipeline" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::pipeline::validate_pipeline_decorator(
                                     deco,
                                     &resolve,
                                     &mut self.diagnostics,

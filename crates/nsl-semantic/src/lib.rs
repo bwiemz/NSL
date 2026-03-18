@@ -1,11 +1,14 @@
 pub mod builtins;
 pub mod checker;
 pub mod context_parallel;
+pub mod determinism;
 pub mod fp8;
 pub mod grammar;
 pub mod kv_compress;
 pub mod moe;
+pub mod nan_analysis;
 pub mod ownership;
+pub mod pipeline;
 pub mod ownership_autodiff;
 pub mod perf_budget;
 pub mod resolve;
