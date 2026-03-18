@@ -377,6 +377,24 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_slab_alloc", &[types::I64], Some(types::I64)),
     ("nsl_slab_free", &[types::I64, types::I64], None),
     ("nsl_slab_offset", &[types::I64, types::I64], Some(types::I64)),
+    // --- M42: KV-cache compression ---
+    ("nsl_kv_quantize_and_store", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_sliding_window_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_sliding_window_check", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_sliding_window_destroy", &[], Some(types::I64)),
+    ("nsl_kv_h2o_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_h2o_accumulate", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_h2o_check", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_h2o_remove_sequence", &[types::I64], Some(types::I64)),
+    ("nsl_kv_h2o_destroy", &[], Some(types::I64)),
+    ("nsl_kv_compress_ratio", &[types::I64], Some(types::I64)),
+    // --- M44: Constrained decoding (grammar FSM) ---
+    ("nsl_grammar_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_grammar_step", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_grammar_apply_mask", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_grammar_is_accept", &[types::I64], Some(types::I64)),
+    ("nsl_grammar_start_state", &[], Some(types::I64)),
+    ("nsl_grammar_destroy", &[], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

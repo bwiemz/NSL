@@ -6,6 +6,9 @@
 
 use crate::paged_kv::BlockId;
 
+/// Sentinel value for evicted block slots.
+pub const EVICTED_SENTINEL: BlockId = u32::MAX;
+
 /// Per-sequence page table: maps logical token indices to physical blocks.
 ///
 /// Tokens are appended one at a time.  When a block boundary is reached the
@@ -90,7 +93,32 @@ impl PageTable {
             return None;
         }
         let block_idx = logical_index / self.block_size;
-        self.entries.get(block_idx).copied()
+        self.entries
+            .get(block_idx)
+            .copied()
+            .filter(|&id| id != EVICTED_SENTINEL)
+    }
+
+    // ── Eviction ──────────────────────────────────────────────────────────
+
+    /// Remove blocks in the logical index range [start_idx, end_idx).
+    /// Returns the physical BlockIds that were removed.
+    /// Evicted slots are set to `EVICTED_SENTINEL`.
+    pub fn remove_block_range(&mut self, start_idx: usize, end_idx: usize) -> Vec<BlockId> {
+        let mut removed = Vec::new();
+        let end = end_idx.min(self.entries.len());
+        for i in start_idx..end {
+            if self.entries[i] != EVICTED_SENTINEL {
+                removed.push(self.entries[i]);
+                self.entries[i] = EVICTED_SENTINEL;
+            }
+        }
+        removed
+    }
+
+    /// Check if a logical block slot has been evicted.
+    pub fn is_evicted(&self, logical_idx: usize) -> bool {
+        logical_idx < self.entries.len() && self.entries[logical_idx] == EVICTED_SENTINEL
     }
 
     // ── Bulk operations ───────────────────────────────────────────────────────

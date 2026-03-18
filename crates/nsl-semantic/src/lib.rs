@@ -2,6 +2,8 @@ pub mod builtins;
 pub mod checker;
 pub mod context_parallel;
 pub mod fp8;
+pub mod grammar;
+pub mod kv_compress;
 pub mod moe;
 pub mod ownership;
 pub mod ownership_autodiff;
