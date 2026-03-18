@@ -158,6 +158,24 @@ let result = c.to(cpu)  # each element = 3.0
 - **vmap** — `@vmap` automatic batching with compile-time AST transformation
 - **Source-to-source AD** — Wengert list extraction, reverse-mode adjoint rules, dead gradient elimination
 
+### Inference Optimization (v0.4.0)
+- **Disaggregated inference** — prefill/decode worker separation with KV-cache transfer
+- **KV-cache compression** — INT8/INT4/FP8 quantized KV storage, sliding window eviction, H2O attention-score eviction
+- **Constrained decoding** — compiled FSM from JSON Schema/BNF grammars, token-level DFA, logit masking (NSL moat feature)
+
+### Deployment & Portability (v0.5.0)
+- **Multi-backend KIR** — Kernel IR (40+ ops) with PTX backend, `GpuTarget` enum, `FeatureSet` bitflags, `GpuBackend` trait
+- **vmap AST transform** — `VmapTransformer` for FnDef-to-FnDef rewriting, matmul/reduction/transpose rewriting
+- **Snapshot testing** — `insta` snapshots for PTX codegen regression detection
+- **Differential testing** — `--disable-fusion` oracle for numerical equivalence verification
+
+### Distributed Training & DX (v0.6.0)
+- **Linear types codegen** — ownership decisions for tensor lifetime (free-at-consumption, tape-holds-reference, refcount-managed)
+- **Source AD extraction** — Wengert extraction from AST, backward context FFI, `--tape-ad` flag
+- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping (dp×tp×pp), ZeRO optimizer sharding, gradient accumulation
+- **Tensor debugger** — binary trace recording with NaN sentinel, compile-time NaN risk analysis, trace diffing, Chrome export
+- **Reproducibility mode** — `--deterministic` with compile-time non-determinism detection, deterministic kernel variants, RNG seed tracking
+
 ### Test Framework
 - `@test` decorator marks functions as test cases
 - `assert_eq`, `assert_close` for value and tensor assertions
@@ -175,8 +193,8 @@ Extract the archive to a permanent location and add `bin/` to your PATH:
 
 ```bash
 # Linux/macOS
-tar xzf nsl-v0.3.0-<target>.tar.gz
-export PATH="$PWD/nsl-v0.3.0-<target>/bin:$PATH"
+tar xzf nsl-v0.6.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.6.0-<target>/bin:$PATH"
 ```
 
 > **Important:** Do not separate the `nsl` binary from the `lib/` directory.
@@ -287,10 +305,13 @@ cargo run -p nsl-cli --features cuda -- run tests/m17_gpu_training_test.nsl
 ## Known Limitations
 
 - No REPL
-- CUDA required for GPU features (no ROCm/Metal yet)
+- CUDA required for GPU features (ROCm/Metal/WebGPU KIR foundation built, backends in progress)
 - Windows requires Visual Studio Build Tools for linking
-- `--linear-types`, `--vram-budget`, `--perf` CLI flags are parsed but not yet wired through the compilation pipeline (infrastructure complete, wiring in progress)
-- Source-to-source AD and vmap AST rewriting are infrastructure-only (analysis libraries complete, codegen integration in progress)
+- Multi-backend KIR pipeline runs alongside existing direct PTX path (not yet default)
+- Source AD backward Cranelift emission and vmap call-site dispatch in progress
+- Pipeline parallelism train block codegen (actual 1F1B loop emission) in progress
+- Tensor debugger TUI (`nsl debug`) and GPU stats kernel deferred
+- 668 unit tests passing, clippy clean
 
 ## License
 
