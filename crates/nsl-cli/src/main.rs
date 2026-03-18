@@ -305,13 +305,7 @@ fn main() {
                 return;
             }
 
-            // TODO(M26-followup): Wire CompileOptions through run_build_inner → compile()
-            // so --no-autotune and --autotune-fresh reach the Compiler. Currently the
-            // autotune benchmarking harness is deferred (always uses middle-value fallback),
-            // so these flags are effectively no-ops until GPU benchmarking is activated.
-            // NOTE: fusion_report_enabled is not yet wired to compile_entry().
-            // The --fusion-report flag is dormant until CompileOptions threading is completed.
-            let _compile_opts = nsl_codegen::CompileOptions {
+            let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
                 world_size: 1, // Build cmd doesn't use --devices; TP world_size is always 1
@@ -351,9 +345,10 @@ fn main() {
                     weights.as_deref().unwrap(),
                     embed_mode,
                     embed_threshold,
+                    &compile_opts,
                 );
             } else {
-                run_build(&file, output, emit_obj, dump_ir);
+                run_build(&file, output, emit_obj, dump_ir, &compile_opts);
             }
         }
         Cli::Run {
@@ -365,14 +360,28 @@ fn main() {
             devices,
             prefill_workers,
             decode_workers,
-            target: _target,
-            disable_fusion: _disable_fusion,
-            tape_ad: _tape_ad,
-            trace_ops: _trace_ops,
-            deterministic: _deterministic,
+            target,
+            disable_fusion,
+            tape_ad,
+            trace_ops,
+            deterministic,
             distribute: _distribute,
             zero_stage: _zero_stage,
         } => {
+            let compile_opts = nsl_codegen::CompileOptions {
+                no_autotune: false,
+                autotune_fresh: false,
+                world_size: devices as usize,
+                fusion_report: false,
+                vram_budget: None,
+                memory_report: false,
+                target,
+                disable_fusion,
+                tape_ad,
+                trace_ops,
+                nan_analysis: false,
+                deterministic,
+            };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
             if prefill_workers > 1 || decode_workers > 1 {
@@ -396,7 +405,7 @@ fn main() {
                 let binary_path = temp_dir.join(&exe_name);
 
                 // Build the binary
-                run_build_inner(&file, Some(binary_path.clone()), false, false, true);
+                run_build_inner(&file, Some(binary_path.clone()), false, false, true, &compile_opts);
 
                 let mut children: Vec<(&str, std::process::Child)> = Vec::new();
                 let total_workers = 1 + prefill_workers + decode_workers;
@@ -521,7 +530,7 @@ fn main() {
                     std::process::exit(1);
                 }
             } else {
-                run_run(&file, &args, profile_memory, profile_kernels, profile);
+                run_run(&file, &args, profile_memory, profile_kernels, profile, &compile_opts);
             }
         }
         Cli::Test { file, filter } => {
@@ -690,8 +699,8 @@ fn needs_multi_file(file: &PathBuf) -> bool {
     }
 }
 
-fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool) {
-    run_build_inner(file, output, emit_obj, dump_ir, false);
+fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, options: &nsl_codegen::CompileOptions) {
+    run_build_inner(file, output, emit_obj, dump_ir, false, options);
 }
 
 fn run_build_standalone(
@@ -700,6 +709,7 @@ fn run_build_standalone(
     weights: &std::path::Path,
     embed_mode: standalone::EmbedMode,
     embed_threshold: u64,
+    options: &nsl_codegen::CompileOptions,
 ) {
     // 1. Read weights from safetensors
     let tensors = standalone::read_safetensors(weights).unwrap_or_else(|e| {
@@ -750,6 +760,7 @@ fn run_build_standalone(
         &analysis.type_map,
         config,
         false,
+        options,
     )
     .unwrap_or_else(|e| {
         eprintln!("codegen error: {e}");
@@ -814,16 +825,16 @@ fn run_build_standalone(
     }
 }
 
-fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
+fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool, options: &nsl_codegen::CompileOptions) {
     if needs_multi_file(file) {
-        run_build_multi(file, output, emit_obj, dump_ir, quiet);
+        run_build_multi(file, output, emit_obj, dump_ir, quiet, options);
     } else {
-        run_build_single(file, output, emit_obj, dump_ir, quiet);
+        run_build_single(file, output, emit_obj, dump_ir, quiet, options);
     }
 }
 
 /// Single-file build (backward compatible, fast path).
-fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
+fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool, options: &nsl_codegen::CompileOptions) {
     let (interner, parse_result, analysis) = frontend(file);
 
     // Codegen
@@ -832,6 +843,7 @@ fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dum
         &interner,
         &analysis.type_map,
         dump_ir,
+        options,
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -882,7 +894,7 @@ fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dum
 }
 
 /// Multi-file build with module system.
-fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool) {
+fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool, options: &nsl_codegen::CompileOptions) {
     let mut source_map = SourceMap::new();
     let mut interner = Interner::new();
 
@@ -924,7 +936,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                 let dep_data = &graph.modules[dep_path];
 
                 // Build function signatures and struct layouts using a temporary compiler
-                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map) {
+                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("codegen error: {e}");
@@ -982,6 +994,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                 imported_enum_variants,
                 imported_enum_defs,
                 dump_ir,
+                options,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -1016,7 +1029,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                     }
 
                     let dep_data = &graph.modules[dep_path];
-                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map) {
+                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("codegen error: {e}");
@@ -1067,6 +1080,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                 lib_struct_layouts,
                 lib_model_names,
                 dump_ir,
+                options,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -1119,7 +1133,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
     }
 }
 
-fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool) {
+fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool, options: &nsl_codegen::CompileOptions) {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
@@ -1138,7 +1152,7 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
     let exe_path = temp_dir.join(&exe_name);
 
     // Build to temp dir (reuse existing build logic, quiet mode)
-    run_build_inner(file, Some(exe_path.clone()), false, false, true);
+    run_build_inner(file, Some(exe_path.clone()), false, false, true, options);
 
     // Execute the compiled program
     let mut cmd = std::process::Command::new(&exe_path);
@@ -1178,6 +1192,7 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
         &interner,
         &analysis.type_map,
         false,
+        &nsl_codegen::CompileOptions::default(),
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -1317,7 +1332,7 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
             // The NSL file should contain an export_model() function (or similar)
             // that calls to_onnx() internally. We just compile and run it.
             println!("Exporting ONNX from {}", file.display());
-            run_run(file, &[], false, false, false);
+            run_run(file, &[], false, false, false, &nsl_codegen::CompileOptions::default());
         }
         "safetensors" => {
             if ext != "nslm" {

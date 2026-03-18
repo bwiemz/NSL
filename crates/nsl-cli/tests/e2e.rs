@@ -3,7 +3,9 @@
 
 use std::process::Command;
 
-/// Truncate floating-point numbers in text to 4 decimal places.
+/// Truncate floating-point numbers in text to 6 decimal places.
+/// Using 6 instead of 4 to catch more subtle numerical regressions
+/// while still tolerating platform-level float formatting differences.
 fn normalize_floats(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
@@ -30,11 +32,11 @@ fn normalize_floats(text: &str) -> String {
                     i += 1;
                 }
                 let decimal_digits = i - decimal_start;
-                if decimal_digits >= 5 {
-                    // Truncate to 4 decimal places
+                if decimal_digits >= 7 {
+                    // Truncate to 6 decimal places
                     let num_str: String = chars[start..i].iter().collect();
                     if let Ok(val) = num_str.parse::<f64>() {
-                        result.push_str(&format!("{:.4}", val));
+                        result.push_str(&format!("{:.6}", val));
                     } else {
                         let s: String = chars[start..i].iter().collect();
                         result.push_str(&s);

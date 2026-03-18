@@ -32,6 +32,7 @@ pub mod kernel_lower;
 pub mod kernel;
 pub mod linker;
 pub mod serve;
+pub mod sparse;
 pub mod speculative;
 pub mod source_ad;
 pub mod standalone;

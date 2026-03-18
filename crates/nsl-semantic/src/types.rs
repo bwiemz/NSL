@@ -134,13 +134,23 @@ impl Type {
 
 /// Arithmetic expression over symbolic dimensions.
 /// Tracks how dimensions compose through reshape/concat/split.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DimExpr {
     Sym(Symbol),
     Lit(i64),
     Add(Box<DimExpr>, Box<DimExpr>),
     Mul(Box<DimExpr>, Box<DimExpr>),
     Div(Box<DimExpr>, Box<DimExpr>),
+    Mod(Box<DimExpr>, Box<DimExpr>),
+}
+
+impl DimExpr {
+    pub fn as_lit(&self) -> Option<i64> {
+        if let DimExpr::Lit(v) = self { Some(*v) } else { None }
+    }
+    pub fn as_sym(&self) -> Option<Symbol> {
+        if let DimExpr::Sym(s) = self { Some(*s) } else { None }
+    }
 }
 
 /// Resolved dimension in a tensor shape.

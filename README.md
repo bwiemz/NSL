@@ -137,7 +137,7 @@ let result = c.to(cpu)  # each element = 3.0
 - **AWQ 4-bit** — `quant { dtype: awq4 }` with in-register dequantize-in-GEMM (v0.3.0)
 - **GPTQ 4-bit/8-bit** — `quant { dtype: gptq4 }` with Hessian-based optimal quantization (v0.3.0)
 
-### Production Inference (v0.2.0)
+### Production Inference *(shipped — v0.2.0)*
 - **Custom datatypes** — `datatype` block for user-defined numeric formats with PTX escape hatch
 - **Standalone export** — `nsl build --standalone` for zero-dependency inference binaries
 - **PagedAttention** — paged KV-cache with block allocation and CoW branching
@@ -148,36 +148,35 @@ let result = c.to(cpu)  # each element = 3.0
 - **Graph-level fusion** — epilogue fusion, reduction fusion, `@fuse_graph` decorator
 - **`@autotune`** — build-time kernel parameter tuning with persistent cache
 
-### Scaling & Optimization (v0.3.0)
+### Scaling & Optimization *(shipped — v0.3.0)*
 - **Mixture of Experts** — `@moe` decorator with top-k gating, capacity-based routing, aux loss
 - **Speculative decoding** — `@speculative` with tree attention, rejection sampling, Medusa heads
 - **Ring attention** — `@context_parallel` for cross-GPU sequence parallelism
 - **Memory planning** — compile-time tensor liveness analysis, interference graph, slab allocation
 - **Roofline cost model** — per-operation FLOP/byte analysis with GPU database (A100, H100, RTX-4090, etc.)
-- **Linear types** — ownership checker for use-after-move detection, `@shared` escape hatch
-- **vmap** — `@vmap` automatic batching with compile-time AST transformation
-- **Source-to-source AD** — Wengert list extraction, reverse-mode adjoint rules, dead gradient elimination
+- **Linear types semantics** — ownership checker for use-after-move detection, `@shared` escape hatch
+- **vmap analysis** — `@vmap` batch tracking, shape rewriting, matmul rewrite classification
+- **Source AD analysis** — Wengert list, reverse-mode adjoint rules, dead gradient elimination
 
-### Inference Optimization (v0.4.0)
-- **Disaggregated inference** — prefill/decode worker separation with KV-cache transfer
-- **KV-cache compression** — INT8/INT4/FP8 quantized KV storage, sliding window eviction, H2O attention-score eviction
-- **Constrained decoding** — compiled FSM from JSON Schema/BNF grammars, token-level DFA, logit masking (NSL moat feature)
+### Infrastructure *(v0.4.0–v0.8.0 — analysis + FFI layers complete, codegen wiring in progress)*
 
-### Deployment & Portability (v0.5.0)
-- **Multi-backend KIR** — Kernel IR (40+ ops) with PTX backend, `GpuTarget` enum, `FeatureSet` bitflags, `GpuBackend` trait
-- **vmap AST transform** — `VmapTransformer` for FnDef-to-FnDef rewriting, matmul/reduction/transpose rewriting
-- **Snapshot testing** — `insta` snapshots for PTX codegen regression detection
-- **Differential testing** — `--disable-fusion` oracle for numerical equivalence verification
+> **Status:** The following features have runtime FFI, semantic validation, and analysis modules fully built and tested. The codegen integration (emitting Cranelift IR that calls these FFI functions during compilation) is in progress. CLI flags are now wired through to the compiler.
 
-### Distributed Training & DX (v0.6.0)
-- **Linear types codegen** — ownership decisions for tensor lifetime (free-at-consumption, tape-holds-reference, refcount-managed)
-- **Source AD extraction** — Wengert extraction from AST, backward context FFI, `--tape-ad` flag
-- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping (dp×tp×pp), ZeRO optimizer sharding, gradient accumulation
-- **Tensor debugger** — binary trace recording with NaN sentinel, compile-time NaN risk analysis, trace diffing, Chrome export
-- **Reproducibility mode** — `--deterministic` with compile-time non-determinism detection, deterministic kernel variants, RNG seed tracking
-
-### Multimodal & DX (v0.7.0)
-- **Multimodal primitives** — `PatchEmbed` (vision), `MelSpectrogram` (audio), `cross_attention`, mel filterbank as compile-time constant, `@multimodal` decorator, modality classification, image/audio preprocessing builtins
+- **Disaggregated inference** — router, KV transfer, prefill/decode worker FFI
+- **KV-cache compression** — INT8/INT4/FP8 quantization, sliding window, H2O eviction
+- **Constrained decoding** — compiled FSM (Thompson/subset/Hopcroft DFA), token alignment, logit masking
+- **Multi-backend KIR** — Kernel IR (40+ ops), PTX backend, GpuTarget, FeatureSet, GpuBackend trait
+- **vmap AST transform** — VmapTransformer FnDef→FnDef rewriting
+- **Linear types codegen** — ownership decision tree (free-at-consumption, tape-holds-reference)
+- **Source AD extraction** — Wengert extraction from AST, backward context
+- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping, ZeRO sharding
+- **Tensor debugger** — trace recording, NaN risk analysis, trace diffing, Chrome export
+- **Reproducibility** — determinism checker, kernel variant selection, RNG tracking
+- **Multimodal** — PatchEmbed, MelSpectrogram, cross_attention, modality classification
+- **Shape algebra** — symbolic dimension solver (equality, divisibility, range proofs)
+- **Sparse tensors** — NslSparseTensor, COO/CSR/CSC/BSR format dispatch, @sparse validation
+- **Snapshot testing** — insta PTX snapshots for codegen regression detection
+- **Differential testing** — --disable-fusion oracle for numerical equivalence
 
 ### Test Framework
 - `@test` decorator marks functions as test cases

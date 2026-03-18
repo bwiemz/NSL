@@ -193,7 +193,7 @@ fn mangle_name(prefix: &str, name: &str) -> String {
 }
 
 impl<'a> Compiler<'a> {
-    pub fn new(interner: &'a Interner, type_map: &'a TypeMap) -> Result<Self, CodegenError> {
+    pub fn new(interner: &'a Interner, type_map: &'a TypeMap, options: &crate::CompileOptions) -> Result<Self, CodegenError> {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("opt_level", "speed")
@@ -242,7 +242,7 @@ impl<'a> Compiler<'a> {
             custom_dtype_ids: HashMap::new(),
             standalone_config: None,
             paged_kv_configs: HashMap::new(),
-            compile_options: crate::CompileOptions::default(),
+            compile_options: options.clone(),
             flash_attention_context: None,
             shard_configs: HashMap::new(),
             moe_configs: HashMap::new(),
@@ -292,10 +292,8 @@ impl<'a> Compiler<'a> {
         idx
     }
 
-    // NOTE: --fusion-report is dormant until CompileOptions is threaded through
-    // compile_entry(). The CLI flag and report formatting are complete, but
-    // fusion_report_enabled is never set to true. This is a known M26-followup gap.
-    // TODO(M31-followup): Wire compile_options.fusion_report to compiler.fusion_report_enabled
+    // CompileOptions is now threaded through the compilation pipeline.
+    // fusion_report_enabled is set from compile_options in each public compile function.
 
     /// Enable fusion report collection (called when --fusion-report or @fuse_graph is present).
     pub fn enable_fusion_report(&mut self) {
@@ -2624,8 +2622,9 @@ pub fn compile(
     interner: &Interner,
     type_map: &TypeMap,
     dump_ir: bool,
+    options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map)?;
+    let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -2651,8 +2650,9 @@ pub fn compile_standalone(
     type_map: &TypeMap,
     config: StandaloneConfig,
     dump_ir: bool,
+    options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map)?;
+    let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
     compiler.intern_string("")?;
@@ -2678,8 +2678,9 @@ pub fn compile_test(
     interner: &Interner,
     type_map: &TypeMap,
     dump_ir: bool,
+    options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Vec<String>), CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map)?;
+    let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -2709,8 +2710,9 @@ pub fn compile_module(
     type_map: &TypeMap,
     module_prefix: &str,
     dump_ir: bool,
+    options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    compile_module_with_imports(ast, interner, type_map, module_prefix, &[], HashMap::new(), HashSet::new(), dump_ir)
+    compile_module_with_imports(ast, interner, type_map, module_prefix, &[], HashMap::new(), HashSet::new(), dump_ir, options)
 }
 
 /// Compile a library module with imported symbols from its own dependencies.
@@ -2724,8 +2726,9 @@ pub fn compile_module_with_imports(
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
     imported_model_names: HashSet<String>,
     dump_ir: bool,
+    options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map)?;
+    let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
     compiler.module_prefix = module_prefix.to_string();
 
@@ -2767,8 +2770,9 @@ pub fn compile_entry(
     imported_enum_variants: HashMap<String, i64>,
     imported_enum_defs: HashMap<String, Vec<(String, i64)>>,
     dump_ir: bool,
+    options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map)?;
+    let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
 
     // Register imported structs/enums so the entry module can reference them

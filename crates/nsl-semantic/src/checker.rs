@@ -468,6 +468,11 @@ impl<'a> TypeChecker<'a> {
                             // Recognized — validation happens in determinism.rs pass
                         }
 
+                        // M49: @shape_assert — recognized here, constraints added to solver during semantic analysis
+                        if dname == "shape_assert" {
+                            // Recognized — constraint added to solver during semantic analysis
+                        }
+
                         if dname == "flash_attention" {
                             match &stmt.kind {
                                 StmtKind::FnDef(_) => {
@@ -1133,6 +1138,20 @@ impl<'a> TypeChecker<'a> {
                                         .to_string()
                                 };
                                 crate::fp8::validate_fp8_compute_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            }
+                            // M50: @sparse decorator validation
+                            if dname == "sparse" {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner
+                                        .resolve(s.0)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                crate::sparse::validate_sparse_decorator(
                                     deco,
                                     &resolve,
                                     &mut self.diagnostics,

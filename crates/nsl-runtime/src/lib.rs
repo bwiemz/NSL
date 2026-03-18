@@ -75,6 +75,7 @@ pub mod tensor_trace;
 pub mod trace_diff;
 pub mod deterministic_ops;
 pub mod multimodal;
+pub mod sparse;
 
 #[cfg(test)]
 mod fuzz;
