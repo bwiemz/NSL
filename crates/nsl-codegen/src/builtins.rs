@@ -395,6 +395,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_grammar_is_accept", &[types::I64], Some(types::I64)),
     ("nsl_grammar_start_state", &[], Some(types::I64)),
     ("nsl_grammar_destroy", &[], Some(types::I64)),
+    // --- M39b: vmap runtime ---
+    ("nsl_vmap_check_batch", &[types::I64, types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.
