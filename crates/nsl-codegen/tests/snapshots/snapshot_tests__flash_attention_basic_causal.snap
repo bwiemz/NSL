@@ -1,0 +1,1335 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry flash_attn_p0_r0_hs_g1_c1_t0_q64_kv64 (
+    .param .u64 q_ptr,
+    .param .u64 k_ptr,
+    .param .u64 v_ptr,
+    .param .u64 out_ptr,
+    .param .f32 scale,
+    .param .u64 batch,
+    .param .u64 heads,
+    .param .u64 seq_len,
+    .param .u64 head_dim,
+    .param .u64 block_table_ptr,
+    .param .u64 k_pool_ptr,
+    .param .u64 v_pool_ptr,
+    .param .u64 block_size,
+    .param .u64 cos_ptr,
+    .param .u64 sin_ptr,
+    .param .u64 seq_ids_ptr,
+    .param .u64 seq_lens_ptr,
+    .param .u64 dfs_enter_ptr,
+    .param .u64 dfs_exit_ptr,
+    .param .u64 num_tree_nodes
+)
+{
+    .shared .align 16 .b8 shmem[32768];
+    .reg .u32 %tid_x, %bid_x, %bid_y;
+    .reg .u64 %rd<64>;
+    .reg .f32 %f<128>;
+    .reg .b16 %h<32>;
+    .reg .pred %p<16>;
+    .reg .u32 %r<32>;
+    .reg .f32 %scale;
+    .reg .f32 %log2e;
+    mov.f32 %log2e, 0x3FB8AA3B;  // 1.4426950408 (log2(e))
+    .reg .u64 %k_start, %k_max;
+    .reg .f32 %row_max, %row_sum, %correction;
+    .reg .f32 %new_max, %old_max;
+    .reg .f32 %shfl_tmp;
+    ld.param.u64 %rd0, [q_ptr];
+    ld.param.u64 %rd1, [k_ptr];
+    ld.param.u64 %rd2, [v_ptr];
+    ld.param.u64 %rd3, [out_ptr];
+    ld.param.f32 %scale, [scale];
+    ld.param.u64 %rd4, [batch];
+    ld.param.u64 %rd5, [heads];
+    ld.param.u64 %rd6, [seq_len];
+    ld.param.u64 %rd7, [head_dim];
+    ld.param.u64 %rd8, [block_table_ptr];
+    ld.param.u64 %rd9, [k_pool_ptr];
+    ld.param.u64 %rd10, [v_pool_ptr];
+    ld.param.u64 %rd11, [block_size];
+    ld.param.u64 %rd12, [cos_ptr];
+    ld.param.u64 %rd13, [sin_ptr];
+    ld.param.u64 %rd14, [seq_ids_ptr];
+    ld.param.u64 %rd15, [seq_lens_ptr];
+    mov.u32 %tid_x, %tid.x;
+    mov.u32 %bid_x, %ctaid.x;
+    mov.u32 %bid_y, %ctaid.y;
+    // q_start = blockIdx.x * block_q
+    cvt.u64.u32 %rd16, %bid_x;
+    mul.lo.u64 %rd16, %rd16, 64;  // %rd16 = q_start
+    // batch_head routing computed from blockIdx.y
+    cvt.u64.u32 %rd17, %bid_y;
+    rem.u64 %rd18, %rd17, %rd5;  // head_idx = bid_y % heads
+    div.u64 %rd19, %rd17, %rd5;  // batch_idx = bid_y / heads
+    // Load Q tile into shared memory
+    // Compute Q base address for this batch/head/q_start
+    mul.lo.u64 %rd21, %rd19, %rd5;   // batch_idx * heads
+    add.u64 %rd21, %rd21, %rd18;      // + head_idx
+    mul.lo.u64 %rd21, %rd21, %rd6;    // * seq_len
+    add.u64 %rd21, %rd21, %rd16;      // + q_start
+    mul.lo.u64 %rd21, %rd21, %rd7;    // * head_dim
+    shl.b64 %rd21, %rd21, 2;          // * 4 (sizeof f32)
+    add.u64 %rd21, %rd0, %rd21;       // q_base = q_ptr + offset
+    // Cooperative Q load: each thread loads 64 elements
+    cvt.u64.u32 %rd22, %tid_x;        // elem_idx = tid_x
+    mov.u64 %rd23, 8192;                // total Q elements
+LOOP_Q_LOAD:
+    shl.b64 %rd24, %rd22, 2;        // byte offset = elem_idx * 4
+    add.u64 %rd25, %rd21, %rd24;    // global addr
+    ld.global.f32 %f0, [%rd25];
+    st.shared.f32 [shmem + %rd24], %f0;
+    add.u64 %rd22, %rd22, 128;      // elem_idx += blockDim.x
+    setp.lt.u64 %p0, %rd22, %rd23;
+    @%p0 bra LOOP_Q_LOAD;
+    bar.sync 0;
+    // Q tile now in shmem[0 .. block_q * head_dim * 4]
+    // Initialize accumulators
+    // O_acc = 0, row_max = -inf, row_sum = 0
+    mov.f32 %row_max, 0xFF800000;  // -inf as IEEE 754
+    mov.f32 %row_sum, 0x00000000;  // 0.0
+    // O_acc: 64 registers per thread (f64..f127)
+    mov.f32 %f64, 0x00000000;
+    mov.f32 %f65, 0x00000000;
+    mov.f32 %f66, 0x00000000;
+    mov.f32 %f67, 0x00000000;
+    mov.f32 %f68, 0x00000000;
+    mov.f32 %f69, 0x00000000;
+    mov.f32 %f70, 0x00000000;
+    mov.f32 %f71, 0x00000000;
+    mov.f32 %f72, 0x00000000;
+    mov.f32 %f73, 0x00000000;
+    mov.f32 %f74, 0x00000000;
+    mov.f32 %f75, 0x00000000;
+    mov.f32 %f76, 0x00000000;
+    mov.f32 %f77, 0x00000000;
+    mov.f32 %f78, 0x00000000;
+    mov.f32 %f79, 0x00000000;
+    mov.f32 %f80, 0x00000000;
+    mov.f32 %f81, 0x00000000;
+    mov.f32 %f82, 0x00000000;
+    mov.f32 %f83, 0x00000000;
+    mov.f32 %f84, 0x00000000;
+    mov.f32 %f85, 0x00000000;
+    mov.f32 %f86, 0x00000000;
+    mov.f32 %f87, 0x00000000;
+    mov.f32 %f88, 0x00000000;
+    mov.f32 %f89, 0x00000000;
+    mov.f32 %f90, 0x00000000;
+    mov.f32 %f91, 0x00000000;
+    mov.f32 %f92, 0x00000000;
+    mov.f32 %f93, 0x00000000;
+    mov.f32 %f94, 0x00000000;
+    mov.f32 %f95, 0x00000000;
+    mov.f32 %f96, 0x00000000;
+    mov.f32 %f97, 0x00000000;
+    mov.f32 %f98, 0x00000000;
+    mov.f32 %f99, 0x00000000;
+    mov.f32 %f100, 0x00000000;
+    mov.f32 %f101, 0x00000000;
+    mov.f32 %f102, 0x00000000;
+    mov.f32 %f103, 0x00000000;
+    mov.f32 %f104, 0x00000000;
+    mov.f32 %f105, 0x00000000;
+    mov.f32 %f106, 0x00000000;
+    mov.f32 %f107, 0x00000000;
+    mov.f32 %f108, 0x00000000;
+    mov.f32 %f109, 0x00000000;
+    mov.f32 %f110, 0x00000000;
+    mov.f32 %f111, 0x00000000;
+    mov.f32 %f112, 0x00000000;
+    mov.f32 %f113, 0x00000000;
+    mov.f32 %f114, 0x00000000;
+    mov.f32 %f115, 0x00000000;
+    mov.f32 %f116, 0x00000000;
+    mov.f32 %f117, 0x00000000;
+    mov.f32 %f118, 0x00000000;
+    mov.f32 %f119, 0x00000000;
+    mov.f32 %f120, 0x00000000;
+    mov.f32 %f121, 0x00000000;
+    mov.f32 %f122, 0x00000000;
+    mov.f32 %f123, 0x00000000;
+    mov.f32 %f124, 0x00000000;
+    mov.f32 %f125, 0x00000000;
+    mov.f32 %f126, 0x00000000;
+    mov.f32 %f127, 0x00000000;
+    // Causal: k_max = min(q_start + block_q, seq_len)
+    add.u64 %k_max, %rd16, 64;  // q_start + block_q
+    min.u64 %k_max, %k_max, %rd6;  // min(..., seq_len)
+    mov.u64 %k_start, 0;
+    // === Main K/V tile loop ===
+    // Causal: k_max = min(seq_len, q_start + block_q)
+    // Zero-divergence — loop naturally terminates at diagonal
+    setp.ge.u64 %p0, %k_start, %k_max;
+    @%p0 bra LOOP_KV_END;
+LOOP_KV_START:
+    // Phase 1: Load K tile into SRAM
+    // shmem_K base = shmem + 32768 (after Q tile)
+    mul.lo.u64 %rd36, %rd19, %rd5;  // batch_idx * heads
+    add.u64 %rd36, %rd36, %rd18;    // + head_idx
+    mul.lo.u64 %rd36, %rd36, %rd6;     // * seq_len
+    add.u64 %rd36, %rd36, %k_start;    // + k_start
+    mul.lo.u64 %rd36, %rd36, %rd7;     // * head_dim
+    shl.b64 %rd36, %rd36, 2;           // * 4 bytes
+    add.u64 %rd40, %rd1, %rd36;        // k_base = k_ptr + offset
+    // Cooperative K load: 8192 total elements, 64 per thread
+    cvt.u64.u32 %rd41, %tid_x;             // elem_idx = tid_x
+    mov.u64 %rd42, 8192;                    // total K elements
+LOOP_K_LOAD:
+    shl.b64 %rd43, %rd41, 2;               // byte offset = elem_idx * 4
+    add.u64 %rd44, %rd40, %rd43;           // global addr
+    ld.global.f32 %f0, [%rd44];
+    add.u64 %rd45, %rd43, 32768;             // shmem_K byte offset
+    st.shared.f32 [shmem + %rd45], %f0;
+    add.u64 %rd41, %rd41, 128;             // elem_idx += blockDim.x
+    setp.lt.u64 %p0, %rd41, %rd42;
+    @%p0 bra LOOP_K_LOAD;
+    bar.sync 0;  // FENCE 1: K tile fully in SRAM
+    // Phase 2: S = Q_tile @ K_tile^T (registers)
+    // Each thread computes 32 S values
+    mov.u32 %r1, 0;                        // s_iter = 0
+    mov.u32 %r2, 32;                      // num_s_per_thread
+LOOP_S_OUTER:
+    // linear_idx = tid_x + s_iter * 128
+    mul.lo.u32 %r3, %r1, 128;
+    add.u32 %r3, %r3, %tid_x;
+    div.u32 %r4, %r3, 64;                 // q_row = linear_idx / block_kv
+    rem.u32 %r5, %r3, 64;                 // k_col = linear_idx % block_kv
+    mov.f32 %f0, 0x00000000;               // S accumulator = 0
+    mov.u32 %r6, 0;                        // d = 0
+    mov.u32 %r7, 128;                      // head_dim
+LOOP_HD:
+    cvt.u64.u32 %rd43, %r4;               // q_row as u64
+    mul.lo.u64 %rd43, %rd43, 128;          // q_row * head_dim
+    cvt.u64.u32 %rd44, %r6;               // d as u64
+    add.u64 %rd43, %rd43, %rd44;           // q_row * head_dim + d
+    shl.b64 %rd43, %rd43, 2;              // * 4 bytes
+    ld.shared.f32 %f1, [shmem + %rd43];   // Q[q_row][d]
+    cvt.u64.u32 %rd44, %r5;               // k_col as u64
+    mul.lo.u64 %rd44, %rd44, 128;          // k_col * head_dim
+    cvt.u64.u32 %rd45, %r6;               // d as u64
+    add.u64 %rd44, %rd44, %rd45;           // k_col * head_dim + d
+    shl.b64 %rd44, %rd44, 2;              // * 4 bytes
+    add.u64 %rd44, %rd44, 32768;             // + shmem_K base offset
+    ld.shared.f32 %f2, [shmem + %rd44];   // K[k_col][d]
+    fma.rn.f32 %f0, %f1, %f2, %f0;       // S += Q[d] * K[d]
+    add.u32 %r6, %r6, 1;                  // d++
+    setp.lt.u32 %p0, %r6, %r7;
+    @%p0 bra LOOP_HD;
+    // S[i][j] *= scale  (mul.f32)
+    mul.f32 %f0, %f0, %scale;
+    // Partial causal mask on diagonal tile: S[i][j] = -inf where k_start+j > q_start+i
+    cvt.u64.u32 %rd43, %r5;           // k_col as u64
+    add.u64 %rd43, %k_start, %rd43;   // k_abs = k_start + k_col
+    cvt.u64.u32 %rd44, %r4;           // q_row as u64
+    add.u64 %rd44, %rd16, %rd44;      // q_abs = q_start + q_row
+    setp.gt.u64 %p1, %rd43, %rd44;    // k_abs > q_abs?
+    @%p1 mov.f32 %f0, 0xFF800000;     // -inf for masked positions
+    // Store S value for this thread's s_iter
+    setp.eq.u32 %p2, %r1, 0;
+    @%p2 mov.f32 %f3, %f0;
+    setp.eq.u32 %p2, %r1, 1;
+    @%p2 mov.f32 %f4, %f0;
+    setp.eq.u32 %p2, %r1, 2;
+    @%p2 mov.f32 %f5, %f0;
+    setp.eq.u32 %p2, %r1, 3;
+    @%p2 mov.f32 %f6, %f0;
+    setp.eq.u32 %p2, %r1, 4;
+    @%p2 mov.f32 %f7, %f0;
+    setp.eq.u32 %p2, %r1, 5;
+    @%p2 mov.f32 %f8, %f0;
+    setp.eq.u32 %p2, %r1, 6;
+    @%p2 mov.f32 %f9, %f0;
+    setp.eq.u32 %p2, %r1, 7;
+    @%p2 mov.f32 %f10, %f0;
+    setp.eq.u32 %p2, %r1, 8;
+    @%p2 mov.f32 %f11, %f0;
+    setp.eq.u32 %p2, %r1, 9;
+    @%p2 mov.f32 %f12, %f0;
+    setp.eq.u32 %p2, %r1, 10;
+    @%p2 mov.f32 %f13, %f0;
+    setp.eq.u32 %p2, %r1, 11;
+    @%p2 mov.f32 %f14, %f0;
+    setp.eq.u32 %p2, %r1, 12;
+    @%p2 mov.f32 %f15, %f0;
+    setp.eq.u32 %p2, %r1, 13;
+    @%p2 mov.f32 %f16, %f0;
+    setp.eq.u32 %p2, %r1, 14;
+    @%p2 mov.f32 %f17, %f0;
+    setp.eq.u32 %p2, %r1, 15;
+    @%p2 mov.f32 %f18, %f0;
+    setp.eq.u32 %p2, %r1, 16;
+    @%p2 mov.f32 %f19, %f0;
+    setp.eq.u32 %p2, %r1, 17;
+    @%p2 mov.f32 %f20, %f0;
+    setp.eq.u32 %p2, %r1, 18;
+    @%p2 mov.f32 %f21, %f0;
+    setp.eq.u32 %p2, %r1, 19;
+    @%p2 mov.f32 %f22, %f0;
+    setp.eq.u32 %p2, %r1, 20;
+    @%p2 mov.f32 %f23, %f0;
+    setp.eq.u32 %p2, %r1, 21;
+    @%p2 mov.f32 %f24, %f0;
+    setp.eq.u32 %p2, %r1, 22;
+    @%p2 mov.f32 %f25, %f0;
+    setp.eq.u32 %p2, %r1, 23;
+    @%p2 mov.f32 %f26, %f0;
+    setp.eq.u32 %p2, %r1, 24;
+    @%p2 mov.f32 %f27, %f0;
+    setp.eq.u32 %p2, %r1, 25;
+    @%p2 mov.f32 %f28, %f0;
+    setp.eq.u32 %p2, %r1, 26;
+    @%p2 mov.f32 %f29, %f0;
+    setp.eq.u32 %p2, %r1, 27;
+    @%p2 mov.f32 %f30, %f0;
+    setp.eq.u32 %p2, %r1, 28;
+    @%p2 mov.f32 %f31, %f0;
+    setp.eq.u32 %p2, %r1, 29;
+    @%p2 mov.f32 %f32, %f0;
+    setp.eq.u32 %p2, %r1, 30;
+    @%p2 mov.f32 %f33, %f0;
+    setp.eq.u32 %p2, %r1, 31;
+    @%p2 mov.f32 %f34, %f0;
+    add.u32 %r1, %r1, 1;                  // s_iter++
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra LOOP_S_OUTER;
+    bar.sync 0;  // FENCE 2: all warps done reading K before SRAM overwrite
+    // Phase 3: Online softmax — S→P in-place in registers
+    // Local max from this thread's S values
+    mov.f32 %f0, 0xFF800000;               // f_local_max = -inf
+    max.f32 %f0, %f0, %f3;              // max with S[0]
+    max.f32 %f0, %f0, %f4;              // max with S[1]
+    max.f32 %f0, %f0, %f5;              // max with S[2]
+    max.f32 %f0, %f0, %f6;              // max with S[3]
+    max.f32 %f0, %f0, %f7;              // max with S[4]
+    max.f32 %f0, %f0, %f8;              // max with S[5]
+    max.f32 %f0, %f0, %f9;              // max with S[6]
+    max.f32 %f0, %f0, %f10;              // max with S[7]
+    max.f32 %f0, %f0, %f11;              // max with S[8]
+    max.f32 %f0, %f0, %f12;              // max with S[9]
+    max.f32 %f0, %f0, %f13;              // max with S[10]
+    max.f32 %f0, %f0, %f14;              // max with S[11]
+    max.f32 %f0, %f0, %f15;              // max with S[12]
+    max.f32 %f0, %f0, %f16;              // max with S[13]
+    max.f32 %f0, %f0, %f17;              // max with S[14]
+    max.f32 %f0, %f0, %f18;              // max with S[15]
+    max.f32 %f0, %f0, %f19;              // max with S[16]
+    max.f32 %f0, %f0, %f20;              // max with S[17]
+    max.f32 %f0, %f0, %f21;              // max with S[18]
+    max.f32 %f0, %f0, %f22;              // max with S[19]
+    max.f32 %f0, %f0, %f23;              // max with S[20]
+    max.f32 %f0, %f0, %f24;              // max with S[21]
+    max.f32 %f0, %f0, %f25;              // max with S[22]
+    max.f32 %f0, %f0, %f26;              // max with S[23]
+    max.f32 %f0, %f0, %f27;              // max with S[24]
+    max.f32 %f0, %f0, %f28;              // max with S[25]
+    max.f32 %f0, %f0, %f29;              // max with S[26]
+    max.f32 %f0, %f0, %f30;              // max with S[27]
+    max.f32 %f0, %f0, %f31;              // max with S[28]
+    max.f32 %f0, %f0, %f32;              // max with S[29]
+    max.f32 %f0, %f0, %f33;              // max with S[30]
+    max.f32 %f0, %f0, %f34;              // max with S[31]
+    // Warp-level reductions via shfl.sync.bfly for row_max, row_sum
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    // new_max = max(row_max, warp_reduce_max(row_max_of_S))
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    // correction = exp(old_max - new_max)  // <= 1.0, no overflow
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;
+    // row_sum = row_sum * correction + warp_reduce_sum(exp(S - new_max))
+    mul.f32 %row_sum, %row_sum, %correction;
+    // O_acc *= correction
+    mul.f32 %f64, %f64, %correction;
+    mul.f32 %f65, %f65, %correction;
+    mul.f32 %f66, %f66, %correction;
+    mul.f32 %f67, %f67, %correction;
+    mul.f32 %f68, %f68, %correction;
+    mul.f32 %f69, %f69, %correction;
+    mul.f32 %f70, %f70, %correction;
+    mul.f32 %f71, %f71, %correction;
+    mul.f32 %f72, %f72, %correction;
+    mul.f32 %f73, %f73, %correction;
+    mul.f32 %f74, %f74, %correction;
+    mul.f32 %f75, %f75, %correction;
+    mul.f32 %f76, %f76, %correction;
+    mul.f32 %f77, %f77, %correction;
+    mul.f32 %f78, %f78, %correction;
+    mul.f32 %f79, %f79, %correction;
+    mul.f32 %f80, %f80, %correction;
+    mul.f32 %f81, %f81, %correction;
+    mul.f32 %f82, %f82, %correction;
+    mul.f32 %f83, %f83, %correction;
+    mul.f32 %f84, %f84, %correction;
+    mul.f32 %f85, %f85, %correction;
+    mul.f32 %f86, %f86, %correction;
+    mul.f32 %f87, %f87, %correction;
+    mul.f32 %f88, %f88, %correction;
+    mul.f32 %f89, %f89, %correction;
+    mul.f32 %f90, %f90, %correction;
+    mul.f32 %f91, %f91, %correction;
+    mul.f32 %f92, %f92, %correction;
+    mul.f32 %f93, %f93, %correction;
+    mul.f32 %f94, %f94, %correction;
+    mul.f32 %f95, %f95, %correction;
+    mul.f32 %f96, %f96, %correction;
+    mul.f32 %f97, %f97, %correction;
+    mul.f32 %f98, %f98, %correction;
+    mul.f32 %f99, %f99, %correction;
+    mul.f32 %f100, %f100, %correction;
+    mul.f32 %f101, %f101, %correction;
+    mul.f32 %f102, %f102, %correction;
+    mul.f32 %f103, %f103, %correction;
+    mul.f32 %f104, %f104, %correction;
+    mul.f32 %f105, %f105, %correction;
+    mul.f32 %f106, %f106, %correction;
+    mul.f32 %f107, %f107, %correction;
+    mul.f32 %f108, %f108, %correction;
+    mul.f32 %f109, %f109, %correction;
+    mul.f32 %f110, %f110, %correction;
+    mul.f32 %f111, %f111, %correction;
+    mul.f32 %f112, %f112, %correction;
+    mul.f32 %f113, %f113, %correction;
+    mul.f32 %f114, %f114, %correction;
+    mul.f32 %f115, %f115, %correction;
+    mul.f32 %f116, %f116, %correction;
+    mul.f32 %f117, %f117, %correction;
+    mul.f32 %f118, %f118, %correction;
+    mul.f32 %f119, %f119, %correction;
+    mul.f32 %f120, %f120, %correction;
+    mul.f32 %f121, %f121, %correction;
+    mul.f32 %f122, %f122, %correction;
+    mul.f32 %f123, %f123, %correction;
+    mul.f32 %f124, %f124, %correction;
+    mul.f32 %f125, %f125, %correction;
+    mul.f32 %f126, %f126, %correction;
+    mul.f32 %f127, %f127, %correction;
+    // P = exp(S - new_max)  // overwrites S registers in-place
+    mov.f32 %f1, 0x00000000;               // partial_sum = 0
+    sub.f32 %f3, %f3, %new_max;
+    mul.f32 %f3, %f3, %log2e;
+    ex2.approx.f32 %f3, %f3;
+    add.f32 %f1, %f1, %f3;              // partial_sum += P[0]
+    sub.f32 %f4, %f4, %new_max;
+    mul.f32 %f4, %f4, %log2e;
+    ex2.approx.f32 %f4, %f4;
+    add.f32 %f1, %f1, %f4;              // partial_sum += P[1]
+    sub.f32 %f5, %f5, %new_max;
+    mul.f32 %f5, %f5, %log2e;
+    ex2.approx.f32 %f5, %f5;
+    add.f32 %f1, %f1, %f5;              // partial_sum += P[2]
+    sub.f32 %f6, %f6, %new_max;
+    mul.f32 %f6, %f6, %log2e;
+    ex2.approx.f32 %f6, %f6;
+    add.f32 %f1, %f1, %f6;              // partial_sum += P[3]
+    sub.f32 %f7, %f7, %new_max;
+    mul.f32 %f7, %f7, %log2e;
+    ex2.approx.f32 %f7, %f7;
+    add.f32 %f1, %f1, %f7;              // partial_sum += P[4]
+    sub.f32 %f8, %f8, %new_max;
+    mul.f32 %f8, %f8, %log2e;
+    ex2.approx.f32 %f8, %f8;
+    add.f32 %f1, %f1, %f8;              // partial_sum += P[5]
+    sub.f32 %f9, %f9, %new_max;
+    mul.f32 %f9, %f9, %log2e;
+    ex2.approx.f32 %f9, %f9;
+    add.f32 %f1, %f1, %f9;              // partial_sum += P[6]
+    sub.f32 %f10, %f10, %new_max;
+    mul.f32 %f10, %f10, %log2e;
+    ex2.approx.f32 %f10, %f10;
+    add.f32 %f1, %f1, %f10;              // partial_sum += P[7]
+    sub.f32 %f11, %f11, %new_max;
+    mul.f32 %f11, %f11, %log2e;
+    ex2.approx.f32 %f11, %f11;
+    add.f32 %f1, %f1, %f11;              // partial_sum += P[8]
+    sub.f32 %f12, %f12, %new_max;
+    mul.f32 %f12, %f12, %log2e;
+    ex2.approx.f32 %f12, %f12;
+    add.f32 %f1, %f1, %f12;              // partial_sum += P[9]
+    sub.f32 %f13, %f13, %new_max;
+    mul.f32 %f13, %f13, %log2e;
+    ex2.approx.f32 %f13, %f13;
+    add.f32 %f1, %f1, %f13;              // partial_sum += P[10]
+    sub.f32 %f14, %f14, %new_max;
+    mul.f32 %f14, %f14, %log2e;
+    ex2.approx.f32 %f14, %f14;
+    add.f32 %f1, %f1, %f14;              // partial_sum += P[11]
+    sub.f32 %f15, %f15, %new_max;
+    mul.f32 %f15, %f15, %log2e;
+    ex2.approx.f32 %f15, %f15;
+    add.f32 %f1, %f1, %f15;              // partial_sum += P[12]
+    sub.f32 %f16, %f16, %new_max;
+    mul.f32 %f16, %f16, %log2e;
+    ex2.approx.f32 %f16, %f16;
+    add.f32 %f1, %f1, %f16;              // partial_sum += P[13]
+    sub.f32 %f17, %f17, %new_max;
+    mul.f32 %f17, %f17, %log2e;
+    ex2.approx.f32 %f17, %f17;
+    add.f32 %f1, %f1, %f17;              // partial_sum += P[14]
+    sub.f32 %f18, %f18, %new_max;
+    mul.f32 %f18, %f18, %log2e;
+    ex2.approx.f32 %f18, %f18;
+    add.f32 %f1, %f1, %f18;              // partial_sum += P[15]
+    sub.f32 %f19, %f19, %new_max;
+    mul.f32 %f19, %f19, %log2e;
+    ex2.approx.f32 %f19, %f19;
+    add.f32 %f1, %f1, %f19;              // partial_sum += P[16]
+    sub.f32 %f20, %f20, %new_max;
+    mul.f32 %f20, %f20, %log2e;
+    ex2.approx.f32 %f20, %f20;
+    add.f32 %f1, %f1, %f20;              // partial_sum += P[17]
+    sub.f32 %f21, %f21, %new_max;
+    mul.f32 %f21, %f21, %log2e;
+    ex2.approx.f32 %f21, %f21;
+    add.f32 %f1, %f1, %f21;              // partial_sum += P[18]
+    sub.f32 %f22, %f22, %new_max;
+    mul.f32 %f22, %f22, %log2e;
+    ex2.approx.f32 %f22, %f22;
+    add.f32 %f1, %f1, %f22;              // partial_sum += P[19]
+    sub.f32 %f23, %f23, %new_max;
+    mul.f32 %f23, %f23, %log2e;
+    ex2.approx.f32 %f23, %f23;
+    add.f32 %f1, %f1, %f23;              // partial_sum += P[20]
+    sub.f32 %f24, %f24, %new_max;
+    mul.f32 %f24, %f24, %log2e;
+    ex2.approx.f32 %f24, %f24;
+    add.f32 %f1, %f1, %f24;              // partial_sum += P[21]
+    sub.f32 %f25, %f25, %new_max;
+    mul.f32 %f25, %f25, %log2e;
+    ex2.approx.f32 %f25, %f25;
+    add.f32 %f1, %f1, %f25;              // partial_sum += P[22]
+    sub.f32 %f26, %f26, %new_max;
+    mul.f32 %f26, %f26, %log2e;
+    ex2.approx.f32 %f26, %f26;
+    add.f32 %f1, %f1, %f26;              // partial_sum += P[23]
+    sub.f32 %f27, %f27, %new_max;
+    mul.f32 %f27, %f27, %log2e;
+    ex2.approx.f32 %f27, %f27;
+    add.f32 %f1, %f1, %f27;              // partial_sum += P[24]
+    sub.f32 %f28, %f28, %new_max;
+    mul.f32 %f28, %f28, %log2e;
+    ex2.approx.f32 %f28, %f28;
+    add.f32 %f1, %f1, %f28;              // partial_sum += P[25]
+    sub.f32 %f29, %f29, %new_max;
+    mul.f32 %f29, %f29, %log2e;
+    ex2.approx.f32 %f29, %f29;
+    add.f32 %f1, %f1, %f29;              // partial_sum += P[26]
+    sub.f32 %f30, %f30, %new_max;
+    mul.f32 %f30, %f30, %log2e;
+    ex2.approx.f32 %f30, %f30;
+    add.f32 %f1, %f1, %f30;              // partial_sum += P[27]
+    sub.f32 %f31, %f31, %new_max;
+    mul.f32 %f31, %f31, %log2e;
+    ex2.approx.f32 %f31, %f31;
+    add.f32 %f1, %f1, %f31;              // partial_sum += P[28]
+    sub.f32 %f32, %f32, %new_max;
+    mul.f32 %f32, %f32, %log2e;
+    ex2.approx.f32 %f32, %f32;
+    add.f32 %f1, %f1, %f32;              // partial_sum += P[29]
+    sub.f32 %f33, %f33, %new_max;
+    mul.f32 %f33, %f33, %log2e;
+    ex2.approx.f32 %f33, %f33;
+    add.f32 %f1, %f1, %f33;              // partial_sum += P[30]
+    sub.f32 %f34, %f34, %new_max;
+    mul.f32 %f34, %f34, %log2e;
+    ex2.approx.f32 %f34, %f34;
+    add.f32 %f1, %f1, %f34;              // partial_sum += P[31]
+    // Sum reduction (5-step butterfly)
+    shfl.sync.bfly.b32 %shfl_tmp, %f1, 16, 31, 0xFFFFFFFF;
+    add.f32 %f1, %f1, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f1, 8, 31, 0xFFFFFFFF;
+    add.f32 %f1, %f1, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f1, 4, 31, 0xFFFFFFFF;
+    add.f32 %f1, %f1, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f1, 2, 31, 0xFFFFFFFF;
+    add.f32 %f1, %f1, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f1, 1, 31, 0xFFFFFFFF;
+    add.f32 %f1, %f1, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f1;       // row_sum += reduced partial_sum
+    // Phase 4: Load V tile (reuses shmem_K address)
+    mul.lo.u64 %rd46, %rd19, %rd5;  // batch_idx * heads
+    add.u64 %rd46, %rd46, %rd18;    // + head_idx
+    mul.lo.u64 %rd46, %rd46, %rd6;     // * seq_len
+    add.u64 %rd46, %rd46, %k_start;    // + k_start
+    mul.lo.u64 %rd46, %rd46, %rd7;     // * head_dim
+    shl.b64 %rd46, %rd46, 2;           // * 4 bytes
+    add.u64 %rd46, %rd2, %rd46;        // v_base = v_ptr + offset
+    cvt.u64.u32 %rd47, %tid_x;             // elem_idx = tid_x
+LOOP_V_LOAD:
+    shl.b64 %rd48, %rd47, 2;               // byte offset
+    add.u64 %rd49, %rd46, %rd48;           // global addr
+    ld.global.f32 %f0, [%rd49];
+    add.u64 %rd50, %rd48, 32768;             // shmem_K byte offset (V reuses K region)
+    st.shared.f32 [shmem + %rd50], %f0;
+    add.u64 %rd47, %rd47, 128;             // elem_idx += blockDim.x
+    setp.lt.u64 %p0, %rd47, 8192;
+    @%p0 bra LOOP_V_LOAD;
+    bar.sync 0;  // FENCE 3: V tile fully in SRAM
+    // Phase 5: O_acc += P @ V_tile
+    // P in registers (Phase 3), V in SRAM
+    mov.u32 %r8, 0;                        // oacc_iter = 0
+    mov.u32 %r9, 64;                      // num_oacc
+LOOP_PV_OUTER:
+    // o_linear = tid_x + oacc_iter * 128
+    mul.lo.u32 %r10, %r8, 128;
+    add.u32 %r10, %r10, %tid_x;
+    rem.u32 %r11, %r10, 128;               // d_col = o_linear % head_dim
+    mov.u32 %r12, 0;                       // k_iter = 0
+    mov.u32 %r13, 64;                     // block_kv
+LOOP_PV:
+    cvt.u64.u32 %rd48, %r12;              // k_iter as u64
+    mul.lo.u64 %rd48, %rd48, 128;          // k_iter * head_dim
+    cvt.u64.u32 %rd49, %r11;              // d_col as u64
+    add.u64 %rd48, %rd48, %rd49;           // k_iter * head_dim + d_col
+    shl.b64 %rd48, %rd48, 2;              // * 4 bytes
+    add.u64 %rd48, %rd48, 32768;             // + shmem_K base
+    ld.shared.f32 %f1, [shmem + %rd48];   // V[k][d_col]
+    mov.f32 %f2, 0x00000000;               // default P = 0
+    setp.eq.u32 %p2, %r12, 0;
+    @%p2 mov.f32 %f2, %f3;
+    setp.eq.u32 %p2, %r12, 1;
+    @%p2 mov.f32 %f2, %f4;
+    setp.eq.u32 %p2, %r12, 2;
+    @%p2 mov.f32 %f2, %f5;
+    setp.eq.u32 %p2, %r12, 3;
+    @%p2 mov.f32 %f2, %f6;
+    setp.eq.u32 %p2, %r12, 4;
+    @%p2 mov.f32 %f2, %f7;
+    setp.eq.u32 %p2, %r12, 5;
+    @%p2 mov.f32 %f2, %f8;
+    setp.eq.u32 %p2, %r12, 6;
+    @%p2 mov.f32 %f2, %f9;
+    setp.eq.u32 %p2, %r12, 7;
+    @%p2 mov.f32 %f2, %f10;
+    setp.eq.u32 %p2, %r12, 8;
+    @%p2 mov.f32 %f2, %f11;
+    setp.eq.u32 %p2, %r12, 9;
+    @%p2 mov.f32 %f2, %f12;
+    setp.eq.u32 %p2, %r12, 10;
+    @%p2 mov.f32 %f2, %f13;
+    setp.eq.u32 %p2, %r12, 11;
+    @%p2 mov.f32 %f2, %f14;
+    setp.eq.u32 %p2, %r12, 12;
+    @%p2 mov.f32 %f2, %f15;
+    setp.eq.u32 %p2, %r12, 13;
+    @%p2 mov.f32 %f2, %f16;
+    setp.eq.u32 %p2, %r12, 14;
+    @%p2 mov.f32 %f2, %f17;
+    setp.eq.u32 %p2, %r12, 15;
+    @%p2 mov.f32 %f2, %f18;
+    setp.eq.u32 %p2, %r12, 16;
+    @%p2 mov.f32 %f2, %f19;
+    setp.eq.u32 %p2, %r12, 17;
+    @%p2 mov.f32 %f2, %f20;
+    setp.eq.u32 %p2, %r12, 18;
+    @%p2 mov.f32 %f2, %f21;
+    setp.eq.u32 %p2, %r12, 19;
+    @%p2 mov.f32 %f2, %f22;
+    setp.eq.u32 %p2, %r12, 20;
+    @%p2 mov.f32 %f2, %f23;
+    setp.eq.u32 %p2, %r12, 21;
+    @%p2 mov.f32 %f2, %f24;
+    setp.eq.u32 %p2, %r12, 22;
+    @%p2 mov.f32 %f2, %f25;
+    setp.eq.u32 %p2, %r12, 23;
+    @%p2 mov.f32 %f2, %f26;
+    setp.eq.u32 %p2, %r12, 24;
+    @%p2 mov.f32 %f2, %f27;
+    setp.eq.u32 %p2, %r12, 25;
+    @%p2 mov.f32 %f2, %f28;
+    setp.eq.u32 %p2, %r12, 26;
+    @%p2 mov.f32 %f2, %f29;
+    setp.eq.u32 %p2, %r12, 27;
+    @%p2 mov.f32 %f2, %f30;
+    setp.eq.u32 %p2, %r12, 28;
+    @%p2 mov.f32 %f2, %f31;
+    setp.eq.u32 %p2, %r12, 29;
+    @%p2 mov.f32 %f2, %f32;
+    setp.eq.u32 %p2, %r12, 30;
+    @%p2 mov.f32 %f2, %f33;
+    setp.eq.u32 %p2, %r12, 31;
+    @%p2 mov.f32 %f2, %f34;
+    setp.eq.u32 %p3, %r8, 0;
+    @%p3 fma.rn.f32 %f64, %f2, %f1, %f64;
+    setp.eq.u32 %p3, %r8, 1;
+    @%p3 fma.rn.f32 %f65, %f2, %f1, %f65;
+    setp.eq.u32 %p3, %r8, 2;
+    @%p3 fma.rn.f32 %f66, %f2, %f1, %f66;
+    setp.eq.u32 %p3, %r8, 3;
+    @%p3 fma.rn.f32 %f67, %f2, %f1, %f67;
+    setp.eq.u32 %p3, %r8, 4;
+    @%p3 fma.rn.f32 %f68, %f2, %f1, %f68;
+    setp.eq.u32 %p3, %r8, 5;
+    @%p3 fma.rn.f32 %f69, %f2, %f1, %f69;
+    setp.eq.u32 %p3, %r8, 6;
+    @%p3 fma.rn.f32 %f70, %f2, %f1, %f70;
+    setp.eq.u32 %p3, %r8, 7;
+    @%p3 fma.rn.f32 %f71, %f2, %f1, %f71;
+    setp.eq.u32 %p3, %r8, 8;
+    @%p3 fma.rn.f32 %f72, %f2, %f1, %f72;
+    setp.eq.u32 %p3, %r8, 9;
+    @%p3 fma.rn.f32 %f73, %f2, %f1, %f73;
+    setp.eq.u32 %p3, %r8, 10;
+    @%p3 fma.rn.f32 %f74, %f2, %f1, %f74;
+    setp.eq.u32 %p3, %r8, 11;
+    @%p3 fma.rn.f32 %f75, %f2, %f1, %f75;
+    setp.eq.u32 %p3, %r8, 12;
+    @%p3 fma.rn.f32 %f76, %f2, %f1, %f76;
+    setp.eq.u32 %p3, %r8, 13;
+    @%p3 fma.rn.f32 %f77, %f2, %f1, %f77;
+    setp.eq.u32 %p3, %r8, 14;
+    @%p3 fma.rn.f32 %f78, %f2, %f1, %f78;
+    setp.eq.u32 %p3, %r8, 15;
+    @%p3 fma.rn.f32 %f79, %f2, %f1, %f79;
+    setp.eq.u32 %p3, %r8, 16;
+    @%p3 fma.rn.f32 %f80, %f2, %f1, %f80;
+    setp.eq.u32 %p3, %r8, 17;
+    @%p3 fma.rn.f32 %f81, %f2, %f1, %f81;
+    setp.eq.u32 %p3, %r8, 18;
+    @%p3 fma.rn.f32 %f82, %f2, %f1, %f82;
+    setp.eq.u32 %p3, %r8, 19;
+    @%p3 fma.rn.f32 %f83, %f2, %f1, %f83;
+    setp.eq.u32 %p3, %r8, 20;
+    @%p3 fma.rn.f32 %f84, %f2, %f1, %f84;
+    setp.eq.u32 %p3, %r8, 21;
+    @%p3 fma.rn.f32 %f85, %f2, %f1, %f85;
+    setp.eq.u32 %p3, %r8, 22;
+    @%p3 fma.rn.f32 %f86, %f2, %f1, %f86;
+    setp.eq.u32 %p3, %r8, 23;
+    @%p3 fma.rn.f32 %f87, %f2, %f1, %f87;
+    setp.eq.u32 %p3, %r8, 24;
+    @%p3 fma.rn.f32 %f88, %f2, %f1, %f88;
+    setp.eq.u32 %p3, %r8, 25;
+    @%p3 fma.rn.f32 %f89, %f2, %f1, %f89;
+    setp.eq.u32 %p3, %r8, 26;
+    @%p3 fma.rn.f32 %f90, %f2, %f1, %f90;
+    setp.eq.u32 %p3, %r8, 27;
+    @%p3 fma.rn.f32 %f91, %f2, %f1, %f91;
+    setp.eq.u32 %p3, %r8, 28;
+    @%p3 fma.rn.f32 %f92, %f2, %f1, %f92;
+    setp.eq.u32 %p3, %r8, 29;
+    @%p3 fma.rn.f32 %f93, %f2, %f1, %f93;
+    setp.eq.u32 %p3, %r8, 30;
+    @%p3 fma.rn.f32 %f94, %f2, %f1, %f94;
+    setp.eq.u32 %p3, %r8, 31;
+    @%p3 fma.rn.f32 %f95, %f2, %f1, %f95;
+    setp.eq.u32 %p3, %r8, 32;
+    @%p3 fma.rn.f32 %f96, %f2, %f1, %f96;
+    setp.eq.u32 %p3, %r8, 33;
+    @%p3 fma.rn.f32 %f97, %f2, %f1, %f97;
+    setp.eq.u32 %p3, %r8, 34;
+    @%p3 fma.rn.f32 %f98, %f2, %f1, %f98;
+    setp.eq.u32 %p3, %r8, 35;
+    @%p3 fma.rn.f32 %f99, %f2, %f1, %f99;
+    setp.eq.u32 %p3, %r8, 36;
+    @%p3 fma.rn.f32 %f100, %f2, %f1, %f100;
+    setp.eq.u32 %p3, %r8, 37;
+    @%p3 fma.rn.f32 %f101, %f2, %f1, %f101;
+    setp.eq.u32 %p3, %r8, 38;
+    @%p3 fma.rn.f32 %f102, %f2, %f1, %f102;
+    setp.eq.u32 %p3, %r8, 39;
+    @%p3 fma.rn.f32 %f103, %f2, %f1, %f103;
+    setp.eq.u32 %p3, %r8, 40;
+    @%p3 fma.rn.f32 %f104, %f2, %f1, %f104;
+    setp.eq.u32 %p3, %r8, 41;
+    @%p3 fma.rn.f32 %f105, %f2, %f1, %f105;
+    setp.eq.u32 %p3, %r8, 42;
+    @%p3 fma.rn.f32 %f106, %f2, %f1, %f106;
+    setp.eq.u32 %p3, %r8, 43;
+    @%p3 fma.rn.f32 %f107, %f2, %f1, %f107;
+    setp.eq.u32 %p3, %r8, 44;
+    @%p3 fma.rn.f32 %f108, %f2, %f1, %f108;
+    setp.eq.u32 %p3, %r8, 45;
+    @%p3 fma.rn.f32 %f109, %f2, %f1, %f109;
+    setp.eq.u32 %p3, %r8, 46;
+    @%p3 fma.rn.f32 %f110, %f2, %f1, %f110;
+    setp.eq.u32 %p3, %r8, 47;
+    @%p3 fma.rn.f32 %f111, %f2, %f1, %f111;
+    setp.eq.u32 %p3, %r8, 48;
+    @%p3 fma.rn.f32 %f112, %f2, %f1, %f112;
+    setp.eq.u32 %p3, %r8, 49;
+    @%p3 fma.rn.f32 %f113, %f2, %f1, %f113;
+    setp.eq.u32 %p3, %r8, 50;
+    @%p3 fma.rn.f32 %f114, %f2, %f1, %f114;
+    setp.eq.u32 %p3, %r8, 51;
+    @%p3 fma.rn.f32 %f115, %f2, %f1, %f115;
+    setp.eq.u32 %p3, %r8, 52;
+    @%p3 fma.rn.f32 %f116, %f2, %f1, %f116;
+    setp.eq.u32 %p3, %r8, 53;
+    @%p3 fma.rn.f32 %f117, %f2, %f1, %f117;
+    setp.eq.u32 %p3, %r8, 54;
+    @%p3 fma.rn.f32 %f118, %f2, %f1, %f118;
+    setp.eq.u32 %p3, %r8, 55;
+    @%p3 fma.rn.f32 %f119, %f2, %f1, %f119;
+    setp.eq.u32 %p3, %r8, 56;
+    @%p3 fma.rn.f32 %f120, %f2, %f1, %f120;
+    setp.eq.u32 %p3, %r8, 57;
+    @%p3 fma.rn.f32 %f121, %f2, %f1, %f121;
+    setp.eq.u32 %p3, %r8, 58;
+    @%p3 fma.rn.f32 %f122, %f2, %f1, %f122;
+    setp.eq.u32 %p3, %r8, 59;
+    @%p3 fma.rn.f32 %f123, %f2, %f1, %f123;
+    setp.eq.u32 %p3, %r8, 60;
+    @%p3 fma.rn.f32 %f124, %f2, %f1, %f124;
+    setp.eq.u32 %p3, %r8, 61;
+    @%p3 fma.rn.f32 %f125, %f2, %f1, %f125;
+    setp.eq.u32 %p3, %r8, 62;
+    @%p3 fma.rn.f32 %f126, %f2, %f1, %f126;
+    setp.eq.u32 %p3, %r8, 63;
+    @%p3 fma.rn.f32 %f127, %f2, %f1, %f127;
+    add.u32 %r12, %r12, 1;                // k_iter++
+    setp.lt.u32 %p0, %r12, %r13;
+    @%p0 bra LOOP_PV;
+    add.u32 %r8, %r8, 1;                  // oacc_iter++
+    setp.lt.u32 %p0, %r8, %r9;
+    @%p0 bra LOOP_PV_OUTER;
+    // Increment k_start, check loop bound
+    add.u64 %k_start, %k_start, 64;       // k_start += block_kv
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra LOOP_KV_START;
+LOOP_KV_END:
+    // Finalize: O = O_acc / row_sum
+    rcp.approx.f32 %f0, %row_sum;          // 1.0 / row_sum
+    mul.f32 %f64, %f64, %f0;
+    mul.f32 %f65, %f65, %f0;
+    mul.f32 %f66, %f66, %f0;
+    mul.f32 %f67, %f67, %f0;
+    mul.f32 %f68, %f68, %f0;
+    mul.f32 %f69, %f69, %f0;
+    mul.f32 %f70, %f70, %f0;
+    mul.f32 %f71, %f71, %f0;
+    mul.f32 %f72, %f72, %f0;
+    mul.f32 %f73, %f73, %f0;
+    mul.f32 %f74, %f74, %f0;
+    mul.f32 %f75, %f75, %f0;
+    mul.f32 %f76, %f76, %f0;
+    mul.f32 %f77, %f77, %f0;
+    mul.f32 %f78, %f78, %f0;
+    mul.f32 %f79, %f79, %f0;
+    mul.f32 %f80, %f80, %f0;
+    mul.f32 %f81, %f81, %f0;
+    mul.f32 %f82, %f82, %f0;
+    mul.f32 %f83, %f83, %f0;
+    mul.f32 %f84, %f84, %f0;
+    mul.f32 %f85, %f85, %f0;
+    mul.f32 %f86, %f86, %f0;
+    mul.f32 %f87, %f87, %f0;
+    mul.f32 %f88, %f88, %f0;
+    mul.f32 %f89, %f89, %f0;
+    mul.f32 %f90, %f90, %f0;
+    mul.f32 %f91, %f91, %f0;
+    mul.f32 %f92, %f92, %f0;
+    mul.f32 %f93, %f93, %f0;
+    mul.f32 %f94, %f94, %f0;
+    mul.f32 %f95, %f95, %f0;
+    mul.f32 %f96, %f96, %f0;
+    mul.f32 %f97, %f97, %f0;
+    mul.f32 %f98, %f98, %f0;
+    mul.f32 %f99, %f99, %f0;
+    mul.f32 %f100, %f100, %f0;
+    mul.f32 %f101, %f101, %f0;
+    mul.f32 %f102, %f102, %f0;
+    mul.f32 %f103, %f103, %f0;
+    mul.f32 %f104, %f104, %f0;
+    mul.f32 %f105, %f105, %f0;
+    mul.f32 %f106, %f106, %f0;
+    mul.f32 %f107, %f107, %f0;
+    mul.f32 %f108, %f108, %f0;
+    mul.f32 %f109, %f109, %f0;
+    mul.f32 %f110, %f110, %f0;
+    mul.f32 %f111, %f111, %f0;
+    mul.f32 %f112, %f112, %f0;
+    mul.f32 %f113, %f113, %f0;
+    mul.f32 %f114, %f114, %f0;
+    mul.f32 %f115, %f115, %f0;
+    mul.f32 %f116, %f116, %f0;
+    mul.f32 %f117, %f117, %f0;
+    mul.f32 %f118, %f118, %f0;
+    mul.f32 %f119, %f119, %f0;
+    mul.f32 %f120, %f120, %f0;
+    mul.f32 %f121, %f121, %f0;
+    mul.f32 %f122, %f122, %f0;
+    mul.f32 %f123, %f123, %f0;
+    mul.f32 %f124, %f124, %f0;
+    mul.f32 %f125, %f125, %f0;
+    mul.f32 %f126, %f126, %f0;
+    mul.f32 %f127, %f127, %f0;
+    // Store output tile to global memory
+    // Compute output base address
+    mul.lo.u64 %rd51, %rd19, %rd5;         // batch_idx * heads
+    add.u64 %rd51, %rd51, %rd18;           // + head_idx
+    mul.lo.u64 %rd51, %rd51, %rd6;         // * seq_len
+    add.u64 %rd51, %rd51, %rd16;           // + q_start
+    mul.lo.u64 %rd51, %rd51, %rd7;         // * head_dim
+    shl.b64 %rd51, %rd51, 1;               // * 2 (sizeof f16)
+    add.u64 %rd51, %rd3, %rd51;            // out_base = out_ptr + offset
+    // Convert 64 O_acc registers f32→f16, store to global
+    cvt.rn.f16.f32 %h0, %f64;              // f32 → f16
+    // elem 0 → global offset = (tid_x + 0) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 0;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h0;
+    cvt.rn.f16.f32 %h1, %f65;              // f32 → f16
+    // elem 1 → global offset = (tid_x + 128) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 128;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h1;
+    cvt.rn.f16.f32 %h2, %f66;              // f32 → f16
+    // elem 2 → global offset = (tid_x + 256) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 256;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h2;
+    cvt.rn.f16.f32 %h3, %f67;              // f32 → f16
+    // elem 3 → global offset = (tid_x + 384) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 384;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h3;
+    cvt.rn.f16.f32 %h4, %f68;              // f32 → f16
+    // elem 4 → global offset = (tid_x + 512) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 512;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h4;
+    cvt.rn.f16.f32 %h5, %f69;              // f32 → f16
+    // elem 5 → global offset = (tid_x + 640) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 640;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h5;
+    cvt.rn.f16.f32 %h6, %f70;              // f32 → f16
+    // elem 6 → global offset = (tid_x + 768) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 768;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h6;
+    cvt.rn.f16.f32 %h7, %f71;              // f32 → f16
+    // elem 7 → global offset = (tid_x + 896) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 896;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h7;
+    cvt.rn.f16.f32 %h8, %f72;              // f32 → f16
+    // elem 8 → global offset = (tid_x + 1024) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1024;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h8;
+    cvt.rn.f16.f32 %h9, %f73;              // f32 → f16
+    // elem 9 → global offset = (tid_x + 1152) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1152;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h9;
+    cvt.rn.f16.f32 %h10, %f74;              // f32 → f16
+    // elem 10 → global offset = (tid_x + 1280) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1280;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h10;
+    cvt.rn.f16.f32 %h11, %f75;              // f32 → f16
+    // elem 11 → global offset = (tid_x + 1408) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1408;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h11;
+    cvt.rn.f16.f32 %h12, %f76;              // f32 → f16
+    // elem 12 → global offset = (tid_x + 1536) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1536;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h12;
+    cvt.rn.f16.f32 %h13, %f77;              // f32 → f16
+    // elem 13 → global offset = (tid_x + 1664) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1664;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h13;
+    cvt.rn.f16.f32 %h14, %f78;              // f32 → f16
+    // elem 14 → global offset = (tid_x + 1792) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1792;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h14;
+    cvt.rn.f16.f32 %h15, %f79;              // f32 → f16
+    // elem 15 → global offset = (tid_x + 1920) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 1920;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h15;
+    cvt.rn.f16.f32 %h16, %f80;              // f32 → f16
+    // elem 16 → global offset = (tid_x + 2048) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2048;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h16;
+    cvt.rn.f16.f32 %h17, %f81;              // f32 → f16
+    // elem 17 → global offset = (tid_x + 2176) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2176;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h17;
+    cvt.rn.f16.f32 %h18, %f82;              // f32 → f16
+    // elem 18 → global offset = (tid_x + 2304) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2304;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h18;
+    cvt.rn.f16.f32 %h19, %f83;              // f32 → f16
+    // elem 19 → global offset = (tid_x + 2432) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2432;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h19;
+    cvt.rn.f16.f32 %h20, %f84;              // f32 → f16
+    // elem 20 → global offset = (tid_x + 2560) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2560;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h20;
+    cvt.rn.f16.f32 %h21, %f85;              // f32 → f16
+    // elem 21 → global offset = (tid_x + 2688) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2688;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h21;
+    cvt.rn.f16.f32 %h22, %f86;              // f32 → f16
+    // elem 22 → global offset = (tid_x + 2816) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2816;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h22;
+    cvt.rn.f16.f32 %h23, %f87;              // f32 → f16
+    // elem 23 → global offset = (tid_x + 2944) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 2944;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h23;
+    cvt.rn.f16.f32 %h24, %f88;              // f32 → f16
+    // elem 24 → global offset = (tid_x + 3072) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3072;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h24;
+    cvt.rn.f16.f32 %h25, %f89;              // f32 → f16
+    // elem 25 → global offset = (tid_x + 3200) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3200;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h25;
+    cvt.rn.f16.f32 %h26, %f90;              // f32 → f16
+    // elem 26 → global offset = (tid_x + 3328) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3328;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h26;
+    cvt.rn.f16.f32 %h27, %f91;              // f32 → f16
+    // elem 27 → global offset = (tid_x + 3456) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3456;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h27;
+    cvt.rn.f16.f32 %h28, %f92;              // f32 → f16
+    // elem 28 → global offset = (tid_x + 3584) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3584;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h28;
+    cvt.rn.f16.f32 %h29, %f93;              // f32 → f16
+    // elem 29 → global offset = (tid_x + 3712) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3712;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h29;
+    cvt.rn.f16.f32 %h30, %f94;              // f32 → f16
+    // elem 30 → global offset = (tid_x + 3840) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3840;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h30;
+    cvt.rn.f16.f32 %h31, %f95;              // f32 → f16
+    // elem 31 → global offset = (tid_x + 3968) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 3968;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h31;
+    cvt.rn.f16.f32 %h0, %f96;              // f32 → f16
+    // elem 32 → global offset = (tid_x + 4096) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4096;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h0;
+    cvt.rn.f16.f32 %h1, %f97;              // f32 → f16
+    // elem 33 → global offset = (tid_x + 4224) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4224;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h1;
+    cvt.rn.f16.f32 %h2, %f98;              // f32 → f16
+    // elem 34 → global offset = (tid_x + 4352) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4352;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h2;
+    cvt.rn.f16.f32 %h3, %f99;              // f32 → f16
+    // elem 35 → global offset = (tid_x + 4480) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4480;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h3;
+    cvt.rn.f16.f32 %h4, %f100;              // f32 → f16
+    // elem 36 → global offset = (tid_x + 4608) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4608;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h4;
+    cvt.rn.f16.f32 %h5, %f101;              // f32 → f16
+    // elem 37 → global offset = (tid_x + 4736) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4736;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h5;
+    cvt.rn.f16.f32 %h6, %f102;              // f32 → f16
+    // elem 38 → global offset = (tid_x + 4864) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4864;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h6;
+    cvt.rn.f16.f32 %h7, %f103;              // f32 → f16
+    // elem 39 → global offset = (tid_x + 4992) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 4992;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h7;
+    cvt.rn.f16.f32 %h8, %f104;              // f32 → f16
+    // elem 40 → global offset = (tid_x + 5120) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5120;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h8;
+    cvt.rn.f16.f32 %h9, %f105;              // f32 → f16
+    // elem 41 → global offset = (tid_x + 5248) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5248;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h9;
+    cvt.rn.f16.f32 %h10, %f106;              // f32 → f16
+    // elem 42 → global offset = (tid_x + 5376) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5376;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h10;
+    cvt.rn.f16.f32 %h11, %f107;              // f32 → f16
+    // elem 43 → global offset = (tid_x + 5504) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5504;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h11;
+    cvt.rn.f16.f32 %h12, %f108;              // f32 → f16
+    // elem 44 → global offset = (tid_x + 5632) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5632;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h12;
+    cvt.rn.f16.f32 %h13, %f109;              // f32 → f16
+    // elem 45 → global offset = (tid_x + 5760) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5760;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h13;
+    cvt.rn.f16.f32 %h14, %f110;              // f32 → f16
+    // elem 46 → global offset = (tid_x + 5888) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 5888;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h14;
+    cvt.rn.f16.f32 %h15, %f111;              // f32 → f16
+    // elem 47 → global offset = (tid_x + 6016) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6016;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h15;
+    cvt.rn.f16.f32 %h16, %f112;              // f32 → f16
+    // elem 48 → global offset = (tid_x + 6144) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6144;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h16;
+    cvt.rn.f16.f32 %h17, %f113;              // f32 → f16
+    // elem 49 → global offset = (tid_x + 6272) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6272;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h17;
+    cvt.rn.f16.f32 %h18, %f114;              // f32 → f16
+    // elem 50 → global offset = (tid_x + 6400) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6400;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h18;
+    cvt.rn.f16.f32 %h19, %f115;              // f32 → f16
+    // elem 51 → global offset = (tid_x + 6528) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6528;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h19;
+    cvt.rn.f16.f32 %h20, %f116;              // f32 → f16
+    // elem 52 → global offset = (tid_x + 6656) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6656;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h20;
+    cvt.rn.f16.f32 %h21, %f117;              // f32 → f16
+    // elem 53 → global offset = (tid_x + 6784) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6784;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h21;
+    cvt.rn.f16.f32 %h22, %f118;              // f32 → f16
+    // elem 54 → global offset = (tid_x + 6912) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 6912;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h22;
+    cvt.rn.f16.f32 %h23, %f119;              // f32 → f16
+    // elem 55 → global offset = (tid_x + 7040) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7040;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h23;
+    cvt.rn.f16.f32 %h24, %f120;              // f32 → f16
+    // elem 56 → global offset = (tid_x + 7168) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7168;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h24;
+    cvt.rn.f16.f32 %h25, %f121;              // f32 → f16
+    // elem 57 → global offset = (tid_x + 7296) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7296;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h25;
+    cvt.rn.f16.f32 %h26, %f122;              // f32 → f16
+    // elem 58 → global offset = (tid_x + 7424) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7424;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h26;
+    cvt.rn.f16.f32 %h27, %f123;              // f32 → f16
+    // elem 59 → global offset = (tid_x + 7552) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7552;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h27;
+    cvt.rn.f16.f32 %h28, %f124;              // f32 → f16
+    // elem 60 → global offset = (tid_x + 7680) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7680;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h28;
+    cvt.rn.f16.f32 %h29, %f125;              // f32 → f16
+    // elem 61 → global offset = (tid_x + 7808) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7808;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h29;
+    cvt.rn.f16.f32 %h30, %f126;              // f32 → f16
+    // elem 62 → global offset = (tid_x + 7936) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 7936;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h30;
+    cvt.rn.f16.f32 %h31, %f127;              // f32 → f16
+    // elem 63 → global offset = (tid_x + 8064) * 2
+    cvt.u64.u32 %rd52, %tid_x;
+    add.u64 %rd52, %rd52, 8064;              // + i * 128
+    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
+    add.u64 %rd52, %rd51, %rd52;          // out_base + offset
+    st.global.b16 [%rd52], %h31;
+    ret;
+}

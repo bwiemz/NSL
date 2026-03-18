@@ -1,0 +1,9 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: desc
+---
+input: op=Input, inputs=[], consumers=[matmul], output=false
+matmul: op=Matmul, inputs=[input], consumers=[bias_add], output=false
+bias_add: op=Elementwise("add"), inputs=[matmul], consumers=[gelu], output=false
+gelu: op=Elementwise("gelu"), inputs=[bias_add], consumers=[layernorm], output=false
+layernorm: op=Reduction("layernorm"), inputs=[gelu], consumers=[], output=true

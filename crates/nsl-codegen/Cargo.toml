@@ -24,3 +24,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 string-interner.workspace = true
+insta = { version = "1.40", features = ["yaml"] }

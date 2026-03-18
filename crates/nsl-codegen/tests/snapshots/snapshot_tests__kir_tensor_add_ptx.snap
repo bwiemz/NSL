@@ -1,0 +1,46 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry nsl_tensor_add(.param .u64 param_a, .param .u64 param_b, .param .u64 param_out, .param .u32 param_len) {
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .pred %p<16>;
+
+    ld.param.u64 %rd0, [param_a];
+    ld.param.u64 %rd1, [param_b];
+    ld.param.u64 %rd2, [param_out];
+    ld.param.u32 %r3, [param_len];
+
+BB0:
+    mov.u32 %r1004, %ctaid.x;
+    mov.u32 %r1005, %ntid.x;
+    mul.lo.u32 %r1004, %r1004, %r1005;
+    mov.u32 %r4, %tid.x;
+    add.u32 %r4, %r1004, %r4;
+    setp.lt.u32 %p5, %r4, %r3;
+    @%p5 bra BB1;
+    bra BB2;
+BB1:
+    cvt.u64.u32 %rd6, %r4;
+    mul.lo.u64 %rd6, %rd6, 4;
+    add.u64 %rd6, %rd0, %rd6;
+    ld.global.f32 %f7, [%rd6];
+    cvt.u64.u32 %rd8, %r4;
+    mul.lo.u64 %rd8, %rd8, 4;
+    add.u64 %rd8, %rd1, %rd8;
+    ld.global.f32 %f9, [%rd8];
+    add.f32 %f10, %f7, %f9;
+    cvt.u64.u32 %rd11, %r4;
+    mul.lo.u64 %rd11, %rd11, 4;
+    add.u64 %rd11, %rd2, %rd11;
+    st.global.f32 [%rd11], %f10;
+    bra BB2;
+BB2:
+    ret;
+}

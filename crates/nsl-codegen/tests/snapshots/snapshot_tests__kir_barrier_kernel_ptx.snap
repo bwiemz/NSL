@@ -1,0 +1,22 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.shared .align 4 .b8 shared_mem[1024];
+
+.visible .entry barrier_kernel(.param .u64 param_data) {
+    .reg .u32 %r<2>;
+    .reg .u64 %rd<2>;
+    .reg .f32 %f<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd0, [param_data];
+
+BB0:
+    bar.sync 0;
+    ret;
+}
