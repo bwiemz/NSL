@@ -415,6 +415,17 @@ impl Compiler<'_> {
             let rt_name = format!("nsl_tensor_{func_name}");
             return self.compile_traced_call(builder, &rt_name, &[val]);
         }
+        // Tensor trig: tensor_sin, tensor_cos (RoPE support)
+        if matches!(func_name.as_str(), "tensor_sin" | "tensor_cos")
+            && !self.functions.contains_key(&func_name)
+        {
+            if args.len() != 1 {
+                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+            }
+            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let rt_name = format!("nsl_{func_name}");
+            return self.compile_traced_call(builder, &rt_name, &[val]);
+        }
         // tanh activation: maps NSL name "tanh" to runtime "nsl_tensor_tanh_act"
         if func_name == "tanh" && !self.functions.contains_key(&func_name) {
             if args.len() != 1 {

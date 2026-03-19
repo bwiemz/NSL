@@ -1,0 +1,16 @@
+let x = zeros([4])
+let s = tensor_sin(x)
+print(s)
+
+let c = tensor_cos(x)
+print(c)
+
+let pi = full([2], 3.14159265)
+let s2 = tensor_sin(pi)
+print(s2)
+
+let half_pi = full([2], 1.57079632)
+let c2 = tensor_cos(half_pi)
+print(c2)
+
+print("tensor_trig: PASS")

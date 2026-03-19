@@ -100,8 +100,8 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
-    // Activation functions (take tensor, return tensor)
-    for name in &["relu", "gelu", "silu", "sigmoid", "tanh"] {
+    // Activation functions and tensor trig (take tensor, return tensor)
+    for name in &["relu", "gelu", "silu", "sigmoid", "tanh", "tensor_sin", "tensor_cos"] {
         def(
             name,
             Type::Function {

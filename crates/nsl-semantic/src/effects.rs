@@ -97,7 +97,7 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
 
         // Known pure operations (tensor math, reductions, activations, creation)
         "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "softmax" | "log_softmax"
-        | "exp" | "log" | "sqrt" | "abs" | "sign" | "clamp"
+        | "exp" | "log" | "sqrt" | "abs" | "sign" | "clamp" | "tensor_sin" | "tensor_cos"
         | "matmul" | "nsl_tensor_matmul" | "nsl_tensor_add" | "nsl_tensor_sub"
         | "nsl_tensor_mul" | "nsl_tensor_div" | "nsl_tensor_neg"
         | "sum" | "mean" | "max" | "min" | "argmax"

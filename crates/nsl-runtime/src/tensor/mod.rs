@@ -5,6 +5,7 @@ pub mod arithmetic;
 pub mod reduction;
 pub mod shape_ops;
 pub mod activation;
+pub mod trig;
 
 // Re-export everything from sub-modules so the public API is unchanged.
 pub use creation::*;
@@ -12,6 +13,7 @@ pub use arithmetic::*;
 pub use reduction::*;
 pub use shape_ops::*;
 pub use activation::*;
+pub use trig::*;
 
 use std::cell::Cell;
 use std::collections::HashMap;
