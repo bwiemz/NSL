@@ -162,6 +162,12 @@ pub struct Compiler<'a> {
     pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
     /// M43: ZeRO optimizer sharding stage.
     pub zero_stage: Option<u8>,
+    /// M52: Loaded weight map (populated when --weights is passed)
+    pub weight_map: Option<crate::weight_aware::WeightMap>,
+    /// M52: Sparsity hints per matmul operation (AST NodeId -> SparsityHint)
+    pub sparsity_hints: HashMap<NodeId, crate::weight_aware::SparsityHint>,
+    /// M52: Weight integrity hash for embedding in .rodata
+    pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
     func_index: u32,
 }
 
@@ -275,6 +281,9 @@ impl<'a> Compiler<'a> {
             pipeline_config: None,
             parallelism_config: None,
             zero_stage: None,
+            weight_map: None,
+            sparsity_hints: HashMap::new(),
+            weight_integrity: None,
             func_index: 0,
         })
     }
@@ -420,6 +429,22 @@ impl<'a> Compiler<'a> {
 
         self.string_pool.insert(s.to_string(), data_id);
         Ok(data_id)
+    }
+
+    /// M52: Embed the weight file SHA-256 hash as a .rodata symbol.
+    /// The symbol `__nsl_weight_hash` contains 32 bytes of the SHA-256 hash.
+    pub fn embed_weight_hash(&mut self) -> Result<(), CodegenError> {
+        if let Some(ref integrity) = self.weight_integrity {
+            let data_id = self.module
+                .declare_data("__nsl_weight_hash", cranelift_module::Linkage::Export, false, false)
+                .map_err(|e| CodegenError::new(format!("failed to declare weight hash data: {e}")))?;
+
+            let mut desc = DataDescription::new();
+            desc.define(integrity.compile_hash.to_vec().into_boxed_slice());
+            self.module.define_data(data_id, &desc)
+                .map_err(|e| CodegenError::new(format!("failed to define weight hash data: {e}")))?;
+        }
+        Ok(())
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {

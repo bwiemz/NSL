@@ -44,6 +44,7 @@ pub mod stmt;
 pub mod types;
 pub mod multimodal;
 pub mod vmap;
+pub mod weight_aware;
 pub mod wengert;
 pub mod ad_rules;
 
@@ -74,6 +75,12 @@ pub struct CompileOptions {
     pub nan_analysis: bool,
     /// M46: Enable deterministic mode.
     pub deterministic: bool,
+    /// M52: Path to safetensors weight file for weight-aware compilation
+    pub weight_file: Option<std::path::PathBuf>,
+    /// M52: Weight-aware compilation configuration
+    pub weight_config: weight_aware::WeightAwareConfig,
+    /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
+    pub weight_analysis: bool,
 }
 
 impl Default for CompileOptions {
@@ -91,6 +98,9 @@ impl Default for CompileOptions {
             trace_ops: false,
             nan_analysis: false,
             deterministic: false,
+            weight_file: None,
+            weight_config: weight_aware::WeightAwareConfig::default(),
+            weight_analysis: false,
         }
     }
 }

@@ -18,6 +18,58 @@ pub fn compile(
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
+
+    // M52: Load weights if --weights was provided
+    if let Some(ref weight_path) = options.weight_file {
+        match crate::weight_aware::WeightMap::load(weight_path) {
+            Ok(mut wmap) => {
+                let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
+
+                // Run sparsity analysis on all weight entries
+                if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
+                    let config = &options.weight_config;
+                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                    for name in &names {
+                        if let Some(entry) = wmap.get_mut(name) {
+                            entry.analyze_sparsity(config);
+                        }
+                    }
+                }
+
+                // Run dead weight elimination
+                if options.weight_config.dead_weight_elim {
+                    let eliminator = crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                    for name in &names {
+                        if let Some(entry) = wmap.get_mut(name) {
+                            eliminator.eliminate(entry);
+                        }
+                    }
+                }
+
+                // Weight analysis report (when --weight-analysis is set)
+                if options.weight_analysis {
+                    crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+                }
+
+                eprintln!(
+                    "[nsl] loaded {} weights from {} (SHA-256: {})",
+                    wmap.len(),
+                    wmap.source_path(),
+                    integrity.hash_hex
+                );
+
+                compiler.weight_integrity = Some(integrity);
+                compiler.weight_map = Some(wmap);
+            }
+            Err(e) => {
+                return Err(crate::error::CodegenError::new(
+                    format!("failed to load weights: {}", e)
+                ));
+            }
+        }
+    }
+
     compiler.dump_ir = dump_ir;
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -35,6 +87,8 @@ pub fn compile(
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
+    // M52: Embed weight hash if weights were loaded
+    compiler.embed_weight_hash()?;
     compiler.finalize()
 }
 

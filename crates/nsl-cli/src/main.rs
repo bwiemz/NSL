@@ -57,6 +57,22 @@ enum Cli {
         /// M46: Enable deterministic mode (compile-time non-determinism detection)
         #[arg(long)]
         deterministic: bool,
+
+        /// M52: Run weight analysis report
+        #[arg(long)]
+        weight_analysis: bool,
+
+        /// M52: Path to safetensors weight file for weight analysis
+        #[arg(long)]
+        weights: Option<PathBuf>,
+
+        /// M52: Dead weight threshold for analysis (default: 1e-6)
+        #[arg(long, default_value_t = 1e-6)]
+        dead_weight_threshold: f64,
+
+        /// M52: Sparsity threshold for analysis (default: 0.5)
+        #[arg(long, default_value_t = 0.5)]
+        sparse_threshold: f64,
     },
 
     /// Compile and execute an NSL program
@@ -205,6 +221,26 @@ enum Cli {
         /// M46: Enable deterministic mode (compile-time non-determinism detection)
         #[arg(long)]
         deterministic: bool,
+
+        /// M52: Dead weight threshold (default: 1e-6). Weights with |value| < threshold are zeroed.
+        #[arg(long, default_value_t = 1e-6)]
+        dead_weight_threshold: f64,
+
+        /// M52: Sparsity threshold (default: 0.5). Matrices with near-zero fraction >= threshold get sparse annotation.
+        #[arg(long, default_value_t = 0.5)]
+        sparse_threshold: f64,
+
+        /// M52: Disable constant folding of weight expressions
+        #[arg(long)]
+        no_constant_fold: bool,
+
+        /// M52: Disable dead weight elimination
+        #[arg(long)]
+        no_dead_weight: bool,
+
+        /// M52: Disable sparsity-aware codegen annotations
+        #[arg(long)]
+        no_sparse_codegen: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -280,6 +316,10 @@ fn main() {
             linear_types: _linear_types,
             nan_analysis,
             deterministic: _deterministic,
+            weight_analysis,
+            weights,
+            dead_weight_threshold,
+            sparse_threshold,
         } => {
             run_check(&file, dump_tokens, dump_ast, dump_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
@@ -300,6 +340,29 @@ fn main() {
                     "note: --nan-analysis pass enabled \
                      (pattern detection requires typed AST walker — in progress)"
                 );
+            }
+
+            // M52: Weight analysis report
+            if weight_analysis {
+                if let Some(ref weights_path) = weights {
+                    let config = nsl_codegen::weight_aware::WeightAwareConfig {
+                        dead_weight_threshold,
+                        sparse_threshold,
+                        ..Default::default()
+                    };
+                    match nsl_codegen::weight_aware::WeightMap::load(weights_path.as_path()) {
+                        Ok(wmap) => {
+                            nsl_codegen::weight_aware::print_weight_analysis_report(&wmap, &config);
+                        }
+                        Err(e) => {
+                            eprintln!("error: failed to load weights: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("error: --weight-analysis requires --weights <path>");
+                    process::exit(1);
+                }
             }
         }
         Cli::Build {
@@ -324,6 +387,11 @@ fn main() {
             distribute: _distribute,
             zero_stage: _zero_stage,
             deterministic: _deterministic,
+            dead_weight_threshold,
+            sparse_threshold,
+            no_constant_fold,
+            no_dead_weight,
+            no_sparse_codegen,
         } => {
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -350,6 +418,17 @@ fn main() {
                 trace_ops: false,
                 nan_analysis: false,
                 deterministic: _deterministic,
+                // M52: When --standalone, weights are handled by standalone pipeline;
+                // otherwise pass through for weight-aware compilation
+                weight_file: if standalone { None } else { weights.clone() },
+                weight_config: nsl_codegen::weight_aware::WeightAwareConfig {
+                    dead_weight_threshold,
+                    sparse_threshold,
+                    constant_fold: !no_constant_fold,
+                    dead_weight_elim: !no_dead_weight,
+                    sparse_codegen: !no_sparse_codegen,
+                },
+                weight_analysis: false,
             };
 
             if standalone {
@@ -412,6 +491,9 @@ fn main() {
                 trace_ops,
                 nan_analysis: false,
                 deterministic,
+                weight_file: None,
+                weight_config: Default::default(),
+                weight_analysis: false,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
