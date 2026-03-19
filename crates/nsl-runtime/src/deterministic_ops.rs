@@ -23,38 +23,67 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
 }
 
 /// Deterministic scatter_add — sort indices then sequential accumulate.
-/// NOT YET IMPLEMENTED: panics with a clear message instead of silently
-/// returning null (which would cause downstream crashes).
+///
+/// CPU implementation: clone input, build sorted (index, value) pairs,
+/// accumulate in sorted order (deterministic regardless of thread scheduling).
+/// GPU sort-based PTX kernel deferred to M46c.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_scatter_add_deterministic(
-    _input: i64,
-    _indices: i64,
-    _src: i64,
+    input: i64,
+    indices: i64,
+    src: i64,
 ) -> i64 {
-    eprintln!(
-        "FATAL: nsl_tensor_scatter_add_deterministic is not yet implemented.\n\
-         The --deterministic flag redirects scatter_add to this function, but the\n\
-         sort-based deterministic kernel is not available until M46b.\n\
-         Workaround: remove --deterministic or avoid scatter_add operations."
-    );
-    std::process::abort();
+    if input == 0 || indices == 0 || src == 0 {
+        return 0;
+    }
+
+    // Clone input tensor as output base
+    let output = crate::tensor::nsl_tensor_clone(input);
+    if output == 0 { return 0; }
+
+    let idx_tensor = unsafe { &*(indices as *const crate::tensor::NslTensor) };
+    let src_tensor = unsafe { &*(src as *const crate::tensor::NslTensor) };
+    let out_tensor = unsafe { &mut *(output as *mut crate::tensor::NslTensor) };
+
+    let n = idx_tensor.len as usize;
+    if n == 0 { return output; }
+
+    // Build sorted (index, value) pairs for deterministic ordering
+    let mut pairs: Vec<(i64, f64)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let idx = unsafe { *(idx_tensor.data as *const f64).add(i) } as i64;
+        let val = unsafe { *(src_tensor.data as *const f64).add(i) };
+        pairs.push((idx, val));
+    }
+    // Sort by index — ensures deterministic accumulation order
+    pairs.sort_by_key(|&(idx, _)| idx);
+
+    // Sequential accumulate in sorted order
+    let out_data = out_tensor.data as *mut f64;
+    for (idx, val) in &pairs {
+        if *idx >= 0 && (*idx as usize) < out_tensor.len as usize {
+            unsafe { *out_data.add(*idx as usize) += val; }
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // NOTE: reduce_sum/mean deterministic variants delegate to nsl_tensor_sum_dim/mean_dim
-    // which require valid tensor pointers. Cannot test with null (0) without crashing.
-    // scatter_add_deterministic now aborts — cannot test without process isolation.
-    // All three variants are integration-tested via E2E tests with real tensors.
-
     #[test]
     fn deterministic_variants_are_exported() {
-        // Just verify the symbols exist and are linkable
         let sum_fn: extern "C" fn(i64, i64, i64) -> i64 = nsl_tensor_reduce_sum_deterministic;
         let mean_fn: extern "C" fn(i64, i64, i64) -> i64 = nsl_tensor_reduce_mean_deterministic;
         assert!(!std::ptr::addr_of!(sum_fn).is_null());
         assert!(!std::ptr::addr_of!(mean_fn).is_null());
+    }
+
+    #[test]
+    fn scatter_add_null_returns_zero() {
+        // Null inputs return 0 (no crash)
+        assert_eq!(nsl_tensor_scatter_add_deterministic(0, 0, 0), 0);
     }
 }
