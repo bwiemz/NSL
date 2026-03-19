@@ -73,6 +73,22 @@ enum Cli {
         /// M52: Sparsity threshold for analysis (default: 0.5)
         #[arg(long, default_value_t = 0.5)]
         sparse_threshold: f64,
+
+        /// M53: Enable WCET analysis for @real_time functions
+        #[arg(long)]
+        wcet: bool,
+
+        /// M53: Write WCET certificate JSON to file
+        #[arg(long)]
+        wcet_cert: Option<PathBuf>,
+
+        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// M53: Write DO-178C compliance report to file
+        #[arg(long)]
+        do178c_report: Option<PathBuf>,
     },
 
     /// Compile and execute an NSL program
@@ -257,6 +273,22 @@ enum Cli {
         /// M54: Unikernel total memory (e.g., "16G", "512M"). 0 or omitted = auto-detect at boot.
         #[arg(long)]
         memory: Option<String>,
+
+        /// M53: Enable WCET analysis for @real_time functions
+        #[arg(long)]
+        wcet: bool,
+
+        /// M53: Write WCET certificate JSON to file
+        #[arg(long)]
+        wcet_cert: Option<PathBuf>,
+
+        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// M53: Write DO-178C compliance report to file
+        #[arg(long)]
+        do178c_report: Option<PathBuf>,
     },
 
     /// Run @test functions in an NSL file
@@ -336,6 +368,10 @@ fn main() {
             weights,
             dead_weight_threshold,
             sparse_threshold,
+            wcet: _wcet,
+            wcet_cert: _wcet_cert,
+            cpu: _cpu,
+            do178c_report: _do178c_report,
         } => {
             run_check(&file, dump_tokens, dump_ast, dump_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
@@ -412,6 +448,10 @@ fn main() {
             unikernel,
             listen,
             memory,
+            wcet,
+            wcet_cert,
+            cpu,
+            do178c_report,
         } => {
             if shared_lib {
                 eprintln!("[nsl] --shared-lib: flag recognized (M62a stub).");
@@ -486,6 +526,12 @@ fn main() {
                 },
                 weight_analysis: false,
                 unikernel_config,
+                wcet_enabled: wcet,
+                wcet_gpu: None, // reuse --gpu from Check variant; Build uses target for backend
+                wcet_cpu: cpu,
+                wcet_report_path: wcet_cert,
+                wcet_safety_margin: 1.05,
+                do178c_report,
             };
 
             if standalone {
@@ -552,6 +598,12 @@ fn main() {
                 weight_config: Default::default(),
                 weight_analysis: false,
                 unikernel_config: None,
+                wcet_enabled: false,
+                wcet_gpu: None,
+                wcet_cpu: None,
+                wcet_report_path: None,
+                wcet_safety_margin: 1.05,
+                do178c_report: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

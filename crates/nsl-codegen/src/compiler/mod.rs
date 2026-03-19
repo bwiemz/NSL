@@ -168,6 +168,12 @@ pub struct Compiler<'a> {
     pub sparsity_hints: HashMap<NodeId, crate::weight_aware::SparsityHint>,
     /// M52: Weight integrity hash for embedding in .rodata
     pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
+    /// M53: Functions decorated with @real_time — name -> constraint
+    pub real_time_fns: HashMap<String, crate::wcet::RealTimeConstraint>,
+    /// M53: Functions decorated with @wcet_budget — name -> constraint
+    pub wcet_budget_fns: HashMap<String, crate::wcet::WcetBudgetConstraint>,
+    /// M53: Collected WCET analysis results for @real_time functions
+    pub wcet_results: Vec<crate::wcet::FunctionWcet>,
     func_index: u32,
 }
 
@@ -284,6 +290,9 @@ impl<'a> Compiler<'a> {
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,
+            real_time_fns: HashMap::new(),
+            wcet_budget_fns: HashMap::new(),
+            wcet_results: Vec::new(),
             func_index: 0,
         })
     }

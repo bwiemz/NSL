@@ -45,6 +45,7 @@ pub mod stmt;
 pub mod types;
 pub mod multimodal;
 pub mod vmap;
+pub mod wcet;
 pub mod weight_aware;
 pub mod wengert;
 pub mod ad_rules;
@@ -84,6 +85,18 @@ pub struct CompileOptions {
     pub weight_analysis: bool,
     /// M54: Unikernel build configuration (None = normal build)
     pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
+    /// M53: Enable WCET analysis for @real_time functions
+    pub wcet_enabled: bool,
+    /// M53: GPU target name for WCET analysis (e.g., "Orin", "H100")
+    pub wcet_gpu: Option<String>,
+    /// M53: CPU target name for WCET analysis (e.g., "cortex-a78")
+    pub wcet_cpu: Option<String>,
+    /// M53: Path to write WCET certificate JSON
+    pub wcet_report_path: Option<std::path::PathBuf>,
+    /// M53: Safety margin multiplier for WCET (default: 1.05 = 5%)
+    pub wcet_safety_margin: f64,
+    /// M53: Path to write DO-178C compliance report
+    pub do178c_report: Option<std::path::PathBuf>,
 }
 
 impl Default for CompileOptions {
@@ -105,6 +118,12 @@ impl Default for CompileOptions {
             weight_config: weight_aware::WeightAwareConfig::default(),
             weight_analysis: false,
             unikernel_config: None,
+            wcet_enabled: false,
+            wcet_gpu: None,
+            wcet_cpu: None,
+            wcet_report_path: None,
+            wcet_safety_margin: 1.05,
+            do178c_report: None,
         }
     }
 }

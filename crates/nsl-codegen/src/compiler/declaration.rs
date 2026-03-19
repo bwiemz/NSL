@@ -67,6 +67,13 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // M53: Extract @real_time and @wcet_budget constraints
+                if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                    self.real_time_fns.insert(raw_name.clone(), rt);
+                }
+                if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                    self.wcet_budget_fns.insert(raw_name.clone(), wb);
+                }
             }
         }
 

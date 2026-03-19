@@ -1135,6 +1135,7 @@ dependencies = [
  "nsl-runtime",
  "nsl-semantic",
  "safetensors",
+ "serde",
  "serde_json",
  "sha2",
  "string-interner",
