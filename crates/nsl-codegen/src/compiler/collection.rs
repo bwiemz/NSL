@@ -380,6 +380,45 @@ impl Compiler<'_> {
                                 let model_name = self.resolve_sym(md.name).to_string();
                                 self.paged_kv_configs.insert(model_name, (num_blocks, block_size, num_heads, head_dim, num_layers));
                             }
+                            // M43b: @pipeline decorator extraction
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "pipeline" {
+                                let mut stages = 4usize; // default
+                                let mut schedule_type = crate::pipeline::ScheduleType::OneF1B;
+                                let mut checkpoint_stages = true;
+                                if let Some(ref args) = deco.args {
+                                    for arg in args {
+                                        if let Some(ref name_sym) = arg.name {
+                                            let key = self.resolve_sym(*name_sym).to_string();
+                                            match key.as_str() {
+                                                "stages" => {
+                                                    if let nsl_ast::expr::ExprKind::IntLiteral(v) = &arg.value.kind {
+                                                        stages = *v as usize;
+                                                    }
+                                                }
+                                                "schedule" => {
+                                                    if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                                        schedule_type = match s.as_str() {
+                                                            "gpipe" => crate::pipeline::ScheduleType::GPipe,
+                                                            _ => crate::pipeline::ScheduleType::OneF1B,
+                                                        };
+                                                    }
+                                                }
+                                                "checkpoint_stages" => {
+                                                    if let nsl_ast::expr::ExprKind::BoolLiteral(b) = &arg.value.kind {
+                                                        checkpoint_stages = *b;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                self.pipeline_config = Some(crate::pipeline::PipelineConfig {
+                                    num_stages: stages,
+                                    schedule_type,
+                                    checkpoint_stages,
+                                });
+                            }
                         }
                     }
                 }

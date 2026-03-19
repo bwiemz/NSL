@@ -1205,6 +1205,11 @@ impl Compiler<'_> {
         state: &mut FuncState,
         train: &nsl_ast::block::TrainBlock,
     ) -> Result<(), CodegenError> {
+        // M43b: Pipeline parallel detection
+        if self.pipeline_config.is_some() {
+            return self.compile_train_block_pipelined(builder, state, train);
+        }
+
         // ── 1. Extract config from train(...) args ──────────────────────
         let mut model_sym: Option<nsl_ast::Symbol> = None;
         let mut epochs: i64 = 1;
@@ -1815,6 +1820,61 @@ impl Compiler<'_> {
         for &buf in &state_buf_2 {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
         }
+
+        Ok(())
+    }
+
+    /// M43b: Emit pipeline-parallel training loop.
+    ///
+    /// When a model carries `@pipeline(stages=N)`, the train block emits:
+    ///   1. `nsl_pipeline_init(num_stages, schedule_type, num_micro_batches)`
+    ///   2. The step body (forward + loss + backward) — the runtime's
+    ///      pipeline schedule orchestrates which micro-batch each stage
+    ///      processes at each clock tick.
+    ///   3. `nsl_pipeline_barrier()` — synchronize all stages after the
+    ///      schedule completes.
+    ///   4. `nsl_pipeline_destroy()` — tear down pipeline state.
+    ///
+    /// Model partitioning (which layers run on which stage) is deferred to
+    /// M43c; the initial implementation emits the full model on every stage.
+    fn compile_train_block_pipelined(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        train: &nsl_ast::block::TrainBlock,
+    ) -> Result<(), CodegenError> {
+        let config = self.pipeline_config.clone().unwrap();
+        let num_stages = config.num_stages;
+
+        // Emit: nsl_pipeline_init(num_stages, schedule_type, num_micro_batches)
+        let v_stages = builder.ins().iconst(cl_types::I64, num_stages as i64);
+        let v_schedule = builder.ins().iconst(
+            cl_types::I64,
+            match config.schedule_type {
+                crate::pipeline::ScheduleType::OneF1B => 0i64,
+                crate::pipeline::ScheduleType::GPipe => 1i64,
+            },
+        );
+        let v_micro = builder.ins().iconst(cl_types::I64, 8); // default micro-batches
+        self.compile_call_by_name(builder, "nsl_pipeline_init", &[v_stages, v_schedule, v_micro])?;
+
+        // Compile the step body (model forward + loss + backward).
+        // The pipeline schedule orchestration happens at the runtime level
+        // via the FFI calls; codegen emits the per-step work that each
+        // stage executes.
+        for section in &train.sections {
+            if let TrainSection::Step { body, .. } = section {
+                for stmt in &body.stmts {
+                    self.compile_stmt(builder, state, stmt)?;
+                }
+            }
+        }
+
+        // Emit: nsl_pipeline_barrier() — synchronize all stages
+        self.compile_call_by_name(builder, "nsl_pipeline_barrier", &[])?;
+
+        // Emit: nsl_pipeline_destroy()
+        self.compile_call_by_name(builder, "nsl_pipeline_destroy", &[])?;
 
         Ok(())
     }
