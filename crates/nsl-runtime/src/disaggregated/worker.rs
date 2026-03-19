@@ -16,8 +16,8 @@ static WORKER_CTX: Mutex<Option<WorkerContext>> = Mutex::new(None);
 
 struct WorkerContext {
     role: WorkerRole,
-    _rank: i32,
-    _model_ptr: i64,  // opaque model handle from codegen
+    rank: i32,
+    model_ptr: i64,  // opaque model handle from codegen
 }
 
 // ---------------------------------------------------------------------------
@@ -48,8 +48,8 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
     }
     *guard = Some(WorkerContext {
         role: worker_role,
-        _rank: rank as i32,
-        _model_ptr: model_ptr,
+        rank: rank as i32,
+        model_ptr,
     });
     0
 }
@@ -83,11 +83,30 @@ pub extern "C" fn nsl_disagg_prefill_loop(_config_ptr: i64) -> i64 {
         }
     }
 
-    // In a full implementation, this would:
-    // 1. Loop waiting for messages from the router (via shared memory or pipe)
-    // 2. For each StartPrefill: allocate KV blocks, run forward, serialize KV,
-    //    transfer to decode worker, notify router
-    // Currently a stub that returns immediately for testing.
+    // M41b: Read worker state for loop
+    let (_rank, _model_ptr) = {
+        let guard = match WORKER_CTX.lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        let ctx = guard.as_ref().unwrap();
+        (ctx.rank, ctx.model_ptr)
+    };
+
+    // M41b: Prefill worker processing loop structure.
+    // Each iteration would:
+    // 1. Receive StartPrefill message from router (via shared memory)
+    // 2. Allocate KV-cache pages from local BlockAllocator
+    // 3. Run model forward pass on prompt tokens (using model_ptr)
+    // 4. Serialize KV-cache pages via nsl_kv_serialize()
+    // 5. Transfer KV to assigned decode worker via KvTransferBackend::send_kv()
+    // 6. Free local KV pages (decode worker has them now)
+    // 7. Send PrefillComplete to router
+    //
+    // Currently returns after init — the actual model forward requires
+    // the compiled model to be loaded and the message transport to be active.
+    // Full continuous loop in M41c when message-based dispatch is wired.
+
     0
 }
 
@@ -120,13 +139,29 @@ pub extern "C" fn nsl_disagg_decode_loop(_config_ptr: i64) -> i64 {
         }
     }
 
-    // In a full implementation, this would:
-    // 1. Check for KV transfers via try_recv_kv()
-    // 2. Admit new sequences into the BatchScheduler
-    // 3. Run batched decode step (reuse M29 scheduler.step())
-    // 4. Sample tokens, stream to router
-    // 5. Free KV pages on EOS
-    // Currently a stub that returns immediately for testing.
+    // M41b: Read worker state for loop
+    let (_rank, _model_ptr) = {
+        let guard = match WORKER_CTX.lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        let ctx = guard.as_ref().unwrap();
+        (ctx.rank, ctx.model_ptr)
+    };
+
+    // M41b: Decode worker processing loop structure.
+    // Each iteration would:
+    // 1. Check for incoming KV transfers via try_recv_kv() (non-blocking)
+    // 2. Deserialize received KV pages into local KV-cache
+    // 3. Admit new sequences into BatchScheduler
+    // 4. Run one batched decode step (scheduler.step() → model forward)
+    // 5. Sample tokens from logits (apply grammar mask if constrained)
+    // 6. Stream generated tokens to router via TokenGenerated message
+    // 7. On EOS/max_tokens: free KV pages, send DecodeComplete
+    //
+    // Reuses M29 BatchScheduler for decode-side batching.
+    // Currently returns after init — full continuous loop in M41c.
+
     0
 }
 
