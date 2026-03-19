@@ -647,6 +647,14 @@ impl Compiler<'_> {
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_stack", &[list_val, dim_val]);
         }
+        // contiguous(tensor) -> tensor — materialize non-contiguous views
+        if func_name == "contiguous" && !self.functions.contains_key(&func_name) {
+            if args.len() != 1 {
+                return Err(CodegenError::new("contiguous() takes exactly 1 argument (tensor)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[tensor_val]);
+        }
         // M18a: causal_mask(seq_len) -> tensor
         if func_name == "causal_mask" && !self.functions.contains_key(&func_name) {
             if args.len() != 1 {

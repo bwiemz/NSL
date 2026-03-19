@@ -340,6 +340,15 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // contiguous(tensor) -> tensor — materialize non-contiguous views
+    def(
+        "contiguous",
+        Type::Function {
+            params: vec![tensor_ret.clone()],
+            ret: Box::new(tensor_ret.clone()),
+        },
+    );
+
     // M18a shape manipulation free functions
     // unsqueeze(tensor, dim) -> tensor
     def(

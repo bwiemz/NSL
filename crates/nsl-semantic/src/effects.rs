@@ -102,7 +102,7 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
         | "nsl_tensor_mul" | "nsl_tensor_div" | "nsl_tensor_neg"
         | "sum" | "mean" | "max" | "min" | "argmax"
         | "nsl_tensor_sum" | "nsl_tensor_mean" | "nsl_tensor_reduce_max"
-        | "reshape" | "transpose" | "unsqueeze" | "squeeze" | "cat" | "stack" | "slice"
+        | "reshape" | "transpose" | "unsqueeze" | "squeeze" | "cat" | "stack" | "slice" | "contiguous"
         | "zeros" | "ones" | "full" | "arange"
         | "nsl_tensor_zeros" | "nsl_tensor_ones" | "nsl_tensor_full"
         | "nsl_tensor_reshape" | "nsl_tensor_transpose" | "nsl_tensor_clone"

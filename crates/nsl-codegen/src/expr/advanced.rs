@@ -453,6 +453,9 @@ impl Compiler<'_> {
                 let shape_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_expand", &[obj_val, shape_val])
             }
+            "contiguous" => {
+                self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[obj_val])
+            }
             "slice" => {
                 if args.len() != 3 {
                     return Err(CodegenError::new("slice() takes exactly 3 arguments (dim, start, end)"));

@@ -1059,3 +1059,100 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
     });
     Box::into_raw(result) as i64
 }
+
+/// Materialize a non-contiguous tensor (e.g. from `expand`) into a contiguous copy.
+///
+/// If the tensor is already contiguous (strides match row-major layout), the same
+/// pointer is returned with its refcount bumped (zero-copy fast path).
+/// Otherwise a new tensor is allocated with data copied element-by-element
+/// using multi-dimensional coordinate decomposition over the source strides.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let ndim = t.ndim as usize;
+
+    // Check if already contiguous: compare actual strides to expected row-major strides
+    let expected = NslTensor::compute_strides(t.shape, t.ndim);
+    let mut is_contiguous = true;
+    for i in 0..ndim {
+        if unsafe { *t.strides.add(i) != *expected.add(i) } {
+            is_contiguous = false;
+            break;
+        }
+    }
+    // Free the temp expected strides
+    unsafe { crate::memory::checked_free(expected as *mut u8, ndim * std::mem::size_of::<i64>()) };
+
+    if is_contiguous {
+        // Already contiguous -- bump refcount, return same pointer
+        t.refcount.fetch_add(1, Ordering::SeqCst);
+        return tensor_ptr;
+    }
+
+    // Materialize: walk through all elements using multi-dim coords and source strides
+    let len = t.len;
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let out_strides = NslTensor::compute_strides(shape, t.ndim);
+
+    // For each flat output index, compute the n-dim coordinates,
+    // then compute the source offset using source strides.
+    if t.dtype == 1 {
+        // f32
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for flat in 0..len as usize {
+            let mut remaining = flat;
+            let mut src_offset: usize = 0;
+            for d in 0..ndim {
+                let stride = unsafe { *out_strides.add(d) } as usize;
+                let coord = if stride > 0 { remaining / stride } else { 0 };
+                if stride > 0 {
+                    remaining %= stride;
+                }
+                let src_stride = unsafe { *t.strides.add(d) } as usize;
+                src_offset += coord * src_stride;
+            }
+            unsafe { *buf.add(flat) = *t.data_f32().add(src_offset) };
+        }
+        let result = Box::new(NslTensor {
+            data: buf as *mut c_void,
+            shape,
+            strides: out_strides,
+            ndim: t.ndim,
+            len,
+            refcount: AtomicI64::new(1),
+            device: t.device,
+            dtype: t.dtype,
+            owns_data: 1,
+        });
+        Box::into_raw(result) as i64
+    } else {
+        // f64
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for flat in 0..len as usize {
+            let mut remaining = flat;
+            let mut src_offset: usize = 0;
+            for d in 0..ndim {
+                let stride = unsafe { *out_strides.add(d) } as usize;
+                let coord = if stride > 0 { remaining / stride } else { 0 };
+                if stride > 0 {
+                    remaining %= stride;
+                }
+                let src_stride = unsafe { *t.strides.add(d) } as usize;
+                src_offset += coord * src_stride;
+            }
+            unsafe { *buf.add(flat) = *t.data_f64().add(src_offset) };
+        }
+        let result = Box::new(NslTensor {
+            data: buf as *mut c_void,
+            shape,
+            strides: out_strides,
+            ndim: t.ndim,
+            len,
+            refcount: AtomicI64::new(1),
+            device: t.device,
+            dtype: t.dtype,
+            owns_data: 1,
+        });
+        Box::into_raw(result) as i64
+    }
+}
