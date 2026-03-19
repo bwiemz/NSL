@@ -158,25 +158,30 @@ let result = c.to(cpu)  # each element = 3.0
 - **vmap analysis** — `@vmap` batch tracking, shape rewriting, matmul rewrite classification
 - **Source AD analysis** — Wengert list, reverse-mode adjoint rules, dead gradient elimination
 
-### Infrastructure *(v0.4.0–v0.8.0 — analysis + FFI layers complete, codegen wiring in progress)*
-
-> **Status:** The following features have runtime FFI, semantic validation, and analysis modules fully built and tested. The codegen integration (emitting Cranelift IR that calls these FFI functions during compilation) is in progress. CLI flags are now wired through to the compiler.
+### Infrastructure *(v0.4.0–v0.8.0 — analysis + FFI layers + codegen wiring)*
 
 - **Disaggregated inference** — router, KV transfer, prefill/decode worker FFI
 - **KV-cache compression** — INT8/INT4/FP8 quantization, sliding window, H2O eviction
-- **Constrained decoding** — compiled FSM (Thompson/subset/Hopcroft DFA), token alignment, logit masking
-- **Multi-backend KIR** — Kernel IR (40+ ops), PTX backend, GpuTarget, FeatureSet, GpuBackend trait
-- **vmap AST transform** — VmapTransformer FnDef→FnDef rewriting
+- **Constrained decoding** — compiled FSM (Thompson/subset/Hopcroft DFA), token alignment, logit masking, per-request grammar state
+- **Multi-backend** — Kernel IR (40+ ops), PTX + AMDGPU + Metal (MSL) + WGSL backends
+- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping, ZeRO sharding, @pipeline codegen
+- **Tensor debugger** — `nsl debug` CLI: trace reader, NaN finder, diff, Chrome export
+- **Reproducibility** — determinism checker, CPU deterministic scatter_add, kernel variant selection
+- **Multimodal** — patch embed, bilinear resize, image normalize, cross-attention, STFT, mel spectrogram, resampling
+- **Sparse tensors** — COO/CSR construction, from_dense, to_dense, SpMM
+- **Shape algebra** — symbolic dimension solver (equality, divisibility, range proofs)
 - **Linear types codegen** — ownership decision tree (free-at-consumption, tape-holds-reference)
 - **Source AD extraction** — Wengert extraction from AST, backward context
-- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping, ZeRO sharding
-- **Tensor debugger** — trace recording, NaN risk analysis, trace diffing, Chrome export
-- **Reproducibility** — determinism checker, kernel variant selection, RNG tracking
-- **Multimodal** — PatchEmbed, MelSpectrogram, cross_attention, modality classification
-- **Shape algebra** — symbolic dimension solver (equality, divisibility, range proofs)
-- **Sparse tensors** — NslSparseTensor, COO/CSR/CSC/BSR format dispatch, @sparse validation
-- **Snapshot testing** — insta PTX snapshots for codegen regression detection
-- **Differential testing** — --disable-fusion oracle for numerical equivalence
+- **vmap AST transform** — VmapTransformer FnDef→FnDef rewriting
+- **Effect system** — effect inference, @pure/@deterministic/@checkpoint validation
+- **Snapshot + differential testing** — insta PTX snapshots, --disable-fusion oracle
+
+### Weight Intelligence & Interop *(v0.9.0 — NEW)*
+
+- **Weight-aware compilation** — `nsl build --weights model.safetensors`: loads weights at compile time, sparsity analysis per matrix, constant folding through matmul/add/relu, dead weight elimination, SHA-256 integrity hash
+- **DLPack zero-copy bridge** — PyTorch/JAX tensor exchange without copying data (DLPack v0.8)
+- **C API** — `nsl build --shared-lib`: model lifecycle, forward pass, DLPack interop, error handling
+- **Unikernel infrastructure** — `nsl build --unikernel`: memory layout computation, linker script generation, boot config (actual bare-metal boot stub in progress)
 
 ### Test Framework
 - `@test` decorator marks functions as test cases
@@ -195,8 +200,8 @@ Extract the archive to a permanent location and add `bin/` to your PATH:
 
 ```bash
 # Linux/macOS
-tar xzf nsl-v0.8.0-<target>.tar.gz
-export PATH="$PWD/nsl-v0.8.0-<target>/bin:$PATH"
+tar xzf nsl-v0.9.0-<target>.tar.gz
+export PATH="$PWD/nsl-v0.9.0-<target>/bin:$PATH"
 ```
 
 > **Important:** Do not separate the `nsl` binary from the `lib/` directory.

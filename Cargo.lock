@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-ast"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nsl-errors",
  "serde",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clap",
  "memmap2",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-codegen"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-errors"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "codespan-reporting",
  "serde",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-lexer"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nsl-errors",
  "string-interner",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-parser"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nsl-ast",
  "nsl-errors",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-runtime"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cudarc",
  "half",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "nsl-semantic"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nsl-ast",
  "nsl-errors",
