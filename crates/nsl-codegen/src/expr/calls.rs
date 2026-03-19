@@ -305,6 +305,13 @@ impl Compiler<'_> {
             let code_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_exit", &[code_val]);
         }
+        // Stdin I/O
+        if func_name == "read_line" && !self.functions.contains_key(&func_name) {
+            if !args.is_empty() {
+                return Err(CodegenError::new("read_line() takes no arguments"));
+            }
+            return self.compile_call_by_name(builder, "nsl_read_line", &[]);
+        }
         // File I/O
         if matches!(func_name.as_str(), "read_file" | "write_file" | "append_file" | "file_exists") {
             let mut arg_vals = Vec::new();

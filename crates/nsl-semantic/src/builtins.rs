@@ -190,6 +190,13 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
     def(
+        "read_line",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Str),
+        },
+    );
+    def(
         "read_file",
         Type::Function {
             params: vec![Type::Str],

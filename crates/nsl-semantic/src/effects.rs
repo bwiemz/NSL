@@ -74,7 +74,7 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
     match name {
         // IO effects
         "print" | "println" | "eprint" | "eprintln"
-        | "read_file" | "write_file" | "open" | "close"
+        | "read_line" | "read_file" | "write_file" | "open" | "close"
         | "nsl_trace_record_op" | "nsl_trace_flush"
         => EffectSet::IO,
 

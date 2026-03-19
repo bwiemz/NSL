@@ -78,6 +78,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Assert & Exit
     ("nsl_assert", &[types::I8, types::I64], None),
     ("nsl_exit", &[types::I64], None),
+    // Stdin I/O
+    ("nsl_read_line", &[], Some(types::I64)),
     // File I/O
     ("nsl_read_file", &[types::I64], Some(types::I64)),
     ("nsl_write_file", &[types::I64, types::I64], None),

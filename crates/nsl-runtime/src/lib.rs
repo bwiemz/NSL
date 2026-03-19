@@ -9,6 +9,7 @@ pub mod memory;
 pub mod list;
 pub mod string;
 pub mod string_ops;
+pub mod io;
 pub mod dict;
 pub mod range;
 pub mod hof;
