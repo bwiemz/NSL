@@ -245,6 +245,18 @@ enum Cli {
         /// M62: Build as shared library (.so/.dylib/.dll) with stable C API
         #[arg(long)]
         shared_lib: bool,
+
+        /// M54: Build as a bare-metal unikernel image
+        #[arg(long)]
+        unikernel: bool,
+
+        /// M54: Unikernel listen address (default: "0.0.0.0:8080")
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+
+        /// M54: Unikernel total memory (e.g., "16G", "512M"). 0 or omitted = auto-detect at boot.
+        #[arg(long)]
+        memory: Option<String>,
     },
 
     /// Run @test functions in an NSL file
@@ -397,6 +409,9 @@ fn main() {
             no_dead_weight,
             no_sparse_codegen,
             shared_lib,
+            unikernel,
+            listen,
+            memory,
         } => {
             if shared_lib {
                 eprintln!("[nsl] --shared-lib: flag recognized (M62a stub).");
@@ -414,6 +429,36 @@ fn main() {
                 }
                 return;
             }
+
+            // M54: Parse unikernel configuration if --unikernel is set.
+            let unikernel_config = if unikernel {
+                let listen_addr = match nsl_codegen::unikernel::parse_listen_addr(&listen) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        eprintln!("error: invalid --listen value: {e}");
+                        process::exit(1);
+                    }
+                };
+                let memory_bytes = match memory.as_deref() {
+                    Some(s) => match nsl_codegen::unikernel::parse_memory_size(s) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("error: invalid --memory value: {e}");
+                            process::exit(1);
+                        }
+                    },
+                    None => 0, // auto-detect at boot
+                };
+                let cfg = nsl_codegen::unikernel::UnikernelConfig {
+                    listen_addr,
+                    memory_bytes,
+                    ..Default::default()
+                };
+                cfg.print_summary();
+                Some(cfg)
+            } else {
+                None
+            };
 
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
@@ -440,6 +485,7 @@ fn main() {
                     sparse_codegen: !no_sparse_codegen,
                 },
                 weight_analysis: false,
+                unikernel_config,
             };
 
             if standalone {
@@ -505,6 +551,7 @@ fn main() {
                 weight_file: None,
                 weight_config: Default::default(),
                 weight_analysis: false,
+                unikernel_config: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

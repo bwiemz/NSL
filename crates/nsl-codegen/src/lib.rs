@@ -39,6 +39,7 @@ pub mod sparse;
 pub mod speculative;
 pub mod source_ad;
 pub mod standalone;
+pub mod unikernel;
 pub mod tensor_parallel;
 pub mod stmt;
 pub mod types;
@@ -81,6 +82,8 @@ pub struct CompileOptions {
     pub weight_config: weight_aware::WeightAwareConfig,
     /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
     pub weight_analysis: bool,
+    /// M54: Unikernel build configuration (None = normal build)
+    pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
 }
 
 impl Default for CompileOptions {
@@ -101,6 +104,7 @@ impl Default for CompileOptions {
             weight_file: None,
             weight_config: weight_aware::WeightAwareConfig::default(),
             weight_analysis: false,
+            unikernel_config: None,
         }
     }
 }
