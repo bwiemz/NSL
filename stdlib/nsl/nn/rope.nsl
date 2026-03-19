@@ -1,0 +1,34 @@
+model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
+    # Precompute inverse frequencies: theta^(-2i/d) for i in [0, dim/2)
+    # Using exp(-log(theta) * indices / dim) since ** is scalar-only
+    inv_freq: Tensor = exp(arange(0.0, float(dim), 2.0) * (-1.0 * log(theta) / float(dim)))
+    _dim: Tensor = full([1], float(dim))
+    _half_dim: Tensor = full([1], float(dim) / 2.0)
+
+    fn forward(self, x: Tensor, seq_len: int) -> Tensor:
+        # x shape: [batch, heads, seq, head_dim]
+        let half_d = int(self._half_dim.item())
+        let d = int(self._dim.item())
+
+        # Build position indices: [seq_len]
+        let t = arange(0.0, float(seq_len))
+
+        # Outer product: freqs[seq, dim/2] = t[:, None] * inv_freq[None, :]
+        let t2 = t.reshape([seq_len, 1])
+        let inv2 = self.inv_freq.reshape([1, half_d])
+        let freqs = t2 @ inv2
+
+        # Duplicate for full head_dim: [seq, dim]
+        let tensors = [freqs, freqs]
+        let emb = tensor_cat(tensors, 1)
+
+        # Compute cos and sin: [seq, dim]
+        let cos_emb = tensor_cos(emb)
+        let sin_emb = tensor_sin(emb)
+
+        # Reshape for broadcasting: [1, 1, seq, dim]
+        let cos_4d = cos_emb.reshape([1, 1, seq_len, d])
+        let sin_4d = sin_emb.reshape([1, 1, seq_len, d])
+
+        # Apply rotation: x * cos + rotate_half(x) * sin
+        return x * cos_4d + rotate_half(x) * sin_4d

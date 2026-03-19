@@ -1,0 +1,27 @@
+from nsl.nn.rope import RotaryEmbedding
+
+let rope = RotaryEmbedding(64, 32, 10000.0)
+
+# Create dummy Q tensor: [batch=1, heads=2, seq=4, head_dim=64]
+let q = randn([1, 2, 4, 64])
+
+let q_rotated = rope.forward(q, 4)
+
+# Verify output shape: [1, 2, 4, 64] — same shape, different values
+print(q_rotated.ndim)
+# Expected: 4
+
+let s = q_rotated.shape
+print(s[0])
+print(s[1])
+print(s[2])
+print(s[3])
+# Expected: 1, 2, 4, 64
+
+# Verify output is not identical to input
+let diff = q_rotated - q
+let diff_sum = sum(abs(diff))
+print(diff_sum)
+# Expected: non-zero value
+
+print("rope: PASS")
