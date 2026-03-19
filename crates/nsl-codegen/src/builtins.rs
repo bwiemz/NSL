@@ -448,7 +448,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_audio_resample", &[types::I64, types::I64, types::I64], Some(types::I64)),
     // --- M50: Sparse tensors ---
     ("nsl_sparse_coo", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
-    ("nsl_sparse_from_dense", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_sparse_from_dense", &[types::I64, types::I64, types::I64], Some(types::I64)),  // M50b: +threshold
     ("nsl_sparse_to_dense", &[types::I64], Some(types::I64)),
     ("nsl_sparse_nnz", &[types::I64], Some(types::I64)),
     ("nsl_sparse_density", &[types::I64], Some(types::I64)),

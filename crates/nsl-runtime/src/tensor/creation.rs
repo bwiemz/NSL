@@ -220,3 +220,38 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
     });
     Box::into_raw(tensor) as i64
 }
+
+/// Create a tensor from a raw f64 slice and shape array.
+/// Used by sparse → dense conversion, SpMM output, and other internal APIs.
+/// Returns pointer to NslTensor as i64, or 0 on empty data.
+pub(crate) fn create_tensor_from_f64_data(data_slice: &[f64], shape_slice: &[i64]) -> i64 {
+    let ndim = shape_slice.len() as i64;
+    let len: i64 = shape_slice.iter().product();
+    if len == 0 { return 0; }
+
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in shape_slice.iter().enumerate() {
+        unsafe { *shape.add(i) = s };
+    }
+
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    let data_size = (len as usize) * std::mem::size_of::<f64>();
+    let data = checked_alloc(data_size) as *mut f64;
+    unsafe {
+        std::ptr::copy_nonoverlapping(data_slice.as_ptr(), data, len as usize);
+    }
+
+    let tensor = Box::new(NslTensor {
+        data: data as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len,
+        refcount: 1,
+        device: 0,
+        dtype: 0,
+        owns_data: 1,
+    });
+    Box::into_raw(tensor) as i64
+}

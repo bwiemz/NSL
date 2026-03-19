@@ -106,20 +106,137 @@ pub extern "C" fn nsl_sparse_coo(
     Box::into_raw(sparse) as i64
 }
 
-/// Convert a dense tensor to sparse format.
+/// Convert a dense tensor to COO sparse format.
+/// dense_ptr: pointer to NslTensor (2D, f64 dtype=0)
+/// format: 0=COO, 1=CSR
+/// threshold_bits: f64 bits — values with |v| < threshold are treated as zero
 /// Returns pointer to NslSparseTensor, or 0 on error.
 #[no_mangle]
-pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64) -> i64 {
-    let _ = (dense_ptr, format);
-    0 // Stub: full implementation in M50b
+pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_bits: i64) -> i64 {
+    if dense_ptr == 0 { return 0; }
+    let threshold = f64::from_bits(threshold_bits as u64);
+
+    // Read dense tensor fields via raw pointer (NslTensor is pub(crate), same crate)
+    let tensor = unsafe { &*(dense_ptr as *const crate::tensor::NslTensor) };
+    if tensor.ndim != 2 { return 0; }
+    let shape = unsafe { std::slice::from_raw_parts(tensor.shape, 2) };
+    let rows = shape[0] as usize;
+    let cols = shape[1] as usize;
+    let data = unsafe { std::slice::from_raw_parts(tensor.data as *const f64, rows * cols) };
+
+    // Scan for non-zeros
+    let mut row_indices = Vec::new();
+    let mut col_indices = Vec::new();
+    let mut values = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = data[r * cols + c];
+            if v.abs() >= threshold {
+                row_indices.push(r as i64);
+                col_indices.push(c as i64);
+                values.push(v);
+            }
+        }
+    }
+    let nnz = values.len() as i64;
+
+    let fmt = match format {
+        1 => SparseFmtId::Csr,
+        _ => SparseFmtId::Coo,
+    };
+
+    if fmt == SparseFmtId::Csr {
+        // Convert COO to CSR: build row_ptr array
+        let mut row_ptr = vec![0i64; rows + 1];
+        for &r in &row_indices {
+            row_ptr[r as usize + 1] += 1;
+        }
+        for i in 1..=rows {
+            row_ptr[i] += row_ptr[i - 1];
+        }
+
+        let val_bytes: Vec<u8> = values.iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+
+        let sparse = Box::new(NslSparseTensor {
+            format: SparseFmtId::Csr as u8,
+            device: 0, dtype: 0, ndim: 2,
+            nnz,
+            rows: rows as i64, cols: cols as i64,
+            data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+            indices_0: Box::into_raw(row_ptr.into_boxed_slice()) as *mut i64, // row_ptr (len = rows+1)
+            indices_1: Box::into_raw(col_indices.into_boxed_slice()) as *mut i64, // col_indices (len = nnz)
+            block_rows: 0, block_cols: 0,
+            refcount: 1, owns_data: 1,
+        });
+        Box::into_raw(sparse) as i64
+    } else {
+        // COO format
+        let val_bytes: Vec<u8> = values.iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+
+        let sparse = Box::new(NslSparseTensor {
+            format: SparseFmtId::Coo as u8,
+            device: 0, dtype: 0, ndim: 2,
+            nnz,
+            rows: rows as i64, cols: cols as i64,
+            data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+            indices_0: Box::into_raw(row_indices.into_boxed_slice()) as *mut i64,
+            indices_1: Box::into_raw(col_indices.into_boxed_slice()) as *mut i64,
+            block_rows: 0, block_cols: 0,
+            refcount: 1, owns_data: 1,
+        });
+        Box::into_raw(sparse) as i64
+    }
 }
 
-/// Convert a sparse tensor to dense.
-/// Returns pointer to NslTensor, or 0 on error.
+/// Convert a sparse tensor to dense NslTensor.
+/// Returns pointer to NslTensor (f64, 2D), or 0 on error.
 #[no_mangle]
 pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
-    let _ = sparse_ptr;
-    0 // Stub: full implementation in M50b
+    if sparse_ptr == 0 { return 0; }
+    let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
+    let rows = sparse.rows as usize;
+    let cols = sparse.cols as usize;
+    let nnz = sparse.nnz as usize;
+
+    // Allocate dense output (zeros)
+    let mut dense = vec![0.0f64; rows * cols];
+    let vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
+
+    match SparseFmtId::from_u8(sparse.format) {
+        Some(SparseFmtId::Coo) => {
+            let row_idx = unsafe { std::slice::from_raw_parts(sparse.indices_0, nnz) };
+            let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
+            for i in 0..nnz {
+                let r = row_idx[i] as usize;
+                let c = col_idx[i] as usize;
+                if r < rows && c < cols {
+                    dense[r * cols + c] = vals[i];
+                }
+            }
+        }
+        Some(SparseFmtId::Csr) => {
+            let row_ptr = unsafe { std::slice::from_raw_parts(sparse.indices_0, rows + 1) };
+            let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
+            for r in 0..rows {
+                let start = row_ptr[r] as usize;
+                let end = row_ptr[r + 1] as usize;
+                for j in start..end {
+                    let c = col_idx[j] as usize;
+                    if c < cols {
+                        dense[r * cols + c] = vals[j];
+                    }
+                }
+            }
+        }
+        _ => return 0,
+    }
+
+    // Create NslTensor — use nsl_tensor_create_from_data
+    crate::tensor::creation::create_tensor_from_f64_data(&dense, &[rows as i64, cols as i64])
 }
 
 /// Get the number of nonzero elements.
@@ -141,12 +258,63 @@ pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
     f64::to_bits(density) as i64
 }
 
-/// Sparse-dense matrix multiply (SpMM).
-/// Stub: returns 0 (null). Full kernel dispatch in M50b.
+/// Sparse-dense matrix multiply: sparse(M×K) × dense(K×N) → dense(M×N).
+/// sparse_ptr: NslSparseTensor (COO or CSR)
+/// dense_ptr: NslTensor (2D, f64)
+/// Returns pointer to new NslTensor, or 0 on error.
 #[no_mangle]
 pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
-    let _ = (sparse_ptr, dense_ptr);
-    0
+    if sparse_ptr == 0 || dense_ptr == 0 { return 0; }
+    let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
+    let dense = unsafe { &*(dense_ptr as *const crate::tensor::NslTensor) };
+
+    if dense.ndim != 2 { return 0; }
+    let d_shape = unsafe { std::slice::from_raw_parts(dense.shape, 2) };
+    let k = d_shape[0] as usize;
+    let n = d_shape[1] as usize;
+    let m = sparse.rows as usize;
+    let nnz = sparse.nnz as usize;
+
+    // Verify dimension compatibility: sparse cols == dense rows
+    if sparse.cols as usize != k { return 0; }
+
+    let d_data = unsafe { std::slice::from_raw_parts(dense.data as *const f64, k * n) };
+    let s_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
+    let mut output = vec![0.0f64; m * n];
+
+    match SparseFmtId::from_u8(sparse.format) {
+        Some(SparseFmtId::Coo) => {
+            let row_idx = unsafe { std::slice::from_raw_parts(sparse.indices_0, nnz) };
+            let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
+            for i in 0..nnz {
+                let r = row_idx[i] as usize;
+                let c = col_idx[i] as usize;
+                let v = s_vals[i];
+                // output[r, :] += v * dense[c, :]
+                for j in 0..n {
+                    output[r * n + j] += v * d_data[c * n + j];
+                }
+            }
+        }
+        Some(SparseFmtId::Csr) => {
+            let row_ptr = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
+            let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
+            for r in 0..m {
+                let start = row_ptr[r] as usize;
+                let end = row_ptr[r + 1] as usize;
+                for idx in start..end {
+                    let c = col_idx[idx] as usize;
+                    let v = s_vals[idx];
+                    for j in 0..n {
+                        output[r * n + j] += v * d_data[c * n + j];
+                    }
+                }
+            }
+        }
+        _ => return 0,
+    }
+
+    crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64, n as i64])
 }
 
 /// Free a sparse tensor and its owned arrays.
@@ -221,7 +389,7 @@ mod tests {
 
     #[test]
     fn stubs_return_zero() {
-        assert_eq!(nsl_sparse_from_dense(0, 1), 0);
+        assert_eq!(nsl_sparse_from_dense(0, 1, 0), 0);
         assert_eq!(nsl_sparse_to_dense(0), 0);
         assert_eq!(nsl_sparse_spmm(0, 0), 0);
     }
