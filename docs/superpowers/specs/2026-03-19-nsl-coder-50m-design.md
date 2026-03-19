@@ -347,8 +347,10 @@ creates a `DataLoader`, runs training with callbacks for logging and checkpointi
 **finetune.nsl** — Contains the Stage 2 `train()` block. Loads the pretrained
 checkpoint, trains on the mixed NSL+general dataset with lower learning rate.
 
-**generate.nsl** — Interactive loop: `read_line()` → tokenize → prefill →
-decode loop → detokenize → print. Loads the finetuned checkpoint.
+**generate.nsl** — Interactive loop: `read_line()` → `tokenizer_encode()` →
+prefill → decode loop → `tokenizer_decode()` → print. Loads the finetuned
+checkpoint. The decode step converts each sampled `u32` token ID back to a
+string fragment via the BPE tokenizer (already in verified deps, Section 6.4).
 
 ## 6. Compiler & Runtime Work
 
