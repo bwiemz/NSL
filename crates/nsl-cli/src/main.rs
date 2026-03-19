@@ -241,6 +241,10 @@ enum Cli {
         /// M52: Disable sparsity-aware codegen annotations
         #[arg(long)]
         no_sparse_codegen: bool,
+
+        /// M62: Build as shared library (.so/.dylib/.dll) with stable C API
+        #[arg(long)]
+        shared_lib: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -392,7 +396,14 @@ fn main() {
             no_constant_fold,
             no_dead_weight,
             no_sparse_codegen,
+            shared_lib,
         } => {
+            if shared_lib {
+                eprintln!("[nsl] --shared-lib: flag recognized (M62a stub).");
+                eprintln!("[nsl] Shared library emission requires M62b linker changes.");
+                eprintln!("[nsl] Proceeding with normal build for now.");
+            }
+
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
                 if cache_dir.exists() {

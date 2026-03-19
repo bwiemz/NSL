@@ -462,6 +462,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_trace_breakpoint", &[], Some(types::I64)),
     ("nsl_trace_flush", &[], Some(types::I64)),
     ("nsl_trace_destroy", &[], Some(types::I64)),
+    // --- M62: Legacy Interop — DLPack bridge + C API ---
+    ("nsl_dlpack_export", &[types::I64], Some(types::I64)),
+    ("nsl_dlpack_import", &[types::I64], Some(types::I64)),
+    ("nsl_dlpack_free", &[types::I64], None),
+    ("nsl_model_create", &[types::I64], Some(types::I64)),
+    ("nsl_model_destroy", &[types::I64], Some(types::I64)),
+    ("nsl_model_forward", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_model_forward_dlpack", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_model_get_version", &[], Some(types::I64)),
+    ("nsl_get_last_error", &[], Some(types::I64)),
+    ("nsl_clear_error", &[], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

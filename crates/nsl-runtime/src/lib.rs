@@ -77,5 +77,9 @@ pub mod deterministic_ops;
 pub mod multimodal;
 pub mod sparse;
 
+// M62: Legacy Interop — DLPack bridge + C API
+pub mod dlpack;
+pub mod c_api;
+
 #[cfg(test)]
 mod fuzz;
