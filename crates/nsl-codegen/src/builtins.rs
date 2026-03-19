@@ -308,6 +308,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         types::I64, types::I64,                                       // ptx_ptr, name_ptr
         types::I64, types::I64,                                       // block_q, block_kv
     ], Some(types::I64)),
+    // M42b: Quantized FlashAttention (KV-cache in INT8/FP8)
+    ("nsl_flash_attention_quantized", &[
+        types::I64, types::I64, types::I64, types::I64, types::I64,  // q, k, v, out, scale
+        types::I64, types::I64, types::I64, types::I64,              // batch, heads, seq_len, head_dim
+        types::I64, types::I64, types::I64, types::I64,              // block_table, k_pool, v_pool, block_size
+        types::I64, types::I64, types::I64,                          // meta_k, meta_v, kv_quant_scheme
+        types::I64,                                                   // shared_mem_bytes
+        types::I64, types::I64,                                       // ptx_ptr, name_ptr
+        types::I64, types::I64,                                       // block_q, block_kv
+    ], Some(types::I64)),
     ("nsl_rope_cache_write", &[
         types::I64, types::I64,                                       // k_projected, v_projected
         types::I64, types::I64, types::I64,                          // cos, sin, positions

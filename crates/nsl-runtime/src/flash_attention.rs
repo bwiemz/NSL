@@ -104,6 +104,115 @@ pub extern "C" fn nsl_flash_attention(
     }
 }
 
+/// M42b: Quantized FlashAttention — KV-cache in INT8/FP8, Q in f16/f32.
+///
+/// Same tiled FlashAttention-2 algorithm but with inline dequantization:
+/// each tile load of K/V dequantizes INT8→f32 (using per-head scales from
+/// meta_k/meta_v) before the Q@K^T dot product.
+///
+/// kv_quant_scheme:
+///   0 = None (f32 KV, same as nsl_flash_attention)
+///   1 = INT8 per-head (scale per attention head)
+///   2 = INT8 per-token (scale per token position)
+///   3 = INT4 per-group (scale + zero_point per group)
+///   4 = FP8 E4M3 (no scale needed, direct cast)
+///
+/// meta_k/meta_v: pointers to KvBlockQuantMeta arrays (null for FP8/None).
+///
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn nsl_flash_attention_quantized(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64, scale_bits: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    block_table_ptr: i64,
+    k_pool_ptr: i64, v_pool_ptr: i64,
+    block_size: i64,
+    meta_k: i64, meta_v: i64,
+    kv_quant_scheme: i64,
+    shared_mem_bytes: i64,
+    ptx_ptr: i64, name_ptr: i64,
+    block_q: i64, _block_kv: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let _scale = f32::from_bits(scale_bits as u32);
+
+        // Grid: (ceil(seq_len / block_q), batch * heads, 1)
+        let grid_x = (seq_len + block_q - 1) / block_q;
+        let grid_y = batch * heads;
+        let grid_z = 1i64;
+
+        // Block: (128, 1, 1) — 4 warps per thread block
+        let block_x = 128i64;
+        let block_y = 1i64;
+        let block_z = 1i64;
+
+        // Marshal all kernel arguments as u64 values
+        let mut q = q_ptr as u64;
+        let mut k = k_ptr as u64;
+        let mut v = v_ptr as u64;
+        let mut out = out_ptr as u64;
+        let mut s = f32::from_bits(scale_bits as u32);
+        let mut b = batch as u64;
+        let mut h = heads as u64;
+        let mut sl = seq_len as u64;
+        let mut hd = head_dim as u64;
+        let mut bt = block_table_ptr as u64;
+        let mut kp = k_pool_ptr as u64;
+        let mut vp = v_pool_ptr as u64;
+        let mut bs = block_size as u64;
+        let mut mk = meta_k as u64;
+        let mut mv = meta_v as u64;
+        let mut qs = kv_quant_scheme as u64;
+
+        let args: [*mut c_void; 16] = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut mk as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
+        ];
+
+        // For scheme 0 (no quantization), delegate to standard FlashAttention PTX.
+        // For scheme 1-4, the quantized PTX kernel handles dequantization inline:
+        //   INT8: each tile load does `v_f32 = (int8_val as f32) * scale[head]`
+        //   FP8:  each tile load does direct E4M3→f32 cast via LUT
+        //   INT4: each tile load unpacks nibbles + applies group scale/zero_point
+        let result = crate::cuda::inner::kernel_launch(
+            ptx_ptr as *const u8,
+            name_ptr as *const u8,
+            [grid_x, grid_y, grid_z],
+            [block_x, block_y, block_z],
+            &args,
+            shared_mem_bytes as u32,
+        );
+
+        result as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q_ptr, k_ptr, v_ptr, out_ptr, scale_bits);
+        let _ = (batch, heads, seq_len, head_dim);
+        let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
+        let _ = (meta_k, meta_v, kv_quant_scheme);
+        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv);
+        eprintln!("[nsl] quantized FlashAttention requires CUDA.");
+        -1
+    }
+}
+
 /// RoPE + paged cache write kernel launch wrapper.
 ///
 /// All params i64 for Cranelift ABI compatibility.
