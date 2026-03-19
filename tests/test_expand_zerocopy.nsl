@@ -1,0 +1,10 @@
+let x = ones([1, 4])
+let expanded = x.expand([3, 4])
+print(expanded)
+
+let y = arange(0.0, 4.0)
+let y2 = y.reshape([1, 4])
+let y3 = y2.expand([3, 4])
+print(y3)
+
+print("expand_zerocopy: PASS")

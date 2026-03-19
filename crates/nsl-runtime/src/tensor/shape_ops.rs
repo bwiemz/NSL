@@ -616,7 +616,11 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     out_ptr
 }
 
-/// Broadcast tensor to target shape.
+/// Broadcast tensor to target shape (zero-copy stride view).
+///
+/// Expanded dimensions get stride=0 so they read the same physical data.
+/// The result tensor does NOT own its data — it shares the source's buffer.
+/// The source tensor's refcount is bumped to keep it alive while the view exists.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -636,86 +640,57 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         );
         std::process::abort();
     }
-    let pad = target_ndim - src_ndim;
-    let src_shape: Vec<i64> = (0..target_ndim).map(|i| {
-        if i < pad { 1 } else { unsafe { *tensor.shape.add(i - pad) } }
-    }).collect();
+    let pad = target_ndim.saturating_sub(src_ndim);
 
-    for i in 0..target_ndim {
-        let s = src_shape[i];
-        let t = target_shape[i];
+    // Validate: source dim must be 1 or match target
+    for (i, &t) in target_shape.iter().enumerate() {
+        let s = if i < pad { 1 } else { unsafe { *tensor.shape.add(i - pad) } };
         if s != 1 && s != t {
             eprintln!(
-                "nsl: expand: source dim {} has size {} which cannot expand to {}",
+                "nsl: expand: cannot expand dim {} from {} to {}",
                 i, s, t
             );
             std::process::abort();
         }
     }
 
-    let out_ndim = target_ndim as i64;
-    let out_shape_ptr = checked_alloc(target_ndim * std::mem::size_of::<i64>()) as *mut i64;
-    for (i, &s) in target_shape.iter().enumerate().take(target_ndim) {
-        unsafe { *out_shape_ptr.add(i) = s };
-    }
-    let out_strides = NslTensor::compute_strides(out_shape_ptr, out_ndim);
-    let out_len = NslTensor::total_elements(out_shape_ptr, out_ndim);
+    // Build output shape and strides (zero-copy: broadcast dims get stride=0)
+    let out_shape = checked_alloc(target_ndim * std::mem::size_of::<i64>()) as *mut i64;
+    let out_strides = checked_alloc(target_ndim * std::mem::size_of::<i64>()) as *mut i64;
 
-    let src_strides: Vec<i64> = (0..target_ndim).map(|i| {
-        if i < pad {
-            0
+    for (i, &t) in target_shape.iter().enumerate() {
+        unsafe { *out_shape.add(i) = t };
+        let src_dim_idx = i as isize - pad as isize;
+        if src_dim_idx < 0 {
+            // Padded leading dimension — no source data, stride=0
+            unsafe { *out_strides.add(i) = 0 };
         } else {
-            let src_i = i - pad;
-            if src_shape[i] == 1 && target_shape[i] > 1 {
-                0
+            let s = unsafe { *tensor.shape.add(src_dim_idx as usize) };
+            if s == 1 && t != 1 {
+                // Broadcast: source dim is 1, target > 1 — stride=0 (zero-copy)
+                unsafe { *out_strides.add(i) = 0 };
             } else {
-                unsafe { *tensor.strides.add(src_i) }
+                // Keep original stride from source tensor
+                unsafe { *out_strides.add(i) = *tensor.strides.add(src_dim_idx as usize) };
             }
         }
-    }).collect();
+    }
 
-    let out_stride_vec: Vec<i64> = (0..target_ndim)
-        .map(|i| unsafe { *out_strides.add(i) })
-        .collect();
+    let out_len = NslTensor::total_elements(out_shape, target_ndim as i64);
 
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-        for flat in 0..out_len as usize {
-            let mut remaining = flat;
-            let mut src_offset: usize = 0;
-            for axis in 0..target_ndim {
-                let idx = remaining / out_stride_vec[axis] as usize;
-                remaining %= out_stride_vec[axis] as usize;
-                src_offset += idx * src_strides[axis] as usize;
-            }
-            unsafe { *buf.add(flat) = *tensor.data_f32().add(src_offset) };
-        }
-        buf as *mut c_void
-    } else {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        for flat in 0..out_len as usize {
-            let mut remaining = flat;
-            let mut src_offset: usize = 0;
-            for axis in 0..target_ndim {
-                let idx = remaining / out_stride_vec[axis] as usize;
-                remaining %= out_stride_vec[axis] as usize;
-                src_offset += idx * src_strides[axis] as usize;
-            }
-            unsafe { *buf.add(flat) = *tensor.data_f64().add(src_offset) };
-        }
-        buf as *mut c_void
-    };
+    // ZERO-COPY: share data pointer, bump source refcount to keep it alive
+    tensor.refcount.fetch_add(1, Ordering::SeqCst);
 
     let out = Box::new(NslTensor {
-        data,
-        shape: out_shape_ptr,
+        data: tensor.data,
+        shape: out_shape,
         strides: out_strides,
-        ndim: out_ndim,
+        ndim: target_ndim as i64,
         len: out_len,
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 0, // view — does NOT own the data buffer
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -1031,7 +1006,7 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
     }
 
     let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
-    if last_dim % 2 != 0 {
+    if !last_dim.is_multiple_of(2) {
         eprintln!(
             "nsl: rotate_half requires even last dimension, got {}",
             last_dim
