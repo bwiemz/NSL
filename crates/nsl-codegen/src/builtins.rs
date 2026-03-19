@@ -424,15 +424,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_pipeline_recv_grad", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_pipeline_barrier", &[], Some(types::I64)),
     ("nsl_pipeline_destroy", &[], Some(types::I64)),
-    // --- M43: ZeRO optimizer ---
-    ("nsl_zero_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
-    ("nsl_zero_partition", &[types::I64, types::I64], Some(types::I64)),
-    ("nsl_zero_reduce_grads", &[], Some(types::I64)),
-    ("nsl_zero_step", &[types::I64], Some(types::I64)),
+    // --- M43: ZeRO optimizer (ABI-fixed: match runtime signatures exactly) ---
+    ("nsl_zero_init", &[types::I64, types::I64], Some(types::I64)),                       // (stage, world_size)
+    ("nsl_zero_partition", &[types::I64], Some(types::I64)),                               // (num_params)
+    ("nsl_zero_reduce_grads", &[types::I64, types::I64], Some(types::I64)),                // (grad_ptr, num_elems)
+    ("nsl_zero_step", &[], Some(types::I64)),                                               // ()
     ("nsl_zero_destroy", &[], Some(types::I64)),
-    // --- M43: Gradient accumulation ---
-    ("nsl_grad_accumulate_add", &[types::I64, types::I64], Some(types::I64)),
-    ("nsl_grad_zero", &[types::I64], Some(types::I64)),
+    // --- M43: Gradient accumulation (ABI-fixed) ---
+    ("nsl_grad_accumulate_add", &[types::I64, types::I64, types::I64], Some(types::I64)),  // (dst, src, num_elems)
+    ("nsl_grad_zero", &[types::I64, types::I64], Some(types::I64)),                         // (grad_ptr, num_elems)
     ("nsl_grad_all_reduce", &[types::I64, types::I64], Some(types::I64)),
     // --- M46: Deterministic kernel variants ---
     ("nsl_tensor_reduce_sum_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),

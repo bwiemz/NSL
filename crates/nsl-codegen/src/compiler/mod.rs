@@ -261,7 +261,7 @@ impl<'a> Compiler<'a> {
             context_parallel_configs: HashMap::new(),
             cp_ring_size: 1,
             activation_states: HashMap::new(),
-            world_size: 1,
+            world_size: options.world_size,
             disaggregated: false,
             prefill_workers: 1,
             decode_workers: 1,
