@@ -111,10 +111,13 @@ pub fn ring_attention_cpu(
             }
         }
 
-        // Normalize
-        for d in 0..dim {
-            out[qi * dim + d] = o_acc[d] / global_sum;
+        // Normalize — guard against zero sum (fully-masked queries in causal ring attention)
+        if global_sum > 0.0 {
+            for d in 0..dim {
+                out[qi * dim + d] = o_acc[d] / global_sum;
+            }
         }
+        // else: out stays 0.0, which is correct for fully-masked query positions
     }
     out
 }

@@ -208,6 +208,8 @@ pub fn quantize_int4_per_group(
     meta: &mut KvBlockQuantMeta,
     group_size: usize,
 ) {
+    // IMPORTANT-3 fix: zero output buffer to prevent stale high nibbles from buffer reuse
+    output.fill(0);
     meta.scheme = KvQuantScheme::Int4PerGroup as u8;
     let num_groups = values.len().div_ceil(group_size);
     meta.num_scales = num_groups as u16;
@@ -294,6 +296,11 @@ fn f32_to_fp8_e4m3(v: f32) -> u8 {
     // E4M3: bias = 7, exp range [-6, 8]
     let biased_exp = (exp + 7).clamp(0, 15) as u8;
     let m3 = (mantissa >> 20) as u8; // top 3 mantissa bits
+
+    // CRITICAL-1 fix: E4M3 NaN is exp=15, mantissa=7 (0x7F/0xFF) — clamp to ±416
+    if biased_exp == 15 && m3 == 7 {
+        return ((sign as u8) << 7) | (15 << 3) | 6; // largest finite: ±416
+    }
     ((sign as u8) << 7) | (biased_exp << 3) | m3
 }
 
@@ -305,6 +312,10 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
 
     if exp == 0 && mantissa == 0 {
         return if sign == 1 { -0.0 } else { 0.0 };
+    }
+    // CRITICAL-2 fix: E4M3 NaN is exp=15, mantissa=7 — decode as f32 NaN
+    if exp == 15 && mantissa == 7 {
+        return f32::NAN;
     }
     let f32_exp = (exp - 7 + 127) as u32; // unbias E4M3, rebias f32
     let f32_mantissa = mantissa << 20;     // position in f32 mantissa

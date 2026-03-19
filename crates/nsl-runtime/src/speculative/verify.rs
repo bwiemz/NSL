@@ -129,11 +129,21 @@ pub fn rejection_sample(
 
 fn softmax_with_temperature(logits: &[f32], temperature: f32) -> Vec<f32> {
     let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    // CRITICAL-3 fix: guard against all-masked (all -inf) or NaN logits
+    if !max_val.is_finite() {
+        let n = logits.len();
+        return if n > 0 { vec![1.0 / n as f32; n] } else { vec![] };
+    }
     let exps: Vec<f32> = logits
         .iter()
         .map(|&x| ((x - max_val) / temperature).exp())
         .collect();
     let sum: f32 = exps.iter().sum();
+    // Guard against sum=0 (all exps underflowed)
+    if sum == 0.0 || !sum.is_finite() {
+        let n = logits.len();
+        return if n > 0 { vec![1.0 / n as f32; n] } else { vec![] };
+    }
     exps.iter().map(|&e| e / sum).collect()
 }
 

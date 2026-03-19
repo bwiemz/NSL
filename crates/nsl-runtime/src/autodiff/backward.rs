@@ -529,7 +529,7 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 
     for row in 0..num_rows {
         let base = row * n;
-        let rms_val = unsafe { *rms_t.data_f64().add(row) };
+        let rms_val = unsafe { *rms_t.data_f64().add(row) }.max(1e-12); // IMPORTANT-1: epsilon guard against underflow
         let rms_cubed = rms_val * rms_val * rms_val;
 
         let mut sum_dout_x = 0.0_f64;

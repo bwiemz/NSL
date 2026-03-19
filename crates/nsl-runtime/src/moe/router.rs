@@ -32,15 +32,21 @@ pub fn route_topk(
         let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
         let sum: f32 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+        // IMPORTANT-4 fix: guard against sum=0 (all exps underflowed)
+        let probs: Vec<f32> = if sum > 0.0 && sum.is_finite() {
+            exps.iter().map(|&e| e / sum).collect()
+        } else {
+            vec![1.0 / num_experts as f32; num_experts] // uniform fallback
+        };
         // Top-k selection
         let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let selected = &indexed[..top_k];
         let weight_sum: f32 = selected.iter().map(|(_, w)| w).sum();
+        let safe_weight_sum = if weight_sum > 1e-8 { weight_sum } else { 1.0 };
         for &(expert_id, weight) in selected {
             expert_indices.push(expert_id as i32);
-            expert_weights.push(weight / weight_sum);
+            expert_weights.push(weight / safe_weight_sum);
         }
     }
 
