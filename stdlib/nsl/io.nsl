@@ -1,0 +1,5 @@
+# nsl.io — Input/output utilities
+
+fn input(prompt: str) -> str:
+    print(prompt)
+    return read_line()
