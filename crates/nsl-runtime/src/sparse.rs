@@ -1,6 +1,6 @@
 //! M50: Sparse tensor runtime — storage, construction, and query FFI.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 
 // NOTE: The semantic crate already has SparseFormat in types.rs (Coo, Csr, Csc, Bsr, Unknown).
 // The runtime uses a u8 format ID instead of re-declaring the enum to avoid cross-crate

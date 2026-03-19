@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 use crate::tensor::{NslTensor, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8};

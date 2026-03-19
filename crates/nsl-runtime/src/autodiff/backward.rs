@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 
 use crate::list::NslList;
 use crate::tensor::{

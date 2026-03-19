@@ -9,7 +9,6 @@
 //! All FFI functions use `i64` parameters to match the Cranelift calling convention.
 
 use std::sync::Mutex;
-use std::sync::atomic::AtomicI64;
 use std::time::Instant;
 
 use crate::tensor::NslTensor;
@@ -422,6 +421,7 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
     use std::mem::size_of;
+    use std::sync::atomic::AtomicI64;
 
     #[test]
     fn trace_entry_size() {

@@ -2,7 +2,7 @@
 //! These are the original implementations extracted from tensor.rs.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 use crate::tensor::NslTensor;

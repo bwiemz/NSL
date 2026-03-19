@@ -92,9 +92,8 @@ pub fn compile(
     // The memory planner requires TensorAlloc records populated during codegen.
     // TODO: Integrate planner.record_alloc() calls into tensor creation codegen,
     // then invoke plan_slab() here. For now, report that the flags are recognized.
-    if options.vram_budget.is_some() {
-        eprintln!("[nsl] --vram-budget set to {} bytes (planner integration in progress)",
-            options.vram_budget.unwrap());
+    if let Some(budget) = options.vram_budget {
+        eprintln!("[nsl] --vram-budget set to {} bytes (planner integration in progress)", budget);
     }
     if options.memory_report {
         eprintln!("[nsl] --memory-report requested (planner integration in progress)");

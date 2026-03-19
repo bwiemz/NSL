@@ -1,6 +1,6 @@
 //! M35: AWQ (Activation-Aware Weight Quantization) 4-bit runtime.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
 
 use crate::memory::checked_alloc;
