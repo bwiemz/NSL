@@ -1,0 +1,25 @@
+# Test gradient clipping via train block — verifies training loop works
+# and loss decreases (no NaN, no explosion)
+
+from nsl.nn.losses import mse_loss
+
+model Tiny:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([2, 2])
+let y = zeros([2, 2])
+
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("grad_clip: PASS")

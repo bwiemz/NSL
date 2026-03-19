@@ -1,0 +1,18 @@
+# Test arange() builtin — verifies nsl_tensor_arange works correctly
+
+# 2-arg form: arange(start, stop) with default step=1.0
+let a = arange(0.0, 5.0)
+print(a)
+# Expected: tensor with values [0, 1, 2, 3, 4]
+
+# 3-arg form: arange(start, stop, step)
+let b = arange(2.0, 8.0, 2.0)
+print(b)
+# Expected: tensor with values [2, 4, 6]
+
+# 1-arg form: arange(stop) — start=0, step=1
+let c = arange(4.0)
+print(c)
+# Expected: tensor with values [0, 1, 2, 3]
+
+print("arange: PASS")
