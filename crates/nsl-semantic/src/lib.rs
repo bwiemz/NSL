@@ -2,6 +2,7 @@ pub mod builtins;
 pub mod checker;
 pub mod context_parallel;
 pub mod determinism;
+pub mod effects;
 pub mod fp8;
 pub mod grammar;
 pub mod kv_compress;

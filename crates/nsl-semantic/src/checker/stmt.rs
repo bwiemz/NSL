@@ -349,6 +349,16 @@ impl<'a> TypeChecker<'a> {
                             // Recognized — validation happens in determinism.rs pass
                         }
 
+                        // M51: @pure — recognized here, effect validation in effects.rs pass
+                        if dname == "pure" {
+                            // Recognized — effect validation in effects.rs pass
+                        }
+
+                        // M51: @checkpoint — recognized here, requires @pure (validated by effects.rs)
+                        if dname == "checkpoint" {
+                            // Recognized — requires @pure (validated by effects.rs)
+                        }
+
                         // M49: @shape_assert — recognized here, constraints added to solver during semantic analysis
                         if dname == "shape_assert" {
                             // Recognized — constraint added to solver during semantic analysis
