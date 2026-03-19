@@ -2,6 +2,7 @@
 //! causal_mask, squeeze.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::autodiff;
 use crate::list::NslList;
@@ -128,7 +129,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         strides,
         ndim: new_ndim,
         len: new_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -279,7 +280,7 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
         strides,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -371,7 +372,7 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
         strides,
         ndim: new_ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -478,7 +479,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -590,7 +591,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: first.device,
         dtype: first.dtype,
         owns_data: 1,
@@ -603,7 +604,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
             .collect();
         for &tp in &ptrs {
             let t = unsafe { &mut *(tp as *mut NslTensor) };
-            t.refcount += 1;
+            t.refcount.fetch_add(1, Ordering::SeqCst);
         }
         autodiff::maybe_record(autodiff::TapeOp::Stack {
             inputs: ptrs,
@@ -711,7 +712,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -765,7 +766,7 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         strides: out_strides,
         ndim: 2,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,
@@ -852,7 +853,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         strides: out_strides,
         ndim: tensor.ndim,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -973,7 +974,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         strides: out_strides,
         ndim: out_ndim,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: first.device,
         dtype: out_dtype,
         owns_data: 1,
@@ -987,7 +988,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     if autodiff::is_recording() {
         for &tp in &input_ptrs {
             let t = unsafe { &mut *(tp as *mut NslTensor) };
-            t.refcount += 1;
+            t.refcount.fetch_add(1, Ordering::SeqCst);
         }
     }
 

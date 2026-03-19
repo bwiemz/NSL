@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicI64;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -81,7 +82,7 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
         strides,
         ndim,
         len: total,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype,
         owns_data: 1,
@@ -161,7 +162,7 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
         strides,
         ndim,
         len: total,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device,
         dtype,
         owns_data: 1,
@@ -193,7 +194,7 @@ pub(crate) fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
         strides,
         ndim,
         len: total,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 1,
@@ -263,7 +264,7 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
             strides: new_strides,
             ndim: orig_ndim as i64,
             len: total,
-            refcount: 1,
+            refcount: AtomicI64::new(1),
         device: 0,
         dtype: res.dtype,
         owns_data: 1,

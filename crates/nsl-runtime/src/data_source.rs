@@ -3,6 +3,7 @@
 //! These are small-data utilities for loading datasets into NSL programs.
 //! For large-scale training data, prefer the streaming DataLoader pipeline.
 
+use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -30,7 +31,7 @@ fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u16, owns_data: u8) ->
         strides,
         ndim: 1,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype,
         owns_data,

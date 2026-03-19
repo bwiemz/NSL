@@ -2,6 +2,7 @@
 //! These are the original implementations extracted from tensor.rs.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 use crate::tensor::NslTensor;
@@ -120,7 +121,7 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         strides,
         ndim: out_ndim as i64,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,
@@ -247,7 +248,7 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         strides,
         ndim: out_ndim as i64,
         len: out_len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 1,
         owns_data: 1,
@@ -299,7 +300,7 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i6
         strides,
         ndim,
         len: total,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype,
         owns_data: 1,

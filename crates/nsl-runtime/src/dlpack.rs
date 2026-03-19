@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::memory::checked_alloc;
 use crate::tensor::{NslTensor, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8};
@@ -184,6 +185,12 @@ pub fn nsl_tensor_to_dlpack(tensor: &NslTensor, tensor_ptr: i64) -> *mut DLManag
         strides,
     });
 
+    // SAFETY (lifetime invariant for DLPack shape pointer):
+    // dl_tensor.shape points into ctx.shape (a Vec<i64> on the heap inside ExportContext).
+    // ctx is moved to the heap via Box::into_raw and stored in managed.manager_ctx.
+    // The deleter (nsl_dlpack_deleter) drops ctx AFTER the DLManagedTensor is freed.
+    // Therefore dl_tensor.shape remains valid for the entire lifetime of managed.
+    // The consumer MUST NOT cache dl_tensor.shape beyond the managed tensor's lifetime.
     let dl_tensor = DLTensor {
         data: tensor.data,
         device: nsl_device_to_dl(tensor.device),
@@ -268,7 +275,7 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
         strides: strides_ptr,
         ndim: ndim as i64,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device,
         dtype: nsl_dtype,
         owns_data: 0, // Borrowed — DLPack consumer owns the data.
@@ -352,7 +359,7 @@ mod tests {
             strides: strides_ptr,
             ndim: ndim as i64,
             len,
-            refcount: 1,
+            refcount: AtomicI64::new(1),
             device: 0,
             dtype: DTYPE_F64,
             owns_data: 1,
@@ -382,7 +389,7 @@ mod tests {
             strides: strides_ptr,
             ndim: ndim as i64,
             len,
-            refcount: 1,
+            refcount: AtomicI64::new(1),
             device: 0,
             dtype: DTYPE_F32,
             owns_data: 1,
@@ -554,7 +561,7 @@ mod tests {
             strides: std::ptr::null_mut(),
             ndim: 0,
             len: 1,
-            refcount: 1,
+            refcount: AtomicI64::new(1),
             device: 0,
             dtype: DTYPE_F64,
             owns_data: 1,

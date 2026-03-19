@@ -4,6 +4,7 @@
 //! Uses asymmetric affine quantization (weight-only RTN).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
 use crate::tensor::NslTensor;
@@ -46,7 +47,7 @@ pub struct QuantizedTensor {
     /// Number of scale/zero_point entries
     pub(crate) num_scales: i64,
     /// Reference count
-    pub(crate) refcount: i64,
+    pub(crate) refcount: AtomicI64,
 }
 
 impl QuantizedTensor {
@@ -132,7 +133,7 @@ fn alloc_qtensor(
         gran_axis,
         group_size,
         num_scales,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
     });
     Box::into_raw(qt)
 }
@@ -166,15 +167,15 @@ pub extern "C" fn nsl_qtensor_free(ptr: i64) {
 pub extern "C" fn nsl_qtensor_addref(ptr: i64) {
     if ptr == 0 { return; }
     let qt = QuantizedTensor::from_ptr(ptr);
-    qt.refcount += 1;
+    qt.refcount.fetch_add(1, Ordering::SeqCst);
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_qtensor_release(ptr: i64) {
     if ptr == 0 { return; }
     let qt = QuantizedTensor::from_ptr(ptr);
-    qt.refcount -= 1;
-    if qt.refcount <= 0 {
+    let prev = qt.refcount.fetch_sub(1, Ordering::SeqCst);
+    if prev <= 1 {
         nsl_qtensor_free(ptr);
     }
 }
@@ -527,7 +528,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
         strides,
         ndim,
         len: total as i64,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,
@@ -616,7 +617,7 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
         strides,
         ndim: 1,
         len: qt.ndim,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,

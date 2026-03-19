@@ -3,6 +3,7 @@
 //! Provides byte-level and BPE tokenizers via the HuggingFace `tokenizers` crate.
 //! Tokenizer handles are stored as boxed `TokenizerKind` enums, converted to i64 pointers.
 
+use std::sync::atomic::AtomicI64;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -86,7 +87,7 @@ fn make_1d_tensor(values: &[f64]) -> i64 {
         strides,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,
@@ -118,7 +119,7 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
         strides,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,

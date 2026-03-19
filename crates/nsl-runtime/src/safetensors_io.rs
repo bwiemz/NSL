@@ -1,6 +1,7 @@
 // M18b: Safetensors read/write FFI
 
 use std::ffi::c_void;
+use std::sync::atomic::AtomicI64;
 
 use crate::dict::{nsl_dict_keys, nsl_dict_new, nsl_dict_set_str};
 use crate::list::NslList;
@@ -142,7 +143,7 @@ pub(crate) fn allocate_f32_tensor(
         strides: strides_ptr,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device,
         dtype: 1, // f32
         owns_data: 1,

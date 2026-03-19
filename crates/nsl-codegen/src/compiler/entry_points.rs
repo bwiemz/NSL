@@ -87,6 +87,19 @@ pub fn compile(
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
+
+    // M36: Memory planner integration
+    // The memory planner requires TensorAlloc records populated during codegen.
+    // TODO: Integrate planner.record_alloc() calls into tensor creation codegen,
+    // then invoke plan_slab() here. For now, report that the flags are recognized.
+    if options.vram_budget.is_some() {
+        eprintln!("[nsl] --vram-budget set to {} bytes (planner integration in progress)",
+            options.vram_budget.unwrap());
+    }
+    if options.memory_report {
+        eprintln!("[nsl] --memory-report requested (planner integration in progress)");
+    }
+
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     compiler.finalize()

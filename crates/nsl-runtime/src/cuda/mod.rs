@@ -3,6 +3,8 @@
 
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
+#[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub(crate) mod kernels;
 
@@ -358,7 +360,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor {
         data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: 1,
+        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
         device: a.device, dtype: 1,
  owns_data: 1,
     });
@@ -397,7 +399,7 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor {
         data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: 1,
+        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
         device: a.device, dtype: 1,
  owns_data: 1,
     });
@@ -455,7 +457,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 
     let out = Box::new(NslTensor {
         data: out_data, shape, strides,
-        ndim: 2, len: out_len as i64, refcount: 1,
+        ndim: 2, len: out_len as i64, refcount: AtomicI64::new(1),
         device: a.device, dtype: 1,
  owns_data: 1,
     });
@@ -505,7 +507,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor {
         data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: 1,
+        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
         device: a.device, dtype: 1,
  owns_data: 1,
     });
@@ -549,7 +551,7 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor {
         data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: 1,
+        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
         device: a.device, dtype: 1,
         owns_data: 1,
     });
@@ -636,7 +638,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor {
         data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: 1,
+        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
         device: a.device, dtype: 1,
         owns_data: 1,
     });
@@ -906,7 +908,7 @@ DONE:
             strides: strides.as_ptr() as *mut i64,
             ndim: 1,
             len: 4,
-            refcount: 1,
+            refcount: AtomicI64::new(1),
             device: 0,
             dtype: 0,
             owns_data: 1,
@@ -949,7 +951,7 @@ DONE:
             data: a_data.as_ptr() as *mut std::ffi::c_void,
             shape: a_shape.as_ptr() as *mut i64,
             strides: a_strides.as_ptr() as *mut i64,
-            ndim: 2, len: 6, refcount: 1, device: 0, dtype: 0,
+            ndim: 2, len: 6, refcount: AtomicI64::new(1), device: 0, dtype: 0,
  owns_data: 1,
         });
         std::mem::forget(a_data); std::mem::forget(a_shape); std::mem::forget(a_strides);
@@ -963,7 +965,7 @@ DONE:
             data: b_data.as_ptr() as *mut std::ffi::c_void,
             shape: b_shape.as_ptr() as *mut i64,
             strides: b_strides.as_ptr() as *mut i64,
-            ndim: 2, len: 6, refcount: 1, device: 0, dtype: 0,
+            ndim: 2, len: 6, refcount: AtomicI64::new(1), device: 0, dtype: 0,
  owns_data: 1,
         });
         std::mem::forget(b_data); std::mem::forget(b_shape); std::mem::forget(b_strides);
@@ -1005,7 +1007,7 @@ DONE:
             data: a_data.as_ptr() as *mut std::ffi::c_void,
             shape: shape.as_ptr() as *mut i64,
             strides: strides.as_ptr() as *mut i64,
-            ndim: 1, len: 4, refcount: 1, device: 0, dtype: 0,
+            ndim: 1, len: 4, refcount: AtomicI64::new(1), device: 0, dtype: 0,
  owns_data: 1,
         });
         std::mem::forget(a_data); std::mem::forget(shape.clone()); std::mem::forget(strides.clone());
@@ -1017,7 +1019,7 @@ DONE:
             data: b_data.as_ptr() as *mut std::ffi::c_void,
             shape: shape2.as_ptr() as *mut i64,
             strides: strides2.as_ptr() as *mut i64,
-            ndim: 1, len: 4, refcount: 1, device: 0, dtype: 0,
+            ndim: 1, len: 4, refcount: AtomicI64::new(1), device: 0, dtype: 0,
  owns_data: 1,
         });
         std::mem::forget(b_data); std::mem::forget(shape2); std::mem::forget(strides2);

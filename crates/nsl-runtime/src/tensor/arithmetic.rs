@@ -1,6 +1,7 @@
 //! Tensor arithmetic operations: add, sub, mul, div, neg, scalar ops, matmul.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
@@ -108,8 +109,8 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x * y);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(a).refcount += 1;
-        NslTensor::from_ptr(b).refcount += 1;
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Mul {
             a,
             b,
@@ -150,8 +151,8 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
     let b_shape = get_shape_vec(NslTensor::from_ptr(b));
     let result = tensor_elementwise_op(a, b, |x, y| x / y);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(a).refcount += 1;
-        NslTensor::from_ptr(b).refcount += 1;
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Div {
             a,
             b,
@@ -210,7 +211,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         strides,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
         owns_data: 1,
@@ -268,7 +269,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         strides,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
         owns_data: 1,
@@ -318,7 +319,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         strides,
         ndim,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
         owns_data: 1,
@@ -507,15 +508,15 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         strides,
         ndim: out_nd as i64,
         len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: out_dtype,
         owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(a_ptr).refcount += 1;
-        NslTensor::from_ptr(b_ptr).refcount += 1;
+        NslTensor::from_ptr(a_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(b_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::MatMul {
             a: a_ptr,
             b: b_ptr,

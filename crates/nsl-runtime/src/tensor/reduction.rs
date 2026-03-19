@@ -1,6 +1,7 @@
 //! Tensor reduction operations: sum, mean, max, gather, softmax.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
@@ -384,7 +385,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 
     if autodiff::is_recording() {
         // Save indices for backward
-        NslTensor::from_ptr(indices_ptr).refcount += 1;
+        NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Gather {
             a: tensor_ptr,
             out: result_ptr,
@@ -478,14 +479,14 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
         owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(result).refcount += 1;
+        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Softmax {
             a: tensor_ptr,
             out: result,

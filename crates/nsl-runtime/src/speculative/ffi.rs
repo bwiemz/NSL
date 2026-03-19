@@ -1,5 +1,6 @@
 //! M33: Speculative decoding FFI — rejection sampling on pre-computed logits.
 
+use std::sync::atomic::AtomicI64;
 use super::verify;
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -148,7 +149,7 @@ pub extern "C" fn nsl_speculative_decode_step(
         strides,
         ndim: 1,
         len: num_tokens as i64,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
         owns_data: 1,

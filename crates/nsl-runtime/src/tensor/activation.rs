@@ -2,6 +2,7 @@
 //! exp, log, sqrt, abs, sign, clamp.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::autodiff;
 use crate::memory::checked_alloc;
@@ -43,12 +44,12 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(result).refcount += 1;
+        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Exp {
             a: tensor_ptr, out: result, saved_out: result,
         });
@@ -95,12 +96,12 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Log {
             a: tensor_ptr, out: result, saved_a: tensor_ptr,
         });
@@ -147,12 +148,12 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(result).refcount += 1;
+        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Sqrt {
             a: tensor_ptr, out: result, saved_out: result,
         });
@@ -199,12 +200,12 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Abs {
             a: tensor_ptr, out: result, saved_a: tensor_ptr,
         });
@@ -251,7 +252,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     // sign is non-differentiable -- no tape recording
@@ -285,12 +286,12 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Clamp {
             a: tensor_ptr, out: result, saved_a: tensor_ptr, min_val, max_val,
         });
@@ -337,7 +338,7 @@ pub(crate) fn nsl_tensor_clamp_backward(
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: input.device, dtype: input.dtype, owns_data: 1,
     });
     Box::into_raw(result) as i64
@@ -380,12 +381,12 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::ReLU {
             a: tensor_ptr, out: result, saved_a: tensor_ptr,
         });
@@ -429,12 +430,12 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::GELU {
             a: tensor_ptr, out: result, saved_a: tensor_ptr,
         });
@@ -470,12 +471,12 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount += 1;
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::SiLU {
             a: tensor_ptr, out: result, saved_a: tensor_ptr,
         });
@@ -518,12 +519,12 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(result).refcount += 1;
+        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Sigmoid {
             a: tensor_ptr, out: result, saved_out: result,
         });
@@ -572,12 +573,12 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: 1,
+        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device, dtype: a.dtype, owns_data: 1,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
-        NslTensor::from_ptr(result).refcount += 1;
+        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Tanh {
             a: tensor_ptr, out: result, saved_out: result,
         });

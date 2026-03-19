@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -146,7 +147,7 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
         strides,
         ndim: t.ndim,
         len: t.len,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: t.device,
         dtype: 1, // f32 on CPU
         owns_data: 1,

@@ -9,6 +9,7 @@
 //! All FFI functions use `i64` parameters to match the Cranelift calling convention.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicI64;
 use std::time::Instant;
 
 use crate::tensor::NslTensor;
@@ -479,7 +480,7 @@ mod tests {
             strides: &mut stride_val as *mut i64,
             ndim: 1,
             len: 3,
-            refcount: 1,
+            refcount: AtomicI64::new(1),
             device: 0,
             dtype: 0,
             owns_data: 0,

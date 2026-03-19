@@ -1,5 +1,7 @@
 //! M50: Sparse tensor runtime — storage, construction, and query FFI.
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 // NOTE: The semantic crate already has SparseFormat in types.rs (Coo, Csr, Csc, Bsr, Unknown).
 // The runtime uses a u8 format ID instead of re-declaring the enum to avoid cross-crate
 // collision. Conversion: Coo=0, Csr=1, Csc=2, Bsr=3. Unknown maps to None.
@@ -51,7 +53,7 @@ pub struct NslSparseTensor {
     pub indices_1: *mut i64,
     pub block_rows: i32,
     pub block_cols: i32,
-    pub refcount: i64,  // lifecycle: same model as NslTensor
+    pub refcount: AtomicI64,  // lifecycle: same model as NslTensor
     pub owns_data: u8,  // 1 = heap-owned (free arrays on drop), 0 = borrowed
 }
 
@@ -100,7 +102,7 @@ pub extern "C" fn nsl_sparse_coo(
         indices_1: Box::into_raw(col_copy.into_boxed_slice()) as *mut i64,
         block_rows: 0,
         block_cols: 0,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         owns_data: 1,
     });
     Box::into_raw(sparse) as i64
@@ -168,7 +170,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
             indices_0: Box::into_raw(row_ptr.into_boxed_slice()) as *mut i64, // row_ptr (len = rows+1)
             indices_1: Box::into_raw(col_indices.into_boxed_slice()) as *mut i64, // col_indices (len = nnz)
             block_rows: 0, block_cols: 0,
-            refcount: 1, owns_data: 1,
+            refcount: AtomicI64::new(1), owns_data: 1,
         });
         Box::into_raw(sparse) as i64
     } else {
@@ -186,7 +188,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
             indices_0: Box::into_raw(row_indices.into_boxed_slice()) as *mut i64,
             indices_1: Box::into_raw(col_indices.into_boxed_slice()) as *mut i64,
             block_rows: 0, block_cols: 0,
-            refcount: 1, owns_data: 1,
+            refcount: AtomicI64::new(1), owns_data: 1,
         });
         Box::into_raw(sparse) as i64
     }

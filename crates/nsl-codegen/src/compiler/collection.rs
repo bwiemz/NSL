@@ -380,6 +380,60 @@ impl Compiler<'_> {
                                 let model_name = self.resolve_sym(md.name).to_string();
                                 self.paged_kv_configs.insert(model_name, (num_blocks, block_size, num_heads, head_dim, num_layers));
                             }
+                            // M33: @speculative decorator extraction
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "speculative" {
+                                if let Some(info) = crate::speculative::extract_speculative_decorator(
+                                    std::slice::from_ref(deco),
+                                    &|sym| self.resolve_sym(sym),
+                                ) {
+                                    let model_name = self.resolve_sym(md.name).to_string();
+                                    let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                    let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                    self.speculative_configs.insert(layer_key, info);
+                                }
+                            }
+                            // M42: @kv_compress decorator extraction
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "kv_compress" {
+                                let mut scheme = 0i64; // 0=none, 1=int8_head, 2=int8_token, 3=int4_group, 4=fp8
+                                let mut window = 0i64;
+                                let mut sinks = 0i64;
+                                if let Some(ref args) = deco.args {
+                                    for arg in args {
+                                        if let Some(ref name_sym) = arg.name {
+                                            let key = self.resolve_sym(*name_sym).to_string();
+                                            match key.as_str() {
+                                                "scheme" => {
+                                                    if let nsl_ast::expr::ExprKind::IntLiteral(v) = &arg.value.kind {
+                                                        scheme = *v;
+                                                    }
+                                                }
+                                                "window" => {
+                                                    if let nsl_ast::expr::ExprKind::IntLiteral(v) = &arg.value.kind {
+                                                        window = *v;
+                                                    }
+                                                }
+                                                "sinks" => {
+                                                    if let nsl_ast::expr::ExprKind::IntLiteral(v) = &arg.value.kind {
+                                                        sinks = *v;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                let model_name = self.resolve_sym(md.name).to_string();
+                                let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                let layer_key = format!("{}.{}", model_name, layer_name_str);
+                                let policy = super::KvCompressPolicy {
+                                    method: "quantize".to_string(),
+                                    scheme: scheme as u8,
+                                    window: window as usize,
+                                    sinks: sinks as usize,
+                                    budget: 0,
+                                };
+                                self.kv_compress_policies.entry(layer_key).or_default().push(policy);
+                            }
                             // M43b: @pipeline decorator extraction
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "pipeline" {
                                 let mut stages = 4usize; // default

@@ -1,5 +1,6 @@
 //! M35: AWQ (Activation-Aware Weight Quantization) 4-bit runtime.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::ffi::c_void;
 
 use crate::memory::checked_alloc;
@@ -40,7 +41,7 @@ pub struct AwqPackedWeight {
     pub group_size: i64,
     /// Number of groups per column: ceil(K / group_size)
     pub num_groups: i64,
-    pub refcount: i64,
+    pub refcount: AtomicI64,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +139,7 @@ pub fn awq_quantize_cpu(weights: &[f64], k: usize, n: usize, group_size: usize) 
         n: n as i64,
         group_size: group_size as i64,
         num_groups: num_groups as i64,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
     }
 }
 
@@ -298,7 +299,7 @@ pub extern "C" fn nsl_awq_matmul(
         strides,
         ndim: 2,
         len: out_len as i64,
-        refcount: 1,
+        refcount: AtomicI64::new(1),
         device: 0,
         dtype: 1,
         owns_data: 1,
