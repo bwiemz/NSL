@@ -1,0 +1,52 @@
+# tests/test_coder50m_forward.nsl
+# Smoke test for the NSL-Coder architecture using tiny dimensions
+
+from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+
+model SwiGLUFFN(d_model: int, d_ff: int):
+    w_gate: Tensor = randn([d_model, d_ff])
+    w_up: Tensor = randn([d_model, d_ff])
+    w_down: Tensor = randn([d_ff, d_model])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let gate = silu(x @ self.w_gate)
+        let up = x @ self.w_up
+        return (gate * up) @ self.w_down
+
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+    ffn_norm: RMSNorm = RMSNorm(d_model)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x))
+        return h + self.ffn.forward(self.ffn_norm.forward(h))
+
+model TinyCoder:
+    embed: Tensor = randn([256, 64])
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 176)
+    norm: RMSNorm = RMSNorm(64)
+
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        # embedding_lookup requires 1D indices, returns [seq, d_model]
+        # Reshape to [1, seq, d_model] for batched attention
+        let emb = embedding_lookup(self.embed, input_ids)
+        let es = emb.shape
+        let x = emb.reshape([1, es[0], es[1]])
+        for block in self.blocks:
+            x = block.forward(x)
+        x = self.norm.forward(x)
+        return x @ self.embed.transpose(0, 1)
+
+let m = TinyCoder()
+let tokens = zeros([8])
+let logits = m.forward(tokens)
+let s = logits.shape
+print(s[0])
+print(s[1])
+print(s[2])
+# Expected: 1, 8, 256
+
+print("coder50m_forward: PASS")
