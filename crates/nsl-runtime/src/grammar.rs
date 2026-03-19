@@ -125,13 +125,30 @@ impl GrammarFSM {
 }
 
 // ---------------------------------------------------------------------------
+// Per-request grammar FSM state for constrained decoding (M44b)
+// ---------------------------------------------------------------------------
+
+/// Per-request grammar FSM state for constrained decoding.
+#[derive(Clone, Debug)]
+pub struct GrammarRequestState {
+    pub current_state: u32,
+    pub active: bool,
+}
+
+impl GrammarRequestState {
+    pub fn new(start_state: u32) -> Self {
+        GrammarRequestState { current_state: start_state, active: true }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Global context + FFI
 // ---------------------------------------------------------------------------
 
-static GRAMMAR_CTX: Mutex<Option<GrammarContext>> = Mutex::new(None);
+pub(crate) static GRAMMAR_CTX: Mutex<Option<GrammarContext>> = Mutex::new(None);
 
-struct GrammarContext {
-    fsm: GrammarFSM,
+pub(crate) struct GrammarContext {
+    pub(crate) fsm: GrammarFSM,
 }
 
 /// Initialize the grammar FSM from a pre-compiled token alignment table.

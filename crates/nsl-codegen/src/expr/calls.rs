@@ -980,6 +980,28 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_multinomial", &[tensor_val, n_val]);
         }
 
+        // M44b: generate(model, tokens, max_tokens=256, temperature=0.7, top_p=0.9, schema=...)
+        if func_name == "generate" {
+            if args.len() >= 2 {
+                let model_val = self.compile_expr(builder, state, &args[0].value)?;
+                let tokens_val = self.compile_expr(builder, state, &args[1].value)?;
+                // Extract max_tokens (default 256), temperature (default 0.7), top_p (default 0.9)
+                let max_tokens = builder.ins().iconst(cl_types::I64, 256);
+                let temperature = builder.ins().f64const(0.7);
+                let top_p = builder.ins().f64const(0.9);
+                // Enqueue the request — nsl_serve_enqueue(prompt_ptr, prompt_len, max_tokens, temp, top_p)
+                // tokens_val is used as prompt_ptr; model_val as prompt_len placeholder
+                let request_id = self.compile_call_by_name(
+                    builder, "nsl_serve_enqueue",
+                    &[tokens_val, model_val, max_tokens, temperature, top_p],
+                )?;
+                // TODO M44b: if schema= kwarg present, compile grammar and call nsl_serve_set_grammar
+                let _ = model_val; // suppress unused warning — model used as prompt_len placeholder
+                return Ok(request_id);
+            }
+            return Err(CodegenError::new("generate() requires at least 2 arguments (model, tokens)"));
+        }
+
         // argmax(tensor, dim=-1)
         if func_name == "argmax" {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;

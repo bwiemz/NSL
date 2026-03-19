@@ -22,6 +22,8 @@ pub struct InferenceRequest {
     pub kv_seq_id: Option<u64>,
     pub priority: i64,
     pub total_tokens: usize,
+    /// M44b: Per-request grammar FSM state for constrained decoding.
+    pub grammar_state: Option<crate::grammar::GrammarRequestState>,
 }
 
 impl InferenceRequest {
@@ -44,6 +46,7 @@ impl InferenceRequest {
             kv_seq_id: None,
             priority: 0,
             total_tokens: total,
+            grammar_state: None,
         }
     }
 
