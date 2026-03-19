@@ -1,0 +1,68 @@
+from nsl.nn.rope import RotaryEmbedding
+
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int):
+    # Store dims as tensor fields for method access
+    _d_model: Tensor = full([1], float(d_model))
+    _n_heads: Tensor = full([1], float(n_heads))
+    _n_kv_heads: Tensor = full([1], float(n_kv_heads))
+    _head_dim: Tensor = full([1], float(d_model // n_heads))
+    _n_rep: Tensor = full([1], float(n_heads // n_kv_heads))
+
+    # Projections
+    wq: Tensor = randn([d_model, d_model])
+    wk: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)])
+    wv: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)])
+    wo: Tensor = randn([d_model, d_model])
+
+    # RoPE
+    rope: RotaryEmbedding = RotaryEmbedding(d_model // n_heads, 1024, 10000.0)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let s = x.shape
+        let batch = s[0]
+        let seq_len = s[1]
+        let dm = int(self._d_model.item())
+        let nh = int(self._n_heads.item())
+        let nkv = int(self._n_kv_heads.item())
+        let hd = int(self._head_dim.item())
+        let n_rep = int(self._n_rep.item())
+
+        # Project Q, K, V
+        let q = x @ self.wq
+        let k = x @ self.wk
+        let v = x @ self.wv
+
+        # Reshape to [batch, seq, heads, head_dim] then transpose to [batch, heads, seq, head_dim]
+        let q4 = q.reshape([batch, seq_len, nh, hd]).transpose(1, 2)
+        let k4 = k.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
+        let v4 = v.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
+
+        # Apply RoPE to Q and K
+        let q_rope = self.rope.forward(q4, seq_len)
+        let k_rope = self.rope.forward(k4, seq_len)
+
+        # GQA: expand KV heads to match Q heads
+        # reshape [B, nkv, S, D] -> [B, nkv, 1, S, D]
+        # expand  [B, nkv, n_rep, S, D]
+        # reshape [B, nh, S, D]
+        let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
+        let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+        let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
+        let v_exp = v5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+
+        # Attention: QK^T / sqrt(d) + causal mask
+        let scale_denom = sqrt(full([1], float(hd)))
+        let scores = (q_rope @ k_exp.transpose(2, 3)) / scale_denom
+        let mask = causal_mask(seq_len)
+        let masked = scores + mask
+        let attn_weights = softmax(masked, 3)
+
+        # Weighted sum of values
+        let attn_out = attn_weights @ v_exp
+
+        # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, d_model]
+        let attn_t = attn_out.transpose(1, 2)
+        let attn_flat = attn_t.reshape([batch, seq_len, dm])
+
+        # Output projection
+        return attn_flat @ self.wo

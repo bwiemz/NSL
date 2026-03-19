@@ -104,23 +104,21 @@ impl Compiler<'_> {
 
         // Promote int -> float if mixed types
         if is_float {
-            if !left_is_float {
-                // fcvt_from_sint requires I32 or I64; widen sub-I32 ints first
-                let lhs_ty = builder.func.dfg.value_type(lhs);
-                if lhs_ty.is_float() {
-                    // Already float (detected by CL type), no conversion needed
-                } else if lhs_ty.bits() < 32 {
+            // Check actual Cranelift value types — the semantic type may claim "Float"
+            // (e.g. Int / Int → Float) but the codegen may have emitted sdiv (i64).
+            // Always check the actual IR value type to decide whether conversion is needed.
+            let lhs_cl_ty = builder.func.dfg.value_type(lhs);
+            if !lhs_cl_ty.is_float() {
+                if lhs_cl_ty.bits() < 32 {
                     lhs = builder.ins().sextend(cl_types::I64, lhs);
                     lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
                 } else {
                     lhs = builder.ins().fcvt_from_sint(cl_types::F64, lhs);
                 }
             }
-            if !right_is_float {
-                let rhs_ty = builder.func.dfg.value_type(rhs);
-                if rhs_ty.is_float() {
-                    // Already float (detected by CL type), no conversion needed
-                } else if rhs_ty.bits() < 32 {
+            let rhs_cl_ty = builder.func.dfg.value_type(rhs);
+            if !rhs_cl_ty.is_float() {
+                if rhs_cl_ty.bits() < 32 {
                     rhs = builder.ins().sextend(cl_types::I64, rhs);
                     rhs = builder.ins().fcvt_from_sint(cl_types::F64, rhs);
                 } else {

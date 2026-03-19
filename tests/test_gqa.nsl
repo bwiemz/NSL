@@ -1,0 +1,16 @@
+from nsl.nn.gqa import GroupedQueryAttention
+
+let attn = GroupedQueryAttention(64, 4, 2)
+
+# Dummy input: [batch=1, seq=8, d_model=64]
+let x = randn([1, 8, 64])
+
+let out = attn.forward(x)
+
+let s = out.shape
+print(s[0])
+print(s[1])
+print(s[2])
+# Expected: 1, 8, 64
+
+print("gqa: PASS")

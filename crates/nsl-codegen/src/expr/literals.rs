@@ -42,6 +42,13 @@ impl Compiler<'_> {
         let push_ref = self.module.declare_func_in_func(push_id, builder.func);
         for elem in elements {
             let val = self.compile_expr(builder, state, elem)?;
+            // nsl_list_push expects i64; convert f64 values (e.g. from Int / Int
+            // which the semantic pass types as Float) to i64 via fcvt_to_sint.
+            let val = if builder.func.dfg.value_type(val).is_float() {
+                builder.ins().fcvt_to_sint_sat(cl_types::I64, val)
+            } else {
+                val
+            };
             builder.ins().call(push_ref, &[list_ptr, val]);
         }
         Ok(list_ptr)
