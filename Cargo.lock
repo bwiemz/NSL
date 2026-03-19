@@ -1127,16 +1127,19 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "half",
  "insta",
  "nsl-ast",
  "nsl-errors",
  "nsl-lexer",
  "nsl-runtime",
  "nsl-semantic",
+ "safetensors",
  "serde_json",
  "sha2",
  "string-interner",
  "target-lexicon 0.12.16",
+ "tempfile",
 ]
 
 [[package]]

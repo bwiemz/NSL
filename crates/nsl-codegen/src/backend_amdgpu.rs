@@ -98,7 +98,7 @@ fn lower_op_to_amdgpu(op: &KirOp, ir: &KernelIR) -> String {
             format!("{}_dword v[{}:{}], v{}", prefix, ptr, ptr + 1, val)
         }
         KirOp::Const(dst, c) => format!("; const v{} = {:?}", dst, c),
-        _ => format!("; unhandled op"),
+        _ => "; unhandled op".to_string(),
     }
 }
 

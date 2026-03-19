@@ -264,14 +264,14 @@ pub extern "C" fn nsl_cross_attention(
             for qi in 0..sq {
                 // Compute attention scores
                 let mut scores = vec![0.0f32; sk];
-                for ki in 0..sk {
+                for (ki, score) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0f32;
                     for di in 0..dh {
                         let q_idx = bi * sq * d + qi * d + hi * dh + di;
                         let k_idx = bi * sk * d + ki * d + hi * dh + di;
                         dot += qd[q_idx] * kd[k_idx];
                     }
-                    scores[ki] = dot * scale;
+                    *score = dot * scale;
                 }
                 // Numerically stable softmax
                 let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -286,9 +286,9 @@ pub extern "C" fn nsl_cross_attention(
                 // Weighted sum of values
                 for di in 0..dh {
                     let mut val = 0.0f32;
-                    for ki in 0..sk {
+                    for (ki, score) in scores.iter().enumerate() {
                         let v_idx = bi * sk * d + ki * d + hi * dh + di;
-                        val += scores[ki] * vd[v_idx];
+                        val += score * vd[v_idx];
                     }
                     od[bi * sq * d + qi * d + hi * dh + di] = val;
                 }

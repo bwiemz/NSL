@@ -103,7 +103,7 @@ pub extern "C" fn nsl_get_last_error() -> i64 {
         let borrow = e.borrow();
         match borrow.as_deref() {
             Some(msg) => msg.as_ptr() as i64,
-            None => b"\0".as_ptr() as i64,
+            None => c"".as_ptr() as i64,
         }
     })
 }

@@ -21,7 +21,7 @@ pub fn lower_kir_to_msl(ir: &KernelIR) -> Vec<u8> {
     writeln!(msl).unwrap();
 
     // Kernel signature
-    write!(msl, "kernel void {}(\n", ir.name).unwrap();
+    writeln!(msl, "kernel void {}(", ir.name).unwrap();
     for (i, param) in ir.params.iter().enumerate() {
         let msl_type = kir_type_to_msl(&param.ty);
         let attr = match param.address_space {

@@ -194,8 +194,8 @@ impl WeightEntry {
     /// Compute sparsity statistics for this weight tensor.
     /// Results are cached on first call.
     pub fn analyze_sparsity(&mut self, config: &WeightAwareConfig) -> &SparsityInfo {
-        if self.sparsity.is_some() {
-            return self.sparsity.as_ref().unwrap();
+        if let Some(ref info) = self.sparsity {
+            return info;
         }
 
         let bw = self.dtype.byte_width();
@@ -816,6 +816,9 @@ impl WeightIntegrity {
 // Weight Analysis Report
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Cloned weight entry fields used for analysis without mutating the original WeightMap.
+type AnalysisEntry = (String, Vec<u8>, Vec<usize>, WeightDType, usize);
+
 /// Run the full weight analysis pass and print a report to stderr.
 /// This is invoked by `nsl check --weight-analysis`.
 ///
@@ -836,7 +839,7 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
     let mut total_elements = 0usize;
 
     // Clone entry data for analysis to avoid mutating the original WeightMap
-    let mut analysis_entries: Vec<(String, Vec<u8>, Vec<usize>, WeightDType, usize)> =
+    let mut analysis_entries: Vec<AnalysisEntry> =
         weight_map.entries().map(|(name, entry)| {
             (name.clone(), entry.data.clone(), entry.shape.clone(), entry.dtype, entry.num_elements)
         }).collect();
