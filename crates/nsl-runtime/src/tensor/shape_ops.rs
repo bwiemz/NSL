@@ -1013,3 +1013,74 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 
     out_ptr
 }
+
+/// Fused rotate_half for RoPE (LLaMA-2 half-split variant):
+/// rotate_half(x) = cat(-x[..., D/2:], x[..., :D/2], dim=-1)
+///
+/// For each contiguous chunk of `last_dim` elements in the flattened data:
+///   output[0..half] = -input[half..last_dim]   (negate second half)
+///   output[half..last_dim] = input[0..half]     (copy first half)
+#[no_mangle]
+pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let ndim = tensor.ndim as usize;
+
+    if ndim == 0 {
+        eprintln!("nsl: rotate_half requires at least 1 dimension");
+        std::process::abort();
+    }
+
+    let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
+    if last_dim % 2 != 0 {
+        eprintln!(
+            "nsl: rotate_half requires even last dimension, got {}",
+            last_dim
+        );
+        std::process::abort();
+    }
+    let half = last_dim / 2;
+    let total = tensor.len as usize;
+    let num_chunks = total / last_dim;
+
+    let shape = NslTensor::copy_shape(tensor.shape, tensor.ndim);
+    let strides = NslTensor::compute_strides(shape, tensor.ndim);
+
+    let data: *mut c_void = if tensor.dtype == 1 {
+        let buf = checked_alloc(total * std::mem::size_of::<f32>()) as *mut f32;
+        let src = tensor.data_f32();
+        for chunk in 0..num_chunks {
+            let base = chunk * last_dim;
+            for i in 0..half {
+                // output[0..half] = -input[half..last_dim]
+                unsafe { *buf.add(base + i) = -(*src.add(base + half + i)) };
+                // output[half..last_dim] = input[0..half]
+                unsafe { *buf.add(base + half + i) = *src.add(base + i) };
+            }
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
+        let src = tensor.data_f64();
+        for chunk in 0..num_chunks {
+            let base = chunk * last_dim;
+            for i in 0..half {
+                unsafe { *buf.add(base + i) = -(*src.add(base + half + i)) };
+                unsafe { *buf.add(base + half + i) = *src.add(base + i) };
+            }
+        }
+        buf as *mut c_void
+    };
+
+    let result = Box::new(NslTensor {
+        data,
+        shape,
+        strides,
+        ndim: tensor.ndim,
+        len: tensor.len,
+        refcount: AtomicI64::new(1),
+        device: tensor.device,
+        dtype: tensor.dtype,
+        owns_data: 1,
+    });
+    Box::into_raw(result) as i64
+}

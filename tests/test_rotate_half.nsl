@@ -1,0 +1,8 @@
+let x = arange(0.0, 8.0)
+let x2 = x.reshape([2, 4])
+let r = rotate_half(x2)
+print(r)
+# For row [0,1,2,3]: rotate_half = [-2,-3,0,1]
+# For row [4,5,6,7]: rotate_half = [-6,-7,4,5]
+
+print("rotate_half: PASS")

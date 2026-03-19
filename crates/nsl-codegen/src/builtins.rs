@@ -175,6 +175,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor trig (RoPE support)
     ("nsl_tensor_sin", &[types::I64], Some(types::I64)),
     ("nsl_tensor_cos", &[types::I64], Some(types::I64)),
+    // Fused rotate_half (RoPE support)
+    ("nsl_tensor_rotate_half", &[types::I64], Some(types::I64)),
     ("nsl_tensor_softmax", &[types::I64, types::I64], Some(types::I64)),
     // Slice & Cat (M15)
     ("nsl_tensor_slice", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
