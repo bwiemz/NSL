@@ -1518,6 +1518,10 @@ impl Compiler<'_> {
         let false_val = builder.ins().iconst(cl_types::I8, 0);
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
+        // 7e2. Gradient clipping: clip global norm to 1.0 before optimizer step
+        let max_norm_val = builder.ins().f64const(1.0);
+        self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
+
         // 7f. Optimizer step: for each param, call optimizer step function
         let optimizer_fn_name = match optimizer_name.as_str() {
             "sgd" => "nsl__optim__sgd__sgd_step",
