@@ -4,21 +4,25 @@
 fn sample_top_k(logits: Tensor, k: int, temperature: float) -> Tensor:
     let scaled = logits / temperature
     let result = topk(scaled, k)
-    let probs = softmax(result["values"], dim = -1)
+    let values = result["values"]
+    let indices = result["indices"]
+    let probs = softmax(values, -1)
     let sampled = multinomial(probs, 1)
-    return result["indices"].gather(-1, sampled)
+    return gather(indices, -1, sampled)
 
 fn sample_top_p(logits: Tensor, p: float, temperature: float) -> Tensor:
     let scaled = logits / temperature
-    let probs = softmax(scaled, dim = -1)
-    let n = probs.shape(-1)
+    let probs = softmax(scaled, -1)
+    let n = probs.shape[-1]
     let result = topk(probs, n)
-    let cumulative = result["values"].cumsum(dim = -1)
-    let shifted = cumulative - result["values"]
+    let values = result["values"]
+    let indices = result["indices"]
+    let cumulative = values.cumsum(-1)
+    let shifted = cumulative - values
     let mask = lt_scalar(shifted, p)
-    let filtered = result["values"] * mask
+    let filtered = values * mask
     let sampled = multinomial(filtered, 1)
-    return result["indices"].gather(-1, sampled)
+    return gather(indices, -1, sampled)
 
 fn sample_greedy(logits: Tensor) -> Tensor:
-    return argmax(logits, dim = -1)
+    return argmax(logits, -1)

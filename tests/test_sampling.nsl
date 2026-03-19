@@ -1,0 +1,17 @@
+# tests/test_sampling.nsl
+from nsl.inference.sampling import sample_top_k
+from nsl.inference.sampling import sample_top_p
+from nsl.inference.sampling import sample_greedy
+
+let logits = randn([1, 100])
+
+let token_k = sample_top_k(logits, 10, 0.8)
+print(token_k)
+
+let token_p = sample_top_p(logits, 0.9, 0.8)
+print(token_p)
+
+let token_g = sample_greedy(logits)
+print(token_g)
+
+print("sampling: PASS")
