@@ -1,3 +1,4 @@
+mod debug;
 mod formatter;
 mod loader;
 mod mangling;
@@ -243,6 +244,24 @@ enum Cli {
         /// Check mode: exit non-zero if changes needed
         #[arg(long)]
         check: bool,
+    },
+
+    /// Read and analyze a tensor operation trace (.nsltrace binary)
+    Debug {
+        /// Path to the .nsltrace binary file
+        file: PathBuf,
+
+        /// Find first NaN/Inf operation
+        #[arg(long)]
+        find_nan: bool,
+
+        /// Compare with another trace file
+        #[arg(long)]
+        diff: Option<PathBuf>,
+
+        /// Export to Chrome tracing JSON file
+        #[arg(long)]
+        export_chrome: Option<PathBuf>,
     },
 }
 
@@ -617,6 +636,19 @@ fn main() {
         }
         Cli::Fmt { files, check } => {
             run_fmt(&files, check);
+        }
+        Cli::Debug {
+            file,
+            find_nan,
+            diff,
+            export_chrome,
+        } => {
+            debug::run_debug(
+                &file,
+                find_nan,
+                diff.as_deref(),
+                export_chrome.as_deref(),
+            );
         }
     }
 }
