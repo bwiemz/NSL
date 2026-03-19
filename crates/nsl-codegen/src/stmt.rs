@@ -1251,7 +1251,7 @@ impl Compiler<'_> {
         let mut beta1_value: f64 = 0.9;
         let mut beta2_value: f64 = 0.999;
         let mut eps_value: f64 = 1e-8;
-        let mut step_body: Option<&nsl_ast::stmt::Block> = None;
+        let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
         let mut callbacks: Vec<&nsl_ast::block::CallbackDef> = Vec::new();
         let mut scheduler_name = String::new();
         let mut scheduler_args: Vec<(String, f64)> = Vec::new();
@@ -1316,8 +1316,8 @@ impl Compiler<'_> {
                         }
                     }
                 }
-                TrainSection::Step { body, .. } => {
-                    step_body = Some(body);
+                TrainSection::Step { param, body } => {
+                    step_body = Some((body, *param));
                 }
                 TrainSection::Callbacks(cbs) => {
                     callbacks.extend(cbs.iter());
@@ -1347,7 +1347,7 @@ impl Compiler<'_> {
             return Err(CodegenError::new("train block requires an optimizer section"));
         }
 
-        let step_body = step_body.ok_or_else(|| {
+        let (step_body, step_param_sym) = step_body.ok_or_else(|| {
             CodegenError::new("train block requires a step section")
         })?;
 
@@ -1484,7 +1484,15 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
 
-        // 7b. Compile step body stmts
+        // 7b. Declare step parameter (e.g. `batch`) as a variable in scope
+        // so that batch.input_ids / batch.labels resolve to field lookups.
+        let step_param_var = state.new_variable();
+        builder.declare_var(step_param_var, cl_types::I64);
+        let null_ptr = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(step_param_var, null_ptr);
+        state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
+
+        // Compile step body stmts
         // Suppress tensor temporary cleanup — tape holds raw pointers to intermediates.
         state.in_tape_region = true;
         for stmt in &step_body.stmts {
@@ -1867,7 +1875,13 @@ impl Compiler<'_> {
         // via the FFI calls; codegen emits the per-step work that each
         // stage executes.
         for section in &train.sections {
-            if let TrainSection::Step { body, .. } = section {
+            if let TrainSection::Step { param, body } = section {
+                // Declare step param (e.g. `batch`) as variable in scope
+                let pv = state.new_variable();
+                builder.declare_var(pv, cl_types::I64);
+                let null_ptr = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(pv, null_ptr);
+                state.variables.insert(*param, (pv, cl_types::I64));
                 for stmt in &body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }

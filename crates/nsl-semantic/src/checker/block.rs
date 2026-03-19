@@ -24,12 +24,28 @@ impl<'a> TypeChecker<'a> {
                     // base_lr and step as the first two arguments, so the user-facing
                     // arg count is intentionally less than the stdlib signature.
                 }
-                TrainSection::Step { param: _, body } => {
+                TrainSection::Step { param, body } => {
                     has_step = true;
-                    self.check_block(body, ScopeKind::Block);
+                    // Declare the step parameter (e.g. `batch`) as Unknown type
+                    // so that batch.input_ids / batch.labels resolve in scope.
+                    let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+                    let prev = self.current_scope;
+                    self.current_scope = scope;
+                    self.declare_symbol(*param, Type::Unknown, body.span, false, true);
+                    for s in &body.stmts {
+                        self.check_stmt(s);
+                    }
+                    self.current_scope = prev;
                 }
-                TrainSection::Eval { param: _, body } => {
-                    self.check_block(body, ScopeKind::Block);
+                TrainSection::Eval { param, body } => {
+                    let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+                    let prev = self.current_scope;
+                    self.current_scope = scope;
+                    self.declare_symbol(*param, Type::Unknown, body.span, false, true);
+                    for s in &body.stmts {
+                        self.check_stmt(s);
+                    }
+                    self.current_scope = prev;
                 }
                 TrainSection::Callbacks(callbacks) => {
                     for cb in callbacks {

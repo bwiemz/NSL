@@ -1,0 +1,26 @@
+# models/coder50m/finetune.nsl
+# Stage 2: Finetune on NSL + general code mix
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+model_load(m, "checkpoints/pretrain_final.nslm")
+print("Loaded pretrained checkpoint. Starting finetuning...")
+
+let tokens = load_mmap("data/finetune/mixed_tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=16, seq_len=1024, shuffle=true, drop_last=true)
+
+train(model=m, epochs=2):
+    optimizer: AdamW(lr=0.00001, weight_decay=0.1)
+    scheduler: warmup_cosine(warmup_steps=100, total_steps=1220, min_lr=0.000001)
+    step(batch):
+        let logits = m.forward(batch.input_ids)
+        let loss = cross_entropy(logits, batch.labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 50 == 0:
+                print(loss)
+
+model_save(m, "checkpoints/coder50m_final.nslm")
+print("Finetuning complete.")

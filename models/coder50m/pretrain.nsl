@@ -1,0 +1,28 @@
+# models/coder50m/pretrain.nsl
+# Stage 1: Pretrain on 10B StarCoder tokens
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+print("NSL-Coder-50M initialized. Starting pretraining...")
+
+# Load pretokenized data (u16 format)
+let tokens = load_mmap("data/pretokenized/tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)
+
+train(model=m, epochs=1):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1)
+    scheduler: warmup_cosine(warmup_steps=3000, total_steps=305000, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward(batch.input_ids)
+        let loss = cross_entropy(logits, batch.labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 100 == 0:
+                print(loss)
+            if step % 10000 == 0:
+                model_save(m, "checkpoints/pretrain.nslm")
+
+model_save(m, "checkpoints/pretrain_final.nslm")
+print("Pretraining complete.")

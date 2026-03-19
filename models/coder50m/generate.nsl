@@ -1,0 +1,43 @@
+# models/coder50m/generate.nsl
+# Interactive code generation with NSL-Coder-50M
+
+from model import NSLCoder
+from nsl.inference.sampling import sample_top_k
+
+let m = NSLCoder()
+model_load(m, "checkpoints/coder50m_final.nslm")
+print("NSL-Coder-50M loaded (48.8M params, f32)")
+print("Type a code prompt, then press Enter to generate.")
+print("Type 'quit' to exit.")
+print("")
+
+let tok = tokenizer_load("data/tokenizer/codeforge.json")
+
+let running = true
+while running:
+    print(">>> ")
+    let prompt = read_line()
+
+    if prompt == "quit":
+        running = false
+    else:
+        let input_ids = tokenizer_encode(tok, prompt)
+        let seq = input_ids.reshape([1, input_ids.shape[0]])
+        let generated = seq
+        let gen_count = 0
+
+        while gen_count < 512:
+            let logits = m.forward(generated)
+            let last_logits = logits.select(1, logits.shape[1] - 1)
+            let next_token = sample_top_k(last_logits, 40, 0.8)
+            let token_str = tokenizer_decode(tok, next_token)
+            print(token_str)
+
+            let next_2d = next_token.reshape([1, 1])
+            generated = tensor_cat([generated, next_2d], 1)
+            gen_count = gen_count + 1
+
+            if token_str == "\n\n":
+                gen_count = 512
+
+        print("")
