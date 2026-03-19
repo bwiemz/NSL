@@ -1,0 +1,71 @@
+# tests/test_dynamic_seq_len.nsl
+# Verify the model handles different sequence lengths (critical for prefill/decode)
+# Tests: short prefill (4), longer prefill (8), single-token decode (1)
+
+from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+
+model SwiGLUFFN(d_model: int, d_ff: int):
+    w_gate: Tensor = randn([d_model, d_ff])
+    w_up: Tensor = randn([d_model, d_ff])
+    w_down: Tensor = randn([d_ff, d_model])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let gate = silu(x @ self.w_gate)
+        let up = x @ self.w_up
+        return (gate * up) @ self.w_down
+
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+    ffn_norm: RMSNorm = RMSNorm(d_model)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x))
+        return h + self.ffn.forward(self.ffn_norm.forward(h))
+
+model TinyCoder:
+    embed: Tensor = randn([256, 64])
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 176)
+    norm: RMSNorm = RMSNorm(64)
+
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        let emb = embedding_lookup(self.embed, input_ids)
+        let es = emb.shape
+        let x = emb.reshape([1, es[0], es[1]])
+        for block in self.blocks:
+            x = block.forward(x)
+        x = self.norm.forward(x)
+        return x @ self.embed.transpose(0, 1)
+
+let m = TinyCoder()
+
+# Test 1: seq_len = 4 (short prefill)
+let t1 = zeros([4])
+let l1 = m.forward(t1)
+let s1 = l1.shape
+print(s1[0])
+print(s1[1])
+print(s1[2])
+# Expected: 1, 4, 256
+
+# Test 2: seq_len = 8 (longer prefill)
+let t2 = zeros([8])
+let l2 = m.forward(t2)
+let s2 = l2.shape
+print(s2[0])
+print(s2[1])
+print(s2[2])
+# Expected: 1, 8, 256
+
+# Test 3: seq_len = 1 (single-token decode)
+let t3 = zeros([1])
+let l3 = m.forward(t3)
+let s3 = l3.shape
+print(s3[0])
+print(s3[1])
+print(s3[2])
+# Expected: 1, 1, 256
+
+print("dynamic_seq_len: PASS")
