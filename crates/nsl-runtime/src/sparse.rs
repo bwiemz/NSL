@@ -323,16 +323,24 @@ pub extern "C" fn nsl_sparse_free(sparse_ptr: i64) -> i64 {
     if sparse_ptr == 0 { return 0; }
     let sparse = unsafe { Box::from_raw(sparse_ptr as *mut NslSparseTensor) };
     if sparse.owns_data == 1 {
-        // Free owned index and data arrays
         let n = sparse.nnz as usize;
-        if !sparse.indices_0.is_null() && n > 0 {
-            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_0, n)) };
+
+        // BUG-1 fix: CSR indices_0 is row_ptr with length (rows+1), not nnz.
+        // COO indices_0 is row_indices with length nnz.
+        let idx0_len = if sparse.format == SparseFmtId::Csr as u8 {
+            sparse.rows as usize + 1
+        } else {
+            n
+        };
+
+        if !sparse.indices_0.is_null() && idx0_len > 0 {
+            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_0, idx0_len)) };
         }
         if !sparse.indices_1.is_null() && n > 0 {
             let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_1, n)) };
         }
         if !sparse.data.is_null() && n > 0 {
-            let bytes = n * 8; // f64 = 8 bytes (approximate; exact depends on dtype)
+            let bytes = n * 8;
             let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.data, bytes)) };
         }
     }

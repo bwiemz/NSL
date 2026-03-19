@@ -114,6 +114,10 @@ pub extern "C" fn nsl_register_custom_dtype(
     let pack_fn = pack_fn as *const c_void;
     let unpack_fn = unpack_fn as *const c_void;
 
+    // RISKY-3 fix: guard against null name_ptr or negative name_len
+    if name_ptr.is_null() || name_len <= 0 {
+        return;
+    }
     let name = unsafe {
         let slice = std::slice::from_raw_parts(name_ptr, name_len as usize);
         String::from_utf8_lossy(slice).into_owned()
@@ -520,37 +524,51 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
     }
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // BUG-2 fix: Extract all fields before Box::from_raw to avoid aliasing UB.
+    // The &mut borrow from from_ptr must end before we create the Box.
+    let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data) = {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        tensor.refcount -= 1;
+        if tensor.refcount > 0 {
+            return; // still referenced — don't free
+        }
+        (
+            true,
+            tensor.data,
+            tensor.data_byte_size(),
+            tensor.shape,
+            tensor.strides,
+            (tensor.ndim as usize) * std::mem::size_of::<i64>(),
+            tensor.device,
+            tensor.owns_data,
+        )
+        // &mut borrow ends here
+    };
 
-    tensor.refcount -= 1;
-    if tensor.refcount <= 0 {
-        let data_size = tensor.data_byte_size();
-        let shape_size = (tensor.ndim as usize) * std::mem::size_of::<i64>();
-        let strides_size = shape_size;
-
+    if should_free {
         unsafe {
-            if tensor.owns_data != 0 {
-                if tensor.device > 0 {
+            if owns_data != 0 {
+                if device > 0 {
                     #[cfg(feature = "cuda")]
                     {
-                        crate::cuda::inner::free_managed(tensor.data);
+                        crate::cuda::inner::free_managed(data_ptr);
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
-                        checked_free(tensor.data as *mut u8, data_size);
+                        checked_free(data_ptr as *mut u8, data_size);
                     }
                 } else {
-                    checked_free(tensor.data as *mut u8, data_size);
+                    checked_free(data_ptr as *mut u8, data_size);
                 }
             }
-            if !tensor.shape.is_null() {
-                checked_free(tensor.shape as *mut u8, shape_size);
+            if !shape_ptr.is_null() {
+                checked_free(shape_ptr as *mut u8, shape_size);
             }
-            if !tensor.strides.is_null() {
-                checked_free(tensor.strides as *mut u8, strides_size);
+            if !strides_ptr.is_null() {
+                checked_free(strides_ptr as *mut u8, shape_size);
             }
             crate::fp8::remove_fp8_scale(tensor_ptr);
-            drop(Box::from_raw(tensor as *mut NslTensor));
+            drop(Box::from_raw(tensor_ptr as *mut NslTensor));
         }
     }
 }
