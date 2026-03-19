@@ -30,6 +30,7 @@ use nsl_errors::Diagnostic;
 use nsl_lexer::Interner;
 
 use crate::checker::{TypeChecker, TypeMap};
+use crate::effects::EffectChecker;
 use crate::scope::ScopeMap;
 use crate::types::Type;
 
@@ -63,6 +64,19 @@ pub fn analyze_with_imports(
     let mut checker = TypeChecker::new(interner, &mut scopes);
     checker.set_import_types(import_types);
     checker.check_module(module);
+
+    // M51: Run effect analysis.
+    // The EffectChecker requires a call graph (which functions call which) to
+    // propagate effects transitively. Building that call graph requires walking
+    // the typed AST and recording caller->callee edges — the TypeChecker does
+    // not currently emit this information. For now we instantiate the checker
+    // so the module is importable and testable; populating the call graph from
+    // the typed AST is the next integration step.
+    let effect_checker = EffectChecker::new();
+    // Once call-graph population is implemented:
+    //   effect_checker.analyze();
+    //   checker.diagnostics.extend(effect_checker.diagnostics);
+    let _ = &effect_checker; // suppress unused-variable warning until full wiring
 
     AnalysisResult {
         diagnostics: checker.diagnostics,

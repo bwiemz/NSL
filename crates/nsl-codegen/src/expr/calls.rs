@@ -402,7 +402,7 @@ impl Compiler<'_> {
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
             let rt_name = format!("nsl_tensor_{func_name}");
-            return self.compile_call_by_name(builder, &rt_name, &[val]);
+            return self.compile_traced_call(builder, &rt_name, &[val]);
         }
         // Activation functions (M15): relu, gelu, silu, sigmoid -- single tensor arg
         if matches!(func_name.as_str(), "relu" | "gelu" | "silu" | "sigmoid")
@@ -413,7 +413,7 @@ impl Compiler<'_> {
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
             let rt_name = format!("nsl_tensor_{func_name}");
-            return self.compile_call_by_name(builder, &rt_name, &[val]);
+            return self.compile_traced_call(builder, &rt_name, &[val]);
         }
         // tanh activation: maps NSL name "tanh" to runtime "nsl_tensor_tanh_act"
         if func_name == "tanh" && !self.functions.contains_key(&func_name) {
@@ -430,7 +430,7 @@ impl Compiler<'_> {
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
+            return self.compile_traced_call(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
         }
         if func_name == "clamp" && !self.functions.contains_key(&func_name) {
             if args.len() != 3 {
@@ -668,35 +668,46 @@ impl Compiler<'_> {
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let k_t = self.compile_call_by_name(builder, "nsl_tensor_transpose", &[k_val, dim_m2, dim_m1])?;
-            let scores = self.compile_call_by_name(builder, "nsl_tensor_matmul", &[q_val, k_t])?;
-            let scaled = self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
+            let scores = self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t])?;
+            let scaled = self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
 
             let masked = if causal {
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
                 let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
                 let mask = self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
-                self.compile_call_by_name(builder, "nsl_tensor_add", &[scaled, mask])?
+                self.compile_traced_call(builder, "nsl_tensor_add", &[scaled, mask])?
             } else {
                 scaled
             };
 
             let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
-            let attn_weights = self.compile_call_by_name(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
-            return self.compile_call_by_name(builder, "nsl_tensor_matmul", &[attn_weights, v_val]);
+            let attn_weights = self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
+            return self.compile_traced_call(builder, "nsl_tensor_matmul", &[attn_weights, v_val]);
         }
 
         // sum/mean with dim args -- overload: sum(tensor) or sum(tensor, dim, keepdim)
         if matches!(func_name.as_str(), "sum" | "mean") {
             if args.len() == 1 {
+                // M46: Full reductions (no dim arg) don't have 1-arg deterministic variants;
+                // deterministic swap only applies to the 3-arg sum_dim/mean_dim below.
                 let val = self.compile_expr(builder, state, &args[0].value)?;
                 let rt_name = format!("nsl_tensor_{func_name}");
-                return self.compile_call_by_name(builder, &rt_name, &[val]);
+                return self.compile_traced_call(builder, &rt_name, &[val]);
             } else if args.len() == 3 {
                 let t = self.compile_expr(builder, state, &args[0].value)?;
                 let dim = self.compile_expr(builder, state, &args[1].value)?;
                 let keepdim = self.compile_expr(builder, state, &args[2].value)?;
-                let rt_name = format!("nsl_tensor_{func_name}_dim");
-                return self.compile_call_by_name(builder, &rt_name, &[t, dim, keepdim]);
+                // M46: Swap to deterministic kernel variants when deterministic mode is active
+                let rt_name = if self.compile_options.deterministic {
+                    match func_name.as_str() {
+                        "sum" => "nsl_tensor_reduce_sum_deterministic".to_string(),
+                        "mean" => "nsl_tensor_reduce_mean_deterministic".to_string(),
+                        _ => format!("nsl_tensor_{func_name}_dim"),
+                    }
+                } else {
+                    format!("nsl_tensor_{func_name}_dim")
+                };
+                return self.compile_traced_call(builder, &rt_name, &[t, dim, keepdim]);
             } else {
                 return Err(CodegenError::new(format!("{func_name}() takes 1 or 3 arguments")));
             }

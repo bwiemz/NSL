@@ -179,4 +179,59 @@ impl Compiler<'_> {
             _ => None,
         }
     }
+
+    // ── Trace instrumentation (M45) ─────────────────────────────────
+
+    /// Emit a tensor FFI call, optionally followed by trace recording
+    /// when `compile_options.trace_ops` is enabled.
+    pub(crate) fn compile_traced_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        fn_name: &str,
+        args: &[Value],
+    ) -> Result<Value, CodegenError> {
+        let result = self.compile_call_by_name(builder, fn_name, args)?;
+
+        if self.compile_options.trace_ops {
+            // Emit: nsl_trace_record_op(op_type_id, input0, input1_or_0, result)
+            let op_id = builder.ins().iconst(
+                cl_types::I64,
+                self.trace_op_id(fn_name) as i64,
+            );
+            let in0 = if !args.is_empty() {
+                args[0]
+            } else {
+                builder.ins().iconst(cl_types::I64, 0)
+            };
+            let in1 = if args.len() > 1 {
+                args[1]
+            } else {
+                builder.ins().iconst(cl_types::I64, 0)
+            };
+            self.compile_call_by_name(
+                builder,
+                "nsl_trace_record_op",
+                &[op_id, in0, in1, result],
+            )?;
+        }
+
+        Ok(result)
+    }
+
+    /// Map FFI function name to a trace op type ID.
+    fn trace_op_id(&self, fn_name: &str) -> u16 {
+        match fn_name {
+            "nsl_tensor_add" | "nsl_tensor_add_scalar" => 0,
+            "nsl_tensor_sub" => 1,
+            "nsl_tensor_mul" | "nsl_tensor_mul_scalar" => 2,
+            "nsl_tensor_div" => 3,
+            "nsl_tensor_matmul" => 4,
+            "nsl_tensor_relu" => 5,
+            "nsl_tensor_sigmoid" => 6,
+            "nsl_tensor_softmax" => 7,
+            "nsl_tensor_sum" | "nsl_tensor_sum_dim" => 8,
+            "nsl_tensor_mean" | "nsl_tensor_mean_dim" => 9,
+            _ => 255, // unknown op
+        }
+    }
 }

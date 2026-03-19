@@ -1825,6 +1825,23 @@ impl Compiler<'_> {
         state: &mut FuncState,
         grad: &nsl_ast::block::GradBlock,
     ) -> Result<(), CodegenError> {
+        // M40b: Source-to-source AD strategy selection
+        // When source AD is enabled, attempt to extract a static computation graph
+        // (Wengert list) from the grad block body. If extraction succeeds, the
+        // backward pass can be emitted directly as Cranelift IR (deferred: backward
+        // codegen). If extraction fails (e.g., dynamic control flow), fall through
+        // to the tape-based AD path below.
+        if self.source_ad_enabled {
+            // Future: WengertExtractor would analyze grad.body here.
+            //   let extractor = crate::wengert::WengertExtractor::new();
+            //   if let Ok(graph) = extractor.extract(&grad.body) {
+            //       return self.compile_source_ad_backward(builder, state, grad, &graph);
+            //   }
+            // For now, always fall through to tape AD — backward Cranelift emission
+            // is not yet wired.
+        }
+        // Existing tape-based AD path continues below.
+
         // 1. Compile targets expression to get param tensor ptr
         let targets_val = self.compile_expr(builder, state, &grad.targets)?;
 

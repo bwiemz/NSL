@@ -225,6 +225,17 @@ impl<'a> TypeChecker<'a> {
                     match method_name.as_str() {
                         "reshape" => {
                             let shape = self.extract_shape_from_args(args);
+                            // M49: ShapeAlgebraSolver would prove this reshape correct
+                            // at compile time by extracting DimExpr from the source
+                            // tensor's shape and the target shape, then calling
+                            // solver.prove_eq() to verify the total element counts
+                            // match. Full integration requires:
+                            //   1. Converting both Shape values to DimExpr products
+                            //   2. Feeding known dimension bindings into the solver
+                            //   3. Emitting a compile error (with ProofFailure detail)
+                            //      when the proof fails
+                            // For now, the runtime assertion path (M28 dynamic shapes)
+                            // remains active as fallback.
                             return Type::Tensor {
                                 shape,
                                 dtype: *dtype,

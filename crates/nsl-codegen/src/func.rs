@@ -110,6 +110,26 @@ impl Compiler<'_> {
                 self.compile_call_by_name(&mut builder, "nsl_tape_pause", &[])?;
             }
 
+            // M38b: Set up ownership lowering for this function.
+            // When --linear-types is active and the semantic pass produced ownership
+            // metadata for this function, create an OwnershipLowering tracker and
+            // install it in the function state. During expr codegen, variable use
+            // compilation can consult `state.ownership_lowering` to decide whether
+            // to emit `nsl_tensor_free` at consumption point (linear bindings) or
+            // skip refcount ops entirely.
+            if self.linear_types_enabled {
+                if let Some(fn_ownership) = self.ownership_info.get(&name) {
+                    let mut lowering = crate::ownership::OwnershipLowering::new();
+                    for sym in &fn_ownership.linear_params {
+                        lowering.mark_linear(*sym);
+                    }
+                    for sym in &fn_ownership.shared_params {
+                        lowering.mark_shared(*sym);
+                    }
+                    state.ownership_lowering = Some(lowering);
+                }
+            }
+
             for stmt in &fn_def.body.stmts {
                 self.compile_stmt(&mut builder, &mut state, stmt)?;
             }

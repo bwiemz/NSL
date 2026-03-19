@@ -288,7 +288,7 @@ impl Compiler<'_> {
                 BinOp::MatMul => "nsl_tensor_matmul",
                 _ => return Err(CodegenError::new(format!("unsupported tensor op: {op:?}"))),
             };
-            let result = self.compile_call_by_name(builder, rt_name, &[lhs, rhs])?;
+            let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs])?;
             state.tensor_temporaries.push(result);
             Ok(result)
         } else if left_is_tensor {
@@ -306,18 +306,18 @@ impl Compiler<'_> {
                 rhs
             };
             let result = match op {
-                BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?,
-                BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?,
+                BinOp::Add => self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?,
+                BinOp::Mul => self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?,
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
-                    self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[lhs, neg])?
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg])?
                 }
                 BinOp::Div => {
                     // tensor / scalar = tensor * (1/scalar)
                     let one = builder.ins().f64const(1.0);
                     let inv = builder.ins().fdiv(one, scalar);
-                    self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[lhs, inv])?
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv])?
                 }
                 _ => return Err(CodegenError::new(format!("unsupported tensor-scalar op: {op:?}"))),
             };
@@ -328,8 +328,8 @@ impl Compiler<'_> {
             let lhs_ty = builder.func.dfg.value_type(lhs);
             let scalar = if lhs_ty == cl_types::F64 { lhs } else { builder.ins().fcvt_from_sint(cl_types::F64, lhs) };
             let result = match op {
-                BinOp::Add => self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[rhs, scalar])?,
-                BinOp::Mul => self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[rhs, scalar])?,
+                BinOp::Add => self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar])?,
+                BinOp::Mul => self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar])?,
                 BinOp::Sub => {
                     // scalar - tensor = neg(tensor) + scalar
                     let neg_tensor = self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
@@ -388,8 +388,10 @@ impl Compiler<'_> {
     ) -> Result<Value, CodegenError> {
         let obj_val = self.compile_expr(builder, state, object)?;
         match method {
-            "sum" => self.compile_call_by_name(builder, "nsl_tensor_sum", &[obj_val]),
-            "mean" => self.compile_call_by_name(builder, "nsl_tensor_mean", &[obj_val]),
+            // M46: Full reductions (no dim arg) don't have 1-arg deterministic variants;
+            // deterministic swap only applies to the 3-arg sum_dim/mean_dim in calls.rs.
+            "sum" => self.compile_traced_call(builder, "nsl_tensor_sum", &[obj_val]),
+            "mean" => self.compile_traced_call(builder, "nsl_tensor_mean", &[obj_val]),
             "reshape" => {
                 if args.len() != 1 {
                     return Err(CodegenError::new("reshape() takes exactly 1 argument (shape list)"));

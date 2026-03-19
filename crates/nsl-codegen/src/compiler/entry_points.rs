@@ -26,6 +26,9 @@ pub fn compile(
     compiler.collect_models(&ast.stmts)?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    // M39b: Apply vmap AST transforms to generate batched function variants
+    let _batched_fns = compiler.apply_vmap_transforms(ast);
+    // TODO: register batched_fns for compilation when call-site dispatch is wired
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
@@ -55,6 +58,9 @@ pub fn compile_standalone(
     compiler.collect_models(&ast.stmts)?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    // M39b: Apply vmap AST transforms to generate batched function variants
+    let _batched_fns = compiler.apply_vmap_transforms(ast);
+    // TODO: register batched_fns for compilation when call-site dispatch is wired
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
@@ -82,6 +88,9 @@ pub fn compile_test(
     compiler.collect_models(&ast.stmts)?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    // M39b: Apply vmap AST transforms to generate batched function variants
+    let _batched_fns = compiler.apply_vmap_transforms(ast);
+    // TODO: register batched_fns for compilation when call-site dispatch is wired
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
@@ -141,6 +150,9 @@ pub fn compile_module_with_imports(
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+    // M39b: Apply vmap AST transforms to generate batched function variants
+    let _batched_fns = compiler.apply_vmap_transforms(ast);
+    // TODO: register batched_fns for compilation when call-site dispatch is wired
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
@@ -191,6 +203,9 @@ pub fn compile_entry(
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+    // M39b: Apply vmap AST transforms to generate batched function variants
+    let _batched_fns = compiler.apply_vmap_transforms(ast);
+    // TODO: register batched_fns for compilation when call-site dispatch is wired
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
