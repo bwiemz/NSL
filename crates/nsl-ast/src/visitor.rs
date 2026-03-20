@@ -100,7 +100,7 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
             }
             for member in &m.members {
                 match member {
-                    crate::decl::ModelMember::Method(f) => {
+                    crate::decl::ModelMember::Method(f, _decos) => {
                         for param in &f.params {
                             if let Some(default) = &param.default {
                                 v.visit_expr(default);

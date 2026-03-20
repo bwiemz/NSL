@@ -330,7 +330,7 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                 }
-                ModelMember::Method(fn_def) => {
+                ModelMember::Method(fn_def, _decos) => {
                     let method_ty = self.build_fn_type(fn_def);
                     methods.push((fn_def.name, method_ty));
                 }
@@ -346,7 +346,7 @@ impl<'a> TypeChecker<'a> {
 
         // Pass 2: Check method bodies with complete self type
         for member in &model_def.members {
-            if let ModelMember::Method(fn_def) = member {
+            if let ModelMember::Method(fn_def, _decos) = member {
                 let method_ty = self.build_fn_type(fn_def);
 
                 let method_scope =

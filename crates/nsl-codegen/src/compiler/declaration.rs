@@ -142,7 +142,7 @@ impl Compiler<'_> {
             // Methods
             let mut method_map = HashMap::new();
             for member in &md.members {
-                if let ModelMember::Method(fn_def) = member {
+                if let ModelMember::Method(fn_def, decos) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
 
@@ -185,6 +185,17 @@ impl Compiler<'_> {
                         .declare_function(&mangled, linkage, &method_sig)
                         .map_err(|e| CodegenError::new(format!("failed to declare model method '{mangled}': {e}")))?;
                     self.functions.insert(mangled.clone(), (method_id, method_sig));
+
+                    // M53: Extract @real_time and @wcet_budget from model method decorators
+                    if !decos.is_empty() {
+                        if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                            self.real_time_fns.insert(mangled.clone(), rt);
+                        }
+                        if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                            self.wcet_budget_fns.insert(mangled.clone(), wb);
+                        }
+                    }
+
                     method_map.insert(method_name, mangled);
                 }
             }
@@ -271,7 +282,7 @@ impl Compiler<'_> {
 
                 // Method signatures
                 for member in &md.members {
-                    if let nsl_ast::decl::ModelMember::Method(fn_def) = member {
+                    if let nsl_ast::decl::ModelMember::Method(fn_def, _decos) = member {
                         let method_name = self.resolve_sym(fn_def.name).to_string();
                         let mangled = format!("__nsl_model_{model_name}_{method_name}");
 

@@ -114,13 +114,7 @@ pub fn parse_model_def_stmt(p: &mut Parser) -> Stmt {
         }
 
         if p.at(&TokenKind::Fn) || p.at(&TokenKind::Async) {
-            // Method
-            if !decorators.is_empty() {
-                p.diagnostics.push(
-                    nsl_errors::Diagnostic::warning("decorators on model methods are not yet supported")
-                        .with_label(decorators[0].span, "this decorator will be ignored"),
-                );
-            }
+            // Method — decorators are now preserved in the AST (M53: @real_time support)
             let method_start = p.current_span();
             let is_async = p.eat(&TokenKind::Async);
             p.expect(&TokenKind::Fn);
@@ -148,7 +142,7 @@ pub fn parse_model_def_stmt(p: &mut Parser) -> Stmt {
                 body: body.clone(),
                 is_async,
                 span: method_start.merge(body.span),
-            }));
+            }, decorators));
         } else {
             // Layer/field declaration: name: Type = init_expr
             let member_start = p.current_span();

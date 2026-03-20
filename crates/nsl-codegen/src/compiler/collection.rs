@@ -74,7 +74,7 @@ impl Compiler<'_> {
                         ModelMember::LayerDecl { init: Some(expr), .. } => {
                             self.collect_strings_in_expr(expr)?;
                         }
-                        ModelMember::Method(fn_def) => {
+                        ModelMember::Method(fn_def, _decos) => {
                             for s in &fn_def.body.stmts { self.collect_strings_in_stmt(s)?; }
                         }
                         _ => {}

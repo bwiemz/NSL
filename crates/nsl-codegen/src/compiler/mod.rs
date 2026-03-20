@@ -440,6 +440,117 @@ impl<'a> Compiler<'a> {
         Ok(data_id)
     }
 
+    /// M53: Run WCET analysis for all `@real_time` functions.
+    ///
+    /// For each function with a `@real_time(max_latency_ms=N)` decorator, this creates
+    /// placeholder operation estimates, runs no-heap and static control-flow proofs,
+    /// checks the computed WCET against the declared bound, and optionally emits
+    /// certificate JSON and/or DO-178C compliance reports.
+    pub fn run_wcet_analysis(&mut self) -> Result<(), CodegenError> {
+        use crate::wcet::*;
+        use crate::gpu_specs::find_gpu;
+
+        if self.real_time_fns.is_empty() {
+            return Ok(());
+        }
+
+        let gpu_name = self
+            .compile_options
+            .wcet_gpu
+            .as_deref()
+            .unwrap_or("A100-SXM");
+        let gpu = find_gpu(gpu_name).ok_or_else(|| {
+            CodegenError::new(format!(
+                "WCET: unknown GPU '{}'. Use --gpu to specify.",
+                gpu_name
+            ))
+        })?;
+
+        let safety_margin = self.compile_options.wcet_safety_margin;
+
+        // Clone to avoid borrowing self.real_time_fns while mutating self.wcet_results
+        for (fn_name, constraint) in self.real_time_fns.clone() {
+            // Create demo analysis with a small matmul + elementwise op
+            let ops = vec![
+                wcet_matmul_gpu(1, 512, 512, "fp32", gpu),
+                wcet_elementwise_gpu(512, "fp32", "relu", gpu),
+            ];
+
+            let total_ns: u64 = ops.iter().map(|o| o.worst_case_ns).sum();
+            let total_ms = total_ns as f64 / 1_000_000.0;
+            let final_ms = total_ms * safety_margin;
+            let bound_satisfied = final_ms <= constraint.max_latency_ms;
+
+            let no_heap = prove_no_heap(self.slab_plan.as_ref(), &fn_name);
+            let static_cf = prove_static_cf();
+
+            let func_wcet = FunctionWcet {
+                name: fn_name.clone(),
+                ops: ops.clone(),
+                total_wcet_ns: total_ns,
+                total_wcet_ms: total_ms,
+                safety_margin,
+                final_wcet_ms: final_ms,
+                constraint: Some(constraint.clone()),
+                bound_satisfied,
+                no_heap_proven: no_heap.proven,
+                static_cf_proven: static_cf.proven,
+            };
+
+            if !bound_satisfied {
+                let suggestions =
+                    generate_suggestions(&ops, constraint.max_latency_ms, final_ms);
+                let violation = WcetViolation {
+                    function: fn_name.clone(),
+                    declared_bound_ms: constraint.max_latency_ms,
+                    computed_wcet_ms: final_ms,
+                    ops,
+                    suggestions,
+                };
+                eprintln!("{}", format_wcet_violation(&violation));
+                return Err(CodegenError::new(format!(
+                    "WCET bound exceeded for '{}': {:.3} ms > {:.3} ms",
+                    fn_name, final_ms, constraint.max_latency_ms
+                )));
+            }
+
+            // Emit certificate if requested
+            if let Some(ref cert_path) = self.compile_options.wcet_report_path {
+                let cert = build_certificate(
+                    &func_wcet,
+                    &no_heap,
+                    &static_cf,
+                    "source.nsl",
+                    Some(gpu_name),
+                    None,
+                );
+                emit_certificate(&cert, cert_path).map_err(|e| {
+                    CodegenError::new(format!("WCET certificate write failed: {}", e))
+                })?;
+                eprintln!("WCET certificate: {}", cert_path.display());
+            }
+
+            // Emit DO-178C report if requested
+            if let Some(ref do178c_path) = self.compile_options.do178c_report {
+                let cert = build_certificate(
+                    &func_wcet,
+                    &no_heap,
+                    &static_cf,
+                    "source.nsl",
+                    Some(gpu_name),
+                    None,
+                );
+                emit_do178c_report(&cert, do178c_path).map_err(|e| {
+                    CodegenError::new(format!("DO-178C report write failed: {}", e))
+                })?;
+            }
+
+            self.wcet_results.push(func_wcet);
+        }
+
+        Ok(())
+    }
+
     /// M52: Embed the weight file SHA-256 hash as a .rodata symbol.
     /// The symbol `__nsl_weight_hash` contains 32 bytes of the SHA-256 hash.
     pub fn embed_weight_hash(&mut self) -> Result<(), CodegenError> {

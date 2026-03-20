@@ -99,6 +99,11 @@ pub fn compile(
         eprintln!("[nsl] --memory-report requested (planner integration in progress)");
     }
 
+    // M53: Run WCET analysis for @real_time functions (after codegen, before finalize)
+    if compiler.compile_options.wcet_enabled {
+        compiler.run_wcet_analysis()?;
+    }
+
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     compiler.finalize()
@@ -133,6 +138,12 @@ pub fn compile_standalone(
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_standalone_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
+
+    // M53: Run WCET analysis for @real_time functions
+    if compiler.compile_options.wcet_enabled {
+        compiler.run_wcet_analysis()?;
+    }
+
     compiler.finalize()
 }
 
@@ -278,6 +289,10 @@ pub fn compile_entry(
     compiler.compile_user_functions(&ast.stmts)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
+    // M53: Run WCET analysis for @real_time functions
+    if compiler.compile_options.wcet_enabled {
+        compiler.run_wcet_analysis()?;
+    }
     // M31: Print fusion report if enabled
     if compiler.fusion_report_enabled {
         crate::fusion_report::print_fusion_report(&compiler.fusion_events, &compiler.fusion_barriers);

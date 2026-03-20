@@ -148,6 +148,26 @@ enum Cli {
         #[arg(long)]
         zero_stage: Option<u32>,
 
+        /// M53: Enable WCET analysis for @real_time functions
+        #[arg(long)]
+        wcet: bool,
+
+        /// M53: Write WCET certificate JSON to file
+        #[arg(long)]
+        wcet_cert: Option<PathBuf>,
+
+        /// M53: GPU target for WCET analysis (e.g., "A100-SXM", "Orin")
+        #[arg(long)]
+        gpu: Option<String>,
+
+        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// M53: Write DO-178C compliance report to file
+        #[arg(long)]
+        do178c_report: Option<PathBuf>,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -580,6 +600,11 @@ fn main() {
             deterministic,
             distribute: _distribute,
             zero_stage: _zero_stage,
+            wcet,
+            wcet_cert,
+            gpu,
+            cpu,
+            do178c_report,
         } => {
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
@@ -598,12 +623,12 @@ fn main() {
                 weight_config: Default::default(),
                 weight_analysis: false,
                 unikernel_config: None,
-                wcet_enabled: false,
-                wcet_gpu: None,
-                wcet_cpu: None,
-                wcet_report_path: None,
+                wcet_enabled: wcet,
+                wcet_gpu: gpu,
+                wcet_cpu: cpu,
+                wcet_report_path: wcet_cert,
                 wcet_safety_margin: 1.05,
-                do178c_report: None,
+                do178c_report,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

@@ -49,7 +49,7 @@ pub enum ModelMember {
         decorators: Vec<Decorator>,
         span: Span,
     },
-    Method(FnDef),
+    Method(FnDef, Vec<Decorator>),
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -336,7 +336,7 @@ impl Compiler<'_> {
         for md in &model_defs {
             let model_name = self.resolve_sym(md.name).to_string();
             for member in &md.members {
-                if let ModelMember::Method(fn_def) = member {
+                if let ModelMember::Method(fn_def, _decos) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
                     let (func_id, sig) = self.functions.get(&mangled)
