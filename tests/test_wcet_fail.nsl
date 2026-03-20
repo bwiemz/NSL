@@ -1,0 +1,8 @@
+model BigNet:
+    w: Tensor = randn([4096, 4096])
+
+    @real_time(max_latency_ms=0.0001)
+    fn forward(self, x: Tensor) -> Tensor:
+        return relu(x @ self.w)
+
+let m = BigNet()

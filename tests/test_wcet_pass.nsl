@@ -1,0 +1,11 @@
+model TinyNet:
+    w: Tensor = randn([64, 64])
+
+    @real_time(max_latency_ms=100.0)
+    fn forward(self, x: Tensor) -> Tensor:
+        return relu(x @ self.w)
+
+let m = TinyNet()
+let x = randn([1, 64])
+let y = m.forward(x)
+print("wcet_pass: PASS")

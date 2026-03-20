@@ -1,0 +1,13 @@
+model SafetyNet:
+    w1: Tensor = randn([16, 64])
+    w2: Tensor = randn([64, 6])
+
+    @real_time(max_latency_ms=5.0)
+    fn forward(self, sensor: Tensor) -> Tensor:
+        let h = relu(sensor @ self.w1)
+        return h @ self.w2
+
+let controller = SafetyNet()
+let sensor_data = randn([1, 16])
+let action = controller.forward(sensor_data)
+print("safety_controller: PASS")
