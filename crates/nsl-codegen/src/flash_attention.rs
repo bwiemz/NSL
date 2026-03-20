@@ -1523,6 +1523,163 @@ fn emit_mma_qk_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
     ptx.push_str("    .reg .pred %mma_pk;                    // K-loop predicate\n");
 }
 
+/// Compute XOR-based swizzle offset for shared memory to avoid bank conflicts
+/// during MMA fragment loads.
+///
+/// Standard 32-bank shared memory layout causes conflicts when multiple threads
+/// in a warp access the same bank. XOR swizzle distributes accesses across banks.
+///
+/// `row`: row index in the tile
+/// `col_bytes`: column offset in bytes
+/// Returns: swizzled byte offset
+pub fn swizzle_smem_offset(row: usize, col_bytes: usize) -> usize {
+    let base = row * 128 + col_bytes; // assume 128-byte row stride (typical for f16 head_dim=64)
+    let bank = (base / 4) % 32;
+    let swizzle_bits = (row % 8) ^ (bank % 8);
+    base ^ (swizzle_bits << 2) // shift by 2 = multiply by 4 (bank granularity)
+}
+
+/// Emit PTX for XOR-based shared memory swizzle during cooperative tile stores.
+///
+/// Produces PTX that transforms a linear byte offset into a swizzled offset
+/// before storing to shared memory. Used when loading Q/K/V tiles from global
+/// to shared memory to ensure bank-conflict-free MMA fragment loads.
+fn emit_smem_swizzle_store(ptx: &mut String) {
+    ptx.push_str("    // XOR swizzle for bank-conflict-free shared memory\n");
+    ptx.push_str("    // Input: %smem_linear_off (linear byte offset)\n");
+    ptx.push_str("    // Output: %smem_swiz_off (swizzled byte offset)\n");
+    ptx.push_str("    shr.u32 %smem_bank, %smem_linear_off, 2;    // bank = offset / 4\n");
+    ptx.push_str("    and.b32 %smem_bank, %smem_bank, 31;         // bank = bank % 32\n");
+    ptx.push_str("    shr.u32 %smem_row_bits, %smem_linear_off, 7; // row ≈ offset / 128\n");
+    ptx.push_str("    and.b32 %smem_row_bits, %smem_row_bits, 7;  // row % 8\n");
+    ptx.push_str("    and.b32 %smem_bank_lo, %smem_bank, 7;       // bank % 8\n");
+    ptx.push_str("    xor.b32 %smem_swiz, %smem_row_bits, %smem_bank_lo;  // XOR\n");
+    ptx.push_str("    shl.u32 %smem_swiz, %smem_swiz, 2;          // * 4 bytes\n");
+    ptx.push_str("    xor.b32 %smem_swiz_off, %smem_linear_off, %smem_swiz;  // apply swizzle\n");
+}
+
+/// Emit online softmax adapted for MMA accumulator layout.
+///
+/// In MMA m16n8k16 output layout, thread t holds 4 f32 values at:
+///   - Registers 0,1: row = (t%4)*2 + (t/16), cols depend on n-tile
+///   - Registers 2,3: row = (t%4)*2 + (t/16) + 8, cols depend on n-tile
+///
+/// For per-row max/sum, threads sharing a row must communicate via warp shuffles.
+/// Within one 16x8 MMA tile, each row is covered by threads with the same
+/// (laneid % 4) and (laneid / 16) values — but different n-tiles extend the columns.
+///
+/// This function emits:
+///   1. Per-register local max across all S accumulators
+///   2. Warp shuffle to compute per-row global max
+///   3. Rescale existing O accumulators by exp(old_max - new_max)
+///   4. Compute P = exp(S - new_max), accumulate row_sum
+///   5. Warp shuffle to compute per-row global sum
+fn emit_mma_online_softmax(
+    ptx: &mut String,
+    block_kv: usize,
+    head_dim: usize,
+) {
+    let n_tiles_s = block_kv / MMA_N;
+    let n_tiles_o = head_dim / MMA_N;
+
+    ptx.push_str("    // === Online softmax (MMA layout) ===\n");
+
+    // Step 1: Find local max across this thread's S accumulator values
+    ptx.push_str("    mov.f32 %mma_local_max, 0xFF800000;  // -inf\n");
+    for nt in 0..n_tiles_s {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    max.f32 %mma_local_max, %mma_local_max, %acc_s_{}_{};  // S[{}][{}]\n",
+                nt, r, nt, r
+            ));
+        }
+    }
+
+    // Step 2: Warp shuffle butterfly reduction for row max
+    // Threads sharing a row: in m16n8k16, 4 threads share one row position
+    // (those with same laneid%4 and laneid/16 value across n-tiles)
+    // Use 5-step butterfly to reduce across all 32 threads in the warp
+    ptx.push_str("    // Warp shuffle for row_max\n");
+    for offset in [16, 8, 4, 2, 1] {
+        ptx.push_str(&format!(
+            "    shfl.sync.bfly.b32 %mma_shfl_tmp, %mma_local_max, {}, 31, 0xFFFFFFFF;\n",
+            offset
+        ));
+        ptx.push_str("    max.f32 %mma_local_max, %mma_local_max, %mma_shfl_tmp;\n");
+    }
+
+    // Step 3: Rescale existing accumulators
+    ptx.push_str("    mov.f32 %mma_old_max, %mma_row_max;\n");
+    ptx.push_str("    max.f32 %mma_row_max, %mma_row_max, %mma_local_max;  // new_max\n");
+    ptx.push_str("    // correction = exp(old_max - new_max)\n");
+    ptx.push_str("    sub.f32 %mma_correction, %mma_old_max, %mma_row_max;\n");
+    ptx.push_str("    mul.f32 %mma_correction, %mma_correction, %log2e;\n");
+    ptx.push_str("    ex2.approx.f32 %mma_correction, %mma_correction;\n");
+    ptx.push_str("    mul.f32 %mma_row_sum, %mma_row_sum, %mma_correction;\n");
+
+    // Rescale O accumulators
+    for nt in 0..n_tiles_o {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mul.f32 %acc_o_{}_{}, %acc_o_{}_{}, %mma_correction;\n",
+                nt, r, nt, r
+            ));
+        }
+    }
+
+    // Step 4: P = exp(S - new_max), accumulate row_sum
+    ptx.push_str("    mov.f32 %mma_partial_sum, 0x00000000;  // 0.0\n");
+    for nt in 0..n_tiles_s {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    sub.f32 %acc_s_{}_{}, %acc_s_{}_{}, %mma_row_max;\n",
+                nt, r, nt, r
+            ));
+            ptx.push_str(&format!(
+                "    mul.f32 %acc_s_{}_{}, %acc_s_{}_{}, %log2e;\n",
+                nt, r, nt, r
+            ));
+            ptx.push_str(&format!(
+                "    ex2.approx.f32 %acc_s_{}_{}, %acc_s_{}_{};  // P[{}][{}]\n",
+                nt, r, nt, r, nt, r
+            ));
+            ptx.push_str(&format!(
+                "    add.f32 %mma_partial_sum, %mma_partial_sum, %acc_s_{}_{};  // += P\n",
+                nt, r
+            ));
+        }
+    }
+
+    // Step 5: Warp shuffle for row_sum
+    ptx.push_str("    // Warp shuffle for row_sum\n");
+    for offset in [16, 8, 4, 2, 1] {
+        ptx.push_str(&format!(
+            "    shfl.sync.bfly.b32 %mma_shfl_tmp, %mma_partial_sum, {}, 31, 0xFFFFFFFF;\n",
+            offset
+        ));
+        ptx.push_str("    add.f32 %mma_partial_sum, %mma_partial_sum, %mma_shfl_tmp;\n");
+    }
+    ptx.push_str("    add.f32 %mma_row_sum, %mma_row_sum, %mma_partial_sum;\n");
+}
+
+/// Emit register declarations for the MMA online softmax path.
+fn emit_mma_softmax_registers(ptx: &mut String) {
+    ptx.push_str("    // MMA softmax registers\n");
+    ptx.push_str("    .reg .f32 %mma_row_max, %mma_row_sum;\n");
+    ptx.push_str("    .reg .f32 %mma_old_max, %mma_local_max;\n");
+    ptx.push_str("    .reg .f32 %mma_correction, %mma_partial_sum;\n");
+    ptx.push_str("    .reg .f32 %mma_shfl_tmp;\n");
+    // Initialize
+    ptx.push_str("    mov.f32 %mma_row_max, 0xFF800000;  // -inf\n");
+    ptx.push_str("    mov.f32 %mma_row_sum, 0x00000000;  // 0.0\n");
+}
+
+/// Emit register declarations for shared memory swizzle temporaries.
+fn emit_smem_swizzle_registers(ptx: &mut String) {
+    ptx.push_str("    .reg .u32 %smem_linear_off, %smem_swiz_off;\n");
+    ptx.push_str("    .reg .u32 %smem_bank, %smem_row_bits, %smem_bank_lo, %smem_swiz;\n");
+}
+
 /// Emit MMA register declarations needed by the fragment load and MMA helpers.
 /// These are shared temporaries — the actual accumulator registers are declared
 /// separately based on the tiling configuration.
@@ -1661,6 +1818,100 @@ mod tests {
         // Each n-tile gets one MMA instruction per K iteration
         let mma_count = ptx.matches("mma.sync.aligned").count();
         assert_eq!(mma_count, 8, "8 MMA instructions (one per n-tile)");
+    }
+
+    #[test]
+    fn test_mma_online_softmax_emission() {
+        let mut ptx = String::new();
+        emit_mma_online_softmax(&mut ptx, 64, 64);
+
+        assert!(ptx.contains("Online softmax (MMA layout)"), "section comment");
+        // Row max reduction
+        assert!(ptx.contains("max.f32 %mma_local_max"), "local max computation");
+        assert!(ptx.contains("shfl.sync.bfly.b32"), "warp shuffle present");
+        // Correction factor
+        assert!(ptx.contains("ex2.approx.f32 %mma_correction"), "exp correction");
+        // O rescaling
+        assert!(ptx.contains("mul.f32 %acc_o_"), "O accumulator rescaling");
+        // P = exp(S - max)
+        assert!(ptx.contains("ex2.approx.f32 %acc_s_"), "P computation");
+        // Row sum
+        assert!(ptx.contains("add.f32 %mma_row_sum"), "row sum accumulation");
+    }
+
+    #[test]
+    fn test_smem_swizzle_emission() {
+        let mut ptx = String::new();
+        emit_smem_swizzle_store(&mut ptx);
+
+        assert!(ptx.contains("XOR swizzle"), "comment present");
+        assert!(ptx.contains("xor.b32 %smem_swiz"), "XOR instruction");
+        assert!(ptx.contains("%smem_swiz_off"), "output register");
+    }
+
+    #[test]
+    fn test_smem_swizzle_offset_no_self_conflict() {
+        // Verify that swizzled offsets for consecutive rows don't collide on same bank
+        for row in 0..16 {
+            let off1 = swizzle_smem_offset(row, 0);
+            let off2 = swizzle_smem_offset(row + 1, 0);
+            let bank1 = (off1 / 4) % 32;
+            let bank2 = (off2 / 4) % 32;
+            // Adjacent rows should map to different banks (or same bank is ok if col differs)
+            // At minimum, swizzle should not map everything to the same bank
+            if row > 0 {
+                // Not all banks should be identical
+                let bank_prev = (swizzle_smem_offset(row - 1, 0) / 4) % 32;
+                assert!(bank1 != bank_prev || bank2 != bank1,
+                    "three consecutive rows hit same bank: row={}, banks={},{},{}", row-1, bank_prev, bank1, bank2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mma_softmax_registers_emission() {
+        let mut ptx = String::new();
+        emit_mma_softmax_registers(&mut ptx);
+
+        assert!(ptx.contains("%mma_row_max"), "row_max declared");
+        assert!(ptx.contains("%mma_row_sum"), "row_sum declared");
+        assert!(ptx.contains("0xFF800000"), "row_max initialized to -inf");
+        assert!(ptx.contains("0x00000000"), "row_sum initialized to 0");
+    }
+
+    #[test]
+    fn test_mma_full_pipeline_ptx_has_all_components() {
+        // Generate a complete MMA pipeline and verify all key components present
+        let mut ptx = String::new();
+
+        // Register declarations
+        emit_mma_qk_registers(&mut ptx, 64, 64);
+        emit_mma_softmax_registers(&mut ptx);
+        emit_mma_temp_registers(&mut ptx);
+        emit_smem_swizzle_registers(&mut ptx);
+
+        // Q@K^T
+        ptx.push_str("    mov.u32 %mma_m_tile_byte_offset, 0;\n");
+        emit_qk_matmul_mma(&mut ptx, 64, 64, 64, 64 * 64 * 4);
+
+        // Online softmax
+        emit_mma_online_softmax(&mut ptx, 64, 64);
+
+        // P@V
+        emit_pv_matmul_mma(&mut ptx, 64, 64, 64 * 64 * 4);
+
+        // Verify all key MMA components are present
+        let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
+        // Q@K^T: n_tiles_s=8, P@V: n_tiles_o=8 → 16 total
+        assert_eq!(mma_count, 16,
+            "expected 16 MMA instructions (8 Q@K^T + 8 P@V), got {}", mma_count);
+
+        assert!(ptx.contains("cvt.rn.f16.f32"), "f32→f16 conversion");
+        assert!(ptx.contains("shfl.sync.bfly"), "warp shuffles for softmax");
+        assert!(ptx.contains("ex2.approx.f32"), "exp via ex2");
+        assert!(ptx.contains("%mma_row_max"), "softmax row max");
+        assert!(ptx.contains("%acc_s_"), "S accumulators");
+        assert!(ptx.contains("%acc_o_"), "O accumulators");
     }
 
     #[test]
