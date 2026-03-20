@@ -5,6 +5,51 @@
 //! sizes (block_q, block_kv). The generated PTX is embedded in .rodata and launched
 //! by the runtime wrappers in nsl-runtime/src/flash_attention.rs.
 
+// ---------------------------------------------------------------------------
+// MMA (Tensor Core) constants for m16n8k16 on sm_80+
+// ---------------------------------------------------------------------------
+
+/// MMA tile dimensions for mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+const MMA_M: usize = 16;
+const MMA_N: usize = 8;
+const MMA_K: usize = 16;
+
+/// Minimum SM version required for f16 MMA tensor core instructions.
+const MMA_MIN_SM: u32 = 80;
+
+/// Check whether the MMA path should be used for this GPU.
+pub fn use_mma_path(gpu_sm: u32) -> bool {
+    gpu_sm >= MMA_MIN_SM
+}
+
+/// Validate that FlashAttention tile sizes are compatible with MMA fragment dimensions.
+/// Returns Ok(()) if valid, Err with a message describing the constraint violation.
+pub fn validate_mma_tile_sizes(
+    block_q: usize,
+    block_kv: usize,
+    head_dim: usize,
+) -> Result<(), String> {
+    if block_q % MMA_M != 0 {
+        return Err(format!(
+            "block_q ({}) must be a multiple of MMA_M ({})",
+            block_q, MMA_M
+        ));
+    }
+    if block_kv % MMA_N != 0 {
+        return Err(format!(
+            "block_kv ({}) must be a multiple of MMA_N ({})",
+            block_kv, MMA_N
+        ));
+    }
+    if head_dim % MMA_K != 0 {
+        return Err(format!(
+            "head_dim ({}) must be a multiple of MMA_K ({})",
+            head_dim, MMA_K
+        ));
+    }
+    Ok(())
+}
+
 /// RoPE interleaving style.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RopeStyle {
@@ -1029,6 +1074,45 @@ fn emit_rope_cache_write_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── MMA tile validation tests ─────────────────────────────────────
+
+    #[test]
+    fn test_mma_tile_validation_ok() {
+        assert!(validate_mma_tile_sizes(64, 64, 64).is_ok());
+        assert!(validate_mma_tile_sizes(128, 64, 128).is_ok());
+        assert!(validate_mma_tile_sizes(16, 8, 16).is_ok()); // minimum MMA tile
+    }
+
+    #[test]
+    fn test_mma_tile_validation_block_q_not_aligned() {
+        let err = validate_mma_tile_sizes(17, 64, 64).unwrap_err();
+        assert!(err.contains("block_q"), "{}", err);
+        assert!(err.contains("MMA_M"), "{}", err);
+    }
+
+    #[test]
+    fn test_mma_tile_validation_block_kv_not_aligned() {
+        let err = validate_mma_tile_sizes(64, 7, 64).unwrap_err();
+        assert!(err.contains("block_kv"), "{}", err);
+    }
+
+    #[test]
+    fn test_mma_tile_validation_head_dim_not_aligned() {
+        let err = validate_mma_tile_sizes(64, 64, 65).unwrap_err();
+        assert!(err.contains("head_dim"), "{}", err);
+    }
+
+    #[test]
+    fn test_use_mma_path() {
+        assert!(!use_mma_path(52));  // Kepler
+        assert!(!use_mma_path(70));  // Volta (has wmma but not f16 mma.sync)
+        assert!(use_mma_path(80));   // Ampere
+        assert!(use_mma_path(89));   // Ada Lovelace
+        assert!(use_mma_path(90));   // Hopper
+    }
+
+    // ── Existing tests ────────────────────────────────────────────────
 
     #[test]
     fn test_kernel_name_encoding() {
