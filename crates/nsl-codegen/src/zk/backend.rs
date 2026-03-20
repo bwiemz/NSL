@@ -5,18 +5,64 @@
 
 use super::field::FieldElement;
 
+// Re-export the IR types from `ir.rs`. Downstream code that imports
+// `ZkIR`, `Wire`, etc. from `crate::zk::backend` (e.g. plonky3/mod.rs)
+// continues to compile without modification.
+pub use super::ir::{Wire, ZkIR};
+
 // ---------------------------------------------------------------------------
-// Placeholder types — will be replaced by real `ir.rs` types in Task 2
+// CompiledCircuit
 // ---------------------------------------------------------------------------
 
-/// Placeholder for the ZK intermediate representation (Task 2).
-pub struct ZkIR;
+/// A backend-agnostic compiled arithmetic circuit.
+///
+/// Produced by [`ZkBackend::compile`] from a [`ZkIR`]. It retains the
+/// original IR alongside the circuit sizing metadata computed during
+/// compilation (e.g. the number of rows `2^k`).
+#[derive(Debug)]
+pub struct CompiledCircuit {
+    /// The ZK-IR that was compiled into this circuit.
+    pub ir: ZkIR,
+    /// Circuit size parameter: the PLONKish table has `2^k` rows.
+    pub k: u32,
+}
 
-/// Placeholder for a compiled arithmetic circuit (Task 2).
-pub struct CompiledCircuit;
+// ---------------------------------------------------------------------------
+// Witness
+// ---------------------------------------------------------------------------
 
-/// Placeholder for the prover witness (Task 2).
-pub struct Witness;
+/// The prover's witness: concrete field-element values for all wires.
+///
+/// A `Witness` is produced by the NSL runtime during inference and passed to
+/// [`ZkBackend::prove`]. It assigns a [`FieldElement`] value to each wire in
+/// the circuit, together with the public inputs and outputs that appear in the
+/// proof's public statement.
+#[derive(Debug)]
+pub struct Witness {
+    /// One field element per wire, indexed by `wire.0`.
+    ///
+    /// `values.len()` must equal `ZkIR::num_wires` for the compiled circuit.
+    pub values: Vec<FieldElement>,
+    /// Public input wires paired with their concrete values.
+    pub public_inputs: Vec<(Wire, FieldElement)>,
+    /// Public output wires paired with their concrete values.
+    pub public_outputs: Vec<(Wire, FieldElement)>,
+}
+
+impl Witness {
+    /// Look up the concrete value of a wire by ID.
+    ///
+    /// # Panics
+    /// Panics if `wire.0` is out of bounds (i.e. the witness is malformed).
+    pub fn get(&self, wire: Wire) -> FieldElement {
+        self.values[wire.0 as usize]
+    }
+
+    /// Return the concrete values of all public output wires, in order.
+    pub fn public_output_values(&self) -> Vec<FieldElement> {
+        self.public_outputs.iter().map(|(_, v)| *v).collect()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ZkBackend trait
