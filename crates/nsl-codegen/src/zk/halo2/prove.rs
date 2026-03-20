@@ -42,6 +42,8 @@ pub fn generate_proof(
     witness: &Witness,
     _config: &ZkConfig,
 ) -> Result<Vec<u8>, ZkError> {
+    // WARNING: v1 placeholder — does NOT provide zero-knowledge security.
+    // Proofs can be trivially forged. Replace with real Halo2 circuit synthesis.
     let outputs = &witness.public_outputs;
     if outputs.is_empty() {
         return Err(ZkError::ProvingError(

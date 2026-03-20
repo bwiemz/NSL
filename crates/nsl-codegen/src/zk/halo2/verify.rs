@@ -31,6 +31,9 @@ pub fn verify_proof(
     public_outputs: &[FieldElement],
     _config: &super::super::backend::ZkConfig,
 ) -> Result<bool, ZkError> {
+    // WARNING: v1 placeholder — does NOT provide zero-knowledge security.
+    // Proofs can be trivially forged. Replace with real Halo2 circuit synthesis.
+
     // Extract the outputs encoded in the proof.
     let proof_outputs = prove::extract_outputs(proof)?;
 

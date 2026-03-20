@@ -131,6 +131,9 @@ impl FieldElement {
 
     /// Deserialize from 32 bytes (4 × u64 little-endian limbs, limbs[0] first).
     ///
+    /// Untrusted input may encode a value >= p; this function reduces to canonical
+    /// form by subtracting p when necessary.
+    ///
     /// # Panics
     /// Panics if `bytes.len() < 32`.
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -144,7 +147,19 @@ impl FieldElement {
             let start = i * 8;
             *limb = u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
         }
-        Self { limbs }
+        let result = Self { limbs };
+        // Reduce to canonical form — untrusted input may be >= p
+        if result.gte_p() {
+            result.sub(&FieldElement { limbs: P })
+        } else {
+            result
+        }
+    }
+
+    /// Returns true if `self >= p` (i.e., not in canonical form).
+    #[inline]
+    fn gte_p(&self) -> bool {
+        !lt256(&self.limbs, &P)
     }
 }
 
@@ -211,7 +226,9 @@ fn mul512(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
         let (v3, c3) = v2.overflowing_add(c1 as u64);
         acc[k + 1] = v3;
         if c2 || c3 {
-            // c2 and c3 cannot both be true simultaneously; at most one carry out.
+            // c2 and c3 can both be true (e.g., when acc[k+1] was u64::MAX).
+            // Adding (c2 as u64) + (c3 as u64) is correct — at most 2, and acc[k+2]
+            // is bounded by the number of partial products, so this won't overflow.
             acc[k + 2] += (c2 as u64) + (c3 as u64);
         }
     }
@@ -437,6 +454,11 @@ fn exp_p_minus_2() -> [u64; 4] {
 
 /// Square-and-multiply exponentiation in the field: computes `base^exp mod p`.
 /// `exp` is a 256-bit little-endian value.
+///
+/// WARNING: This function has a timing side channel — execution time depends
+/// on the bits of the exponent. This is acceptable for the v1 placeholder prover
+/// but MUST be replaced with constant-time exponentiation (e.g., Montgomery ladder)
+/// before real Halo2 proving is integrated, since witness values are secret.
 fn pow_vartime(base: &FieldElement, exp: &[u64; 4]) -> FieldElement {
     let mut result = FieldElement::one();
     let mut cur = *base;

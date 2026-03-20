@@ -424,6 +424,13 @@ fn lower_softmax(
 /// 3. Compute variance via FixedMul + Add chain + inv lookup.
 /// 4. Lookup rsqrt on variance.
 /// 5. FixedMul by gamma, then Add beta.
+///
+/// # Known limitation
+///
+// KNOWN LIMITATION: The inv/rsqrt lookups only work when accumulated values
+// fit within the lookup table's input domain (0..2^input_bits). For real use,
+// LayerNorm requires field-arithmetic division instead of lookup tables,
+// or a wider lookup table. This is tracked for the real Halo2 integration.
 fn lower_layer_norm(
     ir: &mut ZkIR,
     op_info: &[Option<OpInfo>],

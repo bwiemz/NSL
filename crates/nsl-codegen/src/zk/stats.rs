@@ -8,11 +8,12 @@
 //!
 //! The estimates are based on a Halo2/KZG backend:
 //!
-//! - **Constraints**: every [`ZkInstruction::Mul`], [`ZkInstruction::FixedMul`],
-//!   [`ZkInstruction::Requantize`], and the inner products of
-//!   [`ZkInstruction::DotProduct`] each cost 1 multiplication gate = 1 constraint.
-//!   Lookup-table constraints (1 per [`ZkInstruction::Lookup`]) are counted
-//!   separately.
+//! - **Constraints**: every [`ZkInstruction::Mul`] and inner product in
+//!   [`ZkInstruction::DotProduct`] costs 1 constraint. [`ZkInstruction::FixedMul`]
+//!   costs 2 constraints (mul + range check, matching the Halo2 `FixedMulGate`).
+//!   [`ZkInstruction::AssertEq`] costs 1 constraint (linear equality).
+//!   [`ZkInstruction::Requantize`] costs 1 constraint. Lookup-table constraints
+//!   (1 per [`ZkInstruction::Lookup`]) are counted separately.
 //! - **Add gates**: [`ZkInstruction::Add`] is absorbed into linear combinations
 //!   in PLONKish arithmetization; zero constraints, counted for informational
 //!   purposes only.
@@ -34,7 +35,8 @@ pub struct CircuitStats {
     /// requantize gates). This is the primary cost driver for proof generation.
     pub num_constraints: u64,
     /// Number of pure multiplication gates (`Mul` + inner products from
-    /// `DotProduct` + `FixedMul`). Each costs 1 constraint.
+    /// `DotProduct` + `FixedMul`). `Mul` costs 1 constraint; `FixedMul` costs
+    /// 2 (mul + range check, matching Halo2 backend gates.rs cost model).
     pub num_mul_gates: u64,
     /// Number of addition gates (`Add`). Free in PLONKish — zero constraints.
     pub num_add_gates: u64,
@@ -71,11 +73,13 @@ pub struct CircuitStats {
 /// The function is a single linear scan over the instruction list and the
 /// registered lookup tables; it is O(|instructions| + |tables|).
 pub fn compute_stats(ir: &ZkIR) -> CircuitStats {
+    // Constraint counts match Halo2 backend (gates.rs) cost model
     let mut num_mul_gates: u64 = 0;
     let mut num_add_gates: u64 = 0;
     let mut num_dot_product_gates: u64 = 0;
     let mut num_lookup_gates: u64 = 0;
     let mut num_requantize_gates: u64 = 0;
+    let mut num_assert_eq_constraints: u64 = 0;
 
     for instr in &ir.instructions {
         match instr {
@@ -89,10 +93,9 @@ pub fn compute_stats(ir: &ZkIR) -> CircuitStats {
                 // No constraints generated.
             }
             ZkInstruction::AssertEq { .. } => {
-                // Compiles to a linear constraint (a - b = 0); not a mul gate.
-                // Not counted in mul_gates but adds to the total via the
-                // underlying PLONKish row. We exclude it from the high-level
-                // cost model as it is typically negligible.
+                // Compiles to a linear constraint (a - b = 0); counts as 1 constraint.
+                // Constraint counts match Halo2 backend (gates.rs) cost model
+                num_assert_eq_constraints += 1;
             }
             ZkInstruction::DotProduct { a, .. } => {
                 // Each inner product is `len` multiplications.
@@ -100,8 +103,8 @@ pub fn compute_stats(ir: &ZkIR) -> CircuitStats {
                 num_dot_product_gates += 1;
             }
             ZkInstruction::FixedMul { .. } => {
-                // One multiplication + rescale, counts as 1 mul gate.
-                num_mul_gates += 1;
+                // 2 constraints: mul + range check, matching Halo2 backend (gates.rs) cost model
+                num_mul_gates += 2;
             }
             ZkInstruction::Lookup { .. } => {
                 num_lookup_gates += 1;
@@ -115,8 +118,10 @@ pub fn compute_stats(ir: &ZkIR) -> CircuitStats {
         }
     }
 
-    // Total constraints: multiplication gates + lookup argument gates + requantize gates.
-    let num_constraints = num_mul_gates + num_lookup_gates + num_requantize_gates;
+    // Total constraints: multiplication gates + lookup argument gates + requantize gates
+    // + linear equality constraints. Constraint counts match Halo2 backend (gates.rs) cost model.
+    let num_constraints =
+        num_mul_gates + num_lookup_gates + num_requantize_gates + num_assert_eq_constraints;
 
     // Public wire count: union of public_inputs and public_outputs.
     // Use a set to avoid double-counting wires that appear in both lists.
