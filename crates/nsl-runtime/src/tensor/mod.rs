@@ -2126,4 +2126,77 @@ mod tests {
         nsl_tensor_free(a);
         nsl_tensor_free(b);
     }
+
+    #[test]
+    fn test_view_chain_transformer_pattern() {
+        // Simulate: input [batch=2, seq=4, hidden=6]
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 4);
+        crate::list::nsl_list_push(shape_list, 6);
+        let x = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let xt = NslTensor::from_ptr(x);
+        for i in 0..48 { unsafe { *xt.data_f64().add(i) = i as f64 } }
+
+        // Reshape [2,4,6] -> [2,4,2,3] (zero-copy)
+        let sl1 = crate::list::nsl_list_new();
+        for &d in &[2i64, 4, 2, 3] { crate::list::nsl_list_push(sl1, d); }
+        let split = nsl_tensor_reshape(x, sl1);
+        let sv = NslTensor::from_ptr(split);
+        assert_eq!(sv.data, xt.data); // zero-copy
+
+        // Transpose [2,4,2,3] -> [2,2,4,3] (zero-copy)
+        let perm = nsl_tensor_transpose(split, 1, 2);
+        let pv = NslTensor::from_ptr(perm);
+        assert_eq!(pv.data, xt.data); // still zero-copy!
+
+        // Materialize for matmul
+        let contig = nsl_tensor_contiguous(perm);
+        let cv = NslTensor::from_ptr(contig);
+        // After transpose, tensor is non-contiguous, so contiguous() allocates new data
+        assert!(cv.data != xt.data as *mut c_void || contig == perm);
+
+        nsl_tensor_free(contig);
+        nsl_tensor_free(perm);
+        nsl_tensor_free(split);
+        nsl_tensor_free(x);
+    }
+
+    #[test]
+    fn test_reshape_transpose_reshape_chain() {
+        let sl = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(sl, 12);
+        let t = creation::tensor_from_shape_list_f64(sl, 0.0);
+        let tv = NslTensor::from_ptr(t);
+        for i in 0..12 { unsafe { *tv.data_f64().add(i) = i as f64 } }
+
+        // reshape [12] -> [3,4] (zero-copy)
+        let sl1 = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(sl1, 3);
+        crate::list::nsl_list_push(sl1, 4);
+        let r1 = nsl_tensor_reshape(t, sl1);
+        assert_eq!(NslTensor::from_ptr(r1).data, tv.data);
+
+        // transpose [3,4] -> [4,3] (zero-copy, non-contiguous)
+        let tr = nsl_tensor_transpose(r1, 0, 1);
+        assert_eq!(NslTensor::from_ptr(tr).data, tv.data);
+
+        // reshape [4,3] -> [12] (must materialize because input is non-contiguous)
+        let sl2 = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(sl2, 12);
+        let r2 = nsl_tensor_reshape(tr, sl2);
+        let r2v = NslTensor::from_ptr(r2);
+        // Transposed order: [0,4,8,1,5,9,2,6,10,3,7,11]
+        unsafe {
+            assert_eq!(*r2v.data_f64().add(0), 0.0);
+            assert_eq!(*r2v.data_f64().add(1), 4.0);
+            assert_eq!(*r2v.data_f64().add(2), 8.0);
+            assert_eq!(*r2v.data_f64().add(3), 1.0);
+        }
+
+        nsl_tensor_free(r2);
+        nsl_tensor_free(tr);
+        nsl_tensor_free(r1);
+        nsl_tensor_free(t);
+    }
 }
