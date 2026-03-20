@@ -7,7 +7,7 @@ use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::creation::create_scalar_tensor_dtype;
-use super::{get_shape_vec, get_strides_vec, NslTensor};
+use super::{get_shape_vec, get_strides_vec, nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
 
 /// Global sum reduction (backward compatible wrapper).
 #[no_mangle]
@@ -314,8 +314,10 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
 /// Gather along a dimension: output[b] = tensor[b, indices[b]] (for dim=1, 2D input).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
-    let indices = NslTensor::from_ptr(indices_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let i_c = nsl_tensor_contiguous(indices_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
+    let indices = NslTensor::from_ptr(i_c);
     let input_shape = get_shape_vec(tensor);
     let ndim = tensor.ndim as usize;
     let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
@@ -383,6 +385,8 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
         }
     }
 
+    nsl_tensor_free(t_c);
+    nsl_tensor_free(i_c);
     if autodiff::is_recording() {
         // Save indices for backward
         NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);

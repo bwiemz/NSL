@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
-use super::{get_shape_vec, nsl_tensor_free, nsl_tensor_to_device, NslTensor};
+use super::{get_shape_vec, nsl_tensor_contiguous, nsl_tensor_free, nsl_tensor_to_device, NslTensor};
 
 fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64 {
     crate::cpu::tensor_elementwise_op(a_ptr, b_ptr, op)
@@ -41,9 +41,14 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
-    let result = tensor_elementwise_op(a, b, |x, y| x + y);
+    // Ensure contiguous inputs for flat-indexed CPU ops
+    let a_c = nsl_tensor_contiguous(a);
+    let b_c = nsl_tensor_contiguous(b);
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
+    let result = tensor_elementwise_op(a_c, b_c, |x, y| x + y);
+    nsl_tensor_free(a_c);
+    nsl_tensor_free(b_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
     }
@@ -73,9 +78,13 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
-    let result = tensor_elementwise_op(a, b, |x, y| x - y);
+    let a_c = nsl_tensor_contiguous(a);
+    let b_c = nsl_tensor_contiguous(b);
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
+    let result = tensor_elementwise_op(a_c, b_c, |x, y| x - y);
+    nsl_tensor_free(a_c);
+    nsl_tensor_free(b_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
     }
@@ -105,9 +114,13 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
-    let result = tensor_elementwise_op(a, b, |x, y| x * y);
+    let a_c = nsl_tensor_contiguous(a);
+    let b_c = nsl_tensor_contiguous(b);
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
+    let result = tensor_elementwise_op(a_c, b_c, |x, y| x * y);
+    nsl_tensor_free(a_c);
+    nsl_tensor_free(b_c);
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
         NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
@@ -147,9 +160,13 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
-    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
-    let result = tensor_elementwise_op(a, b, |x, y| x / y);
+    let a_c = nsl_tensor_contiguous(a);
+    let b_c = nsl_tensor_contiguous(b);
+    let a_shape = get_shape_vec(NslTensor::from_ptr(a_c));
+    let b_shape = get_shape_vec(NslTensor::from_ptr(b_c));
+    let result = tensor_elementwise_op(a_c, b_c, |x, y| x / y);
+    nsl_tensor_free(a_c);
+    nsl_tensor_free(b_c);
     if autodiff::is_recording() {
         NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
         NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
@@ -184,7 +201,8 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a = NslTensor::from_ptr(a_ptr);
+    let a_c = nsl_tensor_contiguous(a_ptr);
+    let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
@@ -217,6 +235,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Neg { a: a_ptr, out: result });
     }
@@ -242,7 +261,8 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a = NslTensor::from_ptr(a_ptr);
+    let a_c = nsl_tensor_contiguous(a_ptr);
+    let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
@@ -275,6 +295,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::AddScalar { a: a_ptr, out: result });
     }
@@ -292,7 +313,8 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    let a = NslTensor::from_ptr(a_ptr);
+    let a_c = nsl_tensor_contiguous(a_ptr);
+    let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
@@ -325,6 +347,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::MulScalar {
             a: a_ptr,
@@ -355,8 +378,11 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         }
     }
 
-    let a = NslTensor::from_ptr(a_ptr);
-    let b = NslTensor::from_ptr(b_ptr);
+    // Ensure contiguous inputs for flat-indexed matmul
+    let a_c = nsl_tensor_contiguous(a_ptr);
+    let b_c = nsl_tensor_contiguous(b_ptr);
+    let a = NslTensor::from_ptr(a_c);
+    let b = NslTensor::from_ptr(b_c);
 
     if a.ndim < 2 || b.ndim < 2 {
         eprintln!(
@@ -514,6 +540,8 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(a_c);
+    nsl_tensor_free(b_c);
     if autodiff::is_recording() {
         NslTensor::from_ptr(a_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         NslTensor::from_ptr(b_ptr).refcount.fetch_add(1, Ordering::SeqCst);

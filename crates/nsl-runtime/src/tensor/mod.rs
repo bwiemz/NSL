@@ -2083,4 +2083,47 @@ mod tests {
         nsl_tensor_free(u);
         nsl_tensor_free(t);
     }
+
+    #[test]
+    fn test_add_non_contiguous_inputs() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let a = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let shape_list2 = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list2, 2);
+        crate::list::nsl_list_push(shape_list2, 3);
+        let b = creation::tensor_from_shape_list_f64(shape_list2, 0.0);
+        let at = NslTensor::from_ptr(a);
+        let bt = NslTensor::from_ptr(b);
+        for i in 0..6 {
+            unsafe {
+                *at.data_f64().add(i) = (i + 1) as f64;
+                *bt.data_f64().add(i) = 10.0;
+            }
+        }
+
+        // Transpose both to [3,2] (non-contiguous)
+        let a_t = nsl_tensor_transpose(a, 0, 1);
+        let b_t = nsl_tensor_transpose(b, 0, 1);
+
+        let result = nsl_tensor_add(a_t, b_t);
+        let r = NslTensor::from_ptr(result);
+
+        // Transposed [[1,4],[2,5],[3,6]] + 10 = [[11,14],[12,15],[13,16]]
+        unsafe {
+            assert_eq!(*r.data_f64().add(0), 11.0);
+            assert_eq!(*r.data_f64().add(1), 14.0);
+            assert_eq!(*r.data_f64().add(2), 12.0);
+            assert_eq!(*r.data_f64().add(3), 15.0);
+            assert_eq!(*r.data_f64().add(4), 13.0);
+            assert_eq!(*r.data_f64().add(5), 16.0);
+        }
+
+        nsl_tensor_free(result);
+        nsl_tensor_free(a_t);
+        nsl_tensor_free(b_t);
+        nsl_tensor_free(a);
+        nsl_tensor_free(b);
+    }
 }

@@ -743,7 +743,12 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let num_tensors = list.len as usize;
     assert!(num_tensors > 0, "nsl_tensor_cat: empty tensor list");
 
-    let first = NslTensor::from_ptr(unsafe { *list.data.add(0) });
+    // Ensure all inputs are contiguous for flat-indexed copy
+    let contiguous_ptrs: Vec<i64> = (0..num_tensors)
+        .map(|i| nsl_tensor_contiguous(unsafe { *list.data.add(i) }))
+        .collect();
+
+    let first = NslTensor::from_ptr(contiguous_ptrs[0]);
     let ndim = first.ndim as usize;
     let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
     assert!(d < ndim, "nsl_tensor_cat: dim {dim} out of range for ndim {ndim}");
@@ -751,8 +756,8 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let mut split_sizes: Vec<i64> = Vec::with_capacity(num_tensors);
     let mut total_cat_dim: i64 = 0;
 
-    for t_idx in 0..num_tensors {
-        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+    for &cp in &contiguous_ptrs {
+        let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
         let cat_size = unsafe { *t.shape.add(d) };
         split_sizes.push(cat_size);
@@ -787,7 +792,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let mut cat_offset: usize = 0;
         for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+            let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
             let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..t.len as usize {
                 let mut remaining = flat;
@@ -810,7 +815,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
         let mut cat_offset: usize = 0;
         for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+            let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
             let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..t.len as usize {
                 let mut remaining = flat;
@@ -843,6 +848,11 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
+
+    // Free contiguous copies
+    for &cp in &contiguous_ptrs {
+        nsl_tensor_free(cp);
+    }
 
     let input_ptrs: Vec<i64> = (0..num_tensors)
         .map(|i| unsafe { *list.data.add(i) })
@@ -885,7 +895,8 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 ///   output[half..last_dim] = input[0..half]     (copy first half)
 #[no_mangle]
 pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
@@ -945,7 +956,9 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         dtype: tensor.dtype,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(result) as i64
+    let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(t_c);
+    result
 }
 
 /// Materialize a non-contiguous tensor (e.g. from `expand`) into a contiguous copy.
