@@ -256,6 +256,90 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
     Box::into_raw(result) as i64
 }
 
+// ---------------------------------------------------------------------------
+// Cache-tiled matrix multiply
+// ---------------------------------------------------------------------------
+
+const TILE_M: usize = 64;
+const TILE_K: usize = 64;
+const TILE_N: usize = 64;
+
+/// Cache-tiled matrix multiply: C[m,n] += A[m,k] @ B[k,n]
+/// C must be pre-zeroed. All matrices are row-major contiguous.
+///
+/// Tile loop order: jj (N tiles) -> kk (K tiles) -> ii (M tiles)
+/// Inner loop order: i -> k -> j (maximizes B-tile reuse in registers)
+pub fn tiled_matmul_f64(
+    a: *const f64,
+    b: *const f64,
+    c: *mut f64,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    unsafe {
+        let mut jj = 0;
+        while jj < n {
+            let j_end = (jj + TILE_N).min(n);
+            let mut kk = 0;
+            while kk < k {
+                let k_end = (kk + TILE_K).min(k);
+                let mut ii = 0;
+                while ii < m {
+                    let i_end = (ii + TILE_M).min(m);
+                    for i in ii..i_end {
+                        for ki in kk..k_end {
+                            let a_val = *a.add(i * k + ki);
+                            for j in jj..j_end {
+                                *c.add(i * n + j) += a_val * *b.add(ki * n + j);
+                            }
+                        }
+                    }
+                    ii += TILE_M;
+                }
+                kk += TILE_K;
+            }
+            jj += TILE_N;
+        }
+    }
+}
+
+/// Cache-tiled matrix multiply for f32: C[m,n] += A[m,k] @ B[k,n]
+pub fn tiled_matmul_f32(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    unsafe {
+        let mut jj = 0;
+        while jj < n {
+            let j_end = (jj + TILE_N).min(n);
+            let mut kk = 0;
+            while kk < k {
+                let k_end = (kk + TILE_K).min(k);
+                let mut ii = 0;
+                while ii < m {
+                    let i_end = (ii + TILE_M).min(m);
+                    for i in ii..i_end {
+                        for ki in kk..k_end {
+                            let a_val = *a.add(i * k + ki);
+                            for j in jj..j_end {
+                                *c.add(i * n + j) += a_val * *b.add(ki * n + j);
+                            }
+                        }
+                    }
+                    ii += TILE_M;
+                }
+                kk += TILE_K;
+            }
+            jj += TILE_N;
+        }
+    }
+}
+
 /// Helper: get the shape of a tensor as a Vec<i64>.
 pub(crate) fn get_shape_vec(tensor: &NslTensor) -> Vec<i64> {
     (0..tensor.ndim as usize)
@@ -306,4 +390,113 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i6
         owns_data: 1,
     });
     Box::into_raw(tensor) as i64
+}
+
+#[cfg(test)]
+mod matmul_tests {
+    use super::*;
+
+    #[test]
+    fn test_tiled_matmul_f64_small() {
+        // 2x3 @ 3x4 = 2x4
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b: Vec<f64> = vec![
+            7.0, 8.0, 9.0, 10.0,
+            11.0, 12.0, 13.0, 14.0,
+            15.0, 16.0, 17.0, 18.0,
+        ];
+        let mut c = vec![0.0f64; 8];
+
+        tiled_matmul_f64(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 2, 3, 4);
+
+        assert_eq!(c, vec![74.0, 80.0, 86.0, 92.0, 173.0, 188.0, 203.0, 218.0]);
+    }
+
+    #[test]
+    fn test_tiled_matmul_f64_identity() {
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let b: Vec<f64> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let mut c = vec![0.0f64; 9];
+
+        tiled_matmul_f64(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 3, 3, 3);
+
+        assert_eq!(c, a);
+    }
+
+    #[test]
+    fn test_tiled_matmul_f64_large() {
+        // 128x256 @ 256x64 — exercises tiling with exact tile boundaries
+        let m = 128;
+        let k = 256;
+        let n = 64;
+        let a: Vec<f64> = (0..m * k).map(|i| (i % 7) as f64 * 0.1).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| (i % 11) as f64 * 0.1).collect();
+        let mut c_tiled = vec![0.0f64; m * n];
+        let mut c_naive = vec![0.0f64; m * n];
+
+        tiled_matmul_f64(a.as_ptr(), b.as_ptr(), c_tiled.as_mut_ptr(), m, k, n);
+
+        // Naive reference
+        for i in 0..m {
+            for j in 0..k {
+                let a_val = a[i * k + j];
+                for l in 0..n {
+                    c_naive[i * n + l] += a_val * b[j * n + l];
+                }
+            }
+        }
+
+        for i in 0..m * n {
+            assert!((c_tiled[i] - c_naive[i]).abs() < 1e-6,
+                "mismatch at {}: {} vs {}", i, c_tiled[i], c_naive[i]);
+        }
+    }
+
+    #[test]
+    fn test_tiled_matmul_f64_non_tile_aligned() {
+        // 17x33 @ 33x5 — not aligned to any power of 2
+        let m = 17;
+        let k = 33;
+        let n = 5;
+        let a: Vec<f64> = (0..m * k).map(|i| (i as f64) * 0.01).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| (i as f64) * 0.01).collect();
+        let mut c_tiled = vec![0.0f64; m * n];
+        let mut c_naive = vec![0.0f64; m * n];
+
+        tiled_matmul_f64(a.as_ptr(), b.as_ptr(), c_tiled.as_mut_ptr(), m, k, n);
+
+        for i in 0..m {
+            for j in 0..k {
+                let a_val = a[i * k + j];
+                for l in 0..n {
+                    c_naive[i * n + l] += a_val * b[j * n + l];
+                }
+            }
+        }
+
+        for i in 0..m * n {
+            assert!((c_tiled[i] - c_naive[i]).abs() < 1e-6,
+                "mismatch at {}: {} vs {}", i, c_tiled[i], c_naive[i]);
+        }
+    }
+
+    #[test]
+    fn test_tiled_matmul_f32_small() {
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b: Vec<f32> = vec![7.0, 8.0, 11.0, 12.0, 15.0, 16.0];
+        let mut c = vec![0.0f32; 4];
+
+        tiled_matmul_f32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 2, 3, 2);
+
+        assert_eq!(c, vec![74.0, 80.0, 173.0, 188.0]);
+    }
+
+    #[test]
+    fn test_tiled_matmul_single_element() {
+        let a = vec![3.0f64];
+        let b = vec![5.0f64];
+        let mut c = vec![0.0f64];
+        tiled_matmul_f64(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 1, 1, 1);
+        assert_eq!(c[0], 15.0);
+    }
 }
