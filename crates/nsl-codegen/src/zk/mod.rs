@@ -11,3 +11,4 @@ pub mod backend;
 pub mod lower;
 pub mod plonky3;
 pub mod witness;
+pub mod stats;
