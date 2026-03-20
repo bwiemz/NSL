@@ -1071,6 +1071,147 @@ fn emit_rope_cache_write_entry(
     let _ = head_dim; // used in stride computation
 }
 
+// ── MMA PTX emission helpers (sm_80+) ────────────────────────────────
+
+/// Emit PTX to convert f32 registers to packed f16x2 (.b32) for MMA fragments.
+///
+/// Each destination register holds two f16 values packed into a 32-bit word.
+/// `src_f32` names are f32 register names (even count), `dst_b32` are .b32 output names (half count).
+fn emit_f32_to_f16_pack(
+    ptx: &mut String,
+    src_f32: &[String],
+    dst_b32: &[String],
+) {
+    assert_eq!(src_f32.len(), dst_b32.len() * 2, "f16 pack: src must be 2x dst");
+    for i in 0..dst_b32.len() {
+        let lo = &src_f32[i * 2];
+        let hi = &src_f32[i * 2 + 1];
+        let dst = &dst_b32[i];
+        ptx.push_str(&format!("    cvt.rn.f16.f32 %mma_h0, %{};\n", lo));
+        ptx.push_str(&format!("    cvt.rn.f16.f32 %mma_h1, %{};\n", hi));
+        ptx.push_str(&format!("    mov.b32 %{}, {{%mma_h0, %mma_h1}};\n", dst));
+    }
+}
+
+/// Emit PTX to load an MMA A-fragment (m16xk16, row-major f16) from shared memory.
+///
+/// In m16n8k16, the A-fragment maps as follows:
+/// - Thread t holds rows at: row = (t%4)*2 + (t/16), row+8 (for groups 0,1)
+/// - Each thread holds 8 f16 values in 4 .b32 registers
+/// - Registers a0,a1 cover k=0..7; a2,a3 cover k=8..15
+///
+/// `frag_regs`: 4 .b32 register names for the fragment output.
+/// `smem_base_expr`: PTX expression for shared memory base address.
+/// `row_stride`: row stride in bytes (head_dim * 2 for f16, or head_dim * 4 for f32 shmem).
+fn emit_load_a_fragment_smem(
+    ptx: &mut String,
+    frag_regs: &[String; 4],
+    smem_base_expr: &str,
+    row_stride: usize,
+) {
+    ptx.push_str("    // Load A-fragment (m16xk16 row-major) from shared memory\n");
+    // Each thread's row: row = (laneid % 4) * 2 + (laneid / 16)
+    // But we load 4 .b32 registers covering 4 pairs of f16 values
+    // Registers 0,1 are k=0..7; registers 2,3 are k=8..15
+    // Within each pair, the two f16s are at consecutive addresses
+    for (reg_idx, k_base_pair) in [(0, 0usize), (1, 4), (2, 8), (3, 12)].iter() {
+        let byte_col_offset = k_base_pair * 2; // each f16 is 2 bytes, pairs of 2 f16 = 4 bytes
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %mma_addr, %mma_a_row, {}, {};  // row * stride + base\n",
+            row_stride, smem_base_expr
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %mma_addr, %mma_addr, {};  // + k_col byte offset\n",
+            byte_col_offset
+        ));
+        ptx.push_str(&format!(
+            "    ld.shared.b32 %{}, [%mma_addr];\n",
+            frag_regs[*reg_idx]
+        ));
+    }
+}
+
+/// Emit PTX to load an MMA B-fragment (k16xn8, col-major f16) from shared memory.
+///
+/// In m16n8k16, the B-fragment maps as follows:
+/// - Each thread holds 4 f16 values in 2 .b32 registers
+/// - Registers b0 covers k=0..7, b1 covers k=8..15
+///
+/// `frag_regs`: 2 .b32 register names.
+/// `smem_base_expr`: PTX expression for shared memory base address.
+/// `row_stride`: row stride in bytes for the K/V matrix in shared memory.
+fn emit_load_b_fragment_smem(
+    ptx: &mut String,
+    frag_regs: &[String; 2],
+    smem_base_expr: &str,
+    row_stride: usize,
+) {
+    ptx.push_str("    // Load B-fragment (k16xn8 col-major) from shared memory\n");
+    for (reg_idx, k_base_pair) in [(0, 0usize), (1, 8)].iter() {
+        let byte_col_offset = k_base_pair * 2;
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %mma_addr, %mma_b_row, {}, {};  // row * stride + base\n",
+            row_stride, smem_base_expr
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %mma_addr, %mma_addr, {};  // + k byte offset\n",
+            byte_col_offset
+        ));
+        ptx.push_str(&format!(
+            "    ld.shared.b32 %{}, [%mma_addr];\n",
+            frag_regs[*reg_idx]
+        ));
+    }
+}
+
+/// Emit PTX for a single MMA instruction: D = A @ B + C (all in-register).
+fn emit_mma_instruction(
+    ptx: &mut String,
+    d_regs: &[String; 4],   // D accumulator (f32 x4)
+    a_regs: &[String; 4],   // A fragment (.b32 x4)
+    b_regs: &[String; 2],   // B fragment (.b32 x2)
+    c_regs: &[String; 4],   // C accumulator (f32 x4)
+) {
+    ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+    ptx.push_str(&format!(
+        "        {{{}, {}, {}, {}}},\n",
+        d_regs[0], d_regs[1], d_regs[2], d_regs[3]
+    ));
+    ptx.push_str(&format!(
+        "        {{{}, {}, {}, {}}},\n",
+        a_regs[0], a_regs[1], a_regs[2], a_regs[3]
+    ));
+    ptx.push_str(&format!(
+        "        {{{}, {}}},\n",
+        b_regs[0], b_regs[1]
+    ));
+    ptx.push_str(&format!(
+        "        {{{}, {}, {}, {}}};\n",
+        c_regs[0], c_regs[1], c_regs[2], c_regs[3]
+    ));
+}
+
+/// Emit MMA register declarations needed by the fragment load and MMA helpers.
+/// These are shared temporaries — the actual accumulator registers are declared
+/// separately based on the tiling configuration.
+fn emit_mma_temp_registers(ptx: &mut String) {
+    ptx.push_str("    // MMA temporary registers\n");
+    ptx.push_str("    .reg .f16 %mma_h0, %mma_h1;       // f32→f16 conversion temps\n");
+    ptx.push_str("    .reg .u32 %mma_a_row, %mma_b_row;  // fragment row indices\n");
+    ptx.push_str("    .reg .u32 %mma_addr;                // shared memory address temp\n");
+    ptx.push_str("    .reg .u32 %mma_laneid;              // warp lane ID\n");
+    // Compute laneid from tid.x (assuming warp of 32)
+    ptx.push_str("    mov.u32 %mma_laneid, %tid.x;\n");
+    ptx.push_str("    and.b32 %mma_laneid, %mma_laneid, 31;  // laneid = tid.x % 32\n");
+    // A-fragment row mapping: row = (laneid % 4) * 2 + (laneid / 16)
+    ptx.push_str("    and.b32 %mma_a_row, %mma_laneid, 3;    // laneid % 4\n");
+    ptx.push_str("    shl.b32 %mma_a_row, %mma_a_row, 1;     // * 2\n");
+    ptx.push_str("    shr.u32 %mma_addr, %mma_laneid, 4;     // laneid / 16 (reuse mma_addr as temp)\n");
+    ptx.push_str("    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // row = (laneid%4)*2 + laneid/16\n");
+    // B-fragment row mapping: same as A row for the k-dimension
+    ptx.push_str("    mov.u32 %mma_b_row, %mma_a_row;        // B row mapping matches A for k-dim\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,6 +1251,73 @@ mod tests {
         assert!(use_mma_path(80));   // Ampere
         assert!(use_mma_path(89));   // Ada Lovelace
         assert!(use_mma_path(90));   // Hopper
+    }
+
+    // ── MMA PTX emission tests ─────────────────────────────────────
+
+    #[test]
+    fn test_f32_to_f16_pack_emission() {
+        let mut ptx = String::new();
+        let src = vec!["f0".to_string(), "f1".to_string(), "f2".to_string(), "f3".to_string()];
+        let dst = vec!["a0".to_string(), "a1".to_string()];
+        emit_f32_to_f16_pack(&mut ptx, &src, &dst);
+
+        assert!(ptx.contains("cvt.rn.f16.f32 %mma_h0, %f0"), "first lo conversion");
+        assert!(ptx.contains("cvt.rn.f16.f32 %mma_h1, %f1"), "first hi conversion");
+        assert!(ptx.contains("mov.b32 %a0, {%mma_h0, %mma_h1}"), "first pack");
+        assert!(ptx.contains("cvt.rn.f16.f32 %mma_h0, %f2"), "second lo conversion");
+        assert!(ptx.contains("mov.b32 %a1, {%mma_h0, %mma_h1}"), "second pack");
+    }
+
+    #[test]
+    fn test_mma_instruction_emission() {
+        let mut ptx = String::new();
+        let d = ["d0".into(), "d1".into(), "d2".into(), "d3".into()];
+        let a = ["a0".into(), "a1".into(), "a2".into(), "a3".into()];
+        let b = ["b0".into(), "b1".into()];
+        let c = ["c0".into(), "c1".into(), "c2".into(), "c3".into()];
+        emit_mma_instruction(&mut ptx, &d, &a, &b, &c);
+
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "must contain MMA instruction");
+        assert!(ptx.contains("{d0, d1, d2, d3}"), "D accumulator regs");
+        assert!(ptx.contains("{a0, a1, a2, a3}"), "A fragment regs");
+        assert!(ptx.contains("{b0, b1}"), "B fragment regs");
+        assert!(ptx.contains("{c0, c1, c2, c3}"), "C accumulator regs");
+    }
+
+    #[test]
+    fn test_load_a_fragment_emission() {
+        let mut ptx = String::new();
+        let regs: [String; 4] = ["aq0".into(), "aq1".into(), "aq2".into(), "aq3".into()];
+        emit_load_a_fragment_smem(&mut ptx, &regs, "shmem_q", 256);
+
+        assert!(ptx.contains("Load A-fragment"), "comment present");
+        assert!(ptx.contains("ld.shared.b32 %aq0"), "loads first register");
+        assert!(ptx.contains("ld.shared.b32 %aq3"), "loads last register");
+        // Should have 4 load instructions
+        assert_eq!(ptx.matches("ld.shared.b32").count(), 4, "4 fragment loads");
+    }
+
+    #[test]
+    fn test_load_b_fragment_emission() {
+        let mut ptx = String::new();
+        let regs: [String; 2] = ["bk0".into(), "bk1".into()];
+        emit_load_b_fragment_smem(&mut ptx, &regs, "shmem_k", 128);
+
+        assert!(ptx.contains("Load B-fragment"), "comment present");
+        assert_eq!(ptx.matches("ld.shared.b32").count(), 2, "2 fragment loads");
+    }
+
+    #[test]
+    fn test_mma_temp_registers_emission() {
+        let mut ptx = String::new();
+        emit_mma_temp_registers(&mut ptx);
+
+        assert!(ptx.contains(".reg .f16 %mma_h0, %mma_h1"), "f16 temps declared");
+        assert!(ptx.contains(".reg .u32 %mma_a_row"), "A row register declared");
+        assert!(ptx.contains("%mma_laneid"), "laneid register used");
+        assert!(ptx.contains("and.b32 %mma_laneid, %mma_laneid, 31"), "laneid = tid.x % 32");
     }
 
     // ── Existing tests ────────────────────────────────────────────────
