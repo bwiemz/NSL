@@ -1,3 +1,8 @@
+// PTX generation uses format!() extensively, including for strings with no interpolation
+// (for consistency and readability in the emit_* helpers). Suppress clippy's advice
+// to rewrite these as .to_string().
+#![allow(clippy::useless_format)]
+
 //! FlashAttention-2 PTX template synthesis.
 //!
 //! Generates PTX kernel strings at compile time (AOT). Each variant is parameterized
@@ -8,6 +13,42 @@
 // ---------------------------------------------------------------------------
 // MMA (Tensor Core) constants for m16n8k16 on sm_80+
 // ---------------------------------------------------------------------------
+//
+// ## Architecture Overview
+//
+// FlashAttention uses two matmuls per KV-tile iteration:
+//   1. S = Q @ K^T  (score computation)
+//   2. O += P @ V   (output accumulation, where P = softmax(S))
+//
+// Both are implemented using `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`:
+//   - A-fragment: 16x16 row-major f16 (Q for S, P for O)
+//   - B-fragment: 8x16 col-major f16  (K^T for S, V for O)
+//   - C/D accumulator: 16x8 f32
+//
+// ## Thread-to-Element Mapping (m16n8k16)
+//
+// Each warp (32 threads) cooperatively computes one 16x8 output tile.
+// Thread t holds 4 f32 accumulator values at positions:
+//   row = (t % 4) * 2 + (t / 16)       for registers 0, 1
+//   row = (t % 4) * 2 + (t / 16) + 8   for registers 2, 3
+//   col depends on the register index and n-tile offset
+//
+// ## Register Pressure Management
+//
+// Full unrolling of all m-tiles x n-tiles exceeds the 255-register limit.
+// Strategy: process one m-tile at a time, immediately feeding S into softmax
+// and P@V before advancing. This keeps pressure at O(n_tiles * 4) per phase.
+//
+// ## Shared Memory
+//
+// Q and K/V tiles are stored in shared memory as f32 (matching the existing
+// global-to-shared load path). Fragment loads convert f32 -> f16 on the fly
+// via `cvt.rn.f16.f32`. XOR swizzle avoids bank conflicts.
+//
+// ## Fallback
+//
+// GPUs below sm_80 use the existing scalar fma.rn.f32 path. Gate via
+// `use_mma_path(gpu_sm)`.
 
 /// MMA tile dimensions for mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 const MMA_M: usize = 16;
@@ -29,19 +70,19 @@ pub fn validate_mma_tile_sizes(
     block_kv: usize,
     head_dim: usize,
 ) -> Result<(), String> {
-    if block_q % MMA_M != 0 {
+    if !block_q.is_multiple_of(MMA_M) {
         return Err(format!(
             "block_q ({}) must be a multiple of MMA_M ({})",
             block_q, MMA_M
         ));
     }
-    if block_kv % MMA_N != 0 {
+    if !block_kv.is_multiple_of(MMA_N) {
         return Err(format!(
             "block_kv ({}) must be a multiple of MMA_N ({})",
             block_kv, MMA_N
         ));
     }
-    if head_dim % MMA_K != 0 {
+    if !head_dim.is_multiple_of(MMA_K) {
         return Err(format!(
             "head_dim ({}) must be a multiple of MMA_K ({})",
             head_dim, MMA_K
@@ -1072,11 +1113,15 @@ fn emit_rope_cache_write_entry(
 }
 
 // ── MMA PTX emission helpers (sm_80+) ────────────────────────────────
+// These helpers are building blocks for the MMA codegen path. They are
+// individually tested but will be wired into the main synthesis pipeline
+// when the sm_80 feature gate is integrated into emit_kv_tile_loop.
 
 /// Emit PTX to convert f32 registers to packed f16x2 (.b32) for MMA fragments.
 ///
 /// Each destination register holds two f16 values packed into a 32-bit word.
 /// `src_f32` names are f32 register names (even count), `dst_b32` are .b32 output names (half count).
+#[allow(dead_code)]
 fn emit_f32_to_f16_pack(
     ptx: &mut String,
     src_f32: &[String],
@@ -1103,6 +1148,7 @@ fn emit_f32_to_f16_pack(
 /// `frag_regs`: 4 .b32 register names for the fragment output.
 /// `smem_base_expr`: PTX expression for shared memory base address.
 /// `row_stride`: row stride in bytes (head_dim * 2 for f16, or head_dim * 4 for f32 shmem).
+#[allow(dead_code)]
 fn emit_load_a_fragment_smem(
     ptx: &mut String,
     frag_regs: &[String; 4],
@@ -1140,6 +1186,7 @@ fn emit_load_a_fragment_smem(
 /// `frag_regs`: 2 .b32 register names.
 /// `smem_base_expr`: PTX expression for shared memory base address.
 /// `row_stride`: row stride in bytes for the K/V matrix in shared memory.
+#[allow(dead_code)]
 fn emit_load_b_fragment_smem(
     ptx: &mut String,
     frag_regs: &[String; 2],
@@ -1165,6 +1212,7 @@ fn emit_load_b_fragment_smem(
 }
 
 /// Emit PTX for a single MMA instruction: D = A @ B + C (all in-register).
+#[allow(dead_code)]
 fn emit_mma_instruction(
     ptx: &mut String,
     d_regs: &[String; 4],   // D accumulator (f32 x4)
@@ -1202,9 +1250,10 @@ fn emit_mma_instruction(
 ///
 /// Output: S accumulators in `%acc_s_{nt}_{r}` registers for the current m-tile.
 /// The caller must consume S (softmax + P@V) before advancing to the next m-tile.
+#[allow(dead_code)]
 fn emit_qk_matmul_mma(
     ptx: &mut String,
-    block_q: usize,
+    _block_q: usize,
     block_kv: usize,
     head_dim: usize,
     shmem_k_offset: usize,
@@ -1355,6 +1404,7 @@ fn emit_qk_matmul_mma(
 /// V is in shared memory at shmem_k_offset (reuses K's region).
 ///
 /// Accumulates into O registers: O += P @ V for the current m-tile.
+#[allow(dead_code)]
 fn emit_pv_matmul_mma(
     ptx: &mut String,
     block_kv: usize,
@@ -1478,6 +1528,7 @@ fn emit_pv_matmul_mma(
 }
 
 /// Emit MMA-specific register declarations for the Q@K^T and P@V paths.
+#[allow(dead_code)]
 fn emit_mma_qk_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
     let n_tiles_s = block_kv / MMA_N;
     let n_tiles_o = head_dim / MMA_N;
@@ -1544,6 +1595,7 @@ pub fn swizzle_smem_offset(row: usize, col_bytes: usize) -> usize {
 /// Produces PTX that transforms a linear byte offset into a swizzled offset
 /// before storing to shared memory. Used when loading Q/K/V tiles from global
 /// to shared memory to ensure bank-conflict-free MMA fragment loads.
+#[allow(dead_code)]
 fn emit_smem_swizzle_store(ptx: &mut String) {
     ptx.push_str("    // XOR swizzle for bank-conflict-free shared memory\n");
     ptx.push_str("    // Input: %smem_linear_off (linear byte offset)\n");
@@ -1574,6 +1626,7 @@ fn emit_smem_swizzle_store(ptx: &mut String) {
 ///   3. Rescale existing O accumulators by exp(old_max - new_max)
 ///   4. Compute P = exp(S - new_max), accumulate row_sum
 ///   5. Warp shuffle to compute per-row global sum
+#[allow(dead_code)]
 fn emit_mma_online_softmax(
     ptx: &mut String,
     block_kv: usize,
@@ -1663,6 +1716,7 @@ fn emit_mma_online_softmax(
 }
 
 /// Emit register declarations for the MMA online softmax path.
+#[allow(dead_code)]
 fn emit_mma_softmax_registers(ptx: &mut String) {
     ptx.push_str("    // MMA softmax registers\n");
     ptx.push_str("    .reg .f32 %mma_row_max, %mma_row_sum;\n");
@@ -1675,6 +1729,7 @@ fn emit_mma_softmax_registers(ptx: &mut String) {
 }
 
 /// Emit register declarations for shared memory swizzle temporaries.
+#[allow(dead_code)]
 fn emit_smem_swizzle_registers(ptx: &mut String) {
     ptx.push_str("    .reg .u32 %smem_linear_off, %smem_swiz_off;\n");
     ptx.push_str("    .reg .u32 %smem_bank, %smem_row_bits, %smem_bank_lo, %smem_swiz;\n");
@@ -1683,6 +1738,7 @@ fn emit_smem_swizzle_registers(ptx: &mut String) {
 /// Emit MMA register declarations needed by the fragment load and MMA helpers.
 /// These are shared temporaries — the actual accumulator registers are declared
 /// separately based on the tiling configuration.
+#[allow(dead_code)]
 fn emit_mma_temp_registers(ptx: &mut String) {
     ptx.push_str("    // MMA temporary registers\n");
     ptx.push_str("    .reg .f16 %mma_h0, %mma_h1;       // f32→f16 conversion temps\n");
