@@ -34,6 +34,39 @@ pub fn extract_fp8_compute_decorator<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// FP8 matmul compilation dispatch
+// ---------------------------------------------------------------------------
+
+use crate::gpu_specs::GpuSpec;
+
+/// Compilation result for FP8 matmul: either an MMA kernel PTX or a fallback
+/// indicator for the runtime to dequantize and use standard f32 matmul.
+#[derive(Debug)]
+pub enum Fp8MatmulStrategy {
+    /// Emit FP8 MMA kernel PTX for sm_90+ GPUs.
+    /// Contains the PTX string ready for module loading.
+    MmaKernel { ptx: String },
+    /// Fall back to runtime dequantize → f32 matmul.
+    /// Used for GPUs below sm_90.
+    RuntimeFallback,
+}
+
+/// Decide the FP8 matmul strategy based on target GPU capability.
+///
+/// On sm_90+ (H100): emits FP8 MMA PTX kernel via `emit_fp8_matmul_ptx`.
+/// On older GPUs: returns `RuntimeFallback` — the runtime will dequantize
+/// to f32 and use the standard tiled matmul.
+pub fn compile_fp8_matmul(gpu: &GpuSpec, k: usize) -> Fp8MatmulStrategy {
+    if gpu.supports_fp8_mma() && k.is_multiple_of(FP8_MMA_K) {
+        Fp8MatmulStrategy::MmaKernel {
+            ptx: emit_fp8_matmul_ptx(k),
+        }
+    } else {
+        Fp8MatmulStrategy::RuntimeFallback
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FP8 Tensor Core MMA PTX emission (sm_90 / H100+)
 // ---------------------------------------------------------------------------
 
@@ -244,5 +277,37 @@ mod tests {
         assert_eq!(FP8_MMA_M, 16);
         assert_eq!(FP8_MMA_N, 8);
         assert_eq!(FP8_MMA_K, 32); // 32 because e4m3 is 1 byte (vs 2 for f16)
+    }
+
+    #[test]
+    fn test_compile_fp8_matmul_sm90_emits_mma() {
+        let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
+        let result = compile_fp8_matmul(h100, 128);
+        match result {
+            Fp8MatmulStrategy::MmaKernel { ptx } => {
+                assert!(ptx.contains("mma.sync.aligned.m16n8k32"),
+                    "H100 should get FP8 MMA kernel");
+                assert!(ptx.contains(".target sm_90"));
+            }
+            Fp8MatmulStrategy::RuntimeFallback => {
+                panic!("H100 should NOT fall back to runtime");
+            }
+        }
+    }
+
+    #[test]
+    fn test_compile_fp8_matmul_sm80_falls_back() {
+        let a100 = crate::gpu_specs::find_gpu("A100-SXM").unwrap();
+        let result = compile_fp8_matmul(a100, 128);
+        assert!(matches!(result, Fp8MatmulStrategy::RuntimeFallback),
+            "A100 (sm_80) should fall back to runtime");
+    }
+
+    #[test]
+    fn test_compile_fp8_matmul_k_not_aligned_falls_back() {
+        let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
+        let result = compile_fp8_matmul(h100, 100); // 100 not divisible by 32
+        assert!(matches!(result, Fp8MatmulStrategy::RuntimeFallback),
+            "K=100 not aligned to MMA_K=32, should fall back");
     }
 }
