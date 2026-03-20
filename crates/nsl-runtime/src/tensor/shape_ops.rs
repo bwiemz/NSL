@@ -8,7 +8,7 @@ use crate::autodiff;
 use crate::list::NslList;
 use crate::memory::checked_alloc;
 
-use super::NslTensor;
+use super::{NslTensor, nsl_tensor_free};
 
 // === Shape query operations ===
 
@@ -105,11 +105,12 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     let new_shape_nsl = NslList::from_ptr(new_shape_list);
     let new_ndim = new_shape_nsl.len;
 
-    let new_shape = checked_alloc((new_ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    // Extract shape values
+    let mut new_shape_vec = Vec::with_capacity(new_ndim as usize);
     let mut new_len: i64 = 1;
     for i in 0..new_ndim as usize {
         let dim = unsafe { *new_shape_nsl.data.add(i) };
-        unsafe { *new_shape.add(i) = dim };
+        new_shape_vec.push(dim);
         new_len *= dim;
     }
 
@@ -121,54 +122,33 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         std::process::abort();
     }
 
-    let strides = NslTensor::compute_strides(new_shape, new_ndim);
-
-    let new_tensor = Box::new(NslTensor {
-        data: std::ptr::null_mut(), // placeholder, overwritten below with deep-copied data
-        shape: new_shape,
-        strides,
-        ndim: new_ndim,
-        len: new_len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
-    let result = Box::into_raw(new_tensor) as i64;
-    let result_tensor = NslTensor::from_ptr(result);
-
-    // Device/dtype-aware copy
-    if tensor.dtype == 1 {
-        // f32 (GPU tensors use unified memory, so CPU can read/write)
-        let data_size = (new_len as usize) * std::mem::size_of::<f32>();
-        let new_data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed(data_size) as *mut f32 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc(data_size) as *mut f32
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(tensor.data_f32(), new_data, new_len as usize);
+    // Compute row-major strides for new shape
+    let new_strides_vec = {
+        let mut s = vec![1i64; new_ndim as usize];
+        if new_ndim > 0 {
+            for i in (0..(new_ndim as usize) - 1).rev() {
+                s[i] = s[i + 1] * new_shape_vec[i + 1];
+            }
         }
-        result_tensor.data = new_data as *mut c_void;
+        s
+    };
+
+    // Check contiguity directly to avoid refcount undo-redo pattern.
+    let is_contig = tensor.is_contiguous();
+
+    let result = if is_contig {
+        // Contiguous — return a zero-copy view directly
+        NslTensor::new_view_i64(tensor_ptr, &new_shape_vec, &new_strides_vec, new_ndim, new_len)
     } else {
-        let data_size = (new_len as usize) * std::mem::size_of::<f64>();
-        let new_data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed(data_size) as *mut f64 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc(data_size) as *mut f64
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(tensor.data_f64(), new_data, new_len as usize);
-        }
-        result_tensor.data = new_data as *mut c_void;
-    }
+        // Non-contiguous — materialize to contiguous first, then create view of result
+        let contig_ptr = nsl_tensor_contiguous(tensor_ptr);
+        let view = NslTensor::new_view_i64(contig_ptr, &new_shape_vec, &new_strides_vec, new_ndim, new_len);
+        // Free the intermediate contiguous tensor (view holds the ref via data_owner)
+        nsl_tensor_free(contig_ptr);
+        view
+    };
 
+    // Tracing (unchanged)
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);

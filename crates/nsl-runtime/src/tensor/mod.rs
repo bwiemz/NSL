@@ -1923,4 +1923,77 @@ mod tests {
         // Now free view — source data is freed too
         nsl_tensor_free(view_ptr);
     }
+
+    #[test]
+    fn test_reshape_zero_copy_when_contiguous() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+
+        let new_shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(new_shape_list, 3);
+        crate::list::nsl_list_push(new_shape_list, 2);
+        let reshaped = nsl_tensor_reshape(t, new_shape_list);
+        let r = NslTensor::from_ptr(reshaped);
+
+        // Zero-copy: same data pointer
+        assert_eq!(r.data, tensor.data);
+        assert_eq!(r.owns_data, 0);
+        assert_eq!(r.data_owner, t);
+        assert_eq!(r.ndim, 2);
+        assert_eq!(r.len, 6);
+        unsafe {
+            assert_eq!(*r.shape.add(0), 3);
+            assert_eq!(*r.shape.add(1), 2);
+            // Row-major strides for [3,2]
+            assert_eq!(*r.strides.add(0), 2);
+            assert_eq!(*r.strides.add(1), 1);
+            // Data still accessible
+            assert_eq!(*r.data_f64().add(0), 1.0);
+            assert_eq!(*r.data_f64().add(5), 6.0);
+        }
+
+        nsl_tensor_free(reshaped);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_reshape_materializes_non_contiguous() {
+        // Create [2,3], transpose to [3,2] (non-contiguous), then reshape to [6]
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+
+        let transposed = nsl_tensor_transpose(t, 0, 1);
+
+        let new_shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(new_shape_list, 6);
+        let reshaped = nsl_tensor_reshape(transposed, new_shape_list);
+        let r = NslTensor::from_ptr(reshaped);
+
+        // Non-contiguous reshape must materialize
+        // Transposed [3,2]: [[1,4],[2,5],[3,6]] → flattened [1,4,2,5,3,6]
+        unsafe {
+            assert_eq!(*r.data_f64().add(0), 1.0);
+            assert_eq!(*r.data_f64().add(1), 4.0);
+            assert_eq!(*r.data_f64().add(2), 2.0);
+            assert_eq!(*r.data_f64().add(3), 5.0);
+            assert_eq!(*r.data_f64().add(4), 3.0);
+            assert_eq!(*r.data_f64().add(5), 6.0);
+        }
+
+        nsl_tensor_free(reshaped);
+        nsl_tensor_free(transposed);
+        nsl_tensor_free(t);
+    }
 }
