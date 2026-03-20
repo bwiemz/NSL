@@ -139,6 +139,11 @@ pub struct ZkConfig {
     /// Compilation fails with [`ZkError::InvalidConfig`] if the circuit
     /// exceeds this limit.
     pub max_constraints: Option<u64>,
+    /// Number of fractional bits used in fixed-point arithmetic.
+    ///
+    /// Controls the precision of [`ZkInstruction::FixedMul`] instructions:
+    /// `out = (a * b) >> frac_bits`. Defaults to 8.
+    pub frac_bits: u32,
 }
 
 impl Default for ZkConfig {
@@ -149,6 +154,7 @@ impl Default for ZkConfig {
             emit_solidity: false,
             curve: ZkCurve::BN254,
             max_constraints: None,
+            frac_bits: 8,
         }
     }
 }
