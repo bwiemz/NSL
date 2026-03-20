@@ -9,10 +9,14 @@
 //!
 //! - **Custom gates** ([`gates`]): Define the constraint structure for ML-specific
 //!   operations (dot product, fixed-point multiply, requantize, layer norm).
-//! - **Circuit compiler**: Translates [`ZkIR`] instructions into a
-//!   [`CompiledCircuit`] with the correct `k` sizing parameter.
-//! - **Proof generation/verification**: Stubbed pending full Halo2 integration
-//!   (returns informative errors).
+//! - **Layout planner** ([`layout`]): Maps ZK-IR instructions to the PLONKish
+//!   grid (rows x columns) and computes the circuit size parameter `k`.
+//! - **Proof generation** ([`prove`]): Generates v1 placeholder proofs that
+//!   encode public outputs (real Halo2 `create_proof` is a follow-up task).
+//! - **Proof verification** ([`verify`]): Verifies v1 placeholder proofs by
+//!   checking public outputs against expected values.
+//! - **Solidity emitter** ([`solidity`]): Emits EVM-compatible verifier
+//!   contracts (structural placeholder; real pairing check is a follow-up).
 //!
 //! ## Halo2 dependency
 //!
@@ -21,6 +25,10 @@
 //! works without it. Full proof generation requires the feature to be enabled.
 
 pub mod gates;
+pub mod layout;
+pub mod prove;
+pub mod solidity;
+pub mod verify;
 
 use super::backend::{CompiledCircuit, Witness, ZkBackend, ZkConfig, ZkCurve, ZkError, ZkIR};
 use super::field::FieldElement;
@@ -152,37 +160,48 @@ impl ZkBackend for Halo2Backend {
 
     fn setup(
         &self,
-        _circuit: &CompiledCircuit,
+        circuit: &CompiledCircuit,
     ) -> Result<(Self::ProvingKey, Self::VerificationKey), ZkError> {
-        // Halo2 key generation requires the full circuit layout, which is
-        // completed in a follow-up task (real halo2 synthesis).
-        Err(ZkError::BackendNotImplemented {
-            backend: "halo2",
-            message: "Halo2 key generation requires full circuit synthesis (M55 follow-up)",
-        })
+        // V1: return stub keys that carry the circuit size parameter.
+        // Real Halo2 key generation (keygen_pk/keygen_vk) requires full
+        // circuit synthesis (implementing the Circuit trait), which is a
+        // follow-up task.
+        let k = circuit.k;
+
+        // Compute a deterministic VK hash from the circuit name and k.
+        let mut vk_hash = [0u8; 32];
+        let name_bytes = circuit.ir.name.as_bytes();
+        for (i, &b) in name_bytes.iter().enumerate() {
+            vk_hash[i % 32] ^= b;
+        }
+        vk_hash[0] ^= (k & 0xFF) as u8;
+        vk_hash[1] ^= ((k >> 8) & 0xFF) as u8;
+
+        Ok((
+            Halo2ProvingKey { k },
+            Halo2VerificationKey { k, vk_hash },
+        ))
     }
 
     fn prove(
         &self,
         _pk: &Self::ProvingKey,
-        _witness: &Witness,
+        witness: &Witness,
     ) -> Result<Self::Proof, ZkError> {
-        Err(ZkError::BackendNotImplemented {
-            backend: "halo2",
-            message: "Halo2 proof generation requires full circuit synthesis (M55 follow-up)",
-        })
+        let config = ZkConfig::default();
+        let ir = ZkIR::new(""); // IR not used in v1 prove
+        let proof_bytes = prove::generate_proof(&ir, witness, &config)?;
+        Ok(Halo2Proof { bytes: proof_bytes })
     }
 
     fn verify(
         &self,
         _vk: &Self::VerificationKey,
-        _proof: &Self::Proof,
-        _public_inputs: &[FieldElement],
+        proof: &Self::Proof,
+        public_outputs: &[FieldElement],
     ) -> Result<bool, ZkError> {
-        Err(ZkError::BackendNotImplemented {
-            backend: "halo2",
-            message: "Halo2 verification requires full circuit synthesis (M55 follow-up)",
-        })
+        let config = ZkConfig::default();
+        verify::verify_proof(&proof.bytes, public_outputs, &config)
     }
 
     fn estimate_proof_size(&self, circuit: &CompiledCircuit) -> u64 {
@@ -198,9 +217,8 @@ impl ZkBackend for Halo2Backend {
         BASE_BYTES + advice_commitment_bytes + opening_bytes
     }
 
-    fn emit_solidity(&self, _vk: &Self::VerificationKey) -> Option<String> {
-        // Solidity verifier generation is planned but not yet implemented.
-        None
+    fn emit_solidity(&self, vk: &Self::VerificationKey) -> Option<String> {
+        Some(solidity::emit_solidity_verifier("Circuit", &vk.vk_hash))
     }
 }
 
@@ -226,6 +244,9 @@ pub struct Halo2ProvingKey {
 pub struct Halo2VerificationKey {
     /// Circuit size parameter for this key.
     pub k: u32,
+    /// Deterministic hash of the verification key (32 bytes).
+    /// Used in Solidity contract emission.
+    pub vk_hash: [u8; 32],
 }
 
 /// Halo2 proof (stub).
@@ -420,12 +441,17 @@ mod tests {
     }
 
     #[test]
-    fn halo2_backend_setup_returns_not_implemented() {
-        let ir = ZkIR::new("test");
+    fn halo2_backend_setup_returns_keys() {
+        let mut ir = ZkIR::new("test");
+        let w0 = ir.alloc_wire("a");
+        ir.set_public_inputs(vec![w0]);
         let backend = Halo2Backend::new(ZkCurve::BN254);
         let circuit = backend.compile(&ir, &ZkConfig::default()).unwrap();
         let result = backend.setup(&circuit);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        let (pk, vk) = result.unwrap();
+        assert_eq!(pk.k, circuit.k);
+        assert_eq!(vk.k, circuit.k);
     }
 
     #[test]
@@ -458,5 +484,95 @@ mod tests {
         assert_eq!(circuit.ir.instructions.len(), 1);
         assert_eq!(circuit.ir.public_inputs.len(), 1);
         assert_eq!(circuit.ir.public_outputs.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full pipeline roundtrip: compile -> witness -> prove -> verify
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prove_verify_roundtrip_add() {
+        use crate::zk::field::FieldElement;
+        use crate::zk::witness::WitnessGenerator;
+
+        let fe = FieldElement::from_u64;
+
+        let mut ir = ZkIR::new("roundtrip_add");
+        let w0 = ir.alloc_wire("a");
+        let w1 = ir.alloc_wire("b");
+        let w2 = ir.alloc_wire("out");
+        ir.push(ZkInstruction::Add { out: w2, a: w0, b: w1 });
+        ir.set_public_inputs(vec![w0, w1]);
+        ir.set_public_outputs(vec![w2]);
+
+        // Generate witness.
+        let mut gen = WitnessGenerator::new();
+        let witness = gen.generate(&ir, &[fe(3), fe(7)], &[]).unwrap();
+        assert_eq!(witness.get(w2), fe(10));
+
+        // Compile + setup + prove.
+        let backend = Halo2Backend::new(ZkCurve::BN254);
+        let compiled = backend.compile(&ir, &ZkConfig::default()).unwrap();
+        let (_pk, vk) = backend.setup(&compiled).unwrap();
+        let pk = Halo2ProvingKey { k: compiled.k };
+        let proof = backend.prove(&pk, &witness).unwrap();
+
+        // Verify.
+        let public_outputs = witness.public_output_values();
+        let valid = backend.verify(&vk, &proof, &public_outputs).unwrap();
+        assert!(valid, "proof should verify against correct outputs");
+
+        // Verify with wrong outputs should fail.
+        let wrong_outputs = vec![fe(999)];
+        let invalid = backend.verify(&vk, &proof, &wrong_outputs).unwrap();
+        assert!(!invalid, "proof should not verify against wrong outputs");
+    }
+
+    #[test]
+    fn prove_verify_roundtrip_mul() {
+        use crate::zk::field::FieldElement;
+        use crate::zk::witness::WitnessGenerator;
+
+        let fe = FieldElement::from_u64;
+
+        let mut ir = ZkIR::new("roundtrip_mul");
+        let w0 = ir.alloc_wire("a");
+        let w1 = ir.alloc_wire("b");
+        let w2 = ir.alloc_wire("out");
+        ir.push(ZkInstruction::Mul { out: w2, a: w0, b: w1 });
+        ir.set_public_inputs(vec![w0, w1]);
+        ir.set_public_outputs(vec![w2]);
+
+        let mut gen = WitnessGenerator::new();
+        let witness = gen.generate(&ir, &[fe(6), fe(7)], &[]).unwrap();
+        assert_eq!(witness.get(w2), fe(42));
+
+        let backend = Halo2Backend::new(ZkCurve::BN254);
+        let compiled = backend.compile(&ir, &ZkConfig::default()).unwrap();
+        let (pk, vk) = backend.setup(&compiled).unwrap();
+        let proof = backend.prove(&pk, &witness).unwrap();
+
+        let valid = backend.verify(&vk, &proof, &witness.public_output_values()).unwrap();
+        assert!(valid);
+    }
+
+    // -----------------------------------------------------------------------
+    // Solidity emission
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn emit_solidity_produces_contract() {
+        let mut ir = ZkIR::new("sol_test");
+        let w0 = ir.alloc_wire("x");
+        ir.set_public_inputs(vec![w0]);
+        let backend = Halo2Backend::new(ZkCurve::BN254);
+        let compiled = backend.compile(&ir, &ZkConfig::default()).unwrap();
+        let (_pk, vk) = backend.setup(&compiled).unwrap();
+        let sol = backend.emit_solidity(&vk);
+        assert!(sol.is_some());
+        let sol = sol.unwrap();
+        assert!(sol.contains("contract CircuitVerifier"));
+        assert!(sol.contains("function verify"));
+        assert!(sol.contains("pragma solidity"));
     }
 }

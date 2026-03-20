@@ -114,6 +114,41 @@ impl FieldElement {
 }
 
 // ---------------------------------------------------------------------------
+// Serialisation (32-byte little-endian)
+// ---------------------------------------------------------------------------
+
+impl FieldElement {
+    /// Serialize to 32 bytes (4 × u64 little-endian limbs, limbs[0] first).
+    ///
+    /// The encoding is deterministic and compatible with [`from_bytes`].
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        for (i, limb) in self.limbs.iter().enumerate() {
+            buf[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from 32 bytes (4 × u64 little-endian limbs, limbs[0] first).
+    ///
+    /// # Panics
+    /// Panics if `bytes.len() < 32`.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        assert!(
+            bytes.len() >= 32,
+            "FieldElement::from_bytes requires at least 32 bytes, got {}",
+            bytes.len()
+        );
+        let mut limbs = [0u64; 4];
+        for (i, limb) in limbs.iter_mut().enumerate() {
+            let start = i * 8;
+            *limb = u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
+        }
+        Self { limbs }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Low-level 256-bit helpers
 // ---------------------------------------------------------------------------
 
@@ -539,5 +574,48 @@ mod tests {
         let c = a.clone(); // Clone
         assert_eq!(a, b);
         assert_eq!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialisation: to_bytes / from_bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn to_bytes_from_bytes_roundtrip_zero() {
+        let a = FieldElement::zero();
+        let bytes = a.to_bytes();
+        assert_eq!(bytes, [0u8; 32]);
+        assert_eq!(FieldElement::from_bytes(&bytes), a);
+    }
+
+    #[test]
+    fn to_bytes_from_bytes_roundtrip_one() {
+        let a = FieldElement::one();
+        let bytes = a.to_bytes();
+        // limbs[0] = 1 (LE), rest zero
+        assert_eq!(bytes[0], 1);
+        assert!(bytes[1..].iter().all(|&b| b == 0));
+        assert_eq!(FieldElement::from_bytes(&bytes), a);
+    }
+
+    #[test]
+    fn to_bytes_from_bytes_roundtrip_large() {
+        let a = FieldElement::from_u64(0xDEAD_BEEF_CAFE_BABE);
+        let b = FieldElement::from_bytes(&a.to_bytes());
+        assert_eq!(a, b, "roundtrip must preserve value");
+    }
+
+    #[test]
+    fn to_bytes_from_bytes_roundtrip_negative_field_element() {
+        // p - 1 (the largest element)
+        let pm1 = FieldElement { limbs: super::P }.sub(&FieldElement::one());
+        let b = FieldElement::from_bytes(&pm1.to_bytes());
+        assert_eq!(pm1, b);
+    }
+
+    #[test]
+    fn to_bytes_length_is_32() {
+        let bytes = FieldElement::from_u64(999).to_bytes();
+        assert_eq!(bytes.len(), 32);
     }
 }
