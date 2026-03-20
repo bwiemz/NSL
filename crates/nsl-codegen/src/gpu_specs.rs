@@ -55,6 +55,18 @@ impl GpuSpec {
             _ => self.peak_fp32_tflops,
         }
     }
+
+    /// Returns true if the GPU supports FP8 (e4m3/e5m2) tensor core MMA.
+    /// Requires sm_90 (H100/H200) or later.
+    pub fn supports_fp8_mma(&self) -> bool {
+        self.sm_version >= 90
+    }
+
+    /// Returns true if the GPU supports FP16 tensor core MMA (mma.sync).
+    /// Requires sm_80 (A100) or later.
+    pub fn supports_fp16_mma(&self) -> bool {
+        self.sm_version >= 80
+    }
 }
 
 /// Built-in GPU specification database.
@@ -318,5 +330,32 @@ mod tests {
     #[test]
     fn test_cpu_database_size() {
         assert_eq!(CPU_DATABASE.len(), 2);
+    }
+
+    #[test]
+    fn test_fp8_mma_requires_sm90() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert!(h100.supports_fp8_mma(), "H100 (sm_90) should support FP8 MMA");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert!(!a100.supports_fp8_mma(), "A100 (sm_80) should NOT support FP8 MMA");
+
+        let rtx4090 = find_gpu("RTX-4090").unwrap();
+        assert!(!rtx4090.supports_fp8_mma(), "RTX-4090 (sm_89) should NOT support FP8 MMA");
+    }
+
+    #[test]
+    fn test_fp16_mma_requires_sm80() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert!(h100.supports_fp16_mma(), "H100 should support FP16 MMA");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert!(a100.supports_fp16_mma(), "A100 should support FP16 MMA");
+
+        let rtx3090 = find_gpu("RTX-3090").unwrap();
+        assert!(rtx3090.supports_fp16_mma(), "RTX-3090 (sm_86) should support FP16 MMA");
+
+        let orin = find_gpu("Orin").unwrap();
+        assert!(orin.supports_fp16_mma(), "Orin (sm_87) should support FP16 MMA");
     }
 }
