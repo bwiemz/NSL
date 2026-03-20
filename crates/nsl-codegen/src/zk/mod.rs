@@ -14,6 +14,9 @@ pub mod plonky3;
 pub mod stats;
 pub mod witness;
 
+#[cfg(test)]
+mod tests;
+
 use nsl_ast::decl::Decorator;
 use nsl_ast::expr::ExprKind;
 use nsl_ast::Symbol;
