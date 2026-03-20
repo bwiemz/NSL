@@ -470,35 +470,38 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         let b_base = b_batch_idx * b_mat_stride;
         let out_base = batch_idx * out_mat_stride;
 
-        // 2D matmul for this batch element
+        // 2D matmul for this batch element — dispatch to cache-tiled kernel
         if out_dtype == 1 {
-            let data = raw_data as *mut f32;
-            let read_a = |idx: usize| -> f32 {
-                if a.dtype == 1 { unsafe { *a.data_f32().add(idx) } } else { unsafe { *a.data_f64().add(idx) as f32 } }
-            };
-            let read_b = |idx: usize| -> f32 {
-                if b.dtype == 1 { unsafe { *b.data_f32().add(idx) } } else { unsafe { *b.data_f64().add(idx) as f32 } }
-            };
-            for i in 0..m as usize {
-                for j in 0..k as usize {
-                    let a_val = read_a(a_base + i * k as usize + j);
-                    for l in 0..n as usize {
-                        let b_val = read_b(b_base + j * n as usize + l);
-                        unsafe { *data.add(out_base + i * n as usize + l) += a_val * b_val; }
+            let c_ptr = unsafe { (raw_data as *mut f32).add(out_base) };
+            if a.dtype == 1 && b.dtype == 1 {
+                // Both f32 — call tiled kernel directly
+                let a_ptr = unsafe { a.data_f32().add(a_base) };
+                let b_ptr = unsafe { b.data_f32().add(b_base) };
+                crate::cpu::tiled_matmul_f32(a_ptr, b_ptr, c_ptr, m as usize, k as usize, n as usize);
+            } else {
+                // Mixed dtype — fall back to element-wise conversion (rare path)
+                let read_a = |idx: usize| -> f32 {
+                    if a.dtype == 1 { unsafe { *a.data_f32().add(idx) } } else { unsafe { *a.data_f64().add(idx) as f32 } }
+                };
+                let read_b = |idx: usize| -> f32 {
+                    if b.dtype == 1 { unsafe { *b.data_f32().add(idx) } } else { unsafe { *b.data_f64().add(idx) as f32 } }
+                };
+                for i in 0..m as usize {
+                    for j in 0..k as usize {
+                        let a_val = read_a(a_base + i * k as usize + j);
+                        for l in 0..n as usize {
+                            let b_val = read_b(b_base + j * n as usize + l);
+                            unsafe { *c_ptr.add(i * n as usize + l) += a_val * b_val; }
+                        }
                     }
                 }
             }
         } else {
-            let data = raw_data as *mut f64;
-            for i in 0..m as usize {
-                for j in 0..k as usize {
-                    let a_val = unsafe { *a.data_f64().add(a_base + i * k as usize + j) };
-                    for l in 0..n as usize {
-                        let b_val = unsafe { *b.data_f64().add(b_base + j * n as usize + l) };
-                        unsafe { *data.add(out_base + i * n as usize + l) += a_val * b_val; }
-                    }
-                }
-            }
+            // Both f64 — call tiled kernel
+            let c_ptr = unsafe { (raw_data as *mut f64).add(out_base) };
+            let a_ptr = unsafe { a.data_f64().add(a_base) };
+            let b_ptr = unsafe { b.data_f64().add(b_base) };
+            crate::cpu::tiled_matmul_f64(a_ptr, b_ptr, c_ptr, m as usize, k as usize, n as usize);
         }
     }
 
