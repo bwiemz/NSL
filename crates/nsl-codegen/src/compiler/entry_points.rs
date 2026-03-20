@@ -186,10 +186,10 @@ pub fn compile_with_zk_info(
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
 
-    if options.vram_budget.is_some() {
+    if let Some(budget) = options.vram_budget {
         eprintln!(
             "[nsl] --vram-budget set to {} bytes (planner integration in progress)",
-            options.vram_budget.unwrap()
+            budget
         );
     }
     if options.memory_report {
