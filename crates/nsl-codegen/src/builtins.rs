@@ -419,11 +419,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_serve_set_grammar", &[types::I64, types::I64], Some(types::I64)),
     // --- M39b: vmap runtime ---
     ("nsl_vmap_check_batch", &[types::I64, types::I64, types::I64], Some(types::I64)),
-    // --- M40b: Backward context for source-to-source AD ---
+    // --- M40b: Backward context for source-to-source AD (handle-based) ---
     ("nsl_backward_ctx_new", &[types::I64], Some(types::I64)),
-    ("nsl_backward_ctx_save", &[types::I64, types::I64], Some(types::I64)),
-    ("nsl_backward_ctx_load", &[types::I64], Some(types::I64)),
-    ("nsl_backward_ctx_free", &[], Some(types::I64)),
+    ("nsl_backward_ctx_save", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_backward_ctx_load", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_backward_ctx_free", &[types::I64], Some(types::I64)),
     // --- M43: Pipeline parallelism ---
     ("nsl_pipeline_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_pipeline_send", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
