@@ -309,6 +309,22 @@ enum Cli {
         /// M53: Write DO-178C compliance report to file
         #[arg(long)]
         do178c_report: Option<PathBuf>,
+
+        /// M55: Compile @zk_proof functions to ZK inference circuits
+        #[arg(long)]
+        zk_circuit: bool,
+
+        /// M55: ZK proving backend: halo2 (default) or plonky3
+        #[arg(long, default_value = "halo2")]
+        zk_backend: String,
+
+        /// M55: Emit a Solidity verifier contract alongside the ZK circuit
+        #[arg(long)]
+        zk_solidity: bool,
+
+        /// M55: Path to .safetensors weights file used as ZK witness
+        #[arg(long)]
+        zk_weights: Option<PathBuf>,
     },
 
     /// Run @test functions in an NSL file
@@ -366,6 +382,54 @@ enum Cli {
         /// Export to Chrome tracing JSON file
         #[arg(long)]
         export_chrome: Option<PathBuf>,
+    },
+
+    /// M55: ZK inference circuit operations (stats, prove, verify)
+    Zk {
+        #[command(subcommand)]
+        cmd: ZkCmd,
+    },
+}
+
+/// M55: ZK subcommands.
+#[derive(clap::Subcommand)]
+enum ZkCmd {
+    /// Show circuit statistics for a compiled .zkir file
+    Stats {
+        /// Path to the .zkir file
+        file: PathBuf,
+    },
+
+    /// Generate a ZK proof from a compiled circuit
+    Prove {
+        /// Path to the .zkir file
+        file: PathBuf,
+
+        /// Path to the proving key file
+        #[arg(long)]
+        pk: PathBuf,
+
+        /// Path to JSON file containing circuit inputs
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Output path for the generated proof (default: <file>.proof)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Verify a ZK proof against public inputs
+    Verify {
+        /// Path to the verification key file
+        vk: PathBuf,
+
+        /// Path to the proof file to verify
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Path to JSON file containing public inputs
+        #[arg(long)]
+        public: PathBuf,
     },
 }
 
@@ -472,6 +536,10 @@ fn main() {
             wcet_cert,
             cpu,
             do178c_report,
+            zk_circuit,
+            zk_backend,
+            zk_solidity,
+            zk_weights,
         } => {
             if shared_lib {
                 eprintln!("[nsl] --shared-lib: flag recognized (M62a stub).");
@@ -552,6 +620,10 @@ fn main() {
                 wcet_report_path: wcet_cert,
                 wcet_safety_margin: 1.05,
                 do178c_report,
+                zk_circuit,
+                zk_backend,
+                zk_solidity,
+                zk_weights_path: zk_weights.clone(),
             };
 
             if standalone {
@@ -580,6 +652,8 @@ fn main() {
                     embed_threshold,
                     &compile_opts,
                 );
+            } else if zk_circuit {
+                run_build_zk(&file, output, emit_obj, dump_ir, zk_weights.as_deref(), &compile_opts);
             } else {
                 run_build(&file, output, emit_obj, dump_ir, &compile_opts);
             }
@@ -629,6 +703,11 @@ fn main() {
                 wcet_report_path: wcet_cert,
                 wcet_safety_margin: 1.05,
                 do178c_report,
+                // M55: ZK flags not exposed on `run`; use defaults.
+                zk_circuit: false,
+                zk_backend: "halo2".to_string(),
+                zk_solidity: false,
+                zk_weights_path: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -867,6 +946,9 @@ fn main() {
                 export_chrome.as_deref(),
             );
         }
+        Cli::Zk { cmd } => {
+            run_zk_cmd(cmd);
+        }
     }
 }
 
@@ -1019,6 +1101,140 @@ fn needs_multi_file(file: &PathBuf) -> bool {
 
 fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, options: &nsl_codegen::CompileOptions) {
     run_build_inner(file, output, emit_obj, dump_ir, false, options);
+}
+
+/// M55: Build with --zk-circuit. Runs normal compilation and then invokes
+/// `zk::compile_zk()` for each @zk_proof-decorated function found.
+fn run_build_zk(
+    file: &PathBuf,
+    output: Option<PathBuf>,
+    emit_obj: bool,
+    dump_ir: bool,
+    zk_weights: Option<&std::path::Path>,
+    options: &nsl_codegen::CompileOptions,
+) {
+    let (interner, parse_result, analysis) = frontend(file);
+
+    let (obj_bytes, zk_proof_fns) = match nsl_codegen::compile_with_zk_info(
+        &parse_result.module,
+        &interner,
+        &analysis.type_map,
+        dump_ir,
+        options,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("codegen error: {e}");
+            process::exit(1);
+        }
+    };
+
+    // M55: Report ZK function detection results.
+    if zk_proof_fns.is_empty() {
+        eprintln!("[nsl/zk] no @zk_proof functions found — ZK circuit output skipped");
+    } else {
+        eprintln!(
+            "[nsl/zk] found {} @zk_proof function(s):",
+            zk_proof_fns.len()
+        );
+        let zk_config = nsl_codegen::zk::backend::ZkConfig {
+            backend: match options.zk_backend.to_lowercase().as_str() {
+                "plonky3" => nsl_codegen::zk::backend::ZkBackendType::Plonky3,
+                _ => nsl_codegen::zk::backend::ZkBackendType::Halo2,
+            },
+            emit_solidity: options.zk_solidity,
+            ..Default::default()
+        };
+
+        // Optionally note weight path for future ZK witness integration (Task 14)
+        if let Some(wpath) = zk_weights {
+            eprintln!("[nsl/zk]   weights: {}", wpath.display());
+        }
+
+        for (fn_name, mode) in &zk_proof_fns {
+            eprintln!("[nsl/zk]   {} (mode: {:?})", fn_name, mode);
+            match nsl_codegen::zk::compile_zk(fn_name, *mode, &zk_config) {
+                Ok(result) => {
+                    let report = nsl_codegen::zk::stats::format_stats(&result.stats, fn_name);
+                    eprint!("{}", report);
+                }
+                Err(e) => {
+                    // Expected in Task 13 — compile_zk is a stub returning a
+                    // "not yet fully wired" error. Print the message and continue.
+                    eprintln!("[nsl/zk]   note: {e}");
+                }
+            }
+        }
+    }
+
+    // Write normal object / link as usual.
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid input filename '{}'", file.display());
+            process::exit(1);
+        });
+    let obj_path = file.with_file_name(format!("{stem}.o"));
+
+    if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
+        eprintln!("error: could not write object file: {e}");
+        process::exit(1);
+    }
+
+    if emit_obj {
+        println!("Wrote {}", obj_path.display());
+        return;
+    }
+
+    let exe_path = if let Some(out) = output {
+        out
+    } else {
+        nsl_codegen::linker::default_output_path(file)
+    };
+
+    match nsl_codegen::linker::link(&obj_path, &exe_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&obj_path);
+            println!("Built {}", exe_path.display());
+        }
+        Err(e) => {
+            eprintln!("link error: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// M55: Handle `nsl zk <subcommand>`.
+fn run_zk_cmd(cmd: ZkCmd) {
+    match cmd {
+        ZkCmd::Stats { file } => {
+            eprintln!("[nsl/zk] stats: reading circuit from {}", file.display());
+            eprintln!(
+                "[nsl/zk] ZK subcommand not yet fully wired \
+                 (full .zkir serialization wired in Task 14)"
+            );
+        }
+        ZkCmd::Prove { file, pk, input, output } => {
+            eprintln!("[nsl/zk] prove: circuit={} pk={} input={}",
+                file.display(), pk.display(), input.display());
+            if let Some(ref out) = output {
+                eprintln!("[nsl/zk] prove: output={}", out.display());
+            }
+            eprintln!(
+                "[nsl/zk] ZK subcommand not yet fully wired \
+                 (proof generation wired in Task 14)"
+            );
+        }
+        ZkCmd::Verify { vk, proof, public } => {
+            eprintln!("[nsl/zk] verify: vk={} proof={} public={}",
+                vk.display(), proof.display(), public.display());
+            eprintln!(
+                "[nsl/zk] ZK subcommand not yet fully wired \
+                 (proof verification wired in Task 14)"
+            );
+        }
+    }
 }
 
 fn run_build_standalone(

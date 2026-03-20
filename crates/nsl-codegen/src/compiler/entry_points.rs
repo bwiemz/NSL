@@ -109,6 +109,108 @@ pub fn compile(
     compiler.finalize()
 }
 
+/// Like [`compile`] but also returns the collected `@zk_proof` function map.
+///
+/// This allows the CLI to iterate over the ZK-decorated functions after normal
+/// compilation and invoke `zk::compile_zk()` on each one (Task 13 / M55).
+///
+/// Returns `(object_bytes, zk_proof_fns)` where `zk_proof_fns` maps mangled
+/// function names to their [`crate::zk::backend::ZkMode`].
+pub fn compile_with_zk_info(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> Result<(Vec<u8>, HashMap<String, crate::zk::backend::ZkMode>), CodegenError> {
+    let mut compiler = Compiler::new(interner, type_map, options)?;
+
+    // M52: Load weights if --weights was provided
+    if let Some(ref weight_path) = options.weight_file {
+        match crate::weight_aware::WeightMap::load(weight_path) {
+            Ok(mut wmap) => {
+                let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
+                if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
+                    let config = &options.weight_config;
+                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                    for name in &names {
+                        if let Some(entry) = wmap.get_mut(name) {
+                            entry.analyze_sparsity(config);
+                        }
+                    }
+                }
+                if options.weight_config.dead_weight_elim {
+                    let eliminator =
+                        crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                    for name in &names {
+                        if let Some(entry) = wmap.get_mut(name) {
+                            eliminator.eliminate(entry);
+                        }
+                    }
+                }
+                if options.weight_analysis {
+                    crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+                }
+                eprintln!(
+                    "[nsl] loaded {} weights from {} (SHA-256: {})",
+                    wmap.len(),
+                    wmap.source_path(),
+                    integrity.hash_hex
+                );
+                compiler.weight_integrity = Some(integrity);
+                compiler.weight_map = Some(wmap);
+            }
+            Err(e) => {
+                return Err(crate::error::CodegenError::new(format!(
+                    "failed to load weights: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    compiler.dump_ir = dump_ir;
+    compiler.intern_string("")?;
+    compiler.collect_strings(&ast.stmts)?;
+    compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_structs(&ast.stmts)?;
+    compiler.collect_models(&ast.stmts)?;
+    compiler.declare_runtime_functions()?;
+    compiler.declare_user_functions(&ast.stmts)?;
+    let _batched_fns = compiler.apply_vmap_transforms(ast);
+    compiler.compile_datatype_defs(&ast.stmts)?;
+    compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    compiler.compile_user_functions(&ast.stmts)?;
+    compiler.compile_main(&ast.stmts)?;
+    compiler.compile_pending_lambdas()?;
+
+    if options.vram_budget.is_some() {
+        eprintln!(
+            "[nsl] --vram-budget set to {} bytes (planner integration in progress)",
+            options.vram_budget.unwrap()
+        );
+    }
+    if options.memory_report {
+        eprintln!("[nsl] --memory-report requested (planner integration in progress)");
+    }
+
+    // M53: Run WCET analysis for @real_time functions
+    if compiler.compile_options.wcet_enabled {
+        compiler.run_wcet_analysis()?;
+    }
+
+    // M52: Embed weight hash if weights were loaded
+    compiler.embed_weight_hash()?;
+
+    // Capture ZK fn map before finalize() consumes the compiler.
+    let zk_proof_fns = compiler.zk_proof_fns.clone();
+
+    let bytes = compiler.finalize()?;
+    Ok((bytes, zk_proof_fns))
+}
+
 /// Compile for standalone export: like `compile()` but uses `compile_standalone_main()`
 /// which initialises the weight provider and standalone arg parser before user code.
 pub fn compile_standalone(

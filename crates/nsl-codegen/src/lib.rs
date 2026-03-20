@@ -51,7 +51,7 @@ pub mod zk;
 pub mod wengert;
 pub mod ad_rules;
 
-pub use compiler::{compile, compile_entry, compile_module, compile_module_with_imports, compile_test, compile_standalone, StandaloneConfig};
+pub use compiler::{compile, compile_entry, compile_module, compile_module_with_imports, compile_test, compile_standalone, compile_with_zk_info, StandaloneConfig};
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
 

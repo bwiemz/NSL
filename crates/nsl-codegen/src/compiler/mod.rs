@@ -27,7 +27,7 @@ use crate::error::CodegenError;
 // Re-export the free functions for `pub use compiler::{...}` in lib.rs
 pub use entry_points::{
     compile, compile_entry, compile_module, compile_module_with_imports, compile_standalone,
-    compile_test,
+    compile_test, compile_with_zk_info,
 };
 
 /// Compile-time context for FlashAttention PTX dispatch.
