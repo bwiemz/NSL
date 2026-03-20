@@ -74,6 +74,10 @@ impl Compiler<'_> {
                 if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
                     self.wcet_budget_fns.insert(raw_name.clone(), wb);
                 }
+                // M55: Extract @zk_proof from bare function decorators
+                if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                    self.zk_proof_fns.insert(raw_name.clone(), mode);
+                }
             }
         }
 
@@ -194,12 +198,39 @@ impl Compiler<'_> {
                         if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
                             self.wcet_budget_fns.insert(mangled.clone(), wb);
                         }
+                        // M55: Extract @zk_proof from model method decorators
+                        if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                            self.zk_proof_fns.insert(mangled.clone(), mode);
+                        }
                     }
 
                     method_map.insert(method_name, mangled);
                 }
             }
             self.model_methods.insert(model_name, method_map);
+        }
+
+        // M55: Handle @zk_proof on whole model blocks.
+        // When a `model` statement is wrapped in `@zk_proof(...)`, register all
+        // its methods in `zk_proof_fns` using the same mangled names used above.
+        for stmt in stmts {
+            if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
+                if let StmtKind::ModelDef(md) = &inner.kind {
+                    if let Some(mode) = crate::zk::extract_zk_proof_decorator(
+                        decorators,
+                        &|sym| self.resolve_sym(sym),
+                    ) {
+                        let model_name = self.resolve_sym(md.name).to_string();
+                        for member in &md.members {
+                            if let ModelMember::Method(fn_def, _) = member {
+                                let method_name = self.resolve_sym(fn_def.name).to_string();
+                                let mangled = format!("__nsl_model_{model_name}_{method_name}");
+                                self.zk_proof_fns.insert(mangled, mode);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())

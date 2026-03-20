@@ -174,6 +174,8 @@ pub struct Compiler<'a> {
     pub wcet_budget_fns: HashMap<String, crate::wcet::WcetBudgetConstraint>,
     /// M53: Collected WCET analysis results for @real_time functions
     pub wcet_results: Vec<crate::wcet::FunctionWcet>,
+    /// M55: Functions (and model methods) decorated with @zk_proof — name -> ZkMode
+    pub zk_proof_fns: HashMap<String, crate::zk::backend::ZkMode>,
     func_index: u32,
 }
 
@@ -293,6 +295,7 @@ impl<'a> Compiler<'a> {
             real_time_fns: HashMap::new(),
             wcet_budget_fns: HashMap::new(),
             wcet_results: Vec::new(),
+            zk_proof_fns: HashMap::new(),
             func_index: 0,
         })
     }
