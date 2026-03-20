@@ -132,7 +132,7 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(new_tensor) as i64;
     let result_tensor = NslTensor::from_ptr(result);
@@ -283,7 +283,7 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(result) as i64;
 
@@ -375,7 +375,7 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -482,7 +482,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     // NO tape recording -- select is used internally for stack backward
     Box::into_raw(out) as i64
@@ -594,7 +594,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: first.device,
         dtype: first.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -691,6 +691,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 0, // view — does NOT own the data buffer
+        data_owner: tensor_ptr, // back-pointer for cleanup
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -744,7 +745,7 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(out) as i64
 }
@@ -831,7 +832,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -952,7 +953,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: first.device,
         dtype: out_dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -1055,7 +1056,7 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -1122,7 +1123,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             refcount: AtomicI64::new(1),
             device: t.device,
             dtype: t.dtype,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     } else {
@@ -1151,7 +1152,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             refcount: AtomicI64::new(1),
             device: t.device,
             dtype: t.dtype,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     }

@@ -279,6 +279,7 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
         device,
         dtype: nsl_dtype,
         owns_data: 0, // Borrowed — DLPack consumer owns the data.
+        data_owner: 0,
     });
 
     Box::into_raw(tensor) as i64
@@ -362,7 +363,7 @@ mod tests {
             refcount: AtomicI64::new(1),
             device: 0,
             dtype: DTYPE_F64,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
 
         let ptr = Box::into_raw(tensor);
@@ -392,7 +393,7 @@ mod tests {
             refcount: AtomicI64::new(1),
             device: 0,
             dtype: DTYPE_F32,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
 
         let ptr = Box::into_raw(tensor);
@@ -564,7 +565,7 @@ mod tests {
             refcount: AtomicI64::new(1),
             device: 0,
             dtype: DTYPE_F64,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
 
         let tensor_ptr = Box::into_raw(tensor) as i64;

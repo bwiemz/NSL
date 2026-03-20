@@ -35,6 +35,7 @@ fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u16, owns_data: u8) ->
         device: 0,
         dtype,
         owns_data,
+        data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }

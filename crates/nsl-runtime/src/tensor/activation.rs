@@ -45,7 +45,7 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -97,7 +97,7 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -149,7 +149,7 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -201,7 +201,7 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -253,7 +253,7 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     // sign is non-differentiable -- no tape recording
     Box::into_raw(result) as i64
@@ -287,7 +287,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -339,7 +339,7 @@ pub(crate) fn nsl_tensor_clamp_backward(
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: input.device, dtype: input.dtype, owns_data: 1,
+        device: input.device, dtype: input.dtype, owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -382,7 +382,7 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -431,7 +431,7 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -472,7 +472,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -520,7 +520,7 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -574,7 +574,7 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {

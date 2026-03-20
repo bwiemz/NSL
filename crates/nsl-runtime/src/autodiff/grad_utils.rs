@@ -85,7 +85,7 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
         refcount: AtomicI64::new(1),
         device: 0,
         dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -165,7 +165,7 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
         refcount: AtomicI64::new(1),
         device,
         dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -197,7 +197,7 @@ pub(crate) fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(new_tensor) as i64
 }
@@ -267,7 +267,7 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
             refcount: AtomicI64::new(1),
         device: 0,
         dtype: res.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
         let out_ptr = Box::into_raw(out) as i64;
         if result != grad_ptr {

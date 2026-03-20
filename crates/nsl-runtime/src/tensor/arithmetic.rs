@@ -214,7 +214,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -272,7 +272,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -322,7 +322,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
@@ -511,7 +511,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: out_dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {

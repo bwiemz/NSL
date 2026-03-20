@@ -41,7 +41,7 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -79,7 +79,7 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }

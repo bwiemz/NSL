@@ -351,7 +351,7 @@ pub extern "C" fn nsl_moe_dispatch_full(
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: out_dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
 
     Box::into_raw(result) as i64

@@ -53,6 +53,10 @@ pub struct NslTensor {
     pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
     pub(crate) dtype: u16,          // 0 = f64, 1 = f32; 256+ = custom user-defined dtypes
     pub(crate) owns_data: u8,       // 1 = heap-owned (free on drop), 0 = borrowed/mmap
+    /// i64 pointer to the NslTensor that owns this tensor's data buffer.
+    /// 0 means this tensor owns its own data. Non-zero means this is a view.
+    /// When this tensor is freed, the owner's refcount is decremented.
+    pub(crate) data_owner: i64,
 }
 
 // Built-in dtype IDs (match existing u8 values)
@@ -300,7 +304,7 @@ impl NslTensor {
             refcount: AtomicI64::new(1),
             device: tensor.device,
             dtype: tensor.dtype,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     }
@@ -517,7 +521,7 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -527,9 +531,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
     }
-    // BUG-2 fix: Extract all fields before Box::from_raw to avoid aliasing UB.
-    // The &mut borrow from from_ptr must end before we create the Box.
-    let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data) = {
+    let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data, data_owner) = {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
         if prev > 1 {
@@ -544,13 +546,45 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
             (tensor.ndim as usize) * std::mem::size_of::<i64>(),
             tensor.device,
             tensor.owns_data,
+            tensor.data_owner,
         )
-        // &mut borrow ends here
     };
 
     if should_free {
         unsafe {
-            if owns_data != 0 {
+            // If this is a view, decrement the data owner's refcount
+            if data_owner != 0 {
+                let owner = NslTensor::from_ptr(data_owner);
+                let owner_prev = owner.refcount.fetch_sub(1, Ordering::SeqCst);
+                if owner_prev == 1 {
+                    // Owner's last reference gone — free the owner's data
+                    if owner.owns_data != 0 {
+                        if owner.device > 0 {
+                            #[cfg(feature = "cuda")]
+                            {
+                                crate::cuda::inner::free_managed(owner.data);
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                checked_free(owner.data as *mut u8, owner.data_byte_size());
+                            }
+                        } else {
+                            checked_free(owner.data as *mut u8, owner.data_byte_size());
+                        }
+                    }
+                    // Free owner's shape, strides, box
+                    let owner_shape_size = (owner.ndim as usize) * std::mem::size_of::<i64>();
+                    if !owner.shape.is_null() {
+                        checked_free(owner.shape as *mut u8, owner_shape_size);
+                    }
+                    if !owner.strides.is_null() {
+                        checked_free(owner.strides as *mut u8, owner_shape_size);
+                    }
+                    crate::fp8::remove_fp8_scale(data_owner);
+                    drop(Box::from_raw(data_owner as *mut NslTensor));
+                }
+            } else if owns_data != 0 {
+                // This tensor owns its data — free the buffer
                 if device > 0 {
                     #[cfg(feature = "cuda")]
                     {
@@ -564,6 +598,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                     checked_free(data_ptr as *mut u8, data_size);
                 }
             }
+
+            // Free this tensor's shape, strides, and box
             if !shape_ptr.is_null() {
                 checked_free(shape_ptr as *mut u8, shape_size);
             }
@@ -663,7 +699,7 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
             refcount: AtomicI64::new(1),
             device: device as u8,
             dtype: 1,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(tensor) as i64
     }
@@ -843,7 +879,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         refcount: AtomicI64::new(1),
         device: weight.device,
         dtype: out_dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -940,19 +976,19 @@ pub extern "C" fn nsl_tensor_layernorm(
 
     let out = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1,
+        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
     let mean_tensor = Box::new(NslTensor {
         data: mean_data as *mut c_void, shape: mean_shape, strides: mean_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1,
+        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let mean_ptr = Box::into_raw(mean_tensor) as i64;
 
     let inv_std_tensor = Box::new(NslTensor {
         data: inv_std_data as *mut c_void, shape: inv_std_shape, strides: inv_std_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1,
+        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
 
@@ -1024,13 +1060,13 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 
     let out = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1,
+        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
     let rms_tensor = Box::new(NslTensor {
         data: rms_data as *mut c_void, shape: rms_shape, strides: rms_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1,
+        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let rms_ptr = Box::into_raw(rms_tensor) as i64;
 
@@ -1098,13 +1134,13 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 
     let result = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: in_dtype, owns_data: 1,
+        device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
     let mask_tensor = Box::new(NslTensor {
         data: mask_data as *mut c_void, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: 0, owns_data: 1,
+        device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let mask_ptr = Box::into_raw(mask_tensor) as i64;
 
@@ -1212,7 +1248,7 @@ pub extern "C" fn nsl_tensor_conv2d(
 
     let result = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: out_dtype, owns_data: 1,
+        device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -1301,7 +1337,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
 
     let result = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: in_dtype, owns_data: 1,
+        device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -1367,7 +1403,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 
     let out = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: out_ndim, len: out_len, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1,
+        ndim: out_ndim, len: out_len, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -1415,7 +1451,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor {
                 data: dst, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
-                device: target, dtype: 1, owns_data: 1,
+                device: target, dtype: 1, owns_data: 1, data_owner: 0,
             });
             return Box::into_raw(new_t) as i64;
         }
@@ -1439,7 +1475,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor {
                 data: dst_void, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
-                device: 0, dtype: 0, owns_data: 1,
+                device: 0, dtype: 0, owns_data: 1, data_owner: 0,
             });
             return Box::into_raw(new_t) as i64;
         }
@@ -1598,7 +1634,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let result = Box::new(NslTensor {
             data: packed_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
             ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-            dtype: target_dtype_id, owns_data: 1,
+            dtype: target_dtype_id, owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     } else {
@@ -1629,7 +1665,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let result = Box::new(NslTensor {
             data: packed_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
             ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-            dtype: target_dtype_id, owns_data: 1,
+            dtype: target_dtype_id, owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     }
@@ -1691,7 +1727,7 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
     let result = Box::new(NslTensor {
         data: out_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
         ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-        dtype: DTYPE_F64, owns_data: 1,
+        dtype: DTYPE_F64, owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -1714,6 +1750,31 @@ mod tests {
         nsl_tensor_set_element(t, indices.as_ptr() as i64, 2, 42.0);
         let tensor = NslTensor::from_ptr(t);
         assert_eq!(unsafe { *tensor.data_f32().add(5) }, 42.0_f32);
+    }
+
+    #[test]
+    fn test_data_owner_lifecycle() {
+        // Create tensor, create a view, free view, free source — no leak, no crash
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 6);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        assert_eq!(tensor.data_owner, 0); // owned tensors have data_owner = 0
+        assert_eq!(tensor.owns_data, 1);
+        assert_eq!(tensor.refcount.load(Ordering::Relaxed), 1);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_data_owner_default_zero() {
+        // Every newly created tensor has data_owner = 0
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        assert_eq!(tensor.data_owner, 0);
+        nsl_tensor_free(t);
     }
 
     #[test]

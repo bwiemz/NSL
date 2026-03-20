@@ -44,7 +44,7 @@ fn alloc_f32_tensor(shape: &[i64]) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 1,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }

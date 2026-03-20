@@ -482,7 +482,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
         device: a.device,
         dtype: a.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
     if autodiff::is_recording() {
