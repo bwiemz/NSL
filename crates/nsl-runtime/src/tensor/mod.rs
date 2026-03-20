@@ -539,7 +539,9 @@ fn print_tensor_recursive(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Ensure we clone from contiguous data so non-contiguous views are handled correctly
+    let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(c_ptr);
     let ndim = tensor.ndim;
     let len = tensor.len;
 
@@ -571,6 +573,7 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         dtype: tensor.dtype,
         owns_data: 1, data_owner: 0,
     });
+    nsl_tensor_free(c_ptr);
     Box::into_raw(result) as i64
 }
 
@@ -666,6 +669,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
     let src = NslTensor::from_ptr(src_ptr);
+    debug_assert!(dst.is_contiguous(), "copy_data requires contiguous dst");
+    debug_assert!(src.is_contiguous(), "copy_data requires contiguous src");
     assert_eq!(
         dst.len, src.len,
         "nsl_tensor_copy_data: dst len {} != src len {}",
@@ -686,6 +691,8 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
     let src = NslTensor::from_ptr(src_ptr);
+    debug_assert!(dst.is_contiguous(), "add_inplace requires contiguous dst");
+    debug_assert!(src.is_contiguous(), "add_inplace requires contiguous src");
     assert_eq!(
         dst.len, src.len,
         "nsl_tensor_add_inplace: dst len {} != src len {}",

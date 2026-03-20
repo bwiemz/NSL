@@ -382,7 +382,12 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     let num_tensors = list.len as usize;
     assert!(num_tensors > 0, "nsl_tensor_stack: empty tensor list");
 
-    let first = NslTensor::from_ptr(unsafe { *list.data.add(0) });
+    // Ensure all input tensors are contiguous for correct flat indexing
+    let contiguous_ptrs: Vec<i64> = (0..num_tensors)
+        .map(|i| nsl_tensor_contiguous(unsafe { *list.data.add(i) }))
+        .collect();
+
+    let first = NslTensor::from_ptr(contiguous_ptrs[0]);
     let in_ndim = first.ndim as usize;
     let out_ndim = (in_ndim + 1) as i64;
 
@@ -398,8 +403,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     );
 
     // Validate all tensors have the same shape
-    for t_idx in 0..num_tensors {
-        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+    for &cp in &contiguous_ptrs {
+        let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, in_ndim, "nsl_tensor_stack: ndim mismatch");
         for axis in 0..in_ndim {
             let s1 = unsafe { *first.shape.add(axis) };
@@ -427,8 +432,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
             .map(|i| unsafe { *out_strides.add(i) })
             .collect();
-        for t_idx in 0..num_tensors {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
+            let t = NslTensor::from_ptr(cp);
             let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..per_tensor {
                 let mut remaining = flat;
@@ -451,8 +456,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
             .map(|i| unsafe { *out_strides.add(i) })
             .collect();
-        for t_idx in 0..num_tensors {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
+            let t = NslTensor::from_ptr(cp);
             let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..per_tensor {
                 let mut remaining = flat;
@@ -484,6 +489,11 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
+
+    // Free contiguous copies
+    for &cp in &contiguous_ptrs {
+        nsl_tensor_free(cp);
+    }
 
     if autodiff::is_recording() {
         let ptrs: Vec<i64> = (0..num_tensors)
@@ -565,8 +575,17 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
 
     let out_len = NslTensor::total_elements(out_shape, target_ndim as i64);
 
-    // ZERO-COPY: share data pointer, bump source refcount to keep it alive
-    tensor.refcount.fetch_add(1, Ordering::SeqCst);
+    // ZERO-COPY: share data pointer, bump the root owner's refcount to keep it alive.
+    // Root-flattening: if the source is itself a view, follow data_owner to the true root
+    // to avoid use-after-free if the intermediate view is freed first.
+    let true_owner = if tensor.data_owner != 0 {
+        let root = NslTensor::from_ptr(tensor.data_owner);
+        root.refcount.fetch_add(1, Ordering::SeqCst);
+        tensor.data_owner
+    } else {
+        tensor.refcount.fetch_add(1, Ordering::SeqCst);
+        tensor_ptr
+    };
 
     let out = Box::new(NslTensor {
         data: tensor.data,
@@ -578,7 +597,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 0, // view — does NOT own the data buffer
-        data_owner: tensor_ptr, // back-pointer for cleanup
+        data_owner: true_owner, // back-pointer for cleanup (root-flattened)
     });
     let out_ptr = Box::into_raw(out) as i64;
 

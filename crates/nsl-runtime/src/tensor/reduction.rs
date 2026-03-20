@@ -24,7 +24,8 @@ pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
 /// Sum reduction along a dimension (dim=-1 means global).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
     let input_shape = get_shape_vec(tensor);
     let keepdim_bool = keepdim != 0;
 
@@ -44,6 +45,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
             s
         };
         let result = create_scalar_tensor_dtype(total, tensor.dtype);
+        nsl_tensor_free(t_c);
         if autodiff::is_recording() {
             autodiff::maybe_record(autodiff::TapeOp::SumReduce {
                 a: tensor_ptr,
@@ -116,6 +118,7 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
         }
     }
 
+    nsl_tensor_free(t_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::SumReduce {
             a: tensor_ptr,
@@ -131,13 +134,15 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
 /// Mean reduction along a dimension (dim=-1 means global).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
     let input_shape = get_shape_vec(tensor);
     let keepdim_bool = keepdim != 0;
 
     if dim == -1 {
         // Global reduction
         if tensor.len == 0 {
+            nsl_tensor_free(t_c);
             return create_scalar_tensor_dtype(0.0, tensor.dtype);
         }
         let num_elements = tensor.len;
@@ -155,6 +160,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
             s / num_elements as f64
         };
         let result = create_scalar_tensor_dtype(total, tensor.dtype);
+        nsl_tensor_free(t_c);
         if autodiff::is_recording() {
             autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
                 a: tensor_ptr,
@@ -197,6 +203,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
         }
     }
 
+    nsl_tensor_free(t_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
             a: tensor_ptr,
@@ -213,7 +220,8 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
 /// Reduce max along a dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
     let input_shape = get_shape_vec(tensor);
     let keepdim_bool = keepdim != 0;
     let ndim = tensor.ndim as usize;
@@ -298,6 +306,7 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
         }
     }
 
+    nsl_tensor_free(t_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::ReduceMax {
             a: tensor_ptr,
@@ -404,7 +413,8 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 /// Softmax along a dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
-    let a = NslTensor::from_ptr(tensor_ptr);
+    let a_c = nsl_tensor_contiguous(tensor_ptr);
+    let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
@@ -489,6 +499,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Softmax {
