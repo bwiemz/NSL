@@ -431,4 +431,57 @@ mod tests {
     fn round_half_to_even_normal_round_up() {
         assert_eq!(round_half_to_even(2.7), 3);
     }
+
+    // ------------------------------------------------------------------
+    // User-defined custom lookup tables (Task 4b: @zk_lookup)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn custom_table_from_closure_verifies_entries() {
+        // Create a custom lookup table for abs(x) over 8-bit signed inputs.
+        let table = precompute_table_from_fn(|x: f64| x.abs(), 8, 8);
+        assert_eq!(table.entries.len(), 256);
+        assert_eq!(table.name, "<custom>");
+
+        // Verify specific entries:
+        // x = 0 (index 0) -> abs(0) = 0
+        let (_, out_zero) = table.entries[0];
+        assert_eq!(out_zero, FieldElement::from_u64(0), "abs(0) == 0");
+
+        // x = 5 (index 5) -> abs(5) = 5
+        let (_, out_5) = table.entries[5];
+        assert_eq!(out_5, FieldElement::from_u64(5), "abs(5) == 5");
+
+        // x = -5 (index 251 in 8-bit two's complement) -> abs(-5) = 5
+        let (_, out_neg5) = table.entries[251];
+        assert_eq!(out_neg5, FieldElement::from_u64(5), "abs(-5) == 5");
+
+        // x = -128 (index 128) -> abs(-128) = 128, clamped to 127 for 8-bit signed output
+        let (_, out_neg128) = table.entries[128];
+        assert_eq!(out_neg128, FieldElement::from_u64(127), "abs(-128) clamped to 127");
+
+        // x = 127 (index 127) -> abs(127) = 127
+        let (_, out_127) = table.entries[127];
+        assert_eq!(out_127, FieldElement::from_u64(127), "abs(127) == 127");
+    }
+
+    #[test]
+    fn custom_table_clamp_fn_verifies_entries() {
+        // Create a lookup table for clamp(x, -3, 3) via a closure.
+        let table = precompute_table_from_fn(|x: f64| x.clamp(-3.0, 3.0), 8, 8);
+        assert_eq!(table.entries.len(), 256);
+
+        // x = 0 -> clamp(0) = 0
+        let (_, out_0) = table.entries[0];
+        assert_eq!(out_0, FieldElement::from_u64(0));
+
+        // x = 10 (index 10) -> clamp(10, -3, 3) = 3
+        let (_, out_10) = table.entries[10];
+        assert_eq!(out_10, FieldElement::from_u64(3));
+
+        // x = -10 (index 246) -> clamp(-10, -3, 3) = -3
+        // -3 in the field is p - 3, represented as from_fixed_point(-3, 0)
+        let (_, out_neg10) = table.entries[246];
+        assert_eq!(out_neg10, FieldElement::from_fixed_point(-3, 0));
+    }
 }

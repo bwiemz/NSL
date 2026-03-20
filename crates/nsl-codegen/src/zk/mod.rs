@@ -75,6 +75,48 @@ pub fn extract_zk_proof_decorator<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// extract_zk_lookup_decorator
+// ---------------------------------------------------------------------------
+
+/// Extract `@zk_lookup(input_bits=N, output_bits=M)` from a decorator list.
+///
+/// Returns `Some((input_bits, output_bits))` if a `@zk_lookup` decorator is found.
+/// Both `input_bits` and `output_bits` are required; the decorator is ignored
+/// if either argument is missing or not an integer literal.
+pub fn extract_zk_lookup_decorator<'a>(
+    decos: &[Decorator],
+    resolve: &dyn Fn(Symbol) -> &'a str,
+) -> Option<(u32, u32)> {
+    for d in decos {
+        if d.name.len() == 1 && resolve(d.name[0]) == "zk_lookup" {
+            let args = d.args.as_ref()?;
+            let mut input_bits: Option<u32> = None;
+            let mut output_bits: Option<u32> = None;
+
+            for arg in args {
+                let name_sym = match arg.name {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let name = resolve(name_sym);
+                if let ExprKind::IntLiteral(val) = &arg.value.kind {
+                    match name {
+                        "input_bits" => input_bits = Some(*val as u32),
+                        "output_bits" => output_bits = Some(*val as u32),
+                        _ => {}
+                    }
+                }
+            }
+
+            if let (Some(ib), Some(ob)) = (input_bits, output_bits) {
+                return Some((ib, ob));
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // compile_zk — top-level orchestrator (placeholder until Task 14)
 // ---------------------------------------------------------------------------
 

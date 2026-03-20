@@ -78,6 +78,10 @@ impl Compiler<'_> {
                 if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
                     self.zk_proof_fns.insert(raw_name.clone(), mode);
                 }
+                // M55: Extract @zk_lookup from function decorators
+                if let Some((ib, ob)) = crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                    self.zk_lookup_fns.insert(raw_name.clone(), (ib, ob));
+                }
             }
         }
 

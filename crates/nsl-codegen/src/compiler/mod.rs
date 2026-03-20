@@ -176,6 +176,8 @@ pub struct Compiler<'a> {
     pub wcet_results: Vec<crate::wcet::FunctionWcet>,
     /// M55: Functions (and model methods) decorated with @zk_proof — name -> ZkMode
     pub zk_proof_fns: HashMap<String, crate::zk::backend::ZkMode>,
+    /// M55: Functions decorated with @zk_lookup — name -> (input_bits, output_bits)
+    pub zk_lookup_fns: HashMap<String, (u32, u32)>,
     func_index: u32,
 }
 
@@ -296,6 +298,7 @@ impl<'a> Compiler<'a> {
             wcet_budget_fns: HashMap::new(),
             wcet_results: Vec::new(),
             zk_proof_fns: HashMap::new(),
+            zk_lookup_fns: HashMap::new(),
             func_index: 0,
         })
     }
