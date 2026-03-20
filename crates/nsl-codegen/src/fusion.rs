@@ -88,12 +88,6 @@ pub fn try_synthesize_fused(op_chain: &[&str], num_inputs: usize) -> Option<Fuse
 /// Each input is loaded once from global memory, all ops are register-to-register,
 /// output is stored once to global memory.
 ///
-/// KNOWN LIMITATION: Binary ops always use register %f1 as RHS. This is correct
-/// for 2-input chains (e.g., `relu(x + b)`) but incorrect for 3+ input chains
-/// where different binary ops consume different inputs (e.g., `(x + b) - c`).
-/// This must be fixed before enabling the fused kernel launch path — tracked as
-/// part of the GPU activation follow-up.
-///
 /// **ISA correctness:** `ex2.approx.f32` computes base-2 exp, so natural exp requires
 /// multiplying by log2(e) ~ 1.4427 first. Similarly, `lg2.approx.f32` computes base-2
 /// log, so natural log requires multiplying by ln(2) ~ 0.6931 after.
@@ -157,13 +151,19 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
     }
 
     // Apply fused ops -- register-to-register
+    // Each binary op consumes the next unused input register as its RHS.
+    // Input 0 is always the LHS of the first op; inputs 1, 2, 3, ... are
+    // consumed in order by successive binary ops.
     let mut result_reg = 0;
+    let mut next_binary_input = 1usize;
     for (op_idx, op) in ops.iter().enumerate() {
         let out_reg = num_inputs + op_idx;
+        let is_binary = matches!(*op, "add" | "sub" | "mul" | "div" | "pow");
+        let rhs = if is_binary { next_binary_input } else { 0 };
+
         match *op {
             "add" => {
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
-                let rhs = 1;
                 ptx.push_str(&format!(
                     "    add.f32 %f{}, %f{}, %f{};\n",
                     out_reg, lhs, rhs
@@ -173,21 +173,21 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!(
                     "    sub.f32 %f{}, %f{}, %f{};\n",
-                    out_reg, lhs, 1
+                    out_reg, lhs, rhs
                 ));
             }
             "mul" => {
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!(
                     "    mul.f32 %f{}, %f{}, %f{};\n",
-                    out_reg, lhs, 1
+                    out_reg, lhs, rhs
                 ));
             }
             "div" => {
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!(
                     "    div.rn.f32 %f{}, %f{}, %f{};\n",
-                    out_reg, lhs, 1
+                    out_reg, lhs, rhs
                 ));
             }
             "pow" => {
@@ -198,7 +198,7 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
                 ));
                 ptx.push_str(&format!(
                     "    mul.f32 %f{}, %f{}, %f{};\n",
-                    out_reg, out_reg, 1
+                    out_reg, out_reg, rhs
                 ));
                 ptx.push_str(&format!(
                     "    ex2.approx.f32 %f{}, %f{};\n",
@@ -363,6 +363,9 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
                 let src = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!("    mov.f32 %f{}, %f{};\n", out_reg, src));
             }
+        }
+        if is_binary {
+            next_binary_input += 1;
         }
         result_reg = out_reg;
     }
@@ -618,6 +621,51 @@ mod tests {
         assert!(!is_fusible_op("matmul"));
         assert!(!is_fusible_op("gelu")); // NOT in M26 list (handled by epilogue)
         assert!(!is_fusible_op("silu")); // NOT in M26 list
+    }
+
+    #[test]
+    fn test_fused_ptx_3_input_chain_registers() {
+        // (x + b) - c: inputs [x, b, c], ops ["add", "sub"]
+        // add should use %f0 (x) + %f1 (b) → %f3
+        // sub should use %f3 (prev result) - %f2 (c) → %f4
+        let ptx = synthesize_fused_ptx("fused_add_sub", &["add", "sub"], 3);
+        let ptx_str = String::from_utf8(ptx).unwrap();
+
+        assert!(ptx_str.contains("add.f32 %f3, %f0, %f1"),
+            "add should use %f0 + %f1, got:\n{}", ptx_str);
+        assert!(ptx_str.contains("sub.f32 %f4, %f3, %f2"),
+            "sub should use result - %f2, got:\n{}", ptx_str);
+    }
+
+    #[test]
+    fn test_fused_ptx_4_input_chain_registers() {
+        // (x + a) * b + c: inputs [x, a, b, c], ops ["add", "mul", "add"]
+        let ptx = synthesize_fused_ptx("fused_4input", &["add", "mul", "add"], 4);
+        let ptx_str = String::from_utf8(ptx).unwrap();
+
+        // add: %f4 = %f0 + %f1
+        assert!(ptx_str.contains("add.f32 %f4, %f0, %f1"),
+            "first add should use %f0 + %f1, got:\n{}", ptx_str);
+        // mul: %f5 = %f4 * %f2
+        assert!(ptx_str.contains("mul.f32 %f5, %f4, %f2"),
+            "mul should use result * %f2, got:\n{}", ptx_str);
+        // add: %f6 = %f5 + %f3
+        assert!(ptx_str.contains("add.f32 %f6, %f5, %f3"),
+            "second add should use result + %f3, got:\n{}", ptx_str);
+    }
+
+    #[test]
+    fn test_fused_ptx_unary_after_binary_no_consume() {
+        // relu(x + b): inputs [x, b], ops ["add", "relu"]
+        // add: %f2 = %f0 + %f1
+        // relu: %f3 = max(%f2, 0) — unary, does not consume an input
+        let ptx = synthesize_fused_ptx("fused_add_relu", &["add", "relu"], 2);
+        let ptx_str = String::from_utf8(ptx).unwrap();
+
+        assert!(ptx_str.contains("add.f32 %f2, %f0, %f1"),
+            "add should use %f0 + %f1, got:\n{}", ptx_str);
+        assert!(ptx_str.contains("max.f32 %f3, %f2, %f3"),
+            "relu should use previous result, got:\n{}", ptx_str);
     }
 
     #[test]
