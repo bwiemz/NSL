@@ -98,6 +98,14 @@ pub struct CompileOptions {
     pub wcet_safety_margin: f64,
     /// M53: Path to write DO-178C compliance report
     pub do178c_report: Option<std::path::PathBuf>,
+    /// M55: Emit a ZK inference circuit alongside compiled output.
+    pub zk_circuit: bool,
+    /// M55: ZK backend to use ("halo2" or "plonky3").
+    pub zk_backend: String,
+    /// M55: Also emit a Solidity verifier contract.
+    pub zk_solidity: bool,
+    /// M55: Path to safetensors weight file used as ZK witness.
+    pub zk_weights_path: Option<std::path::PathBuf>,
 }
 
 impl Default for CompileOptions {
@@ -125,6 +133,10 @@ impl Default for CompileOptions {
             wcet_report_path: None,
             wcet_safety_margin: 1.05,
             do178c_report: None,
+            zk_circuit: false,
+            zk_backend: "halo2".to_string(),
+            zk_solidity: false,
+            zk_weights_path: None,
         }
     }
 }

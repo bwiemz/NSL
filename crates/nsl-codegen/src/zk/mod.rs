@@ -5,3 +5,5 @@
 //! BN254 scalar field, enabling verifiable ML inference without revealing weights.
 
 pub mod field;
+pub mod backend;
+pub mod plonky3;
