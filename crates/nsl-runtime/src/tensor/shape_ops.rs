@@ -222,78 +222,53 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
 #[no_mangle]
 pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    let old_ndim = tensor.ndim;
-    let new_ndim = old_ndim + 1;
+    let ndim = tensor.ndim as usize;
+    let new_ndim = ndim + 1;
 
     let insert_pos = if dim < 0 {
-        dim + new_ndim
+        (dim + new_ndim as i64) as usize
     } else {
-        dim
+        dim as usize
     };
 
-    if insert_pos < 0 || insert_pos > old_ndim {
-        eprintln!(
-            "nsl: unsqueeze dim {} out of range for ndim {}",
-            dim, old_ndim
-        );
-        std::process::abort();
-    }
-    let insert_pos = insert_pos as usize;
+    assert!(insert_pos <= ndim, "unsqueeze dim {} out of range for ndim {}", dim, ndim);
 
-    // Build new shape: copy old shape, insert 1 at insert_pos
-    let new_shape = checked_alloc((new_ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..insert_pos {
-        unsafe { *new_shape.add(i) = *tensor.shape.add(i) };
-    }
-    unsafe { *new_shape.add(insert_pos) = 1 };
-    for i in insert_pos..old_ndim as usize {
-        unsafe { *new_shape.add(i + 1) = *tensor.shape.add(i) };
-    }
+    let mut new_shape = Vec::with_capacity(new_ndim);
+    let mut new_strides = Vec::with_capacity(new_ndim);
 
-    let strides = NslTensor::compute_strides(new_shape, new_ndim);
-    let len = tensor.len;
-
-    // Deep copy data (dtype-aware, device-aware)
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let buf = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>()) as *mut f32 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+    let mut j = 0usize;
+    for i in 0..new_ndim {
+        if i == insert_pos {
+            new_shape.push(1);
+            // Stride for size-1 dim doesn't matter for indexing (only 1 element),
+            // but for contiguity checks it should be product of dims to its right
+            let stride_val = if j < ndim {
+                unsafe { *tensor.strides.add(j) * *tensor.shape.add(j) }
+            } else {
+                1
+            };
+            new_strides.push(stride_val);
         } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32
-        };
-        unsafe { std::ptr::copy_nonoverlapping(tensor.data_f32(), buf, len as usize) };
-        buf as *mut c_void
-    } else {
-        let buf = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f64>()) as *mut f64 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64
-        };
-        unsafe { std::ptr::copy_nonoverlapping(tensor.data_f64(), buf, len as usize) };
-        buf as *mut c_void
-    };
+            unsafe {
+                new_shape.push(*tensor.shape.add(j));
+                new_strides.push(*tensor.strides.add(j));
+            }
+            j += 1;
+        }
+    }
 
-    let out = Box::new(NslTensor {
-        data,
-        shape: new_shape,
-        strides,
-        ndim: new_ndim,
-        len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::new_view_i64(
+        tensor_ptr,
+        &new_shape,
+        &new_strides,
+        new_ndim as i64,
+        tensor.len,
+    );
 
-    if autodiff::is_recording() {
+    // Autodiff tape (preserve existing behavior)
+    if crate::autodiff::is_recording() {
         let input_shape = unsafe {
-            std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize)
+            std::slice::from_raw_parts(tensor.shape, ndim)
         }.to_vec();
         autodiff::maybe_record(autodiff::TapeOp::Unsqueeze {
             input: tensor_ptr,

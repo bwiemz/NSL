@@ -2058,4 +2058,29 @@ mod tests {
         nsl_tensor_free(tr);
         nsl_tensor_free(t);
     }
+
+    #[test]
+    fn test_unsqueeze_zero_copy() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 3);
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        // shape=[3,4], strides=[4,1]
+
+        let u = nsl_tensor_unsqueeze(t, 0);
+        let uv = NslTensor::from_ptr(u);
+
+        assert_eq!(uv.data, tensor.data);
+        assert_eq!(uv.owns_data, 0);
+        assert_eq!(uv.ndim, 3);
+        unsafe {
+            assert_eq!(*uv.shape.add(0), 1);
+            assert_eq!(*uv.shape.add(1), 3);
+            assert_eq!(*uv.shape.add(2), 4);
+        }
+
+        nsl_tensor_free(u);
+        nsl_tensor_free(t);
+    }
 }
