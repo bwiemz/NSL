@@ -308,6 +308,54 @@ impl NslTensor {
         });
         Box::into_raw(result) as i64
     }
+
+    /// Create a view tensor that shares data with `source_ptr`.
+    /// Bumps source refcount. View has `owns_data = 0` and `data_owner = source_ptr`.
+    /// `new_shape` and `new_strides` slices are copied into fresh allocations.
+    pub fn new_view_i64(
+        source_ptr: i64,
+        new_shape: &[i64],
+        new_strides: &[i64],
+        ndim: i64,
+        len: i64,
+    ) -> i64 {
+        let source = NslTensor::from_ptr(source_ptr);
+        let n = ndim as usize;
+        let shape_bytes = n * std::mem::size_of::<i64>();
+
+        let shape = checked_alloc(shape_bytes) as *mut i64;
+        unsafe { std::ptr::copy_nonoverlapping(new_shape.as_ptr(), shape, n) };
+
+        let strides = checked_alloc(shape_bytes) as *mut i64;
+        unsafe { std::ptr::copy_nonoverlapping(new_strides.as_ptr(), strides, n) };
+
+        // Determine the true data owner: if source is itself a view, inherit its owner
+        let true_owner = if source.data_owner != 0 {
+            // Source is a view — our owner is the source's owner (the root)
+            let root = NslTensor::from_ptr(source.data_owner);
+            root.refcount.fetch_add(1, Ordering::SeqCst);
+            source.data_owner
+        } else {
+            // Source owns its data — it becomes our owner
+            source.refcount.fetch_add(1, Ordering::SeqCst);
+            source_ptr
+        };
+
+        let tensor = Box::new(NslTensor {
+            data: source.data,
+            shape,
+            strides,
+            ndim,
+            len,
+            refcount: AtomicI64::new(1),
+            device: source.device,
+            dtype: source.dtype,
+            owns_data: 0,
+            data_owner: true_owner,
+        });
+
+        Box::into_raw(tensor) as i64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1806,5 +1854,73 @@ mod tests {
         assert_eq!(unsafe { *t.data_f32().add(2) }, 30.0_f32);
         assert_eq!(unsafe { *t.data_f32().add(3) }, 0.0_f32);
         assert_eq!(unsafe { *t.data_f32().add(4) }, 0.0_f32);
+    }
+
+    #[test]
+    fn test_new_view_shares_data() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+
+        // Fill with known values
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+
+        let new_shape: [i64; 2] = [3, 2];
+        let new_strides: [i64; 2] = [2, 1];
+        let view_ptr = NslTensor::new_view_i64(t, &new_shape, &new_strides, 2, 6);
+        let view = NslTensor::from_ptr(view_ptr);
+
+        // View shares same data pointer
+        assert_eq!(view.data, tensor.data);
+        assert_eq!(view.owns_data, 0);
+        assert_eq!(view.data_owner, t);
+        assert_eq!(view.ndim, 2);
+        assert_eq!(view.len, 6);
+        unsafe {
+            assert_eq!(*view.shape.add(0), 3);
+            assert_eq!(*view.shape.add(1), 2);
+            assert_eq!(*view.strides.add(0), 2);
+            assert_eq!(*view.strides.add(1), 1);
+        }
+
+        // Source refcount bumped
+        assert_eq!(tensor.refcount.load(Ordering::Relaxed), 2);
+
+        // Free view first, then source — no crash
+        nsl_tensor_free(view_ptr);
+        // Source refcount back to 1
+        assert_eq!(tensor.refcount.load(Ordering::Relaxed), 1);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_free_source_before_view() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..4 {
+            unsafe { *tensor.data_f64().add(i) = i as f64 };
+        }
+
+        let new_shape: [i64; 2] = [2, 2];
+        let new_strides: [i64; 2] = [2, 1];
+        let view_ptr = NslTensor::new_view_i64(t, &new_shape, &new_strides, 2, 4);
+
+        // Free source first — view keeps data alive via data_owner refcount
+        nsl_tensor_free(t);
+        // Source not fully freed yet (refcount went from 2 to 1)
+        let view = NslTensor::from_ptr(view_ptr);
+        unsafe {
+            assert_eq!(*view.data_f64().add(0), 0.0);
+            assert_eq!(*view.data_f64().add(3), 3.0);
+        }
+
+        // Now free view — source data is freed too
+        nsl_tensor_free(view_ptr);
     }
 }
