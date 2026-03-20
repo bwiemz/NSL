@@ -207,15 +207,114 @@ pub extern "C" fn nsl_fp8_matmul(
     crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr)
 }
 
+// ---------------------------------------------------------------------------
+// FP8 Calibration — running max with EMA
+// ---------------------------------------------------------------------------
+
+/// Calibration state for FP8 quantization.
+/// Tracks running absolute maximum via exponential moving average (EMA)
+/// to compute optimal per-tensor scale factors over multiple batches.
+pub struct Fp8CalibrationState {
+    /// Running maximum absolute value (EMA-smoothed)
+    pub running_amax: f32,
+    /// EMA decay factor (0.0-1.0, higher = more weight on history)
+    pub ema_decay: f32,
+    /// Number of batches seen
+    pub num_samples: u64,
+}
+
+impl Fp8CalibrationState {
+    pub fn new(ema_decay: f32) -> Self {
+        Self {
+            running_amax: 0.0,
+            ema_decay,
+            num_samples: 0,
+        }
+    }
+
+    /// Update running max with a new batch of values.
+    pub fn update(&mut self, data: &[f32]) {
+        let batch_amax = data.iter()
+            .map(|x| x.abs())
+            .fold(0.0_f32, f32::max);
+
+        if self.num_samples == 0 {
+            self.running_amax = batch_amax;
+        } else {
+            self.running_amax = self.ema_decay * self.running_amax
+                + (1.0 - self.ema_decay) * batch_amax;
+        }
+        self.num_samples += 1;
+    }
+
+    /// Compute the scale factor for quantization to FP8.
+    /// scale = amax / fp8_max  (to be used as: quantized = value / scale)
+    pub fn compute_scale_e4m3(&self) -> f32 {
+        if self.running_amax == 0.0 { 1.0 } else { self.running_amax / FP8E4M3_MAX }
+    }
+
+    pub fn compute_scale_e5m2(&self) -> f32 {
+        if self.running_amax == 0.0 { 1.0 } else { self.running_amax / FP8E5M2_MAX }
+    }
+}
+
 /// Update calibration running max (EMA). Returns updated running_max as f64.
-/// Deferred to M35b — stub only.
+///
+/// `tensor_ptr`: i64 pointer to an NslTensor (f32 data)
+/// `running_max_ptr`: i64 pointer to a scalar tensor holding the running max
+/// `momentum`: EMA decay factor (e.g., 0.999)
 #[no_mangle]
 pub extern "C" fn nsl_fp8_update_calibration(
-    _tensor_ptr: i64,
-    _running_max_ptr: i64,
-    _momentum: f64,
+    tensor_ptr: i64,
+    running_max_ptr: i64,
+    momentum: f64,
 ) -> f64 {
-    0.0
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let len = tensor.len as usize;
+    if len == 0 {
+        return 0.0;
+    }
+
+    // Compute batch amax
+    let mut batch_amax: f64 = 0.0;
+    if tensor.dtype == 1 {
+        for i in 0..len {
+            let val = unsafe { *tensor.data_f32().add(i) };
+            batch_amax = batch_amax.max(val.abs() as f64);
+        }
+    } else {
+        for i in 0..len {
+            let val = unsafe { *tensor.data_f64().add(i) };
+            batch_amax = batch_amax.max(val.abs());
+        }
+    }
+
+    // Update running max via EMA
+    if running_max_ptr != 0 {
+        let rm = NslTensor::from_ptr(running_max_ptr);
+        let old_max = if rm.dtype == 1 {
+            unsafe { *rm.data_f32() as f64 }
+        } else {
+            unsafe { *rm.data_f64() }
+        };
+
+        let new_max = if old_max == 0.0 {
+            batch_amax
+        } else {
+            momentum * old_max + (1.0 - momentum) * batch_amax
+        };
+
+        // Write back
+        if rm.dtype == 1 {
+            unsafe { *rm.data_f32() = new_max as f32 };
+        } else {
+            unsafe { *rm.data_f64() = new_max };
+        }
+
+        new_max
+    } else {
+        batch_amax
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -320,5 +419,39 @@ mod tests {
         assert!((result[1] - 22.0).abs() < 1.0);
         assert!((result[2] - 43.0).abs() < 2.0);
         assert!((result[3] - 50.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_fp8_calibration_running_max() {
+        let mut cal = Fp8CalibrationState::new(0.9);
+
+        // First batch: max abs = 100.0
+        cal.update(&[50.0, -100.0, 25.0]);
+        assert_eq!(cal.running_amax, 100.0);
+        assert_eq!(cal.num_samples, 1);
+
+        // Second batch: max abs = 200.0, EMA = 0.9 * 100 + 0.1 * 200 = 110.0
+        cal.update(&[-200.0, 10.0]);
+        assert!((cal.running_amax - 110.0).abs() < 1e-5);
+        assert_eq!(cal.num_samples, 2);
+
+        // Scale for E4M3: 110 / 448 = 0.2455...
+        let scale = cal.compute_scale_e4m3();
+        assert!((scale - 110.0 / 448.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_fp8_calibration_zero_data() {
+        let mut cal = Fp8CalibrationState::new(0.9);
+        cal.update(&[0.0, 0.0, 0.0]);
+        assert_eq!(cal.compute_scale_e4m3(), 1.0); // safe default
+        assert_eq!(cal.compute_scale_e5m2(), 1.0);
+    }
+
+    #[test]
+    fn test_fp8_calibration_single_value() {
+        let mut cal = Fp8CalibrationState::new(1.0); // no decay
+        cal.update(&[448.0]);
+        assert_eq!(cal.compute_scale_e4m3(), 1.0); // amax == fp8_max → scale = 1.0
     }
 }
