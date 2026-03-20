@@ -9,3 +9,4 @@ pub mod lookup;
 pub mod ir;
 pub mod backend;
 pub mod plonky3;
+pub mod witness;
