@@ -47,6 +47,7 @@ pub mod multimodal;
 pub mod vmap;
 pub mod wcet;
 pub mod weight_aware;
+pub mod zk;
 pub mod wengert;
 pub mod ad_rules;
 
