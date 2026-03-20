@@ -163,7 +163,6 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
 pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
 
-    // Support negative dimension indices
     let d0 = if dim0 < 0 { dim0 + tensor.ndim } else { dim0 };
     let d1 = if dim1 < 0 { dim1 + tensor.ndim } else { dim1 };
 
@@ -177,95 +176,28 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
     let dim0 = d0;
     let dim1 = d1;
 
-    // Deep copy with transposed shape
-    let ndim = tensor.ndim;
-    let new_shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..ndim as usize {
-        unsafe { *new_shape.add(i) = *tensor.shape.add(i) };
-    }
-    // Swap dimensions
-    unsafe {
-        let tmp = *new_shape.add(dim0 as usize);
-        *new_shape.add(dim0 as usize) = *new_shape.add(dim1 as usize);
-        *new_shape.add(dim1 as usize) = tmp;
-    }
+    let ndim = tensor.ndim as usize;
 
-    let strides = NslTensor::compute_strides(new_shape, ndim);
-    let len = tensor.len;
-
-    // Copy data with transposition
-    let old_strides_arr: Vec<i64> = (0..ndim as usize)
-        .map(|i| unsafe { *tensor.strides.add(i) })
-        .collect();
-    let new_strides_arr: Vec<i64> = (0..ndim as usize)
-        .map(|i| unsafe { *strides.add(i) })
-        .collect();
-
-    // Device/dtype-aware transposed copy
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>()) as *mut f32 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32
-        };
-        for flat_idx in 0..len as usize {
-            let mut remaining = flat_idx;
-            let mut new_indices = vec![0usize; ndim as usize];
-            for d in 0..ndim as usize {
-                new_indices[d] = remaining / new_strides_arr[d] as usize;
-                remaining %= new_strides_arr[d] as usize;
-            }
-            let mut old_indices = new_indices.clone();
-            old_indices.swap(dim0 as usize, dim1 as usize);
-            let mut old_offset = 0usize;
-            for d in 0..ndim as usize {
-                old_offset += old_indices[d] * old_strides_arr[d] as usize;
-            }
-            unsafe { *data.add(flat_idx) = *tensor.data_f32().add(old_offset) };
+    // Build new shape and strides by swapping dim0/dim1
+    let mut new_shape_vec = Vec::with_capacity(ndim);
+    let mut new_strides_vec = Vec::with_capacity(ndim);
+    for i in 0..ndim {
+        unsafe {
+            new_shape_vec.push(*tensor.shape.add(i));
+            new_strides_vec.push(*tensor.strides.add(i));
         }
-        data as *mut c_void
-    } else {
-        let data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f64>()) as *mut f64 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64
-        };
-        for flat_idx in 0..len as usize {
-            let mut remaining = flat_idx;
-            let mut new_indices = vec![0usize; ndim as usize];
-            for d in 0..ndim as usize {
-                new_indices[d] = remaining / new_strides_arr[d] as usize;
-                remaining %= new_strides_arr[d] as usize;
-            }
-            let mut old_indices = new_indices.clone();
-            old_indices.swap(dim0 as usize, dim1 as usize);
-            let mut old_offset = 0usize;
-            for d in 0..ndim as usize {
-                old_offset += old_indices[d] * old_strides_arr[d] as usize;
-            }
-            unsafe { *data.add(flat_idx) = *tensor.data_f64().add(old_offset) };
-        }
-        data as *mut c_void
-    };
+    }
+    new_shape_vec.swap(dim0 as usize, dim1 as usize);
+    new_strides_vec.swap(dim0 as usize, dim1 as usize);
 
-    let result = Box::new(NslTensor {
-        data,
-        shape: new_shape,
-        strides,
-        ndim,
-        len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
-    let out_ptr = Box::into_raw(result) as i64;
+    // Create zero-copy view
+    let out_ptr = NslTensor::new_view_i64(
+        tensor_ptr,
+        &new_shape_vec,
+        &new_strides_vec,
+        tensor.ndim,
+        tensor.len,
+    );
 
     // Record on tape for autodiff
     if crate::autodiff::is_recording() {

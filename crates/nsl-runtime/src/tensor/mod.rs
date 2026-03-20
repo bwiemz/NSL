@@ -1996,4 +1996,66 @@ mod tests {
         nsl_tensor_free(transposed);
         nsl_tensor_free(t);
     }
+
+    #[test]
+    fn test_transpose_zero_copy() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+        // Original: shape=[2,3], strides=[3,1]
+
+        let tr = nsl_tensor_transpose(t, 0, 1);
+        let trv = NslTensor::from_ptr(tr);
+
+        // Zero-copy: same data pointer
+        assert_eq!(trv.data, tensor.data);
+        assert_eq!(trv.owns_data, 0);
+        assert_eq!(trv.data_owner, t);
+        // Shape swapped: [3, 2]
+        unsafe {
+            assert_eq!(*trv.shape.add(0), 3);
+            assert_eq!(*trv.shape.add(1), 2);
+            // Strides swapped: was [3,1] → [1,3]
+            assert_eq!(*trv.strides.add(0), 1);
+            assert_eq!(*trv.strides.add(1), 3);
+        }
+
+        // Non-contiguous
+        assert!(!trv.is_contiguous(), "transposed tensor should be non-contiguous");
+
+        nsl_tensor_free(tr);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_transpose_3d_zero_copy() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        // strides = [12, 4, 1]
+
+        let tr = nsl_tensor_transpose(t, 0, 2);
+        let trv = NslTensor::from_ptr(tr);
+        // shape = [4, 3, 2], strides = [1, 4, 12]
+        unsafe {
+            assert_eq!(*trv.shape.add(0), 4);
+            assert_eq!(*trv.shape.add(1), 3);
+            assert_eq!(*trv.shape.add(2), 2);
+            assert_eq!(*trv.strides.add(0), 1);
+            assert_eq!(*trv.strides.add(1), 4);
+            assert_eq!(*trv.strides.add(2), 12);
+        }
+        assert_eq!(trv.data, tensor.data);
+
+        nsl_tensor_free(tr);
+        nsl_tensor_free(t);
+    }
 }
