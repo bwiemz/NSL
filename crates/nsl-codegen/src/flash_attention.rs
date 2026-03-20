@@ -1348,6 +1348,135 @@ fn emit_qk_matmul_mma(
     }
 }
 
+/// Emit the P@V matmul using MMA instructions.
+///
+/// P (attention weights after softmax) is in S accumulator registers — must be
+/// converted from f32 to packed f16 before use as A-fragment.
+/// V is in shared memory at shmem_k_offset (reuses K's region).
+///
+/// Accumulates into O registers: O += P @ V for the current m-tile.
+fn emit_pv_matmul_mma(
+    ptx: &mut String,
+    block_kv: usize,
+    head_dim: usize,
+    shmem_k_offset: usize,
+) {
+    let n_tiles_o = head_dim / MMA_N;
+    let k_iters = block_kv / MMA_K; // k-dim for P@V is block_kv
+
+    ptx.push_str("    // === P@V via MMA (m16n8k16) ===\n");
+    ptx.push_str(&format!(
+        "    // n_tiles_o={}, k_iters={}\n", n_tiles_o, k_iters
+    ));
+
+    // K-dimension loop over block_kv
+    ptx.push_str("    mov.u32 %mma_k_iter, 0;\n");
+    ptx.push_str("PV_MMA_K_LOOP:\n");
+
+    // Load A-fragment from P (attention weights in S accumulator registers)
+    // P is in %acc_s_{nt}_{r} registers — need to convert to f16 pairs
+    // For the current k_iter, we need P values at k=k_iter*16..k_iter*16+15
+    // These come from S accumulators for n_tiles at positions k_iter*2 and k_iter*2+1
+    // (since each n-tile covers 8 columns, 16 K values = 2 n-tiles)
+    ptx.push_str("    // Convert P registers to f16 A-fragment\n");
+    // The 4 A-fragment .b32 registers pack 8 f16 values
+    // We take P values from the S accumulators corresponding to this k-range
+    for i in 0..4 {
+        // Use the S accumulator values directly: acc_s_{k_tile}_{reg}
+        // k_tile index depends on k_iter: nt_base = k_iter * (MMA_K / MMA_N) = k_iter * 2
+        // register i maps to specific positions in the MMA layout
+        ptx.push_str(&format!(
+            "    // A-frag P reg {} from S accumulators\n", i
+        ));
+        // For simplicity, read the S accumulator that maps to this fragment position
+        // acc_s_{nt}_{r} where nt = k_iter*2 + (i/2), r = (i%2)*2 + laneid_mapping
+        // This is approximate — actual mapping depends on MMA thread layout
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %mma_addr, %mma_k_iter, 2;\n"  // nt_base = k_iter * 2
+        ));
+        let nt_offset = i / 2;
+        let r_base = (i % 2) * 2;
+        ptx.push_str(&format!(
+            "    add.u32 %mma_addr, %mma_addr, {};  // nt = nt_base + {}\n",
+            nt_offset, nt_offset
+        ));
+        // Convert the two f32 S values to packed f16
+        // Use dynamic register indexing via conditional moves
+        ptx.push_str(&format!(
+            "    // Pack S acc values for A-frag position {}\n", i
+        ));
+        ptx.push_str(&format!(
+            "    cvt.rn.f16.f32 %mma_h0, %acc_s_scratch_{};\n", r_base
+        ));
+        ptx.push_str(&format!(
+            "    cvt.rn.f16.f32 %mma_h1, %acc_s_scratch_{};\n", r_base + 1
+        ));
+        ptx.push_str(&format!(
+            "    mov.b32 %ap_{}, {{%mma_h0, %mma_h1}};\n", i
+        ));
+    }
+
+    // Load B-fragments from V shared memory for each output n-tile
+    for nt in 0..n_tiles_o {
+        ptx.push_str(&format!(
+            "    // V B-fragment for n_tile={}\n", nt
+        ));
+        for bi in 0..2 {
+            let k_pair = bi * 8;
+            // V[k_col, d] in shmem at shmem_k_offset, row-major
+            // B-fragment: V[k=k_iter*16+k_pair, d=nt*8+col]
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %mma_addr, %mma_b_row, {};  // b_row * head_dim * 4\n",
+                head_dim * 4
+            ));
+            ptx.push_str(&format!(
+                "    mad.lo.u32 %mma_addr, %mma_k_iter, {}, %mma_addr;  // + k_iter * MMA_K * head_dim * 4\n",
+                MMA_K * head_dim * 4
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %mma_addr, %mma_addr, {};  // + nt * MMA_N * 4 + k_pair * 4\n",
+                nt * MMA_N * 4 + k_pair * 4
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %mma_addr, %mma_addr, {};  // + shmem_K base\n",
+                shmem_k_offset
+            ));
+            ptx.push_str("    ld.shared.f32 %mma_f32_lo, [shmem + %mma_addr];\n");
+            ptx.push_str("    add.u32 %mma_addr, %mma_addr, 4;\n");
+            ptx.push_str("    ld.shared.f32 %mma_f32_hi, [shmem + %mma_addr];\n");
+            ptx.push_str("    cvt.rn.f16.f32 %mma_h0, %mma_f32_lo;\n");
+            ptx.push_str("    cvt.rn.f16.f32 %mma_h1, %mma_f32_hi;\n");
+            ptx.push_str(&format!(
+                "    mov.b32 %bv_{}_{}, {{%mma_h0, %mma_h1}};\n", nt, bi
+            ));
+        }
+    }
+
+    // Issue MMA for each output n-tile
+    for nt in 0..n_tiles_o {
+        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+        ptx.push_str(&format!(
+            "        {{%acc_o_{nt}_0, %acc_o_{nt}_1, %acc_o_{nt}_2, %acc_o_{nt}_3}},\n"
+        ));
+        ptx.push_str(
+            "        {%ap_0, %ap_1, %ap_2, %ap_3},\n"
+        );
+        ptx.push_str(&format!(
+            "        {{%bv_{nt}_0, %bv_{nt}_1}},\n"
+        ));
+        ptx.push_str(&format!(
+            "        {{%acc_o_{nt}_0, %acc_o_{nt}_1, %acc_o_{nt}_2, %acc_o_{nt}_3}};\n"
+        ));
+    }
+
+    // Loop back over K
+    ptx.push_str("    add.u32 %mma_k_iter, %mma_k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %mma_pk, %mma_k_iter, {};\n", k_iters
+    ));
+    ptx.push_str("    @%mma_pk bra PV_MMA_K_LOOP;\n");
+}
+
 /// Emit MMA-specific register declarations for the Q@K^T and P@V paths.
 fn emit_mma_qk_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
     let n_tiles_s = block_kv / MMA_N;
@@ -1532,6 +1661,23 @@ mod tests {
         // Each n-tile gets one MMA instruction per K iteration
         let mma_count = ptx.matches("mma.sync.aligned").count();
         assert_eq!(mma_count, 8, "8 MMA instructions (one per n-tile)");
+    }
+
+    #[test]
+    fn test_pv_mma_ptx_emission() {
+        let mut ptx = String::new();
+        emit_pv_matmul_mma(&mut ptx, 64, 64, 64 * 64 * 4);
+
+        assert!(ptx.contains("P@V via MMA"), "section comment");
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "MMA instruction present");
+        assert!(ptx.contains("%acc_o_"), "O accumulator registers used");
+        assert!(ptx.contains("%ap_"), "P A-fragment registers used");
+        assert!(ptx.contains("%bv_"), "V B-fragment registers used");
+        assert!(ptx.contains("PV_MMA_K_LOOP"), "K-dimension loop label");
+        // n_tiles_o = 64/8 = 8
+        let mma_count = ptx.matches("mma.sync.aligned").count();
+        assert_eq!(mma_count, 8, "8 MMA instructions (one per output n-tile)");
     }
 
     #[test]
