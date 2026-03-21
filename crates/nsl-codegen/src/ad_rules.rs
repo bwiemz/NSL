@@ -24,6 +24,11 @@ pub enum AdjointExpr {
     SqrtBackward(VarId, VarId),
     DivNumeratorBackward(VarId, VarId),
     DivDenominatorBackward(VarId, VarId, VarId),
+    // Control flow backward rules
+    /// SelectTrue: adj_true = cond ? adj_out : 0.  inputs: (adj_out, cond_var)
+    SelectTrue(VarId, VarId),
+    /// SelectFalse: adj_false = !cond ? adj_out : 0.  inputs: (adj_out, cond_var)
+    SelectFalse(VarId, VarId),
 }
 
 /// A single input-adjoint pair from applying an AD rule.
@@ -99,6 +104,25 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Reshape(output_bar),
         }],
+        // Select(cond, true_val, false_val) -> result
+        // d(result)/d(true_val) = cond ? 1 : 0, so adj_true = cond ? adj_out : 0
+        // d(result)/d(false_val) = cond ? 0 : 1, so adj_false = !cond ? adj_out : 0
+        // cond is non-differentiable — no adjoint propagated to inputs[0]
+        PrimalOp::Select => {
+            let cond_var = op.inputs[0];
+            vec![
+                InputAdjoint {
+                    input_var: op.inputs[1],
+                    expr: AdjointExpr::SelectTrue(output_bar, cond_var),
+                },
+                InputAdjoint {
+                    input_var: op.inputs[2],
+                    expr: AdjointExpr::SelectFalse(output_bar, cond_var),
+                },
+            ]
+        }
+        // Condition is non-differentiable — no adjoints to propagate
+        PrimalOp::Condition(_) => vec![],
         _ => vec![],
     }
 }
@@ -123,6 +147,10 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Gelu | PrimalOp::Silu => SavedRequirement::Inputs,
         PrimalOp::Sigmoid | PrimalOp::Tanh | PrimalOp::Exp
         | PrimalOp::Sqrt | PrimalOp::Softmax { .. } => SavedRequirement::Output,
+        // Select needs the condition saved (input[0]), plus both branch values
+        PrimalOp::Select => SavedRequirement::Inputs,
+        // Condition is non-differentiable — nothing needed
+        PrimalOp::Condition(_) => SavedRequirement::Nothing,
         _ => SavedRequirement::Nothing,
     }
 }

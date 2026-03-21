@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
-use crate::wengert::{OpId, PrimalOp, VarId, WengertList, WengertOp};
+use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp};
 
 // M40b: Wengert extraction from typed AST
 use nsl_ast::expr::ExprKind;
@@ -109,6 +109,27 @@ impl AdjointGenerator {
             AdjointExpr::SqrtBackward(y_bar, y) => (PrimalOp::Div, vec![y_bar, y]),
             AdjointExpr::DivNumeratorBackward(y_bar, b) => (PrimalOp::Div, vec![y_bar, b]),
             AdjointExpr::DivDenominatorBackward(y_bar, a, b) => (PrimalOp::Mul, vec![y_bar, a, b]),
+            // SelectTrue: cond ? adj_out : 0
+            AdjointExpr::SelectTrue(y_bar, cond) => {
+                // Emit a zero constant first
+                let zero = self.next_var();
+                let zero_op = self.next_op();
+                self.adjoint_ops.push(WengertOp {
+                    id: zero_op, result: zero, op: PrimalOp::Constant(0.0),
+                    inputs: vec![], saved_for_backward: false, checkpointed: false,
+                });
+                (PrimalOp::Select, vec![cond, y_bar, zero])
+            }
+            // SelectFalse: !cond ? adj_out : 0, i.e. cond ? 0 : adj_out
+            AdjointExpr::SelectFalse(y_bar, cond) => {
+                let zero = self.next_var();
+                let zero_op = self.next_op();
+                self.adjoint_ops.push(WengertOp {
+                    id: zero_op, result: zero, op: PrimalOp::Constant(0.0),
+                    inputs: vec![], saved_for_backward: false, checkpointed: false,
+                });
+                (PrimalOp::Select, vec![cond, zero, y_bar])
+            }
         };
         self.adjoint_ops.push(WengertOp {
             id: op_id, result, op, inputs,
@@ -335,12 +356,10 @@ impl<'a> WengertExtractor<'a> {
                 false
             }
 
-            // If statements: mark as dynamic (data-dependent branches)
-            // Shape-dependent ifs could be resolved at compile time, but
-            // that requires type-level analysis deferred to M40c
-            StmtKind::If { .. } => {
-                self.is_static = false;
-                false
+            // If/else: extract both branches, emit Select ops for variables
+            // that differ between branches. The condition is saved for backward.
+            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+                self.extract_if(condition, then_block, elif_clauses, else_block.as_ref())
             }
 
             // Other statements pass through (assign, decorated, etc.)
@@ -365,6 +384,13 @@ impl<'a> WengertExtractor<'a> {
                     BinOp::Sub => PrimalOp::Sub,
                     BinOp::Mul => PrimalOp::Mul,
                     BinOp::Div => PrimalOp::Div,
+                    // Comparison operators (non-differentiable, used for branch conditions)
+                    BinOp::Gt => PrimalOp::Condition(CompareKind::Gt),
+                    BinOp::Lt => PrimalOp::Condition(CompareKind::Lt),
+                    BinOp::GtEq => PrimalOp::Condition(CompareKind::GtEq),
+                    BinOp::LtEq => PrimalOp::Condition(CompareKind::LtEq),
+                    BinOp::Eq => PrimalOp::Condition(CompareKind::Eq),
+                    BinOp::NotEq => PrimalOp::Condition(CompareKind::NotEq),
                     _ => return None, // Unsupported op for AD
                 };
                 self.list.ops.push(WengertOp {
@@ -471,6 +497,139 @@ impl<'a> WengertExtractor<'a> {
             // Anything else we can't extract -> fallback
             _ => None,
         }
+    }
+
+    /// Extract an if/else statement into the Wengert list.
+    ///
+    /// Strategy: flatten branches into linear SSA by extracting both branches
+    /// independently, then emitting `Select(cond, true_val, false_val)` ops
+    /// for any variables that differ between branches.
+    ///
+    /// For `if cond { return x*x } else { return -x }`, this produces:
+    ///   cond_var = Condition(Gt, x, 0)
+    ///   true_val = Mul(x, x)        // from then-branch
+    ///   false_val = Neg(x)           // from else-branch
+    ///   result = Select(cond_var, true_val, false_val)
+    fn extract_if(
+        &mut self,
+        condition: &nsl_ast::expr::Expr,
+        then_block: &nsl_ast::stmt::Block,
+        elif_clauses: &[(nsl_ast::expr::Expr, nsl_ast::stmt::Block)],
+        else_block: Option<&nsl_ast::stmt::Block>,
+    ) -> bool {
+        // Extract the condition expression
+        let cond_var = match self.extract_expr(condition) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // Snapshot the current symbol -> var mapping before entering branches
+        let snapshot = self.symbol_to_var.clone();
+        let output_before = self.list.output;
+
+        // --- Extract then-branch ---
+        if !self.extract_stmts(&then_block.stmts) {
+            return false;
+        }
+        let then_symbols = self.symbol_to_var.clone();
+        let then_output = self.list.output;
+
+        // Restore snapshot for else-branch extraction
+        self.symbol_to_var = snapshot.clone();
+        self.list.output = output_before;
+
+        // --- Extract else-branch ---
+        // Handle elif as nested if/else: `elif c2: B2 else: B3` becomes
+        // `else: if c2: B2 else: B3` — we support at most simple else for now.
+        // If there are elif clauses, desugar the first one as a nested if.
+        if !elif_clauses.is_empty() {
+            // Desugar: elif chain becomes nested if/else
+            let (elif_cond, elif_block) = &elif_clauses[0];
+            let remaining_elifs = &elif_clauses[1..];
+            // The "else" of this elif is either the remaining elifs or the final else
+            let nested_else = if remaining_elifs.is_empty() {
+                else_block
+            } else {
+                // For simplicity, only support single elif + optional else
+                // More complex chains fall back to dynamic
+                self.is_static = false;
+                return false;
+            };
+            if !self.extract_if(elif_cond, elif_block, &[], nested_else) {
+                return false;
+            }
+        } else if let Some(else_blk) = else_block {
+            if !self.extract_stmts(&else_blk.stmts) {
+                return false;
+            }
+        }
+        // If no else block: variables retain their pre-branch values (identity)
+
+        let else_symbols = self.symbol_to_var.clone();
+        let else_output = self.list.output;
+
+        // --- Merge branches with Select ops ---
+        // Collect all symbols that exist in either branch
+        let all_symbols: HashSet<nsl_ast::Symbol> = then_symbols.keys()
+            .chain(else_symbols.keys())
+            .copied()
+            .collect();
+
+        for sym in &all_symbols {
+            let then_var = then_symbols.get(sym).copied();
+            let else_var = else_symbols.get(sym).copied();
+            let before_var = snapshot.get(sym).copied();
+
+            let tv = then_var.or(before_var);
+            let ev = else_var.or(before_var);
+
+            if let (Some(t), Some(e)) = (tv, ev) {
+                if t != e {
+                    // Different values in each branch — emit Select
+                    let result = self.alloc_var();
+                    self.list.ops.push(WengertOp {
+                        id: self.list.ops.len() as u32,
+                        result,
+                        op: PrimalOp::Select,
+                        inputs: vec![cond_var, t, e],
+                        saved_for_backward: false,
+                        checkpointed: false,
+                    });
+                    self.symbol_to_var.insert(*sym, result);
+                    // Propagate variable name
+                    if let Some(name) = self.list.var_names.get(&t).cloned()
+                        .or_else(|| self.list.var_names.get(&e).cloned())
+                    {
+                        self.list.var_names.insert(result, name);
+                    }
+                } else {
+                    // Same value in both branches — no Select needed
+                    self.symbol_to_var.insert(*sym, t);
+                }
+            }
+        }
+
+        // Handle output (return value) merging
+        if then_output != output_before || else_output != output_before {
+            let t_out = if then_output != output_before { then_output } else { output_before };
+            let e_out = if else_output != output_before { else_output } else { output_before };
+            if t_out != e_out {
+                let result = self.alloc_var();
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: PrimalOp::Select,
+                    inputs: vec![cond_var, t_out, e_out],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                self.list.output = result;
+            } else {
+                self.list.output = t_out;
+            }
+        }
+
+        true
     }
 
     /// Finalize extraction. Returns the WengertList if the graph is static.
@@ -689,5 +848,201 @@ mod tests {
         let interner = Interner::new();
         let extractor = WengertExtractor::new(&interner);
         assert!(extractor.finalize().is_none());
+    }
+
+    // --- Helper: build AST nodes for if/else tests ---
+
+    fn dummy_span() -> nsl_errors::Span {
+        nsl_errors::Span::dummy()
+    }
+
+    fn make_ident_expr(sym: nsl_ast::Symbol) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::Ident(sym),
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_float_expr(v: f64) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::FloatLiteral(v),
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_binop_expr(
+        left: nsl_ast::expr::Expr,
+        op: nsl_ast::operator::BinOp,
+        right: nsl_ast::expr::Expr,
+    ) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_neg_expr(operand: nsl_ast::expr::Expr) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::UnaryOp {
+                op: nsl_ast::operator::UnaryOp::Neg,
+                operand: Box::new(operand),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_return_stmt(expr: nsl_ast::expr::Expr) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::Return(Some(expr)),
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_let_stmt(
+        sym: nsl_ast::Symbol,
+        value: nsl_ast::expr::Expr,
+    ) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::VarDecl {
+                is_const: false,
+                pattern: nsl_ast::pattern::Pattern {
+                    kind: nsl_ast::pattern::PatternKind::Ident(sym),
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId::next(),
+                },
+                type_ann: None,
+                value: Some(value),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_block(stmts: Vec<nsl_ast::stmt::Stmt>) -> nsl_ast::stmt::Block {
+        nsl_ast::stmt::Block { stmts, span: dummy_span() }
+    }
+
+    fn make_if_stmt(
+        condition: nsl_ast::expr::Expr,
+        then_stmts: Vec<nsl_ast::stmt::Stmt>,
+        else_stmts: Option<Vec<nsl_ast::stmt::Stmt>>,
+    ) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::If {
+                condition,
+                then_block: make_block(then_stmts),
+                elif_clauses: vec![],
+                else_block: else_stmts.map(make_block),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_if_elif_stmt(
+        condition: nsl_ast::expr::Expr,
+        then_stmts: Vec<nsl_ast::stmt::Stmt>,
+        elif_cond: nsl_ast::expr::Expr,
+        elif_stmts: Vec<nsl_ast::stmt::Stmt>,
+        else_stmts: Option<Vec<nsl_ast::stmt::Stmt>>,
+    ) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::If {
+                condition,
+                then_block: make_block(then_stmts),
+                elif_clauses: vec![(elif_cond, make_block(elif_stmts))],
+                else_block: else_stmts.map(make_block),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Task 1: Source AD accepts simple if/else (no longer marks dynamic)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_accepts_simple_if_else() {
+        // f(x) = if x > 0: return x else: return 0.0
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let then_stmts = vec![make_return_stmt(make_ident_expr(x_sym))];
+        let else_stmts = vec![make_return_stmt(make_float_expr(0.0))];
+        let if_stmt = make_if_stmt(cond, then_stmts, Some(else_stmts));
+
+        let result = extractor.extract_stmts(&[if_stmt]);
+        assert!(result, "Source AD should accept simple if/else");
+        assert!(extractor.is_static_graph(), "If/else should not make graph dynamic");
+
+        let list = extractor.finalize();
+        assert!(list.is_some(), "Should produce a valid WengertList");
+    }
+
+    #[test]
+    fn extract_still_rejects_while_loops() {
+        // Ensure while loops are still dynamic
+        let interner = Interner::new();
+        let mut extractor = WengertExtractor::new(&interner);
+
+        let while_stmt = nsl_ast::stmt::Stmt {
+            kind: StmtKind::While {
+                condition: nsl_ast::expr::Expr {
+                    kind: ExprKind::BoolLiteral(true),
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId(0),
+                },
+                body: make_block(vec![]),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId(1),
+        };
+
+        assert!(!extractor.extract_stmts(&[while_stmt]));
+        assert!(!extractor.is_static_graph());
+    }
+
+    #[test]
+    fn extract_still_rejects_for_loops() {
+        let interner = Interner::new();
+        let mut extractor = WengertExtractor::new(&interner);
+
+        let for_stmt = nsl_ast::stmt::Stmt {
+            kind: StmtKind::For {
+                pattern: nsl_ast::pattern::Pattern {
+                    kind: nsl_ast::pattern::PatternKind::Wildcard,
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId(0),
+                },
+                iterable: nsl_ast::expr::Expr {
+                    kind: ExprKind::IntLiteral(10),
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId(0),
+                },
+                body: make_block(vec![]),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId(1),
+        };
+
+        assert!(!extractor.extract_stmts(&[for_stmt]));
     }
 }
