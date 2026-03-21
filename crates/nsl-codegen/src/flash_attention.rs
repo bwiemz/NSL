@@ -1744,6 +1744,7 @@ fn emit_smem_swizzle_registers(ptx: &mut String) {
 // ── wgmma.mma_async PTX emission helpers (sm_90+ / Hopper) ──────────
 
 /// wgmma tile dimensions: m64n64k16 for f16, m64n64k32 for fp8.
+#[allow(dead_code)]
 const WGMMA_M: usize = 64;
 const WGMMA_N: usize = 64;
 const WGMMA_K_F16: usize = 16;
