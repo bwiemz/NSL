@@ -1216,6 +1216,7 @@ impl Compiler<'_> {
         // ── 1. Extract config from train(...) args ──────────────────────
         let mut model_sym: Option<nsl_ast::Symbol> = None;
         let mut epochs: i64 = 1;
+        let mut grad_accumulation_steps: i64 = 1;
 
         for arg in &train.config {
             if let Some(name_sym) = arg.name {
@@ -1233,6 +1234,11 @@ impl Compiler<'_> {
                             epochs = *n;
                         } else {
                             return Err(CodegenError::new("train 'epochs' arg must be an integer literal"));
+                        }
+                    }
+                    "grad_accumulation" => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            grad_accumulation_steps = (*n).max(1);
                         }
                     }
                     _ => {} // ignore unknown config for forward compat
@@ -1342,7 +1348,13 @@ impl Compiler<'_> {
                         }
                     }
                 }
-                _ => {} // Data, Eval, Distribute, Stmt — not yet implemented
+                TrainSection::Data(stmts) => {
+                    // Compile data section stmts — typically creates a DataLoader
+                    for stmt in stmts {
+                        self.compile_stmt(builder, state, stmt)?;
+                    }
+                }
+                _ => {} // Eval, Distribute, Stmt — not yet implemented
             }
         }
 
@@ -1480,26 +1492,55 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
-        // ── 7. Inside body: tape_start → step body → find loss → backward → optimizer → callbacks ──
+        // ── 7. Inner batch loop (when DataLoader exists) or single-step (backward compat) ──
 
-        // 7a. Set training mode = true, then start tape recording
+        let has_dataloader = state.dataloader_vars.last().copied();
+
+        // Declare step parameter variable
+        let step_param_var = state.new_variable();
+        builder.declare_var(step_param_var, cl_types::I64);
+        let init_null = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(step_param_var, init_null);
+        state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
+
+        // If DataLoader exists: emit inner batch loop
+        // Structure: reset → [batch_header: next_batch → null check → batch_body | batch_exit]
+        let batch_header_block;
+        let batch_body_block;
+        let batch_exit_block = builder.create_block();
+
+        if let Some(dl_handle) = has_dataloader {
+            // Reset DataLoader at epoch start
+            self.compile_call_by_name(builder, "nsl_dataloader_reset", &[dl_handle])?;
+
+            batch_header_block = builder.create_block();
+            batch_body_block = builder.create_block();
+
+            builder.ins().jump(batch_header_block, &[]);
+
+            // Batch header: get next batch, check for null (exhausted)
+            builder.switch_to_block(batch_header_block);
+            builder.seal_block(batch_header_block);
+            let batch_ptr = self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_handle])?;
+            let null_check = builder.ins().iconst(cl_types::I64, 0);
+            let is_done = builder.ins().icmp(IntCC::Equal, batch_ptr, null_check);
+            builder.ins().brif(is_done, batch_exit_block, &[], batch_body_block, &[]);
+
+            // Batch body
+            builder.switch_to_block(batch_body_block);
+            builder.seal_block(batch_body_block);
+            state.current_block = Some(batch_body_block);
+            builder.def_var(step_param_var, batch_ptr);
+        } else {
+            // No DataLoader — step body runs once per epoch (backward compat)
+            batch_header_block = body_block; // unused, just needs a value
+            batch_body_block = body_block;   // we're already in it
+        }
+
+        // 7a. Set training mode = true, then start tape recording (PER BATCH)
         let true_val = builder.ins().iconst(cl_types::I8, 1);
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
-
-        // 7b. Declare step parameter (e.g. `batch`) and wire to DataLoader.
-        // Get next batch from the DataLoader — the step parameter IS the batch dict.
-        let step_param_var = state.new_variable();
-        builder.declare_var(step_param_var, cl_types::I64);
-        let batch_val = if let Some(&dl_handle) = state.dataloader_vars.last() {
-            // DataLoader exists — call next_batch to get the batch dict
-            self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_handle])?
-        } else {
-            // No DataLoader — null (shouldn't happen in practice)
-            builder.ins().iconst(cl_types::I64, 0)
-        };
-        builder.def_var(step_param_var, batch_val);
-        state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
 
         // Compile step body stmts
         // Suppress tensor temporary cleanup — tape holds raw pointers to intermediates.
@@ -1538,6 +1579,31 @@ impl Compiler<'_> {
         // 7e2. Gradient clipping: clip global norm to 1.0 before optimizer step
         let max_norm_val = builder.ins().f64const(1.0);
         self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
+
+        // 7e3. Gradient accumulation gate: only step optimizer every N batches
+        let optimizer_block = builder.create_block();
+        let post_optimizer_block = builder.create_block();
+
+        if grad_accumulation_steps > 1 {
+            let sc = builder.use_var(step_count_var);
+            let accum_val = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+            let one_ga = builder.ins().iconst(cl_types::I64, 1);
+            let sc_plus_one = builder.ins().iadd(sc, one_ga);
+            let rem = builder.ins().srem(sc_plus_one, accum_val);
+            let zero_check = builder.ins().iconst(cl_types::I64, 0);
+            let should_step = builder.ins().icmp(IntCC::Equal, rem, zero_check);
+            builder.ins().brif(should_step, optimizer_block, &[], post_optimizer_block, &[]);
+
+            builder.switch_to_block(optimizer_block);
+            builder.seal_block(optimizer_block);
+            state.current_block = Some(optimizer_block);
+        } else {
+            // No accumulation — always step
+            builder.ins().jump(optimizer_block, &[]);
+            builder.switch_to_block(optimizer_block);
+            builder.seal_block(optimizer_block);
+            state.current_block = Some(optimizer_block);
+        }
 
         // 7f. Optimizer step: for each param, call optimizer step function
         let optimizer_fn_name = match optimizer_name.as_str() {
@@ -1647,6 +1713,12 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
         }
         self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+
+        // Jump to post-optimizer block (merges optimizer and skip paths)
+        builder.ins().jump(post_optimizer_block, &[]);
+        builder.switch_to_block(post_optimizer_block);
+        builder.seal_block(post_optimizer_block);
+        state.current_block = Some(post_optimizer_block);
 
         // 7h. Increment step count
         let sc = builder.use_var(step_count_var);
@@ -1811,10 +1883,23 @@ impl Compiler<'_> {
             }
         }
 
-        // ── 8. Increment epoch counter and loop back ────────────────────
-        let current = state.current_block.unwrap_or(body_block);
-        if !is_block_filled(builder, current) {
+        // ── 8. Close batch loop (if DataLoader) and increment epoch ──────
+        let current = state.current_block.unwrap_or(batch_body_block);
+        if has_dataloader.is_some() {
+            // Jump back to batch_header for next batch
+            if !is_block_filled(builder, current) {
+                builder.ins().jump(batch_header_block, &[]);
+            }
+            // batch_exit: all batches done → jump to epoch increment
+            builder.switch_to_block(batch_exit_block);
+            builder.seal_block(batch_exit_block);
+            state.current_block = Some(batch_exit_block);
             builder.ins().jump(increment_block, &[]);
+        } else {
+            // No DataLoader — single step per epoch, jump to increment
+            if !is_block_filled(builder, current) {
+                builder.ins().jump(increment_block, &[]);
+            }
         }
 
         builder.switch_to_block(increment_block);
