@@ -1337,6 +1337,98 @@ mod tests {
             "Adjoint should have >= 2 Select ops for nested branching, got {adj_selects}");
     }
 
+    // ---------------------------------------------------------------
+    // Task 5: If-without-else (identity for missing branch)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_if_without_else() {
+        // f(x):
+        //   let y = x
+        //   if x > 5: y = x * 2
+        //   return y
+        // For x > 5: f(x) = 2x, f'(x) = 2
+        // For x <= 5: f(x) = x, f'(x) = 1
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let y_sym = nsl_ast::Symbol(interner.get_or_intern("y"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        // let y = x
+        let let_y = make_let_stmt(y_sym, make_ident_expr(x_sym));
+
+        // if x > 5: let y = x * 2.0
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(5.0),
+        );
+        let x_times_2 = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_float_expr(2.0),
+        );
+        let reassign_y = make_let_stmt(y_sym, x_times_2);
+        let if_stmt = make_if_stmt(cond, vec![reassign_y], None); // No else!
+
+        // return y
+        let return_y = make_return_stmt(make_ident_expr(y_sym));
+
+        let result = extractor.extract_stmts(&[let_y, if_stmt, return_y]);
+        assert!(result, "If-without-else should be extractable");
+        assert!(extractor.is_static_graph());
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Should have a Select op that chooses between modified y (x*2) and original y (x)
+        let select_ops: Vec<_> = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .collect();
+        assert!(!select_ops.is_empty(),
+            "If-without-else should produce Select op (modified vs identity)");
+
+        // The Select should use the pre-branch value as the false (else) input
+        // This is the identity case — when condition is false, y retains its original value
+        let sel = select_ops.last().unwrap();
+        assert_eq!(sel.inputs.len(), 3);
+    }
+
+    #[test]
+    fn adjoint_if_without_else_identity_passthrough() {
+        // Manual Wengert for: y = x; if x > 5: y = x * 2; return y
+        //   x(0), five(1), two(2)
+        //   cond(3) = x > 5
+        //   modified_y(4) = x * 2
+        //   y_merged(5) = Select(cond, modified_y, x)  // else branch is identity (x)
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(5.0), vec![]),
+                make_op(2, 2, PrimalOp::Constant(2.0), vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(4, 4, PrimalOp::Mul, vec![0, 2]),  // x * 2
+                make_op(5, 5, PrimalOp::Select, vec![3, 4, 0]),  // cond ? x*2 : x
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // x should have an adjoint
+        assert!(gen.adjoint_of(0).is_some(), "x should have adjoint");
+
+        // The backward pass should produce Select ops for conditional adjoint
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 1,
+            "Backward should use Select for conditional adjoint, got {adj_selects}");
+    }
+
     #[test]
     fn extract_elif_desugars_to_nested() {
         // f(x) = if x > 1: x*x*x  elif x > 0: x*x  else: 0
@@ -1389,5 +1481,89 @@ mod tests {
             .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
             .count();
         assert_eq!(cond_count, 2, "Should have 2 Condition ops for if/elif/else, got {cond_count}");
+    }
+
+    // ---------------------------------------------------------------
+    // Integration: end-to-end extraction + adjoint generation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn end_to_end_relu_extraction_and_adjoint() {
+        // Build AST for: if x > 0 { return x } else { return 0 }
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let if_stmt = make_if_stmt(
+            cond,
+            vec![make_return_stmt(make_ident_expr(x_sym))],
+            Some(vec![make_return_stmt(make_float_expr(0.0))]),
+        );
+
+        assert!(extractor.extract_stmts(&[if_stmt]));
+        let primal = extractor.finalize().unwrap();
+
+        // Generate adjoint
+        let max_primal_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
+        let mut gen = AdjointGenerator::new(max_primal_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // Verify the full pipeline works
+        assert!(!adjoint.ops.is_empty(), "Adjoint list should not be empty");
+        // x should have an adjoint
+        let x_var = primal.ops.iter()
+            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .map(|op| op.result)
+            .unwrap();
+        assert!(gen.adjoint_of(x_var).is_some(), "Param x should have adjoint in relu");
+    }
+
+    #[test]
+    fn end_to_end_quadratic_branch_extraction_and_adjoint() {
+        // Build AST for: if x > 0 { return x*x } else { return -x }
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let x_squared = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let neg_x = make_neg_expr(make_ident_expr(x_sym));
+        let if_stmt = make_if_stmt(
+            cond,
+            vec![make_return_stmt(x_squared)],
+            Some(vec![make_return_stmt(neg_x)]),
+        );
+
+        assert!(extractor.extract_stmts(&[if_stmt]));
+        let primal = extractor.finalize().unwrap();
+
+        let max_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        assert!(!adjoint.ops.is_empty());
+        // Both branches contribute to the adjoint of x
+        let x_var = primal.ops.iter()
+            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .map(|op| op.result)
+            .unwrap();
+        assert!(gen.adjoint_of(x_var).is_some());
     }
 }
