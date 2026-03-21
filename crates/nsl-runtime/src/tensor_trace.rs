@@ -484,6 +484,7 @@ mod tests {
             device: 0,
             dtype: 0,
             owns_data: 0,
+            data_owner: 0,
         };
 
         let ret = nsl_trace_record_op(0, 0, 0, &t as *const NslTensor as i64);

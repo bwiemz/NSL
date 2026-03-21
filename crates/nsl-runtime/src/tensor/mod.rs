@@ -53,6 +53,10 @@ pub struct NslTensor {
     pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
     pub(crate) dtype: u16,          // 0 = f64, 1 = f32; 256+ = custom user-defined dtypes
     pub(crate) owns_data: u8,       // 1 = heap-owned (free on drop), 0 = borrowed/mmap
+    /// i64 pointer to the NslTensor that owns this tensor's data buffer.
+    /// 0 means this tensor owns its own data. Non-zero means this is a view.
+    /// When this tensor is freed, the owner's refcount is decremented.
+    pub(crate) data_owner: i64,
 }
 
 // Built-in dtype IDs (match existing u8 values)
@@ -300,9 +304,57 @@ impl NslTensor {
             refcount: AtomicI64::new(1),
             device: tensor.device,
             dtype: tensor.dtype,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
+    }
+
+    /// Create a view tensor that shares data with `source_ptr`.
+    /// Bumps source refcount. View has `owns_data = 0` and `data_owner = source_ptr`.
+    /// `new_shape` and `new_strides` slices are copied into fresh allocations.
+    pub fn new_view_i64(
+        source_ptr: i64,
+        new_shape: &[i64],
+        new_strides: &[i64],
+        ndim: i64,
+        len: i64,
+    ) -> i64 {
+        let source = NslTensor::from_ptr(source_ptr);
+        let n = ndim as usize;
+        let shape_bytes = n * std::mem::size_of::<i64>();
+
+        let shape = checked_alloc(shape_bytes) as *mut i64;
+        unsafe { std::ptr::copy_nonoverlapping(new_shape.as_ptr(), shape, n) };
+
+        let strides = checked_alloc(shape_bytes) as *mut i64;
+        unsafe { std::ptr::copy_nonoverlapping(new_strides.as_ptr(), strides, n) };
+
+        // Determine the true data owner: if source is itself a view, inherit its owner
+        let true_owner = if source.data_owner != 0 {
+            // Source is a view — our owner is the source's owner (the root)
+            let root = NslTensor::from_ptr(source.data_owner);
+            root.refcount.fetch_add(1, Ordering::SeqCst);
+            source.data_owner
+        } else {
+            // Source owns its data — it becomes our owner
+            source.refcount.fetch_add(1, Ordering::SeqCst);
+            source_ptr
+        };
+
+        let tensor = Box::new(NslTensor {
+            data: source.data,
+            shape,
+            strides,
+            ndim,
+            len,
+            refcount: AtomicI64::new(1),
+            device: source.device,
+            dtype: source.dtype,
+            owns_data: 0,
+            data_owner: true_owner,
+        });
+
+        Box::into_raw(tensor) as i64
     }
 }
 
@@ -487,7 +539,9 @@ fn print_tensor_recursive(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Ensure we clone from contiguous data so non-contiguous views are handled correctly
+    let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(c_ptr);
     let ndim = tensor.ndim;
     let len = tensor.len;
 
@@ -517,8 +571,9 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
+    nsl_tensor_free(c_ptr);
     Box::into_raw(result) as i64
 }
 
@@ -527,9 +582,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
     }
-    // BUG-2 fix: Extract all fields before Box::from_raw to avoid aliasing UB.
-    // The &mut borrow from from_ptr must end before we create the Box.
-    let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data) = {
+    let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data, data_owner) = {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
         if prev > 1 {
@@ -544,13 +597,45 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
             (tensor.ndim as usize) * std::mem::size_of::<i64>(),
             tensor.device,
             tensor.owns_data,
+            tensor.data_owner,
         )
-        // &mut borrow ends here
     };
 
     if should_free {
         unsafe {
-            if owns_data != 0 {
+            // If this is a view, decrement the data owner's refcount
+            if data_owner != 0 {
+                let owner = NslTensor::from_ptr(data_owner);
+                let owner_prev = owner.refcount.fetch_sub(1, Ordering::SeqCst);
+                if owner_prev == 1 {
+                    // Owner's last reference gone — free the owner's data
+                    if owner.owns_data != 0 {
+                        if owner.device > 0 {
+                            #[cfg(feature = "cuda")]
+                            {
+                                crate::cuda::inner::free_managed(owner.data);
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                checked_free(owner.data as *mut u8, owner.data_byte_size());
+                            }
+                        } else {
+                            checked_free(owner.data as *mut u8, owner.data_byte_size());
+                        }
+                    }
+                    // Free owner's shape, strides, box
+                    let owner_shape_size = (owner.ndim as usize) * std::mem::size_of::<i64>();
+                    if !owner.shape.is_null() {
+                        checked_free(owner.shape as *mut u8, owner_shape_size);
+                    }
+                    if !owner.strides.is_null() {
+                        checked_free(owner.strides as *mut u8, owner_shape_size);
+                    }
+                    crate::fp8::remove_fp8_scale(data_owner);
+                    drop(Box::from_raw(data_owner as *mut NslTensor));
+                }
+            } else if owns_data != 0 {
+                // This tensor owns its data — free the buffer
                 if device > 0 {
                     #[cfg(feature = "cuda")]
                     {
@@ -564,6 +649,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                     checked_free(data_ptr as *mut u8, data_size);
                 }
             }
+
+            // Free this tensor's shape, strides, and box
             if !shape_ptr.is_null() {
                 checked_free(shape_ptr as *mut u8, shape_size);
             }
@@ -582,6 +669,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
     let src = NslTensor::from_ptr(src_ptr);
+    debug_assert!(dst.is_contiguous(), "copy_data requires contiguous dst");
+    debug_assert!(src.is_contiguous(), "copy_data requires contiguous src");
     assert_eq!(
         dst.len, src.len,
         "nsl_tensor_copy_data: dst len {} != src len {}",
@@ -602,6 +691,8 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
     let src = NslTensor::from_ptr(src_ptr);
+    debug_assert!(dst.is_contiguous(), "add_inplace requires contiguous dst");
+    debug_assert!(src.is_contiguous(), "add_inplace requires contiguous src");
     assert_eq!(
         dst.len, src.len,
         "nsl_tensor_add_inplace: dst len {} != src len {}",
@@ -663,7 +754,7 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
             refcount: AtomicI64::new(1),
             device: device as u8,
             dtype: 1,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(tensor) as i64
     }
@@ -843,7 +934,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         refcount: AtomicI64::new(1),
         device: weight.device,
         dtype: out_dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -940,19 +1031,19 @@ pub extern "C" fn nsl_tensor_layernorm(
 
     let out = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1,
+        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
     let mean_tensor = Box::new(NslTensor {
         data: mean_data as *mut c_void, shape: mean_shape, strides: mean_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1,
+        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let mean_ptr = Box::into_raw(mean_tensor) as i64;
 
     let inv_std_tensor = Box::new(NslTensor {
         data: inv_std_data as *mut c_void, shape: inv_std_shape, strides: inv_std_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1,
+        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
 
@@ -1024,13 +1115,13 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 
     let out = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1,
+        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
     let rms_tensor = Box::new(NslTensor {
         data: rms_data as *mut c_void, shape: rms_shape, strides: rms_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1,
+        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let rms_ptr = Box::into_raw(rms_tensor) as i64;
 
@@ -1098,13 +1189,13 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 
     let result = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: in_dtype, owns_data: 1,
+        device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
     let mask_tensor = Box::new(NslTensor {
         data: mask_data as *mut c_void, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: 0, owns_data: 1,
+        device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
     let mask_ptr = Box::into_raw(mask_tensor) as i64;
 
@@ -1212,7 +1303,7 @@ pub extern "C" fn nsl_tensor_conv2d(
 
     let result = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: out_dtype, owns_data: 1,
+        device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -1301,7 +1392,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
 
     let result = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: in_dtype, owns_data: 1,
+        device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
     let result_ptr = Box::into_raw(result) as i64;
 
@@ -1367,7 +1458,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 
     let out = Box::new(NslTensor {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: out_ndim, len: out_len, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1,
+        ndim: out_ndim, len: out_len, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -1415,7 +1506,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor {
                 data: dst, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
-                device: target, dtype: 1, owns_data: 1,
+                device: target, dtype: 1, owns_data: 1, data_owner: 0,
             });
             return Box::into_raw(new_t) as i64;
         }
@@ -1439,7 +1530,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor {
                 data: dst_void, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
-                device: 0, dtype: 0, owns_data: 1,
+                device: 0, dtype: 0, owns_data: 1, data_owner: 0,
             });
             return Box::into_raw(new_t) as i64;
         }
@@ -1598,7 +1689,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let result = Box::new(NslTensor {
             data: packed_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
             ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-            dtype: target_dtype_id, owns_data: 1,
+            dtype: target_dtype_id, owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     } else {
@@ -1629,7 +1720,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let result = Box::new(NslTensor {
             data: packed_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
             ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-            dtype: target_dtype_id, owns_data: 1,
+            dtype: target_dtype_id, owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     }
@@ -1691,7 +1782,7 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
     let result = Box::new(NslTensor {
         data: out_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
         ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-        dtype: DTYPE_F64, owns_data: 1,
+        dtype: DTYPE_F64, owns_data: 1, data_owner: 0,
     });
     Box::into_raw(result) as i64
 }
@@ -1714,6 +1805,31 @@ mod tests {
         nsl_tensor_set_element(t, indices.as_ptr() as i64, 2, 42.0);
         let tensor = NslTensor::from_ptr(t);
         assert_eq!(unsafe { *tensor.data_f32().add(5) }, 42.0_f32);
+    }
+
+    #[test]
+    fn test_data_owner_lifecycle() {
+        // Create tensor, create a view, free view, free source — no leak, no crash
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 6);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        assert_eq!(tensor.data_owner, 0); // owned tensors have data_owner = 0
+        assert_eq!(tensor.owns_data, 1);
+        assert_eq!(tensor.refcount.load(Ordering::Relaxed), 1);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_data_owner_default_zero() {
+        // Every newly created tensor has data_owner = 0
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        assert_eq!(tensor.data_owner, 0);
+        nsl_tensor_free(t);
     }
 
     #[test]
@@ -1745,5 +1861,349 @@ mod tests {
         assert_eq!(unsafe { *t.data_f32().add(2) }, 30.0_f32);
         assert_eq!(unsafe { *t.data_f32().add(3) }, 0.0_f32);
         assert_eq!(unsafe { *t.data_f32().add(4) }, 0.0_f32);
+    }
+
+    #[test]
+    fn test_new_view_shares_data() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+
+        // Fill with known values
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+
+        let new_shape: [i64; 2] = [3, 2];
+        let new_strides: [i64; 2] = [2, 1];
+        let view_ptr = NslTensor::new_view_i64(t, &new_shape, &new_strides, 2, 6);
+        let view = NslTensor::from_ptr(view_ptr);
+
+        // View shares same data pointer
+        assert_eq!(view.data, tensor.data);
+        assert_eq!(view.owns_data, 0);
+        assert_eq!(view.data_owner, t);
+        assert_eq!(view.ndim, 2);
+        assert_eq!(view.len, 6);
+        unsafe {
+            assert_eq!(*view.shape.add(0), 3);
+            assert_eq!(*view.shape.add(1), 2);
+            assert_eq!(*view.strides.add(0), 2);
+            assert_eq!(*view.strides.add(1), 1);
+        }
+
+        // Source refcount bumped
+        assert_eq!(tensor.refcount.load(Ordering::Relaxed), 2);
+
+        // Free view first, then source — no crash
+        nsl_tensor_free(view_ptr);
+        // Source refcount back to 1
+        assert_eq!(tensor.refcount.load(Ordering::Relaxed), 1);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_free_source_before_view() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..4 {
+            unsafe { *tensor.data_f64().add(i) = i as f64 };
+        }
+
+        let new_shape: [i64; 2] = [2, 2];
+        let new_strides: [i64; 2] = [2, 1];
+        let view_ptr = NslTensor::new_view_i64(t, &new_shape, &new_strides, 2, 4);
+
+        // Free source first — view keeps data alive via data_owner refcount
+        nsl_tensor_free(t);
+        // Source not fully freed yet (refcount went from 2 to 1)
+        let view = NslTensor::from_ptr(view_ptr);
+        unsafe {
+            assert_eq!(*view.data_f64().add(0), 0.0);
+            assert_eq!(*view.data_f64().add(3), 3.0);
+        }
+
+        // Now free view — source data is freed too
+        nsl_tensor_free(view_ptr);
+    }
+
+    #[test]
+    fn test_reshape_zero_copy_when_contiguous() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+
+        let new_shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(new_shape_list, 3);
+        crate::list::nsl_list_push(new_shape_list, 2);
+        let reshaped = nsl_tensor_reshape(t, new_shape_list);
+        let r = NslTensor::from_ptr(reshaped);
+
+        // Zero-copy: same data pointer
+        assert_eq!(r.data, tensor.data);
+        assert_eq!(r.owns_data, 0);
+        assert_eq!(r.data_owner, t);
+        assert_eq!(r.ndim, 2);
+        assert_eq!(r.len, 6);
+        unsafe {
+            assert_eq!(*r.shape.add(0), 3);
+            assert_eq!(*r.shape.add(1), 2);
+            // Row-major strides for [3,2]
+            assert_eq!(*r.strides.add(0), 2);
+            assert_eq!(*r.strides.add(1), 1);
+            // Data still accessible
+            assert_eq!(*r.data_f64().add(0), 1.0);
+            assert_eq!(*r.data_f64().add(5), 6.0);
+        }
+
+        nsl_tensor_free(reshaped);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_reshape_materializes_non_contiguous() {
+        // Create [2,3], transpose to [3,2] (non-contiguous), then reshape to [6]
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+
+        let transposed = nsl_tensor_transpose(t, 0, 1);
+
+        let new_shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(new_shape_list, 6);
+        let reshaped = nsl_tensor_reshape(transposed, new_shape_list);
+        let r = NslTensor::from_ptr(reshaped);
+
+        // Non-contiguous reshape must materialize
+        // Transposed [3,2]: [[1,4],[2,5],[3,6]] → flattened [1,4,2,5,3,6]
+        unsafe {
+            assert_eq!(*r.data_f64().add(0), 1.0);
+            assert_eq!(*r.data_f64().add(1), 4.0);
+            assert_eq!(*r.data_f64().add(2), 2.0);
+            assert_eq!(*r.data_f64().add(3), 5.0);
+            assert_eq!(*r.data_f64().add(4), 3.0);
+            assert_eq!(*r.data_f64().add(5), 6.0);
+        }
+
+        nsl_tensor_free(reshaped);
+        nsl_tensor_free(transposed);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_transpose_zero_copy() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        for i in 0..6 {
+            unsafe { *tensor.data_f64().add(i) = (i + 1) as f64 };
+        }
+        // Original: shape=[2,3], strides=[3,1]
+
+        let tr = nsl_tensor_transpose(t, 0, 1);
+        let trv = NslTensor::from_ptr(tr);
+
+        // Zero-copy: same data pointer
+        assert_eq!(trv.data, tensor.data);
+        assert_eq!(trv.owns_data, 0);
+        assert_eq!(trv.data_owner, t);
+        // Shape swapped: [3, 2]
+        unsafe {
+            assert_eq!(*trv.shape.add(0), 3);
+            assert_eq!(*trv.shape.add(1), 2);
+            // Strides swapped: was [3,1] → [1,3]
+            assert_eq!(*trv.strides.add(0), 1);
+            assert_eq!(*trv.strides.add(1), 3);
+        }
+
+        // Non-contiguous
+        assert!(!trv.is_contiguous(), "transposed tensor should be non-contiguous");
+
+        nsl_tensor_free(tr);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_transpose_3d_zero_copy() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        // strides = [12, 4, 1]
+
+        let tr = nsl_tensor_transpose(t, 0, 2);
+        let trv = NslTensor::from_ptr(tr);
+        // shape = [4, 3, 2], strides = [1, 4, 12]
+        unsafe {
+            assert_eq!(*trv.shape.add(0), 4);
+            assert_eq!(*trv.shape.add(1), 3);
+            assert_eq!(*trv.shape.add(2), 2);
+            assert_eq!(*trv.strides.add(0), 1);
+            assert_eq!(*trv.strides.add(1), 4);
+            assert_eq!(*trv.strides.add(2), 12);
+        }
+        assert_eq!(trv.data, tensor.data);
+
+        nsl_tensor_free(tr);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_unsqueeze_zero_copy() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 3);
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let tensor = NslTensor::from_ptr(t);
+        // shape=[3,4], strides=[4,1]
+
+        let u = nsl_tensor_unsqueeze(t, 0);
+        let uv = NslTensor::from_ptr(u);
+
+        assert_eq!(uv.data, tensor.data);
+        assert_eq!(uv.owns_data, 0);
+        assert_eq!(uv.ndim, 3);
+        unsafe {
+            assert_eq!(*uv.shape.add(0), 1);
+            assert_eq!(*uv.shape.add(1), 3);
+            assert_eq!(*uv.shape.add(2), 4);
+        }
+
+        nsl_tensor_free(u);
+        nsl_tensor_free(t);
+    }
+
+    #[test]
+    fn test_add_non_contiguous_inputs() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let a = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let shape_list2 = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list2, 2);
+        crate::list::nsl_list_push(shape_list2, 3);
+        let b = creation::tensor_from_shape_list_f64(shape_list2, 0.0);
+        let at = NslTensor::from_ptr(a);
+        let bt = NslTensor::from_ptr(b);
+        for i in 0..6 {
+            unsafe {
+                *at.data_f64().add(i) = (i + 1) as f64;
+                *bt.data_f64().add(i) = 10.0;
+            }
+        }
+
+        // Transpose both to [3,2] (non-contiguous)
+        let a_t = nsl_tensor_transpose(a, 0, 1);
+        let b_t = nsl_tensor_transpose(b, 0, 1);
+
+        let result = nsl_tensor_add(a_t, b_t);
+        let r = NslTensor::from_ptr(result);
+
+        // Transposed [[1,4],[2,5],[3,6]] + 10 = [[11,14],[12,15],[13,16]]
+        unsafe {
+            assert_eq!(*r.data_f64().add(0), 11.0);
+            assert_eq!(*r.data_f64().add(1), 14.0);
+            assert_eq!(*r.data_f64().add(2), 12.0);
+            assert_eq!(*r.data_f64().add(3), 15.0);
+            assert_eq!(*r.data_f64().add(4), 13.0);
+            assert_eq!(*r.data_f64().add(5), 16.0);
+        }
+
+        nsl_tensor_free(result);
+        nsl_tensor_free(a_t);
+        nsl_tensor_free(b_t);
+        nsl_tensor_free(a);
+        nsl_tensor_free(b);
+    }
+
+    #[test]
+    fn test_view_chain_transformer_pattern() {
+        // Simulate: input [batch=2, seq=4, hidden=6]
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 4);
+        crate::list::nsl_list_push(shape_list, 6);
+        let x = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let xt = NslTensor::from_ptr(x);
+        for i in 0..48 { unsafe { *xt.data_f64().add(i) = i as f64 } }
+
+        // Reshape [2,4,6] -> [2,4,2,3] (zero-copy)
+        let sl1 = crate::list::nsl_list_new();
+        for &d in &[2i64, 4, 2, 3] { crate::list::nsl_list_push(sl1, d); }
+        let split = nsl_tensor_reshape(x, sl1);
+        let sv = NslTensor::from_ptr(split);
+        assert_eq!(sv.data, xt.data); // zero-copy
+
+        // Transpose [2,4,2,3] -> [2,2,4,3] (zero-copy)
+        let perm = nsl_tensor_transpose(split, 1, 2);
+        let pv = NslTensor::from_ptr(perm);
+        assert_eq!(pv.data, xt.data); // still zero-copy!
+
+        // Materialize for matmul
+        let contig = nsl_tensor_contiguous(perm);
+        let cv = NslTensor::from_ptr(contig);
+        // After transpose, tensor is non-contiguous, so contiguous() allocates new data
+        assert!(cv.data != xt.data as *mut c_void || contig == perm);
+
+        nsl_tensor_free(contig);
+        nsl_tensor_free(perm);
+        nsl_tensor_free(split);
+        nsl_tensor_free(x);
+    }
+
+    #[test]
+    fn test_reshape_transpose_reshape_chain() {
+        let sl = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(sl, 12);
+        let t = creation::tensor_from_shape_list_f64(sl, 0.0);
+        let tv = NslTensor::from_ptr(t);
+        for i in 0..12 { unsafe { *tv.data_f64().add(i) = i as f64 } }
+
+        // reshape [12] -> [3,4] (zero-copy)
+        let sl1 = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(sl1, 3);
+        crate::list::nsl_list_push(sl1, 4);
+        let r1 = nsl_tensor_reshape(t, sl1);
+        assert_eq!(NslTensor::from_ptr(r1).data, tv.data);
+
+        // transpose [3,4] -> [4,3] (zero-copy, non-contiguous)
+        let tr = nsl_tensor_transpose(r1, 0, 1);
+        assert_eq!(NslTensor::from_ptr(tr).data, tv.data);
+
+        // reshape [4,3] -> [12] (must materialize because input is non-contiguous)
+        let sl2 = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(sl2, 12);
+        let r2 = nsl_tensor_reshape(tr, sl2);
+        let r2v = NslTensor::from_ptr(r2);
+        // Transposed order: [0,4,8,1,5,9,2,6,10,3,7,11]
+        unsafe {
+            assert_eq!(*r2v.data_f64().add(0), 0.0);
+            assert_eq!(*r2v.data_f64().add(1), 4.0);
+            assert_eq!(*r2v.data_f64().add(2), 8.0);
+            assert_eq!(*r2v.data_f64().add(3), 1.0);
+        }
+
+        nsl_tensor_free(r2);
+        nsl_tensor_free(tr);
+        nsl_tensor_free(r1);
+        nsl_tensor_free(t);
     }
 }

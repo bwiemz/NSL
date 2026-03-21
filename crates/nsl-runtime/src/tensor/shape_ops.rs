@@ -8,7 +8,7 @@ use crate::autodiff;
 use crate::list::NslList;
 use crate::memory::checked_alloc;
 
-use super::NslTensor;
+use super::{NslTensor, nsl_tensor_free};
 
 // === Shape query operations ===
 
@@ -105,11 +105,12 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     let new_shape_nsl = NslList::from_ptr(new_shape_list);
     let new_ndim = new_shape_nsl.len;
 
-    let new_shape = checked_alloc((new_ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    // Extract shape values
+    let mut new_shape_vec = Vec::with_capacity(new_ndim as usize);
     let mut new_len: i64 = 1;
     for i in 0..new_ndim as usize {
         let dim = unsafe { *new_shape_nsl.data.add(i) };
-        unsafe { *new_shape.add(i) = dim };
+        new_shape_vec.push(dim);
         new_len *= dim;
     }
 
@@ -121,54 +122,33 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         std::process::abort();
     }
 
-    let strides = NslTensor::compute_strides(new_shape, new_ndim);
-
-    let new_tensor = Box::new(NslTensor {
-        data: std::ptr::null_mut(), // placeholder, overwritten below with deep-copied data
-        shape: new_shape,
-        strides,
-        ndim: new_ndim,
-        len: new_len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1,
-    });
-    let result = Box::into_raw(new_tensor) as i64;
-    let result_tensor = NslTensor::from_ptr(result);
-
-    // Device/dtype-aware copy
-    if tensor.dtype == 1 {
-        // f32 (GPU tensors use unified memory, so CPU can read/write)
-        let data_size = (new_len as usize) * std::mem::size_of::<f32>();
-        let new_data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed(data_size) as *mut f32 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc(data_size) as *mut f32
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(tensor.data_f32(), new_data, new_len as usize);
+    // Compute row-major strides for new shape
+    let new_strides_vec = {
+        let mut s = vec![1i64; new_ndim as usize];
+        if new_ndim > 0 {
+            for i in (0..(new_ndim as usize) - 1).rev() {
+                s[i] = s[i + 1] * new_shape_vec[i + 1];
+            }
         }
-        result_tensor.data = new_data as *mut c_void;
+        s
+    };
+
+    // Check contiguity directly to avoid refcount undo-redo pattern.
+    let is_contig = tensor.is_contiguous();
+
+    let result = if is_contig {
+        // Contiguous — return a zero-copy view directly
+        NslTensor::new_view_i64(tensor_ptr, &new_shape_vec, &new_strides_vec, new_ndim, new_len)
     } else {
-        let data_size = (new_len as usize) * std::mem::size_of::<f64>();
-        let new_data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed(data_size) as *mut f64 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc(data_size) as *mut f64
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(tensor.data_f64(), new_data, new_len as usize);
-        }
-        result_tensor.data = new_data as *mut c_void;
-    }
+        // Non-contiguous — materialize to contiguous first, then create view of result
+        let contig_ptr = nsl_tensor_contiguous(tensor_ptr);
+        let view = NslTensor::new_view_i64(contig_ptr, &new_shape_vec, &new_strides_vec, new_ndim, new_len);
+        // Free the intermediate contiguous tensor (view holds the ref via data_owner)
+        nsl_tensor_free(contig_ptr);
+        view
+    };
 
+    // Tracing (unchanged)
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
@@ -183,7 +163,6 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
 pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
 
-    // Support negative dimension indices
     let d0 = if dim0 < 0 { dim0 + tensor.ndim } else { dim0 };
     let d1 = if dim1 < 0 { dim1 + tensor.ndim } else { dim1 };
 
@@ -197,95 +176,28 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
     let dim0 = d0;
     let dim1 = d1;
 
-    // Deep copy with transposed shape
-    let ndim = tensor.ndim;
-    let new_shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..ndim as usize {
-        unsafe { *new_shape.add(i) = *tensor.shape.add(i) };
-    }
-    // Swap dimensions
-    unsafe {
-        let tmp = *new_shape.add(dim0 as usize);
-        *new_shape.add(dim0 as usize) = *new_shape.add(dim1 as usize);
-        *new_shape.add(dim1 as usize) = tmp;
-    }
+    let ndim = tensor.ndim as usize;
 
-    let strides = NslTensor::compute_strides(new_shape, ndim);
-    let len = tensor.len;
-
-    // Copy data with transposition
-    let old_strides_arr: Vec<i64> = (0..ndim as usize)
-        .map(|i| unsafe { *tensor.strides.add(i) })
-        .collect();
-    let new_strides_arr: Vec<i64> = (0..ndim as usize)
-        .map(|i| unsafe { *strides.add(i) })
-        .collect();
-
-    // Device/dtype-aware transposed copy
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>()) as *mut f32 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32
-        };
-        for flat_idx in 0..len as usize {
-            let mut remaining = flat_idx;
-            let mut new_indices = vec![0usize; ndim as usize];
-            for d in 0..ndim as usize {
-                new_indices[d] = remaining / new_strides_arr[d] as usize;
-                remaining %= new_strides_arr[d] as usize;
-            }
-            let mut old_indices = new_indices.clone();
-            old_indices.swap(dim0 as usize, dim1 as usize);
-            let mut old_offset = 0usize;
-            for d in 0..ndim as usize {
-                old_offset += old_indices[d] * old_strides_arr[d] as usize;
-            }
-            unsafe { *data.add(flat_idx) = *tensor.data_f32().add(old_offset) };
+    // Build new shape and strides by swapping dim0/dim1
+    let mut new_shape_vec = Vec::with_capacity(ndim);
+    let mut new_strides_vec = Vec::with_capacity(ndim);
+    for i in 0..ndim {
+        unsafe {
+            new_shape_vec.push(*tensor.shape.add(i));
+            new_strides_vec.push(*tensor.strides.add(i));
         }
-        data as *mut c_void
-    } else {
-        let data = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f64>()) as *mut f64 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64
-        };
-        for flat_idx in 0..len as usize {
-            let mut remaining = flat_idx;
-            let mut new_indices = vec![0usize; ndim as usize];
-            for d in 0..ndim as usize {
-                new_indices[d] = remaining / new_strides_arr[d] as usize;
-                remaining %= new_strides_arr[d] as usize;
-            }
-            let mut old_indices = new_indices.clone();
-            old_indices.swap(dim0 as usize, dim1 as usize);
-            let mut old_offset = 0usize;
-            for d in 0..ndim as usize {
-                old_offset += old_indices[d] * old_strides_arr[d] as usize;
-            }
-            unsafe { *data.add(flat_idx) = *tensor.data_f64().add(old_offset) };
-        }
-        data as *mut c_void
-    };
+    }
+    new_shape_vec.swap(dim0 as usize, dim1 as usize);
+    new_strides_vec.swap(dim0 as usize, dim1 as usize);
 
-    let result = Box::new(NslTensor {
-        data,
-        shape: new_shape,
-        strides,
-        ndim,
-        len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1,
-    });
-    let out_ptr = Box::into_raw(result) as i64;
+    // Create zero-copy view
+    let out_ptr = NslTensor::new_view_i64(
+        tensor_ptr,
+        &new_shape_vec,
+        &new_strides_vec,
+        tensor.ndim,
+        tensor.len,
+    );
 
     // Record on tape for autodiff
     if crate::autodiff::is_recording() {
@@ -310,78 +222,53 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
 #[no_mangle]
 pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    let old_ndim = tensor.ndim;
-    let new_ndim = old_ndim + 1;
+    let ndim = tensor.ndim as usize;
+    let new_ndim = ndim + 1;
 
     let insert_pos = if dim < 0 {
-        dim + new_ndim
+        (dim + new_ndim as i64) as usize
     } else {
-        dim
+        dim as usize
     };
 
-    if insert_pos < 0 || insert_pos > old_ndim {
-        eprintln!(
-            "nsl: unsqueeze dim {} out of range for ndim {}",
-            dim, old_ndim
-        );
-        std::process::abort();
-    }
-    let insert_pos = insert_pos as usize;
+    assert!(insert_pos <= ndim, "unsqueeze dim {} out of range for ndim {}", dim, ndim);
 
-    // Build new shape: copy old shape, insert 1 at insert_pos
-    let new_shape = checked_alloc((new_ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    for i in 0..insert_pos {
-        unsafe { *new_shape.add(i) = *tensor.shape.add(i) };
-    }
-    unsafe { *new_shape.add(insert_pos) = 1 };
-    for i in insert_pos..old_ndim as usize {
-        unsafe { *new_shape.add(i + 1) = *tensor.shape.add(i) };
-    }
+    let mut new_shape = Vec::with_capacity(new_ndim);
+    let mut new_strides = Vec::with_capacity(new_ndim);
 
-    let strides = NslTensor::compute_strides(new_shape, new_ndim);
-    let len = tensor.len;
-
-    // Deep copy data (dtype-aware, device-aware)
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let buf = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>()) as *mut f32 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+    let mut j = 0usize;
+    for i in 0..new_ndim {
+        if i == insert_pos {
+            new_shape.push(1);
+            // Stride for size-1 dim doesn't matter for indexing (only 1 element),
+            // but for contiguity checks it should be product of dims to its right
+            let stride_val = if j < ndim {
+                unsafe { *tensor.strides.add(j) * *tensor.shape.add(j) }
+            } else {
+                1
+            };
+            new_strides.push(stride_val);
         } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32
-        };
-        unsafe { std::ptr::copy_nonoverlapping(tensor.data_f32(), buf, len as usize) };
-        buf as *mut c_void
-    } else {
-        let buf = if tensor.device > 0 {
-            #[cfg(feature = "cuda")]
-            { crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f64>()) as *mut f64 }
-            #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
-        } else {
-            checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64
-        };
-        unsafe { std::ptr::copy_nonoverlapping(tensor.data_f64(), buf, len as usize) };
-        buf as *mut c_void
-    };
+            unsafe {
+                new_shape.push(*tensor.shape.add(j));
+                new_strides.push(*tensor.strides.add(j));
+            }
+            j += 1;
+        }
+    }
 
-    let out = Box::new(NslTensor {
-        data,
-        shape: new_shape,
-        strides,
-        ndim: new_ndim,
-        len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1,
-    });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::new_view_i64(
+        tensor_ptr,
+        &new_shape,
+        &new_strides,
+        new_ndim as i64,
+        tensor.len,
+    );
 
-    if autodiff::is_recording() {
+    // Autodiff tape (preserve existing behavior)
+    if crate::autodiff::is_recording() {
         let input_shape = unsafe {
-            std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize)
+            std::slice::from_raw_parts(tensor.shape, ndim)
         }.to_vec();
         autodiff::maybe_record(autodiff::TapeOp::Unsqueeze {
             input: tensor_ptr,
@@ -482,7 +369,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     // NO tape recording -- select is used internally for stack backward
     Box::into_raw(out) as i64
@@ -495,7 +382,12 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     let num_tensors = list.len as usize;
     assert!(num_tensors > 0, "nsl_tensor_stack: empty tensor list");
 
-    let first = NslTensor::from_ptr(unsafe { *list.data.add(0) });
+    // Ensure all input tensors are contiguous for correct flat indexing
+    let contiguous_ptrs: Vec<i64> = (0..num_tensors)
+        .map(|i| nsl_tensor_contiguous(unsafe { *list.data.add(i) }))
+        .collect();
+
+    let first = NslTensor::from_ptr(contiguous_ptrs[0]);
     let in_ndim = first.ndim as usize;
     let out_ndim = (in_ndim + 1) as i64;
 
@@ -511,8 +403,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     );
 
     // Validate all tensors have the same shape
-    for t_idx in 0..num_tensors {
-        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+    for &cp in &contiguous_ptrs {
+        let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, in_ndim, "nsl_tensor_stack: ndim mismatch");
         for axis in 0..in_ndim {
             let s1 = unsafe { *first.shape.add(axis) };
@@ -540,8 +432,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
             .map(|i| unsafe { *out_strides.add(i) })
             .collect();
-        for t_idx in 0..num_tensors {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
+            let t = NslTensor::from_ptr(cp);
             let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..per_tensor {
                 let mut remaining = flat;
@@ -564,8 +456,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
             .map(|i| unsafe { *out_strides.add(i) })
             .collect();
-        for t_idx in 0..num_tensors {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+        for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
+            let t = NslTensor::from_ptr(cp);
             let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..per_tensor {
                 let mut remaining = flat;
@@ -594,9 +486,14 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: first.device,
         dtype: first.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
+
+    // Free contiguous copies
+    for &cp in &contiguous_ptrs {
+        nsl_tensor_free(cp);
+    }
 
     if autodiff::is_recording() {
         let ptrs: Vec<i64> = (0..num_tensors)
@@ -678,8 +575,17 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
 
     let out_len = NslTensor::total_elements(out_shape, target_ndim as i64);
 
-    // ZERO-COPY: share data pointer, bump source refcount to keep it alive
-    tensor.refcount.fetch_add(1, Ordering::SeqCst);
+    // ZERO-COPY: share data pointer, bump the root owner's refcount to keep it alive.
+    // Root-flattening: if the source is itself a view, follow data_owner to the true root
+    // to avoid use-after-free if the intermediate view is freed first.
+    let true_owner = if tensor.data_owner != 0 {
+        let root = NslTensor::from_ptr(tensor.data_owner);
+        root.refcount.fetch_add(1, Ordering::SeqCst);
+        tensor.data_owner
+    } else {
+        tensor.refcount.fetch_add(1, Ordering::SeqCst);
+        tensor_ptr
+    };
 
     let out = Box::new(NslTensor {
         data: tensor.data,
@@ -691,6 +597,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         device: tensor.device,
         dtype: tensor.dtype,
         owns_data: 0, // view — does NOT own the data buffer
+        data_owner: true_owner, // back-pointer for cleanup (root-flattened)
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -744,7 +651,7 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(out) as i64
 }
@@ -831,7 +738,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 
@@ -855,7 +762,12 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let num_tensors = list.len as usize;
     assert!(num_tensors > 0, "nsl_tensor_cat: empty tensor list");
 
-    let first = NslTensor::from_ptr(unsafe { *list.data.add(0) });
+    // Ensure all inputs are contiguous for flat-indexed copy
+    let contiguous_ptrs: Vec<i64> = (0..num_tensors)
+        .map(|i| nsl_tensor_contiguous(unsafe { *list.data.add(i) }))
+        .collect();
+
+    let first = NslTensor::from_ptr(contiguous_ptrs[0]);
     let ndim = first.ndim as usize;
     let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
     assert!(d < ndim, "nsl_tensor_cat: dim {dim} out of range for ndim {ndim}");
@@ -863,8 +775,8 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let mut split_sizes: Vec<i64> = Vec::with_capacity(num_tensors);
     let mut total_cat_dim: i64 = 0;
 
-    for t_idx in 0..num_tensors {
-        let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+    for &cp in &contiguous_ptrs {
+        let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
         let cat_size = unsafe { *t.shape.add(d) };
         split_sizes.push(cat_size);
@@ -899,7 +811,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let mut cat_offset: usize = 0;
         for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+            let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
             let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..t.len as usize {
                 let mut remaining = flat;
@@ -922,7 +834,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
         let mut cat_offset: usize = 0;
         for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-            let t = NslTensor::from_ptr(unsafe { *list.data.add(t_idx) });
+            let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
             let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
             for flat in 0..t.len as usize {
                 let mut remaining = flat;
@@ -952,9 +864,14 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: first.device,
         dtype: out_dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
+
+    // Free contiguous copies
+    for &cp in &contiguous_ptrs {
+        nsl_tensor_free(cp);
+    }
 
     let input_ptrs: Vec<i64> = (0..num_tensors)
         .map(|i| unsafe { *list.data.add(i) })
@@ -997,7 +914,8 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 ///   output[half..last_dim] = input[0..half]     (copy first half)
 #[no_mangle]
 pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_c);
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
@@ -1055,9 +973,11 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         refcount: AtomicI64::new(1),
         device: tensor.device,
         dtype: tensor.dtype,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(result) as i64
+    let result = Box::into_raw(result) as i64;
+    nsl_tensor_free(t_c);
+    result
 }
 
 /// Materialize a non-contiguous tensor (e.g. from `expand`) into a contiguous copy.
@@ -1122,7 +1042,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             refcount: AtomicI64::new(1),
             device: t.device,
             dtype: t.dtype,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     } else {
@@ -1151,7 +1071,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             refcount: AtomicI64::new(1),
             device: t.device,
             dtype: t.dtype,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(result) as i64
     }

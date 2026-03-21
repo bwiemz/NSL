@@ -150,7 +150,7 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
         refcount: AtomicI64::new(1),
         device: t.device,
         dtype: 1, // f32 on CPU
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     let out_ptr = Box::into_raw(out) as i64;
 

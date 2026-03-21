@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 
-use super::NslTensor;
+use super::{NslTensor, nsl_tensor_contiguous, nsl_tensor_free};
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
@@ -19,7 +19,8 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
             { panic!("GPU tensor_sin not yet implemented"); }
         }
     }
-    let a = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let a = NslTensor::from_ptr(t_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -41,8 +42,9 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
+    nsl_tensor_free(t_c);
     Box::into_raw(result) as i64
 }
 
@@ -57,7 +59,8 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
             { panic!("GPU tensor_cos not yet implemented"); }
         }
     }
-    let a = NslTensor::from_ptr(tensor_ptr);
+    let t_c = nsl_tensor_contiguous(tensor_ptr);
+    let a = NslTensor::from_ptr(t_c);
     let len = a.len;
     let ndim = a.ndim;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -79,7 +82,8 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
 
     let result = Box::new(NslTensor {
         data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1,
+        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
     });
+    nsl_tensor_free(t_c);
     Box::into_raw(result) as i64
 }

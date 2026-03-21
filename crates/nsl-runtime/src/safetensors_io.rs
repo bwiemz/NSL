@@ -147,6 +147,7 @@ pub(crate) fn allocate_f32_tensor(
         device,
         dtype: 1, // f32
         owns_data: 1,
+        data_owner: 0,
     }
 }
 

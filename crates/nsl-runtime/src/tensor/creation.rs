@@ -42,7 +42,7 @@ pub(crate) fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 1,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -82,7 +82,7 @@ pub(crate) fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -100,7 +100,7 @@ pub(crate) fn create_scalar_tensor(value: f64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 1,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -121,7 +121,7 @@ pub(crate) fn create_scalar_tensor_dtype(value: f64, dtype: u16) -> i64 {
             refcount: AtomicI64::new(1),
             device: 0,
             dtype: 0,
-            owns_data: 1,
+            owns_data: 1, data_owner: 0,
         });
         Box::into_raw(tensor) as i64
     }
@@ -217,7 +217,7 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 1,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
@@ -252,7 +252,7 @@ pub(crate) fn create_tensor_from_f64_data(data_slice: &[f64], shape_slice: &[i64
         refcount: AtomicI64::new(1),
         device: 0,
         dtype: 0,
-        owns_data: 1,
+        owns_data: 1, data_owner: 0,
     });
     Box::into_raw(tensor) as i64
 }
