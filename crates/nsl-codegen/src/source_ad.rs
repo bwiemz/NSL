@@ -1566,4 +1566,235 @@ mod tests {
             .unwrap();
         assert!(gen.adjoint_of(x_var).is_some());
     }
+
+    // ---------------------------------------------------------------
+    // Task 6: E2E-style tests for branching gradients
+    //
+    // These tests exercise the full pipeline (extractor → primal list →
+    // adjoint generator) for the three canonical patterns from the plan.
+    // Full NSL-file E2E tests are not practical without a live runtime,
+    // so we use the AST-level API which is exactly what the compiler uses.
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Task 6.1: Leaky ReLU
+    //   f(x) = if x > 0 { x } else { 0.01 * x }
+    //   f'(x) = 1.0  when x > 0
+    //   f'(x) = 0.01 when x <= 0
+    //
+    // Primal Wengert:
+    //   x(0), zero(1), alpha(2)=0.01
+    //   cond(3) = x > 0          Condition(Gt, x, zero)
+    //   scaled(4) = alpha * x    Mul(alpha, x)
+    //   out(5) = Select(cond, x, scaled)
+    //
+    // Backward:
+    //   adj(x) should come from Select(cond, 1·adj_out, 0.01·adj_out)
+    // ---------------------------------------------------------------
+    #[test]
+    fn leaky_relu_gradient_structure() {
+        // Build using the AST extractor to stay close to the real compiler path.
+        let mut interner = Interner::new();
+        let x_sym   = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let alpha_sym = nsl_ast::Symbol(interner.get_or_intern("alpha"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+        extractor.register_input(alpha_sym);
+
+        // cond: x > 0
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        // then branch: return x
+        let then_branch = vec![make_return_stmt(make_ident_expr(x_sym))];
+        // else branch: return alpha * x
+        let alpha_times_x = make_binop_expr(
+            make_ident_expr(alpha_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let else_branch = vec![make_return_stmt(alpha_times_x)];
+
+        let if_stmt = make_if_stmt(cond, then_branch, Some(else_branch));
+
+        let ok = extractor.extract_stmts(&[if_stmt]);
+        assert!(ok, "Leaky ReLU if/else should be extractable by source AD");
+        assert!(extractor.is_static_graph(), "Should remain static graph");
+
+        let primal = extractor.finalize().expect("Should produce WengertList");
+
+        // Structural checks on the primal
+        let cond_count = primal.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .count();
+        assert_eq!(cond_count, 1, "Leaky ReLU needs exactly 1 Condition op");
+
+        let select_count = primal.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert_eq!(select_count, 1, "Leaky ReLU needs exactly 1 Select op");
+
+        // Generate the adjoint
+        let max_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // x (the param) must have an adjoint
+        let x_var = primal.ops.iter()
+            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .map(|op| op.result)
+            .expect("x must be in primal");
+        assert!(gen.adjoint_of(x_var).is_some(),
+            "Param x should have an adjoint in leaky ReLU");
+
+        // The adjoint must use Select to conditionally route gradient
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 1,
+            "Leaky ReLU backward should use at least 1 Select op for conditional gradient, \
+             got {adj_selects}");
+
+        // There must be no tape-style Input ops in the adjoint (source AD is tape-free)
+        let tape_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Input(_)))
+            .count();
+        assert_eq!(tape_ops, 0,
+            "Source AD adjoint must not contain Input (tape-push) ops, got {tape_ops}");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 6.2: Nested clamp gradient
+    //   f(x, lo, hi) = if x < lo { lo } else { if x > hi { hi } else { x } }
+    //   f'(x) = 0  when x < lo  (gradient killed — lo is constant)
+    //   f'(x) = 0  when x > hi  (gradient killed — hi is constant)
+    //   f'(x) = 1  when lo <= x <= hi (pass-through)
+    //
+    // We build the flat Wengert directly (as the adjoint generator sees it):
+    //   x(0), lo(1), hi(2)
+    //   cond_low(3)  = x < lo       Condition(Lt)
+    //   cond_high(4) = x > hi       Condition(Gt)
+    //   inner(5) = Select(cond_high, hi, x)   -- inner if: x>hi ? hi : x
+    //   out(6)   = Select(cond_low, lo, inner) -- outer if: x<lo ? lo : inner
+    //
+    // In the true branch of cond_low the result is lo (Input, not Param of x),
+    // so x gets gradient 0 from that branch.  In the false branch x's gradient
+    // flows through inner_select, again gated by cond_high.
+    // ---------------------------------------------------------------
+    #[test]
+    fn nested_clamp_gradient_structure() {
+        // x is the param we differentiate w.r.t.; lo and hi are inputs (constants).
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()),  vec![]),
+                make_op(1, 1, PrimalOp::Input("lo".into()), vec![]),
+                make_op(2, 2, PrimalOp::Input("hi".into()), vec![]),
+                // cond_low = x < lo
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Lt), vec![0, 1]),
+                // cond_high = x > hi
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                // inner = cond_high ? hi : x
+                make_op(5, 5, PrimalOp::Select, vec![4, 2, 0]),
+                // out = cond_low ? lo : inner
+                make_op(6, 6, PrimalOp::Select, vec![3, 1, 5]),
+            ],
+            output: 6,
+            var_names: HashMap::new(),
+        };
+
+        let max_var = 6;
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // x must have an adjoint
+        assert!(gen.adjoint_of(0).is_some(),
+            "x should have an adjoint through the nested clamp Select chain");
+
+        // The adjoint should use multiple Select ops to gate the gradient
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Nested clamp backward needs >= 2 Select ops (one per nesting level), \
+             got {adj_selects}");
+
+        // lo (var 1) and hi (var 2) are Inputs — no gradient expected
+        // (they are not Params so AdjointGenerator will not produce a path to them
+        //  that matters for x's gradient, but the adjoint list should still be sound)
+        assert!(!adjoint.ops.is_empty(), "Adjoint list must not be empty");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 6.3: Multiple differentiable variables in branches
+    //   f(cond_flag, a, b) = if cond_flag > 0.5 { a * b } else { a + b }
+    //
+    // Gradient w.r.t. a:
+    //   true  branch: d(a*b)/da = b  → adjoint contributes b * adj_out
+    //   false branch: d(a+b)/da = 1  → adjoint contributes 1 * adj_out
+    //   Combined via Select: adj_a = Select(cond, b·adj_out, adj_out)
+    //
+    // Gradient w.r.t. b:
+    //   true  branch: d(a*b)/db = a  → a * adj_out
+    //   false branch: d(a+b)/db = 1  → adj_out
+    //   Combined via Select: adj_b = Select(cond, a·adj_out, adj_out)
+    //
+    // Primal Wengert (flat):
+    //   cond_raw(0), a(1), b(2)  — all Params
+    //   half(3) = Constant(0.5)
+    //   cond(4)  = cond_raw > 0.5
+    //   t_mul(5) = a * b
+    //   f_add(6) = a + b
+    //   out(7)   = Select(cond, t_mul, f_add)
+    // ---------------------------------------------------------------
+    #[test]
+    fn multi_variable_branch_adjoint_structure() {
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("cond_flag".into()), vec![]),
+                make_op(1, 1, PrimalOp::Param("a".into()), vec![]),
+                make_op(2, 2, PrimalOp::Param("b".into()), vec![]),
+                make_op(3, 3, PrimalOp::Constant(0.5), vec![]),
+                // cond = cond_flag > 0.5
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 3]),
+                // true branch: a * b
+                make_op(5, 5, PrimalOp::Mul, vec![1, 2]),
+                // false branch: a + b
+                make_op(6, 6, PrimalOp::Add, vec![1, 2]),
+                // output: Select(cond, t_mul, f_add)
+                make_op(7, 7, PrimalOp::Select, vec![4, 5, 6]),
+            ],
+            output: 7,
+            var_names: HashMap::new(),
+        };
+
+        let max_var = 7;
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // Both a and b must have adjoints
+        assert!(gen.adjoint_of(1).is_some(), "Param a should have an adjoint");
+        assert!(gen.adjoint_of(2).is_some(), "Param b should have an adjoint");
+
+        // The true-branch result and false-branch result should have adjoints
+        assert!(gen.adjoint_of(5).is_some(), "True-branch Mul result should have adjoint");
+        assert!(gen.adjoint_of(6).is_some(), "False-branch Add result should have adjoint");
+
+        // The backward pass must contain Select ops (one per branch input of the primal Select)
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Multi-variable branch backward needs >= 2 Select ops, got {adj_selects}");
+
+        // No tape-style markers in source AD adjoint
+        let tape_inputs = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Input(_)))
+            .count();
+        assert_eq!(tape_inputs, 0,
+            "Source AD adjoint must be tape-free (no Input ops), got {tape_inputs}");
+    }
+
 }
