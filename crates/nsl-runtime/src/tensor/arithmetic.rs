@@ -33,6 +33,14 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
+                let tb = unsafe { &*(b as *const NslTensor) };
+                if ta.can_mutate_inplace_gpu() && ta.shape_eq(tb) {
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    if b_transferred { nsl_tensor_free(b); }
+                    return a;
+                }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
                 if b_transferred { nsl_tensor_free(b); }
                 return result;
@@ -41,7 +49,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: reuse left operand when uniquely owned + same shape (no broadcast)
+    // FBIP: reuse left operand when uniquely owned + same shape (no broadcast, CPU)
     {
         let ta = unsafe { &mut *(a as *mut NslTensor) };
         let tb = unsafe { &*(b as *const NslTensor) };
@@ -92,6 +100,14 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
+                let tb = unsafe { &*(b as *const NslTensor) };
+                if ta.can_mutate_inplace_gpu() && ta.shape_eq(tb) {
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    if b_transferred { nsl_tensor_free(b); }
+                    return a;
+                }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
                 if b_transferred { nsl_tensor_free(b); }
                 return result;
@@ -100,7 +116,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: reuse left operand when uniquely owned + same shape
+    // FBIP: reuse left operand when uniquely owned + same shape (CPU)
     {
         let ta = unsafe { &mut *(a as *mut NslTensor) };
         let tb = unsafe { &*(b as *const NslTensor) };
@@ -150,6 +166,14 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
+                let tb = unsafe { &*(b as *const NslTensor) };
+                if ta.can_mutate_inplace_gpu() && ta.shape_eq(tb) {
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    if b_transferred { nsl_tensor_free(b); }
+                    return a;
+                }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
                 if b_transferred { nsl_tensor_free(b); }
                 return result;
@@ -158,7 +182,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: reuse left operand when uniquely owned + same shape
+    // FBIP: reuse left operand when uniquely owned + same shape (CPU)
     {
         let ta = unsafe { &mut *(a as *mut NslTensor) };
         let tb = unsafe { &*(b as *const NslTensor) };
@@ -218,6 +242,14 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
+                let tb = unsafe { &*(b as *const NslTensor) };
+                if ta.can_mutate_inplace_gpu() && ta.shape_eq(tb) {
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    if b_transferred { nsl_tensor_free(b); }
+                    return a;
+                }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
                 if b_transferred { nsl_tensor_free(b); }
                 return result;
@@ -226,7 +258,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: reuse left operand when uniquely owned + same shape
+    // FBIP: reuse left operand when uniquely owned + same shape (CPU)
     {
         let ta = unsafe { &mut *(a as *mut NslTensor) };
         let tb = unsafe { &*(b as *const NslTensor) };
@@ -284,12 +316,20 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         let ta = unsafe { &*(a_ptr as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0"); }
+            {
+                if ta.can_mutate_inplace_gpu() {
+                    crate::cuda::gpu_elementwise_unary_inplace(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    return a_ptr;
+                }
+                return crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned
+    // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
         if t.can_mutate_inplace() {
@@ -362,12 +402,20 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         let ta = unsafe { &*(a_ptr as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0"); }
+            {
+                if ta.can_mutate_inplace_gpu() {
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    return a_ptr;
+                }
+                return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned
+    // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
         if t.can_mutate_inplace() {
@@ -433,12 +481,20 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         let ta = unsafe { &*(a_ptr as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
-            { return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0"); }
+            {
+                if ta.can_mutate_inplace_gpu() {
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    return a_ptr;
+                }
+                return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned
+    // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
         if t.can_mutate_inplace() {

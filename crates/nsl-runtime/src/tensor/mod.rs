@@ -276,6 +276,18 @@ impl NslTensor {
             && !autodiff::is_recording()
     }
 
+    /// Returns true if this GPU tensor can be safely mutated in-place (FBIP).
+    /// Same logic as CPU but requires device > 0.
+    #[inline]
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn can_mutate_inplace_gpu(&self) -> bool {
+        self.refcount.load(Ordering::Acquire) == 1
+            && self.owns_data == 1
+            && self.data_owner == 0
+            && self.device > 0
+            && !autodiff::is_recording()
+    }
+
     /// Returns true if two tensors have identical shapes.
     #[inline]
     pub(crate) fn shape_eq(&self, other: &NslTensor) -> bool {
@@ -2508,6 +2520,26 @@ mod tests {
         crate::autodiff::nsl_tape_stop();
         assert_ne!(result, ptr, "FBIP should not trigger during autodiff recording");
         nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
+    }
+
+    #[test]
+    fn test_fbip_gpu_can_mutate_inplace() {
+        // CPU tensor (device=0) should NOT pass GPU check
+        let ptr = make_f64_tensor(&[1.0, 2.0]);
+        let t = NslTensor::from_ptr(ptr);
+        assert!(!t.can_mutate_inplace_gpu(), "CPU tensor should fail GPU inplace check");
+        nsl_tensor_free(ptr);
+    }
+
+    #[test]
+    fn test_fbip_gpu_method_requires_device() {
+        // Manually construct a tensor-like struct to verify the GPU check logic
+        let ptr = make_f64_tensor(&[1.0]);
+        let t = NslTensor::from_ptr(ptr);
+        // CPU tensor: can_mutate_inplace() should be true, can_mutate_inplace_gpu() false
+        assert!(t.can_mutate_inplace(), "CPU tensor with refcount=1 should pass CPU check");
+        assert!(!t.can_mutate_inplace_gpu(), "CPU tensor should fail GPU check");
         nsl_tensor_free(ptr);
     }
 }

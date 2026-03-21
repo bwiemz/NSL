@@ -425,6 +425,89 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     out_ptr as i64
 }
 
+/// GPU elementwise unary op — in-place (FBIP). Writes output to input buffer.
+/// Caller must have verified `can_mutate_inplace_gpu()`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_elementwise_unary_inplace(a_ptr: i64, ptx: &str, kernel_name: &str) {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let n = a.len as usize;
+
+    let mut a_data = a.data as u64;
+    let mut c_data = a.data as u64; // output = input buffer
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU inplace kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+}
+
+/// GPU elementwise binary op — in-place (FBIP). Writes output to left operand's buffer.
+/// Caller must have verified `can_mutate_inplace_gpu()` on `a` and shapes match.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    assert_eq!(a.len, b.len, "GPU inplace elementwise: length mismatch");
+
+    let n = a.len as usize;
+    let mut a_data = a.data as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = a.data as u64; // output = left operand buffer
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU inplace kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+}
+
+/// GPU scalar op — in-place (FBIP). Writes output to input buffer.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &str) {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let n = a.len as usize;
+
+    let mut a_data = a.data as u64;
+    let mut c_data = a.data as u64; // output = input buffer
+    let mut s_val = scalar;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut s_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU inplace scalar kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
