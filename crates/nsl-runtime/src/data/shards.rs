@@ -339,6 +339,22 @@ pub extern "C" fn nsl_data_assign_shards(
     buf as i64
 }
 
+/// Free the buffer returned by nsl_data_assign_shards.
+/// `ptr`: pointer returned by nsl_data_assign_shards.
+#[no_mangle]
+pub extern "C" fn nsl_data_free_shards(ptr: i64) -> i64 {
+    if ptr == 0 { return -1; }
+    let buf = ptr as *mut i64;
+    let n = unsafe { *buf } as usize;
+    unsafe {
+        crate::memory::checked_free(
+            buf as *mut u8,
+            (n + 1) * std::mem::size_of::<i64>(),
+        );
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

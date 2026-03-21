@@ -127,6 +127,7 @@ pub fn deserialize_sample(buf: &[u8]) -> Option<Sample> {
             let height = u32::from_le_bytes(rest[4..8].try_into().ok()?);
             let channels = u32::from_le_bytes(rest[8..12].try_into().ok()?);
             let data_len = u32::from_le_bytes(rest[12..16].try_into().ok()?) as usize;
+            if rest.len() < 16 + data_len { return None; }
             let data = rest[16..16 + data_len].to_vec();
             Some(Sample::Image { data, width, height, channels })
         }
@@ -278,5 +279,17 @@ mod tests {
     fn test_empty_sample_deserialization() {
         assert!(deserialize_sample(&[]).is_none());
         assert!(deserialize_sample(&[255]).is_none()); // unknown tag
+    }
+
+    #[test]
+    fn test_malformed_image_data_len() {
+        // data_len claims 1000 bytes but buffer only has 20
+        let mut buf = vec![TAG_IMAGE];
+        buf.extend_from_slice(&10u32.to_le_bytes()); // width
+        buf.extend_from_slice(&10u32.to_le_bytes()); // height
+        buf.extend_from_slice(&3u32.to_le_bytes());  // channels
+        buf.extend_from_slice(&1000u32.to_le_bytes()); // data_len (way too large)
+        buf.extend_from_slice(&[0u8; 4]); // only 4 bytes of data
+        assert!(deserialize_sample(&buf).is_none(), "should reject oversized data_len");
     }
 }

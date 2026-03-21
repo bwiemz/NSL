@@ -215,13 +215,24 @@ impl PrefetchPipeline {
         self.output_queue.len()
     }
 
-    /// Shut down the pipeline. Signals all I/O workers to stop.
-    pub fn shutdown(self) {
+    /// Shut down the pipeline. Signals all I/O workers to stop and joins them.
+    pub fn shutdown(mut self) {
+        self.stop_and_join();
+    }
+
+    /// Signal shutdown and join worker threads.
+    fn stop_and_join(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.output_queue.close();
-        for handle in self.io_handles {
+        for handle in self.io_handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+impl Drop for PrefetchPipeline {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
