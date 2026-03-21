@@ -138,6 +138,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor memory
     ("nsl_tensor_clone", &[types::I64], Some(types::I64)),
     ("nsl_tensor_free", &[types::I64], None),
+    // FBIP Phase 2: unconditional in-place variants (compiler-guaranteed single-use)
+    ("nsl_tensor_relu_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_exp_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_log_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_sqrt_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_abs_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_sigmoid_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_tanh_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_neg_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_sign_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_gelu_inplace", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_silu_inplace", &[types::I64], Some(types::I64)),
     // Autodiff tape management
     ("nsl_tape_start", &[types::I64], None),
     ("nsl_tape_stop", &[], None),

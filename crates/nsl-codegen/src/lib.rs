@@ -43,6 +43,7 @@ pub mod unikernel;
 pub mod tensor_parallel;
 pub mod stmt;
 pub mod types;
+pub mod use_count;
 pub mod multimodal;
 pub mod vmap;
 pub mod wcet;
@@ -98,10 +99,16 @@ pub struct CompileOptions {
     pub wcet_safety_margin: f64,
     /// M53: Path to write DO-178C compliance report
     pub do178c_report: Option<std::path::PathBuf>,
+    /// M53: WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked)
+    pub wcet_target: String,
+    /// M53: FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg")
+    pub fpga_device: Option<String>,
     /// M55: Emit a ZK inference circuit alongside compiled output.
     pub zk_circuit: bool,
-    /// M55: ZK backend to use ("halo2" or "plonky3").
+    /// M55: ZK backend to use ("folding", "halo2", or "plonky3").
     pub zk_backend: String,
+    /// M55: ZK field to use ("m31" or "bn254").
+    pub zk_field: String,
     /// M55: Also emit a Solidity verifier contract.
     pub zk_solidity: bool,
     /// M55: Path to safetensors weight file used as ZK witness.
@@ -133,8 +140,11 @@ impl Default for CompileOptions {
             wcet_report_path: None,
             wcet_safety_margin: 1.05,
             do178c_report: None,
+            wcet_target: "gpu".to_string(),
+            fpga_device: None,
             zk_circuit: false,
-            zk_backend: "halo2".to_string(),
+            zk_backend: "folding".to_string(),
+            zk_field: "m31".to_string(),
             zk_solidity: false,
             zk_weights_path: None,
         }

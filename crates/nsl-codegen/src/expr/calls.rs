@@ -408,7 +408,8 @@ impl Compiler<'_> {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
-            let rt_name = format!("nsl_tensor_{func_name}");
+            // FBIP Phase 2: emit inplace variant when arg is single-use
+            let rt_name = self.fbip_select_variant(state, &args[0].value, &func_name);
             return self.compile_traced_call(builder, &rt_name, &[val]);
         }
         // Activation functions (M15): relu, gelu, silu, sigmoid -- single tensor arg
@@ -419,7 +420,8 @@ impl Compiler<'_> {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
-            let rt_name = format!("nsl_tensor_{func_name}");
+            // FBIP Phase 2: emit inplace variant when arg is single-use
+            let rt_name = self.fbip_select_variant(state, &args[0].value, &func_name);
             return self.compile_traced_call(builder, &rt_name, &[val]);
         }
         // Tensor trig: tensor_sin, tensor_cos (RoPE support)

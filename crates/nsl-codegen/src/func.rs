@@ -115,6 +115,10 @@ impl Compiler<'_> {
                 state.is_fp8_compute = true;
             }
 
+            // FBIP Phase 2: Pre-compute use counts for single-use optimizations
+            // (clone elision, in-place op emission).
+            state.use_counts = Some(crate::use_count::analyze_use_counts(&fn_def.body));
+
             // M38b: Set up ownership lowering for this function.
             // When --linear-types is active and the semantic pass produced ownership
             // metadata for this function, create an OwnershipLowering tracker and

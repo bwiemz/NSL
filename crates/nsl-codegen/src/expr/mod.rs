@@ -182,6 +182,32 @@ impl Compiler<'_> {
 
     // ── Trace instrumentation (M45) ─────────────────────────────────
 
+    /// FBIP Phase 2: Select inplace or normal variant for a unary tensor op.
+    /// Returns `nsl_tensor_{op}_inplace` when the argument is a single-use Ident
+    /// binding and we're not in a tape-recording region, otherwise `nsl_tensor_{op}`.
+    pub(crate) fn fbip_select_variant(
+        &self,
+        state: &FuncState,
+        arg_expr: &nsl_ast::expr::Expr,
+        op_name: &str,
+    ) -> String {
+        // Only optimize when use-count data is available and not recording autodiff
+        if !state.in_tape_region {
+            if let nsl_ast::expr::ExprKind::Ident(sym) = &arg_expr.kind {
+                if let Some(ref uc) = state.use_counts {
+                    if uc.is_single_use(sym) {
+                        let inplace = format!("nsl_tensor_{op_name}_inplace");
+                        // Verify the inplace variant is registered before using it
+                        if self.functions.contains_key(&inplace) {
+                            return inplace;
+                        }
+                    }
+                }
+            }
+        }
+        format!("nsl_tensor_{op_name}")
+    }
+
     /// Emit a tensor FFI call, optionally followed by trace recording
     /// when `compile_options.trace_ops` is enabled.
     pub(crate) fn compile_traced_call(

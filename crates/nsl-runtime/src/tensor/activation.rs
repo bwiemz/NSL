@@ -913,3 +913,96 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     }
     result
 }
+
+// === FBIP Phase 2: Unconditional in-place variants ===
+// These skip the refcount check — the compiler guarantees the tensor is uniquely
+// owned via use-count analysis. No allocation, no refcount bump, no branch.
+
+macro_rules! define_inplace_unary {
+    ($name:ident, $op_f32:expr, $op_f64:expr) => {
+        #[no_mangle]
+        pub extern "C" fn $name(ptr: i64) -> i64 {
+            let t = unsafe { &mut *(ptr as *mut NslTensor) };
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len {
+                    unsafe {
+                        let v = *d.add(i);
+                        *d.add(i) = $op_f32(v);
+                    }
+                }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len {
+                    unsafe {
+                        let v = *d.add(i);
+                        *d.add(i) = $op_f64(v);
+                    }
+                }
+            }
+            super::fbip_record_reuse();
+            ptr
+        }
+    };
+}
+
+define_inplace_unary!(nsl_tensor_relu_inplace, |v: f32| if v > 0.0 { v } else { 0.0_f32 }, |v: f64| if v > 0.0 { v } else { 0.0 });
+define_inplace_unary!(nsl_tensor_exp_inplace, |v: f32| v.exp(), |v: f64| v.exp());
+define_inplace_unary!(nsl_tensor_log_inplace, |v: f32| v.ln(), |v: f64| v.ln());
+define_inplace_unary!(nsl_tensor_sqrt_inplace, |v: f32| v.sqrt(), |v: f64| v.sqrt());
+define_inplace_unary!(nsl_tensor_abs_inplace, |v: f32| v.abs(), |v: f64| v.abs());
+define_inplace_unary!(nsl_tensor_sigmoid_inplace, |v: f32| 1.0_f32 / (1.0_f32 + (-v).exp()), |v: f64| 1.0 / (1.0 + (-v).exp()));
+define_inplace_unary!(nsl_tensor_tanh_inplace, |v: f32| v.tanh(), |v: f64| v.tanh());
+define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v);
+define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 });
+
+/// GELU in-place.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
+    let t = unsafe { &mut *(ptr as *mut NslTensor) };
+    let len = t.len as usize;
+    if t.dtype == 1 {
+        let d = t.data as *mut f32;
+        let c = (2.0_f32 / std::f32::consts::PI).sqrt();
+        for i in 0..len {
+            let x = unsafe { *d.add(i) };
+            let inner = c * (x + 0.044715_f32 * x * x * x);
+            unsafe { *d.add(i) = 0.5_f32 * x * (1.0_f32 + inner.tanh()) };
+        }
+    } else {
+        let d = t.data as *mut f64;
+        let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+        for i in 0..len {
+            let x = unsafe { *d.add(i) };
+            let inner = c * (x + 0.044715 * x * x * x);
+            unsafe { *d.add(i) = 0.5 * x * (1.0 + inner.tanh()) };
+        }
+    }
+    super::fbip_record_reuse();
+    ptr
+}
+
+/// SiLU in-place.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
+    let t = unsafe { &mut *(ptr as *mut NslTensor) };
+    let len = t.len as usize;
+    if t.dtype == 1 {
+        let d = t.data as *mut f32;
+        for i in 0..len {
+            let x = unsafe { *d.add(i) };
+            let sig = 1.0_f32 / (1.0_f32 + (-x).exp());
+            unsafe { *d.add(i) = x * sig };
+        }
+    } else {
+        let d = t.data as *mut f64;
+        for i in 0..len {
+            let x = unsafe { *d.add(i) };
+            let sig = 1.0 / (1.0 + (-x).exp());
+            unsafe { *d.add(i) = x * sig };
+        }
+    }
+    super::fbip_record_reuse();
+    ptr
+}

@@ -63,6 +63,10 @@ pub struct FuncState {
     /// M35: True when compiling a function with @fp8_compute decorator.
     /// MatMul ops use nsl_fp8_matmul_training for E5M2 backward tape recording.
     pub is_fp8_compute: bool,
+    /// FBIP Phase 2: Per-binding use counts for single-use optimization.
+    /// When a binding is referenced exactly once, the codegen can emit in-place
+    /// op variants and skip clones.
+    pub use_counts: Option<crate::use_count::UseCountMap>,
 }
 
 impl Default for FuncState {
@@ -89,6 +93,7 @@ impl FuncState {
             in_tape_region: false,
             ownership_lowering: None,
             is_fp8_compute: false,
+            use_counts: None,
         }
     }
 

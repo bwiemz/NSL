@@ -411,7 +411,18 @@ impl Compiler<'_> {
                 let d1 = self.compile_expr(builder, state, &args[1].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_transpose", &[obj_val, d0, d1])
             }
-            "clone" => self.compile_call_by_name(builder, "nsl_tensor_clone", &[obj_val]),
+            "clone" => {
+                // FBIP Phase 2: skip clone when source binding is single-use
+                // (the binding won't be referenced again, so cloning is unnecessary)
+                if let ExprKind::Ident(sym) = &object.kind {
+                    if let Some(ref uc) = state.use_counts {
+                        if uc.is_single_use(sym) && !state.in_tape_region {
+                            return Ok(obj_val); // elide clone
+                        }
+                    }
+                }
+                self.compile_call_by_name(builder, "nsl_tensor_clone", &[obj_val])
+            }
             "item" => self.compile_call_by_name(builder, "nsl_tensor_item", &[obj_val]),
             "to" => {
                 if args.len() != 1 {
