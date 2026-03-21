@@ -1045,4 +1045,86 @@ mod tests {
 
         assert!(!extractor.extract_stmts(&[for_stmt]));
     }
+
+    // ---------------------------------------------------------------
+    // Task 2: Forward pass saves branch condition + emits Select
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_if_else_produces_select_op() {
+        // f(x) = if x > 0: return x*x else: return -x
+        // Should produce: cond = Condition(Gt, x, 0); t = Mul(x,x); e = Neg(x); out = Select(cond, t, e)
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let then_stmts = vec![make_return_stmt(make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        ))];
+        let else_stmts = vec![make_return_stmt(make_neg_expr(make_ident_expr(x_sym)))];
+        let if_stmt = make_if_stmt(cond, then_stmts, Some(else_stmts));
+
+        let result = extractor.extract_stmts(&[if_stmt]);
+        assert!(result, "Should extract if/else successfully");
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Verify a Condition op was emitted
+        let has_condition = list.ops.iter().any(|op| matches!(&op.op, PrimalOp::Condition(CompareKind::Gt)));
+        assert!(has_condition, "Should contain a Condition(Gt) op for `x > 0`");
+
+        // Verify a Select op was emitted
+        let select_ops: Vec<_> = list.ops.iter().filter(|op| matches!(&op.op, PrimalOp::Select)).collect();
+        assert!(!select_ops.is_empty(), "Should contain at least one Select op");
+
+        // The Select op should have 3 inputs: [cond, true_val, false_val]
+        for sel in &select_ops {
+            assert_eq!(sel.inputs.len(), 3, "Select should have 3 inputs (cond, true, false)");
+        }
+
+        // The output should be the Select result
+        let last_select = select_ops.last().unwrap();
+        assert_eq!(list.output, last_select.result, "Output should be the Select result");
+    }
+
+    #[test]
+    fn extract_if_else_condition_saved_as_var() {
+        // Verify the condition comparison result is captured in the Wengert list
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let then_stmts = vec![make_return_stmt(make_ident_expr(x_sym))];
+        let else_stmts = vec![make_return_stmt(make_float_expr(0.0))];
+        let if_stmt = make_if_stmt(cond, then_stmts, Some(else_stmts));
+
+        extractor.extract_stmts(&[if_stmt]);
+        let list = extractor.finalize().unwrap();
+
+        // Find the Condition op
+        let cond_op = list.ops.iter().find(|op| matches!(&op.op, PrimalOp::Condition(_))).unwrap();
+        let cond_var = cond_op.result;
+
+        // Find the Select op that uses this condition
+        let select_op = list.ops.iter().find(|op| {
+            matches!(&op.op, PrimalOp::Select) && op.inputs[0] == cond_var
+        });
+        assert!(select_op.is_some(), "Select should reference the saved condition variable");
+    }
 }
