@@ -35,6 +35,19 @@ pub struct GpuSpec {
     pub occupancy_worst_case: f64,
     /// L2 cache size in bytes.
     pub l2_cache_bytes: u64,
+    // --- Multi-level memory hierarchy (for cost model) ---
+    /// L1 cache / shared memory size per SM in KB.
+    pub l1_cache_kb: u32,
+    /// Aggregate L1 bandwidth in GB/s (across all SMs).
+    pub l1_bandwidth_gbs: f64,
+    /// L2 cache bandwidth in GB/s.
+    pub l2_bandwidth_gbs: f64,
+    /// Maximum concurrent warps per SM.
+    pub max_warps_per_sm: u32,
+    /// Total 32-bit registers per SM.
+    pub registers_per_sm: u32,
+    /// Number of SMs.
+    pub num_sms: u32,
 }
 
 impl GpuSpec {
@@ -78,6 +91,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 153.0, crossover_fp8: 0.0, crossover_fp32: 9.6,
         base_clock_mhz: 765, kernel_launch_overhead_ns: 6000, sync_overhead_ns: 3000,
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 40 * 1024 * 1024,
+        l1_cache_kb: 192, l1_bandwidth_gbs: 14400.0, l2_bandwidth_gbs: 4800.0,
+        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 108,
     },
     GpuSpec {
         name: "A100-PCIe", sm_version: 80,
@@ -86,6 +101,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 200.6, crossover_fp8: 0.0, crossover_fp32: 12.5,
         base_clock_mhz: 765, kernel_launch_overhead_ns: 6000, sync_overhead_ns: 3000,
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 40 * 1024 * 1024,
+        l1_cache_kb: 192, l1_bandwidth_gbs: 14400.0, l2_bandwidth_gbs: 4800.0,
+        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 108,
     },
     GpuSpec {
         name: "H100-SXM", sm_version: 90,
@@ -94,6 +111,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 295.2, crossover_fp8: 590.7, crossover_fp32: 20.0,
         base_clock_mhz: 1095, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.5, l2_cache_bytes: 50 * 1024 * 1024,
+        l1_cache_kb: 256, l1_bandwidth_gbs: 19200.0, l2_bandwidth_gbs: 6000.0,
+        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 132,
     },
     GpuSpec {
         name: "H100-PCIe", sm_version: 90,
@@ -102,6 +121,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 370.8, crossover_fp8: 741.9, crossover_fp32: 25.0,
         base_clock_mhz: 1095, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 50 * 1024 * 1024,
+        l1_cache_kb: 256, l1_bandwidth_gbs: 19200.0, l2_bandwidth_gbs: 6000.0,
+        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 114,
     },
     GpuSpec {
         name: "RTX-4090", sm_version: 89,
@@ -110,6 +131,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 327.4, crossover_fp8: 655.8, crossover_fp32: 81.9,
         base_clock_mhz: 2235, kernel_launch_overhead_ns: 4000, sync_overhead_ns: 1500,
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 72 * 1024 * 1024,
+        l1_cache_kb: 128, l1_bandwidth_gbs: 12800.0, l2_bandwidth_gbs: 5600.0,
+        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 128,
     },
     GpuSpec {
         name: "RTX-3090", sm_version: 86,
@@ -118,6 +141,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 151.7, crossover_fp8: 0.0, crossover_fp32: 38.0,
         base_clock_mhz: 1395, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 6 * 1024 * 1024,
+        l1_cache_kb: 128, l1_bandwidth_gbs: 9600.0, l2_bandwidth_gbs: 2400.0,
+        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 82,
     },
     GpuSpec {
         name: "L40S", sm_version: 89,
@@ -126,6 +151,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 419.0, crossover_fp8: 848.4, crossover_fp32: 106.0,
         base_clock_mhz: 1110, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 48 * 1024 * 1024,
+        l1_cache_kb: 128, l1_bandwidth_gbs: 12800.0, l2_bandwidth_gbs: 5600.0,
+        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 142,
     },
     // NVIDIA Jetson AGX Orin
     GpuSpec {
@@ -135,6 +162,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 830.0, crossover_fp8: 830.0, crossover_fp32: 25.9,
         base_clock_mhz: 624, kernel_launch_overhead_ns: 8000, sync_overhead_ns: 4000,
         pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.4, l2_cache_bytes: 4 * 1024 * 1024,
+        l1_cache_kb: 128, l1_bandwidth_gbs: 3200.0, l2_bandwidth_gbs: 800.0,
+        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 16,
     },
     // NVIDIA Jetson Orin NX (smaller edge)
     GpuSpec {
@@ -144,6 +173,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 976.0, crossover_fp8: 976.0, crossover_fp32: 30.3,
         base_clock_mhz: 624, kernel_launch_overhead_ns: 8000, sync_overhead_ns: 4000,
         pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.35, l2_cache_bytes: 2 * 1024 * 1024,
+        l1_cache_kb: 128, l1_bandwidth_gbs: 1600.0, l2_bandwidth_gbs: 400.0,
+        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 8,
     },
 ];
 

@@ -145,6 +145,88 @@ pub fn conv2d_cost(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-level memory hierarchy
+// ---------------------------------------------------------------------------
+
+/// Memory tier in the GPU cache hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryTier {
+    /// L1 / shared memory (per-SM, highest bandwidth)
+    L1,
+    /// L2 cache (shared across SMs)
+    L2,
+    /// HBM / VRAM (global memory, lowest bandwidth)
+    Hbm,
+}
+
+impl MemoryTier {
+    /// Get the effective bandwidth in GB/s for this tier on the given GPU.
+    pub fn bandwidth_gbs(&self, gpu: &GpuSpec) -> f64 {
+        match self {
+            MemoryTier::L1 => gpu.l1_bandwidth_gbs,
+            MemoryTier::L2 => gpu.l2_bandwidth_gbs,
+            MemoryTier::Hbm => gpu.peak_bandwidth_gbs,
+        }
+    }
+}
+
+/// Select the memory tier based on an operation's data footprint.
+///
+/// Heuristic: if the working set fits in a single SM's L1, use L1 bandwidth;
+/// if it fits in the total L2, use L2 bandwidth; otherwise HBM.
+pub fn select_memory_tier(gpu: &GpuSpec, data_bytes: u64) -> MemoryTier {
+    let l1_bytes = (gpu.l1_cache_kb as u64) * 1024;
+    let l2_bytes = gpu.l2_cache_bytes;
+
+    if data_bytes <= l1_bytes {
+        MemoryTier::L1
+    } else if data_bytes <= l2_bytes {
+        MemoryTier::L2
+    } else {
+        MemoryTier::Hbm
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Occupancy estimation
+// ---------------------------------------------------------------------------
+
+/// Estimate SM occupancy as a fraction [0.0, 1.0].
+///
+/// Considers register pressure, shared memory per block, and max warps per SM.
+/// Returns the fraction of maximum warps that can be active on one SM.
+pub fn estimate_occupancy(
+    gpu: &GpuSpec,
+    regs_per_thread: u32,
+    threads_per_block: u32,
+    shared_mem_per_block: u32,
+) -> f64 {
+    let warp_size: u32 = 32;
+    let max_warps = gpu.max_warps_per_sm;
+
+    // Register-limited threads
+    let max_threads_by_regs = if regs_per_thread > 0 {
+        gpu.registers_per_sm / regs_per_thread
+    } else {
+        max_warps * warp_size
+    };
+    let warps_by_regs = max_threads_by_regs / warp_size;
+
+    // Shared-memory-limited blocks
+    let l1_shared_bytes = gpu.l1_cache_kb * 1024;
+    let blocks_by_smem = if shared_mem_per_block > 0 {
+        l1_shared_bytes / shared_mem_per_block
+    } else {
+        u32::MAX
+    };
+    let warps_per_block = threads_per_block.div_ceil(warp_size);
+    let warps_by_smem = blocks_by_smem.saturating_mul(warps_per_block);
+
+    let active_warps = warps_by_regs.min(warps_by_smem).min(max_warps);
+    (active_warps as f64) / (max_warps as f64)
+}
+
+// ---------------------------------------------------------------------------
 // Roofline classification
 // ---------------------------------------------------------------------------
 
@@ -157,7 +239,25 @@ pub fn arithmetic_intensity(flops: u64, bytes_read: u64, bytes_written: u64) -> 
     flops as f64 / total_bytes as f64
 }
 
+/// Compute the roofline ridge point (FLOPs/byte) for a given memory tier and dtype.
+///
+/// Operations with arithmetic intensity above this are compute-bound;
+/// below are memory-bound.
+pub fn compute_ridge_point(gpu: &GpuSpec, tier: MemoryTier, dtype_bytes: usize) -> f64 {
+    let peak_tflops = gpu.peak_tflops(dtype_bytes);
+    let effective_peak = if peak_tflops == 0.0 { gpu.peak_fp32_tflops } else { peak_tflops };
+    let bandwidth = tier.bandwidth_gbs(gpu);
+    if bandwidth == 0.0 {
+        return 0.0;
+    }
+    // TFLOPS / (GB/s) = 1e12 FLOPS / 1e9 B/s = 1e3 FLOPs/byte
+    (effective_peak * 1e3) / bandwidth
+}
+
 /// Classify an operation as compute-bound, memory-bound, or balanced.
+///
+/// Uses the provided crossover point (ridge point) instead of hardcoded thresholds.
+/// The ±20% band around the ridge defines the "balanced" zone.
 pub fn classify_op(ai: f64, crossover: f64) -> BoundClassification {
     if crossover == 0.0 {
         return BoundClassification::Unknown;
@@ -172,7 +272,28 @@ pub fn classify_op(ai: f64, crossover: f64) -> BoundClassification {
     }
 }
 
+/// Classify an operation using multi-level bandwidth selection.
+///
+/// Selects the memory tier based on data footprint, computes the tier-specific
+/// ridge point, and classifies against it.
+pub fn classify_op_multilevel(
+    flops: u64,
+    bytes_read: u64,
+    bytes_written: u64,
+    gpu: &GpuSpec,
+    dtype_bytes: usize,
+) -> (BoundClassification, MemoryTier) {
+    let total_bytes = bytes_read + bytes_written;
+    let tier = select_memory_tier(gpu, total_bytes);
+    let ridge = compute_ridge_point(gpu, tier, dtype_bytes);
+    let ai = arithmetic_intensity(flops, bytes_read, bytes_written);
+    (classify_op(ai, ridge), tier)
+}
+
 /// Estimate wall-clock time in microseconds for an operation on a target GPU.
+///
+/// Uses multi-level memory hierarchy: selects L1/L2/HBM bandwidth based on
+/// the total data footprint (bytes_read + bytes_written).
 pub fn estimate_time_us(
     flops: u64,
     bytes_read: u64,
@@ -182,13 +303,21 @@ pub fn estimate_time_us(
 ) -> f64 {
     let total_bytes = bytes_read + bytes_written;
     let peak = gpu.peak_tflops(dtype_bytes);
-    // Fall back to FP32 throughput if this dtype is unsupported on the GPU
     let effective_peak = if peak == 0.0 { gpu.peak_fp32_tflops } else { peak };
     if effective_peak == 0.0 {
         return 0.0;
     }
+
+    // Select bandwidth tier based on data footprint
+    let tier = select_memory_tier(gpu, total_bytes);
+    let bandwidth_gbs = tier.bandwidth_gbs(gpu);
+
     let compute_time_us = flops as f64 / (effective_peak * 1e6);
-    let memory_time_us = total_bytes as f64 / (gpu.peak_bandwidth_gbs * 1e3);
+    let memory_time_us = if bandwidth_gbs > 0.0 {
+        total_bytes as f64 / (bandwidth_gbs * 1e3)
+    } else {
+        0.0
+    };
     compute_time_us.max(memory_time_us)
 }
 
@@ -561,5 +690,120 @@ mod tests {
         assert!(table.contains("A100-SXM"));
         assert!(table.contains("matmul(x, W)"));
         assert!(table.contains("MEMORY"));
+    }
+
+    // ── Multi-level cost model tests ──────────────────────────────────
+
+    #[test]
+    fn test_memory_tier_selection() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        // Small: fits in L1 (256 KB)
+        assert_eq!(select_memory_tier(h100, 128 * 1024), MemoryTier::L1);
+
+        // Medium: fits in L2 (50 MB) but not L1
+        assert_eq!(select_memory_tier(h100, 10 * 1024 * 1024), MemoryTier::L2);
+
+        // Large: exceeds L2
+        assert_eq!(select_memory_tier(h100, 100 * 1024 * 1024), MemoryTier::Hbm);
+    }
+
+    #[test]
+    fn test_memory_tier_bandwidth() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        let l1_bw = MemoryTier::L1.bandwidth_gbs(h100);
+        let l2_bw = MemoryTier::L2.bandwidth_gbs(h100);
+        let hbm_bw = MemoryTier::Hbm.bandwidth_gbs(h100);
+
+        assert!(l1_bw > l2_bw, "L1 should be faster than L2");
+        assert!(l2_bw > hbm_bw, "L2 should be faster than HBM");
+    }
+
+    #[test]
+    fn test_occupancy_register_limited() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        // 32 regs/thread, 256 threads/block: 65536/32 = 2048 threads = 64 warps = max
+        let occ = estimate_occupancy(h100, 32, 256, 0);
+        assert!((occ - 1.0).abs() < 0.01, "Full occupancy with 32 regs: {occ}");
+
+        // 128 regs/thread: 65536/128 = 512 threads = 16 warps, 16/64 = 0.25
+        let occ = estimate_occupancy(h100, 128, 256, 0);
+        assert!((occ - 0.25).abs() < 0.01, "Quarter occupancy with 128 regs: {occ}");
+    }
+
+    #[test]
+    fn test_occupancy_shared_memory_limited() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        // 48KB shared per block, 256KB L1 => 5 blocks fit
+        // 5 blocks * (256 threads / 32) = 5 * 8 = 40 warps, capped at 64
+        let occ = estimate_occupancy(h100, 32, 256, 48 * 1024);
+        assert!((occ - 40.0 / 64.0).abs() < 0.01, "Shared-mem limited: {occ}");
+    }
+
+    #[test]
+    fn test_ridge_point_tiers() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        let ridge_l1 = compute_ridge_point(h100, MemoryTier::L1, 2);
+        let ridge_l2 = compute_ridge_point(h100, MemoryTier::L2, 2);
+        let ridge_hbm = compute_ridge_point(h100, MemoryTier::Hbm, 2);
+
+        // L1 ridge < L2 ridge < HBM ridge (faster memory = easier to be compute-bound)
+        assert!(ridge_l1 < ridge_l2, "L1 ridge ({ridge_l1:.1}) < L2 ({ridge_l2:.1})");
+        assert!(ridge_l2 < ridge_hbm, "L2 ridge ({ridge_l2:.1}) < HBM ({ridge_hbm:.1})");
+
+        // Sanity: HBM ridge should be in a reasonable range
+        assert!(ridge_hbm > 100.0 && ridge_hbm < 1000.0,
+            "HBM ridge {ridge_hbm:.1} should be 100-1000 FLOPs/byte");
+    }
+
+    #[test]
+    fn test_classify_multilevel() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        // Large matmul: compute-bound on HBM
+        let (flops, br, bw) = matmul_cost(4096, 4096, 4096, 2);
+        let (class, tier) = classify_op_multilevel(flops, br, bw, h100, 2);
+        assert_eq!(tier, MemoryTier::Hbm, "large matmul should be HBM");
+        assert_eq!(class, BoundClassification::ComputeBound, "large matmul is compute-bound");
+
+        // Small elementwise: memory-bound on L1
+        let (flops, br, bw) = elementwise_unary_cost(64 * 64, 2);
+        let (class, _tier) = classify_op_multilevel(flops, br, bw, h100, 2);
+        assert_eq!(class, BoundClassification::MemoryBound, "small elementwise is memory-bound");
+    }
+
+    #[test]
+    fn test_estimate_time_multilevel_uses_tier_bandwidth() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+
+        // Small op (L1-resident) should be faster than same-size op at HBM bandwidth
+        let small_bytes: u64 = 64 * 64 * 2; // 8KB — fits in L1
+        let time_actual = estimate_time_us(0, small_bytes, small_bytes, h100, 2);
+
+        // What it WOULD be if we used HBM bandwidth
+        let time_hbm_only = (2 * small_bytes) as f64 / (h100.peak_bandwidth_gbs * 1e3);
+
+        // Multi-level should give faster (or equal) time since L1 is faster
+        assert!(time_actual <= time_hbm_only + 1e-10,
+            "L1-resident op should be at least as fast as HBM prediction: actual={time_actual}, hbm={time_hbm_only}");
+    }
+
+    #[test]
+    fn test_cost_model_monotonicity() {
+        let h100 = gpu_specs::find_gpu("H100-SXM").unwrap();
+        let sizes: [u64; 5] = [64, 256, 1024, 4096, 8192];
+        let mut prev_time = 0.0;
+
+        for &n in &sizes {
+            let (flops, br, bw) = matmul_cost(n, n, n, 2);
+            let time = estimate_time_us(flops, br, bw, h100, 2);
+            assert!(time > prev_time,
+                "Time should increase: n={n}, time={time:.4}, prev={prev_time:.4}");
+            prev_time = time;
+        }
     }
 }
