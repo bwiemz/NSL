@@ -2,8 +2,11 @@
 //!
 //! Generates Cartesian products of tuning parameters, hashes kernel ASTs
 //! for cache key generation, and provides read/write for the `.nsl-cache/autotune/`
-//! directory. Actual GPU benchmarking is deferred to M26 integration; for now,
-//! the middle-value fallback is used.
+//! directory.
+//!
+//! GPU benchmarking: `find_best_variant()` accepts a `BenchmarkFn` callback that
+//! the runtime provides (actual CUDA event timing). When no GPU is available or
+//! `NSL_AUTOTUNE_FALLBACK=1` is set, `select_middle_values()` is used instead.
 
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -51,6 +54,160 @@ pub fn select_middle_values(params: &TuningParams) -> Variant {
             (name.clone(), values[mid_idx])
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// GPU benchmarking protocol
+// ---------------------------------------------------------------------------
+
+/// Result of benchmarking a single autotuned variant.
+#[derive(Debug, Clone)]
+pub struct BenchmarkResult {
+    /// The parameter values for this variant.
+    pub variant: Variant,
+    /// Median kernel latency in milliseconds across measured runs.
+    pub median_ms: f64,
+    /// Minimum kernel latency.
+    pub min_ms: f64,
+    /// Maximum kernel latency.
+    pub max_ms: f64,
+}
+
+/// Callback type for benchmarking a single variant on real hardware.
+///
+/// The runtime provides this — it loads the PTX, allocates dummy data, launches
+/// with CUDA events, and returns the `BenchmarkResult`.
+///
+/// Arguments: (ptx_source, kernel_name, variant_params) -> Result<BenchmarkResult>
+pub type BenchmarkFn = dyn Fn(&str, &str, &Variant) -> Result<BenchmarkResult, String>;
+
+/// Number of warmup launches (not timed) before measured runs.
+pub const WARMUP_RUNS: usize = 5;
+/// Number of measured launches for computing median latency.
+pub const MEASURED_RUNS: usize = 10;
+/// Maximum time (ms) for a single variant before it's skipped.
+pub const VARIANT_TIMEOUT_MS: f64 = 5000.0;
+
+/// Find the best autotuned variant for a kernel by benchmarking all Cartesian-product
+/// parameter combinations on real hardware.
+///
+/// - Checks cache first (cache hit skips benchmarking entirely).
+/// - If `NSL_AUTOTUNE_FALLBACK=1` is set, uses `select_middle_values()` without GPU.
+/// - Calls `ptx_generator` for each variant to produce PTX, then `benchmark_fn` to time it.
+/// - Failed variants are skipped (e.g., too much shared memory, CUDA errors).
+/// - Winner (lowest median latency) is written to cache.
+/// - If `NSL_AUTOTUNE_VERBOSE=1` is set, prints a formatted report table.
+pub fn find_best_variant(
+    kernel_name: &str,
+    tuning_params: &TuningParams,
+    cache_hash: &str,
+    ptx_generator: &dyn Fn(&Variant) -> Result<String, String>,
+    benchmark_fn: &BenchmarkFn,
+) -> Result<Variant, String> {
+    // 1. Check cache
+    if let Some(cached) = check_cache(kernel_name, cache_hash) {
+        if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+            eprintln!("[autotune] cache hit for {kernel_name}");
+        }
+        return Ok(cached);
+    }
+
+    // 2. Fallback mode (no GPU)
+    if std::env::var("NSL_AUTOTUNE_FALLBACK").is_ok() {
+        if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+            eprintln!("[autotune] fallback mode: picking median values (no GPU benchmarking)");
+        }
+        return Ok(select_middle_values(tuning_params));
+    }
+
+    // 3. Generate all variants
+    let all_variants = cartesian_product(tuning_params);
+    let num_variants = all_variants.len();
+
+    // 4. Benchmark each
+    let mut results: Vec<BenchmarkResult> = Vec::new();
+    for variant in &all_variants {
+        let ptx = match ptx_generator(variant) {
+            Ok(p) => p,
+            Err(e) => {
+                if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                    eprintln!("[autotune]   {:?} => compile FAILED: {e}", variant);
+                }
+                continue; // skip failed compilation
+            }
+        };
+
+        match benchmark_fn(&ptx, kernel_name, variant) {
+            Ok(result) => {
+                // Timeout check
+                if result.median_ms > VARIANT_TIMEOUT_MS {
+                    if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                        eprintln!(
+                            "[autotune]   {:?} => too slow ({:.1}ms), skipping",
+                            variant, result.median_ms
+                        );
+                    }
+                    continue;
+                }
+                results.push(result);
+            }
+            Err(e) => {
+                if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                    eprintln!("[autotune]   {:?} => benchmark FAILED: {e}", variant);
+                }
+                continue;
+            }
+        }
+    }
+
+    // 5. All failed? Fall back to median
+    if results.is_empty() {
+        eprintln!(
+            "[autotune] WARNING: all {num_variants} variants failed for {kernel_name}, using median fallback"
+        );
+        return Ok(select_middle_values(tuning_params));
+    }
+
+    // 6. Select winner
+    results.sort_by(|a, b| a.median_ms.partial_cmp(&b.median_ms).unwrap());
+    let winner = results[0].variant.clone();
+
+    // 7. Verbose report
+    if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+        print_benchmark_report(kernel_name, &results);
+    }
+
+    // 8. Write to cache
+    let autotune_result = AutotuneResult {
+        winner: winner.clone(),
+        all_timings: results.iter().map(|r| (r.variant.clone(), r.median_ms)).collect(),
+        device_name: String::new(), // filled by runtime if available
+        compute_capability: String::new(),
+        sm_count: 0,
+    };
+    write_cache(cache_hash, kernel_name, &autotune_result);
+
+    Ok(winner)
+}
+
+/// Print a formatted benchmark report table to stderr.
+pub fn print_benchmark_report(kernel_name: &str, results: &[BenchmarkResult]) {
+    eprintln!("\n=== Autotune Report: {kernel_name} ===");
+    eprintln!("{:<40} {:>10} {:>10} {:>10}", "Variant", "Median", "Min", "Max");
+    eprintln!("{:-<72}", "");
+    for r in results {
+        let params_str: String = r.variant
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marker = if r.variant == results[0].variant { " <-- winner" } else { "" };
+        eprintln!(
+            "{:<40} {:>9.3}ms {:>9.3}ms {:>9.3}ms{}",
+            params_str, r.median_ms, r.min_ms, r.max_ms, marker
+        );
+    }
+    eprintln!();
 }
 
 /// Hash a kernel's AST body for cache key generation (SHA-256).
@@ -311,5 +468,164 @@ mod tests {
     fn test_check_cache_miss() {
         let cached = check_cache("nonexistent_kernel", "nonexistent_hash");
         assert!(cached.is_none());
+    }
+
+    // ── GPU benchmarking tests ────────────────────────────────────────
+
+    #[test]
+    fn test_find_best_variant_with_mock_benchmark() {
+        // Mock benchmark: pretend block_size=128 is fastest
+        let params = vec![
+            ("block_size".to_string(), vec![64, 128, 256]),
+        ];
+
+        let ptx_gen = |variant: &Variant| -> Result<String, String> {
+            Ok(format!("// PTX for {:?}", variant))
+        };
+
+        let benchmark = |_ptx: &str, _name: &str, variant: &Variant| -> Result<BenchmarkResult, String> {
+            let block_size = variant[0].1;
+            // Simulate: 128 is fastest, 64 medium, 256 slowest
+            let median = match block_size {
+                64 => 1.5,
+                128 => 0.8,
+                256 => 2.1,
+                _ => 10.0,
+            };
+            Ok(BenchmarkResult {
+                variant: variant.clone(),
+                median_ms: median,
+                min_ms: median * 0.9,
+                max_ms: median * 1.1,
+            })
+        };
+
+        // Use a unique cache hash to avoid collisions
+        let hash = "test_mock_bench_001";
+        // Clean up any previous cache entry
+        let path = cache_dir().join(format!("test_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let winner = find_best_variant(
+            "test_kernel",
+            &params,
+            hash,
+            &ptx_gen,
+            &benchmark,
+        ).expect("should find a winner");
+
+        assert_eq!(winner, vec![("block_size".to_string(), 128)],
+            "block_size=128 should win (lowest median)");
+
+        // Clean up
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_find_best_variant_cache_hit() {
+        // Pre-populate cache, then verify find_best_variant returns cached result
+        let hash = "test_cache_hit_002";
+        let result = AutotuneResult {
+            winner: vec![("tile_k".to_string(), 32)],
+            all_timings: vec![(vec![("tile_k".to_string(), 32)], 0.5)],
+            device_name: "MockGPU".to_string(),
+            compute_capability: "8.0".to_string(),
+            sm_count: 108,
+        };
+        write_cache(hash, "cached_kernel", &result);
+
+        let params = vec![("tile_k".to_string(), vec![16, 32, 64])];
+        let ptx_gen = |_: &Variant| -> Result<String, String> {
+            panic!("should not be called — cache hit");
+        };
+        let benchmark = |_: &str, _: &str, _: &Variant| -> Result<BenchmarkResult, String> {
+            panic!("should not be called — cache hit");
+        };
+
+        let winner = find_best_variant(
+            "cached_kernel", &params, hash, &ptx_gen, &benchmark,
+        ).expect("cache hit should succeed");
+
+        assert_eq!(winner, vec![("tile_k".to_string(), 32)]);
+
+        // Clean up
+        let path = cache_dir().join(format!("cached_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_find_best_variant_all_fail_falls_back() {
+        let params = vec![("x".to_string(), vec![1, 2, 3])];
+        let hash = "test_all_fail_003";
+        let path = cache_dir().join(format!("fail_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let ptx_gen = |_: &Variant| -> Result<String, String> {
+            Err("compile error".to_string()) // all variants fail
+        };
+        let benchmark = |_: &str, _: &str, _: &Variant| -> Result<BenchmarkResult, String> {
+            panic!("should not be called — PTX gen fails");
+        };
+
+        let winner = find_best_variant(
+            "fail_kernel", &params, hash, &ptx_gen, &benchmark,
+        ).expect("should fall back to median");
+
+        // Median of [1,2,3] is index 1 => value 2
+        assert_eq!(winner, vec![("x".to_string(), 2)]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_find_best_variant_skips_slow_variants() {
+        let params = vec![("size".to_string(), vec![1, 2])];
+        let hash = "test_timeout_004";
+        let path = cache_dir().join(format!("timeout_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let ptx_gen = |_: &Variant| -> Result<String, String> {
+            Ok("// ptx".to_string())
+        };
+        let benchmark = |_: &str, _: &str, variant: &Variant| -> Result<BenchmarkResult, String> {
+            let size = variant[0].1;
+            let median = if size == 1 { 10000.0 } else { 0.5 }; // size=1 is too slow
+            Ok(BenchmarkResult {
+                variant: variant.clone(),
+                median_ms: median,
+                min_ms: median,
+                max_ms: median,
+            })
+        };
+
+        let winner = find_best_variant(
+            "timeout_kernel", &params, hash, &ptx_gen, &benchmark,
+        ).expect("should pick fast variant");
+
+        assert_eq!(winner, vec![("size".to_string(), 2)],
+            "should skip the 10-second variant and pick size=2");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_benchmark_report_format() {
+        let results = vec![
+            BenchmarkResult {
+                variant: vec![("bs".to_string(), 128)],
+                median_ms: 0.8,
+                min_ms: 0.7,
+                max_ms: 0.9,
+            },
+            BenchmarkResult {
+                variant: vec![("bs".to_string(), 256)],
+                median_ms: 1.2,
+                min_ms: 1.0,
+                max_ms: 1.5,
+            },
+        ];
+
+        // Just verify it doesn't panic
+        print_benchmark_report("test_report_kernel", &results);
     }
 }
