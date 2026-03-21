@@ -67,6 +67,10 @@ impl<'a> TypeResolver<'a> {
                     Type::Unknown
                 }
             }
+            TypeExprKind::Borrow(inner) => {
+                let inner_ty = self.resolve(inner, scope);
+                Type::Borrow(Box::new(inner_ty))
+            }
         }
     }
 

@@ -4,7 +4,7 @@ use nsl_lexer::TokenKind;
 
 use crate::expr::parse_expr;
 use crate::parser::Parser;
-use crate::types::parse_type;
+use crate::types::{parse_type, parse_type_no_borrow};
 
 pub fn parse_fn_def_stmt(p: &mut Parser) -> Stmt {
     let start = p.current_span();
@@ -25,9 +25,9 @@ pub fn parse_fn_def_stmt(p: &mut Parser) -> Stmt {
     let params = parse_params(p);
     p.expect(&TokenKind::RightParen);
 
-    // Return type: -> Type
+    // Return type: -> Type (borrows not allowed in return position)
     let return_type = if p.eat(&TokenKind::Arrow) {
-        Some(parse_type(p))
+        Some(parse_type_no_borrow(p))
     } else {
         None
     };
@@ -128,7 +128,7 @@ pub fn parse_model_def_stmt(p: &mut Parser) -> Stmt {
             let mparams = parse_params(p);
             p.expect(&TokenKind::RightParen);
             let return_type = if p.eat(&TokenKind::Arrow) {
-                Some(parse_type(p))
+                Some(parse_type_no_borrow(p))
             } else {
                 None
             };
@@ -336,7 +336,7 @@ pub fn parse_trait_def_stmt(p: &mut Parser) -> Stmt {
         let params = parse_params(p);
         p.expect(&TokenKind::RightParen);
         let return_type = if p.eat(&TokenKind::Arrow) {
-            Some(parse_type(p))
+            Some(parse_type_no_borrow(p))
         } else {
             None
         };

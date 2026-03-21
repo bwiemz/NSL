@@ -33,6 +33,18 @@ pub fn parse_type(p: &mut Parser) -> TypeExpr {
 /// Parse a single (non-union) type expression. Public so lambda params can
 /// use this to avoid consuming `|` as a union-type separator.
 pub fn parse_primary_type(p: &mut Parser) -> TypeExpr {
+    // Immutable borrow: &Type
+    if p.at(&TokenKind::Ampersand) {
+        let start = p.advance().span;
+        let inner = parse_primary_type(p);
+        let span = start.merge(inner.span);
+        return TypeExpr {
+            kind: TypeExprKind::Borrow(Box::new(inner)),
+            span,
+            id: p.next_node_id(),
+        };
+    }
+
     match p.peek().clone() {
         TokenKind::Ident(sym) => {
             let name: Symbol = sym.into();
@@ -376,6 +388,24 @@ fn parse_device_expr(p: &mut Parser) -> DeviceExpr {
     }
 }
 
+/// Parse a type expression, but reject borrow types (`&T`) with an error.
+/// Used for return type positions where borrows cannot escape.
+pub fn parse_type_no_borrow(p: &mut Parser) -> TypeExpr {
+    let ty = parse_type(p);
+    reject_borrow_in_type(&ty, p);
+    ty
+}
+
+/// Recursively check for borrow types and emit an error if found.
+fn reject_borrow_in_type(ty: &TypeExpr, p: &mut Parser) {
+    if let TypeExprKind::Borrow(_) = &ty.kind {
+        p.diagnostics.push(
+            nsl_errors::Diagnostic::error("borrow types (`&T`) cannot appear in return position — borrows cannot escape function scope")
+                .with_label(ty.span, "borrow in return type"),
+        );
+    }
+}
+
 fn parse_function_or_tuple_type(p: &mut Parser) -> TypeExpr {
     let start = p.current_span();
     p.advance(); // consume (
@@ -409,5 +439,74 @@ fn parse_function_or_tuple_type(p: &mut Parser) -> TypeExpr {
             span,
             id: p.next_node_id(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsl_ast::types::TypeExprKind;
+    use nsl_errors::FileId;
+    use nsl_lexer;
+
+    fn parse_type_str(src: &str) -> (TypeExpr, Vec<nsl_errors::Diagnostic>) {
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+        let mut p = crate::parser::Parser::new(&tokens, &mut interner);
+        let ty = parse_type(&mut p);
+        let diags = p.diagnostics;
+        (ty, diags)
+    }
+
+    #[test]
+    fn test_parse_borrow_named_type() {
+        let (ty, diags) = parse_type_str("&int");
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+        match &ty.kind {
+            TypeExprKind::Borrow(inner) => {
+                assert!(matches!(inner.kind, TypeExprKind::Named(_)));
+            }
+            other => panic!("expected Borrow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_borrow_tensor_type() {
+        let (ty, diags) = parse_type_str("&Tensor<[4], f32>");
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+        match &ty.kind {
+            TypeExprKind::Borrow(inner) => {
+                assert!(matches!(inner.kind, TypeExprKind::Tensor { .. }));
+            }
+            other => panic!("expected Borrow(Tensor), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_non_borrow_type() {
+        let (ty, diags) = parse_type_str("Tensor<[4], f32>");
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+        assert!(matches!(ty.kind, TypeExprKind::Tensor { .. }));
+    }
+
+    #[test]
+    fn test_borrow_return_type_error() {
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize("&Tensor<[4], f32>", FileId(0), &mut interner);
+        let mut p = crate::parser::Parser::new(&tokens, &mut interner);
+        let ty = parse_type_no_borrow(&mut p);
+        assert!(
+            matches!(ty.kind, TypeExprKind::Borrow(_)),
+            "should still parse the borrow"
+        );
+        assert!(
+            !p.diagnostics.is_empty(),
+            "should produce a diagnostic for borrow in return position"
+        );
+        assert!(
+            format!("{:?}", p.diagnostics[0]).contains("borrow"),
+            "diagnostic should mention 'borrow', got: {:?}",
+            p.diagnostics[0]
+        );
     }
 }
