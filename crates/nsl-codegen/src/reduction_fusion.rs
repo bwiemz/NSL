@@ -380,6 +380,93 @@ fn emit_crosswarp_reduce(buf: &mut Vec<u8>, freg: &str, reduce_op: &str, n_warps
     emit_warp_reduce_f32(buf, freg, reduce_op);
 }
 
+/// Emit Welford warp-level butterfly reduction for (mean=%f0, M2=%f1, count=%r2).
+/// Uses the proper weighted merge formula that handles unequal element counts.
+/// After reduction, lane 0 holds the combined (mean, M2, n) for the entire warp.
+fn emit_welford_warp_reduce_v2(buf: &mut Vec<u8>) {
+    // Declare merge temporaries (once, outside loop)
+    buf.extend_from_slice(
+        b"    .reg .f32 %wf_other_mean, %wf_other_m2;\n\
+          .reg .u32 %wf_other_n, %wf_n_a;\n\
+          .reg .f32 %wf_delta, %wf_fn_a, %wf_fn_b, %wf_fn_c, %wf_dsq;\n"
+    );
+
+    for offset in [16u32, 8, 4, 2, 1] {
+        buf.extend_from_slice(
+            format!(
+                "    // Welford merge offset={offset}\n\
+                 // Shuffle mean, M2, count\n\
+                 mov.b32 %rs0, %f0;\n\
+                 shfl.sync.bfly.b32 %rs1, %rs0, {offset}, 31, 0xFFFFFFFF;\n\
+                 mov.b32 %wf_other_mean, %rs1;\n\
+                 mov.b32 %rs0, %f1;\n\
+                 shfl.sync.bfly.b32 %rs1, %rs0, {offset}, 31, 0xFFFFFFFF;\n\
+                 mov.b32 %wf_other_m2, %rs1;\n\
+                 shfl.sync.bfly.b32 %wf_other_n, %r2, {offset}, 31, 0xFFFFFFFF;\n\
+                 // Save n_a before merging\n\
+                 mov.u32 %wf_n_a, %r2;\n\
+                 // delta = other_mean - mean\n\
+                 sub.f32 %wf_delta, %wf_other_mean, %f0;\n\
+                 // combined_n = n_a + n_b\n\
+                 add.u32 %r2, %wf_n_a, %wf_other_n;\n\
+                 // Convert to float for division\n\
+                 cvt.rn.f32.u32 %wf_fn_a, %wf_n_a;\n\
+                 cvt.rn.f32.u32 %wf_fn_b, %wf_other_n;\n\
+                 cvt.rn.f32.u32 %wf_fn_c, %r2;  // combined_n\n\
+                 // combined_mean = (n_a * mean_a + n_b * mean_b) / combined_n\n\
+                 mul.f32 %f0, %wf_fn_a, %f0;  // n_a * mean_a\n\
+                 fma.rn.f32 %f0, %wf_fn_b, %wf_other_mean, %f0;  // + n_b * mean_b\n\
+                 div.approx.f32 %f0, %f0, %wf_fn_c;  // / combined_n\n\
+                 // combined_M2 = M2_a + M2_b + delta^2 * n_a * n_b / combined_n\n\
+                 mul.f32 %wf_dsq, %wf_delta, %wf_delta;  // delta^2\n\
+                 mul.f32 %wf_dsq, %wf_dsq, %wf_fn_a;    // * n_a\n\
+                 mul.f32 %wf_dsq, %wf_dsq, %wf_fn_b;    // * n_b\n\
+                 div.approx.f32 %wf_dsq, %wf_dsq, %wf_fn_c;  // / combined_n\n\
+                 add.f32 %f1, %f1, %wf_other_m2;  // M2_a + M2_b\n\
+                 add.f32 %f1, %f1, %wf_dsq;       // + delta^2 term\n"
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// Emit Welford cross-warp reduction via shared memory.
+/// After warp reduction, lane 0 of each warp has (mean, M2, n).
+/// This writes them to shared memory, syncs, and warp 0 reduces.
+fn emit_welford_crosswarp_reduce(buf: &mut Vec<u8>, n_warps: u32) {
+    buf.extend_from_slice(
+        format!(
+            "    // Welford cross-warp reduction\n\
+             and.b32 %r_lane, %r_tid, 31;\n\
+             shr.u32 %r_warp, %r_tid, 5;\n\
+             setp.eq.u32 %p_lane0, %r_lane, 0;\n\
+             // Lane 0 writes (mean, M2, n) to shared memory slots [warp*12..warp*12+11]\n\
+             mul.lo.u32 %r_lane, %r_warp, 12;  // 3 * sizeof(f32) per warp\n\
+             @%p_lane0 st.shared.f32 [%smem + %r_lane], %f0;\n\
+             add.u32 %r_lane, %r_lane, 4;\n\
+             @%p_lane0 st.shared.f32 [%smem + %r_lane], %f1;\n\
+             add.u32 %r_lane, %r_lane, 4;\n\
+             @%p_lane0 st.shared.u32 [%smem + %r_lane], %r2;\n\
+             bar.sync 0;\n\
+             // Warp 0 loads and reduces\n\
+             setp.lt.u32 %p_warp_slot, %r_tid, {n_warps};\n\
+             mul.lo.u32 %r_lane, %r_tid, 12;\n\
+             @%p_warp_slot ld.shared.f32 %f0, [%smem + %r_lane];\n\
+             add.u32 %r_lane, %r_lane, 4;\n\
+             @%p_warp_slot ld.shared.f32 %f1, [%smem + %r_lane];\n\
+             add.u32 %r_lane, %r_lane, 4;\n\
+             @%p_warp_slot ld.shared.u32 %r2, [%smem + %r_lane];\n\
+             @!%p_warp_slot mov.f32 %f0, 0.0;\n\
+             @!%p_warp_slot mov.f32 %f1, 0.0;\n\
+             @!%p_warp_slot mov.u32 %r2, 0;\n\
+             bar.sync 0;\n"
+        )
+        .as_bytes(),
+    );
+    // Final warp reduce within warp 0
+    emit_welford_warp_reduce_v2(buf);
+}
+
 /// Returns the store + optional dtype-convert instruction for a result in `%f_res`.
 fn emit_store_with_dtype(buf: &mut Vec<u8>, dtype: DType, out_ptr_reg: &str) {
     match dtype {
@@ -583,11 +670,10 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
 /// Synthesize a fused layernorm PTX kernel using Welford's online algorithm.
 /// Returns null-terminated PTX bytes.
 ///
-/// TODO(M31-followup): The cross-warp Welford merge is simplified (adds means then
-/// divides by n_warps). This is only correct when every thread processes the same
-/// number of elements. For hidden_dim not divisible by block_size, use proper
-/// parallel Welford merge: combined_mean = (n1*m1 + n2*m2)/(n1+n2), or switch
-/// to sum-based reduction and divide by hidden_dim at the end.
+/// The Welford warp reduction uses the proper weighted parallel merge formula:
+/// combined_mean = (n_a * mean_a + n_b * mean_b) / (n_a + n_b)
+/// combined_M2 = M2_a + M2_b + delta^2 * n_a * n_b / (n_a + n_b)
+/// This handles uneven element counts (hidden_dim % block_size != 0) correctly.
 pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64, dtype: DType) -> Vec<u8> {
     let block_size: u32 = 256.min(hidden_dim);
     let n_warps: u32 = block_size / 32;
@@ -631,7 +717,7 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
              .reg .u32 %r_warp;\n\
              .reg .b16 %h_out;\n\
              .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
-        , smem_bytes = n_warps * 8)  // 2 floats per warp: mean + M2
+        , smem_bytes = n_warps * 12)  // 3 values per warp: mean + M2 + count
         .as_bytes(),
     );
 
@@ -699,32 +785,36 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
         );
     }
 
-    // Warp reduce mean (sum partial means, then divide)
-    buf.extend_from_slice(b"\n    // Warp + cross-warp reduce mean\n");
-    emit_warp_reduce_f32(&mut buf, "%f0", "add");
-    emit_crosswarp_reduce(&mut buf, "%f0", "add", n_warps);
-    // Broadcast mean
+    // Proper Welford warp + cross-warp reduction.
+    // Each thread has (mean=%f0, M2=%f1, count=%r2) from its local Welford accumulation.
+    // The merge uses the parallel Welford formula that handles unequal element counts:
+    //   delta = mean_b - mean_a
+    //   combined_n = n_a + n_b
+    //   combined_mean = (n_a * mean_a + n_b * mean_b) / combined_n
+    //   combined_M2 = M2_a + M2_b + delta^2 * n_a * n_b / combined_n
+    buf.extend_from_slice(b"\n    // Welford warp reduction (weighted merge)\n");
+    emit_welford_warp_reduce_v2(&mut buf);
+
+    // Cross-warp Welford reduction via shared memory
+    // After warp reduce, lane 0 of each warp has (mean, M2, n) for its warp.
+    // Write to shared memory, sync, then warp 0 reads and reduces.
+    emit_welford_crosswarp_reduce(&mut buf, n_warps);
+
+    // Broadcast final mean to all threads
     buf.extend_from_slice(
         b"    mov.b32 %rs0, %f0;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
           mov.b32 %f0, %rs1;\n"
     );
-    // Divide by n_warps to get true mean
-    buf.extend_from_slice(
-        format!("    mul.f32 %f0, %f0, 0f{inv_warps:08X};\n\n", inv_warps = (1.0f32 / n_warps as f32).to_bits())
-        .as_bytes(),
-    );
 
-    // Warp reduce M2 (variance numerator)
-    buf.extend_from_slice(b"    // Warp + cross-warp reduce M2\n");
-    emit_warp_reduce_f32(&mut buf, "%f1", "add");
-    emit_crosswarp_reduce(&mut buf, "%f1", "add", n_warps);
+    // Compute variance = M2 / N (using the combined count, not hardcoded hidden_dim)
+    // Broadcast M2 first
     buf.extend_from_slice(
         b"    mov.b32 %rs0, %f1;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
           mov.b32 %f1, %rs1;\n"
     );
-    // var = M2 / hidden_dim
+    // var = M2 / hidden_dim (hidden_dim is the total element count — always correct)
     buf.extend_from_slice(
         format!("    mul.f32 %f1, %f1, 0f{inv_n:08X};  // var = M2/N\n", inv_n = (1.0f32 / hidden_dim as f32).to_bits())
         .as_bytes(),
@@ -1174,7 +1264,9 @@ mod tests {
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
 
         assert!(ptx_str.contains(".entry fused_layernorm_768"));
-        assert!(ptx_str.contains("shfl.sync.down.b32"));
+        // Welford merge uses butterfly shuffles for (mean, M2, count) triples
+        assert!(ptx_str.contains("shfl.sync.bfly.b32"),
+            "layernorm should use Welford bfly shuffles");
         assert!(ptx_str.contains("bar.sync"));
         // Affine: gamma * normalized + beta
         assert!(ptx_str.contains("param_gamma"));
