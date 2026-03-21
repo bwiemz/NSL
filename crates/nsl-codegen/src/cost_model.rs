@@ -71,8 +71,16 @@ pub fn elementwise_binary_cost(
 }
 
 /// Softmax [B, S] cost.
+///
+/// 7 FLOPs per element:
+///   1. max reduction (1 comparison/element)
+///   2. subtract max (1 sub)
+///   3. exp (1 transcendental)
+///   4. sum reduction (1 add)
+///   5. divide by sum (1 div)
+///   6-7. log-sum-exp stability: 2 extra ops for safe max tracking
 pub fn softmax_cost(b: u64, s: u64, dtype_bytes: u64) -> (u64, u64, u64) {
-    let flops = 5 * b * s;
+    let flops = 7 * b * s;
     let bytes = b * s * dtype_bytes;
     (flops, bytes, bytes)
 }
@@ -288,6 +296,128 @@ pub fn classify_op_multilevel(
     let ridge = compute_ridge_point(gpu, tier, dtype_bytes);
     let ai = arithmetic_intensity(flops, bytes_read, bytes_written);
     (classify_op(ai, ridge), tier)
+}
+
+// ---------------------------------------------------------------------------
+// Fusion memory traffic modeling
+// ---------------------------------------------------------------------------
+
+/// Simple descriptor of a single op's memory behavior in a fusion chain.
+#[derive(Debug, Clone)]
+pub struct FusionOpInfo {
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+}
+
+/// Estimate total HBM traffic for a fused chain of elementwise operations.
+///
+/// Fused: only the first op reads inputs from HBM, only the last op writes
+/// output to HBM. All intermediates stay in registers (zero HBM traffic).
+pub fn estimate_fused_bytes(chain: &[FusionOpInfo]) -> u64 {
+    if chain.is_empty() { return 0; }
+    let first_read = chain[0].bytes_read;
+    let last_write = chain[chain.len() - 1].bytes_written;
+    first_read + last_write
+}
+
+/// Compute the fraction of memory traffic saved by fusing a chain.
+///
+/// Returns a value in [0.0, 1.0] — 0.0 means no savings, 1.0 means all
+/// intermediate traffic eliminated.
+pub fn fusion_memory_savings(chain: &[FusionOpInfo]) -> f64 {
+    let unfused: u64 = chain.iter().map(|op| op.bytes_read + op.bytes_written).sum();
+    if unfused == 0 { return 0.0; }
+    let fused = estimate_fused_bytes(chain);
+    1.0 - (fused as f64 / unfused as f64)
+}
+
+// ---------------------------------------------------------------------------
+// Effective bandwidth under cache reuse
+// ---------------------------------------------------------------------------
+
+/// Access pattern classification for bandwidth estimation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AccessPattern {
+    /// Single-pass streaming (elementwise, reduction)
+    Streaming,
+    /// Data is accessed multiple times (matmul tiles, attention Q reuse)
+    Reuse { reuse_factor: u32 },
+}
+
+/// Compute effective bandwidth accounting for cache reuse.
+///
+/// When data fits in cache and is reused, the effective bandwidth is higher
+/// than raw HBM peak because subsequent accesses hit L1/L2 instead of HBM.
+pub fn effective_bandwidth_gbs(
+    data_bytes: u64,
+    pattern: AccessPattern,
+    gpu: &GpuSpec,
+) -> f64 {
+    match pattern {
+        AccessPattern::Streaming => {
+            // One-pass: use tier-based bandwidth from data size
+            let tier = select_memory_tier(gpu, data_bytes);
+            tier.bandwidth_gbs(gpu)
+        }
+        AccessPattern::Reuse { reuse_factor } => {
+            if reuse_factor <= 1 {
+                let tier = select_memory_tier(gpu, data_bytes);
+                return tier.bandwidth_gbs(gpu);
+            }
+            // If data fits in cache, amortize over reuse
+            let l1_bytes = (gpu.l1_cache_kb as u64) * 1024;
+            let l2_bytes = gpu.l2_cache_bytes;
+            if data_bytes <= l1_bytes {
+                // Data stays in L1 across reuses — effective BW scales with reuse
+                gpu.l1_bandwidth_gbs
+            } else if data_bytes <= l2_bytes {
+                // Data stays in L2
+                gpu.l2_bandwidth_gbs
+            } else {
+                // Exceeds cache — only first access is cold, rest hit cache partially
+                // Approximate: blend HBM (first pass) with L2 (reuse passes)
+                let first_pass_fraction = 1.0 / reuse_factor as f64;
+                first_pass_fraction * gpu.peak_bandwidth_gbs
+                    + (1.0 - first_pass_fraction) * gpu.l2_bandwidth_gbs
+            }
+        }
+    }
+}
+
+/// Classify a matmul's access pattern based on tile reuse.
+///
+/// For matmul C[M,N] = A[M,K] @ B[K,N] with tile sizes:
+///   A-tile reuse = N / tile_n (each A-tile is reused across N output columns)
+///   B-tile reuse = M / tile_m (each B-tile is reused across M output rows)
+pub fn matmul_access_pattern(m: u64, n: u64, tile_m: u64, tile_n: u64) -> AccessPattern {
+    let reuse = ((n / tile_n.max(1)) as u32).max((m / tile_m.max(1)) as u32).max(1);
+    AccessPattern::Reuse { reuse_factor: reuse }
+}
+
+// ---------------------------------------------------------------------------
+// Confidence indicators
+// ---------------------------------------------------------------------------
+
+/// Confidence level for a cost model prediction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostConfidence {
+    /// Well-characterized operation (matmul, softmax, layernorm, elementwise)
+    High,
+    /// Partially modeled (custom kernel, fusion chain, sparse)
+    Medium,
+    /// Unknown or highly variable (user-defined kernels, dynamic shapes)
+    Low,
+}
+
+/// Classify confidence for a named operation.
+pub fn op_confidence(op_name: &str) -> CostConfidence {
+    match op_name {
+        "matmul" | "batched_matmul" | "softmax" | "layernorm" | "rmsnorm"
+        | "elementwise" | "relu" | "gelu" | "sigmoid" | "add" | "mul"
+        | "embedding" | "transpose" | "concat" | "reduction" => CostConfidence::High,
+        "flash_attention" | "conv2d" | "sparse_matmul" | "fused_chain" => CostConfidence::Medium,
+        _ => CostConfidence::Low,
+    }
 }
 
 /// Estimate wall-clock time in microseconds for an operation on a target GPU.
@@ -516,7 +646,7 @@ mod tests {
     #[test]
     fn test_softmax_cost() {
         let (flops, _, _) = softmax_cost(32, 2048, 2);
-        assert_eq!(flops, 5 * 32 * 2048);
+        assert_eq!(flops, 7 * 32 * 2048); // 7 FLOPs/element (stable softmax)
     }
 
     #[test]
@@ -805,5 +935,97 @@ mod tests {
                 "Time should increase: n={n}, time={time:.4}, prev={prev_time:.4}");
             prev_time = time;
         }
+    }
+
+    // ── Fusion memory traffic tests ──────────────────────────────────
+
+    #[test]
+    fn test_fused_bytes_eliminates_intermediates() {
+        // Chain: read 1024B → write 1024B → read 1024B → write 512B
+        let chain = vec![
+            FusionOpInfo { bytes_read: 1024, bytes_written: 1024 },
+            FusionOpInfo { bytes_read: 1024, bytes_written: 512 },
+        ];
+
+        let fused = estimate_fused_bytes(&chain);
+        let unfused: u64 = chain.iter().map(|op| op.bytes_read + op.bytes_written).sum();
+
+        // Fused: first read (1024) + last write (512) = 1536
+        assert_eq!(fused, 1536);
+        // Unfused: 1024+1024 + 1024+512 = 3584
+        assert_eq!(unfused, 3584);
+        assert!(fused < unfused, "fused traffic should be less");
+    }
+
+    #[test]
+    fn test_fusion_memory_savings() {
+        let chain = vec![
+            FusionOpInfo { bytes_read: 4096, bytes_written: 4096 },
+            FusionOpInfo { bytes_read: 4096, bytes_written: 4096 },
+            FusionOpInfo { bytes_read: 4096, bytes_written: 4096 },
+        ];
+
+        let savings = fusion_memory_savings(&chain);
+        // Unfused: 3 * (4096 + 4096) = 24576
+        // Fused: 4096 + 4096 = 8192
+        // Savings: 1 - 8192/24576 = 0.667
+        assert!((savings - 0.667).abs() < 0.01,
+            "3-op chain should save ~67%, got {savings:.3}");
+    }
+
+    #[test]
+    fn test_fusion_savings_empty_chain() {
+        assert_eq!(fusion_memory_savings(&[]), 0.0);
+    }
+
+    // ── Effective bandwidth tests ────────────────────────────────────
+
+    #[test]
+    fn test_effective_bandwidth_streaming() {
+        let gpu = gpu_specs::find_gpu("H100-SXM").unwrap();
+        let bw = effective_bandwidth_gbs(100 * 1024 * 1024, AccessPattern::Streaming, gpu);
+        // HBM tier for 100MB
+        assert!((bw - gpu.peak_bandwidth_gbs).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_effective_bandwidth_reuse_in_l2() {
+        let gpu = gpu_specs::find_gpu("H100-SXM").unwrap();
+        // 10MB data with reuse — fits in L2 (50MB)
+        let bw = effective_bandwidth_gbs(10 * 1024 * 1024, AccessPattern::Reuse { reuse_factor: 4 }, gpu);
+        // Should get L2 bandwidth (faster than HBM)
+        assert!(bw > gpu.peak_bandwidth_gbs,
+            "L2 BW ({bw}) should be > HBM BW ({})", gpu.peak_bandwidth_gbs);
+    }
+
+    #[test]
+    fn test_effective_bandwidth_reuse_exceeds_cache() {
+        let gpu = gpu_specs::find_gpu("H100-SXM").unwrap();
+        // 200MB data with reuse — exceeds L2 (50MB)
+        let bw = effective_bandwidth_gbs(200 * 1024 * 1024, AccessPattern::Reuse { reuse_factor: 4 }, gpu);
+        // Should be a blend of HBM + L2 (better than pure HBM)
+        assert!(bw > gpu.peak_bandwidth_gbs,
+            "Blended BW ({bw}) should be > pure HBM ({})", gpu.peak_bandwidth_gbs);
+    }
+
+    #[test]
+    fn test_matmul_access_pattern() {
+        let pattern = matmul_access_pattern(1024, 1024, 64, 64);
+        match pattern {
+            AccessPattern::Reuse { reuse_factor } => {
+                assert_eq!(reuse_factor, 16, "1024/64 = 16x reuse");
+            }
+            _ => panic!("matmul should have Reuse pattern"),
+        }
+    }
+
+    // ── Confidence tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_op_confidence() {
+        assert_eq!(op_confidence("matmul"), CostConfidence::High);
+        assert_eq!(op_confidence("softmax"), CostConfidence::High);
+        assert_eq!(op_confidence("flash_attention"), CostConfidence::Medium);
+        assert_eq!(op_confidence("my_custom_kernel"), CostConfidence::Low);
     }
 }
