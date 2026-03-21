@@ -193,9 +193,21 @@ pub struct SlabPlan {
     pub assignments: HashMap<TensorAllocId, (u32, u64)>,
     /// Naive allocation total (sum of all planned tensor sizes) for savings report.
     pub naive_total: u64,
+    /// Total alignment padding bytes (aligned_size - actual_size across all tensors).
+    pub padding_bytes: u64,
 }
 
 impl SlabPlan {
+    /// Fragmentation ratio: padding_bytes / total_bytes.
+    /// 0.0 means no wasted alignment padding; higher = more fragmentation.
+    pub fn fragmentation_ratio(&self) -> f64 {
+        if self.total_bytes == 0 {
+            0.0
+        } else {
+            self.padding_bytes as f64 / self.total_bytes as f64
+        }
+    }
+
     /// Memory savings as a fraction (0.0 to 1.0).
     pub fn savings_fraction(&self) -> f64 {
         if self.naive_total == 0 {
@@ -208,10 +220,16 @@ impl SlabPlan {
 /// GPU alignment for slab offsets (256 bytes).
 const SLAB_ALIGNMENT: u64 = 256;
 
-/// Assign tensors to memory slots using first-fit-decreasing.
+/// Assign tensors to memory slots using best-fit-decreasing (BFD).
+///
+/// For each tensor (sorted by size descending), scans ALL existing non-conflicting
+/// slots and picks the one with minimum wasted space (smallest slot that fits).
+/// This produces tighter packing than first-fit-decreasing (FFD) by avoiding
+/// placing small tensors into large slots when a closer-fitting slot exists.
+///
 /// Tensors with SizeKind::Dynamic are skipped.
 pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> SlabPlan {
-    // Sort tensor IDs by size (largest first) for first-fit-decreasing
+    // Sort tensor IDs by size (largest first) for decreasing order
     let mut sorted: Vec<TensorAllocId> = allocs
         .iter()
         .filter(|a| a.is_plannable())
@@ -230,32 +248,50 @@ pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> Sl
 
     let mut slots: Vec<MemorySlot> = Vec::new();
     let mut assignments = HashMap::new();
+    let mut total_padding: u64 = 0;
 
     for &tensor_id in &sorted {
         let tensor = &allocs[tensor_id as usize];
-        let mut assigned = false;
+        let aligned_size = align_up(tensor.size_bytes, SLAB_ALIGNMENT);
+        total_padding += aligned_size - tensor.size_bytes;
 
-        for slot in &mut slots {
+        // Best-fit: scan ALL non-conflicting slots, pick smallest that fits
+        let mut best_slot_idx: Option<usize> = None;
+        let mut best_waste: u64 = u64::MAX;
+
+        for (idx, slot) in slots.iter().enumerate() {
             let conflicts = slot
                 .assigned
                 .iter()
                 .any(|&other_id| interference.interferes(tensor_id, other_id));
-            if !conflicts {
-                slot.size = slot.size.max(tensor.size_bytes);
-                slot.assigned.push(tensor_id);
-                assigned = true;
-                break;
+            if conflicts {
+                continue;
+            }
+
+            // Slot must be at least as big as the tensor (slot.size is already the max
+            // of all occupants, and we'll take the max again below)
+            let slot_size_after = slot.size.max(tensor.size_bytes);
+            let waste = slot_size_after - tensor.size_bytes;
+            if waste < best_waste {
+                best_waste = waste;
+                best_slot_idx = Some(idx);
             }
         }
 
-        if !assigned {
-            let slot_id = slots.len() as u32;
-            slots.push(MemorySlot {
-                id: slot_id,
-                offset: 0, // computed after all assignments
-                size: tensor.size_bytes,
-                assigned: vec![tensor_id],
-            });
+        match best_slot_idx {
+            Some(idx) => {
+                slots[idx].size = slots[idx].size.max(tensor.size_bytes);
+                slots[idx].assigned.push(tensor_id);
+            }
+            None => {
+                let slot_id = slots.len() as u32;
+                slots.push(MemorySlot {
+                    id: slot_id,
+                    offset: 0,
+                    size: tensor.size_bytes,
+                    assigned: vec![tensor_id],
+                });
+            }
         }
     }
 
@@ -274,6 +310,7 @@ pub fn plan_slab(allocs: &[TensorAlloc], interference: &InterferenceGraph) -> Sl
         slots,
         assignments,
         naive_total,
+        padding_bytes: total_padding,
     }
 }
 
@@ -675,7 +712,7 @@ mod tests {
     #[test]
     fn test_savings_fraction_zero_allocs() {
         let plan = SlabPlan {
-            slots: vec![], total_bytes: 0, assignments: HashMap::new(), naive_total: 0,
+            slots: vec![], total_bytes: 0, assignments: HashMap::new(), naive_total: 0, padding_bytes: 0,
         };
         assert_eq!(plan.savings_fraction(), 0.0);
     }
@@ -683,7 +720,7 @@ mod tests {
     #[test]
     fn test_check_vram_budget_passes() {
         let plan = SlabPlan {
-            slots: vec![], total_bytes: 1024, assignments: HashMap::new(), naive_total: 2048,
+            slots: vec![], total_bytes: 1024, assignments: HashMap::new(), naive_total: 2048, padding_bytes: 0,
         };
         assert!(check_vram_budget(&plan, 2048).is_none());
     }
@@ -691,10 +728,106 @@ mod tests {
     #[test]
     fn test_check_vram_budget_fails() {
         let plan = SlabPlan {
-            slots: vec![], total_bytes: 4096, assignments: HashMap::new(), naive_total: 4096,
+            slots: vec![], total_bytes: 4096, assignments: HashMap::new(), naive_total: 4096, padding_bytes: 0,
         };
         let err = check_vram_budget(&plan, 2048);
         assert!(err.is_some());
         assert!(err.unwrap().contains("exceeds VRAM budget"));
+    }
+
+    // ── Best-fit-decreasing tests ─────────────────────────────────────
+
+    #[test]
+    fn test_bfd_prefers_tighter_slot() {
+        // Scenario: slot A (1000 bytes), slot B (600 bytes) both available.
+        // New tensor of 580 bytes should go to slot B (waste=20) not slot A (waste=420).
+        //
+        // Setup: 3 tensors, first two occupy separate slots (overlapping lifetimes),
+        // third has non-overlapping lifetime with both and should pick the smaller slot.
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "big".into(), size_bytes: 1000, birth: 0, death: 5,
+                source_loc: String::new(), size_kind: SizeKind::Static(1000),
+            },
+            TensorAlloc {
+                id: 1, name: "medium".into(), size_bytes: 600, birth: 0, death: 5,
+                source_loc: String::new(), size_kind: SizeKind::Static(600),
+            },
+            TensorAlloc {
+                id: 2, name: "fits_medium".into(), size_bytes: 580, birth: 6, death: 10,
+                source_loc: String::new(), size_kind: SizeKind::Static(580),
+            },
+        ];
+
+        let ig = InterferenceGraph::build(&allocs);
+        let plan = plan_slab(&allocs, &ig);
+
+        // Tensor 2 should share a slot with tensor 1 (600, waste=20)
+        // not tensor 0 (1000, waste=420)
+        let (slot_t1, _) = plan.assignments[&1];
+        let (slot_t2, _) = plan.assignments[&2];
+        assert_eq!(slot_t2, slot_t1,
+            "BFD should assign 580-byte tensor to 600-byte slot, not 1000-byte slot");
+
+        // Only 2 slots needed (1000 + 600)
+        assert_eq!(plan.slots.len(), 2);
+    }
+
+    #[test]
+    fn test_bfd_reuses_slot_for_non_overlapping() {
+        // Two tensors with non-overlapping lifetimes should share one slot
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 5,
+                source_loc: String::new(), size_kind: SizeKind::Static(1024),
+            },
+            TensorAlloc {
+                id: 1, name: "b".into(), size_bytes: 512, birth: 6, death: 10,
+                source_loc: String::new(), size_kind: SizeKind::Static(512),
+            },
+        ];
+
+        let ig = InterferenceGraph::build(&allocs);
+        let plan = plan_slab(&allocs, &ig);
+
+        assert_eq!(plan.slots.len(), 1, "non-overlapping tensors should share 1 slot");
+        assert_eq!(plan.total_bytes, 1024, "slot size = max(1024, 512)");
+    }
+
+    #[test]
+    fn test_fragmentation_zero_for_aligned_sizes() {
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "aligned".into(), size_bytes: 256, birth: 0, death: 5,
+                source_loc: String::new(), size_kind: SizeKind::Static(256),
+            },
+            TensorAlloc {
+                id: 1, name: "aligned2".into(), size_bytes: 512, birth: 0, death: 5,
+                source_loc: String::new(), size_kind: SizeKind::Static(512),
+            },
+        ];
+
+        let ig = InterferenceGraph::build(&allocs);
+        let plan = plan_slab(&allocs, &ig);
+
+        assert_eq!(plan.padding_bytes, 0, "aligned sizes should have zero padding");
+        assert!((plan.fragmentation_ratio() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_fragmentation_nonzero_for_unaligned_sizes() {
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "unaligned".into(), size_bytes: 100, birth: 0, death: 5,
+                source_loc: String::new(), size_kind: SizeKind::Static(100),
+            },
+        ];
+
+        let ig = InterferenceGraph::build(&allocs);
+        let plan = plan_slab(&allocs, &ig);
+
+        // 100 bytes -> 256 aligned, padding = 156
+        assert_eq!(plan.padding_bytes, 156);
+        assert!(plan.fragmentation_ratio() > 0.5);
     }
 }
