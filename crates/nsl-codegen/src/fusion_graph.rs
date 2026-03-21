@@ -36,6 +36,13 @@ pub struct FusionNode {
     /// Scalar constant value, if this node represents a compile-time f32 constant.
     /// Set by the frontend when it lowers a literal into the fusion graph.
     pub const_value: Option<f32>,
+    /// Estimated FLOPs for this node (0 for inputs, views).
+    /// Populated by cost model analysis for profitability-guided fusion.
+    pub flops: f64,
+    /// Estimated bytes read from HBM for this operation.
+    pub bytes_read: u64,
+    /// Estimated bytes written to HBM.
+    pub bytes_written: u64,
 }
 
 /// The fusion analysis DAG for a single function.
@@ -74,6 +81,9 @@ impl FusionGraph {
             dtype: None,
             no_fuse: false,
             const_value: None,
+            flops: 0.0,
+            bytes_read: 0,
+            bytes_written: 0,
         });
         id
     }
@@ -108,6 +118,14 @@ impl FusionGraph {
         let node = &mut self.nodes[id as usize];
         node.shape = Some(shape);
         node.dtype = Some(dtype);
+    }
+
+    /// Set cost model annotations on a node (FLOPs and memory traffic).
+    pub fn set_cost_info(&mut self, id: NodeId, flops: f64, bytes_read: u64, bytes_written: u64) {
+        let node = &mut self.nodes[id as usize];
+        node.flops = flops;
+        node.bytes_read = bytes_read;
+        node.bytes_written = bytes_written;
     }
 
     /// Build consumer back-links from input forward-links.

@@ -332,6 +332,133 @@ pub fn fusion_memory_savings(chain: &[FusionOpInfo]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Fusion profitability analysis
+// ---------------------------------------------------------------------------
+
+/// Default threshold: fusion must improve arithmetic intensity by at least 10%.
+pub const FUSION_AI_THRESHOLD: f64 = 0.10;
+
+/// Maximum register pressure for a fused kernel before rejection (leaves headroom).
+pub const MAX_FUSED_REGISTERS: u32 = 200;
+
+/// Epilogue-specific register limit (epilogue chains use %f registers).
+pub const MAX_EPILOGUE_REGISTERS: u32 = 30;
+
+/// Result of fusion profitability analysis.
+#[derive(Debug, Clone)]
+pub struct FusionBenefit {
+    /// Total memory traffic without fusion (each op reads/writes to HBM).
+    pub unfused_bytes: u64,
+    /// Total memory traffic with fusion (intermediates eliminated).
+    pub fused_bytes: u64,
+    /// Total FLOPs (same fused or unfused).
+    pub total_flops: f64,
+    /// (fused_ai - unfused_ai) / unfused_ai — positive means fusion helps.
+    pub ai_improvement: f64,
+    /// Whether fusion meets the profitability threshold.
+    pub profitable: bool,
+}
+
+/// Op descriptor for fusion profitability analysis.
+#[derive(Debug, Clone)]
+pub struct FusionOpDesc {
+    pub flops: f64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    /// Estimated register consumption: output registers + scratch registers.
+    pub output_regs: u32,
+    pub temp_regs: u32,
+}
+
+/// Estimate whether fusing a chain of ops improves performance.
+///
+/// Computes arithmetic intensity (FLOP/byte) for unfused vs fused variants.
+/// Fusion eliminates intermediate HBM traffic: only first read + last write.
+pub fn estimate_fusion_benefit(ops: &[FusionOpDesc], threshold: f64) -> FusionBenefit {
+    if ops.is_empty() {
+        return FusionBenefit {
+            unfused_bytes: 0, fused_bytes: 0, total_flops: 0.0,
+            ai_improvement: 0.0, profitable: false,
+        };
+    }
+
+    let unfused_bytes: u64 = ops.iter().map(|op| op.bytes_read + op.bytes_written).sum();
+    let fused_bytes = ops[0].bytes_read + ops[ops.len() - 1].bytes_written;
+    let total_flops: f64 = ops.iter().map(|op| op.flops).sum();
+
+    let unfused_ai = if unfused_bytes > 0 { total_flops / unfused_bytes as f64 } else { 0.0 };
+    let fused_ai = if fused_bytes > 0 { total_flops / fused_bytes as f64 } else { 0.0 };
+    let ai_improvement = if unfused_ai > 0.0 {
+        (fused_ai - unfused_ai) / unfused_ai
+    } else {
+        // Zero FLOPs (e.g., reshape chain) — allow fusion (it's free)
+        0.0
+    };
+
+    // Zero-FLOP chains (reshape, transpose) are always "profitable" (free to fuse)
+    let profitable = total_flops == 0.0 || ai_improvement >= threshold;
+
+    FusionBenefit {
+        unfused_bytes, fused_bytes, total_flops,
+        ai_improvement, profitable,
+    }
+}
+
+/// Register pressure estimate for a fused kernel.
+#[derive(Debug, Clone)]
+pub struct RegisterBudget {
+    /// Peak live register count during the fused execution.
+    pub peak_regs: u32,
+    /// Maximum allowed registers (hardware limit with headroom).
+    pub max_allowed: u32,
+    /// Whether the budget is exceeded.
+    pub exceeded: bool,
+}
+
+/// Estimate peak register pressure for a fused chain.
+///
+/// Each op's output registers stay live until consumed by the next op.
+/// Temp (scratch) registers are freed after each op completes.
+pub fn estimate_register_pressure(ops: &[FusionOpDesc], max_allowed: u32) -> RegisterBudget {
+    let mut live_regs: u32 = 0;
+    let mut peak_regs: u32 = 0;
+
+    for op in ops {
+        live_regs += op.output_regs;
+        live_regs += op.temp_regs;
+        peak_regs = peak_regs.max(live_regs);
+        live_regs = live_regs.saturating_sub(op.temp_regs);
+    }
+
+    RegisterBudget {
+        peak_regs,
+        max_allowed,
+        exceeded: peak_regs > max_allowed,
+    }
+}
+
+/// Combined profitability + register check: should this chain be fused?
+///
+/// Returns true if fusion is both profitable (AI improvement ≥ threshold)
+/// and fits within the register budget.
+/// `force_fuse` overrides the profitability check (for @fuse annotation).
+pub fn should_fuse(
+    ops: &[FusionOpDesc],
+    force_fuse: bool,
+    max_regs: u32,
+) -> bool {
+    if ops.len() < 2 { return false; }
+
+    let regs = estimate_register_pressure(ops, max_regs);
+    if regs.exceeded && !force_fuse { return false; }
+
+    if force_fuse { return true; }
+
+    let benefit = estimate_fusion_benefit(ops, FUSION_AI_THRESHOLD);
+    benefit.profitable
+}
+
+// ---------------------------------------------------------------------------
 // Effective bandwidth under cache reuse
 // ---------------------------------------------------------------------------
 
@@ -1027,5 +1154,94 @@ mod tests {
         assert_eq!(op_confidence("softmax"), CostConfidence::High);
         assert_eq!(op_confidence("flash_attention"), CostConfidence::Medium);
         assert_eq!(op_confidence("my_custom_kernel"), CostConfidence::Low);
+    }
+
+    // ── Fusion profitability tests ───────────────────────────────────
+
+    #[test]
+    fn test_fusion_benefit_add_relu() {
+        // add + relu on [1024, 1024] f32 tensor
+        // add: reads 2 inputs (8MB), writes 4MB
+        // relu: reads 4MB, writes 4MB
+        // Unfused: 8 + 4 + 4 + 4 = 20MB
+        // Fused: 8 + 4 = 12MB (40% reduction)
+        let ops = vec![
+            FusionOpDesc { flops: 1024.0 * 1024.0, bytes_read: 8 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
+            FusionOpDesc { flops: 1024.0 * 1024.0, bytes_read: 4 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
+        ];
+
+        let benefit = estimate_fusion_benefit(&ops, FUSION_AI_THRESHOLD);
+        assert!(benefit.profitable, "add+relu should be profitable (40% traffic reduction)");
+        assert!(benefit.ai_improvement > 0.3, "AI improvement should be >30%, got {:.2}", benefit.ai_improvement);
+        assert_eq!(benefit.fused_bytes, 12 * 1024 * 1024);
+        assert_eq!(benefit.unfused_bytes, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_fusion_benefit_zero_flops_always_profitable() {
+        // Two reshapes (0 FLOPs) — fusion is free
+        let ops = vec![
+            FusionOpDesc { flops: 0.0, bytes_read: 4096, bytes_written: 4096, output_regs: 0, temp_regs: 0 },
+            FusionOpDesc { flops: 0.0, bytes_read: 4096, bytes_written: 4096, output_regs: 0, temp_regs: 0 },
+        ];
+
+        let benefit = estimate_fusion_benefit(&ops, FUSION_AI_THRESHOLD);
+        assert!(benefit.profitable, "zero-FLOP chains should always be profitable");
+    }
+
+    #[test]
+    fn test_register_pressure_small_chain() {
+        let ops = vec![
+            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 2, temp_regs: 1 },
+            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 2, temp_regs: 1 },
+        ];
+
+        let budget = estimate_register_pressure(&ops, MAX_FUSED_REGISTERS);
+        assert!(!budget.exceeded, "2-op chain should fit in register budget");
+        assert!(budget.peak_regs <= 10, "peak should be small: {}", budget.peak_regs);
+    }
+
+    #[test]
+    fn test_register_pressure_exceeds_budget() {
+        // 50 ops each using 5 output regs
+        let ops: Vec<FusionOpDesc> = (0..50).map(|_| {
+            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 5, temp_regs: 2 }
+        }).collect();
+
+        let budget = estimate_register_pressure(&ops, MAX_FUSED_REGISTERS);
+        assert!(budget.exceeded, "50-op chain with 5 regs each should exceed budget");
+    }
+
+    #[test]
+    fn test_should_fuse_combined() {
+        let ops = vec![
+            FusionOpDesc { flops: 1e6, bytes_read: 4 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
+            FusionOpDesc { flops: 1e6, bytes_read: 4 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
+        ];
+
+        assert!(should_fuse(&ops, false, MAX_FUSED_REGISTERS),
+            "2-op chain with good AI improvement should fuse");
+    }
+
+    #[test]
+    fn test_should_fuse_force_overrides() {
+        // Single op — normally wouldn't fuse
+        let ops = vec![
+            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 1, temp_regs: 0 },
+        ];
+
+        assert!(!should_fuse(&ops, false, MAX_FUSED_REGISTERS), "single op shouldn't fuse");
+        // But @fuse still doesn't fuse a single op (need ≥2)
+        assert!(!should_fuse(&ops, true, MAX_FUSED_REGISTERS), "even @fuse needs ≥2 ops");
+    }
+
+    #[test]
+    fn test_should_fuse_rejects_register_overload() {
+        let ops: Vec<FusionOpDesc> = (0..100).map(|_| {
+            FusionOpDesc { flops: 1e6, bytes_read: 1024, bytes_written: 1024, output_regs: 3, temp_regs: 1 }
+        }).collect();
+
+        assert!(!should_fuse(&ops, false, MAX_FUSED_REGISTERS),
+            "100-op chain should exceed register budget");
     }
 }
