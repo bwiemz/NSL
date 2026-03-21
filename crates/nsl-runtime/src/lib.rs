@@ -71,6 +71,7 @@ pub mod gpu_backend;
 pub mod vmap_runtime;
 pub mod backward_context;
 pub mod pipeline;
+pub mod data;
 pub mod zero;
 pub mod tensor_trace;
 pub mod trace_diff;
