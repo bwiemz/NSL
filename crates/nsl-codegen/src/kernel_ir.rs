@@ -231,6 +231,11 @@ impl KirBuilder {
         id
     }
 
+    /// Look up the type of a VarId, if recorded.
+    pub fn var_type(&self, id: VarId) -> Option<KirType> {
+        self.var_types.get(&id).cloned()
+    }
+
     pub fn add_param(&mut self, name: &str, ty: KirType, address_space: AddressSpace) -> VarId {
         let id = self.new_var();
         self.var_types.insert(id, ty.clone());
