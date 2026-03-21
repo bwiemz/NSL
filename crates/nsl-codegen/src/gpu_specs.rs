@@ -88,6 +88,18 @@ impl GpuSpec {
         self.sm_version >= 90
     }
 
+    /// Returns true if the GPU supports MXFP8 per-block scaling with E8M0 scales.
+    /// Requires sm_100 (Blackwell B100/B200) or later.
+    pub fn supports_mxfp8(&self) -> bool {
+        self.sm_version >= 100
+    }
+
+    /// Returns true if the GPU supports NVFP4 (E2M1) tensor core operations.
+    /// Requires sm_100 (Blackwell B100/B200) or later.
+    pub fn supports_fp4(&self) -> bool {
+        self.sm_version >= 100
+    }
+
     /// Returns the appropriate PTX version string for this GPU's features.
     pub fn ptx_version(&self) -> &'static str {
         if self.sm_version >= 90 { "8.0" }
@@ -203,6 +215,28 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.35, l2_cache_bytes: 2 * 1024 * 1024,
         l1_cache_kb: 128, l1_bandwidth_gbs: 1600.0, l2_bandwidth_gbs: 400.0,
         max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 8,
+    },
+    // NVIDIA B200 (Blackwell, sm_100) — MXFP8 per-block scaling + NVFP4
+    GpuSpec {
+        name: "B200", sm_version: 100,
+        peak_fp16_tflops: 2250.0, peak_fp8_tflops: 4500.0, peak_fp32_tflops: 70.0,
+        peak_bandwidth_gbs: 8000.0, vram_gb: 192.0, l2_cache_mb: 128.0,
+        crossover_fp16: 281.3, crossover_fp8: 562.5, crossover_fp32: 8.75,
+        base_clock_mhz: 1800, kernel_launch_overhead_ns: 3000, sync_overhead_ns: 1200,
+        pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.6, l2_cache_bytes: 128 * 1024 * 1024,
+        l1_cache_kb: 256, l1_bandwidth_gbs: 25600.0, l2_bandwidth_gbs: 12000.0,
+        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 160,
+    },
+    // NVIDIA B100 (Blackwell, sm_100) — MXFP8 + NVFP4 (PCIe variant)
+    GpuSpec {
+        name: "B100", sm_version: 100,
+        peak_fp16_tflops: 1750.0, peak_fp8_tflops: 3500.0, peak_fp32_tflops: 56.0,
+        peak_bandwidth_gbs: 6400.0, vram_gb: 192.0, l2_cache_mb: 96.0,
+        crossover_fp16: 273.4, crossover_fp8: 546.9, crossover_fp32: 8.75,
+        base_clock_mhz: 1600, kernel_launch_overhead_ns: 3500, sync_overhead_ns: 1500,
+        pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.55, l2_cache_bytes: 96 * 1024 * 1024,
+        l1_cache_kb: 256, l1_bandwidth_gbs: 20000.0, l2_bandwidth_gbs: 10000.0,
+        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 128,
     },
 ];
 
