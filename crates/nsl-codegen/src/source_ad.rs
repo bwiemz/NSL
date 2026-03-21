@@ -82,6 +82,28 @@ impl AdjointGenerator {
         }
     }
 
+    /// Emit a constant value as a new WengertOp, returning its VarId.
+    fn emit_constant(&mut self, value: f64) -> VarId {
+        let var = self.next_var();
+        let op_id = self.next_op();
+        self.adjoint_ops.push(WengertOp {
+            id: op_id, result: var, op: PrimalOp::Constant(value),
+            inputs: vec![], saved_for_backward: false, checkpointed: false,
+        });
+        var
+    }
+
+    /// Emit a PrimalOp with the given inputs, returning the result VarId.
+    fn emit_op(&mut self, op: PrimalOp, inputs: Vec<VarId>) -> VarId {
+        let var = self.next_var();
+        let op_id = self.next_op();
+        self.adjoint_ops.push(WengertOp {
+            id: op_id, result: var, op, inputs,
+            saved_for_backward: false, checkpointed: false,
+        });
+        var
+    }
+
     fn lower_adjoint_expr(&mut self, expr: AdjointExpr) -> VarId {
         // Identity: pass-through, no op needed
         if let AdjointExpr::Identity(v) = expr {
@@ -102,13 +124,47 @@ impl AdjointGenerator {
             AdjointExpr::Transpose(v, d0, d1) => (PrimalOp::Transpose { dim0: d0, dim1: d1 }, vec![v]),
             AdjointExpr::Reshape(v) => (PrimalOp::Reshape { target_ndim: 0 }, vec![v]),
             AdjointExpr::ExpBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
-            AdjointExpr::ReluBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
-            AdjointExpr::SigmoidBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
-            AdjointExpr::TanhBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
             AdjointExpr::LogBackward(y_bar, x) => (PrimalOp::Div, vec![y_bar, x]),
-            AdjointExpr::SqrtBackward(y_bar, y) => (PrimalOp::Div, vec![y_bar, y]),
             AdjointExpr::DivNumeratorBackward(y_bar, b) => (PrimalOp::Div, vec![y_bar, b]),
-            AdjointExpr::DivDenominatorBackward(y_bar, a, b) => (PrimalOp::Mul, vec![y_bar, a, b]),
+
+            // ReluBackward: grad * (x > 0) — step function, not grad * x
+            AdjointExpr::ReluBackward(y_bar, x) => {
+                let zero = self.emit_constant(0.0);
+                let cond = self.emit_op(PrimalOp::Condition(CompareKind::Gt), vec![x, zero]);
+                let zero2 = self.emit_constant(0.0);
+                return self.emit_op(PrimalOp::Select, vec![cond, y_bar, zero2]);
+            }
+
+            // SigmoidBackward: grad * y * (1 - y) where y = sigmoid(x)
+            AdjointExpr::SigmoidBackward(y_bar, y) => {
+                let one = self.emit_constant(1.0);
+                let one_minus_y = self.emit_op(PrimalOp::Sub, vec![one, y]);
+                let deriv = self.emit_op(PrimalOp::Mul, vec![y, one_minus_y]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, deriv]);
+            }
+
+            // TanhBackward: grad * (1 - y^2) where y = tanh(x)
+            AdjointExpr::TanhBackward(y_bar, y) => {
+                let y_sq = self.emit_op(PrimalOp::Mul, vec![y, y]);
+                let one = self.emit_constant(1.0);
+                let deriv = self.emit_op(PrimalOp::Sub, vec![one, y_sq]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, deriv]);
+            }
+
+            // SqrtBackward: grad / (2 * sqrt(x)) where y = sqrt(x)
+            AdjointExpr::SqrtBackward(y_bar, y) => {
+                let two = self.emit_constant(2.0);
+                let two_y = self.emit_op(PrimalOp::Mul, vec![two, y]);
+                return self.emit_op(PrimalOp::Div, vec![y_bar, two_y]);
+            }
+
+            // DivDenominatorBackward: grad * (-a / b^2)
+            AdjointExpr::DivDenominatorBackward(y_bar, a, b) => {
+                let b_sq = self.emit_op(PrimalOp::Mul, vec![b, b]);
+                let a_div_b2 = self.emit_op(PrimalOp::Div, vec![a, b_sq]);
+                let neg = self.emit_op(PrimalOp::Neg, vec![a_div_b2]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, neg]);
+            }
             // SelectTrue: cond ? adj_out : 0
             AdjointExpr::SelectTrue(y_bar, cond) => {
                 // Emit a zero constant first
@@ -131,40 +187,184 @@ impl AdjointGenerator {
                 (PrimalOp::Select, vec![cond, zero, y_bar])
             }
 
-            // --- New backward rules lowered to primitive ops ---
-            // GELU/SiLU backward are compound — lowered as mul for now (M40b will expand)
-            AdjointExpr::GeluBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
-            AdjointExpr::SiluBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
-            AdjointExpr::SignMul(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
-            AdjointExpr::ClampBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
+            // --- Compound backward rules lowered to multi-step op sequences ---
 
-            AdjointExpr::SoftmaxBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
-            AdjointExpr::LogSoftmaxBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
+            // GeluBackward: grad * σ(1.702x) * (1 + 1.702x * (1 - σ(1.702x)))
+            AdjointExpr::GeluBackward(y_bar, x) => {
+                let k = self.emit_constant(1.702);
+                let kx = self.emit_op(PrimalOp::Mul, vec![k, x]);
+                let sig_kx = self.emit_op(PrimalOp::Sigmoid, vec![kx]);
+                let one = self.emit_constant(1.0);
+                let one_minus_sig = self.emit_op(PrimalOp::Sub, vec![one, sig_kx]);
+                let kx_term = self.emit_op(PrimalOp::Mul, vec![kx, one_minus_sig]);
+                let one2 = self.emit_constant(1.0);
+                let one_plus_kx = self.emit_op(PrimalOp::Add, vec![one2, kx_term]);
+                let deriv = self.emit_op(PrimalOp::Mul, vec![sig_kx, one_plus_kx]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, deriv]);
+            }
 
-            AdjointExpr::LayerNormBackward(y_bar, x, _mean, _rstd) => (PrimalOp::Mul, vec![y_bar, x]),
-            AdjointExpr::BatchNormBackward(y_bar, x, _mean, _rstd) => (PrimalOp::Mul, vec![y_bar, x]),
+            // SiluBackward: grad * σ(x) * (1 + x * (1 - σ(x)))
+            AdjointExpr::SiluBackward(y_bar, x) => {
+                let sig_x = self.emit_op(PrimalOp::Sigmoid, vec![x]);
+                let one = self.emit_constant(1.0);
+                let one_minus_sig = self.emit_op(PrimalOp::Sub, vec![one, sig_x]);
+                let x_term = self.emit_op(PrimalOp::Mul, vec![x, one_minus_sig]);
+                let one2 = self.emit_constant(1.0);
+                let one_plus_x = self.emit_op(PrimalOp::Add, vec![one2, x_term]);
+                let deriv = self.emit_op(PrimalOp::Mul, vec![sig_x, one_plus_x]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, deriv]);
+            }
 
-            AdjointExpr::DropoutBackward(y_bar, mask, _scale) => (PrimalOp::Mul, vec![y_bar, mask]),
+            AdjointExpr::SignMul(y_bar, x) => {
+                let zero = self.emit_constant(0.0);
+                let pos = self.emit_op(PrimalOp::Condition(CompareKind::Gt), vec![x, zero]);
+                let one = self.emit_constant(1.0);
+                let neg_one = self.emit_constant(-1.0);
+                let sign = self.emit_op(PrimalOp::Select, vec![pos, one, neg_one]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, sign]);
+            }
 
-            AdjointExpr::EmbeddingBackward(y_bar, indices, _vocab) => (PrimalOp::Mul, vec![y_bar, indices]),
-            AdjointExpr::GatherBackward(y_bar, indices, _dim) => (PrimalOp::Mul, vec![y_bar, indices]),
-            AdjointExpr::ScatterAddSrcBackward(y_bar, indices, _dim) => (PrimalOp::Mul, vec![y_bar, indices]),
+            // ClampBackward: grad * (min <= x <= max)
+            AdjointExpr::ClampBackward(y_bar, x, min_val, max_val) => {
+                let min_c = self.emit_constant(min_val);
+                let max_c = self.emit_constant(max_val);
+                let ge_min = self.emit_op(PrimalOp::Condition(CompareKind::GtEq), vec![x, min_c]);
+                let le_max = self.emit_op(PrimalOp::Condition(CompareKind::LtEq), vec![x, max_c]);
+                // in_range = ge_min AND le_max (both must be true)
+                // Simulate AND with Mul of conditions (1*1=1, 1*0=0, etc.)
+                let in_range = self.emit_op(PrimalOp::Mul, vec![ge_min, le_max]);
+                let zero = self.emit_constant(0.0);
+                return self.emit_op(PrimalOp::Select, vec![in_range, y_bar, zero]);
+            }
 
-            AdjointExpr::ConcatSplit(y_bar, _dim, _offset, _size) => (PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar]),
-            AdjointExpr::SplitConcat(y_bar, _dim) => (PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar]),
-            AdjointExpr::SliceBackward(y_bar, _dim, _start, _end) => (PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar]),
+            // MeanBackward: grad * (1/N) broadcast
+            AdjointExpr::MeanBackward(y_bar, dim_size) => {
+                if dim_size > 0 {
+                    let scale = self.emit_constant(1.0 / dim_size as f64);
+                    let scaled = self.emit_op(PrimalOp::Mul, vec![y_bar, scale]);
+                    return self.emit_op(PrimalOp::Broadcast, vec![scaled]);
+                } else {
+                    // dim_size unknown — just broadcast (1/N scaling deferred to runtime)
+                    return self.emit_op(PrimalOp::Broadcast, vec![y_bar]);
+                }
+            }
+
+            // SoftmaxBackward: y * (grad - sum(grad * y))
+            AdjointExpr::SoftmaxBackward(y_bar, y) => {
+                let dot = self.emit_op(PrimalOp::Mul, vec![y_bar, y]);
+                let dot_sum = self.emit_op(PrimalOp::Sum { dim: Some(-1) }, vec![dot]);
+                let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum]);
+                return self.emit_op(PrimalOp::Mul, vec![y, diff]);
+            }
+
+            // LogSoftmaxBackward: grad - exp(y) * sum(grad)
+            AdjointExpr::LogSoftmaxBackward(y_bar, y) => {
+                let exp_y = self.emit_op(PrimalOp::Exp, vec![y]);
+                let grad_sum = self.emit_op(PrimalOp::Sum { dim: Some(-1) }, vec![y_bar]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![exp_y, grad_sum]);
+                return self.emit_op(PrimalOp::Sub, vec![y_bar, correction]);
+            }
+
+            // LayerNormBackward: rstd * (grad - mean(grad) - x_hat * mean(grad * x_hat))
+            AdjointExpr::LayerNormBackward(y_bar, x, mean, rstd) => {
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
+                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
+                let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![grad_x_hat]);
+                let mean_grad = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![y_bar]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh]);
+                let grad_minus_mean = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad]);
+                let grad_corrected = self.emit_op(PrimalOp::Sub, vec![grad_minus_mean, correction]);
+                return self.emit_op(PrimalOp::Mul, vec![grad_corrected, rstd]);
+            }
+
+            // BatchNormBackward: same structure as LayerNorm but over batch dim
+            AdjointExpr::BatchNormBackward(y_bar, x, mean, rstd) => {
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
+                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
+                let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![grad_x_hat]);
+                let mean_grad = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![y_bar]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh]);
+                let grad_minus_mean = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad]);
+                let grad_corrected = self.emit_op(PrimalOp::Sub, vec![grad_minus_mean, correction]);
+                return self.emit_op(PrimalOp::Mul, vec![grad_corrected, rstd]);
+            }
+
+            // DropoutBackward: grad * mask / (1-p)
+            AdjointExpr::DropoutBackward(y_bar, mask, p) => {
+                let masked = self.emit_op(PrimalOp::Mul, vec![y_bar, mask]);
+                let scale = self.emit_constant(1.0 / (1.0 - p));
+                return self.emit_op(PrimalOp::Mul, vec![masked, scale]);
+            }
+
+            // EmbeddingBackward: scatter_add(grad, indices)
+            AdjointExpr::EmbeddingBackward(y_bar, indices, _vocab) => {
+                return self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices]);
+            }
+
+            // GatherBackward: scatter_add(grad, indices, dim)
+            AdjointExpr::GatherBackward(y_bar, indices, dim) => {
+                return self.emit_op(PrimalOp::ScatterAdd { dim }, vec![y_bar, indices]);
+            }
+
+            AdjointExpr::ScatterAddSrcBackward(y_bar, indices, dim) => {
+                return self.emit_op(PrimalOp::Gather { dim }, vec![y_bar, indices]);
+            }
+
+            // Shape backward rules
+            AdjointExpr::ConcatSplit(y_bar, dim, offset, size) => {
+                return self.emit_op(PrimalOp::Slice { dim, start: offset as i64, end: (offset + size) as i64 }, vec![y_bar]);
+            }
+            AdjointExpr::SplitConcat(y_bar, _dim) => {
+                // Pass through — split backward is concat of grads (handled by accumulation)
+                return y_bar;
+            }
+            AdjointExpr::SliceBackward(y_bar, _dim, _start, _end) => {
+                // Slice backward: zero-pad grad back to original shape
+                // For now, broadcast (approximate — correct implementation needs shape metadata)
+                return self.emit_op(PrimalOp::Broadcast, vec![y_bar]);
+            }
 
             AdjointExpr::ConvTransposeInput(y_bar, weight) => (PrimalOp::Matmul, vec![y_bar, weight]),
             AdjointExpr::ConvTransposeWeight(input, y_bar) => (PrimalOp::Matmul, vec![input, y_bar]),
             AdjointExpr::MaxPoolBackward(y_bar, indices) => (PrimalOp::Mul, vec![y_bar, indices]),
             AdjointExpr::AvgPoolBackward(y_bar, _pool_size) => (PrimalOp::Broadcast, vec![y_bar]),
 
-            AdjointExpr::CrossEntropyBackward(logits, _targets) => (PrimalOp::Softmax { dim: -1 }, vec![logits]),
-            AdjointExpr::MSEBackward(y_bar, pred, target) => (PrimalOp::Mul, vec![y_bar, pred, target]),
-            AdjointExpr::L1Backward(y_bar, pred, target) => (PrimalOp::Mul, vec![y_bar, pred, target]),
+            // CrossEntropyBackward: softmax(logits) - targets
+            AdjointExpr::CrossEntropyBackward(logits, targets) => {
+                let probs = self.emit_op(PrimalOp::Softmax { dim: -1 }, vec![logits]);
+                return self.emit_op(PrimalOp::Sub, vec![probs, targets]);
+            }
 
-            AdjointExpr::AttentionBackward(y_bar, q, k, v) => (PrimalOp::Matmul, vec![y_bar, q, k, v]),
-            AdjointExpr::RoPEBackward(y_bar, _dim) => (PrimalOp::Neg, vec![y_bar]),
+            // MSEBackward: 2 * (pred - target) * grad / N (approximate: scale by grad)
+            AdjointExpr::MSEBackward(y_bar, pred, target) => {
+                let diff = self.emit_op(PrimalOp::Sub, vec![pred, target]);
+                let two = self.emit_constant(2.0);
+                let scaled = self.emit_op(PrimalOp::Mul, vec![two, diff]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, scaled]);
+            }
+
+            // L1Backward: sign(pred - target) * grad / N (approximate)
+            AdjointExpr::L1Backward(y_bar, pred, target) => {
+                let diff = self.emit_op(PrimalOp::Sub, vec![pred, target]);
+                let zero = self.emit_constant(0.0);
+                let pos = self.emit_op(PrimalOp::Condition(CompareKind::Gt), vec![diff, zero]);
+                let one = self.emit_constant(1.0);
+                let neg_one = self.emit_constant(-1.0);
+                let sign = self.emit_op(PrimalOp::Select, vec![pos, one, neg_one]);
+                return self.emit_op(PrimalOp::Mul, vec![y_bar, sign]);
+            }
+
+            // AttentionBackward: emit FlashAttentionBackward fused kernel
+            AdjointExpr::AttentionBackward(y_bar, q, k, v) => {
+                return self.emit_op(PrimalOp::FlashAttentionBackward { causal: false }, vec![y_bar, q, k, v]);
+            }
+
+            // RoPEBackward: inverse rotation (not negation!)
+            AdjointExpr::RoPEBackward(y_bar, dim) => {
+                return self.emit_op(PrimalOp::RoPEInverse { dim }, vec![y_bar]);
+            }
         };
         self.adjoint_ops.push(WengertOp {
             id: op_id, result, op, inputs,

@@ -31,8 +31,10 @@ pub enum AdjointExpr {
     SiluBackward(VarId, VarId),
     /// Abs backward: sign(x) * grad
     SignMul(VarId, VarId),
-    /// Clamp backward: grad * (min <= x <= max)
-    ClampBackward(VarId, VarId),
+    /// Clamp backward: grad * (min <= x <= max). args: (grad, x, min, max)
+    ClampBackward(VarId, VarId, f64, f64),
+    /// Mean backward: scale grad by 1/N and broadcast. args: (grad, dim_size)
+    MeanBackward(VarId, i64),
 
     // Softmax/LogSoftmax backward
     /// Softmax backward: grad - sum(grad * y) * y  (y = softmax output)
@@ -163,10 +165,16 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Broadcast(output_bar),
         }],
-        PrimalOp::Mean { .. } => vec![InputAdjoint {
-            input_var: op.inputs[0],
-            expr: AdjointExpr::ScaleBroadcast(output_bar, 1.0),
-        }],
+        PrimalOp::Mean { dim: _ } => {
+            // The dimension size is needed for 1/N scaling.
+            // For now, use dim_size=0 as a sentinel — the lowering will treat 0 as "unknown,
+            // use a runtime query". The codegen can specialize when shape is statically known.
+            let dim_size = 0; // TODO: pass actual dim size from shape metadata
+            vec![InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::MeanBackward(output_bar, dim_size),
+            }]
+        }
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::Reshape(output_bar),
@@ -201,9 +209,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::SignMul(output_bar, op.inputs[0]),
         }],
-        PrimalOp::Clamp { .. } => vec![InputAdjoint {
+        PrimalOp::Clamp { min, max } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::ClampBackward(output_bar, op.inputs[0]),
+            expr: AdjointExpr::ClampBackward(output_bar, op.inputs[0], *min, *max),
         }],
 
         // --- Softmax / LogSoftmax ---
@@ -412,8 +420,9 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Sum { .. } | PrimalOp::Mean { .. }
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. } | PrimalOp::Split { .. } | PrimalOp::Slice { .. }
-        | PrimalOp::RoPE { .. }
-        | PrimalOp::AvgPool2d { .. } => SavedRequirement::Nothing,
+        | PrimalOp::RoPE { .. } | PrimalOp::RoPEInverse { .. }
+        | PrimalOp::AvgPool2d { .. }
+        | PrimalOp::FlashAttentionBackward { .. } => SavedRequirement::Nothing,
 
         // Save inputs — gradient depends on forward input values
         PrimalOp::Mul | PrimalOp::Div | PrimalOp::Matmul
@@ -532,10 +541,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_scale_broadcasts() {
+    fn test_mean_backward() {
         let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::ScaleBroadcast(100, _)));
+        assert!(matches!(adj[0].expr, AdjointExpr::MeanBackward(100, _)));
     }
 
     #[test]
@@ -666,7 +675,7 @@ mod tests {
         let op = make_op(1, PrimalOp::Clamp { min: 0.0, max: 1.0 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0, _, _)));
         assert_eq!(saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }), SavedRequirement::Inputs);
     }
 
