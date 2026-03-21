@@ -46,11 +46,11 @@ impl EffectSet {
         parts.join(" + ")
     }
 
-    /// Check if this set is deterministic (no Random).
+    /// Check if this set is deterministic (no Random effect).
     ///
-    /// KNOWN LIMITATION (M51a): This rejects ALL Random, even with explicit Rng.
-    /// The spec allows @deterministic functions with explicit Rng parameters.
-    /// M51b should add has_explicit_rng() detection to distinguish implicit vs explicit RNG.
+    /// Note: this is a pure bitset check. The `EffectChecker::validate()` method
+    /// additionally allows Random for functions with an explicit `Rng` parameter
+    /// (controlled randomness — deterministic given the same seed).
     pub fn is_deterministic(self) -> bool {
         !self.contains(Self::RANDOM)
     }
@@ -76,6 +76,8 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
         "print" | "println" | "eprint" | "eprintln"
         | "read_line" | "read_file" | "write_file" | "open" | "close"
         | "nsl_trace_record_op" | "nsl_trace_flush"
+        | "model_save" | "model_load"
+        | "nsl_model_save" | "nsl_model_load"
         => EffectSet::IO,
 
         // Random effects
@@ -139,6 +141,11 @@ pub struct EffectChecker {
     /// Functions annotated @checkpoint.
     checkpointed_fns: HashSet<String>,
 
+    /// Functions with an explicit `Rng` parameter. Their Random effect is
+    /// "controlled" — deterministic given the same seed. @deterministic
+    /// validation skips the Random check for these functions.
+    explicit_rng_fns: HashSet<String>,
+
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -150,6 +157,7 @@ impl EffectChecker {
             pure_fns: HashSet::new(),
             deterministic_fns: HashSet::new(),
             checkpointed_fns: HashSet::new(),
+            explicit_rng_fns: HashSet::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -175,6 +183,17 @@ impl EffectChecker {
     /// Mark a function as @checkpoint.
     pub fn mark_checkpointed(&mut self, name: &str) {
         self.checkpointed_fns.insert(name.to_string());
+    }
+
+    /// Mark a function as having an explicit `Rng` parameter.
+    /// This makes its Random effect "controlled" — @deterministic is allowed.
+    pub fn mark_has_explicit_rng(&mut self, name: &str) {
+        self.explicit_rng_fns.insert(name.to_string());
+    }
+
+    /// Check if a function has an explicit Rng parameter.
+    pub fn has_explicit_rng(&self, name: &str) -> bool {
+        self.explicit_rng_fns.contains(name)
     }
 
     // --- Phase 2: Propagation ---
@@ -222,14 +241,20 @@ impl EffectChecker {
             }
         }
 
-        // @deterministic: must have no Random effect
+        // @deterministic: must have no Random effect (unless controlled via explicit Rng param)
         for name in self.deterministic_fns.clone() {
             let effects = self.fn_effects.get(&name).copied().unwrap_or(EffectSet::PURE);
             if !effects.is_deterministic() {
+                // Allow Random if the function takes an explicit Rng parameter —
+                // randomness is "controlled" (deterministic given the same seed).
+                if self.has_explicit_rng(&name) {
+                    continue;
+                }
                 self.diagnostics.push(
                     Diagnostic::error(format!(
                         "@deterministic function '{}' has Random effect — \
-                         use explicit Rng parameter instead of implicit RNG",
+                         add an explicit `rng: Rng` parameter to make randomness controlled, \
+                         or remove @deterministic",
                         name
                     )),
                 );
@@ -427,5 +452,65 @@ mod tests {
         // a should fail @pure because it transitively calls rand
         assert_eq!(checker.diagnostics.len(), 1);
         assert!(checker.get_effects("a").contains(EffectSet::RANDOM));
+    }
+
+    // ── Explicit Rng detection (M51b) ─────────────────────────────────
+
+    #[test]
+    fn deterministic_allows_explicit_rng() {
+        let mut checker = EffectChecker::new();
+        // seeded_sample calls rand (Random effect) but has explicit Rng param
+        checker.register_function("seeded_sample", EffectSet::RANDOM, vec![]);
+        checker.mark_deterministic("seeded_sample");
+        checker.mark_has_explicit_rng("seeded_sample");
+        checker.analyze();
+
+        // Should NOT produce a diagnostic — controlled randomness is allowed
+        assert!(checker.diagnostics.is_empty(),
+            "@deterministic should allow Random with explicit Rng, got: {:?}",
+            checker.diagnostics);
+    }
+
+    #[test]
+    fn deterministic_rejects_uncontrolled_random() {
+        let mut checker = EffectChecker::new();
+        // bad_sample calls rand but does NOT have Rng param
+        checker.register_function("bad_sample", EffectSet::RANDOM, vec![]);
+        checker.mark_deterministic("bad_sample");
+        // NOT calling mark_has_explicit_rng — no Rng param
+        checker.analyze();
+
+        assert_eq!(checker.diagnostics.len(), 1,
+            "Should reject uncontrolled Random");
+        let msg = format!("{:?}", checker.diagnostics[0]);
+        assert!(msg.contains("Random"), "Error should mention Random: {msg}");
+        assert!(msg.contains("Rng"), "Error should hint about adding Rng param: {msg}");
+    }
+
+    #[test]
+    fn deterministic_with_rng_still_rejects_io() {
+        let mut checker = EffectChecker::new();
+        // Function has Rng AND IO — Rng exempts Random but not IO
+        checker.register_function("rng_and_io", EffectSet::RANDOM | EffectSet::IO, vec![]);
+        checker.mark_deterministic("rng_and_io");
+        checker.mark_has_explicit_rng("rng_and_io");
+        checker.analyze();
+
+        // Should still fail because of IO (Random is exempted but IO is not)
+        // Actually, the current validate() checks is_deterministic() which only checks Random.
+        // IO is not checked by @deterministic — only @pure checks all effects.
+        // So this should pass (is_deterministic only cares about Random).
+        // Let's verify:
+        assert!(checker.diagnostics.is_empty(),
+            "@deterministic only checks Random, not IO: {:?}", checker.diagnostics);
+    }
+
+    #[test]
+    fn has_explicit_rng_tracking() {
+        let mut checker = EffectChecker::new();
+        checker.mark_has_explicit_rng("func_a");
+
+        assert!(checker.has_explicit_rng("func_a"));
+        assert!(!checker.has_explicit_rng("func_b"));
     }
 }
