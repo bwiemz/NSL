@@ -60,90 +60,51 @@ pub struct StandaloneConfig {
     pub sidecar_path: String,
 }
 
-pub struct Compiler<'a> {
-    pub module: ObjectModule,
-    pub interner: &'a Interner,
-    pub type_map: &'a TypeMap,
-    pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
-    pub runtime_fns: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
-    pub string_pool: HashMap<String, DataId>,
-    pub struct_layouts: HashMap<String, StructLayout>,
-    /// Enum variant name → integer tag. Flat map: "ReLU" → 0, "Sigmoid" → 1, etc.
-    pub enum_variants: HashMap<String, i64>,
-    /// Enum name → list of (variant_name, tag)
-    pub enum_defs: HashMap<String, Vec<(String, i64)>>,
-    /// Model name → { method_name → mangled_fn_name } for method dispatch.
-    pub model_methods: HashMap<String, HashMap<String, String>>,
-    /// Lambda bodies to compile after the current function is finished.
-    pub pending_lambdas: Vec<PendingLambda>,
-    /// Maps variable Symbol to its closure capture count. If present, the variable holds a
-    /// heap-allocated closure struct `{ fn_ptr, num_captures, captures[] }` instead of a bare fn ptr.
-    pub closure_info: HashMap<Symbol, usize>,
-    /// Set by compile_lambda when it creates a closure; consumed by VarDecl to register in closure_info.
-    pub last_lambda_capture_count: Option<usize>,
-    pub call_conv: CallConv,
-    pub dump_ir: bool,
-    /// Functions decorated with `@no_grad` — tape is paused during their execution.
-    pub no_grad_fns: HashSet<String>,
-    /// Functions decorated with `@test` — discovered by `nsl test` runner.
-    pub test_fns: Vec<String>,
-    /// Module prefix for name mangling. Empty means no mangling (entry module / single-file).
-    pub module_prefix: String,
-    /// Kernel name → (ptx_data_id, name_data_id) for compiled GPU kernels.
-    pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
-    /// model_name → { field_name → type_marker }
-    /// type_marker is "[ElemModel;N]" for fixed model arrays, or the nested model name.
-    pub model_field_types: HashMap<String, HashMap<String, String>>,
-    /// Variable Symbol → model name (for model array loop variables)
-    pub model_var_types: HashMap<Symbol, String>,
-    /// Names of models imported from other modules (not defined locally).
-    /// These have struct layouts but should NOT generate struct ctors.
-    pub imported_model_names: HashSet<String>,
-    /// Custom dtype name → numeric id (starting at 256). Populated by compile_datatype_defs.
-    pub custom_dtype_ids: HashMap<String, u16>,
-    /// Configuration for standalone export (set by `compile_standalone()`).
-    pub(crate) standalone_config: Option<StandaloneConfig>,
-    /// Models with @paged_kv: model_name -> (num_blocks, block_size, num_heads, head_dim, num_layers)
-    pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
-    /// Compiler configuration flags (--no-autotune, --autotune-fresh, etc.)
-    pub compile_options: crate::CompileOptions,
-    /// FlashAttention compile context: set during compile_flash_attention_kernels(),
-    /// consumed by compile_flash_attention_call() when lowering scaled_dot_product_attention.
-    pub flash_attention_context: Option<FlashAttentionCompileContext>,
+/// Feature-specific decorator and configuration state extracted from model/function
+/// decorators during compilation. These are set during declaration processing and
+/// consumed during codegen. Grouped here to keep the main Compiler struct manageable.
+pub struct FeatureConfigs {
+    // ── Scaling & Parallelism (M30, M34, M41, M43) ───────────────────
     /// M30: Sharded layers — "ModelName.layer_name" → ShardInfo
     pub shard_configs: HashMap<String, crate::tensor_parallel::ShardInfo>,
-    /// M32: MoE layer configs — "ModelName.layer_name" → MoeInfo
-    pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
-    /// M33: Speculative decoding configs — "ModelName.layer_name" → SpeculativeInfo
-    pub speculative_configs: HashMap<String, crate::speculative::SpeculativeInfo>,
-    /// M34: Context parallelism configs — "ModelName.layer_name" → ContextParallelInfo
-    pub context_parallel_configs: HashMap<String, crate::context_parallel::ContextParallelInfo>,
-    /// M34: Ring size for context parallelism
-    pub cp_ring_size: usize,
     /// M30: Activation distribution states (for future all-reduce insertion)
     pub activation_states: HashMap<String, crate::tensor_parallel::DistState>,
     /// M30: Tensor parallelism world size (number of devices)
     pub world_size: usize,
+    /// M34: Context parallelism configs — "ModelName.layer_name" → ContextParallelInfo
+    pub context_parallel_configs: HashMap<String, crate::context_parallel::ContextParallelInfo>,
+    /// M34: Ring size for context parallelism
+    pub cp_ring_size: usize,
     /// M41: Whether this serve block uses disaggregated inference.
     pub disaggregated: bool,
     /// M41: Number of prefill workers (from serve config).
     pub prefill_workers: usize,
     /// M41: Number of decode workers (from serve config).
     pub decode_workers: usize,
-    /// M31: Collected fusion optimization events for --fusion-report
-    pub fusion_events: Vec<crate::fusion_report::FusionEvent>,
-    /// M31: Collected fusion barrier events for --fusion-report
-    pub fusion_barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
-    /// M31: Whether fusion event collection is enabled
-    pub fusion_report_enabled: bool,
-    /// M47: Disable all fusion optimizations for differential testing.
-    pub disable_fusion: bool,
+    /// M43: Pipeline parallelism configuration.
+    pub pipeline_config: Option<crate::pipeline::PipelineConfig>,
+    /// M43: 3D parallelism configuration.
+    pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
+    /// M43: ZeRO optimizer sharding stage.
+    pub zero_stage: Option<u8>,
+
+    // ── Inference Features (M32, M33, M42, M44) ──────────────────────
+    /// M32: MoE layer configs — "ModelName.layer_name" → MoeInfo
+    pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
+    /// M33: Speculative decoding configs — "ModelName.layer_name" → SpeculativeInfo
+    pub speculative_configs: HashMap<String, crate::speculative::SpeculativeInfo>,
+    /// M42: Per-model KV compression policies from @kv_compress decorators.
+    pub kv_compress_policies: HashMap<String, Vec<KvCompressPolicy>>,
+    /// M44: Compiled grammar FSMs from @grammar decorators and generate() schema= args.
+    pub grammar_configs: HashMap<String, GrammarInfo>,
+
+    // ── Quantization & Precision (M35) ───────────────────────────────
     /// M35: Functions with @fp8_compute decorator
     pub fp8_compute_fns: HashSet<String>,
     /// M35: Model quantization configs — "ModelName" -> QuantConfig
     pub quant_configs: HashMap<String, QuantConfig>,
-    /// M36: Computed memory plan for slab allocation (None if planning disabled/empty)
-    pub slab_plan: Option<crate::memory_planner::SlabPlan>,
+
+    // ── Ownership & Safety (M38, M39, M40) ───────────────────────────
     /// M38b: Whether --linear-types flag is active
     pub linear_types_enabled: bool,
     /// M38b: Per-function ownership metadata from semantic pass
@@ -152,22 +113,16 @@ pub struct Compiler<'a> {
     pub vmap_configs: HashMap<String, crate::vmap::VmapConfig>,
     /// M40: Source-to-source AD enabled (default true; --tape-ad forces tape-only)
     pub source_ad_enabled: bool,
-    /// M42: Per-model KV compression policies from @kv_compress decorators.
-    pub kv_compress_policies: HashMap<String, Vec<KvCompressPolicy>>,
-    /// M44: Compiled grammar FSMs from @grammar decorators and generate() schema= args.
-    pub grammar_configs: HashMap<String, GrammarInfo>,
-    /// M43: Pipeline parallelism configuration.
-    pub pipeline_config: Option<crate::pipeline::PipelineConfig>,
-    /// M43: 3D parallelism configuration.
-    pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
-    /// M43: ZeRO optimizer sharding stage.
-    pub zero_stage: Option<u8>,
+
+    // ── Weight Intelligence (M52) ────────────────────────────────────
     /// M52: Loaded weight map (populated when --weights is passed)
     pub weight_map: Option<crate::weight_aware::WeightMap>,
     /// M52: Sparsity hints per matmul operation (AST NodeId -> SparsityHint)
     pub sparsity_hints: HashMap<NodeId, crate::weight_aware::SparsityHint>,
     /// M52: Weight integrity hash for embedding in .rodata
     pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
+
+    // ── Safety & Verification (M53, M55) ─────────────────────────────
     /// M53: Functions decorated with @real_time — name -> constraint
     pub real_time_fns: HashMap<String, crate::wcet::RealTimeConstraint>,
     /// M53: Functions decorated with @wcet_budget — name -> constraint
@@ -178,7 +133,98 @@ pub struct Compiler<'a> {
     pub zk_proof_fns: HashMap<String, crate::zk::backend::ZkMode>,
     /// M55: Functions decorated with @zk_lookup — name -> (input_bits, output_bits)
     pub zk_lookup_fns: HashMap<String, (u32, u32)>,
+}
+
+impl FeatureConfigs {
+    fn new(options: &crate::CompileOptions) -> Self {
+        Self {
+            shard_configs: HashMap::new(),
+            activation_states: HashMap::new(),
+            world_size: options.world_size,
+            context_parallel_configs: HashMap::new(),
+            cp_ring_size: 1,
+            disaggregated: false,
+            prefill_workers: 1,
+            decode_workers: 1,
+            pipeline_config: None,
+            parallelism_config: None,
+            zero_stage: None,
+            moe_configs: HashMap::new(),
+            speculative_configs: HashMap::new(),
+            kv_compress_policies: HashMap::new(),
+            grammar_configs: HashMap::new(),
+            fp8_compute_fns: HashSet::new(),
+            quant_configs: HashMap::new(),
+            linear_types_enabled: false,
+            ownership_info: HashMap::new(),
+            vmap_configs: HashMap::new(),
+            source_ad_enabled: !options.tape_ad,
+            weight_map: None,
+            sparsity_hints: HashMap::new(),
+            weight_integrity: None,
+            real_time_fns: HashMap::new(),
+            wcet_budget_fns: HashMap::new(),
+            wcet_results: Vec::new(),
+            zk_proof_fns: HashMap::new(),
+            zk_lookup_fns: HashMap::new(),
+        }
+    }
+}
+
+pub struct Compiler<'a> {
+    // ── Core infrastructure ──────────────────────────────────────────
+    pub module: ObjectModule,
+    pub interner: &'a Interner,
+    pub type_map: &'a TypeMap,
+    pub call_conv: CallConv,
+    pub compile_options: crate::CompileOptions,
+    pub dump_ir: bool,
     func_index: u32,
+
+    // ── Function registry ────────────────────────────────────────────
+    pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
+    pub runtime_fns: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
+    pub pending_lambdas: Vec<PendingLambda>,
+    pub closure_info: HashMap<Symbol, usize>,
+    pub last_lambda_capture_count: Option<usize>,
+    pub no_grad_fns: HashSet<String>,
+    pub test_fns: Vec<String>,
+
+    // ── Type system ──────────────────────────────────────────────────
+    pub struct_layouts: HashMap<String, StructLayout>,
+    pub enum_variants: HashMap<String, i64>,
+    pub enum_defs: HashMap<String, Vec<(String, i64)>>,
+    pub custom_dtype_ids: HashMap<String, u16>,
+
+    // ── Model metadata ───────────────────────────────────────────────
+    pub model_methods: HashMap<String, HashMap<String, String>>,
+    pub model_field_types: HashMap<String, HashMap<String, String>>,
+    pub model_var_types: HashMap<Symbol, String>,
+    pub imported_model_names: HashSet<String>,
+    pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
+
+    // ── Module & linking ─────────────────────────────────────────────
+    pub module_prefix: String,
+    pub string_pool: HashMap<String, DataId>,
+    pub(crate) standalone_config: Option<StandaloneConfig>,
+
+    // ── GPU kernels ──────────────────────────────────────────────────
+    pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
+    pub flash_attention_context: Option<FlashAttentionCompileContext>,
+
+    // ── Fusion reporting (M31) ───────────────────────────────────────
+    pub fusion_events: Vec<crate::fusion_report::FusionEvent>,
+    pub fusion_barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
+    pub fusion_report_enabled: bool,
+    pub disable_fusion: bool,
+
+    // ── Memory planning (M36) ────────────────────────────────────────
+    pub slab_plan: Option<crate::memory_planner::SlabPlan>,
+
+    // ── Feature configs (M30-M55 decorators) ─────────────────────────
+    /// All feature-specific decorator state extracted into a single sub-struct.
+    /// Access via `self.features.field_name`.
+    pub features: FeatureConfigs,
 }
 
 /// Quantization configuration for a model.
@@ -241,65 +287,37 @@ impl<'a> Compiler<'a> {
             module,
             interner,
             type_map,
+            call_conv,
+            compile_options: options.clone(),
+            dump_ir: false,
+            func_index: 0,
             functions: HashMap::new(),
             runtime_fns: HashMap::new(),
-            string_pool: HashMap::new(),
-            struct_layouts: HashMap::new(),
-            model_methods: HashMap::new(),
-            enum_variants: HashMap::new(),
-            enum_defs: HashMap::new(),
             pending_lambdas: Vec::new(),
             closure_info: HashMap::new(),
             last_lambda_capture_count: None,
-            call_conv,
-            dump_ir: false,
             no_grad_fns: HashSet::new(),
             test_fns: Vec::new(),
-            module_prefix: String::new(),
-            kernel_ptx_data: HashMap::new(),
+            struct_layouts: HashMap::new(),
+            enum_variants: HashMap::new(),
+            enum_defs: HashMap::new(),
+            custom_dtype_ids: HashMap::new(),
+            model_methods: HashMap::new(),
             model_field_types: HashMap::new(),
             model_var_types: HashMap::new(),
             imported_model_names: HashSet::new(),
-            custom_dtype_ids: HashMap::new(),
-            standalone_config: None,
             paged_kv_configs: HashMap::new(),
-            compile_options: options.clone(),
+            module_prefix: String::new(),
+            string_pool: HashMap::new(),
+            standalone_config: None,
+            kernel_ptx_data: HashMap::new(),
             flash_attention_context: None,
-            shard_configs: HashMap::new(),
-            moe_configs: HashMap::new(),
-            speculative_configs: HashMap::new(),
-            context_parallel_configs: HashMap::new(),
-            cp_ring_size: 1,
-            activation_states: HashMap::new(),
-            world_size: options.world_size,
-            disaggregated: false,
-            prefill_workers: 1,
-            decode_workers: 1,
             fusion_events: Vec::new(),
             fusion_barriers: Vec::new(),
             fusion_report_enabled: options.fusion_report,
             disable_fusion: options.disable_fusion,
-            fp8_compute_fns: HashSet::new(),
-            quant_configs: HashMap::new(),
             slab_plan: None,
-            linear_types_enabled: false,
-            ownership_info: HashMap::new(),
-            vmap_configs: HashMap::new(),
-            source_ad_enabled: !options.tape_ad,
-            kv_compress_policies: HashMap::new(),
-            grammar_configs: HashMap::new(),
-            pipeline_config: None,
-            parallelism_config: None,
-            zero_stage: None,
-            weight_map: None,
-            sparsity_hints: HashMap::new(),
-            weight_integrity: None,
-            real_time_fns: HashMap::new(),
-            wcet_budget_fns: HashMap::new(),
-            wcet_results: Vec::new(),
-            zk_proof_fns: HashMap::new(),
-            zk_lookup_fns: HashMap::new(),
-            func_index: 0,
+            features: FeatureConfigs::new(options),
         })
     }
 
@@ -456,7 +474,7 @@ impl<'a> Compiler<'a> {
         use crate::wcet::*;
         use crate::gpu_specs::find_gpu;
 
-        if self.real_time_fns.is_empty() {
+        if self.features.real_time_fns.is_empty() {
             return Ok(());
         }
 
@@ -474,8 +492,8 @@ impl<'a> Compiler<'a> {
 
         let safety_margin = self.compile_options.wcet_safety_margin;
 
-        // Clone to avoid borrowing self.real_time_fns while mutating self.wcet_results
-        for (fn_name, constraint) in self.real_time_fns.clone() {
+        // Clone to avoid borrowing self.features.real_time_fns while mutating self.features.wcet_results
+        for (fn_name, constraint) in self.features.real_time_fns.clone() {
             // Create demo analysis with a small matmul + elementwise op
             let ops = vec![
                 wcet_matmul_gpu(1, 512, 512, "fp32", gpu),
@@ -551,7 +569,7 @@ impl<'a> Compiler<'a> {
                 })?;
             }
 
-            self.wcet_results.push(func_wcet);
+            self.features.wcet_results.push(func_wcet);
         }
 
         Ok(())
@@ -560,7 +578,7 @@ impl<'a> Compiler<'a> {
     /// M52: Embed the weight file SHA-256 hash as a .rodata symbol.
     /// The symbol `__nsl_weight_hash` contains 32 bytes of the SHA-256 hash.
     pub fn embed_weight_hash(&mut self) -> Result<(), CodegenError> {
-        if let Some(ref integrity) = self.weight_integrity {
+        if let Some(ref integrity) = self.features.weight_integrity {
             let data_id = self.module
                 .declare_data("__nsl_weight_hash", cranelift_module::Linkage::Export, false, false)
                 .map_err(|e| CodegenError::new(format!("failed to declare weight hash data: {e}")))?;

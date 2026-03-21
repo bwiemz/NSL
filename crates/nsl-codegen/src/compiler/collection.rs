@@ -326,7 +326,7 @@ impl Compiler<'_> {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.shard_configs.insert(layer_key, info);
+                                    self.features.shard_configs.insert(layer_key, info);
                                 }
                             }
                             // M32: @moe decorator extraction
@@ -338,7 +338,7 @@ impl Compiler<'_> {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.moe_configs.insert(layer_key, info);
+                                    self.features.moe_configs.insert(layer_key, info);
                                 }
                             }
                             // M34: @context_parallel decorator extraction
@@ -350,8 +350,8 @@ impl Compiler<'_> {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.cp_ring_size = info.ring_size;
-                                    self.context_parallel_configs.insert(layer_key, info);
+                                    self.features.cp_ring_size = info.ring_size;
+                                    self.features.context_parallel_configs.insert(layer_key, info);
                                 }
                             }
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "paged_kv" {
@@ -389,7 +389,7 @@ impl Compiler<'_> {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.speculative_configs.insert(layer_key, info);
+                                    self.features.speculative_configs.insert(layer_key, info);
                                 }
                             }
                             // M42: @kv_compress decorator extraction
@@ -432,7 +432,7 @@ impl Compiler<'_> {
                                     sinks: sinks as usize,
                                     budget: 0,
                                 };
-                                self.kv_compress_policies.entry(layer_key).or_default().push(policy);
+                                self.features.kv_compress_policies.entry(layer_key).or_default().push(policy);
                             }
                             // M43b: @pipeline decorator extraction
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "pipeline" {
@@ -467,7 +467,7 @@ impl Compiler<'_> {
                                         }
                                     }
                                 }
-                                self.pipeline_config = Some(crate::pipeline::PipelineConfig {
+                                self.features.pipeline_config = Some(crate::pipeline::PipelineConfig {
                                     num_stages: stages,
                                     schedule_type,
                                     checkpoint_stages,

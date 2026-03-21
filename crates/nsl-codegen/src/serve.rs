@@ -17,7 +17,7 @@ impl Compiler<'_> {
         serve: &ServeBlock,
     ) -> Result<(), CodegenError> {
         // M30: Initialize tensor parallelism if multi-device
-        if self.world_size > 1 {
+        if self.features.world_size > 1 {
             self.compile_call_by_name(builder, "nsl_tp_init", &[])?;
         }
 
@@ -69,11 +69,11 @@ impl Compiler<'_> {
         }
 
         // Override from CLI flags if set
-        if self.prefill_workers > 1 {
-            prefill_workers = self.prefill_workers as i64;
+        if self.features.prefill_workers > 1 {
+            prefill_workers = self.features.prefill_workers as i64;
         }
-        if self.decode_workers > 1 {
-            decode_workers = self.decode_workers as i64;
+        if self.features.decode_workers > 1 {
+            decode_workers = self.features.decode_workers as i64;
         }
 
         let is_disaggregated = prefill_workers > 1 || decode_workers > 1;
@@ -107,7 +107,7 @@ impl Compiler<'_> {
         }
 
         // M30: Tear down tensor parallelism if multi-device
-        if self.world_size > 1 {
+        if self.features.world_size > 1 {
             self.compile_call_by_name(builder, "nsl_tp_destroy", &[])?;
         }
 

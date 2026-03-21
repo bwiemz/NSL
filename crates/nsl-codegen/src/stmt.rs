@@ -1206,7 +1206,7 @@ impl Compiler<'_> {
         train: &nsl_ast::block::TrainBlock,
     ) -> Result<(), CodegenError> {
         // M43b: Pipeline parallel detection
-        if self.pipeline_config.is_some() {
+        if self.features.pipeline_config.is_some() {
             return self.compile_train_block_pipelined(builder, state, train);
         }
 
@@ -1855,7 +1855,7 @@ impl Compiler<'_> {
         state: &mut FuncState,
         train: &nsl_ast::block::TrainBlock,
     ) -> Result<(), CodegenError> {
-        let config = self.pipeline_config.clone().unwrap();
+        let config = self.features.pipeline_config.clone().unwrap();
         let num_stages = config.num_stages;
 
         // Emit: nsl_pipeline_init(num_stages, schedule_type, num_micro_batches)
@@ -1909,7 +1909,7 @@ impl Compiler<'_> {
         // backward pass can be emitted directly as Cranelift IR (deferred: backward
         // codegen). If extraction fails (e.g., dynamic control flow), fall through
         // to the tape-based AD path below.
-        if self.source_ad_enabled {
+        if self.features.source_ad_enabled {
             // Future: WengertExtractor would analyze grad.body here.
             //   let extractor = crate::wengert::WengertExtractor::new();
             //   if let Ok(graph) = extractor.extract(&grad.body) {

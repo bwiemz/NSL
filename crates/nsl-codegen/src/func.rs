@@ -117,8 +117,8 @@ impl Compiler<'_> {
             // compilation can consult `state.ownership_lowering` to decide whether
             // to emit `nsl_tensor_free` at consumption point (linear bindings) or
             // skip refcount ops entirely.
-            if self.linear_types_enabled {
-                if let Some(fn_ownership) = self.ownership_info.get(&name) {
+            if self.features.linear_types_enabled {
+                if let Some(fn_ownership) = self.features.ownership_info.get(&name) {
                     let mut lowering = crate::ownership::OwnershipLowering::new();
                     for sym in &fn_ownership.linear_params {
                         lowering.mark_linear(*sym);

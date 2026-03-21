@@ -63,24 +63,24 @@ impl Compiler<'_> {
                         } else if dname == "test" {
                             self.test_fns.push(raw_name.clone());
                         } else if dname == "fp8_compute" {
-                            self.fp8_compute_fns.insert(raw_name.clone());
+                            self.features.fp8_compute_fns.insert(raw_name.clone());
                         }
                     }
                 }
                 // M53: Extract @real_time and @wcet_budget constraints
                 if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                    self.real_time_fns.insert(raw_name.clone(), rt);
+                    self.features.real_time_fns.insert(raw_name.clone(), rt);
                 }
                 if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                    self.wcet_budget_fns.insert(raw_name.clone(), wb);
+                    self.features.wcet_budget_fns.insert(raw_name.clone(), wb);
                 }
                 // M55: Extract @zk_proof from bare function decorators
                 if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                    self.zk_proof_fns.insert(raw_name.clone(), mode);
+                    self.features.zk_proof_fns.insert(raw_name.clone(), mode);
                 }
                 // M55: Extract @zk_lookup from function decorators
                 if let Some((ib, ob)) = crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                    self.zk_lookup_fns.insert(raw_name.clone(), (ib, ob));
+                    self.features.zk_lookup_fns.insert(raw_name.clone(), (ib, ob));
                 }
             }
         }
@@ -197,14 +197,14 @@ impl Compiler<'_> {
                     // M53: Extract @real_time and @wcet_budget from model method decorators
                     if !decos.is_empty() {
                         if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                            self.real_time_fns.insert(mangled.clone(), rt);
+                            self.features.real_time_fns.insert(mangled.clone(), rt);
                         }
                         if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                            self.wcet_budget_fns.insert(mangled.clone(), wb);
+                            self.features.wcet_budget_fns.insert(mangled.clone(), wb);
                         }
                         // M55: Extract @zk_proof from model method decorators
                         if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                            self.zk_proof_fns.insert(mangled.clone(), mode);
+                            self.features.zk_proof_fns.insert(mangled.clone(), mode);
                         }
                     }
 
@@ -229,7 +229,7 @@ impl Compiler<'_> {
                             if let ModelMember::Method(fn_def, _) = member {
                                 let method_name = self.resolve_sym(fn_def.name).to_string();
                                 let mangled = format!("__nsl_model_{model_name}_{method_name}");
-                                self.zk_proof_fns.insert(mangled, mode);
+                                self.features.zk_proof_fns.insert(mangled, mode);
                             }
                         }
                     }

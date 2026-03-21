@@ -939,4 +939,156 @@ impl Compiler<'_> {
 
         Ok(None)
     }
+
+    /// Compile `model_save(model, "path.nslm")` — serialize model parameters to disk.
+    ///
+    /// Codegen emits:
+    ///   1. Build NslList of parameter name C-string pointers
+    ///   2. Build NslList of parameter tensor pointers (from struct fields)
+    ///   3. Call nsl_model_save(path_ptr, path_len, names_list, tensors_list)
+    pub(crate) fn compile_model_save(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        args: &[nsl_ast::expr::Arg],
+    ) -> Result<Value, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::new(
+                "model_save() takes exactly 2 arguments (model, path)",
+            ));
+        }
+
+        // arg 0: model instance
+        let model_val = self.compile_expr(builder, state, &args[0].value)?;
+        let model_type = self.node_type(args[0].value.id).clone();
+        let model_name = match &model_type {
+            Type::Model { name, .. } => self.resolve_sym(*name).to_string(),
+            _ => {
+                return Err(CodegenError::new(
+                    "model_save(): first argument must be a model instance",
+                ));
+            }
+        };
+
+        // arg 1: path string
+        let path_val = self.compile_expr(builder, state, &args[1].value)?;
+        let path_str = match &args[1].value.kind {
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => {
+                return Err(CodegenError::new(
+                    "model_save(): second argument must be a string literal (file path)",
+                ));
+            }
+        };
+        let path_len = builder
+            .ins()
+            .iconst(cl_types::I64, path_str.len() as i64);
+
+        // Look up model struct layout
+        let layout = self.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!(
+                "model_save(): no struct layout found for model '{}'",
+                model_name
+            ))
+        })?;
+
+        // Build NslList of parameter name pointers (null-terminated C strings)
+        let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for field in &layout.fields {
+            let name_data_id = self.intern_string(&field.name)?;
+            let gv = self.module.declare_data_in_func(name_data_id, builder.func);
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+            self.compile_call_by_name(builder, "nsl_list_push", &[names_list, name_ptr])?;
+        }
+
+        // Build NslList of parameter tensor pointers (load from model struct fields)
+        let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for field in &layout.fields {
+            let field_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                model_val,
+                field.offset as i32,
+            );
+            self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, field_val])?;
+        }
+
+        // Call nsl_model_save(path_ptr, path_len, names_list, tensors_list)
+        self.compile_call_by_name(
+            builder,
+            "nsl_model_save",
+            &[path_val, path_len, names_list, tensors_list],
+        )
+    }
+
+    /// Compile `model_load(model, "path.nslm")` — load model parameters from disk.
+    ///
+    /// Codegen emits:
+    ///   1. Build NslList of parameter tensor pointers (from struct fields)
+    ///   2. Call nsl_model_load(path_ptr, path_len, tensors_list)
+    pub(crate) fn compile_model_load(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        args: &[nsl_ast::expr::Arg],
+    ) -> Result<Value, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::new(
+                "model_load() takes exactly 2 arguments (model, path)",
+            ));
+        }
+
+        // arg 0: model instance
+        let model_val = self.compile_expr(builder, state, &args[0].value)?;
+        let model_type = self.node_type(args[0].value.id).clone();
+        let model_name = match &model_type {
+            Type::Model { name, .. } => self.resolve_sym(*name).to_string(),
+            _ => {
+                return Err(CodegenError::new(
+                    "model_load(): first argument must be a model instance",
+                ));
+            }
+        };
+
+        // arg 1: path string
+        let path_val = self.compile_expr(builder, state, &args[1].value)?;
+        let path_str = match &args[1].value.kind {
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => {
+                return Err(CodegenError::new(
+                    "model_load(): second argument must be a string literal (file path)",
+                ));
+            }
+        };
+        let path_len = builder
+            .ins()
+            .iconst(cl_types::I64, path_str.len() as i64);
+
+        // Look up model struct layout
+        let layout = self.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!(
+                "model_load(): no struct layout found for model '{}'",
+                model_name
+            ))
+        })?;
+
+        // Build NslList of parameter tensor pointers (load from model struct fields)
+        let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for field in &layout.fields {
+            let field_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                model_val,
+                field.offset as i32,
+            );
+            self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, field_val])?;
+        }
+
+        // Call nsl_model_load(path_ptr, path_len, tensors_list)
+        self.compile_call_by_name(
+            builder,
+            "nsl_model_load",
+            &[path_val, path_len, tensors_list],
+        )
+    }
 }

@@ -59,8 +59,8 @@ pub fn compile(
                     integrity.hash_hex
                 );
 
-                compiler.weight_integrity = Some(integrity);
-                compiler.weight_map = Some(wmap);
+                compiler.features.weight_integrity = Some(integrity);
+                compiler.features.weight_map = Some(wmap);
             }
             Err(e) => {
                 return Err(crate::error::CodegenError::new(
@@ -158,8 +158,8 @@ pub fn compile_with_zk_info(
                     wmap.source_path(),
                     integrity.hash_hex
                 );
-                compiler.weight_integrity = Some(integrity);
-                compiler.weight_map = Some(wmap);
+                compiler.features.weight_integrity = Some(integrity);
+                compiler.features.weight_map = Some(wmap);
             }
             Err(e) => {
                 return Err(crate::error::CodegenError::new(format!(
@@ -205,7 +205,7 @@ pub fn compile_with_zk_info(
     compiler.embed_weight_hash()?;
 
     // Capture ZK fn map before finalize() consumes the compiler.
-    let zk_proof_fns = compiler.zk_proof_fns.clone();
+    let zk_proof_fns = compiler.features.zk_proof_fns.clone();
 
     let bytes = compiler.finalize()?;
     Ok((bytes, zk_proof_fns))

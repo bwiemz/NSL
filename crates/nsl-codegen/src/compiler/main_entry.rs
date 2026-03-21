@@ -293,7 +293,7 @@ impl Compiler<'_> {
 
             if let Some(fn_def) = fn_def {
                 let name = self.resolve_sym(fn_def.name).to_string();
-                if let Some(config) = self.vmap_configs.get(&name).cloned() {
+                if let Some(config) = self.features.vmap_configs.get(&name).cloned() {
                     let mut transformer = crate::vmap::VmapTransformer::new(
                         self.interner,
                         &config,

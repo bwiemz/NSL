@@ -873,6 +873,16 @@ impl Compiler<'_> {
             return self.compile_to_onnx(builder, state, args);
         }
 
+        // Checkpoint I/O: model_save(model, "path.nslm")
+        if func_name == "model_save" {
+            return self.compile_model_save(builder, state, args);
+        }
+
+        // Checkpoint I/O: model_load(model, "path.nslm")
+        if func_name == "model_load" {
+            return self.compile_model_load(builder, state, args);
+        }
+
         // Safetensors load intrinsic: load_safetensors("path.safetensors")
         // Optional second arg: device (0=CPU default, 1=CUDA)
         if func_name == "load_safetensors" {
@@ -928,7 +938,7 @@ impl Compiler<'_> {
             let _experts_val = self.compile_expr(builder, state, &args[2].value)?;
 
             // Look up MoE config from decorator extraction
-            let config = self.moe_configs.values().next().cloned();
+            let config = self.features.moe_configs.values().next().cloned();
             let (num_experts, top_k, capacity_factor) = match config {
                 Some(info) => (info.num_experts, info.top_k, info.capacity_factor),
                 None => (8, 2, 1.25f32), // defaults
@@ -964,7 +974,7 @@ impl Compiler<'_> {
             let vocab_size = self.compile_expr(builder, state, &args[3].value)?;
 
             // Get temperature from @speculative config, default 0.0
-            let config = self.speculative_configs.values().next().cloned();
+            let config = self.features.speculative_configs.values().next().cloned();
             let temperature = config.map(|c| c.temperature).unwrap_or(0.0f32);
 
             // Get num_draft_tokens from draft_tokens tensor length
