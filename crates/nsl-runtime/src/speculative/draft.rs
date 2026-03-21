@@ -125,9 +125,35 @@ impl DraftModelRunner {
             crate::tensor::nsl_tensor_free(logits_ptr);
         }
 
-        // Build output tensors
-        let tokens_tensor = Self::make_1d_tensor(tokens_data, num_drafted);
-        let logits_tensor = Self::make_2d_tensor(logits_data, num_drafted, vocab);
+        // Build output tensors — reallocate to exact size if num_drafted < k
+        // to avoid dealloc size mismatch (allocator requires matching Layout).
+        let (final_tokens, final_logits) = if num_drafted < k && num_drafted > 0 {
+            // Copy to correctly-sized buffers
+            let t = checked_alloc(num_drafted * std::mem::size_of::<f64>()) as *mut f64;
+            unsafe { std::ptr::copy_nonoverlapping(tokens_data, t, num_drafted) };
+            let l = checked_alloc(num_drafted * vocab * std::mem::size_of::<f64>()) as *mut f64;
+            unsafe { std::ptr::copy_nonoverlapping(logits_data, l, num_drafted * vocab) };
+            // Free oversized originals
+            unsafe {
+                crate::memory::checked_free(tokens_data as *mut u8, k * std::mem::size_of::<f64>());
+                crate::memory::checked_free(logits_data as *mut u8, k * vocab * std::mem::size_of::<f64>());
+            }
+            (t, l)
+        } else if num_drafted == 0 {
+            // Nothing drafted — free originals, use 1-element placeholders
+            unsafe {
+                crate::memory::checked_free(tokens_data as *mut u8, k * std::mem::size_of::<f64>());
+                crate::memory::checked_free(logits_data as *mut u8, k * vocab * std::mem::size_of::<f64>());
+            }
+            let t = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
+            let l = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
+            (t, l)
+        } else {
+            // num_drafted == k — buffers are exactly the right size
+            (tokens_data, logits_data)
+        };
+        let tokens_tensor = Self::make_1d_tensor(final_tokens, num_drafted);
+        let logits_tensor = Self::make_2d_tensor(final_logits, num_drafted, vocab);
 
         DraftSequence {
             tokens_ptr: Box::into_raw(tokens_tensor) as i64,
@@ -398,10 +424,8 @@ mod tests {
         }
 
         // Cleanup
-        unsafe {
-            crate::tensor::nsl_tensor_free(result.tokens_ptr);
-            crate::tensor::nsl_tensor_free(result.logits_ptr);
-        }
+        crate::tensor::nsl_tensor_free(result.tokens_ptr);
+        crate::tensor::nsl_tensor_free(result.logits_ptr);
     }
 
     #[test]
@@ -415,10 +439,8 @@ mod tests {
         let tokens = unsafe { std::slice::from_raw_parts(tokens_tensor.data as *const f64, 1) };
         assert_eq!(tokens[0] as i64, 2);
 
-        unsafe {
-            crate::tensor::nsl_tensor_free(result.tokens_ptr);
-            crate::tensor::nsl_tensor_free(result.logits_ptr);
-        }
+        crate::tensor::nsl_tensor_free(result.tokens_ptr);
+        crate::tensor::nsl_tensor_free(result.logits_ptr);
     }
 
     #[test]
@@ -436,9 +458,55 @@ mod tests {
             assert!(tok >= 0 && tok < 4, "token {} out of range [0,4)", tok);
         }
 
+        crate::tensor::nsl_tensor_free(result.tokens_ptr);
+        crate::tensor::nsl_tensor_free(result.logits_ptr);
+    }
+
+    // Mock forward for Medusa: returns [2, 4] logits (2 heads, vocab=4)
+    // Head 0: token 1 is max, Head 1: token 3 is max
+    extern "C" fn mock_medusa_forward(_input: i64, _kv: i64, _pos: i64) -> i64 {
+        let num_heads = 2;
+        let vocab = 4;
+        let total = num_heads * vocab;
+        let data = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
         unsafe {
-            crate::tensor::nsl_tensor_free(result.tokens_ptr);
-            crate::tensor::nsl_tensor_free(result.logits_ptr);
+            // Head 0: [0.1, 5.0, -1.0, 0.5] → token 1 is max
+            *data.add(0) = 0.1; *data.add(1) = 5.0; *data.add(2) = -1.0; *data.add(3) = 0.5;
+            // Head 1: [-2.0, 0.0, 1.0, 4.0] → token 3 is max
+            *data.add(4) = -2.0; *data.add(5) = 0.0; *data.add(6) = 1.0; *data.add(7) = 4.0;
+        }
+        let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *shape = num_heads as i64; *shape.add(1) = vocab as i64 };
+        let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *strides = vocab as i64; *strides.add(1) = 1 };
+        let tensor = Box::new(NslTensor {
+            data: data as *mut c_void,
+            shape, strides, ndim: 2, len: total as i64,
+            refcount: AtomicI64::new(1),
+            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
+        });
+        Box::into_raw(tensor) as i64
+    }
+
+    #[test]
+    fn medusa_runner_builds_tree() {
+        let runner = MedusaDraftRunner::new(mock_medusa_forward, 2, 2, 4);
+        let result = runner.run_draft(0, 0, 0);
+
+        // Should have a tree with: root + 2 tokens from head 0 + 2*2 from head 1
+        assert!(!result.tree.nodes.is_empty(), "tree should have nodes");
+        assert!(result.tree.nodes.len() >= 3, "tree should have root + at least 2 children");
+
+        // The top-1 token from head 0 should be token 1 (highest logit)
+        // Find first non-root node at depth 1
+        let depth1_nodes: Vec<_> = result.tree.nodes.iter()
+            .filter(|n| n.depth == 1).collect();
+        assert!(!depth1_nodes.is_empty(), "should have depth-1 nodes");
+        assert_eq!(depth1_nodes[0].token_id, 1, "head 0's top token should be 1");
+
+        // Clean up head logits tensor
+        if result.head_logits_ptr != 0 {
+            crate::tensor::nsl_tensor_free(result.head_logits_ptr);
         }
     }
 

@@ -42,8 +42,8 @@ pub extern "C" fn nsl_speculative_draft(
 
     let result = runner.run_draft(last_token, kv_cache_handle, start_pos);
 
-    // Return as NslList [tokens_tensor, logits_tensor] via a 2-element packed struct
-    // For simplicity, pack as a 3-element i64 array: [tokens_ptr, logits_ptr, num_drafted]
+    // Return as a 3-element i64 array: [tokens_ptr, logits_ptr, num_drafted].
+    // Caller must free this buffer via nsl_speculative_draft_result_free.
     let out = checked_alloc(3 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
         *out = result.tokens_ptr;
@@ -51,6 +51,20 @@ pub extern "C" fn nsl_speculative_draft(
         *out.add(2) = result.num_drafted as i64;
     }
     out as i64
+}
+
+/// Free the result buffer returned by nsl_speculative_draft.
+/// Also frees the tokens and logits tensors within.
+#[no_mangle]
+pub extern "C" fn nsl_speculative_draft_result_free(result_ptr: i64) -> i64 {
+    if result_ptr == 0 { return 0; }
+    let out = result_ptr as *mut i64;
+    let tokens_ptr = unsafe { *out };
+    let logits_ptr = unsafe { *out.add(1) };
+    if tokens_ptr != 0 { crate::tensor::nsl_tensor_free(tokens_ptr); }
+    if logits_ptr != 0 { crate::tensor::nsl_tensor_free(logits_ptr); }
+    unsafe { crate::memory::checked_free(out as *mut u8, 3 * std::mem::size_of::<i64>()) };
+    0
 }
 
 /// Verify draft tokens via rejection sampling on pre-computed logits.
