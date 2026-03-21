@@ -502,6 +502,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_model_destroy", &[types::I64], Some(types::I64)),
     ("nsl_model_forward", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_model_forward_dlpack", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_model_backward", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_model_get_version", &[], Some(types::I64)),
     ("nsl_get_last_error", &[], Some(types::I64)),
     ("nsl_clear_error", &[], Some(types::I64)),

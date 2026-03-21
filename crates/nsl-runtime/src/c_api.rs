@@ -551,6 +551,46 @@ fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
 }
 
 // ---------------------------------------------------------------------------
+// M62b: Backward pass FFI
+// ---------------------------------------------------------------------------
+
+/// Run the model backward pass, computing gradients of the loss w.r.t. inputs.
+///
+/// Parameters:
+///   model_ptr:        NslModel* handle
+///   grad_outputs_ptr: DLManagedTensor* array of gradient tensors (loss w.r.t. outputs)
+///   num_grad_outputs: number of gradient output tensors
+///   grad_inputs_ptr:  output buffer for DLManagedTensor* gradient tensors
+///   num_grad_inputs:  output — number of gradient input tensors written
+///
+/// Returns: 0 on success, negative on error.
+///
+/// Note: This is a stub for M62b. Full backward support requires wiring to NSL's
+/// tape-based AD system, which expects the forward pass to have been recorded.
+/// The gradient bridge in Python (nslpy.autograd) calls this and falls back to
+/// returning None gradients if it fails.
+#[no_mangle]
+pub extern "C" fn nsl_model_backward(
+    model_ptr: i64,
+    _grad_outputs_ptr: i64,
+    _num_grad_outputs: i64,
+    _grad_inputs_ptr: i64,
+    num_grad_inputs: i64,
+) -> i64 {
+    if model_ptr == 0 {
+        return -1;
+    }
+    // Write 0 grad inputs (stub — no gradients computed yet)
+    if num_grad_inputs != 0 {
+        unsafe { *(num_grad_inputs as *mut i64) = 0 };
+    }
+    // TODO: Wire to NSL's tape-based or source-to-source AD backward pass.
+    // The forward pass would need to record a tape, then backward replays it.
+    // For now, the Python autograd bridge catches the error and returns None grads.
+    0
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
