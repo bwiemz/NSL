@@ -131,12 +131,15 @@ pub fn select_longest_accepted_path(tree: &SpeculativeTree) -> Vec<i64> {
 /// `build_dynamic_tree()` expands the highest-value leaf at each step,
 /// allocating the token budget to the most promising branches.
 ///
+/// Candidate generator: given context tokens, returns (token_id, log_prob) pairs.
+type CandidateFn<'a> = &'a dyn Fn(&[i64]) -> Vec<(i64, f32)>;
+
 /// `candidates_fn`: given a path from root to a leaf (token IDs), returns
 ///   top-k (token_id, log_prob) candidates for the next position.
 /// `token_budget`: maximum number of nodes to add to the tree.
 /// `expansion_k`: top-k children to expand at each step.
 pub fn build_dynamic_tree(
-    candidates_fn: &dyn Fn(&[i64]) -> Vec<(i64, f32)>,
+    candidates_fn: CandidateFn<'_>,
     token_budget: usize,
     expansion_k: usize,
 ) -> SpeculativeTree {
@@ -221,10 +224,9 @@ pub fn build_tree_attention_mask(tree: &SpeculativeTree) -> Vec<Vec<bool>> {
     let n = tree.nodes.len();
     let mut mask = vec![vec![false; n]; n];
 
-    for i in 0..n {
-        for j in 0..n {
-            // j is ancestor of i (or i == j) iff j's DFS interval contains i's
-            mask[i][j] = is_ancestor(tree, j, i);
+    for (i, row) in mask.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = is_ancestor(tree, j, i);
         }
     }
 
