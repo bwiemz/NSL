@@ -113,6 +113,8 @@ pub struct FlashAttentionConfig {
     pub gqa_group_size: u32,
     /// M33: Whether this attention uses a tree-structured causal mask for speculative decoding.
     pub tree_mask: bool,
+    /// Target GPU SM version for PTX target selection (default: 52).
+    pub gpu_sm: u32,
 }
 
 /// Generate PTX for the FlashAttention-2 kernel with the given configuration.
@@ -122,8 +124,8 @@ pub fn synthesize_flash_attention_ptx(config: &FlashAttentionConfig) -> Vec<u8> 
     let mut ptx = String::with_capacity(8192);
     let kernel_name = flash_attention_kernel_name(config);
 
-    // PTX header
-    emit_ptx_header(&mut ptx);
+    // PTX header (dynamic target based on GPU)
+    emit_ptx_header(&mut ptx, config.gpu_sm);
 
     // Kernel entry point
     emit_flash_attention_entry(&mut ptx, &kernel_name, config);
@@ -142,7 +144,7 @@ pub fn synthesize_rope_cache_write_ptx(
 ) -> Vec<u8> {
     let mut ptx = String::with_capacity(4096);
 
-    emit_ptx_header(&mut ptx);
+    emit_ptx_header(&mut ptx, 52); // RoPE cache write targets sm_52 minimum
     emit_rope_cache_write_entry(&mut ptx, head_dim, rope_style);
 
     ptx.push('\0');
@@ -179,9 +181,13 @@ pub fn shared_mem_bytes(config: &FlashAttentionConfig) -> u32 {
 
 // ── PTX emission helpers ──────────────────────────────────────────
 
-fn emit_ptx_header(ptx: &mut String) {
-    ptx.push_str(".version 7.0\n");
-    ptx.push_str(".target sm_52\n");
+fn emit_ptx_header(ptx: &mut String, gpu_sm: u32) {
+    let version = if gpu_sm >= 90 { "8.0" } else { "7.0" };
+    let target = if gpu_sm >= 90 { "sm_90" }
+        else if gpu_sm >= 80 { "sm_80" }
+        else { "sm_52" };
+    ptx.push_str(&format!(".version {version}\n"));
+    ptx.push_str(&format!(".target {target}\n"));
     ptx.push_str(".address_size 64\n\n");
 }
 
@@ -2028,6 +2034,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -2047,6 +2054,7 @@ mod tests {
             rope_style: RopeStyle::Adjacent,
             gqa_group_size: 4,
             tree_mask: false,
+            gpu_sm: 80,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -2066,6 +2074,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         // (64 + 64) * 128 * 2 = 32768 bytes (32 KB)
         assert_eq!(shared_mem_bytes(&config), 32768);
@@ -2085,6 +2094,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         assert_eq!(shared_mem_bytes(&config), 49152);
         // This exceeds 48KB — the semantic checker should reject this combination
@@ -2102,11 +2112,12 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap(); // strip null
         assert!(ptx_str.starts_with(".version 7.0\n"));
-        assert!(ptx_str.contains(".target sm_52"));
+        assert!(ptx_str.contains(".target sm_80"));
         assert!(ptx_str.contains(&flash_attention_kernel_name(&config)));
         assert!(ptx_str.contains("bar.sync 0"));
         assert!(ptx_str.contains("FENCE 1"));
@@ -2126,6 +2137,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
         let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len()-1]).unwrap();
@@ -2150,6 +2162,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
@@ -2170,6 +2183,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
@@ -2190,6 +2204,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 4,
             tree_mask: false,
+            gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
@@ -2225,6 +2240,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: true,
+            gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();

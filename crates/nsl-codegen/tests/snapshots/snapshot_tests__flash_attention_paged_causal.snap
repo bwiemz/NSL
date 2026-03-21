@@ -1,9 +1,10 @@
 ---
 source: crates/nsl-codegen/tests/snapshot_tests.rs
+assertion_line: 48
 expression: ptx_str
 ---
 .version 7.0
-.target sm_52
+.target sm_80
 .address_size 64
 
 .visible .entry flash_attn_p1_r0_hs_g1_c1_t0_q64_kv64 (
