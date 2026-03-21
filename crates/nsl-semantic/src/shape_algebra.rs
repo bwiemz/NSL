@@ -55,6 +55,13 @@ pub struct ShapeAlgebraSolver {
     equalities: Vec<(DimExpr, DimExpr)>,
 }
 
+/// Linear constraint for Fourier-Motzkin elimination: constant + sum(coeff_i * x_i) <= 0
+#[derive(Clone, Debug)]
+struct FmConstraint {
+    coeffs: HashMap<Symbol, i64>,
+    constant: i64,
+}
+
 impl ShapeAlgebraSolver {
     pub fn new() -> Self {
         ShapeAlgebraSolver {
@@ -277,6 +284,12 @@ impl ShapeAlgebraSolver {
                     return Ok(());
                 }
             }
+            // Strategy 2b: Singleton bound — if sym in [v, v], check v % divisor
+            if let Some((Some(lo), Some(hi))) = self.bounds.get(s) {
+                if lo == hi && lo % divisor == 0 {
+                    return Ok(());
+                }
+            }
         }
 
         // Strategy 3: Product of terms — if a*b and b % divisor == 0, then a*b % divisor == 0
@@ -420,55 +433,242 @@ impl ShapeAlgebraSolver {
     }
 
     // ---------------------------------------------------------------------------
-    // Fourier-Motzkin variable elimination (limited)
+    // Fourier-Motzkin variable elimination
     // ---------------------------------------------------------------------------
 
-    /// Try to prove `expr <= value` using transitive bound reasoning.
+    /// Try to prove `expr <= value` using Fourier-Motzkin variable elimination.
     ///
-    /// Converts stored bounds into linear constraints and eliminates variables
-    /// to derive a bound on the target expression. Limited to simple symbol
-    /// expressions with ≤3 elimination steps to avoid exponential blowup.
+    /// Converts stored bounds and equalities into linear constraints of the form
+    /// `c0 + c1*x1 + c2*x2 + ... <= 0`, then eliminates variables one at a time
+    /// to derive a bound on the target expression.
+    ///
+    /// Limited to ≤3 variable eliminations to avoid exponential blowup.
     fn fm_prove_le(&self, expr: &DimExpr, value: i64) -> bool {
-        // Only handle simple symbol case for now
-        let target_sym = match expr {
-            DimExpr::Sym(s) => *s,
-            _ => return false,
-        };
+        let mut constraints = self.bounds_as_constraints();
+        self.equalities_as_constraints(&mut constraints);
 
-        // Collect transitive upper bounds: if A <= B and B <= C and C <= value,
-        // then A <= value. Walk the equality chain.
-        // Simple implementation: check if any bound chain leads to <= value
-        self.fm_trace_upper(target_sym, value, &mut Vec::new(), 3)
-    }
+        // Collect variables in the target expression
+        let target_vars = Self::collect_vars(expr);
 
-    /// Recursively trace upper bounds. `depth` limits recursion.
-    fn fm_trace_upper(&self, sym: Symbol, target: i64, visited: &mut Vec<Symbol>, depth: u32) -> bool {
-        if depth == 0 { return false; }
-        if visited.contains(&sym) { return false; }
-        visited.push(sym);
-
-        // Direct bound check
-        if let Some((_, Some(hi))) = self.bounds.get(&sym) {
-            if *hi <= target { return true; }
-        }
-
-        // Check if bound on sym is via another symbol (from equalities)
-        // e.g., assert_eq(A, B) and B has bound <= target
-        for (eq_l, eq_r) in &self.equalities {
-            if let DimExpr::Sym(s) = eq_l {
-                if *s == sym {
-                    if let DimExpr::Sym(other) = eq_r {
-                        if self.fm_trace_upper(*other, target, visited, depth - 1) {
-                            return true;
-                        }
-                    }
+        // Collect all variables to eliminate (not in target)
+        let all_vars: Vec<Symbol> = {
+            let mut seen = std::collections::HashSet::new();
+            for c in &constraints {
+                for &v in c.coeffs.keys() {
+                    seen.insert(v);
                 }
             }
-            if let DimExpr::Sym(s) = eq_r {
-                if *s == sym {
-                    if let DimExpr::Sym(other) = eq_l {
-                        if self.fm_trace_upper(*other, target, visited, depth - 1) {
-                            return true;
+            seen.into_iter().filter(|v| !target_vars.contains(v)).collect()
+        };
+
+        // Limit elimination to 3 variables
+        let to_eliminate = if all_vars.len() > 3 { &all_vars[..3] } else { &all_vars };
+
+        for var in to_eliminate {
+            constraints = Self::eliminate_variable(&constraints, *var);
+            if constraints.len() > 50 { return false; } // blowup guard
+        }
+
+        // Convert target: expr <= value  →  expr - value <= 0
+        if let Some(mut target) = self.expr_to_linear(expr) {
+            target.constant -= value;
+            Self::check_implied(&constraints, &target)
+        } else {
+            false
+        }
+    }
+
+    /// Convert stored bounds to linear constraints.
+    /// bound (sym, Some(lo), Some(hi)) becomes:
+    ///   lo - sym <= 0   (sym >= lo)
+    ///   sym - hi <= 0   (sym <= hi)
+    fn bounds_as_constraints(&self) -> Vec<FmConstraint> {
+        let mut out = Vec::new();
+        for (&sym, &(lo, hi)) in &self.bounds {
+            if let Some(lo_val) = lo {
+                let mut coeffs = HashMap::new();
+                coeffs.insert(sym, -1);
+                out.push(FmConstraint { coeffs, constant: lo_val });
+            }
+            if let Some(hi_val) = hi {
+                let mut coeffs = HashMap::new();
+                coeffs.insert(sym, 1);
+                out.push(FmConstraint { coeffs, constant: -hi_val });
+            }
+        }
+        for (&sym, &val) in &self.bindings {
+            let mut c1 = HashMap::new();
+            c1.insert(sym, 1);
+            out.push(FmConstraint { coeffs: c1, constant: -val });
+            let mut c2 = HashMap::new();
+            c2.insert(sym, -1);
+            out.push(FmConstraint { coeffs: c2, constant: val });
+        }
+        out
+    }
+
+    /// Convert equalities to paired <= constraints.
+    fn equalities_as_constraints(&self, out: &mut Vec<FmConstraint>) {
+        for (lhs, rhs) in &self.equalities {
+            if let (Some(mut c_fwd), Some(c_rhs)) = (self.expr_to_linear(lhs), self.expr_to_linear(rhs)) {
+                // lhs - rhs <= 0
+                for (var, coeff) in &c_rhs.coeffs {
+                    *c_fwd.coeffs.entry(*var).or_insert(0) -= coeff;
+                }
+                c_fwd.constant -= c_rhs.constant;
+                // rhs - lhs <= 0 (negate)
+                let c_rev = FmConstraint {
+                    coeffs: c_fwd.coeffs.iter().map(|(&k, &v)| (k, -v)).collect(),
+                    constant: -c_fwd.constant,
+                };
+                out.push(c_fwd);
+                out.push(c_rev);
+            }
+        }
+    }
+
+    /// Convert a DimExpr to a linear form: constant + sum(coeff * var).
+    /// Returns None for non-linear expressions (e.g., sym * sym).
+    fn expr_to_linear(&self, expr: &DimExpr) -> Option<FmConstraint> {
+        match expr {
+            DimExpr::Lit(v) => Some(FmConstraint { coeffs: HashMap::new(), constant: *v }),
+            DimExpr::Sym(s) => {
+                if let Some(&v) = self.bindings.get(s) {
+                    Some(FmConstraint { coeffs: HashMap::new(), constant: v })
+                } else {
+                    let mut coeffs = HashMap::new();
+                    coeffs.insert(*s, 1);
+                    Some(FmConstraint { coeffs, constant: 0 })
+                }
+            }
+            DimExpr::Add(a, b) => {
+                let mut la = self.expr_to_linear(a)?;
+                let lb = self.expr_to_linear(b)?;
+                for (var, coeff) in lb.coeffs {
+                    *la.coeffs.entry(var).or_insert(0) += coeff;
+                }
+                la.constant += lb.constant;
+                Some(la)
+            }
+            DimExpr::Mul(a, b) => {
+                let la = self.expr_to_linear(a)?;
+                let lb = self.expr_to_linear(b)?;
+                if la.coeffs.is_empty() {
+                    let s = la.constant;
+                    Some(FmConstraint {
+                        coeffs: lb.coeffs.into_iter().map(|(k, v)| (k, v * s)).collect(),
+                        constant: lb.constant * s,
+                    })
+                } else if lb.coeffs.is_empty() {
+                    let s = lb.constant;
+                    Some(FmConstraint {
+                        coeffs: la.coeffs.into_iter().map(|(k, v)| (k, v * s)).collect(),
+                        constant: la.constant * s,
+                    })
+                } else {
+                    None // non-linear
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Collect all symbolic variables in an expression.
+    fn collect_vars(expr: &DimExpr) -> Vec<Symbol> {
+        let mut vars = Vec::new();
+        Self::collect_vars_inner(expr, &mut vars);
+        vars
+    }
+
+    fn collect_vars_inner(expr: &DimExpr, vars: &mut Vec<Symbol>) {
+        match expr {
+            DimExpr::Sym(s) => { if !vars.contains(s) { vars.push(*s); } }
+            DimExpr::Lit(_) => {}
+            DimExpr::Add(a, b) | DimExpr::Mul(a, b) | DimExpr::Div(a, b) | DimExpr::Mod(a, b) => {
+                Self::collect_vars_inner(a, vars);
+                Self::collect_vars_inner(b, vars);
+            }
+        }
+    }
+
+    /// Eliminate one variable from the constraint set.
+    /// Partitions constraints by the sign of the variable's coefficient,
+    /// then combines upper-lower pairs to produce var-free constraints.
+    fn eliminate_variable(constraints: &[FmConstraint], var: Symbol) -> Vec<FmConstraint> {
+        let mut upper = Vec::new(); // positive coeff: upper bound on var
+        let mut lower = Vec::new(); // negative coeff: lower bound on var
+        let mut rest = Vec::new();
+
+        for c in constraints {
+            match c.coeffs.get(&var) {
+                Some(&coeff) if coeff > 0 => upper.push(c.clone()),
+                Some(&coeff) if coeff < 0 => lower.push(c.clone()),
+                _ => rest.push(c.clone()),
+            }
+        }
+
+        for u in &upper {
+            for l in &lower {
+                let u_coeff = *u.coeffs.get(&var).unwrap();           // positive
+                let l_coeff = -(*l.coeffs.get(&var).unwrap());        // make positive
+
+                let mut new_coeffs = HashMap::new();
+                for (&v, &c) in &u.coeffs {
+                    if v != var { *new_coeffs.entry(v).or_insert(0) += c * l_coeff; }
+                }
+                for (&v, &c) in &l.coeffs {
+                    if v != var { *new_coeffs.entry(v).or_insert(0) += c * u_coeff; }
+                }
+                new_coeffs.retain(|_, v| *v != 0);
+
+                rest.push(FmConstraint {
+                    coeffs: new_coeffs,
+                    constant: u.constant * l_coeff + l.constant * u_coeff,
+                });
+            }
+        }
+
+        rest
+    }
+
+    /// Check if the constraint set implies the target.
+    fn check_implied(constraints: &[FmConstraint], target: &FmConstraint) -> bool {
+        // Pure constant: target.constant <= 0?
+        if target.coeffs.is_empty() {
+            return target.constant <= 0;
+        }
+
+        // Direct match: constraint c with same coefficients implies target when
+        // c is at least as tight: c.constant >= target.constant
+        // (since coeff*x + const <= 0 means x <= -const/coeff, larger const = tighter)
+        for c in constraints {
+            if c.coeffs == target.coeffs && c.constant >= target.constant {
+                return true;
+            }
+        }
+
+        // Single-variable scaling: normalize to unit coefficient and compare bounds.
+        if target.coeffs.len() == 1 {
+            let (&var, &t_coeff) = target.coeffs.iter().next().unwrap();
+            for c in constraints {
+                if c.coeffs.len() == 1 {
+                    if let Some(&c_coeff) = c.coeffs.get(&var) {
+                        if c_coeff > 0 && t_coeff > 0 {
+                            // c_coeff * x + c.const <= 0  means  x <= -c.const/c_coeff
+                            // t_coeff * x + t.const <= 0  means  x <= -t.const/t_coeff
+                            // Implied when -c.const/c_coeff <= -t.const/t_coeff
+                            // i.e., c.const * t_coeff >= t.const * c_coeff (cross-multiply, both positive)
+                            if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
+                                return true;
+                            }
+                        } else if c_coeff < 0 && t_coeff < 0 {
+                            // -|c| * x + c.const <= 0  means  x >= c.const / |c|
+                            // Implied when c.const/|c| >= t.const/|t|
+                            // Cross-multiply (both negative, so flip): c.const * |t| <= t.const * |c|
+                            // With c_coeff, t_coeff both negative: c.const * t_coeff >= t.const * c_coeff
+                            if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -852,5 +1052,113 @@ mod tests {
         // Normalized prove_eq succeeds
         assert!(solver.prove_eq_normalized(&ab, &ba).is_ok(),
             "A*B == B*A should be provable via normalization");
+    }
+
+    // ── Fourier-Motzkin elimination tests ──────────────────────────────
+
+    #[test]
+    fn fm_transitive_chain_a_le_b_le_1024() {
+        // A <= B, B <= 1024  ⟹  A <= 1024
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let mut solver = ShapeAlgebraSolver::new();
+        // A <= B expressed as: assert_eq(A, B) would be equality,
+        // but for true inequality: A has upper bound B.
+        // Express as: A in [0, MAX], B in [0, 1024], A <= B via equality-as-upper-bound.
+        // FM approach: set bounds and let elimination derive.
+        solver.assert_bound(a, Some(0), None);
+        solver.assert_bound(b, Some(0), Some(1024));
+        solver.assert_eq(DimExpr::Sym(a), DimExpr::Sym(b)); // A == B implies A <= 1024
+
+        assert!(solver.prove_le(&DimExpr::Sym(a), 1024).is_ok(),
+            "A <= 1024 via A == B, B <= 1024 (FM elimination)");
+    }
+
+    #[test]
+    fn fm_chain_three_vars() {
+        // A == B, B == C, C <= 100  ⟹  A <= 100
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let c = make_sym(&mut interner, "C");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_eq(DimExpr::Sym(a), DimExpr::Sym(b));
+        solver.assert_eq(DimExpr::Sym(b), DimExpr::Sym(c));
+        solver.assert_bound(c, Some(1), Some(100));
+
+        assert!(solver.prove_le(&DimExpr::Sym(a), 100).is_ok(),
+            "A <= 100 via A == B == C, C <= 100");
+    }
+
+    #[test]
+    fn fm_linear_expression() {
+        // S in [1, 100], prove 2*S <= 200
+        let mut interner = Interner::new();
+        let s = make_sym(&mut interner, "S");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(s, Some(1), Some(100));
+
+        let two_s = DimExpr::Mul(Box::new(DimExpr::Lit(2)), Box::new(DimExpr::Sym(s)));
+        assert!(solver.prove_le(&two_s, 200).is_ok(),
+            "2*S <= 200 when S <= 100");
+        assert!(solver.prove_le(&two_s, 199).is_err(),
+            "2*S <= 199 should fail when S can be 100");
+    }
+
+    #[test]
+    fn fm_sum_expression() {
+        // A in [0, 50], B in [0, 50], prove A + B <= 100
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(a, Some(0), Some(50));
+        solver.assert_bound(b, Some(0), Some(50));
+
+        let sum = DimExpr::Add(Box::new(DimExpr::Sym(a)), Box::new(DimExpr::Sym(b)));
+        assert!(solver.prove_le(&sum, 100).is_ok(),
+            "A + B <= 100 when both in [0, 50]");
+        assert!(solver.prove_le(&sum, 99).is_err(),
+            "A + B <= 99 should fail when both can be 50");
+    }
+
+    #[test]
+    fn fm_ge_via_lower_bound() {
+        // S in [1, 4096], prove S >= 1
+        let mut interner = Interner::new();
+        let s = make_sym(&mut interner, "S");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(s, Some(1), Some(4096));
+
+        assert!(solver.prove_ge(&DimExpr::Sym(s), 1).is_ok());
+        assert!(solver.prove_ge(&DimExpr::Sym(s), 0).is_ok());
+        assert!(solver.prove_ge(&DimExpr::Sym(s), 2).is_err());
+    }
+
+    #[test]
+    fn fm_does_not_prove_impossible() {
+        // A in [1, 100], should NOT prove A <= 50
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(a, Some(1), Some(100));
+
+        assert!(solver.prove_le(&DimExpr::Sym(a), 50).is_err(),
+            "Should not prove A <= 50 when upper bound is 100");
+    }
+
+    #[test]
+    fn bound_based_divisibility() {
+        // S is exactly 32 (singleton bound) — should be divisible by 8
+        let mut interner = Interner::new();
+        let s = make_sym(&mut interner, "S");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(s, Some(32), Some(32));
+
+        assert!(solver.prove_divisible(&DimExpr::Sym(s), 8).is_ok(),
+            "S=[32,32] should be divisible by 8");
+        assert!(solver.prove_divisible(&DimExpr::Sym(s), 7).is_err(),
+            "S=[32,32] should not be divisible by 7");
     }
 }

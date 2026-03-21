@@ -224,20 +224,27 @@ impl<'a> TypeChecker<'a> {
                 if let Type::Tensor { dtype, device, .. } = &obj_ty {
                     match method_name.as_str() {
                         "reshape" => {
-                            let shape = self.extract_shape_from_args(args);
-                            // M49: ShapeAlgebraSolver would prove this reshape correct
-                            // at compile time by extracting DimExpr from the source
-                            // tensor's shape and the target shape, then calling
-                            // solver.prove_eq() to verify the total element counts
-                            // match. Full integration requires:
-                            //   1. Converting both Shape values to DimExpr products
-                            //   2. Feeding known dimension bindings into the solver
-                            //   3. Emitting a compile error (with ProofFailure detail)
-                            //      when the proof fails
-                            // For now, the runtime assertion path (M28 dynamic shapes)
-                            // remains active as fallback.
+                            let target_shape = self.extract_shape_from_args(args);
+                            if let Type::Tensor { shape: source_shape, .. } = &obj_ty {
+                                // M49: Prove reshape correctness via shape algebra
+                                if !source_shape.dims.is_empty() && !target_shape.dims.is_empty() {
+                                    let mut solver = crate::shape_algebra::ShapeAlgebraSolver::new();
+                                    let src_expr = Self::shape_to_product(source_shape, &mut solver);
+                                    let tgt_expr = Self::shape_to_product(&target_shape, &mut solver);
+                                    if let (Some(src), Some(tgt)) = (src_expr, tgt_expr) {
+                                        if let Err(pf) = solver.prove_eq_normalized(&src, &tgt) {
+                                            // Only warn — runtime check still active as fallback
+                                            self.diagnostics.push(
+                                                Diagnostic::warning(format!(
+                                                    "reshape may be invalid: {}", pf.reason
+                                                ))
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             return Type::Tensor {
-                                shape,
+                                shape: target_shape,
                                 dtype: *dtype,
                                 device: device.clone(),
                             };
@@ -337,6 +344,42 @@ impl<'a> TypeChecker<'a> {
 
     /// Try to extract a concrete tensor shape from a function call's arguments.
     /// Returns Shape::unknown() if the first arg isn't a list literal or contains non-integer elements.
+    /// Convert a Shape's dimensions into a product DimExpr for the solver.
+    /// Also feeds bounds from Bounded dims into the solver.
+    /// Returns None for empty/wildcard shapes.
+    fn shape_to_product(
+        shape: &Shape,
+        solver: &mut crate::shape_algebra::ShapeAlgebraSolver,
+    ) -> Option<DimExpr> {
+        let dim_to_expr = |dim: &Dim| -> Option<DimExpr> {
+            match dim {
+                Dim::Concrete(v) => Some(DimExpr::Lit(*v)),
+                Dim::Symbolic(s) => Some(DimExpr::Sym(*s)),
+                Dim::Named { size, .. } => match size.as_ref() {
+                    Dim::Concrete(v) => Some(DimExpr::Lit(*v)),
+                    Dim::Symbolic(s) => Some(DimExpr::Sym(*s)),
+                    _ => None,
+                },
+                Dim::Bounded { name, upper_bound } => {
+                    solver.assert_bound(*name, Some(1), Some(*upper_bound));
+                    Some(DimExpr::Sym(*name))
+                }
+                Dim::Computed(expr) => Some(expr.as_ref().clone()),
+                Dim::Wildcard => None,
+            }
+        };
+
+        let exprs: Vec<DimExpr> = shape.dims.iter().filter_map(dim_to_expr).collect();
+        if exprs.is_empty() {
+            return None;
+        }
+        let mut product = exprs[0].clone();
+        for e in &exprs[1..] {
+            product = DimExpr::Mul(Box::new(product), Box::new(e.clone()));
+        }
+        Some(product)
+    }
+
     pub(crate) fn extract_shape_from_args(&self, args: &[Arg]) -> Shape {
         if args.is_empty() {
             return Shape::unknown();
