@@ -1741,6 +1741,202 @@ fn emit_smem_swizzle_registers(ptx: &mut String) {
     ptx.push_str("    .reg .u32 %smem_bank, %smem_row_bits, %smem_bank_lo, %smem_swiz;\n");
 }
 
+// ── wgmma.mma_async PTX emission helpers (sm_90+ / Hopper) ──────────
+
+/// wgmma tile dimensions: m64n64k16 for f16, m64n64k32 for fp8.
+const WGMMA_M: usize = 64;
+const WGMMA_N: usize = 64;
+const WGMMA_K_F16: usize = 16;
+
+/// Emit PTX for a wgmma shared memory matrix descriptor.
+///
+/// wgmma reads A and B from shared memory via 64-bit descriptors that encode
+/// the base address, leading dimension stride, and swizzle mode. The descriptor
+/// is constructed in registers then passed to the wgmma instruction.
+///
+/// `desc_reg`: name of the .b64 register to hold the descriptor.
+/// `smem_base_expr`: PTX expression for the base address of the tile in shared memory.
+/// `leading_dim_bytes`: stride in bytes between rows (must be 128-byte aligned for wgmma).
+/// `swizzle_mode`: 0=none, 1=32B, 2=64B, 3=128B (128B required for peak performance).
+#[allow(dead_code)]
+fn emit_wgmma_smem_descriptor(
+    ptx: &mut String,
+    desc_reg: &str,
+    smem_base_expr: &str,
+    leading_dim_bytes: usize,
+    swizzle_mode: u32,
+) {
+    use std::fmt::Write;
+    // Descriptor layout (64-bit):
+    //   [13:0]  = base address (byte offset in shared memory, 16-byte aligned → shift right 4)
+    //   [15:14] = swizzle mode
+    //   [29:16] = leading dimension stride (in 16-byte units)
+    //   [31:30] = reserved
+    //   [63:32] = reserved
+    writeln!(ptx, "    // Build wgmma shared memory descriptor for {desc_reg}").unwrap();
+    writeln!(ptx, "    .reg .b64 %{desc_reg};").unwrap();
+    writeln!(ptx, "    .reg .u32 %wgmma_desc_lo, %wgmma_desc_hi;").unwrap();
+    // Base address: shift right 4 to get 16-byte units
+    writeln!(ptx, "    shr.u32 %wgmma_desc_lo, {smem_base_expr}, 4;  // base in 16B units").unwrap();
+    writeln!(ptx, "    and.b32 %wgmma_desc_lo, %wgmma_desc_lo, 0x3FFF;  // 14-bit base").unwrap();
+    // Swizzle mode in bits [15:14]
+    writeln!(ptx, "    or.b32 %wgmma_desc_lo, %wgmma_desc_lo, {};  // swizzle mode",
+        swizzle_mode << 14).unwrap();
+    // Leading dimension in 16-byte units, bits [29:16]
+    let ld_16b = leading_dim_bytes / 16;
+    writeln!(ptx, "    or.b32 %wgmma_desc_lo, %wgmma_desc_lo, {};  // leading dim in 16B units",
+        (ld_16b as u32) << 16).unwrap();
+    writeln!(ptx, "    mov.u32 %wgmma_desc_hi, 0;  // reserved upper 32 bits").unwrap();
+    writeln!(ptx, "    mov.b64 %{desc_reg}, {{%wgmma_desc_lo, %wgmma_desc_hi}};").unwrap();
+}
+
+/// Emit the Q@K^T matmul using wgmma.mma_async for Hopper (sm_90).
+///
+/// wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 uses 128-thread warp groups.
+/// Both A (Q) and B (K^T) are read from shared memory via descriptors.
+/// The async execution allows overlapping softmax scalar math between
+/// commit_group and wait_group.
+#[allow(dead_code)]
+fn emit_qk_matmul_wgmma(
+    ptx: &mut String,
+    _block_q: usize,
+    block_kv: usize,
+    head_dim: usize,
+    _shmem_k_offset: usize,
+) {
+    use std::fmt::Write;
+
+    let n_tiles = block_kv / WGMMA_N;
+    let k_iters = head_dim / WGMMA_K_F16;
+
+    writeln!(ptx, "    // === Q@K^T via wgmma.mma_async (m64n64k16, sm_90) ===").unwrap();
+    writeln!(ptx, "    // 128-thread warp group, async execution").unwrap();
+    writeln!(ptx, "    // n_tiles={n_tiles}, k_iters={k_iters}").unwrap();
+
+    // wgmma accumulator registers: 32 f32 per thread per tile
+    for nt in 0..n_tiles {
+        for r in 0..32 {
+            writeln!(ptx, "    .reg .f32 %wg_acc_s_{nt}_{r};").unwrap();
+        }
+    }
+    writeln!(ptx, "    .reg .u32 %wg_k_iter;").unwrap();
+    writeln!(ptx, "    .reg .pred %wg_pk;").unwrap();
+
+    // Zero accumulators
+    for nt in 0..n_tiles {
+        for r in 0..32 {
+            writeln!(ptx, "    mov.f32 %wg_acc_s_{nt}_{r}, 0.0;").unwrap();
+        }
+    }
+
+    // K-dimension loop
+    writeln!(ptx, "    mov.u32 %wg_k_iter, 0;").unwrap();
+    writeln!(ptx, "QK_WGMMA_K_LOOP:").unwrap();
+
+    // Issue wgmma for each n-tile
+    for nt in 0..n_tiles {
+        // wgmma instruction (f16 inputs from shared memory, f32 accumulators)
+        writeln!(ptx, "    wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16").unwrap();
+        // Accumulators (32 per tile)
+        let acc_list: Vec<String> = (0..32).map(|r| format!("%wg_acc_s_{nt}_{r}")).collect();
+        writeln!(ptx, "        {{{}}},", acc_list.join(", ")).unwrap();
+        // A descriptor (Q tile in shared memory)
+        writeln!(ptx, "        [%wg_desc_q],").unwrap();
+        // B descriptor (K^T tile in shared memory)
+        writeln!(ptx, "        [%wg_desc_kt_{nt}],").unwrap();
+        // Scale/negate flags: p=0 (no scale A), q=0 (no scale B), r=0, s=0
+        writeln!(ptx, "        0, 0, 0, 0;").unwrap();
+    }
+
+    // Commit the wgmma group (allows async execution)
+    writeln!(ptx, "    wgmma.commit_group.sync.aligned;").unwrap();
+    writeln!(ptx).unwrap();
+    writeln!(ptx, "    // --- Softmax scalar math can overlap here (async!) ---").unwrap();
+    writeln!(ptx).unwrap();
+
+    // Wait for wgmma to complete before consuming accumulators
+    writeln!(ptx, "    wgmma.wait_group.sync.aligned 0;").unwrap();
+
+    // K-loop advancement
+    writeln!(ptx, "    add.u32 %wg_k_iter, %wg_k_iter, 1;").unwrap();
+    writeln!(ptx, "    setp.lt.u32 %wg_pk, %wg_k_iter, {k_iters};").unwrap();
+    writeln!(ptx, "    @%wg_pk bra QK_WGMMA_K_LOOP;").unwrap();
+
+    // Scale S by 1/sqrt(head_dim)
+    writeln!(ptx, "    // Scale S accumulators").unwrap();
+    for nt in 0..n_tiles {
+        for r in 0..32 {
+            writeln!(ptx, "    mul.f32 %wg_acc_s_{nt}_{r}, %wg_acc_s_{nt}_{r}, %scale;").unwrap();
+        }
+    }
+}
+
+/// Emit the P@V matmul using wgmma.mma_async for Hopper.
+///
+/// P (softmax output) must be staged to shared memory first since wgmma
+/// requires shared memory inputs (unlike mma.sync which can use registers).
+#[allow(dead_code)]
+fn emit_pv_matmul_wgmma(
+    ptx: &mut String,
+    block_kv: usize,
+    head_dim: usize,
+    _shmem_k_offset: usize,
+) {
+    use std::fmt::Write;
+
+    let n_tiles = head_dim / WGMMA_N;
+    let k_iters = block_kv / WGMMA_K_F16;
+
+    writeln!(ptx, "    // === P@V via wgmma.mma_async (m64n64k16, sm_90) ===").unwrap();
+    writeln!(ptx, "    // P staged to shared memory, V already in shared memory").unwrap();
+
+    // O accumulators (persist across KV-tile iterations)
+    for nt in 0..n_tiles {
+        for r in 0..32 {
+            writeln!(ptx, "    .reg .f32 %wg_acc_o_{nt}_{r};").unwrap();
+        }
+    }
+
+    // P@V K-dimension loop
+    writeln!(ptx, "    mov.u32 %wg_k_iter, 0;").unwrap();
+    writeln!(ptx, "PV_WGMMA_K_LOOP:").unwrap();
+
+    for nt in 0..n_tiles {
+        writeln!(ptx, "    wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16").unwrap();
+        let acc_list: Vec<String> = (0..32).map(|r| format!("%wg_acc_o_{nt}_{r}")).collect();
+        writeln!(ptx, "        {{{}}},", acc_list.join(", ")).unwrap();
+        writeln!(ptx, "        [%wg_desc_p],").unwrap();
+        writeln!(ptx, "        [%wg_desc_v_{nt}],").unwrap();
+        writeln!(ptx, "        0, 0, 0, 0;").unwrap();
+    }
+
+    writeln!(ptx, "    wgmma.commit_group.sync.aligned;").unwrap();
+    writeln!(ptx, "    wgmma.wait_group.sync.aligned 0;").unwrap();
+
+    writeln!(ptx, "    add.u32 %wg_k_iter, %wg_k_iter, 1;").unwrap();
+    writeln!(ptx, "    setp.lt.u32 %wg_pk, %wg_k_iter, {k_iters};").unwrap();
+    writeln!(ptx, "    @%wg_pk bra PV_WGMMA_K_LOOP;").unwrap();
+}
+
+/// Emit wgmma register declarations (descriptor registers, accumulators).
+#[allow(dead_code)]
+fn emit_wgmma_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
+    use std::fmt::Write;
+
+    let n_tiles_s = block_kv / WGMMA_N;
+    let n_tiles_o = head_dim / WGMMA_N;
+
+    writeln!(ptx, "    // wgmma descriptor registers").unwrap();
+    writeln!(ptx, "    .reg .b64 %wg_desc_q;  // Q tile descriptor").unwrap();
+    for nt in 0..n_tiles_s {
+        writeln!(ptx, "    .reg .b64 %wg_desc_kt_{nt};  // K^T tile {nt} descriptor").unwrap();
+    }
+    writeln!(ptx, "    .reg .b64 %wg_desc_p;  // P tile descriptor (softmax output)").unwrap();
+    for nt in 0..n_tiles_o {
+        writeln!(ptx, "    .reg .b64 %wg_desc_v_{nt};  // V tile {nt} descriptor").unwrap();
+    }
+}
+
 /// Emit MMA register declarations needed by the fragment load and MMA helpers.
 /// These are shared temporaries — the actual accumulator registers are declared
 /// separately based on the tiling configuration.
@@ -1836,6 +2032,94 @@ mod tests {
         assert!(ptx.contains("{b0, b1}"), "B fragment regs");
         assert!(ptx.contains("{c0, c1, c2, c3}"), "C accumulator regs");
     }
+
+    // ── wgmma (Hopper sm_90) tests ──────────────────────────────────
+
+    #[test]
+    fn test_wgmma_smem_descriptor_emission() {
+        let mut ptx = String::new();
+        emit_wgmma_smem_descriptor(&mut ptx, "desc_q", "%smem_q_base", 128, 3);
+
+        assert!(ptx.contains("wgmma shared memory descriptor"), "comment present");
+        assert!(ptx.contains(".reg .b64 %desc_q"), "descriptor register declared");
+        assert!(ptx.contains("shr.u32"), "base address shift");
+        assert!(ptx.contains("0x3FFF"), "14-bit mask for base");
+    }
+
+    #[test]
+    fn test_qk_matmul_wgmma_emission() {
+        let mut ptx = String::new();
+        emit_qk_matmul_wgmma(&mut ptx, 64, 64, 64, 64 * 64 * 4);
+
+        assert!(ptx.contains("wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16"),
+            "wgmma instruction present");
+        assert!(ptx.contains("wgmma.commit_group.sync.aligned"), "commit present");
+        assert!(ptx.contains("wgmma.wait_group.sync.aligned"), "wait present");
+        assert!(ptx.contains("Softmax scalar math can overlap"), "async overlap comment");
+        assert!(ptx.contains("QK_WGMMA_K_LOOP"), "K loop label");
+        assert!(ptx.contains("%wg_acc_s_"), "S accumulator registers");
+        assert!(ptx.contains("%wg_desc_q"), "Q descriptor");
+        assert!(ptx.contains("%wg_desc_kt_"), "K^T descriptor");
+        // 64/64 = 1 n-tile, so 1 wgmma instruction per K iteration
+        let wgmma_count = ptx.matches("wgmma.mma_async.sync").count();
+        assert_eq!(wgmma_count, 1, "1 wgmma per n-tile");
+    }
+
+    #[test]
+    fn test_pv_matmul_wgmma_emission() {
+        let mut ptx = String::new();
+        emit_pv_matmul_wgmma(&mut ptx, 64, 64, 64 * 64 * 4);
+
+        assert!(ptx.contains("wgmma.mma_async.sync.aligned"), "wgmma present");
+        assert!(ptx.contains("%wg_acc_o_"), "O accumulator registers");
+        assert!(ptx.contains("%wg_desc_p"), "P descriptor");
+        assert!(ptx.contains("%wg_desc_v_"), "V descriptor");
+        assert!(ptx.contains("PV_WGMMA_K_LOOP"), "K loop label");
+    }
+
+    #[test]
+    fn test_wgmma_registers_emission() {
+        let mut ptx = String::new();
+        emit_wgmma_registers(&mut ptx, 64, 64);
+
+        assert!(ptx.contains("%wg_desc_q"), "Q descriptor register");
+        assert!(ptx.contains("%wg_desc_kt_0"), "K^T descriptor for tile 0");
+        assert!(ptx.contains("%wg_desc_p"), "P descriptor register");
+        assert!(ptx.contains("%wg_desc_v_0"), "V descriptor for tile 0");
+    }
+
+    #[test]
+    fn test_wgmma_constants() {
+        assert_eq!(WGMMA_M, 64, "wgmma tile M = 64");
+        assert_eq!(WGMMA_N, 64, "wgmma tile N = 64");
+        assert_eq!(WGMMA_K_F16, 16, "wgmma K for f16 = 16");
+    }
+
+    #[test]
+    fn test_wgmma_full_pipeline() {
+        let mut ptx = String::new();
+
+        // Register declarations
+        emit_wgmma_registers(&mut ptx, 64, 64);
+
+        // Q@K^T via wgmma
+        emit_qk_matmul_wgmma(&mut ptx, 64, 64, 64, 64 * 64 * 4);
+
+        // P@V via wgmma
+        emit_pv_matmul_wgmma(&mut ptx, 64, 64, 64 * 64 * 4);
+
+        // Both matmuls should use wgmma
+        let wgmma_count = ptx.matches("wgmma.mma_async.sync").count();
+        assert_eq!(wgmma_count, 2, "Q@K^T + P@V = 2 wgmma instructions");
+
+        // Both should have commit/wait pairs
+        let commit_count = ptx.matches("wgmma.commit_group").count();
+        let wait_count = ptx.matches("wgmma.wait_group").count();
+        assert_eq!(commit_count, 2, "2 commit groups");
+        assert_eq!(wait_count, 2, "2 wait groups");
+    }
+
+    // ── mma.sync (Ampere sm_80) tests ─────────────────────────────────
 
     #[test]
     fn test_load_a_fragment_emission() {
