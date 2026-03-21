@@ -547,7 +547,7 @@ impl<'a> Compiler<'a> {
             let bound_satisfied = final_ms <= constraint.max_latency_ms;
 
             let no_heap = prove_no_heap(self.slab_plan.as_ref(), &fn_name);
-            let static_cf = prove_static_cf(&target);
+            let static_cf = prove_static_cf(&target, &ops);
 
             let func_wcet = FunctionWcet {
                 name: fn_name.clone(),

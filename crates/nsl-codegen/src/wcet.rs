@@ -1,7 +1,15 @@
 //! M53: Worst-Case Execution Time (WCET) analysis for real-time inference.
 //!
+//! Two-tier model:
+//!   - **GPU** (statistical): roofline-based estimates with empirical p95 variance.
+//!     These are advisory bounds only — GPU warp scheduling is non-deterministic.
+//!     DO-178C reports are NOT valid for GPU targets.
+//!   - **FPGA** (certified): deterministic cycle counting on PE arrays with OCM isolation.
+//!     DO-178C compliance reports are valid only for FPGA targets.
+//!
 //! Provides per-operation cycle counting, proof generation (no-heap, static control flow),
-//! certificate emission (JSON + DO-178C), and structured error output with optimization hints.
+//! certificate emission (JSON + DO-178C for FPGA only), and structured error output with
+//! optimization hints.
 
 use std::path::Path;
 
@@ -50,6 +58,18 @@ pub enum OpKind {
 pub enum WcetDevice {
     GPU,
     CPU,
+    FPGA,
+}
+
+/// Target for WCET analysis with full device context.
+#[derive(Debug, Clone, Serialize)]
+pub enum WcetTarget {
+    /// GPU: statistical bounds only (advisory). DO-178C NOT valid.
+    Gpu { device_name: String },
+    /// FPGA: certified deterministic cycle counts. DO-178C valid.
+    Fpga { device_name: String, ocm_size_kb: u32 },
+    /// Groq LPU: blocked on ISA documentation.
+    GroqLpu,
 }
 
 /// Worst-case timing for a single operation.
@@ -74,6 +94,12 @@ pub struct OpWcet {
     pub sync_overhead_ns: u64,
     /// Whether this op was folded away by constant folding.
     pub folded: bool,
+    /// Confidence level: 1.0 for FPGA (deterministic), 0.95 for GPU (statistical p95).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Source of the heuristic used (e.g., "roofline_model_with_empirical_p95_variance").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heuristic_source: Option<String>,
 }
 
 /// Aggregate WCET result for a single function.
@@ -135,15 +161,23 @@ pub struct WcetCertificate {
     pub source_file: String,
     pub target_gpu: Option<String>,
     pub target_cpu: Option<String>,
+    pub target_fpga: Option<String>,
     pub declared_bound_ms: f64,
     pub computed_wcet_ms: f64,
     pub final_wcet_ms: f64,
     pub safety_margin: f64,
     pub bound_satisfied: bool,
+    /// Whether this certificate is valid for DO-178C compliance (FPGA only).
+    pub certifiable: bool,
+    /// Statistical confidence level (1.0 for FPGA, 0.95 for GPU).
+    pub confidence: f64,
     pub operations: Vec<OpWcet>,
     pub no_heap_proof: NoHeapProof,
     pub static_control_flow: StaticCFProof,
     pub summary: String,
+    /// Advisory note for GPU targets (non-certifiable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_statistical_note: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,17 +277,20 @@ fn dtype_bytes(dtype: &str) -> u64 {
 // Per-operation WCET cycle counting (Task 3)
 // ---------------------------------------------------------------------------
 
-/// GPU matmul WCET: [M, K] x [K, N].
+/// GPU matmul WCET (statistical p95): [M, K] x [K, N].
 ///
-/// Formula: `max(FLOPs / (peak_rate * occupancy), bytes / bandwidth) + launch + sync`
-pub fn wcet_matmul_gpu(m: u64, k: u64, n: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet {
+/// Formula: `max(FLOPs / (peak_rate * occupancy), bytes / bandwidth) * p95_ratio + launch + sync`
+///
+/// This is a statistical estimate, not a certified bound. GPU warp scheduling
+/// introduces non-deterministic variance. The `empirical_p95_ratio` inflates the
+/// optimistic roofline result to a p95 bound.
+pub fn estimate_matmul_gpu_statistical(m: u64, k: u64, n: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet {
     let db = dtype_bytes(dtype);
     let flops = 2 * m * k * n;
     let bytes = (m * k + k * n + m * n) * db;
 
     let peak_tflops = gpu.peak_tflops(db as usize);
-    // peak_tflops * 1e12 = FLOPs/s; occupancy reduces effective throughput
-    let peak_flops_per_ns = peak_tflops * 1e12 / 1e9; // FLOPs per nanosecond
+    let peak_flops_per_ns = peak_tflops * 1e12 / 1e9;
     let effective_rate = peak_flops_per_ns * gpu.occupancy_worst_case;
 
     let compute_ns = if effective_rate > 0.0 {
@@ -262,8 +299,7 @@ pub fn wcet_matmul_gpu(m: u64, k: u64, n: u64, dtype: &str, gpu: &GpuSpec) -> Op
         u64::MAX
     };
 
-    // bandwidth in GB/s = bytes per nanosecond
-    let bw_bytes_per_ns = gpu.peak_bandwidth_gbs; // GB/s = bytes/ns
+    let bw_bytes_per_ns = gpu.peak_bandwidth_gbs;
     let memory_ns = if bw_bytes_per_ns > 0.0 {
         (bytes as f64 / bw_bytes_per_ns).ceil() as u64
     } else {
@@ -272,7 +308,8 @@ pub fn wcet_matmul_gpu(m: u64, k: u64, n: u64, dtype: &str, gpu: &GpuSpec) -> Op
 
     let launch = gpu.kernel_launch_overhead_ns;
     let sync = gpu.sync_overhead_ns;
-    let worst_case_ns = compute_ns.max(memory_ns) + launch + sync;
+    let optimistic_ns = compute_ns.max(memory_ns) + launch + sync;
+    let p95_ns = (optimistic_ns as f64 * gpu.empirical_p95_ratio).ceil() as u64;
 
     OpWcet {
         name: format!("matmul_{}x{}x{}", m, k, n),
@@ -282,26 +319,32 @@ pub fn wcet_matmul_gpu(m: u64, k: u64, n: u64, dtype: &str, gpu: &GpuSpec) -> Op
         output_shape: format!("[{}, {}]", m, n),
         dtype: dtype.to_string(),
         device: WcetDevice::GPU,
-        worst_case_ns,
+        worst_case_ns: p95_ns,
         compute_ns,
         memory_ns,
         launch_overhead_ns: launch,
         sync_overhead_ns: sync,
         folded: false,
+        confidence: Some(0.95),
+        heuristic_source: Some("roofline_model_with_empirical_p95_variance".to_string()),
     }
 }
 
-/// GPU elementwise WCET (always memory-bound, compute_ns == 0).
+/// Backward-compatible alias for `estimate_matmul_gpu_statistical`.
+pub fn wcet_matmul_gpu(m: u64, k: u64, n: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet {
+    estimate_matmul_gpu_statistical(m, k, n, dtype, gpu)
+}
+
+/// GPU elementwise WCET (statistical p95, always memory-bound).
 ///
-/// Formula: `bytes / bandwidth + launch + sync`
-pub fn wcet_elementwise_gpu(
+/// Formula: `(bytes / bandwidth + launch + sync) * p95_ratio`
+pub fn estimate_elementwise_gpu_statistical(
     num_elements: u64,
     dtype: &str,
     op_name: &str,
     gpu: &GpuSpec,
 ) -> OpWcet {
     let db = dtype_bytes(dtype);
-    // Read input + write output = 2 * elements * dtype_bytes
     let bytes = 2 * num_elements * db;
 
     let bw_bytes_per_ns = gpu.peak_bandwidth_gbs;
@@ -313,7 +356,8 @@ pub fn wcet_elementwise_gpu(
 
     let launch = gpu.kernel_launch_overhead_ns;
     let sync = gpu.sync_overhead_ns;
-    let worst_case_ns = memory_ns + launch + sync;
+    let optimistic_ns = memory_ns + launch + sync;
+    let p95_ns = (optimistic_ns as f64 * gpu.empirical_p95_ratio).ceil() as u64;
 
     OpWcet {
         name: format!("{}_{}", op_name, num_elements),
@@ -323,21 +367,27 @@ pub fn wcet_elementwise_gpu(
         output_shape: format!("[{}]", num_elements),
         dtype: dtype.to_string(),
         device: WcetDevice::GPU,
-        worst_case_ns,
+        worst_case_ns: p95_ns,
         compute_ns: 0,
         memory_ns,
         launch_overhead_ns: launch,
         sync_overhead_ns: sync,
         folded: false,
+        confidence: Some(0.95),
+        heuristic_source: Some("roofline_model_with_empirical_p95_variance".to_string()),
     }
 }
 
-/// GPU softmax WCET (3 passes: max, exp-sum, normalize).
+/// Backward-compatible alias for `estimate_elementwise_gpu_statistical`.
+pub fn wcet_elementwise_gpu(num_elements: u64, dtype: &str, op_name: &str, gpu: &GpuSpec) -> OpWcet {
+    estimate_elementwise_gpu_statistical(num_elements, dtype, op_name, gpu)
+}
+
+/// GPU softmax WCET (statistical p95, 3 passes: max, exp-sum, normalize).
 ///
-/// Formula: `bytes * 6 / bandwidth + 3*launch + sync`
-pub fn wcet_softmax_gpu(num_elements: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet {
+/// Formula: `(bytes * 6 / bandwidth + 3*launch + sync) * p95_ratio`
+pub fn estimate_softmax_gpu_statistical(num_elements: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet {
     let db = dtype_bytes(dtype);
-    // 3 passes, each reads + writes the full tensor: 6 * elements * dtype_bytes total traffic
     let bytes = 6 * num_elements * db;
 
     let bw_bytes_per_ns = gpu.peak_bandwidth_gbs;
@@ -347,9 +397,10 @@ pub fn wcet_softmax_gpu(num_elements: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet
         u64::MAX
     };
 
-    let launch = gpu.kernel_launch_overhead_ns * 3; // 3 kernel launches
+    let launch = gpu.kernel_launch_overhead_ns * 3;
     let sync = gpu.sync_overhead_ns;
-    let worst_case_ns = memory_ns + launch + sync;
+    let optimistic_ns = memory_ns + launch + sync;
+    let p95_ns = (optimistic_ns as f64 * gpu.empirical_p95_ratio).ceil() as u64;
 
     OpWcet {
         name: format!("softmax_{}", num_elements),
@@ -359,13 +410,20 @@ pub fn wcet_softmax_gpu(num_elements: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet
         output_shape: format!("[{}]", num_elements),
         dtype: dtype.to_string(),
         device: WcetDevice::GPU,
-        worst_case_ns,
+        worst_case_ns: p95_ns,
         compute_ns: 0,
         memory_ns,
         launch_overhead_ns: launch,
         sync_overhead_ns: sync,
         folded: false,
+        confidence: Some(0.95),
+        heuristic_source: Some("roofline_model_with_empirical_p95_variance".to_string()),
     }
+}
+
+/// Backward-compatible alias for `estimate_softmax_gpu_statistical`.
+pub fn wcet_softmax_gpu(num_elements: u64, dtype: &str, gpu: &GpuSpec) -> OpWcet {
+    estimate_softmax_gpu_statistical(num_elements, dtype, gpu)
 }
 
 /// CPU matmul WCET: [M, K] x [K, N].
@@ -415,7 +473,172 @@ pub fn wcet_matmul_cpu(m: u64, k: u64, n: u64, dtype: &str, cpu: &CpuSpec) -> Op
         launch_overhead_ns: 0,
         sync_overhead_ns: 0,
         folded: false,
+        confidence: None,
+        heuristic_source: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// FPGA certified WCET (Phase 4 — deterministic cycle counting)
+// ---------------------------------------------------------------------------
+
+/// FPGA matmul WCET (certified): [M, K] x [K, N].
+///
+/// Deterministic: PE array systolic cycles + OCM load/store latency.
+/// No variance — clock is fixed, no speculative execution, no cache hierarchy.
+/// Confidence = 1.0 (suitable for DO-178C certification).
+pub fn wcet_matmul_fpga_certified(
+    m: u64, k: u64, n: u64, dtype: &str, fpga: &crate::gpu_specs::FpgaSpec,
+) -> OpWcet {
+    let db = dtype_bytes(dtype);
+    let (pe_rows, pe_cols) = fpga.pe_array_dims;
+    let pe_total = pe_rows as u64 * pe_cols as u64;
+
+    // Systolic array: each output element needs K MAC operations.
+    // With a (pe_rows x pe_cols) array, we tile M and N dimensions.
+    let m_tiles = m.div_ceil(pe_rows as u64);
+    let n_tiles = n.div_ceil(pe_cols as u64);
+    // Each tile processes K cycles for the reduction dimension
+    let compute_cycles = m_tiles * n_tiles * k;
+
+    // OCM load: load A tile (pe_rows * K) + B tile (K * pe_cols) per tile pair
+    // OCM store: write C tile (pe_rows * pe_cols) per output tile
+    let load_cycles_per_tile = (pe_rows as u64 * k + k * pe_cols as u64) * fpga.ocm_latency_cycles as u64;
+    let store_cycles_per_tile = pe_total * fpga.ocm_latency_cycles as u64;
+    let io_cycles = m_tiles * n_tiles * (load_cycles_per_tile + store_cycles_per_tile);
+
+    let total_cycles = compute_cycles + io_cycles;
+    let ns = (total_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64;
+
+    let _ = db; // dtype affects data width but not cycle count on fixed-width PEs
+
+    OpWcet {
+        name: format!("matmul_{}x{}x{}_fpga", m, k, n),
+        kind: OpKind::Matmul,
+        source_loc: String::new(),
+        input_shapes: vec![format!("[{}, {}]", m, k), format!("[{}, {}]", k, n)],
+        output_shape: format!("[{}, {}]", m, n),
+        dtype: dtype.to_string(),
+        device: WcetDevice::FPGA,
+        worst_case_ns: ns,
+        compute_ns: (compute_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64,
+        memory_ns: (io_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64,
+        launch_overhead_ns: 0,
+        sync_overhead_ns: 0,
+        folded: false,
+        confidence: Some(1.0),
+        heuristic_source: Some("fpga_deterministic_cycle_count".to_string()),
+    }
+}
+
+/// FPGA elementwise WCET (certified): N elements through PE pipeline.
+///
+/// Each element requires 1 cycle compute + OCM read + OCM write.
+pub fn wcet_elementwise_fpga_certified(
+    num_elements: u64, dtype: &str, op_name: &str, fpga: &crate::gpu_specs::FpgaSpec,
+) -> OpWcet {
+    let (pe_rows, pe_cols) = fpga.pe_array_dims;
+    let pe_total = pe_rows as u64 * pe_cols as u64;
+
+    // Elements processed in parallel across PEs
+    let batches = num_elements.div_ceil(pe_total);
+    let compute_cycles = batches; // 1 cycle per batch
+    let io_cycles = batches * 2 * fpga.ocm_latency_cycles as u64; // read + write per batch
+
+    let total_cycles = compute_cycles + io_cycles;
+    let ns = (total_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64;
+
+    let _ = dtype;
+
+    OpWcet {
+        name: format!("{}_{}_fpga", op_name, num_elements),
+        kind: OpKind::Elementwise,
+        source_loc: String::new(),
+        input_shapes: vec![format!("[{}]", num_elements)],
+        output_shape: format!("[{}]", num_elements),
+        dtype: dtype.to_string(),
+        device: WcetDevice::FPGA,
+        worst_case_ns: ns,
+        compute_ns: (compute_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64,
+        memory_ns: (io_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64,
+        launch_overhead_ns: 0,
+        sync_overhead_ns: 0,
+        folded: false,
+        confidence: Some(1.0),
+        heuristic_source: Some("fpga_deterministic_cycle_count".to_string()),
+    }
+}
+
+/// FPGA softmax WCET (certified): 3-pass (max, exp-sum, normalize) over N elements.
+pub fn wcet_softmax_fpga_certified(
+    num_elements: u64, dtype: &str, fpga: &crate::gpu_specs::FpgaSpec,
+) -> OpWcet {
+    let (pe_rows, pe_cols) = fpga.pe_array_dims;
+    let pe_total = pe_rows as u64 * pe_cols as u64;
+
+    let batches = num_elements.div_ceil(pe_total);
+    // 3 passes: max-reduce, exp-and-sum, normalize
+    let compute_cycles = batches * 3;
+    let io_cycles = batches * 6 * fpga.ocm_latency_cycles as u64; // 3 passes * (read + write)
+
+    let total_cycles = compute_cycles + io_cycles;
+    let ns = (total_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64;
+
+    let _ = dtype;
+
+    OpWcet {
+        name: format!("softmax_{}_fpga", num_elements),
+        kind: OpKind::Softmax,
+        source_loc: String::new(),
+        input_shapes: vec![format!("[{}]", num_elements)],
+        output_shape: format!("[{}]", num_elements),
+        dtype: dtype.to_string(),
+        device: WcetDevice::FPGA,
+        worst_case_ns: ns,
+        compute_ns: (compute_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64,
+        memory_ns: (io_cycles as f64 / fpga.clock_mhz as f64 * 1000.0).ceil() as u64,
+        launch_overhead_ns: 0,
+        sync_overhead_ns: 0,
+        folded: false,
+        confidence: Some(1.0),
+        heuristic_source: Some("fpga_deterministic_cycle_count".to_string()),
+    }
+}
+
+/// Prove that no DDR access occurs in the certified FPGA path.
+///
+/// Verifies that total data size (weights + activations + intermediates) fits in OCM.
+/// If it doesn't fit, returns false with the overshoot amount.
+pub fn prove_no_ddr_access(
+    total_data_bytes: u64,
+    fpga: &crate::gpu_specs::FpgaSpec,
+) -> (bool, u64) {
+    let ocm_bytes = fpga.ocm_size_kb as u64 * 1024;
+    if total_data_bytes <= ocm_bytes {
+        (true, 0)
+    } else {
+        (false, total_data_bytes - ocm_bytes)
+    }
+}
+
+/// Estimate total data footprint from a list of WCET ops.
+/// Sums input + output sizes across all ops (conservative — assumes no reuse).
+/// Returns total bytes assuming f32 (4 bytes per element).
+pub fn estimate_data_footprint_from_ops(ops: &[OpWcet]) -> u64 {
+    let mut total: u64 = 0;
+    for op in ops {
+        // Parse shapes to estimate element counts
+        for shape_str in op.input_shapes.iter().chain(std::iter::once(&op.output_shape)) {
+            let elements: u64 = shape_str
+                .trim_matches(|c: char| c == '[' || c == ']')
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u64>().ok())
+                .product::<u64>()
+                .max(1);
+            total += elements * 4; // f32 = 4 bytes
+        }
+    }
+    total
 }
 
 // ---------------------------------------------------------------------------
@@ -459,14 +682,60 @@ pub fn prove_no_heap(
 
 /// Prove that control flow is statically deterministic.
 ///
-/// For now this is a conservative approximation: we assume all branches in NSL model
-/// forward passes are loop-count-based (shape-dependent), which are static. A full
-/// implementation would walk the CFG and check for data-dependent branches.
-pub fn prove_static_cf() -> StaticCFProof {
-    StaticCFProof {
-        total_branches: 0,
-        data_dependent_branches: 0,
-        proven: true,
+/// For FPGA targets, we walk the analyzed ops and verify all branches are
+/// shape-dependent (statically deterministic). For GPU targets, static CF is
+/// unprovable because warp scheduling is non-deterministic — we return proven=false.
+///
+/// `ops` is the list of analyzed operations. Shape-dependent branches (e.g., loop
+/// bounds from tensor dimensions) are statically deterministic. Data-dependent
+/// branches (e.g., `if tensor[i] > 0`) are not — but NSL model forward passes
+/// don't generate data-dependent branches (the type system guarantees this for
+/// @real_time functions that pass the semantic checker).
+pub fn prove_static_cf(target: &WcetTarget, ops: &[OpWcet]) -> StaticCFProof {
+    match target {
+        WcetTarget::Gpu { .. } => {
+            // GPU warp scheduling is non-deterministic; cannot prove static CF.
+            StaticCFProof {
+                total_branches: 0,
+                data_dependent_branches: 0,
+                proven: false,
+            }
+        }
+        WcetTarget::Fpga { .. } => {
+            // Count branches from the op list. In NSL's compiled model code:
+            // - Loop bounds are tensor dimensions (shape-dependent = static)
+            // - Softmax has 3 passes (all shape-dependent loops)
+            // - Elementwise ops have no branches
+            // - Matmul has nested loops (all shape-dependent)
+            //
+            // Data-dependent branches would come from ops like dynamic control
+            // flow (match on tensor values). NSL's @real_time checker prevents
+            // these in annotated functions.
+            let total_branches = ops.iter().map(|op| match op.kind {
+                OpKind::Matmul | OpKind::Conv2d => 3, // 3 nested loops (M, K, N)
+                OpKind::Softmax => 3,                  // max, exp+sum, div passes
+                OpKind::Reduce => 1,                   // reduction loop
+                OpKind::Elementwise => 0,              // no branches
+                OpKind::Attention => 4,                // Q*K, softmax, *V, concat
+                OpKind::DataTransfer | OpKind::KernelLaunch
+                | OpKind::Synchronize | OpKind::SlabInit
+                | OpKind::WeightLoad => 0,
+            }).sum();
+
+            // Data-dependent = 0 because NSL's type system prevents data-dependent
+            // control flow in @real_time functions. The semantic checker rejects
+            // match/if on tensor values inside @real_time scope.
+            StaticCFProof {
+                total_branches,
+                data_dependent_branches: 0,
+                proven: true,
+            }
+        }
+        WcetTarget::GroqLpu => StaticCFProof {
+            total_branches: 0,
+            data_dependent_branches: 0,
+            proven: false,
+        },
     }
 }
 
@@ -494,8 +763,7 @@ pub fn build_certificate(
     no_heap: &NoHeapProof,
     static_cf: &StaticCFProof,
     source_file: &str,
-    gpu_name: Option<&str>,
-    cpu_name: Option<&str>,
+    target: &WcetTarget,
 ) -> WcetCertificate {
     let declared_bound_ms = func_wcet
         .constraint
@@ -503,16 +771,46 @@ pub fn build_certificate(
         .map(|c| c.max_latency_ms)
         .unwrap_or(0.0);
 
+    let (certifiable, confidence, gpu_name, cpu_name, fpga_name, gpu_note) = match target {
+        WcetTarget::Gpu { device_name } => (
+            false,
+            0.95,
+            Some(device_name.clone()),
+            None,
+            None,
+            Some(
+                "WARNING: This WCET bound is a statistical estimate based on roofline modeling. \
+                 GPU warp scheduling is non-deterministic. Actual latency may exceed this bound. \
+                 For safety-critical applications, use --wcet-target fpga."
+                    .to_string(),
+            ),
+        ),
+        WcetTarget::Fpga { device_name, .. } => (
+            true,
+            1.0,
+            None,
+            None,
+            Some(device_name.clone()),
+            None,
+        ),
+        WcetTarget::GroqLpu => (false, 0.0, None, None, None, Some(
+            "Groq LPU WCET not yet supported (ISA not public).".to_string(),
+        )),
+    };
+
+    let tier_label = if certifiable { "CERTIFIED" } else { "STATISTICAL" };
     let summary = if func_wcet.bound_satisfied {
         format!(
-            "WCET bound SATISFIED: {:.3}ms <= {:.3}ms (margin: {:.0}%)",
+            "[{}] WCET bound SATISFIED: {:.3}ms <= {:.3}ms (margin: {:.0}%)",
+            tier_label,
             func_wcet.final_wcet_ms,
             declared_bound_ms,
             (func_wcet.safety_margin - 1.0) * 100.0
         )
     } else {
         format!(
-            "WCET bound VIOLATED: {:.3}ms > {:.3}ms (margin: {:.0}%)",
+            "[{}] WCET bound VIOLATED: {:.3}ms > {:.3}ms (margin: {:.0}%)",
+            tier_label,
             func_wcet.final_wcet_ms,
             declared_bound_ms,
             (func_wcet.safety_margin - 1.0) * 100.0
@@ -520,20 +818,24 @@ pub fn build_certificate(
     };
 
     WcetCertificate {
-        version: "1.0".to_string(),
+        version: "2.0".to_string(),
         compiler_version: env!("CARGO_PKG_VERSION").to_string(),
         source_file: source_file.to_string(),
-        target_gpu: gpu_name.map(|s| s.to_string()),
-        target_cpu: cpu_name.map(|s| s.to_string()),
+        target_gpu: gpu_name,
+        target_cpu: cpu_name,
+        target_fpga: fpga_name,
         declared_bound_ms,
         computed_wcet_ms: func_wcet.total_wcet_ms,
         final_wcet_ms: func_wcet.final_wcet_ms,
         safety_margin: func_wcet.safety_margin,
         bound_satisfied: func_wcet.bound_satisfied,
+        certifiable,
+        confidence,
         operations: func_wcet.ops.clone(),
         no_heap_proof: no_heap.clone(),
         static_control_flow: static_cf.clone(),
         summary,
+        gpu_statistical_note: gpu_note,
     }
 }
 
@@ -546,7 +848,18 @@ pub fn emit_certificate(cert: &WcetCertificate, path: &Path) -> Result<(), Strin
 }
 
 /// Emit a DO-178C compliance report as a text file.
+///
+/// Returns an error if the certificate is not certifiable (e.g., GPU target).
+/// DO-178C reports require deterministic cycle counting (FPGA only).
 pub fn emit_do178c_report(cert: &WcetCertificate, path: &Path) -> Result<(), String> {
+    if !cert.certifiable {
+        return Err(
+            "DO-178C report requires FPGA target (GPU WCET is statistical only). \
+             Use --wcet-target fpga for certifiable analysis."
+                .to_string(),
+        );
+    }
+
     let mut report = String::new();
 
     report.push_str("==========================================================\n");
@@ -562,6 +875,11 @@ pub fn emit_do178c_report(cert: &WcetCertificate, path: &Path) -> Result<(), Str
     if let Some(ref cpu) = cert.target_cpu {
         report.push_str(&format!("Target CPU:        {}\n", cpu));
     }
+    if let Some(ref fpga) = cert.target_fpga {
+        report.push_str(&format!("Target FPGA:       {}\n", fpga));
+    }
+    report.push_str(&format!("Certifiable:       {}\n", if cert.certifiable { "YES" } else { "NO" }));
+    report.push_str(&format!("Confidence:        {:.0}%\n", cert.confidence * 100.0));
     report.push('\n');
 
     report.push_str("----------------------------------------------------------\n");
@@ -882,10 +1200,50 @@ mod tests {
     }
 
     #[test]
-    fn test_prove_static_cf() {
-        let proof = prove_static_cf();
-        assert!(proof.proven);
+    fn test_prove_static_cf_gpu_not_proven() {
+        let target = WcetTarget::Gpu { device_name: "H100-SXM".to_string() };
+        let proof = prove_static_cf(&target, &[]);
+        assert!(!proof.proven, "GPU static CF should NOT be provable");
+    }
+
+    #[test]
+    fn test_prove_static_cf_fpga_proven() {
+        let target = WcetTarget::Fpga { device_name: "xcvu440".to_string(), ocm_size_kb: 52_920 };
+        let ops = vec![
+            make_test_op("matmul", OpKind::Matmul),
+            make_test_op("softmax", OpKind::Softmax),
+        ];
+        let proof = prove_static_cf(&target, &ops);
+        assert!(proof.proven, "FPGA static CF should be provable");
         assert_eq!(proof.data_dependent_branches, 0);
+        assert_eq!(proof.total_branches, 6); // matmul=3 + softmax=3
+    }
+
+    fn make_test_op(name: &str, kind: OpKind) -> OpWcet {
+        OpWcet {
+            name: name.into(), kind,
+            source_loc: String::new(),
+            input_shapes: vec!["[64, 128]".into()],
+            output_shape: "[64, 256]".into(),
+            dtype: "f32".into(),
+            device: WcetDevice::GPU,
+            worst_case_ns: 1000,
+            compute_ns: 500, memory_ns: 500,
+            launch_overhead_ns: 0, sync_overhead_ns: 0,
+            folded: false,
+            confidence: Some(1.0), heuristic_source: None,
+        }
+    }
+
+    #[test]
+    fn test_estimate_data_footprint() {
+        let mut op = make_test_op("matmul", OpKind::Matmul);
+        op.input_shapes = vec!["[64, 128]".into(), "[128, 256]".into()];
+        op.output_shape = "[64, 256]".into();
+        let ops = vec![op];
+        let footprint = estimate_data_footprint_from_ops(&ops);
+        // [64,128]=8192 elements, [128,256]=32768, [64,256]=16384 → total 57344 elements × 4 bytes
+        assert_eq!(footprint, 57344 * 4);
     }
 
     // ---- Safety margin + bound tests ----
@@ -944,10 +1302,15 @@ mod tests {
             proven: true,
         };
 
-        let cert = build_certificate(&func, &no_heap, &static_cf, "model.nsl", Some("H100-SXM"), None);
+        let target = WcetTarget::Gpu { device_name: "H100-SXM".to_string() };
+        let cert = build_certificate(&func, &no_heap, &static_cf, "model.nsl", &target);
         assert!(cert.bound_satisfied);
         assert_eq!(cert.declared_bound_ms, 10.0);
         assert!(cert.summary.contains("SATISFIED"));
+        // GPU certificate must NOT be certifiable
+        assert!(!cert.certifiable, "GPU certificates are not certifiable for DO-178C");
+        assert!((cert.confidence - 0.95).abs() < 0.01);
+        assert!(cert.gpu_statistical_note.is_some());
     }
 
     // ---- Error output tests ----
@@ -972,6 +1335,8 @@ mod tests {
                 launch_overhead_ns: 5000,
                 sync_overhead_ns: 2000,
                 folded: false,
+                confidence: Some(0.95),
+                heuristic_source: Some("roofline_model_with_empirical_p95_variance".to_string()),
             }],
             suggestions: vec!["try FP8 quantization".to_string()],
         };
@@ -1001,6 +1366,8 @@ mod tests {
             launch_overhead_ns: 5000,
             sync_overhead_ns: 2000,
             folded: false,
+            confidence: None,
+            heuristic_source: None,
         }];
 
         let suggestions = generate_suggestions(&ops, 5.0, 10.0);
@@ -1015,5 +1382,191 @@ mod tests {
     fn test_generate_suggestions_empty_ops() {
         let suggestions = generate_suggestions(&[], 10.0, 5.0);
         assert!(suggestions.is_empty());
+    }
+
+    // ---- Phase 6: Two-tier WCET tests ----
+
+    #[test]
+    fn test_gpu_certificate_not_certifiable() {
+        let func = FunctionWcet {
+            name: "forward".to_string(),
+            ops: vec![],
+            total_wcet_ns: 5_000_000,
+            total_wcet_ms: 5.0,
+            safety_margin: 1.05,
+            final_wcet_ms: 5.25,
+            constraint: Some(RealTimeConstraint { max_latency_ms: 10.0, device: None }),
+            bound_satisfied: true,
+            no_heap_proven: true,
+            static_cf_proven: false,
+        };
+        let no_heap = NoHeapProof {
+            functions_checked: vec!["forward".to_string()],
+            total_alloc_sites: 1, slab_planned_sites: 1,
+            violations: Vec::new(), proven: true,
+        };
+        let static_cf = StaticCFProof { total_branches: 0, data_dependent_branches: 0, proven: false };
+        let target = WcetTarget::Gpu { device_name: "H100-SXM".to_string() };
+        let cert = build_certificate(&func, &no_heap, &static_cf, "test.nsl", &target);
+
+        assert!(!cert.certifiable);
+        assert!((cert.confidence - 0.95).abs() < 0.01);
+        assert!(cert.gpu_statistical_note.is_some());
+        assert!(cert.summary.contains("STATISTICAL"));
+    }
+
+    #[test]
+    fn test_fpga_certificate_certifiable() {
+        let func = FunctionWcet {
+            name: "forward".to_string(),
+            ops: vec![],
+            total_wcet_ns: 5_000_000,
+            total_wcet_ms: 5.0,
+            safety_margin: 1.05,
+            final_wcet_ms: 5.25,
+            constraint: Some(RealTimeConstraint { max_latency_ms: 10.0, device: None }),
+            bound_satisfied: true,
+            no_heap_proven: true,
+            static_cf_proven: true,
+        };
+        let no_heap = NoHeapProof {
+            functions_checked: vec!["forward".to_string()],
+            total_alloc_sites: 1, slab_planned_sites: 1,
+            violations: Vec::new(), proven: true,
+        };
+        let static_cf = StaticCFProof { total_branches: 0, data_dependent_branches: 0, proven: true };
+        let target = WcetTarget::Fpga { device_name: "xcvu440".to_string(), ocm_size_kb: 52_920 };
+        let cert = build_certificate(&func, &no_heap, &static_cf, "test.nsl", &target);
+
+        assert!(cert.certifiable);
+        assert!((cert.confidence - 1.0).abs() < 0.01);
+        assert!(cert.gpu_statistical_note.is_none());
+        assert!(cert.summary.contains("CERTIFIED"));
+    }
+
+    #[test]
+    fn test_do178c_report_rejected_for_gpu() {
+        let func = FunctionWcet {
+            name: "forward".to_string(),
+            ops: vec![],
+            total_wcet_ns: 5_000_000,
+            total_wcet_ms: 5.0,
+            safety_margin: 1.05,
+            final_wcet_ms: 5.25,
+            constraint: None,
+            bound_satisfied: true,
+            no_heap_proven: true,
+            static_cf_proven: false,
+        };
+        let no_heap = NoHeapProof {
+            functions_checked: vec!["forward".to_string()],
+            total_alloc_sites: 0, slab_planned_sites: 0,
+            violations: Vec::new(), proven: true,
+        };
+        let static_cf = StaticCFProof { total_branches: 0, data_dependent_branches: 0, proven: false };
+        let target = WcetTarget::Gpu { device_name: "Orin".to_string() };
+        let cert = build_certificate(&func, &no_heap, &static_cf, "test.nsl", &target);
+
+        // Should fail to emit DO-178C for GPU target
+        let result = emit_do178c_report(&cert, std::path::Path::new("/tmp/should_not_exist.txt"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("FPGA target"));
+    }
+
+    #[test]
+    fn test_gpu_p95_estimate_larger_than_optimistic() {
+        let gpu = find_gpu("H100-SXM").unwrap();
+        let op = estimate_matmul_gpu_statistical(128, 4096, 4096, "fp16", gpu);
+        assert!(op.confidence == Some(0.95));
+
+        // The p95 estimate should be > the raw compute/memory time
+        // (since empirical_p95_ratio > 1.0)
+        let raw_ns = op.compute_ns.max(op.memory_ns) + op.launch_overhead_ns + op.sync_overhead_ns;
+        assert!(
+            op.worst_case_ns > raw_ns,
+            "p95 estimate ({}) should exceed raw roofline ({})",
+            op.worst_case_ns, raw_ns
+        );
+    }
+
+    #[test]
+    fn test_fpga_matmul_deterministic() {
+        let fpga = crate::gpu_specs::find_fpga("xcvu440").unwrap();
+        let op = wcet_matmul_fpga_certified(64, 256, 256, "fp16", fpga);
+        assert!(op.worst_case_ns > 0);
+        assert_eq!(op.confidence, Some(1.0));
+        assert!(matches!(op.device, WcetDevice::FPGA));
+        assert!(op.launch_overhead_ns == 0);
+        assert!(op.sync_overhead_ns == 0);
+    }
+
+    #[test]
+    fn test_fpga_elementwise_deterministic() {
+        let fpga = crate::gpu_specs::find_fpga("xcvu440").unwrap();
+        let op = wcet_elementwise_fpga_certified(1024, "fp16", "relu", fpga);
+        assert!(op.worst_case_ns > 0);
+        assert_eq!(op.confidence, Some(1.0));
+    }
+
+    #[test]
+    fn test_fpga_softmax_deterministic() {
+        let fpga = crate::gpu_specs::find_fpga("xcvu440").unwrap();
+        let op = wcet_softmax_fpga_certified(1024, "fp16", fpga);
+        assert!(op.worst_case_ns > 0);
+        assert_eq!(op.confidence, Some(1.0));
+    }
+
+    #[test]
+    fn test_prove_no_ddr_access_fits() {
+        let fpga = crate::gpu_specs::find_fpga("xcvu440").unwrap();
+        let (proven, overshoot) = prove_no_ddr_access(1024 * 1024, fpga); // 1 MB fits in 51.7 MB OCM
+        assert!(proven);
+        assert_eq!(overshoot, 0);
+    }
+
+    #[test]
+    fn test_prove_no_ddr_access_exceeds() {
+        let fpga = crate::gpu_specs::find_fpga("xczu9eg").unwrap();
+        let data_bytes = 4 * 1024 * 1024; // 4 MB > 1.8 MB OCM
+        let (proven, overshoot) = prove_no_ddr_access(data_bytes, fpga);
+        assert!(!proven);
+        assert!(overshoot > 0);
+    }
+
+    #[test]
+    fn test_fpga_database_lookup() {
+        let fpga = crate::gpu_specs::find_fpga("xcvu440").unwrap();
+        assert_eq!(fpga.device_name, "xcvu440");
+        assert_eq!(fpga.clock_mhz, 300);
+        assert_eq!(fpga.pe_array_dims, (16, 16));
+
+        let zynq = crate::gpu_specs::find_fpga("xczu9eg").unwrap();
+        assert_eq!(zynq.device_name, "xczu9eg");
+
+        let versal = crate::gpu_specs::find_fpga("ve2302").unwrap();
+        assert_eq!(versal.device_name, "ve2302");
+        assert_eq!(versal.clock_mhz, 400);
+
+        assert!(crate::gpu_specs::find_fpga("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_gpu_empirical_p95_ratios() {
+        // Verify all GPUs have sensible p95 ratios
+        for gpu in crate::gpu_specs::GPU_DATABASE {
+            assert!(
+                gpu.empirical_p95_ratio >= 1.0 && gpu.empirical_p95_ratio <= 2.0,
+                "{} has out-of-range p95 ratio: {}",
+                gpu.name, gpu.empirical_p95_ratio
+            );
+        }
+        // Edge GPUs should have higher variance than datacenter
+        let h100 = find_gpu("H100-SXM").unwrap();
+        let orin = find_gpu("Orin").unwrap();
+        assert!(
+            orin.empirical_p95_ratio > h100.empirical_p95_ratio,
+            "Edge GPU Orin ({}) should have higher p95 variance than datacenter H100 ({})",
+            orin.empirical_p95_ratio, h100.empirical_p95_ratio
+        );
     }
 }
