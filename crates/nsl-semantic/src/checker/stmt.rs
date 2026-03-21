@@ -344,19 +344,28 @@ impl<'a> TypeChecker<'a> {
                             // No validation logic required (just recognized and passed through)
                         }
 
-                        // M46: @deterministic — recognized here, validation in determinism.rs pass
+                        // M46: @deterministic — register with effect checker for validation
                         if dname == "deterministic" {
-                            // Recognized — validation happens in determinism.rs pass
+                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                                self.effect_checker.mark_deterministic(&fn_name);
+                            }
                         }
 
-                        // M51: @pure — recognized here, effect validation in effects.rs pass
+                        // M51: @pure — register with effect checker for validation
                         if dname == "pure" {
-                            // Recognized — effect validation in effects.rs pass
+                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                                self.effect_checker.mark_pure(&fn_name);
+                            }
                         }
 
-                        // M51: @checkpoint — recognized here, requires @pure (validated by effects.rs)
+                        // M51: @checkpoint — register with effect checker (requires @pure)
                         if dname == "checkpoint" {
-                            // Recognized — requires @pure (validated by effects.rs)
+                            if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                                self.effect_checker.mark_checkpointed(&fn_name);
+                            }
                         }
 
                         // M49: @shape_assert — recognized here, constraints added to solver during semantic analysis

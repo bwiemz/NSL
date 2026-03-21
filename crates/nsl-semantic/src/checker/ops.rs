@@ -151,6 +151,14 @@ impl<'a> TypeChecker<'a> {
         // Check each argument
         let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(&a.value)).collect();
 
+        // M51: Track callee names for effect call graph construction
+        if let ExprKind::Ident(sym) = &callee.kind {
+            let callee_name = self.interner.resolve(sym.0).unwrap_or("").to_string();
+            if !callee_name.is_empty() {
+                self.current_callees.push(callee_name);
+            }
+        }
+
         // Special type inference for enumerate(list) -> List(Tuple(Int, T))
         if let ExprKind::Ident(sym) = &callee.kind {
             let name = self.interner.resolve(sym.0).unwrap_or("").to_string();

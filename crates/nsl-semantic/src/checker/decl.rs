@@ -75,10 +75,22 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Check body
+        // Check body (track callees for effect graph)
+        let prev_callees = std::mem::take(&mut self.current_callees);
         for s in &fn_def.body.stmts {
             self.check_stmt(s);
         }
+        let callees = std::mem::replace(&mut self.current_callees, prev_callees);
+
+        // M51: Register function with effect checker for propagation/validation.
+        // Local effects are computed from direct builtin calls in the callee list.
+        let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+        let mut local_effects = crate::effects::EffectSet::PURE;
+        for callee in &callees {
+            let ce = crate::effects::classify_builtin_effects(callee);
+            local_effects |= ce;
+        }
+        self.effect_checker.register_function(&fn_name, local_effects, callees);
 
         self.current_scope = prev_scope;
         self.current_return_type = prev_return;

@@ -51,6 +51,9 @@ pub struct TypeChecker<'a> {
     pub effect_checker: crate::effects::EffectChecker,
     current_scope: ScopeId,
     current_return_type: Option<Type>,
+    /// M51: Tracks callee function names during function body checking
+    /// for effect call graph construction.
+    current_callees: Vec<String>,
     /// Pre-resolved types for imported symbols (from other modules).
     import_types: HashMap<Symbol, Type>,
     /// Registry of user-defined `datatype` blocks validated in this module.
@@ -67,6 +70,7 @@ impl<'a> TypeChecker<'a> {
             effect_checker: crate::effects::EffectChecker::new(),
             current_scope: ScopeId::ROOT,
             current_return_type: None,
+            current_callees: Vec::new(),
             import_types: HashMap::new(),
             custom_datatypes: HashMap::new(),
         }
@@ -83,6 +87,11 @@ impl<'a> TypeChecker<'a> {
         for stmt in &module.stmts {
             self.check_stmt(stmt);
         }
+
+        // M51: Propagate effects through call graph and validate assertions.
+        self.effect_checker.propagate();
+        self.effect_checker.validate();
+        self.diagnostics.append(&mut self.effect_checker.diagnostics);
     }
 
     /// Pre-declare top-level names so forward references work.

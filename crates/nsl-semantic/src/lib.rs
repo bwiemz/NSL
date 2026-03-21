@@ -19,6 +19,7 @@ pub mod scope;
 pub mod shape_algebra;
 pub mod shapes;
 pub mod sparse;
+pub mod sparse_layout;
 pub mod speculative;
 pub mod target;
 pub mod types;
@@ -31,7 +32,6 @@ use nsl_errors::Diagnostic;
 use nsl_lexer::Interner;
 
 use crate::checker::{TypeChecker, TypeMap};
-use crate::effects::EffectChecker;
 use crate::scope::ScopeMap;
 use crate::types::Type;
 
@@ -79,8 +79,8 @@ pub fn analyze_with_imports(
     checker.set_import_types(import_types);
     checker.check_module(module);
 
-    // M51: Run effect analysis (placeholder — call-graph population not yet implemented).
-    let _effect_checker = EffectChecker::new();
+    // M51: Effect analysis is now integrated into TypeChecker — propagation
+    // and validation run at the end of check_module(). Diagnostics are merged.
 
     // Extract results from type checker, releasing its borrows on interner/scopes
     let mut diagnostics = checker.diagnostics;
