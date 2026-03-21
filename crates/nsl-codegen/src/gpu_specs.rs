@@ -80,6 +80,34 @@ impl GpuSpec {
     pub fn supports_fp16_mma(&self) -> bool {
         self.sm_version >= 80
     }
+
+    /// Returns true if the GPU supports wgmma.mma_async (128-thread warp groups).
+    /// Requires sm_90 (H100/H200). Enables ~37% more tensor core utilization
+    /// over mma.sync via asynchronous warp group execution.
+    pub fn supports_wgmma(&self) -> bool {
+        self.sm_version >= 90
+    }
+
+    /// Returns the appropriate PTX version string for this GPU's features.
+    pub fn ptx_version(&self) -> &'static str {
+        if self.sm_version >= 90 { "8.0" }
+        else { "7.0" }
+    }
+
+    /// Returns the PTX target string for this GPU.
+    pub fn ptx_target(&self) -> &'static str {
+        if self.sm_version >= 90 { "sm_90" }
+        else if self.sm_version >= 89 { "sm_89" }
+        else if self.sm_version >= 87 { "sm_87" }
+        else if self.sm_version >= 86 { "sm_86" }
+        else if self.sm_version >= 80 { "sm_80" }
+        else { "sm_52" }
+    }
+
+    /// Warp group size: 128 threads on Hopper (4 warps collaborate), 32 on older.
+    pub fn warp_group_size(&self) -> u32 {
+        if self.sm_version >= 90 { 128 } else { 32 }
+    }
 }
 
 /// Built-in GPU specification database.
@@ -388,5 +416,40 @@ mod tests {
 
         let orin = find_gpu("Orin").unwrap();
         assert!(orin.supports_fp16_mma(), "Orin (sm_87) should support FP16 MMA");
+    }
+
+    #[test]
+    fn test_wgmma_requires_sm90() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert!(h100.supports_wgmma(), "H100 (sm_90) should support wgmma");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert!(!a100.supports_wgmma(), "A100 (sm_80) should NOT support wgmma");
+
+        let rtx4090 = find_gpu("RTX-4090").unwrap();
+        assert!(!rtx4090.supports_wgmma(), "RTX-4090 (sm_89) should NOT support wgmma");
+    }
+
+    #[test]
+    fn test_ptx_target_selection() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert_eq!(h100.ptx_target(), "sm_90");
+        assert_eq!(h100.ptx_version(), "8.0");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert_eq!(a100.ptx_target(), "sm_80");
+        assert_eq!(a100.ptx_version(), "7.0");
+
+        let rtx4090 = find_gpu("RTX-4090").unwrap();
+        assert_eq!(rtx4090.ptx_target(), "sm_89");
+    }
+
+    #[test]
+    fn test_warp_group_size() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert_eq!(h100.warp_group_size(), 128, "Hopper uses 128-thread warp groups");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert_eq!(a100.warp_group_size(), 32, "Ampere uses 32-thread warps");
     }
 }
