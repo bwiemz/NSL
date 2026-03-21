@@ -3,7 +3,7 @@ use nsl_errors::Span;
 use nsl_lexer::Interner;
 
 use crate::scope::{ScopeId, ScopeMap, SymbolInfo};
-use crate::types::{Type, Shape, DType, Device};
+use crate::types::{Type, Shape, DType, Device, Effect};
 
 /// Register all built-in symbols in the root scope.
 pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
@@ -30,6 +30,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -37,6 +38,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Int))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -44,6 +46,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -51,6 +54,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -58,6 +62,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -65,6 +70,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
+            effect: Effect::Inferred,
         },
     );
 
@@ -80,6 +86,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![Type::List(Box::new(Type::Int))],
                 ret: Box::new(tensor_ret.clone()),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -89,6 +96,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::List(Box::new(Type::Int)), Type::Float],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // arange(start, stop, step) -> Tensor (variadic via Unknown)
@@ -97,6 +105,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -107,6 +116,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![tensor_ret.clone()],
                 ret: Box::new(tensor_ret.clone()),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -116,6 +126,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -135,6 +146,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![Type::Unknown],
                 ret: Box::new(Type::Unknown),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -145,6 +157,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Bool),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -152,6 +165,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Bool],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
 
@@ -161,6 +175,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -168,6 +183,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -180,6 +196,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
                 Type::Float,
             ],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -187,6 +204,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -194,6 +212,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Str),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -201,6 +220,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Str],
             ret: Box::new(Type::Str),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -208,6 +228,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Str, Type::Str],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -215,6 +236,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Str, Type::Str],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -222,6 +244,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Str],
             ret: Box::new(Type::Bool),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -229,6 +252,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::List(Box::new(Type::Str))),
+            effect: Effect::Inferred,
         },
     );
 
@@ -239,6 +263,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![Type::Unknown],
                 ret: Box::new(Type::Unknown),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -249,6 +274,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
 
@@ -258,6 +284,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), tensor_ret.clone()],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -267,6 +294,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone(), Type::Float],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // rmsnorm(input, weight, eps) -> tensor
@@ -275,6 +303,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), tensor_ret.clone(), Type::Float],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -284,6 +313,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), Type::Float, Type::Bool],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
@@ -292,6 +322,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone(), Type::Int, Type::Int, Type::Int, Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // maxpool2d(input, kernel_h, kernel_w, stride, padding) -> tensor
@@ -300,6 +331,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), Type::Int, Type::Int, Type::Int, Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -309,6 +341,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), tensor_ret.clone()],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -319,6 +352,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![Type::Unknown],
                 ret: Box::new(Type::Unknown),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -329,6 +363,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), Type::Int, Type::Int, Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // tensor_cat(list_of_tensors, dim) -> tensor
@@ -337,6 +372,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::List(Box::new(tensor_ret.clone())), Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -346,6 +382,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone()],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -356,6 +393,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![tensor_ret.clone(), Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // stack(list_of_tensors, dim) -> tensor
@@ -364,6 +402,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::List(Box::new(tensor_ret.clone())), Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // causal_mask(seq_len) -> tensor
@@ -372,6 +411,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -388,6 +428,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
                 Type::Unknown,       // causal (optional, makes it variadic)
             ],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -397,6 +438,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -404,6 +446,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Str, Type::Int, Type::Int, Type::List(Box::new(Type::Str))],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -411,6 +454,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Str],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -418,6 +462,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Str],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -425,6 +470,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Str],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -432,6 +478,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, tensor_ret.clone()],
             ret: Box::new(Type::Str),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -439,6 +486,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -446,6 +494,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::List(Box::new(Type::Str)), Type::Int, Type::Int, Type::Int],
             ret: Box::new(Type::List(Box::new(tensor_ret.clone()))),
+            effect: Effect::Inferred,
         },
     );
 
@@ -456,6 +505,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Int, Type::Int, Type::Int, Type::Int],
             ret: Box::new(Type::QuantizedTensor),
+            effect: Effect::Inferred,
         },
     );
     // nsl_qtensor_dequantize(qtensor) -> Tensor
@@ -464,6 +514,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::QuantizedTensor],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // nsl_qtensor_matmul_mixed(tensor, qtensor) -> Tensor
@@ -472,6 +523,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::QuantizedTensor],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     // nsl_qtensor_dtype(qtensor) -> Int
@@ -480,6 +532,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::QuantizedTensor],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     // nsl_qtensor_shape(qtensor) -> Tensor (1D shape as f64 values)
@@ -488,6 +541,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::QuantizedTensor],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -498,6 +552,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![Type::Unknown],
                 ret: Box::new(Type::Float),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -508,6 +563,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -515,6 +571,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Float),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -522,6 +579,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Bool),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -529,6 +587,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Str),
+            effect: Effect::Inferred,
         },
     );
     def("void", Type::Void);
@@ -540,6 +599,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             Type::Function {
                 params: vec![],
                 ret: Box::new(Type::Int),
+                effect: Effect::Inferred,
             },
         );
     }
@@ -548,6 +608,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     // Device identifier constants (M17)
@@ -564,6 +625,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -571,6 +633,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -578,6 +641,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -585,6 +649,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -592,6 +657,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -599,6 +665,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Unknown))),
+            effect: Effect::Inferred,
         },
     );
 
@@ -609,6 +676,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()))),
+            effect: Effect::Inferred,
         },
     );
     // save_safetensors(dict, path) -> void
@@ -617,6 +685,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     // from_hf(repo_id, model, device=0) -> model
@@ -625,6 +694,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
+            effect: Effect::Inferred,
         },
     );
     // to_onnx(model, input, path) -> void
@@ -633,6 +703,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
 
@@ -642,6 +713,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Str))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -649,6 +721,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::List(Box::new(Type::Str))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -656,6 +729,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -663,6 +737,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Unknown),
+            effect: Effect::Inferred,
         },
     );
 
@@ -672,6 +747,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()))),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -679,6 +755,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -686,6 +763,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -693,6 +771,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -700,6 +779,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -707,6 +787,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -716,6 +797,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int, Type::Int, Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -723,6 +805,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int, Type::Int, Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -730,6 +813,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -737,6 +821,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -744,6 +829,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -751,6 +837,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -758,6 +845,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -765,6 +853,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -772,6 +861,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -779,6 +869,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int, Type::Int],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -786,6 +877,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::Float),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -793,6 +885,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
 
@@ -802,6 +895,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -809,6 +903,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -816,6 +911,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
         },
     );
     // Kernel profiler builtins (M26)
@@ -824,6 +920,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -831,6 +928,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
 
@@ -840,6 +938,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown, Type::Unknown],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -854,6 +953,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
                 Type::Int,           // vocab_size
             ],
             ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
         },
     );
 
@@ -863,6 +963,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Str],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
     def(
@@ -870,6 +971,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         Type::Function {
             params: vec![Type::Unknown, Type::Str],
             ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
         },
     );
 }

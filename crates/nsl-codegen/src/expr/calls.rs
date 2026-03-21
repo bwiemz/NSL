@@ -1354,7 +1354,7 @@ impl Compiler<'_> {
 
         let raw_val = self.compile_expr(builder, state, callee)?;
 
-        if let Type::Function { params: param_types, ret } = &callee_type {
+        if let Type::Function { params: param_types, ret, .. } = &callee_type {
             if let Some(num_captures) = closure_captures {
                 // Closure call: raw_val is a pointer to { fn_ptr, num_captures, captures[] }
                 let closure_ptr = raw_val;

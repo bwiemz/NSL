@@ -445,7 +445,7 @@ fn reject_borrow_in_type(ty: &TypeExpr, p: &mut Parser) {
                 reject_borrow_in_type(arg, p);
             }
         }
-        TypeExprKind::Function { params, ret } => {
+        TypeExprKind::Function { params, ret, .. } => {
             // Borrows in function *param* types are allowed; only reject in the return type.
             reject_borrow_in_type(ret, p);
             let _ = params; // params are fine
@@ -479,6 +479,7 @@ fn parse_function_or_tuple_type(p: &mut Parser) -> TypeExpr {
             kind: TypeExprKind::Function {
                 params: types,
                 ret: Box::new(ret),
+                effect: None,
             },
             span,
             id: p.next_node_id(),

@@ -287,7 +287,7 @@ impl<'a> TypeChecker<'a> {
         }
 
         match &callee_ty {
-            Type::Function { params, ret } => {
+            Type::Function { params, ret, effect } => {
                 // Check arity (allow flexible arity if params has Unknown — variadic builtins)
                 let is_variadic = params.iter().any(|p| matches!(p, Type::Unknown));
                 if arg_types.len() > params.len() && !is_variadic {
@@ -310,6 +310,13 @@ impl<'a> TypeChecker<'a> {
                         .with_label(span, "missing arguments"),
                     );
                 }
+
+                // Effect variable bindings: when a function parameter is a callable
+                // with an effect variable, bind that variable to the concrete effect
+                // of the passed argument.
+                let mut effect_bindings: std::collections::HashMap<nsl_ast::Symbol, crate::effects::EffectSet> =
+                    std::collections::HashMap::new();
+
                 // Check each arg type against param type
                 for (i, (arg_ty, param_ty)) in
                     arg_types.iter().zip(params.iter()).enumerate()
@@ -325,7 +332,20 @@ impl<'a> TypeChecker<'a> {
                             .with_label(args[i].span, "type mismatch"),
                         );
                     }
+
+                    // Unify effect variables: if param is fn(...) | E and arg is fn(...) | {concrete}
+                    if let (
+                        Type::Function { effect: Effect::Var(var_sym), .. },
+                        Type::Function { effect: arg_eff, .. },
+                    ) = (param_ty, arg_ty) {
+                        let concrete = arg_eff.substitute(&effect_bindings);
+                        effect_bindings.insert(*var_sym, concrete);
+                    }
                 }
+
+                // Substitute effect bindings into the return effect
+                let _call_effect = effect.substitute(&effect_bindings);
+
                 *ret.clone()
             }
             Type::Model { .. } => callee_ty.clone(),
@@ -470,6 +490,7 @@ impl<'a> TypeChecker<'a> {
                             dtype: crate::types::DType::Unknown,
                             device: crate::types::Device::Unknown,
                         }),
+                        effect: Effect::Inferred,
                     },
                     "mean" => Type::Function {
                         params: vec![],
@@ -478,22 +499,27 @@ impl<'a> TypeChecker<'a> {
                             dtype: crate::types::DType::Unknown,
                             device: crate::types::Device::Unknown,
                         }),
+                        effect: Effect::Inferred,
                     },
                     "reshape" => Type::Function {
                         params: vec![Type::List(Box::new(Type::Int))],
                         ret: Box::new(obj_ty.clone()),
+                        effect: Effect::Inferred,
                     },
                     "transpose" => Type::Function {
                         params: vec![Type::Int, Type::Int],
                         ret: Box::new(obj_ty.clone()),
+                        effect: Effect::Inferred,
                     },
                     "clone" => Type::Function {
                         params: vec![],
                         ret: Box::new(obj_ty.clone()),
+                        effect: Effect::Inferred,
                     },
                     "item" => Type::Function {
                         params: vec![],
                         ret: Box::new(Type::Float),
+                        effect: Effect::Inferred,
                     },
                     "to" => Type::Function {
                         params: vec![Type::Int],
@@ -502,6 +528,7 @@ impl<'a> TypeChecker<'a> {
                             dtype: crate::types::DType::Unknown,
                             device: crate::types::Device::Unknown,
                         }),
+                        effect: Effect::Inferred,
                     },
                     _ => Type::Unknown,    // tensor methods
                 }
@@ -513,21 +540,25 @@ impl<'a> TypeChecker<'a> {
                     "upper" | "lower" | "strip" | "replace" | "join" => Type::Function {
                         params: vec![Type::Unknown],
                         ret: Box::new(Type::Str),
+                        effect: Effect::Inferred,
                     },
                     // String methods that return lists
                     "split" => Type::Function {
                         params: vec![Type::Unknown],
                         ret: Box::new(Type::List(Box::new(Type::Str))),
+                        effect: Effect::Inferred,
                     },
                     // String methods that return int
                     "find" => Type::Function {
                         params: vec![Type::Unknown],
                         ret: Box::new(Type::Int),
+                        effect: Effect::Inferred,
                     },
                     // String methods that return bool
                     "startswith" | "endswith" | "contains" => Type::Function {
                         params: vec![Type::Unknown],
                         ret: Box::new(Type::Bool),
+                        effect: Effect::Inferred,
                     },
                     _ => Type::Unknown,
                 }
@@ -538,10 +569,12 @@ impl<'a> TypeChecker<'a> {
                     "append" | "push" => Type::Function {
                         params: vec![Type::Unknown],
                         ret: Box::new(Type::Void),
+                        effect: Effect::Inferred,
                     },
                     "len" => Type::Function {
                         params: vec![],
                         ret: Box::new(Type::Int),
+                        effect: Effect::Inferred,
                     },
                     _ => Type::Unknown,
                 }

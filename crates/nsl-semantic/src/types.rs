@@ -2,7 +2,61 @@ use std::collections::HashMap;
 
 use nsl_ast::Symbol;
 
+use crate::effects::EffectSet;
 use crate::shapes;
+
+// ---------------------------------------------------------------------------
+// Effect — effect annotation on function types
+// ---------------------------------------------------------------------------
+
+/// An effect annotation: either concrete, inferred, or a variable to be unified at call sites.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Effect {
+    /// Known concrete effects: {IO, RANDOM}, etc.
+    Concrete(EffectSet),
+    /// Effect variable: resolved at each call site via unification.
+    Var(Symbol),
+    /// Union of an effect variable and concrete effects: E | {IO}.
+    Union(Box<Effect>, Box<Effect>),
+    /// Not yet resolved — default for functions without explicit annotations.
+    /// Resolved during effect inference to Concrete.
+    #[default]
+    Inferred,
+}
+
+impl Effect {
+    /// Pure effect — no side effects.
+    pub fn pure() -> Self { Effect::Concrete(EffectSet::PURE) }
+
+    /// Substitute effect variables using the given bindings.
+    /// Returns a concrete EffectSet.
+    pub fn substitute(&self, bindings: &HashMap<Symbol, EffectSet>) -> EffectSet {
+        match self {
+            Effect::Concrete(set) => *set,
+            Effect::Var(name) => bindings.get(name).copied().unwrap_or(EffectSet::PURE),
+            Effect::Union(a, b) => a.substitute(bindings) | b.substitute(bindings),
+            Effect::Inferred => EffectSet::PURE,
+        }
+    }
+
+    /// Returns true if this effect contains any effect variables.
+    pub fn has_vars(&self) -> bool {
+        match self {
+            Effect::Concrete(_) | Effect::Inferred => false,
+            Effect::Var(_) => true,
+            Effect::Union(a, b) => a.has_vars() || b.has_vars(),
+        }
+    }
+
+    /// Collect all effect variable names.
+    pub fn collect_vars(&self, out: &mut Vec<Symbol>) {
+        match self {
+            Effect::Var(name) => out.push(*name),
+            Effect::Union(a, b) => { a.collect_vars(out); b.collect_vars(out); }
+            Effect::Concrete(_) | Effect::Inferred => {}
+        }
+    }
+}
 
 /// Resolved, canonical type representation.
 /// Distinct from `nsl_ast::types::TypeExpr` which is syntactic.
@@ -62,6 +116,7 @@ pub enum Type {
     Function {
         params: Vec<Type>,
         ret: Box<Type>,
+        effect: Effect,
     },
 
     // Nominal user-defined types
@@ -497,9 +552,15 @@ pub fn display_type(ty: &Type) -> String {
             format!("({})", inner.join(", "))
         }
         Type::Optional(inner) => format!("{}?", display_type(inner)),
-        Type::Function { params, ret } => {
+        Type::Function { params, ret, effect } => {
             let ps: Vec<String> = params.iter().map(display_type).collect();
-            format!("({}) -> {}", ps.join(", "), display_type(ret))
+            let eff_str = match effect {
+                Effect::Concrete(set) if !set.is_pure() => format!(" | {{{}}}", set.display()),
+                Effect::Var(_) => " | E".into(),
+                Effect::Union(_, _) => " | <effects>".into(),
+                _ => String::new(),
+            };
+            format!("({}) -> {}{}", ps.join(", "), display_type(ret), eff_str)
         }
         Type::QuantizedTensor => "QuantizedTensor".into(),
         Type::Module { .. } => "module".into(),

@@ -8,11 +8,24 @@ use crate::{Span, Symbol};
 pub struct FnDef {
     pub name: Symbol,
     pub type_params: Vec<TypeParam>,
+    pub effect_params: Vec<Symbol>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
+    pub return_effect: Option<EffectExpr>,
     pub body: Block,
     pub is_async: bool,
     pub span: Span,
+}
+
+/// Syntactic effect annotation (before resolution).
+#[derive(Debug, Clone, Serialize)]
+pub enum EffectExpr {
+    /// Effect variable: `E`
+    Var(Symbol),
+    /// Concrete effect name: `IO`, `RANDOM`, etc.
+    Named(Symbol),
+    /// Union: `E1 | E2` or `E | {IO}`
+    Union(Vec<EffectExpr>),
 }
 
 #[derive(Debug, Clone, Serialize)]
