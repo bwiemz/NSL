@@ -56,6 +56,8 @@ pub use compiler::{compile, compile_entry, compile_module, compile_module_with_i
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
 
+use std::collections::HashMap;
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -103,6 +105,11 @@ pub struct CompileOptions {
     pub wcet_target: String,
     /// M53: FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg")
     pub fpga_device: Option<String>,
+    /// M38a: Enable linear types ownership checking.
+    pub linear_types_enabled: bool,
+    /// M38a: Per-function ownership metadata from semantic analysis.
+    /// Keys are function names, values have linear_params and shared_params.
+    pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
     /// M55: Emit a ZK inference circuit alongside compiled output.
     pub zk_circuit: bool,
     /// M55: ZK backend to use ("folding", "halo2", or "plonky3").
@@ -142,6 +149,8 @@ impl Default for CompileOptions {
             do178c_report: None,
             wcet_target: "gpu".to_string(),
             fpga_device: None,
+            linear_types_enabled: false,
+            ownership_info: HashMap::new(),
             zk_circuit: false,
             zk_backend: "folding".to_string(),
             zk_field: "m31".to_string(),

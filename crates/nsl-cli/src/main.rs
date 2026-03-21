@@ -86,9 +86,17 @@ enum Cli {
         #[arg(long)]
         cpu: Option<String>,
 
-        /// M53: Write DO-178C compliance report to file
+        /// M53: Write DO-178C compliance report to file (FPGA only)
         #[arg(long)]
         do178c_report: Option<PathBuf>,
+
+        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
+        #[arg(long, default_value = "gpu")]
+        wcet_target: String,
+
+        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
+        #[arg(long)]
+        fpga_device: Option<String>,
     },
 
     /// Compile and execute an NSL program
@@ -164,9 +172,17 @@ enum Cli {
         #[arg(long)]
         cpu: Option<String>,
 
-        /// M53: Write DO-178C compliance report to file
+        /// M53: Write DO-178C compliance report to file (FPGA only)
         #[arg(long)]
         do178c_report: Option<PathBuf>,
+
+        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
+        #[arg(long, default_value = "gpu")]
+        wcet_target: String,
+
+        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
+        #[arg(long)]
+        fpga_device: Option<String>,
 
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
@@ -306,17 +322,29 @@ enum Cli {
         #[arg(long)]
         cpu: Option<String>,
 
-        /// M53: Write DO-178C compliance report to file
+        /// M53: Write DO-178C compliance report to file (FPGA only)
         #[arg(long)]
         do178c_report: Option<PathBuf>,
+
+        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
+        #[arg(long, default_value = "gpu")]
+        wcet_target: String,
+
+        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
+        #[arg(long)]
+        fpga_device: Option<String>,
 
         /// M55: Compile @zk_proof functions to ZK inference circuits
         #[arg(long)]
         zk_circuit: bool,
 
-        /// M55: ZK proving backend: halo2 (default) or plonky3
-        #[arg(long, default_value = "halo2")]
+        /// M55: ZK proving backend: folding (default), halo2, or plonky3
+        #[arg(long, default_value = "folding")]
         zk_backend: String,
+
+        /// M55: ZK field: m31 (default, ~10x faster) or bn254 (EVM-compatible)
+        #[arg(long, default_value = "m31")]
+        zk_field: String,
 
         /// M55: Emit a Solidity verifier contract alongside the ZK circuit
         #[arg(long)]
@@ -445,7 +473,7 @@ fn main() {
             perf: _perf,
             gpu: _gpu,
             trace: _trace,
-            linear_types: _linear_types,
+            linear_types,
             nan_analysis,
             deterministic: _deterministic,
             weight_analysis,
@@ -456,11 +484,11 @@ fn main() {
             wcet_cert: _wcet_cert,
             cpu: _cpu,
             do178c_report: _do178c_report,
+            wcet_target: _wcet_target,
+            fpga_device: _fpga_device,
         } => {
-            run_check(&file, dump_tokens, dump_ast, dump_types);
+            run_check(&file, dump_tokens, dump_ast, dump_types, linear_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
-            // M38a: --linear-types parsed but dormant until ownership checker
-            // is wired through the compilation pipeline.
             // M46: --deterministic parsed but dormant until determinism checker
             // is wired through the check pipeline.
 
@@ -516,7 +544,7 @@ fn main() {
             fusion_report,
             vram_budget,
             memory_report,
-            linear_types: _linear_types,
+            linear_types,
             target,
             disable_fusion,
             tape_ad: _tape_ad,
@@ -536,8 +564,11 @@ fn main() {
             wcet_cert,
             cpu,
             do178c_report,
+            wcet_target,
+            fpga_device,
             zk_circuit,
             zk_backend,
+            zk_field,
             zk_solidity,
             zk_weights,
         } => {
@@ -620,10 +651,15 @@ fn main() {
                 wcet_report_path: wcet_cert,
                 wcet_safety_margin: 1.05,
                 do178c_report,
+                wcet_target,
+                fpga_device,
                 zk_circuit,
                 zk_backend,
+                zk_field,
                 zk_solidity,
                 zk_weights_path: zk_weights.clone(),
+                linear_types_enabled: linear_types,
+                ownership_info: std::collections::HashMap::new(), // populated by loader
             };
 
             if standalone {
@@ -679,6 +715,8 @@ fn main() {
             gpu,
             cpu,
             do178c_report,
+            wcet_target,
+            fpga_device,
         } => {
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
@@ -703,11 +741,16 @@ fn main() {
                 wcet_report_path: wcet_cert,
                 wcet_safety_margin: 1.05,
                 do178c_report,
+                wcet_target,
+                fpga_device,
                 // M55: ZK flags not exposed on `run`; use defaults.
                 zk_circuit: false,
-                zk_backend: "halo2".to_string(),
+                zk_backend: "folding".to_string(),
+                zk_field: "m31".to_string(),
                 zk_solidity: false,
                 zk_weights_path: None,
+                linear_types_enabled: false, // run command doesn't expose --linear-types
+                ownership_info: std::collections::HashMap::new(),
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -1002,7 +1045,7 @@ fn frontend(file: &PathBuf) -> (Interner, nsl_parser::ParseResult, nsl_semantic:
     (interner, parse_result, analysis)
 }
 
-fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool) {
+fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool, linear_types: bool) {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -1043,8 +1086,10 @@ fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool
         }
     }
 
-    // Semantic analysis
-    let analysis = nsl_semantic::analyze(&parse_result.module, &mut interner);
+    // Semantic analysis (with ownership checking when --linear-types is active)
+    let analysis = nsl_semantic::analyze_with_imports(
+        &parse_result.module, &mut interner, &std::collections::HashMap::new(), linear_types,
+    );
 
     for diag in &analysis.diagnostics {
         source_map.emit_diagnostic(diag);
@@ -1140,7 +1185,12 @@ fn run_build_zk(
         let zk_config = nsl_codegen::zk::backend::ZkConfig {
             backend: match options.zk_backend.to_lowercase().as_str() {
                 "plonky3" => nsl_codegen::zk::backend::ZkBackendType::Plonky3,
-                _ => nsl_codegen::zk::backend::ZkBackendType::Halo2,
+                "halo2" => nsl_codegen::zk::backend::ZkBackendType::Halo2,
+                _ => nsl_codegen::zk::backend::ZkBackendType::Folding,
+            },
+            field: match options.zk_field.to_lowercase().as_str() {
+                "bn254" => nsl_codegen::zk::backend::ZkField::BN254,
+                _ => nsl_codegen::zk::backend::ZkField::Mersenne31,
             },
             emit_solidity: options.zk_solidity,
             ..Default::default()

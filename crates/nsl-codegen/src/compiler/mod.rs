@@ -155,8 +155,8 @@ impl FeatureConfigs {
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
             quant_configs: HashMap::new(),
-            linear_types_enabled: false,
-            ownership_info: HashMap::new(),
+            linear_types_enabled: options.linear_types_enabled,
+            ownership_info: options.ownership_info.clone(),
             vmap_configs: HashMap::new(),
             source_ad_enabled: !options.tape_ad,
             weight_map: None,
@@ -472,33 +472,74 @@ impl<'a> Compiler<'a> {
     /// certificate JSON and/or DO-178C compliance reports.
     pub fn run_wcet_analysis(&mut self) -> Result<(), CodegenError> {
         use crate::wcet::*;
-        use crate::gpu_specs::find_gpu;
+        use crate::gpu_specs::{find_gpu, find_fpga};
 
         if self.features.real_time_fns.is_empty() {
             return Ok(());
         }
 
-        let gpu_name = self
-            .compile_options
-            .wcet_gpu
-            .as_deref()
-            .unwrap_or("A100-SXM");
-        let gpu = find_gpu(gpu_name).ok_or_else(|| {
-            CodegenError::new(format!(
-                "WCET: unknown GPU '{}'. Use --gpu to specify.",
-                gpu_name
-            ))
-        })?;
-
         let safety_margin = self.compile_options.wcet_safety_margin;
+        let target_kind = self.compile_options.wcet_target.as_str();
+
+        // Build the WcetTarget based on CLI flags
+        let target = match target_kind {
+            "fpga" => {
+                let fpga_name = self.compile_options.fpga_device.as_deref()
+                    .unwrap_or("xcvu440");
+                let fpga = find_fpga(fpga_name).ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "WCET: unknown FPGA '{}'. Available: xcvu440, xczu9eg, ve2302",
+                        fpga_name
+                    ))
+                })?;
+                WcetTarget::Fpga {
+                    device_name: fpga.device_name.to_string(),
+                    ocm_size_kb: fpga.ocm_size_kb,
+                }
+            }
+            "groq" => {
+                return Err(CodegenError::new(
+                    "Groq LPU WCET not yet supported (ISA not public). \
+                     Use --wcet-target gpu or --wcet-target fpga.".to_string()
+                ));
+            }
+            _ => {
+                // Default: GPU statistical
+                let gpu_name = self.compile_options.wcet_gpu.as_deref()
+                    .unwrap_or("A100-SXM");
+                let _ = find_gpu(gpu_name).ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "WCET: unknown GPU '{}'. Use --gpu to specify.",
+                        gpu_name
+                    ))
+                })?;
+                WcetTarget::Gpu { device_name: gpu_name.to_string() }
+            }
+        };
 
         // Clone to avoid borrowing self.features.real_time_fns while mutating self.features.wcet_results
         for (fn_name, constraint) in self.features.real_time_fns.clone() {
-            // Create demo analysis with a small matmul + elementwise op
-            let ops = vec![
-                wcet_matmul_gpu(1, 512, 512, "fp32", gpu),
-                wcet_elementwise_gpu(512, "fp32", "relu", gpu),
-            ];
+            let ops = match &target {
+                WcetTarget::Gpu { device_name } => {
+                    let gpu = find_gpu(device_name).unwrap();
+                    eprintln!(
+                        "note: GPU WCET is a statistical p95 estimate (not a certified proof). \
+                         For safety-critical applications, use --wcet-target fpga."
+                    );
+                    vec![
+                        estimate_matmul_gpu_statistical(1, 512, 512, "fp32", gpu),
+                        estimate_elementwise_gpu_statistical(512, "fp32", "relu", gpu),
+                    ]
+                }
+                WcetTarget::Fpga { device_name, .. } => {
+                    let fpga = find_fpga(device_name).unwrap();
+                    vec![
+                        wcet_matmul_fpga_certified(1, 512, 512, "fp32", fpga),
+                        wcet_elementwise_fpga_certified(512, "fp32", "relu", fpga),
+                    ]
+                }
+                WcetTarget::GroqLpu => unreachable!(),
+            };
 
             let total_ns: u64 = ops.iter().map(|o| o.worst_case_ns).sum();
             let total_ms = total_ns as f64 / 1_000_000.0;
@@ -506,7 +547,7 @@ impl<'a> Compiler<'a> {
             let bound_satisfied = final_ms <= constraint.max_latency_ms;
 
             let no_heap = prove_no_heap(self.slab_plan.as_ref(), &fn_name);
-            let static_cf = prove_static_cf();
+            let static_cf = prove_static_cf(&target);
 
             let func_wcet = FunctionWcet {
                 name: fn_name.clone(),
@@ -545,8 +586,7 @@ impl<'a> Compiler<'a> {
                     &no_heap,
                     &static_cf,
                     "source.nsl",
-                    Some(gpu_name),
-                    None,
+                    &target,
                 );
                 emit_certificate(&cert, cert_path).map_err(|e| {
                     CodegenError::new(format!("WCET certificate write failed: {}", e))
@@ -554,18 +594,17 @@ impl<'a> Compiler<'a> {
                 eprintln!("WCET certificate: {}", cert_path.display());
             }
 
-            // Emit DO-178C report if requested
+            // Emit DO-178C report if requested (guarded: FPGA only)
             if let Some(ref do178c_path) = self.compile_options.do178c_report {
                 let cert = build_certificate(
                     &func_wcet,
                     &no_heap,
                     &static_cf,
                     "source.nsl",
-                    Some(gpu_name),
-                    None,
+                    &target,
                 );
                 emit_do178c_report(&cert, do178c_path).map_err(|e| {
-                    CodegenError::new(format!("DO-178C report write failed: {}", e))
+                    CodegenError::new(format!("DO-178C report: {}", e))
                 })?;
             }
 

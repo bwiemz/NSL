@@ -344,7 +344,7 @@ pub fn load_all_modules(
         }
 
         // Analyze with real imported types
-        let analysis = nsl_semantic::analyze_with_imports(&ast, interner, &import_types);
+        let analysis = nsl_semantic::analyze_with_imports(&ast, interner, &import_types, false);
 
         for diag in &analysis.diagnostics {
             source_map.emit_diagnostic(diag);
