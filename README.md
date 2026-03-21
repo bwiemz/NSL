@@ -152,10 +152,10 @@ let result = c.to(cpu)  # each element = 3.0
 - **Mixture of Experts** — `@moe` decorator with top-k gating, capacity-based routing, aux loss
 - **Speculative decoding** — `@speculative` with tree attention, rejection sampling, Medusa heads
 - **Ring attention** — `@context_parallel` for cross-GPU sequence parallelism
-- **Memory planning** — compile-time tensor liveness analysis, interference graph, BFD slab allocation with 256-byte alignment
+- **Memory planning** — compile-time tensor liveness analysis, interference graph, BFD slab allocation with 256-byte alignment, rematerialization pass (trade compute for memory by recomputing cheap activations)
 - **Roofline cost model** — multi-level memory hierarchy (L1/L2/HBM bandwidth), occupancy estimation, per-op FLOP/byte analysis with GPU database (A100, H100, RTX-4090, etc.)
 - **Cost-guided fusion** — profitability analysis (arithmetic intensity improvement threshold), register pressure estimation, prevents counterproductive fusions
-- **Linear types semantics** — ownership checker for use-after-move detection, immutable borrow (`&T`) semantics, `@shared` escape hatch
+- **Linear types & borrowing** — ownership checker for use-after-move detection, immutable borrow (`&T`) syntax with auto-borrow at call sites, borrow safety (no consume while borrowed, no borrows in return types, no `&mut`/`&&`), autodiff tape transparency for borrowed tensors, `@shared` escape hatch
 - **vmap analysis** — `@vmap` batch tracking, shape rewriting, matmul rewrite classification
 - **Source AD** — Wengert extraction, reverse-mode adjoint rules, if/else branch support with condition saving, dead gradient elimination
 
@@ -169,8 +169,8 @@ let result = c.to(cpu)  # each element = 3.0
 - **Tensor debugger** — `nsl debug` CLI: trace reader, NaN finder, diff, Chrome export
 - **Reproducibility** — determinism checker, CPU deterministic scatter_add, kernel variant selection
 - **Multimodal** — patch embed, bilinear resize, image normalize, cross-attention, STFT, mel spectrogram, resampling
-- **Sparse tensors** — COO/CSR construction, from_dense, to_dense, SpMM
-- **Shape algebra** — symbolic dimension solver (equality, divisibility, range proofs)
+- **Sparse tensors** — COO/CSR/CSC construction and conversion, from_dense, to_dense, SpMV, SpMM, TACO-style merge lattices (intersection for mul, union for add), workspace transformation for output assembly, density-aware cost model
+- **Shape algebra** — symbolic dimension solver (equality, divisibility, range proofs, Fourier-Motzkin bound reasoning for inequality chains and reshape validation)
 - **Linear types codegen** — ownership decision tree (free-at-consumption, tape-holds-reference)
 - **Source AD extraction** — Wengert extraction from AST, backward context
 - **vmap AST transform** — VmapTransformer FnDef→FnDef rewriting
@@ -333,11 +333,8 @@ nsl check --weight-analysis file.nsl --weights model.safetensors
 
 - FBIP (Functional But In-Place) — zero-allocation inference via refcount-checked in-place mutation
 - Effect polymorphism — effect variables on function types for correct higher-order effect propagation
-- Shape algebra bounds — Fourier-Motzkin elimination for symbolic dimension proofs
-- Memory planner rematerialization — trade compute for memory in training
 - WCET two-tier — FPGA certified path (GPU WCET is statistically bounded only)
 - ZK upgrade — lookup-native arithmetization (Jolt-style), folding accumulation, Mersenne-31 field
-- Sparse merge lattices — TACO-style co-iteration for sparse tensor operations
 
 **Future milestones (M56-M62):** Multi-agent shared memory, FPGA/neuromorphic backend, elastic fault tolerance, topology-aware routing, exabyte data streaming, cluster debugging, PyTorch FFI.
 
@@ -352,6 +349,7 @@ See `docs/plans/` and `docs/summaries/` for details.
 - ZK circuits use v1 Halo2 scaffolding — upgrade to lookup-native/folding in progress
 - Autodiff backward rules cover ~11 operations (need ~40+ for full coverage)
 - Multi-backend (AMDGPU/Metal/WGSL) are codegen stubs — only PTX is production
+- FBIP (in-place tensor mutation for unique owners) not yet implemented
 
 ## License
 
