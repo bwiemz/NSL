@@ -42,7 +42,7 @@ pub fn promote_types(a: KirType, b: KirType) -> KirType {
     }
 
     use KirType::*;
-    match (a.clone(), b.clone()) {
+    match (a, b) {
         // Float promotions (wider wins)
         (F16, F32) | (F32, F16) => F32,
         (F16, F64) | (F64, F16) => F64,
@@ -57,7 +57,7 @@ pub fn promote_types(a: KirType, b: KirType) -> KirType {
         (U32, I32) | (I32, U32) => I32,
         (U64, I64) | (I64, U64) => I64,
         (U32, I64) | (I64, U32) => I64,
-        (U64, I32) | (I32, U64) => I64, // i32 widens to i64 to hold u64 range
+        (U64, I32) | (I32, U64) => I64, // best-effort promotion; no single signed type spans both ranges (matches C99 behavior)
 
         // Int + Float promotions
         (I32, F32) | (F32, I32) => F32,
@@ -81,7 +81,7 @@ pub fn promote_types(a: KirType, b: KirType) -> KirType {
         (Bool, other) | (other, Bool) => other,
 
         // Pointer types and Vec types -- no arithmetic promotion
-        _ => panic!("Cannot promote types {:?} and {:?}", a, b),
+        (a, b) => panic!("Cannot promote types {:?} and {:?}", a, b),
     }
 }
 
