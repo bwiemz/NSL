@@ -510,6 +510,28 @@ impl<'a> WengertExtractor<'a> {
     ///   true_val = Mul(x, x)        // from then-branch
     ///   false_val = Neg(x)           // from else-branch
     ///   result = Select(cond_var, true_val, false_val)
+    ///
+    /// # Speculative (Eager) Evaluation of Both Branches
+    ///
+    /// **Both branches are eagerly evaluated**: all ops from both the then-branch
+    /// and the else-branch appear unconditionally in the Wengert list. Only the
+    /// `Select` op at the end chooses which result to use based on the condition.
+    ///
+    /// This design is **intentional** for two reasons:
+    /// 1. **SSA flattening**: the Wengert list is a linear DAG with no control flow;
+    ///    both paths must be materialized so that reverse-mode AD can propagate
+    ///    gradients through the chosen branch.
+    /// 2. **AD correctness**: the `SelectTrue`/`SelectFalse` adjoint rules mask
+    ///    gradient flow to the non-taken branch (multiplying by 0), which is the
+    ///    correct sub-gradient for a piecewise-linear selection.
+    ///
+    /// **Known limitation — side effects and expensive computations**: Because both
+    /// branches execute unconditionally, any side-effectful code (I/O, mutations,
+    /// random sampling) inside a branch will run on *every* evaluation regardless of
+    /// the condition. Similarly, expensive computations in the unused branch still
+    /// pay their full cost. This is a deliberate trade-off for AD correctness; users
+    /// with side-effectful branches should use the dynamic tape fallback (`@no_static`
+    /// or constructs that prevent static extraction) instead.
     fn extract_if(
         &mut self,
         condition: &nsl_ast::expr::Expr,
@@ -543,19 +565,14 @@ impl<'a> WengertExtractor<'a> {
         // `else: if c2: B2 else: B3` — we support at most simple else for now.
         // If there are elif clauses, desugar the first one as a nested if.
         if !elif_clauses.is_empty() {
-            // Desugar: elif chain becomes nested if/else
+            // Desugar: elif chain becomes nested if/else.
+            // `elif c2: B2 elif c3: B3 else: B4` is treated as
+            // `else: if c2: B2 elif c3: B3 else: B4`, recursively.
             let (elif_cond, elif_block) = &elif_clauses[0];
             let remaining_elifs = &elif_clauses[1..];
-            // The "else" of this elif is either the remaining elifs or the final else
-            let nested_else = if remaining_elifs.is_empty() {
-                else_block
-            } else {
-                // For simplicity, only support single elif + optional else
-                // More complex chains fall back to dynamic
-                self.is_static = false;
-                return false;
-            };
-            if !self.extract_if(elif_cond, elif_block, &[], nested_else) {
+            // Pass the remaining elif clauses into the recursive call so the
+            // entire chain is desugared, not just the first level.
+            if !self.extract_if(elif_cond, elif_block, remaining_elifs, else_block) {
                 return false;
             }
         } else if let Some(else_blk) = else_block {

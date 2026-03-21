@@ -281,4 +281,62 @@ mod tests {
         assert_eq!(saved_for_backward(&PrimalOp::Tanh), SavedRequirement::Output);
         assert_eq!(saved_for_backward(&PrimalOp::Exp), SavedRequirement::Output);
     }
+
+    // --- Control-flow AD rules ---
+
+    #[test]
+    fn test_select_rule() {
+        // Select(cond=0, true_val=1, false_val=2) -> result=3
+        // apply_ad_rule should return two InputAdjoint entries:
+        //   inputs[1] (true_val)  -> SelectTrue(output_bar, cond_var)
+        //   inputs[2] (false_val) -> SelectFalse(output_bar, cond_var)
+        // No adjoint is propagated to inputs[0] (the condition is non-differentiable).
+        let op = make_op(3, PrimalOp::Select, vec![0, 1, 2]);
+        let adj = apply_ad_rule(&op, 100);
+        assert_eq!(adj.len(), 2, "Select should produce exactly two input adjoints");
+        // First: adjoint for the true branch value
+        assert_eq!(adj[0].input_var, 1, "First adjoint targets true_val (inputs[1])");
+        assert!(
+            matches!(adj[0].expr, AdjointExpr::SelectTrue(100, 0)),
+            "Expected SelectTrue(output_bar=100, cond_var=0), got {:?}",
+            adj[0].expr
+        );
+        // Second: adjoint for the false branch value
+        assert_eq!(adj[1].input_var, 2, "Second adjoint targets false_val (inputs[2])");
+        assert!(
+            matches!(adj[1].expr, AdjointExpr::SelectFalse(100, 0)),
+            "Expected SelectFalse(output_bar=100, cond_var=0), got {:?}",
+            adj[1].expr
+        );
+    }
+
+    #[test]
+    fn test_condition_rule() {
+        // Condition is non-differentiable — apply_ad_rule should return empty vec.
+        use crate::wengert::CompareKind;
+        let op = make_op(1, PrimalOp::Condition(CompareKind::Gt), vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(adj.is_empty(), "Condition op should have no adjoints (non-differentiable)");
+    }
+
+    #[test]
+    fn test_saved_select() {
+        // Select needs the condition + both branch values saved for backward.
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Select),
+            SavedRequirement::Inputs,
+            "Select should save its inputs (cond, true_val, false_val)"
+        );
+    }
+
+    #[test]
+    fn test_saved_condition() {
+        // Condition is non-differentiable — nothing needs to be saved.
+        use crate::wengert::CompareKind;
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Condition(CompareKind::Gt)),
+            SavedRequirement::Nothing,
+            "Condition op should not save anything"
+        );
+    }
 }
