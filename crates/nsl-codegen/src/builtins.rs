@@ -468,6 +468,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_sparse_nnz", &[types::I64], Some(types::I64)),
     ("nsl_sparse_density", &[types::I64], Some(types::I64)),
     ("nsl_sparse_spmm", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_sparse_spmv", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_sparse_coo_to_csr", &[types::I64], Some(types::I64)),
+    ("nsl_sparse_coo_to_csc", &[types::I64], Some(types::I64)),
+    ("nsl_sparse_add", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_sparse_mul", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_sparse_free", &[types::I64], Some(types::I64)),
     // --- M45: Tensor debugger trace ---
     ("nsl_trace_init", &[], Some(types::I64)),
