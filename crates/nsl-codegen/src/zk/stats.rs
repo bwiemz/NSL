@@ -144,22 +144,28 @@ pub fn compute_stats(ir: &ZkIR) -> CircuitStats {
         .collect();
     lookup_table_summary.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-    // Proof size estimate: 32 KiB baseline for Halo2/KZG group elements + a
-    // small per-constraint term. The baseline dominates in practice.
-    const PROOF_SIZE_BASE_BYTES: u64 = 32 * 1024; // 32 KiB
-    const PROOF_SIZE_PER_CONSTRAINT_BYTES: u64 = 0; // negligible for KZG
+    // Proof size estimate: folding produces constant-size proofs (~200 KB for
+    // lookup-native; independent of model depth). The lookup multiplicities
+    // add a small per-table term.
+    const PROOF_SIZE_BASE_BYTES: u64 = 200 * 1024; // ~200 KiB for folding proof
+    const PROOF_SIZE_PER_TABLE_BYTES: u64 = 1024; // per lookup table
+    let num_tables = lookup_table_summary.len() as u64;
     let estimated_proof_size_bytes =
-        PROOF_SIZE_BASE_BYTES + num_constraints * PROOF_SIZE_PER_CONSTRAINT_BYTES;
+        PROOF_SIZE_BASE_BYTES + num_tables * PROOF_SIZE_PER_TABLE_BYTES;
 
-    // Prove time: ~0.3 ms per constraint single-threaded.
-    // Use integer arithmetic: constraints * 3 / 10 ms (rounds down).
-    let estimated_prove_time_ms = num_constraints * 3 / 10;
+    // Prove time: folding with Mersenne-31 is ~0.05 ms per constraint (6x faster
+    // than BN254 Halo2 at 0.3 ms/constraint). Lookup-native saves another 4x on
+    // activation-heavy circuits because activations become table lookups (1 constraint)
+    // instead of high-degree polynomial constraints.
+    let estimated_prove_time_ms = num_constraints / 20; // 0.05 ms per constraint
 
-    // Verify time: essentially constant at ~20 ms for Halo2/KZG.
-    let estimated_verify_time_ms = 20;
+    // Verify time: folding verification is essentially constant (~10 ms)
+    // because the verifier only checks the final accumulated instance.
+    let estimated_verify_time_ms = 10;
 
-    // Witness memory: one BN254 scalar (32 bytes) per wire.
-    let estimated_witness_memory_bytes = ir.num_wires * 32;
+    // Witness memory: Mersenne-31 uses 4 bytes per wire (vs 32 for BN254).
+    // Default to M31 estimate since it's the default field.
+    let estimated_witness_memory_bytes = ir.num_wires * 4;
 
     CircuitStats {
         num_constraints,
@@ -328,7 +334,7 @@ mod tests {
         assert_eq!(stats.num_add_gates, 1);
         assert_eq!(stats.num_lookup_gates, 1);
         assert_eq!(stats.num_public_wires, 3); // 2 inputs + 1 output
-        assert_eq!(stats.estimated_witness_memory_bytes, 5 * 32); // 5 wires * 32 bytes
+        assert_eq!(stats.estimated_witness_memory_bytes, 5 * 4); // 5 wires * 4 bytes (M31 field)
     }
 
     #[test]
@@ -419,14 +425,14 @@ mod tests {
     }
 
     #[test]
-    fn witness_memory_is_num_wires_times_32() {
+    fn witness_memory_is_num_wires_times_4() {
         let mut ir = ZkIR::new("mem_test");
         for i in 0..10 {
             ir.alloc_wire(&format!("w{i}"));
         }
 
         let stats = compute_stats(&ir);
-        assert_eq!(stats.estimated_witness_memory_bytes, 10 * 32);
+        assert_eq!(stats.estimated_witness_memory_bytes, 10 * 4); // M31 field: 4 bytes/wire
     }
 
     #[test]

@@ -918,6 +918,185 @@ fn shape_as_2d(shape: &[usize]) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-layer lowering for folding backend (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// Detect layer boundaries in a DAG for folding-based proving.
+///
+/// A "layer" is a foldable unit: matmul → activation → (optional norm).
+/// Each layer becomes an independent ZkIR that the folding prover processes
+/// sequentially.
+fn is_layer_boundary(op: &ZkOp) -> bool {
+    matches!(
+        op,
+        ZkOp::Relu { .. }
+            | ZkOp::Gelu { .. }
+            | ZkOp::Sigmoid { .. }
+            | ZkOp::Tanh { .. }
+            | ZkOp::Softmax { .. }
+            | ZkOp::LayerNorm { .. }
+    )
+}
+
+/// Lower a DAG into per-layer ZkIRs for folding-based proving.
+///
+/// Groups operations by layer boundaries (matmul + activation = one fold unit).
+/// Each returned ZkIR is independently foldable.
+pub fn lower_model_for_folding(dag: &ZkDag, config: &ZkConfig) -> Vec<ZkIR> {
+    if dag.ops.is_empty() {
+        return vec![];
+    }
+
+    // Partition ops into layers at activation/norm boundaries
+    let mut layer_groups: Vec<Vec<usize>> = Vec::new();
+    let mut current_group: Vec<usize> = Vec::new();
+
+    for (idx, op) in dag.ops.iter().enumerate() {
+        current_group.push(idx);
+        if is_layer_boundary(op) {
+            layer_groups.push(std::mem::take(&mut current_group));
+        }
+    }
+    // Remaining ops form the last group
+    if !current_group.is_empty() {
+        layer_groups.push(current_group);
+    }
+
+    // If no boundaries found, return a single ZkIR (the whole model)
+    if layer_groups.len() <= 1 {
+        return vec![lower_dag_to_zkir(dag, config)];
+    }
+
+    // Lower each group into an independent ZkIR
+    let mut layer_irs = Vec::with_capacity(layer_groups.len());
+    for (layer_idx, group) in layer_groups.iter().enumerate() {
+        // Build a sub-DAG for this group
+        let sub_dag = build_sub_dag(dag, group, layer_idx);
+        let ir = lower_dag_to_zkir(&sub_dag, config);
+        layer_irs.push(ir);
+    }
+
+    layer_irs
+}
+
+/// Build a sub-DAG from a subset of operation indices.
+fn build_sub_dag(dag: &ZkDag, indices: &[usize], layer_idx: usize) -> ZkDag {
+    // Map old indices to new indices in the sub-DAG
+    let mut index_map = std::collections::HashMap::new();
+    let mut sub_ops = Vec::new();
+    let mut input_indices = Vec::new();
+    let mut weight_indices = Vec::new();
+
+    for (new_idx, &old_idx) in indices.iter().enumerate() {
+        index_map.insert(old_idx, new_idx);
+
+        // Remap operation references
+        let remapped_op = remap_op(&dag.ops[old_idx], &index_map, layer_idx);
+        if matches!(remapped_op, ZkOp::Input { .. }) {
+            input_indices.push(new_idx);
+        }
+        if matches!(remapped_op, ZkOp::Weight { .. }) {
+            weight_indices.push(new_idx);
+        }
+        sub_ops.push(remapped_op);
+    }
+
+    let output_idx = sub_ops.len().saturating_sub(1);
+
+    ZkDag {
+        ops: sub_ops,
+        output_idx,
+        input_indices,
+        weight_indices,
+    }
+}
+
+/// Remap an operation's references to new indices in a sub-DAG.
+///
+/// If a referenced op is not in the sub-DAG's index map, it becomes
+/// an Input node (inter-layer dependency).
+fn remap_op(
+    op: &ZkOp,
+    index_map: &std::collections::HashMap<usize, usize>,
+    layer_idx: usize,
+) -> ZkOp {
+    let remap = |old: usize| -> usize {
+        *index_map.get(&old).unwrap_or(&0)
+    };
+
+    match op {
+        ZkOp::Input { name, shape, dtype_bits } => ZkOp::Input {
+            name: name.clone(),
+            shape: shape.clone(),
+            dtype_bits: *dtype_bits,
+        },
+        ZkOp::Weight { name, shape, dtype_bits, values } => ZkOp::Weight {
+            name: name.clone(),
+            shape: shape.clone(),
+            dtype_bits: *dtype_bits,
+            values: values.clone(),
+        },
+        ZkOp::Matmul { a, b } => {
+            if index_map.contains_key(a) && index_map.contains_key(b) {
+                ZkOp::Matmul { a: remap(*a), b: remap(*b) }
+            } else {
+                // Reference outside this layer — create placeholder input
+                ZkOp::Input {
+                    name: format!("layer{layer_idx}_matmul_input"),
+                    shape: vec![1],
+                    dtype_bits: 8,
+                }
+            }
+        }
+        ZkOp::Add { a, b } => {
+            if index_map.contains_key(a) && index_map.contains_key(b) {
+                ZkOp::Add { a: remap(*a), b: remap(*b) }
+            } else {
+                ZkOp::Input {
+                    name: format!("layer{layer_idx}_add_input"),
+                    shape: vec![1],
+                    dtype_bits: 8,
+                }
+            }
+        }
+        ZkOp::Mul { a, b } => {
+            if index_map.contains_key(a) && index_map.contains_key(b) {
+                ZkOp::Mul { a: remap(*a), b: remap(*b) }
+            } else {
+                ZkOp::Input {
+                    name: format!("layer{layer_idx}_mul_input"),
+                    shape: vec![1],
+                    dtype_bits: 8,
+                }
+            }
+        }
+        ZkOp::Relu { input } => ZkOp::Relu { input: remap(*input) },
+        ZkOp::Gelu { input } => ZkOp::Gelu { input: remap(*input) },
+        ZkOp::Sigmoid { input } => ZkOp::Sigmoid { input: remap(*input) },
+        ZkOp::Tanh { input } => ZkOp::Tanh { input: remap(*input) },
+        ZkOp::Softmax { input, dim } => ZkOp::Softmax { input: remap(*input), dim: *dim },
+        ZkOp::LayerNorm { input, gamma, beta } => ZkOp::LayerNorm {
+            input: remap(*input),
+            gamma: remap(*gamma),
+            beta: remap(*beta),
+        },
+        ZkOp::Exp { input } => ZkOp::Exp { input: remap(*input) },
+        ZkOp::Log { input } => ZkOp::Log { input: remap(*input) },
+        ZkOp::Transpose { input } => ZkOp::Transpose { input: remap(*input) },
+        ZkOp::Reshape { input, new_shape } => ZkOp::Reshape {
+            input: remap(*input),
+            new_shape: new_shape.clone(),
+        },
+        ZkOp::Requantize { input, scale, zero_point, target_bits } => ZkOp::Requantize {
+            input: remap(*input),
+            scale: *scale,
+            zero_point: *zero_point,
+            target_bits: *target_bits,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1252,6 +1431,34 @@ mod tests {
             .filter(|i| matches!(i, ZkInstruction::Remap { .. }))
             .count();
         assert_eq!(remaps, 1, "transpose should produce 1 Remap instruction");
+    }
+
+    #[test]
+    fn lower_for_folding_6_layer_mlp() {
+        // 6-layer MLP: (input -> matmul -> relu) × 3
+        let dag = ZkDag {
+            ops: vec![
+                // Layer 1
+                ZkOp::Input { name: "x".into(), shape: vec![1, 4], dtype_bits: 8 },
+                ZkOp::Weight { name: "w1".into(), shape: vec![4, 4], dtype_bits: 8, values: None },
+                ZkOp::Matmul { a: 0, b: 1 },
+                ZkOp::Relu { input: 2 },
+                // Layer 2
+                ZkOp::Weight { name: "w2".into(), shape: vec![4, 4], dtype_bits: 8, values: None },
+                ZkOp::Matmul { a: 3, b: 4 },
+                ZkOp::Relu { input: 5 },
+                // Layer 3
+                ZkOp::Weight { name: "w3".into(), shape: vec![4, 4], dtype_bits: 8, values: None },
+                ZkOp::Matmul { a: 6, b: 7 },
+                ZkOp::Relu { input: 8 },
+            ],
+            output_idx: 9,
+            input_indices: vec![0],
+            weight_indices: vec![1, 4, 7],
+        };
+
+        let layers = lower_model_for_folding(&dag, &ZkConfig::default());
+        assert_eq!(layers.len(), 3, "3-layer MLP should produce 3 foldable ZkIRs");
     }
 
     #[test]

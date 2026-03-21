@@ -53,16 +53,18 @@ The `gpu_target.rs` abstraction and `kernel_ir.rs` intermediate representation (
 
 ## FlashAttention-2 (M27)
 
-Production-quality implementation in `flash_attention.rs` (2,241 lines):
+Production-quality implementation in `flash_attention.rs` (~2,600 lines):
 
 - **Tiled attention** with online softmax (numerically stable)
-- **MMA tensor core** support (`mma.sync.aligned.m16n8k16` for sm_80+)
+- **Hopper wgmma.mma_async** (sm_90+): asynchronous matrix multiply with TMA loads and warp specialization (producer/consumer warps), pingpong scheduling to hide softmax latency behind tensor core compute
+- **Ampere mma.sync** (sm_80): `mma.sync.aligned.m16n8k16` fallback for A100-class GPUs
 - **Paged KV-cache** integration (block table lookup during attention)
 - **RoPE fusion** (half-split and adjacent rotary embedding applied in-register)
 - **GQA support** (grouped query attention with head mapping)
 - **Tree-structured causal mask** (for speculative decoding, M33)
-- **21 configurable variants** parameterized by head dim, block sizes, causal/non-causal
+- **21+ configurable variants** parameterized by head dim, block sizes, causal/non-causal
 - **Register pressure optimization**: processes one m-tile at a time
+- **Logsumexp saving** for correct backward pass gradient computation
 - **Fallback**: scalar FMA path for GPUs without tensor cores
 
 Activated via `@flash_attention` decorator on attention functions.
@@ -199,12 +201,14 @@ Currently: framework with median-value fallback. Full GPU benchmarking (cuEvent 
 Production-quality FP8 support targeting H100 (sm_90):
 
 - **MMA instruction**: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`
-- **Formats**: E4M3 (inference), E5M2 (training gradients)
+- **Formats**: E4M3 (forward/inference), E5M2 (backward/training gradients)
 - **Calibration**: Running-max EMA for per-tensor scale factors
 - **Dispatch**: sm_90 → MMA kernel, older GPUs → dequantize-to-f32 fallback
 - **Quantization/dequantization**: Round-to-nearest with saturation
 
 Activated via `@fp8_compute` decorator.
+
+**Planned upgrade**: MXFP8 per-block scaling (E8M0 scale per 32 elements) and NVFP4 (E2M1 with Hadamard preprocessing) for Blackwell GPUs. Plan: `mxfp8-per-block-scaling.md`.
 
 ---
 

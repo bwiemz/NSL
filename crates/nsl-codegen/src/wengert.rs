@@ -22,6 +22,7 @@ pub enum PrimalOp {
     // Elementwise unary
     Relu, Sigmoid, Tanh, Gelu, Silu,
     Exp, Log, Sqrt, Abs, Neg,
+    Clamp { min: f64, max: f64 },
     // Elementwise binary
     Add, Sub, Mul, Div,
     // Linear algebra
@@ -31,9 +32,34 @@ pub enum PrimalOp {
     Sum { dim: Option<i64> },
     Mean { dim: Option<i64> },
     Softmax { dim: i64 },
+    LogSoftmax { dim: i64 },
     // Shape ops
     Reshape { target_ndim: usize },
     Broadcast,
+    Concat { dim: i64 },
+    Split { dim: i64, chunks: usize },
+    Slice { dim: i64, start: i64, end: i64 },
+    // Indexing
+    Gather { dim: i64 },
+    ScatterAdd { dim: i64 },
+    Embedding,
+    // Normalization
+    LayerNorm { eps: f64 },
+    BatchNorm { eps: f64, training: bool },
+    // Pooling
+    MaxPool2d { kernel: usize, stride: usize },
+    AvgPool2d { kernel: usize, stride: usize },
+    // Convolution
+    Conv2d { stride: usize, padding: usize },
+    // Loss functions
+    CrossEntropyLoss,
+    MSELoss,
+    L1Loss,
+    // Attention
+    ScaledDotProductAttention { causal: bool },
+    RoPE { dim: usize },
+    // Regularization
+    Dropout { p: f64 },
     // Control flow
     /// Conditional select: result = inputs[0] (cond) ? inputs[1] (true_val) : inputs[2] (false_val)
     Select,

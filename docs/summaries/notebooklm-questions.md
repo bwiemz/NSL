@@ -36,8 +36,8 @@ What are NeuralScript's "moat features" — capabilities that are structurally i
 ### Q7: Operator Fusion System
 How does NSL's 4-level operator fusion system work? Explain each level: (1) elementwise fusion — how are chains of element-wise ops detected and compiled into single PTX kernels? (2) epilogue fusion — how are post-matmul operations fused into the matmul kernel? (3) reduction fusion — how are map-reduce patterns fused? (4) graph-level fusion — how does the DAG analysis identify global fusion opportunities?
 
-### Q8: FlashAttention-2 Implementation
-How does NSL's FlashAttention-2 implementation work? Cover: tiled attention with online softmax, MMA tensor core instructions (mma.sync.aligned), paged KV-cache integration, RoPE fusion (in-register rotary embedding), GQA support, tree-structured causal masks for speculative decoding, and the 21 kernel variant parameterization.
+### Q8: FlashAttention-2/3 Implementation
+How does NSL's FlashAttention implementation work? Cover: tiled attention with online softmax, Hopper wgmma.mma_async with TMA loads and warp specialization (producer/consumer warps, pingpong scheduling), Ampere mma.sync fallback, paged KV-cache integration, RoPE fusion (in-register rotary embedding), GQA support, tree-structured causal masks for speculative decoding, logsumexp saving for backward pass, and the 21+ kernel variant parameterization.
 
 ### Q9: Weight-Aware Compilation
 How does weight-aware compilation (M52) work? How does the compiler load .safetensors at compile time? What constant folding does it perform (matmul, add, relu with known operands)? How does dead weight elimination work? What is the sparsity analysis (CSR layout)? How does SHA-256 integrity checking protect against weight corruption?
@@ -78,5 +78,6 @@ How would ZK inference circuits work in NSL? Explain: compiling a forward pass t
 ### Q17: Effect System
 How does NSL's effect system track side effects? Explain: the 4 effect categories (IO, RANDOM, MUTATION, COMMUNICATION), effect inference via call graph propagation, the @pure and @deterministic decorators, and how effect tracking enables reproducibility verification, parallelism safety, and optimization. What is the known M51a limitation with explicit Rng seeds?
 
-### Q18: Implementation Maturity
-What is the current implementation maturity of NeuralScript across all milestones M9-M62? Categorize each as: Production (real algorithms, tested), Functional (core logic works but missing optimizations/GPU kernels), Framework (types/config defined but algorithms are stubs), or Not Started. What are the biggest gaps between "functional" and "production" for the scaling features (M32-M51)?
+### Q18: Implementation Maturity (Updated 2026-03-21)
+
+What is the current implementation maturity of NeuralScript across all milestones M9-M62? The codebase is ~83,500 LOC across 249 files with 606+ tests. All compiler/runtime/optimization plans are now implemented. Key features: FlashAttention-3 Hopper wgmma with warp specialization, 50+ AD backward rules, EAGLE-2 dynamic draft trees + Lookahead decoding, MXFP8/NVFP4 Blackwell quantization, FBIP in-place mutation with GPU kernels and static reuse analysis, effect polymorphism (Effect::Var + unification), format-agnostic @layout sparsity with TACO concrete index notation, cost-guided fusion profitability with register pressure + occupancy, two-tier WCET (GPU statistical + FPGA certified), Jolt lookup-native ZK gates + Nova folding + Mersenne-31 field, rematerialization, SharedMem pipeline comm, C API forward pass, disaggregated worker loops. Only remaining plan: nsl-coder-50m (ML model training, not compiler work). Categorize each milestone as Production, Functional, Framework, or Not Started.

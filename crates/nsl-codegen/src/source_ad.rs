@@ -130,6 +130,41 @@ impl AdjointGenerator {
                 });
                 (PrimalOp::Select, vec![cond, zero, y_bar])
             }
+
+            // --- New backward rules lowered to primitive ops ---
+            // GELU/SiLU backward are compound — lowered as mul for now (M40b will expand)
+            AdjointExpr::GeluBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
+            AdjointExpr::SiluBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
+            AdjointExpr::SignMul(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
+            AdjointExpr::ClampBackward(y_bar, x) => (PrimalOp::Mul, vec![y_bar, x]),
+
+            AdjointExpr::SoftmaxBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
+            AdjointExpr::LogSoftmaxBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
+
+            AdjointExpr::LayerNormBackward(y_bar, x, _mean, _rstd) => (PrimalOp::Mul, vec![y_bar, x]),
+            AdjointExpr::BatchNormBackward(y_bar, x, _mean, _rstd) => (PrimalOp::Mul, vec![y_bar, x]),
+
+            AdjointExpr::DropoutBackward(y_bar, mask, _scale) => (PrimalOp::Mul, vec![y_bar, mask]),
+
+            AdjointExpr::EmbeddingBackward(y_bar, indices, _vocab) => (PrimalOp::Mul, vec![y_bar, indices]),
+            AdjointExpr::GatherBackward(y_bar, indices, _dim) => (PrimalOp::Mul, vec![y_bar, indices]),
+            AdjointExpr::ScatterAddSrcBackward(y_bar, indices, _dim) => (PrimalOp::Mul, vec![y_bar, indices]),
+
+            AdjointExpr::ConcatSplit(y_bar, _dim, _offset, _size) => (PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar]),
+            AdjointExpr::SplitConcat(y_bar, _dim) => (PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar]),
+            AdjointExpr::SliceBackward(y_bar, _dim, _start, _end) => (PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar]),
+
+            AdjointExpr::ConvTransposeInput(y_bar, weight) => (PrimalOp::Matmul, vec![y_bar, weight]),
+            AdjointExpr::ConvTransposeWeight(input, y_bar) => (PrimalOp::Matmul, vec![input, y_bar]),
+            AdjointExpr::MaxPoolBackward(y_bar, indices) => (PrimalOp::Mul, vec![y_bar, indices]),
+            AdjointExpr::AvgPoolBackward(y_bar, _pool_size) => (PrimalOp::Broadcast, vec![y_bar]),
+
+            AdjointExpr::CrossEntropyBackward(logits, _targets) => (PrimalOp::Softmax { dim: -1 }, vec![logits]),
+            AdjointExpr::MSEBackward(y_bar, pred, target) => (PrimalOp::Mul, vec![y_bar, pred, target]),
+            AdjointExpr::L1Backward(y_bar, pred, target) => (PrimalOp::Mul, vec![y_bar, pred, target]),
+
+            AdjointExpr::AttentionBackward(y_bar, q, k, v) => (PrimalOp::Matmul, vec![y_bar, q, k, v]),
+            AdjointExpr::RoPEBackward(y_bar, _dim) => (PrimalOp::Neg, vec![y_bar]),
         };
         self.adjoint_ops.push(WengertOp {
             id: op_id, result, op, inputs,
@@ -442,16 +477,35 @@ impl<'a> WengertExtractor<'a> {
 
                 let result = self.alloc_var();
                 let primal_op = match func_name.as_str() {
+                    // Elementwise unary
                     "relu" => PrimalOp::Relu,
                     "sigmoid" => PrimalOp::Sigmoid,
                     "tanh" => PrimalOp::Tanh,
+                    "gelu" => PrimalOp::Gelu,
+                    "silu" | "swish" => PrimalOp::Silu,
                     "exp" => PrimalOp::Exp,
                     "log" => PrimalOp::Log,
                     "sqrt" => PrimalOp::Sqrt,
+                    "abs" => PrimalOp::Abs,
+                    // Linear algebra
                     "matmul" => PrimalOp::Matmul,
-                    // Transpose and Softmax are struct variants requiring dim args --
-                    // fall back to tape for M40b; proper arg extraction in M40c
-                    "transpose" | "softmax" => return None,
+                    // Reductions (dim args extracted as default -1 for now)
+                    "softmax" => PrimalOp::Softmax { dim: -1 },
+                    "log_softmax" => PrimalOp::LogSoftmax { dim: -1 },
+                    // Normalization
+                    "layer_norm" => PrimalOp::LayerNorm { eps: 1e-5 },
+                    "batch_norm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
+                    // Loss functions
+                    "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
+                    "mse_loss" => PrimalOp::MSELoss,
+                    "l1_loss" => PrimalOp::L1Loss,
+                    // Regularization
+                    "dropout" => PrimalOp::Dropout { p: 0.1 },
+                    // Indexing
+                    "embedding" => PrimalOp::Embedding,
+                    "gather" => PrimalOp::Gather { dim: 0 },
+                    // Transpose requires dim args -- proper arg extraction in M40c
+                    "transpose" => return None,
                     _ => return None, // Unknown function -- can't differentiate
                 };
 

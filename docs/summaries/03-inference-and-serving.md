@@ -24,16 +24,18 @@ This eliminates memory fragmentation from variable-length sequences and enables 
 
 ## FlashAttention-2 (M27)
 
-Production-quality tiled attention (2,241 lines):
+Production-quality tiled attention (~2,600 lines):
 
 - **Online softmax**: Numerically stable attention without materializing the full S×S attention matrix
 - **Tiled computation**: Processes attention in tiles that fit in GPU shared memory / registers
-- **MMA tensor cores**: `mma.sync.aligned.m16n8k16` instructions on sm_80+ (Ampere, Hopper)
+- **Hopper wgmma.mma_async** (sm_90+): Asynchronous matrix multiply with TMA loads, warp specialization (producer/consumer), and pingpong scheduling to overlap softmax with tensor core compute
+- **Ampere mma.sync** (sm_80): `mma.sync.aligned.m16n8k16` fallback for A100-class GPUs
 - **Paged KV integration**: Reads KV from paged blocks via block table lookup
 - **RoPE fusion**: Rotary positional embedding applied in-register (both half-split and adjacent layouts)
 - **GQA**: Grouped query attention with configurable head mapping (multiple Q heads per KV head)
 - **Tree causal mask**: Supports non-contiguous causal masks for speculative decoding token trees
-- **21 kernel variants**: Parameterized by head dim, block size, causal mode
+- **21+ kernel variants**: Parameterized by head dim, block size, causal mode
+- **Logsumexp saving**: For correct backward pass gradient computation
 - **Fallback path**: Scalar FMA for GPUs without tensor cores
 
 Activated via decorator:

@@ -215,6 +215,10 @@ pub enum LevelFormat {
     Compressed,
     /// Iterate via coordinate array (COO).
     Singleton,
+    /// Compressed with duplicate indices allowed (COO batched insertions).
+    CompressedNonUnique,
+    /// Hash-map backed level. O(1) lookup but non-sequential iteration.
+    Hashed,
 }
 
 /// One level in the iteration graph.
@@ -371,6 +375,241 @@ pub fn estimate_sparse_flops(op: SparseOp, nnz: usize, n: usize, nnz_b: usize) -
         SparseOp::Add => (nnz + nnz_b) as f64,            // merge cost
         SparseOp::ScalarMul => nnz as f64,                // one mul per nz
         SparseOp::StructuredMatMul => nnz as f64 * n as f64,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Format-agnostic @layout lowering (Task 2: concrete index notation)
+// ---------------------------------------------------------------------------
+
+/// An index variable in the iteration graph (e.g., i, j, k for C[i,j] = A[i,k] * B[k,j]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexVar(pub String);
+
+/// Access pattern for a tensor in a tensor expression.
+#[derive(Debug, Clone)]
+pub struct TensorAccess {
+    /// Index variables used to access this tensor, in dimension order.
+    pub index_vars: Vec<IndexVar>,
+    /// Per-dimension level formats from @layout annotation.
+    pub levels: Vec<LevelFormat>,
+}
+
+/// A tensor expression to be lowered to sparse iteration code.
+#[derive(Debug, Clone)]
+pub enum TensorExpr {
+    /// C = A @ B (matmul)
+    Matmul {
+        output: TensorAccess,
+        left: TensorAccess,
+        right: TensorAccess,
+    },
+    /// C = A + B (element-wise add)
+    Add {
+        output: TensorAccess,
+        left: TensorAccess,
+        right: TensorAccess,
+    },
+    /// C = A * B (element-wise mul)
+    Mul {
+        output: TensorAccess,
+        left: TensorAccess,
+        right: TensorAccess,
+    },
+}
+
+/// Build an iteration graph from a tensor expression using TACO-style lowering.
+///
+/// The graph determines loop nesting order and merge strategy for each level.
+/// This is the core of format-agnostic sparsity: users write `C = A @ B`,
+/// the compiler inspects A's and B's @layout annotations, and generates
+/// the optimal iteration structure.
+pub fn build_iteration_graph_from_expr(expr: &TensorExpr) -> IterationGraph {
+    match expr {
+        TensorExpr::Matmul { left, right, .. } => {
+            // C[i,j] = A[i,k] * B[k,j]
+            // Outer loop: iterate A's row dimension (level 0)
+            // Inner loop: iterate A's column dimension (level 1), merge with B's row dimension
+            let row_fmt = left.levels.first().copied().unwrap_or(LevelFormat::Dense);
+            let col_fmt = left.levels.get(1).copied().unwrap_or(LevelFormat::Compressed);
+
+            IterationGraph {
+                levels: vec![
+                    IterLevel {
+                        dimension: 0,
+                        format: row_fmt,
+                        merge_with: vec![],
+                    },
+                    IterLevel {
+                        dimension: 1,
+                        format: col_fmt,
+                        merge_with: vec![1], // merge with right operand's row dimension
+                    },
+                ],
+            }
+        }
+        TensorExpr::Add { left, right, .. } => {
+            // C[i,j] = A[i,j] + B[i,j] — union merge at both levels
+            let levels: Vec<IterLevel> = left
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(dim, &fmt)| {
+                    let right_fmt = right.levels.get(dim).copied().unwrap_or(LevelFormat::Dense);
+                    // For union merge, use the more compressed format
+                    let merged_fmt = if fmt == LevelFormat::Compressed || right_fmt == LevelFormat::Compressed {
+                        LevelFormat::Compressed
+                    } else {
+                        fmt
+                    };
+                    IterLevel {
+                        dimension: dim,
+                        format: merged_fmt,
+                        merge_with: vec![1],
+                    }
+                })
+                .collect();
+            IterationGraph { levels }
+        }
+        TensorExpr::Mul { left, right, .. } => {
+            // C[i,j] = A[i,j] * B[i,j] — intersection merge at both levels
+            let levels: Vec<IterLevel> = left
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(dim, &fmt)| {
+                    let right_fmt = right.levels.get(dim).copied().unwrap_or(LevelFormat::Dense);
+                    // For intersection, use compressed if either is compressed
+                    let merged_fmt = if fmt == LevelFormat::Compressed || right_fmt == LevelFormat::Compressed {
+                        LevelFormat::Compressed
+                    } else {
+                        fmt
+                    };
+                    IterLevel {
+                        dimension: dim,
+                        format: merged_fmt,
+                        merge_with: vec![1],
+                    }
+                })
+                .collect();
+            IterationGraph { levels }
+        }
+    }
+}
+
+/// Determine the merge lattice for a tensor expression.
+pub fn build_merge_lattice_from_expr(expr: &TensorExpr) -> MergeLattice {
+    match expr {
+        TensorExpr::Matmul { .. } | TensorExpr::Mul { .. } => MergeLattice::intersection(),
+        TensorExpr::Add { .. } => MergeLattice::union(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: Automatic format selection from @layout
+// ---------------------------------------------------------------------------
+
+/// Select the optimal sparse kernel for a tensor expression based on @layout annotations.
+///
+/// This replaces manual kernel selection — users write standard math (`C = A @ B`)
+/// and the compiler selects the best kernel from the annotated formats.
+pub fn select_kernel_from_layout(
+    expr: &TensorExpr,
+    device: u8,
+) -> KernelSelection {
+    match expr {
+        TensorExpr::Matmul { left, .. } => {
+            // Determine format ID from left operand's layout
+            let format_id = layout_to_format_id(&left.levels);
+            let op = if left.levels.len() <= 1 || left.levels.iter().all(|l| *l == LevelFormat::Dense) {
+                // Dense — shouldn't use sparse kernel
+                return KernelSelection::Fallback;
+            } else {
+                SparseOp::MatMul
+            };
+            select_sparse_kernel(op, format_id, device)
+        }
+        TensorExpr::Add { left, .. } => {
+            let format_id = layout_to_format_id(&left.levels);
+            select_sparse_kernel(SparseOp::Add, format_id, device)
+        }
+        TensorExpr::Mul { left, .. } => {
+            let format_id = layout_to_format_id(&left.levels);
+            select_sparse_kernel(SparseOp::ScalarMul, format_id, device)
+        }
+    }
+}
+
+/// Map a level format list to the M50 format ID (0=COO, 1=CSR, 2=CSC, 3=BSR).
+fn layout_to_format_id(levels: &[LevelFormat]) -> u8 {
+    match levels {
+        [LevelFormat::Dense, LevelFormat::Compressed] => 1,      // CSR
+        [LevelFormat::Compressed, LevelFormat::Dense] => 2,      // CSC
+        [LevelFormat::CompressedNonUnique, LevelFormat::Singleton] => 0, // COO
+        [LevelFormat::Dense, LevelFormat::Compressed, LevelFormat::Dense, LevelFormat::Dense] => 3, // BSR
+        _ => 1, // default to CSR for unknown layouts
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: Auto-insertion of format conversions
+// ---------------------------------------------------------------------------
+
+/// Determine if a format conversion is needed for an operation.
+///
+/// Returns `Some((from_format_id, to_format_id))` if a conversion is needed,
+/// or `None` if the tensor is already in the preferred format.
+pub fn needs_format_conversion(
+    current_levels: &[LevelFormat],
+    expr: &TensorExpr,
+) -> Option<(u8, u8)> {
+    let current_id = layout_to_format_id(current_levels);
+
+    let preferred_id = match expr {
+        TensorExpr::Matmul { .. } => 1,  // CSR preferred for SpMM
+        TensorExpr::Add { .. } => current_id, // keep current for add (sorted merge)
+        TensorExpr::Mul { .. } => current_id, // keep current for mul
+    };
+
+    if current_id != preferred_id {
+        Some((current_id, preferred_id))
+    } else {
+        None
+    }
+}
+
+/// Select the conversion function name for a format pair.
+pub fn conversion_function(from: u8, to: u8) -> &'static str {
+    match (from, to) {
+        (0, 1) => "nsl_sparse_coo_to_csr",
+        (0, 2) => "nsl_sparse_coo_to_csc",
+        (1, 0) => "nsl_sparse_csr_to_coo",
+        (1, 2) => "nsl_sparse_csr_to_csc",
+        (2, 0) => "nsl_sparse_csc_to_coo",
+        (2, 1) => "nsl_sparse_csc_to_csr",
+        _ => "nsl_sparse_convert",
+    }
+}
+
+/// Workspace allocation hint for sparse output assembly.
+///
+/// The output of a sparse operation is assembled in a dense workspace first,
+/// then compressed to the output format. This returns the workspace size in elements.
+pub fn workspace_size_hint(output_levels: &[LevelFormat], dim_sizes: &[usize]) -> usize {
+    // For CSR output: workspace is one dense row (size = num_cols)
+    // For COO output: workspace is the full dense matrix (worst case)
+    if output_levels.is_empty() || dim_sizes.is_empty() {
+        return 0;
+    }
+
+    // CSR/CSC: workspace = last dimension size (one row/column at a time)
+    if output_levels.len() >= 2 {
+        match output_levels.last() {
+            Some(LevelFormat::Compressed) => *dim_sizes.last().unwrap_or(&0),
+            _ => dim_sizes.iter().product(),
+        }
+    } else {
+        dim_sizes.iter().product()
     }
 }
 
@@ -578,5 +817,166 @@ mod tests {
         assert_eq!(estimate_sparse_flops(SparseOp::MatVec, 1000, 1, 0), 2000.0);
         assert_eq!(estimate_sparse_flops(SparseOp::MatMul, 1000, 64, 0), 128000.0);
         assert_eq!(estimate_sparse_flops(SparseOp::Add, 500, 0, 300), 800.0);
+    }
+
+    // ── Format-agnostic @layout tests ────────────────────────────────
+
+    fn csr_access(vars: &[&str]) -> TensorAccess {
+        TensorAccess {
+            index_vars: vars.iter().map(|v| IndexVar(v.to_string())).collect(),
+            levels: vec![LevelFormat::Dense, LevelFormat::Compressed],
+        }
+    }
+
+    fn csc_access(vars: &[&str]) -> TensorAccess {
+        TensorAccess {
+            index_vars: vars.iter().map(|v| IndexVar(v.to_string())).collect(),
+            levels: vec![LevelFormat::Compressed, LevelFormat::Dense],
+        }
+    }
+
+    fn dense_access(vars: &[&str]) -> TensorAccess {
+        TensorAccess {
+            index_vars: vars.iter().map(|v| IndexVar(v.to_string())).collect(),
+            levels: vec![LevelFormat::Dense, LevelFormat::Dense],
+        }
+    }
+
+    #[test]
+    fn iteration_graph_csr_matmul() {
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: csr_access(&["i", "k"]),
+            right: dense_access(&["k", "j"]),
+        };
+        let ig = build_iteration_graph_from_expr(&expr);
+        assert_eq!(ig.levels.len(), 2);
+        assert_eq!(ig.levels[0].format, LevelFormat::Dense); // CSR row: dense
+        assert_eq!(ig.levels[1].format, LevelFormat::Compressed); // CSR col: compressed
+    }
+
+    #[test]
+    fn iteration_graph_csc_matmul() {
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: csc_access(&["i", "k"]),
+            right: dense_access(&["k", "j"]),
+        };
+        let ig = build_iteration_graph_from_expr(&expr);
+        assert_eq!(ig.levels[0].format, LevelFormat::Compressed); // CSC: compressed rows
+        assert_eq!(ig.levels[1].format, LevelFormat::Dense); // CSC: dense cols
+    }
+
+    #[test]
+    fn merge_lattice_from_add_is_union() {
+        let expr = TensorExpr::Add {
+            output: csr_access(&["i", "j"]),
+            left: csr_access(&["i", "j"]),
+            right: csr_access(&["i", "j"]),
+        };
+        let lattice = build_merge_lattice_from_expr(&expr);
+        assert_eq!(lattice.merge_op, MergeOp::Union);
+        assert_eq!(lattice.points.len(), 3);
+    }
+
+    #[test]
+    fn merge_lattice_from_mul_is_intersection() {
+        let expr = TensorExpr::Mul {
+            output: csr_access(&["i", "j"]),
+            left: csr_access(&["i", "j"]),
+            right: csr_access(&["i", "j"]),
+        };
+        let lattice = build_merge_lattice_from_expr(&expr);
+        assert_eq!(lattice.merge_op, MergeOp::Intersection);
+        assert_eq!(lattice.points.len(), 1);
+    }
+
+    #[test]
+    fn kernel_selection_from_csr_layout() {
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: csr_access(&["i", "k"]),
+            right: dense_access(&["k", "j"]),
+        };
+        // GPU
+        assert_eq!(select_kernel_from_layout(&expr, 1), KernelSelection::PtxCsrSpmm);
+        // CPU
+        assert_eq!(select_kernel_from_layout(&expr, 0), KernelSelection::CpuCsrSpmm);
+    }
+
+    #[test]
+    fn kernel_selection_from_coo_layout() {
+        let coo_access = TensorAccess {
+            index_vars: vec![IndexVar("i".into()), IndexVar("k".into())],
+            levels: vec![LevelFormat::CompressedNonUnique, LevelFormat::Singleton],
+        };
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: coo_access,
+            right: dense_access(&["k", "j"]),
+        };
+        assert_eq!(select_kernel_from_layout(&expr, 1), KernelSelection::PtxCooSpmm);
+    }
+
+    #[test]
+    fn kernel_selection_dense_falls_back() {
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: dense_access(&["i", "k"]),
+            right: dense_access(&["k", "j"]),
+        };
+        assert_eq!(select_kernel_from_layout(&expr, 1), KernelSelection::Fallback);
+    }
+
+    #[test]
+    fn format_conversion_coo_to_csr() {
+        let coo_levels = vec![LevelFormat::CompressedNonUnique, LevelFormat::Singleton];
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: TensorAccess {
+                index_vars: vec![IndexVar("i".into()), IndexVar("k".into())],
+                levels: coo_levels.clone(),
+            },
+            right: dense_access(&["k", "j"]),
+        };
+        let conv = needs_format_conversion(&coo_levels, &expr);
+        assert_eq!(conv, Some((0, 1))); // COO → CSR
+        assert_eq!(conversion_function(0, 1), "nsl_sparse_coo_to_csr");
+    }
+
+    #[test]
+    fn no_conversion_needed_for_csr_matmul() {
+        let csr_levels = vec![LevelFormat::Dense, LevelFormat::Compressed];
+        let expr = TensorExpr::Matmul {
+            output: dense_access(&["i", "j"]),
+            left: csr_access(&["i", "k"]),
+            right: dense_access(&["k", "j"]),
+        };
+        assert_eq!(needs_format_conversion(&csr_levels, &expr), None);
+    }
+
+    #[test]
+    fn workspace_size_csr_output() {
+        let csr_out = vec![LevelFormat::Dense, LevelFormat::Compressed];
+        // For a 1000×500 output in CSR, workspace = 500 (one row)
+        assert_eq!(workspace_size_hint(&csr_out, &[1000, 500]), 500);
+    }
+
+    #[test]
+    fn workspace_size_dense_output() {
+        let dense_out = vec![LevelFormat::Dense, LevelFormat::Dense];
+        assert_eq!(workspace_size_hint(&dense_out, &[100, 200]), 20000);
+    }
+
+    #[test]
+    fn workspace_size_empty() {
+        assert_eq!(workspace_size_hint(&[], &[]), 0);
+    }
+
+    #[test]
+    fn layout_to_format_id_mapping() {
+        assert_eq!(layout_to_format_id(&[LevelFormat::Dense, LevelFormat::Compressed]), 1); // CSR
+        assert_eq!(layout_to_format_id(&[LevelFormat::Compressed, LevelFormat::Dense]), 2); // CSC
+        assert_eq!(layout_to_format_id(&[LevelFormat::CompressedNonUnique, LevelFormat::Singleton]), 0); // COO
     }
 }

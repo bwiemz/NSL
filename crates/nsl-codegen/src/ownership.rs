@@ -79,6 +79,47 @@ impl OwnershipLowering {
         self.shared_bindings.insert(sym);
     }
 
+    // ── Clone FBIP (Phase 2, Item 1) ─────────────────────────────
+
+    /// Returns true if the binding is consumed exactly once, has no live borrows,
+    /// and is not @shared. When this is true, `clone(x)` can be eliminated —
+    /// the codegen uses the source pointer directly instead of allocating a copy.
+    pub fn is_consumed_once(&self, sym: &Symbol) -> bool {
+        self.linear_bindings.contains(sym)
+            && !self.shared_bindings.contains(sym)
+            && !self.active_borrows.contains_key(sym)
+    }
+
+    /// Determine whether a clone call can be eliminated for this source binding.
+    ///
+    /// Returns `CloneDecision::Eliminate` when the source is linear and consumed
+    /// once (no live borrows, not @shared) — the clone target reuses the source
+    /// pointer directly, and the source's free is suppressed.
+    ///
+    /// Returns `CloneDecision::Keep` when the source has shared ownership, live
+    /// borrows, or will be used again after the clone.
+    pub fn decide_clone(&self, source: &Symbol) -> CloneDecision {
+        if self.is_consumed_once(source) {
+            CloneDecision::Eliminate
+        } else {
+            CloneDecision::Keep
+        }
+    }
+
+    // ── Static Reuse Analysis (Phase 2, Item 3) ──────────────────
+
+    /// Returns true if the binding should use unconditional in-place FFI variants
+    /// (no refcount check, no allocation). This is the "trust the compiler" fast path.
+    ///
+    /// Requires: linear + not shared + no active borrows. When true, the codegen
+    /// emits `nsl_tensor_relu_inplace()` instead of `nsl_tensor_relu()`, skipping
+    /// the runtime `can_mutate_inplace()` check entirely.
+    pub fn should_use_inplace(&self, sym: &Symbol) -> bool {
+        self.linear_bindings.contains(sym)
+            && !self.shared_bindings.contains(sym)
+            && !self.active_borrows.contains_key(sym)
+    }
+
     /// Determine the ownership action(s) for a tensor binding at a specific usage site.
     ///
     /// `sym`: the binding being used
@@ -149,6 +190,16 @@ impl OwnershipLowering {
         decisions.push(OwnershipDecision::RefcountManaged);
         decisions
     }
+}
+
+/// Decision for whether a clone call can be eliminated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloneDecision {
+    /// Source is linear and consumed once — skip clone, reuse pointer directly.
+    /// The codegen must also suppress the source's `nsl_tensor_free()`.
+    Eliminate,
+    /// Source has shared ownership or live borrows — real clone required.
+    Keep,
 }
 
 /// Decision for how to handle a tensor at a usage site.
@@ -437,6 +488,98 @@ mod tests {
                 "shared weight should be RefcountManaged on every forward call"
             );
         }
+    }
+
+    // ── Clone FBIP tests (Phase 2, Item 1) ─────────────────────
+
+    #[test]
+    fn clone_eliminated_for_linear_consumed_once() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "a");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(a);
+
+        assert!(lowering.is_consumed_once(&a));
+        assert_eq!(lowering.decide_clone(&a), CloneDecision::Eliminate);
+    }
+
+    #[test]
+    fn clone_kept_for_shared() {
+        let mut interner = Interner::new();
+        let w = make_sym(&mut interner, "w");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_shared(w);
+
+        assert!(!lowering.is_consumed_once(&w));
+        assert_eq!(lowering.decide_clone(&w), CloneDecision::Keep);
+    }
+
+    #[test]
+    fn clone_kept_when_borrowed() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "a");
+        let a_ref = make_sym(&mut interner, "a_ref");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(a);
+        lowering.active_borrows.insert(a, BorrowKind::Immutable { borrower: a_ref });
+
+        assert!(!lowering.is_consumed_once(&a));
+        assert_eq!(lowering.decide_clone(&a), CloneDecision::Keep);
+    }
+
+    #[test]
+    fn clone_kept_for_linear_and_shared() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+        lowering.mark_shared(x);
+
+        assert!(!lowering.is_consumed_once(&x));
+        assert_eq!(lowering.decide_clone(&x), CloneDecision::Keep);
+    }
+
+    // ── Static reuse tests (Phase 2, Item 3) ─────────────────
+
+    #[test]
+    fn should_use_inplace_for_linear() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+
+        assert!(lowering.should_use_inplace(&x));
+    }
+
+    #[test]
+    fn should_not_use_inplace_for_shared() {
+        let mut interner = Interner::new();
+        let w = make_sym(&mut interner, "w");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_shared(w);
+
+        assert!(!lowering.should_use_inplace(&w));
+    }
+
+    #[test]
+    fn should_not_use_inplace_when_borrowed() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let b = make_sym(&mut interner, "ref_x");
+        let mut lowering = OwnershipLowering::new();
+        lowering.mark_linear(x);
+        lowering.active_borrows.insert(x, BorrowKind::Immutable { borrower: b });
+
+        assert!(!lowering.should_use_inplace(&x));
+    }
+
+    #[test]
+    fn should_not_use_inplace_for_unknown() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let lowering = OwnershipLowering::new();
+
+        assert!(!lowering.should_use_inplace(&x));
     }
 
     #[test]

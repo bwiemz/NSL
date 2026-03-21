@@ -27,8 +27,11 @@ nsl check --weight-analysis file.nsl --weights model.safetensors  # Weight analy
 NSL's ownership system brings Rust-like move semantics to tensor programming:
 
 - **Use-after-move detection**: Compiler catches attempts to use a tensor after it has been consumed
-- **Borrowed vs. owned parameters**: Functions declare whether they borrow or consume tensor arguments
-- **Tape safety**: Ensures autodiff tape operations don't hold dangling references (tape ops use pointer-as-key, never dereference)
+- **Immutable borrow syntax (`&T`)**: Functions can borrow tensors without consuming them. Auto-borrow at call sites (`T` auto-converts to `&T`).
+- **Borrow safety rules**: Cannot consume while borrowed, no borrows in return types, no `&mut T` (unsupported), no nested `&&T`
+- **Tape safety**: Borrowed tensors are transparent to the autodiff tape — the borrow passes through the same raw pointer as the owned tensor
+- **`@shared` escape hatch**: Marks tensors as refcounted for shared ownership (e.g., model weights used in multiple forward passes)
+- **Codegen integration**: Ownership decision tree (FreeAtConsumption, TapeHoldsReference, BorrowedNoAction), refcount elision for proven linear bindings
 
 ### Why This Matters
 In Python/PyTorch, tensor aliasing bugs cause silent correctness errors:
@@ -40,9 +43,10 @@ x += 1            # silently corrupts y
 
 In NSL, the ownership checker prevents this at compile time.
 
-### Design Split
-- **M38a (semantics)**: Ownership rules, use-after-move, borrow checking — implemented
-- **M38b (codegen)**: Elide reference counting for owned values, insert frees at consumption — planned
+### Current Status
+- **M38a (semantics)**: Ownership rules, use-after-move, borrow checking, `&T` syntax, autodiff integration — **implemented**
+- **M38b (codegen)**: Elide reference counting for owned values, insert frees at consumption — **implemented** (basic decision tree)
+- **FBIP (planned)**: Refcount-checked in-place mutation — when `refcount == 1`, mutate tensor in-place instead of allocating. Plan exists: `fbip-inplace-mutation.md`
 
 ---
 
@@ -252,9 +256,13 @@ ZK circuits require a static computation DAG with no data-dependent branching. P
 
 ### Implementation
 - **Type system**: `Sparse<format, [shape], dtype>` as distinct type
-- **Kernel selection**: Dispatcher routes to format-specific CPU or GPU kernels
-- **Sparsity-preserving inference**: Compiler tracks which operations preserve sparsity
-- **Cost model integration**: Sparsity-aware FLOP calculations
+- **`@layout` annotation**: Format-agnostic sparsity — users annotate tensors with `@layout("CSR")` and write standard dense equations; compiler auto-generates optimal sparse iteration
+- **TACO-style merge lattices**: Intersection (for multiply) and union (for add) co-iteration over multiple sparse tensors
+- **Level format composition**: Dense, Compressed, Singleton, CompressedNonUnique, Hashed — compose per-dimension to express CSR, CSC, COO, BCSR, and custom formats
+- **Concrete index notation lowering**: Translates tensor index notation to TACO's loop nesting + workspace allocation, then lowers directly to Cranelift IR (no intermediate C code generation)
+- **Workspace transformation**: Dense temporary for inner-loop accumulation, compressed output assembly
+- **Kernel selection**: Dispatcher routes to format-specific CPU or GPU kernels (SpMV, SpMM, structured MMA.sp for Ampere 2:4)
+- **Cost model integration**: Density-aware FLOP estimation for kernel selection
 
 ---
 

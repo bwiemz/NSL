@@ -1,13 +1,60 @@
-//! M55: BN254 scalar field element arithmetic.
+//! M55: Field element arithmetic for ZK circuits.
 //!
-//! Implements 256-bit modular arithmetic over the BN254 scalar field prime:
-//!   p = 21888242871839275222246405745257275088548364400416034343698204186575808495617
+//! Two field implementations:
+//!   - **BN254** (256-bit): EVM-compatible pairing, suitable for Solidity verifiers.
+//!   - **Mersenne-31** (32-bit, p = 2^31 - 1): ~10x faster, suitable for folding provers.
 //!
-//! Representation: 4 × 64-bit little-endian limbs (Montgomery-free, residue form).
-//! All operations reduce the result into [0, p).
+//! The `Field` trait abstracts over both; backend code is generic over `F: Field`.
+//!
+//! BN254 representation: 4 × 64-bit little-endian limbs (Montgomery-free, residue form).
+//! Mersenne-31 representation: single `u32` (all arithmetic in u64 intermediates).
 //!
 //! This is a pure-Rust implementation with no external crate dependencies,
 //! suitable for embedding into the NSL codegen pipeline.
+
+// ---------------------------------------------------------------------------
+// Field trait — generic interface for ZK field elements
+// ---------------------------------------------------------------------------
+
+/// Trait abstracting over finite field elements for ZK circuits.
+///
+/// Both BN254 (256-bit) and Mersenne-31 (32-bit) implement this trait,
+/// allowing backend code to be generic over the field choice.
+pub trait Field: Clone + std::fmt::Debug + PartialEq + Sized + Send + Sync {
+    /// The additive identity.
+    fn zero() -> Self;
+    /// The multiplicative identity.
+    fn one() -> Self;
+    /// Modular addition.
+    fn field_add(&self, other: &Self) -> Self;
+    /// Modular subtraction.
+    fn field_sub(&self, other: &Self) -> Self;
+    /// Modular multiplication.
+    fn field_mul(&self, other: &Self) -> Self;
+    /// Modular multiplicative inverse (Fermat's little theorem).
+    fn field_inv(&self) -> Self;
+    /// Additive inverse (negation).
+    fn field_neg(&self) -> Self;
+    /// Construct from a u64 value.
+    fn from_u64(val: u64) -> Self;
+    /// Serialize to a byte vector.
+    fn to_bytes_vec(&self) -> Vec<u8>;
+    /// Name of this field (for diagnostics).
+    fn field_name() -> &'static str;
+}
+
+impl Field for FieldElement {
+    #[inline] fn zero() -> Self { FieldElement::zero() }
+    #[inline] fn one() -> Self { FieldElement::one() }
+    #[inline] fn field_add(&self, other: &Self) -> Self { self.add(other) }
+    #[inline] fn field_sub(&self, other: &Self) -> Self { self.sub(other) }
+    #[inline] fn field_mul(&self, other: &Self) -> Self { self.mul(other) }
+    #[inline] fn field_inv(&self) -> Self { self.inv() }
+    #[inline] fn field_neg(&self) -> Self { FieldElement::zero().sub(self) }
+    #[inline] fn from_u64(val: u64) -> Self { FieldElement::from_u64(val) }
+    fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
+    fn field_name() -> &'static str { "BN254" }
+}
 
 // ---------------------------------------------------------------------------
 // BN254 scalar field prime (little-endian 64-bit limbs)

@@ -26,9 +26,13 @@ The primary autodiff implementation uses a global tape:
 **Tape operations** (defined in `nsl-runtime/src/autodiff/`):
 - Arithmetic: Add, Sub, Mul, Div, MatMul
 - Activations: ReLU, GELU, SiLU, Sigmoid, Tanh, Softmax
-- Normalization: LayerNorm, RMSNorm
-- Shape: Slice, Concat, Reshape, Transpose
-- Other: Dropout, Embedding lookup
+- Normalization: LayerNorm, BatchNorm, RMSNorm
+- Shape: Slice, Concat, Split, Reshape, Transpose, Gather, ScatterAdd
+- Pooling: MaxPool2d, AvgPool2d
+- Convolution: Conv2d
+- Attention: ScaledDotProductAttention, RoPE
+- Loss: CrossEntropy, MSE, L1
+- Other: Dropout, Embedding lookup, Clamp, Abs
 
 **Critical implementation detail**: Tape ops store raw i64 pointers to tensors. These pointers are used **only as hashmap keys** for gradient accumulation — they must never be dereferenced because the original tensors may have been freed. Shape information is stored separately in the tape op.
 
@@ -37,9 +41,10 @@ An alternative to tape-based AD that transforms the forward computation into an 
 
 **File**: `source_ad.rs`, `wengert.rs`
 
-1. **Wengert extraction**: Converts forward pass AST into a Wengert list (sequence of elementary operations)
-2. **Adjoint generation**: Walks Wengert ops in reverse, applying AD rules
+1. **Wengert extraction**: Converts forward pass AST into a Wengert list (50+ PrimalOp types)
+2. **Adjoint generation**: Walks Wengert ops in reverse, applying 50+ AD rules (all common ops including softmax, layernorm, cross-entropy, dropout, conv2d, attention, RoPE)
 3. **Dead code elimination**: Removes unused adjoint variables
+4. **Saved-for-backward analysis**: Classifies each op as needing Nothing, Inputs, or Output saved
 
 Advantages over tape-based:
 - No runtime tape overhead

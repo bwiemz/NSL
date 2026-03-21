@@ -134,6 +134,8 @@ pub struct ZkConfig {
     pub emit_solidity: bool,
     /// Elliptic curve to use for commitments / pairing.
     pub curve: ZkCurve,
+    /// Which finite field to use for circuit arithmetic.
+    pub field: ZkField,
     /// Optional hard cap on the number of arithmetic constraints.
     ///
     /// Compilation fails with [`ZkError::InvalidConfig`] if the circuit
@@ -149,10 +151,11 @@ pub struct ZkConfig {
 impl Default for ZkConfig {
     fn default() -> Self {
         Self {
-            backend: ZkBackendType::Halo2,
+            backend: ZkBackendType::Folding,
             mode: ZkMode::ArchitectureAttestation,
             emit_solidity: false,
             curve: ZkCurve::BN254,
+            field: ZkField::Mersenne31,
             max_constraints: None,
             frac_bits: 8,
         }
@@ -166,10 +169,22 @@ impl Default for ZkConfig {
 /// Selects which proof system backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZkBackendType {
-    /// Halo2 (PSE fork) — plonkish arithmetization, no trusted setup.
+    /// Halo2 (PSE fork) — plonkish arithmetization, no trusted setup. DEPRECATED.
     Halo2,
     /// Plonky3 — FRI-based, fast prover, no trusted setup.
     Plonky3,
+    /// Folding — Nova/HyperNova-style incremental verifiable computation.
+    /// Lookup-native with AIR constraints. Production backend for large models.
+    Folding,
+}
+
+/// Selects which finite field to use for ZK arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZkField {
+    /// BN254 scalar field (256-bit). EVM-compatible for Solidity verifiers.
+    BN254,
+    /// Mersenne-31 (p = 2^31 - 1, 32-bit). ~10x faster, used by folding prover.
+    Mersenne31,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,3 +255,39 @@ impl std::fmt::Display for ZkError {
 }
 
 impl std::error::Error for ZkError {}
+
+// ---------------------------------------------------------------------------
+// FoldingBackend trait — incremental proving for large models
+// ---------------------------------------------------------------------------
+
+/// Abstract interface for folding-based ZK proof backends.
+///
+/// Unlike `ZkBackend` (which compiles the entire circuit at once), a
+/// `FoldingBackend` processes the model layer-by-layer, folding each layer's
+/// constraints into a running accumulator. This produces constant-size proofs
+/// regardless of model depth.
+pub trait FoldingBackend<F: super::field::Field> {
+    /// Fold a new layer's circuit into the running accumulator.
+    fn fold_layer(&mut self, ir: &ZkIR, witness: &[F]) -> Result<(), ZkError>;
+
+    /// Finalize: produce the proof from the accumulated state.
+    fn finalize(&self) -> Result<ZkProof, ZkError>;
+
+    /// Verify a folding proof against public inputs.
+    fn verify(proof: &ZkProof, public_io: &[F]) -> Result<bool, ZkError>;
+}
+
+/// A ZK proof produced by any backend (folding or one-shot).
+///
+/// Opaque bytes that can be serialized, transmitted, and verified.
+#[derive(Debug, Clone)]
+pub struct ZkProof {
+    /// Serialized proof bytes.
+    pub data: Vec<u8>,
+    /// Number of layers folded (for folding proofs).
+    pub num_folds: u32,
+    /// Public inputs committed in the proof.
+    pub public_inputs: Vec<Vec<u8>>,
+    /// Public outputs committed in the proof.
+    pub public_outputs: Vec<Vec<u8>>,
+}

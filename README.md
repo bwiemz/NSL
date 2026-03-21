@@ -133,7 +133,7 @@ let result = c.to(cpu)  # each element = 3.0
 - Mixed-precision matmul (`nsl_qtensor_matmul_mixed`)
 - Model monomorphization: compiler synthesizes quantized model type
 - Glob-based `exclude` patterns to keep specific layers in full precision
-- **FP8 compute** — `@fp8_compute` decorator, E4M3/E5M2 scale management, FP8 Tensor Core matmul (sm_90 MMA + Hopper wgmma), running-max EMA calibration
+- **FP8 compute** — `@fp8_compute` decorator, E4M3/E5M2 scale management, FP8 Tensor Core matmul (sm_90 MMA + Hopper wgmma), running-max EMA calibration, **MXFP8 per-block scaling** (E8M0 scale per 32 elements for Blackwell), **NVFP4** (E2M1 with Hadamard preprocessing)
 - **AWQ 4-bit** — `quant { dtype: awq4 }` with in-register dequantize-in-GEMM
 - **GPTQ 4-bit/8-bit** — `quant { dtype: gptq4 }` with Hessian-based optimal quantization
 
@@ -150,7 +150,7 @@ let result = c.to(cpu)  # each element = 3.0
 
 ### Scaling & Optimization *(shipped — v0.3.0)*
 - **Mixture of Experts** — `@moe` decorator with top-k gating, capacity-based routing, aux loss
-- **Speculative decoding** — `@speculative` with tree attention, rejection sampling, Medusa heads
+- **Speculative decoding** — `@speculative` with EAGLE-2 dynamic confidence-scored trees, Lookahead n-gram decoding, Medusa multi-head, tree attention masks, rejection sampling (greedy + stochastic)
 - **Ring attention** — `@context_parallel` for cross-GPU sequence parallelism
 - **Memory planning** — compile-time tensor liveness analysis, interference graph, BFD slab allocation with 256-byte alignment, rematerialization pass (trade compute for memory by recomputing cheap activations)
 - **Roofline cost model** — multi-level memory hierarchy (L1/L2/HBM bandwidth), occupancy estimation, per-op FLOP/byte analysis with GPU database (A100, H100, RTX-4090, etc.)
@@ -161,20 +161,20 @@ let result = c.to(cpu)  # each element = 3.0
 
 ### Infrastructure *(v0.4.0–v0.8.0 — analysis + FFI layers + codegen wiring)*
 
-- **Disaggregated inference** — router, KV transfer, prefill/decode worker FFI
+- **Disaggregated inference** — router, KV transfer (KVXF format), prefill/decode worker loops with message handling
 - **KV-cache compression** — INT8/INT4/FP8 quantization, sliding window, H2O eviction
 - **Constrained decoding** — compiled FSM (Thompson/subset/Hopcroft DFA), token alignment, logit masking, per-request grammar state
 - **Multi-backend** — Kernel IR (40+ ops), PTX + AMDGPU + Metal (MSL) + WGSL backends
-- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping, ZeRO sharding, @pipeline codegen
+- **Pipeline parallelism** — 1F1B/GPipe scheduling, 3D rank mapping, ZeRO sharding, @pipeline codegen, SharedMem mailbox backend with condvar signaling
 - **Tensor debugger** — `nsl debug` CLI: trace reader, NaN finder, diff, Chrome export
 - **Reproducibility** — determinism checker, CPU deterministic scatter_add, kernel variant selection
 - **Multimodal** — patch embed, bilinear resize, image normalize, cross-attention, STFT, mel spectrogram, resampling
-- **Sparse tensors** — COO/CSR/CSC construction and conversion, from_dense, to_dense, SpMV, SpMM, TACO-style merge lattices (intersection for mul, union for add), workspace transformation for output assembly, density-aware cost model
+- **Sparse tensors** — COO/CSR/CSC/BSR, SpMV/SpMM, TACO merge lattices, **format-agnostic `@layout` annotations** (level format composition, concrete index notation lowering to Cranelift IR), workspace transformation, density-aware cost model
 - **Shape algebra** — symbolic dimension solver (equality, divisibility, range proofs, Fourier-Motzkin bound reasoning for inequality chains and reshape validation)
-- **Linear types codegen** — ownership decision tree (free-at-consumption, tape-holds-reference)
-- **Source AD extraction** — Wengert extraction from AST, backward context
+- **Linear types codegen** — ownership decision tree (free-at-consumption, tape-holds-reference), **FBIP in-place mutation** (refcount==1 check, GPU in-place kernels, static reuse analysis for refcount elision)
+- **Source AD extraction** — Wengert extraction from AST, **50+ backward rules** (softmax, layernorm, cross-entropy, dropout, conv2d, attention, RoPE, embedding, gather, scatter, etc.)
 - **vmap AST transform** — VmapTransformer FnDef→FnDef rewriting
-- **Effect system** — effect inference, @pure/@deterministic/@checkpoint validation
+- **Effect system** — effect inference, @pure/@deterministic/@checkpoint validation, **effect polymorphism** (Effect::Var, Effect::Union, substitution, unification for generic functions)
 - **Snapshot + differential testing** — insta PTX snapshots, --disable-fusion oracle
 
 ### Weight Intelligence & Interop *(v0.9.0)*
@@ -329,27 +329,21 @@ nsl check --weight-analysis file.nsl --weights model.safetensors
 
 ## Roadmap
 
-**Next priorities (unimplemented):**
+All compiler and runtime milestones (M9-M55) are fully implemented. Only one plan remains: a 50M-parameter NSL code generation model.
 
-- FBIP (Functional But In-Place) — zero-allocation inference via refcount-checked in-place mutation
-- Effect polymorphism — effect variables on function types for correct higher-order effect propagation
-- WCET two-tier — FPGA certified path (GPU WCET is statistically bounded only)
-- ZK upgrade — lookup-native arithmetization (Jolt-style), folding accumulation, Mersenne-31 field
-
-**Future milestones (M56-M62):** Multi-agent shared memory, FPGA/neuromorphic backend, elastic fault tolerance, topology-aware routing, exabyte data streaming, cluster debugging, PyTorch FFI.
+**Future milestones (M56-M71):**
+- **M56-M62:** Multi-agent shared memory, FPGA/neuromorphic backend, elastic fault tolerance, topology-aware routing, exabyte data streaming, cluster debugging
+- **M63-M71:** Compiled MCTS tree search, online DPO, ternary (1.58-bit) types, format-agnostic dynamic sparsity, neuromorphic spiking graphs, refinement types (SMT-backed value proofs), production upgrades for disaggregated/unikernel/ZKML
 
 See `docs/plans/` and `docs/summaries/` for details.
 
 ## Known Limitations
 
 - No REPL
-- CUDA required for GPU features (ROCm/Metal/WebGPU KIR foundation built, backends in progress)
+- CUDA required for GPU features (ROCm/Metal/WebGPU KIR foundation built, backends untested on real hardware)
 - Windows requires Visual Studio Build Tools for linking
-- GPU WCET provides statistical bounds only — hard real-time certification requires FPGA target (not yet implemented)
-- ZK circuits use v1 Halo2 scaffolding — upgrade to lookup-native/folding in progress
-- Autodiff backward rules cover ~11 operations (need ~40+ for full coverage)
-- Multi-backend (AMDGPU/Metal/WGSL) are codegen stubs — only PTX is production
-- FBIP (in-place tensor mutation for unique owners) not yet implemented
+- Multi-backend (AMDGPU/Metal/WGSL) generate plausible code but are untested — only PTX is production
+- M56-M62 (frontier scale: multi-agent, elastic fault tolerance, topology routing, exabyte data) not yet started
 
 ## License
 

@@ -48,6 +48,11 @@ pub struct GpuSpec {
     pub registers_per_sm: u32,
     /// Number of SMs.
     pub num_sms: u32,
+    /// Empirical p95 variance ratio for WCET statistical bounds.
+    /// GPU execution times vary due to non-deterministic warp scheduling,
+    /// memory coalescing patterns, and L2 contention. This factor converts
+    /// optimistic roofline estimates to p95 bounds. Typical: 1.2-1.4.
+    pub empirical_p95_ratio: f64,
 }
 
 impl GpuSpec {
@@ -135,6 +140,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 40 * 1024 * 1024,
         l1_cache_kb: 192, l1_bandwidth_gbs: 14400.0, l2_bandwidth_gbs: 4800.0,
         max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 108,
+        empirical_p95_ratio: 1.30,
     },
     GpuSpec {
         name: "A100-PCIe", sm_version: 80,
@@ -145,6 +151,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 40 * 1024 * 1024,
         l1_cache_kb: 192, l1_bandwidth_gbs: 14400.0, l2_bandwidth_gbs: 4800.0,
         max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 108,
+        empirical_p95_ratio: 1.30,
     },
     GpuSpec {
         name: "H100-SXM", sm_version: 90,
@@ -155,6 +162,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.5, l2_cache_bytes: 50 * 1024 * 1024,
         l1_cache_kb: 256, l1_bandwidth_gbs: 19200.0, l2_bandwidth_gbs: 6000.0,
         max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 132,
+        empirical_p95_ratio: 1.25,
     },
     GpuSpec {
         name: "H100-PCIe", sm_version: 90,
@@ -165,6 +173,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 50 * 1024 * 1024,
         l1_cache_kb: 256, l1_bandwidth_gbs: 19200.0, l2_bandwidth_gbs: 6000.0,
         max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 114,
+        empirical_p95_ratio: 1.25,
     },
     GpuSpec {
         name: "RTX-4090", sm_version: 89,
@@ -175,6 +184,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 72 * 1024 * 1024,
         l1_cache_kb: 128, l1_bandwidth_gbs: 12800.0, l2_bandwidth_gbs: 5600.0,
         max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 128,
+        empirical_p95_ratio: 1.35,
     },
     GpuSpec {
         name: "RTX-3090", sm_version: 86,
@@ -185,6 +195,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 6 * 1024 * 1024,
         l1_cache_kb: 128, l1_bandwidth_gbs: 9600.0, l2_bandwidth_gbs: 2400.0,
         max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 82,
+        empirical_p95_ratio: 1.35,
     },
     GpuSpec {
         name: "L40S", sm_version: 89,
@@ -195,6 +206,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 48 * 1024 * 1024,
         l1_cache_kb: 128, l1_bandwidth_gbs: 12800.0, l2_bandwidth_gbs: 5600.0,
         max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 142,
+        empirical_p95_ratio: 1.30,
     },
     // NVIDIA Jetson AGX Orin
     GpuSpec {
@@ -206,6 +218,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.4, l2_cache_bytes: 4 * 1024 * 1024,
         l1_cache_kb: 128, l1_bandwidth_gbs: 3200.0, l2_bandwidth_gbs: 800.0,
         max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 16,
+        empirical_p95_ratio: 1.40,
     },
     // NVIDIA Jetson Orin NX (smaller edge)
     GpuSpec {
@@ -217,6 +230,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.35, l2_cache_bytes: 2 * 1024 * 1024,
         l1_cache_kb: 128, l1_bandwidth_gbs: 1600.0, l2_bandwidth_gbs: 400.0,
         max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 8,
+        empirical_p95_ratio: 1.40,
     },
     // NVIDIA B200 (Blackwell, sm_100) — MXFP8 per-block scaling + NVFP4
     GpuSpec {
@@ -228,6 +242,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.6, l2_cache_bytes: 128 * 1024 * 1024,
         l1_cache_kb: 256, l1_bandwidth_gbs: 25600.0, l2_bandwidth_gbs: 12000.0,
         max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 160,
+        empirical_p95_ratio: 1.20,
     },
     // NVIDIA B100 (Blackwell, sm_100) — MXFP8 + NVFP4 (PCIe variant)
     GpuSpec {
@@ -239,6 +254,7 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.55, l2_cache_bytes: 96 * 1024 * 1024,
         l1_cache_kb: 256, l1_bandwidth_gbs: 20000.0, l2_bandwidth_gbs: 10000.0,
         max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 128,
+        empirical_p95_ratio: 1.20,
     },
 ];
 
@@ -267,6 +283,72 @@ pub fn find_gpu(name: &str) -> Option<&'static GpuSpec> {
 /// Default GPU when none specified and auto-detect unavailable.
 pub fn default_gpu() -> &'static GpuSpec {
     find_gpu("A100-SXM").unwrap()
+}
+
+/// Hardware specifications for an FPGA device (used for certified WCET analysis).
+///
+/// FPGA WCET is deterministic: fixed clock, no speculative execution, no cache hierarchy
+/// variability. When all data fits in OCM (on-chip memory), execution time is a pure
+/// function of the computation graph and PE array dimensions.
+#[derive(Debug, Clone)]
+pub struct FpgaSpec {
+    pub device_name: &'static str,
+    pub vendor: &'static str,
+    /// Fixed clock frequency in MHz (no boost, no throttling).
+    pub clock_mhz: u32,
+    /// On-chip memory (OCM/BRAM) size in KB.
+    pub ocm_size_kb: u32,
+    /// Processing element array dimensions (rows, cols).
+    pub pe_array_dims: (u32, u32),
+    /// OCM read/write latency in cycles (deterministic).
+    pub ocm_latency_cycles: u32,
+    /// DDR read/write latency in cycles (best case — but certified path avoids DDR).
+    pub ddr_latency_cycles: u32,
+    /// DSP slices available (for MAC operations).
+    pub dsp_slices: u32,
+}
+
+/// Built-in FPGA specification database for certified WCET analysis.
+pub const FPGA_DATABASE: &[FpgaSpec] = &[
+    // Xilinx VU440 — large FPGA for inference
+    FpgaSpec {
+        device_name: "xcvu440",
+        vendor: "xilinx",
+        clock_mhz: 300,
+        ocm_size_kb: 52_920, // ~51.7 MB BRAM
+        pe_array_dims: (16, 16),
+        ocm_latency_cycles: 2,
+        ddr_latency_cycles: 80,
+        dsp_slices: 2880,
+    },
+    // Xilinx ZU9EG (Zynq UltraScale+ for edge robotics)
+    FpgaSpec {
+        device_name: "xczu9eg",
+        vendor: "xilinx",
+        clock_mhz: 300,
+        ocm_size_kb: 1_824, // ~1.8 MB BRAM
+        pe_array_dims: (8, 8),
+        ocm_latency_cycles: 2,
+        ddr_latency_cycles: 100,
+        dsp_slices: 2520,
+    },
+    // Xilinx Versal AI Edge VE2302 (for automotive/robotics)
+    FpgaSpec {
+        device_name: "ve2302",
+        vendor: "xilinx",
+        clock_mhz: 400,
+        ocm_size_kb: 4_096, // 4 MB BRAM+URAM
+        pe_array_dims: (12, 12),
+        ocm_latency_cycles: 1,
+        ddr_latency_cycles: 60,
+        dsp_slices: 1968,
+    },
+];
+
+/// Find an FPGA by device name. Case-insensitive exact match.
+pub fn find_fpga(name: &str) -> Option<&'static FpgaSpec> {
+    let name_lower = name.to_lowercase();
+    FPGA_DATABASE.iter().find(|f| f.device_name.to_lowercase() == name_lower)
 }
 
 /// Hardware specifications for a CPU model (used for WCET analysis on CPU targets).
@@ -503,5 +585,54 @@ mod tests {
 
         let a100 = find_gpu("A100-SXM").unwrap();
         assert_eq!(a100.warp_group_size(), 32, "Ampere uses 32-thread warps");
+    }
+
+    // ---- FPGA database tests ----
+
+    #[test]
+    fn test_find_fpga_exact() {
+        let fpga = find_fpga("xcvu440").unwrap();
+        assert_eq!(fpga.device_name, "xcvu440");
+        assert_eq!(fpga.vendor, "xilinx");
+        assert_eq!(fpga.clock_mhz, 300);
+    }
+
+    #[test]
+    fn test_find_fpga_case_insensitive() {
+        let fpga = find_fpga("XCVU440").unwrap();
+        assert_eq!(fpga.device_name, "xcvu440");
+    }
+
+    #[test]
+    fn test_find_fpga_not_found() {
+        assert!(find_fpga("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_fpga_database_size() {
+        assert_eq!(FPGA_DATABASE.len(), 3);
+    }
+
+    #[test]
+    fn test_fpga_specs_valid() {
+        for fpga in FPGA_DATABASE {
+            assert!(fpga.clock_mhz > 0);
+            assert!(fpga.ocm_size_kb > 0);
+            assert!(fpga.pe_array_dims.0 > 0);
+            assert!(fpga.pe_array_dims.1 > 0);
+            assert!(fpga.ocm_latency_cycles > 0);
+            assert!(fpga.dsp_slices > 0);
+        }
+    }
+
+    #[test]
+    fn test_empirical_p95_ratio_valid() {
+        for gpu in GPU_DATABASE {
+            assert!(
+                gpu.empirical_p95_ratio >= 1.0,
+                "{} has p95 ratio < 1.0: {}",
+                gpu.name, gpu.empirical_p95_ratio
+            );
+        }
     }
 }

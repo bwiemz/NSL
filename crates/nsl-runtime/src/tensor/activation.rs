@@ -1006,3 +1006,88 @@ pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
     super::fbip_record_reuse();
     ptr
 }
+
+// ---------------------------------------------------------------------------
+// Static reuse: unconditional in-place binary variants (Phase 2, Item 3)
+//
+// The 11 unary inplace variants were added in Phase 1 (lines 921-1008 above).
+// These binary variants are new — they skip all runtime checks and operate
+// directly on the left operand's buffer. Only safe when M38a proves left is
+// uniquely owned and shapes match.
+// ---------------------------------------------------------------------------
+
+/// Unconditional in-place add: left += right.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_add_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
+    let left = unsafe { &*(left_ptr as *const NslTensor) };
+    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let len = left.len.min(right.len) as usize;
+    if left.dtype == 1 && right.dtype == 1 {
+        let ld = left.data as *mut f32;
+        let rd = right.data as *const f32;
+        for i in 0..len { unsafe { *ld.add(i) += *rd.add(i) }; }
+    } else {
+        let ld = left.data as *mut f64;
+        let rd = right.data as *const f64;
+        for i in 0..len { unsafe { *ld.add(i) += *rd.add(i) }; }
+    }
+    super::fbip_record_reuse();
+    left_ptr
+}
+
+/// Unconditional in-place sub: left -= right.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sub_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
+    let left = unsafe { &*(left_ptr as *const NslTensor) };
+    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let len = left.len.min(right.len) as usize;
+    if left.dtype == 1 && right.dtype == 1 {
+        let ld = left.data as *mut f32;
+        let rd = right.data as *const f32;
+        for i in 0..len { unsafe { *ld.add(i) -= *rd.add(i) }; }
+    } else {
+        let ld = left.data as *mut f64;
+        let rd = right.data as *const f64;
+        for i in 0..len { unsafe { *ld.add(i) -= *rd.add(i) }; }
+    }
+    super::fbip_record_reuse();
+    left_ptr
+}
+
+/// Unconditional in-place mul: left *= right.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_mul_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
+    let left = unsafe { &*(left_ptr as *const NslTensor) };
+    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let len = left.len.min(right.len) as usize;
+    if left.dtype == 1 && right.dtype == 1 {
+        let ld = left.data as *mut f32;
+        let rd = right.data as *const f32;
+        for i in 0..len { unsafe { *ld.add(i) *= *rd.add(i) }; }
+    } else {
+        let ld = left.data as *mut f64;
+        let rd = right.data as *const f64;
+        for i in 0..len { unsafe { *ld.add(i) *= *rd.add(i) }; }
+    }
+    super::fbip_record_reuse();
+    left_ptr
+}
+
+/// Unconditional in-place div: left /= right.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_div_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
+    let left = unsafe { &*(left_ptr as *const NslTensor) };
+    let right = unsafe { &*(right_ptr as *const NslTensor) };
+    let len = left.len.min(right.len) as usize;
+    if left.dtype == 1 && right.dtype == 1 {
+        let ld = left.data as *mut f32;
+        let rd = right.data as *const f32;
+        for i in 0..len { unsafe { *ld.add(i) /= *rd.add(i) }; }
+    } else {
+        let ld = left.data as *mut f64;
+        let rd = right.data as *const f64;
+        for i in 0..len { unsafe { *ld.add(i) /= *rd.add(i) }; }
+    }
+    super::fbip_record_reuse();
+    left_ptr
+}
