@@ -1205,4 +1205,132 @@ mod tests {
         assert!(!ptx_str.contains("cvt.rn.f16.f32"));
         assert!(ptx_str.contains("st.global.f32"));
     }
+
+    // ── Welford merge simulation tests ────────────────────────────────
+
+    /// Simulate Welford warp-level butterfly reduction with proper weighted merge.
+    fn welford_tree_reduce(partials: &[(f32, f32, u32)]) -> (f32, f32, u32) {
+        let mut vals: Vec<(f32, f32, u32)> = partials.to_vec();
+        for offset in [16usize, 8, 4, 2, 1] {
+            let prev = vals.clone();
+            for i in 0..vals.len() {
+                let j = i ^ offset;
+                if j < prev.len() && j > i {
+                    let (mean_a, m2_a, n_a) = prev[i];
+                    let (mean_b, m2_b, n_b) = prev[j];
+                    if n_b == 0 { continue; }
+                    let delta = mean_b - mean_a;
+                    let combined_n = n_a + n_b;
+                    let combined_mean = (n_a as f32 * mean_a + n_b as f32 * mean_b)
+                        / combined_n as f32;
+                    let combined_m2 = m2_a + m2_b
+                        + delta * delta * n_a as f32 * n_b as f32 / combined_n as f32;
+                    vals[i] = (combined_mean, combined_m2, combined_n);
+                }
+            }
+        }
+        vals[0]
+    }
+
+    /// Partition data across threads and compute per-thread Welford partials.
+    fn compute_partials(data: &[f32], block_size: usize) -> Vec<(f32, f32, u32)> {
+        let hidden_dim = data.len();
+        let base_n = hidden_dim / block_size;
+        let extra = hidden_dim % block_size;
+        let mut partials = Vec::new();
+        let mut offset = 0;
+        for t in 0..block_size {
+            let n = if t < extra { base_n + 1 } else { base_n };
+            if n == 0 {
+                partials.push((0.0, 0.0, 0));
+            } else {
+                let chunk = &data[offset..offset + n];
+                let mean = chunk.iter().sum::<f32>() / n as f32;
+                let m2 = chunk.iter().map(|x| (x - mean).powi(2)).sum::<f32>();
+                partials.push((mean, m2, n as u32));
+            }
+            offset += n;
+        }
+        partials
+    }
+
+    #[test]
+    fn test_welford_merge_uneven_elements() {
+        // hidden_dim=100, block_size=32: threads get 3 or 4 elements
+        let data: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
+        let ref_mean = data.iter().sum::<f32>() / data.len() as f32;
+        let ref_var = data.iter()
+            .map(|x| (x - ref_mean).powi(2))
+            .sum::<f32>() / data.len() as f32;
+
+        let partials = compute_partials(&data, 32);
+        let (sim_mean, sim_m2, sim_n) = welford_tree_reduce(&partials);
+        let sim_var = sim_m2 / sim_n as f32;
+
+        assert!((sim_mean - ref_mean).abs() < 1e-5,
+            "mean: got {}, expected {}", sim_mean, ref_mean);
+        assert!((sim_var - ref_var).abs() < 1e-4,
+            "var: got {}, expected {}", sim_var, ref_var);
+    }
+
+    #[test]
+    fn test_welford_merge_edge_cases() {
+        for hidden_dim in [1, 32, 33, 100, 1023, 1024, 4096, 4097] {
+            let data: Vec<f32> = (0..hidden_dim).map(|i| (i as f32) * 0.01 - 5.0).collect();
+            let ref_mean = data.iter().sum::<f32>() / data.len() as f32;
+            let ref_var = data.iter()
+                .map(|x| (x - ref_mean).powi(2))
+                .sum::<f32>() / data.len() as f32;
+
+            let block_size = 32.min(hidden_dim);
+            let partials = compute_partials(&data, block_size);
+            let (sim_mean, sim_m2, sim_n) = welford_tree_reduce(&partials);
+            let sim_var = sim_m2 / sim_n as f32;
+
+            assert!((sim_mean - ref_mean).abs() < 1e-3,
+                "hidden_dim={}: mean got {}, expected {}", hidden_dim, sim_mean, ref_mean);
+            assert!((sim_var - ref_var).abs() < 1e-2,
+                "hidden_dim={}: var got {}, expected {}", hidden_dim, sim_var, ref_var);
+        }
+    }
+
+    #[test]
+    fn test_welford_broken_merge_is_inaccurate() {
+        // Demonstrate the bug: simple averaging gives wrong results for uneven splits
+        fn welford_broken_reduce(partials: &[(f32, f32, u32)]) -> (f32, f32, u32) {
+            let mut vals: Vec<(f32, f32, u32)> = partials.to_vec();
+            for offset in [16usize, 8, 4, 2, 1] {
+                let prev = vals.clone();
+                for i in 0..vals.len() {
+                    let j = i ^ offset;
+                    if j < prev.len() && j > i {
+                        let (mean_a, m2_a, n_a) = prev[i];
+                        let (mean_b, m2_b, _n_b) = prev[j];
+                        // BROKEN: simple average, ignores element counts
+                        let combined_mean = (mean_a + mean_b) * 0.5;
+                        let combined_m2 = m2_a + m2_b; // missing delta^2 term
+                        vals[i] = (combined_mean, combined_m2, n_a);
+                    }
+                }
+            }
+            vals[0]
+        }
+
+        let data: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
+        let ref_mean = data.iter().sum::<f32>() / data.len() as f32;
+        let ref_var = data.iter()
+            .map(|x| (x - ref_mean).powi(2))
+            .sum::<f32>() / data.len() as f32;
+
+        let partials = compute_partials(&data, 32);
+        let (broken_mean, broken_m2, _broken_n) = welford_broken_reduce(&partials);
+        let broken_var = broken_m2 / 100.0; // use true N for denominator
+
+        // Broken merge should give noticeably different results
+        let mean_err = (broken_mean - ref_mean).abs();
+        let var_err = (broken_var - ref_var).abs();
+        // At least one of mean or variance should be significantly off
+        assert!(mean_err > 0.01 || var_err > 0.01,
+            "Expected broken merge to be inaccurate, got mean_err={}, var_err={}", mean_err, var_err);
+    }
 }
