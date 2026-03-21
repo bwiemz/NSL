@@ -1,21 +1,32 @@
 # models/coder50m/pretrain.nsl
-# Stage 1: Pretrain on 10B StarCoder tokens
+# Stage 1: Pretrain on 10B StarCoder tokens (from 30B corpus)
+#
+# Training features:
+#   - AdamW with warmup cosine schedule (beta2=0.95 for stability)
+#   - Gradient clipping to max_norm=1.0 (automatic in train block)
+#   - Dropout 0.1 (attention + FFN, via training=true)
+#   - Xavier weight initialization
+#   - Checkpoint every 10k steps
+#
+# Data: StarCoder u16 pretokenized (30B tokens, we use first 10B)
+# Steps: 10B tokens / (32 batch * 1024 seq) = ~305k steps
 
 from model import NSLCoder
 from nsl.nn.losses import cross_entropy
 
 let m = NSLCoder()
-print("NSL-Coder-50M initialized. Starting pretraining...")
+print("NSL-Coder-50M initialized (48.8M params, Xavier init, dropout=0.1)")
+print("Starting pretraining on 10B StarCoder tokens...")
 
-# Load pretokenized data (u16 format)
-let tokens = load_mmap("data/pretokenized/tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)
+# Load pretokenized StarCoder data (u16 format, mmap for 82GB file)
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true, max_tokens=10000000000)
 
 train(model=m, epochs=1):
-    optimizer: AdamW(lr=0.0003, weight_decay=0.1)
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95)
     scheduler: warmup_cosine(warmup_steps=3000, total_steps=305000, min_lr=0.00003)
     step(batch):
-        let logits = m.forward(batch.input_ids)
+        let logits = m.forward_train(batch.input_ids, true)
         let loss = cross_entropy(logits, batch.labels)
     callbacks:
         on_step(step, loss):

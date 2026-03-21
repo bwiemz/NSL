@@ -120,6 +120,65 @@ pub struct ShmHeader {
 const DATA_OFFSET: usize = 64; // cache-line aligned, leaves room for header growth
 
 // ---------------------------------------------------------------------------
+// f16 / bf16 conversion helpers (software, no hardware dependency)
+// ---------------------------------------------------------------------------
+
+/// Convert IEEE 754 half-precision (f16) bits to f32.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) as u32) << 31;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    if exp == 0 {
+        // Subnormal or zero
+        if mant == 0 { return f32::from_bits(sign); }
+        let mut e = 1u32;
+        let mut m = mant;
+        while (m & 0x400) == 0 { m <<= 1; e += 1; }
+        let f_exp = (127 - 15 + 1 - e) << 23;
+        let f_mant = (m & 0x3FF) << 13;
+        f32::from_bits(sign | f_exp | f_mant)
+    } else if exp == 31 {
+        // Inf or NaN
+        f32::from_bits(sign | 0x7F800000 | (mant << 13))
+    } else {
+        let f_exp = (exp + 127 - 15) << 23;
+        f32::from_bits(sign | f_exp | (mant << 13))
+    }
+}
+
+/// Convert f32 to IEEE 754 half-precision (f16) bits (round-to-nearest-even).
+fn f32_to_half(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7FFFFF;
+    if exp >= 143 { // overflow → inf
+        return sign | 0x7C00;
+    }
+    if exp <= 102 { // underflow → zero
+        return sign;
+    }
+    if exp <= 112 { // subnormal
+        let shift = 113 - exp;
+        let m = (0x800000 | mant) >> (shift + 13);
+        return sign | m as u16;
+    }
+    let f16_exp = ((exp - 112) as u16) << 10;
+    let f16_mant = (mant >> 13) as u16;
+    sign | f16_exp | f16_mant
+}
+
+/// Convert bfloat16 bits to f32 (simple: bf16 is just the top 16 bits of f32).
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Convert f32 to bfloat16 bits (truncate lower 16 bits).
+fn f32_to_bf16(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
+}
+
+// ---------------------------------------------------------------------------
 // SimulatedBackend — file-backed shared memory for testing without NCCL
 // ---------------------------------------------------------------------------
 
@@ -239,6 +298,30 @@ impl CollectiveBackend for SimulatedBackend {
                         acc += unsafe { *src.add(i) };
                     }
                     unsafe { *dst.add(i) = acc; }
+                }
+            }
+            DTYPE_F16 | DTYPE_BF16 => {
+                // f16/bf16 reduction: accumulate in f32 for numerical stability,
+                // then convert back. Uses bit manipulation for f16<->f32 conversion.
+                let dst = recvbuf as *mut u16;
+                for i in 0..count {
+                    let mut acc: f32 = 0.0;
+                    for r in 0..self.world_size {
+                        let src = self.slot_ptr(r, nbytes) as *const u16;
+                        let bits = unsafe { *src.add(i) };
+                        let val = if dtype == DTYPE_F16 {
+                            half_to_f32(bits)
+                        } else {
+                            bf16_to_f32(bits)
+                        };
+                        acc += val;
+                    }
+                    let result_bits = if dtype == DTYPE_F16 {
+                        f32_to_half(acc)
+                    } else {
+                        f32_to_bf16(acc)
+                    };
+                    unsafe { *dst.add(i) = result_bits; }
                 }
             }
             _ => return -2, // unsupported dtype for reduction

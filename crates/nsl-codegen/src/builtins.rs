@@ -115,6 +115,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_assert_dim", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_assert_dim_bound", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_ndim", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_get_dtype", &[types::I64], Some(types::I64)),
     ("nsl_tensor_reshape", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_transpose", &[types::I64, types::I64, types::I64], Some(types::I64)),
     // Tensor arithmetic (elementwise)
@@ -271,7 +272,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_load_csv", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_load_mmap", &[types::I64, types::I64, types::I64], Some(types::I64)),
     // DataLoader (M19)
-    ("nsl_dataloader_create", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_dataloader_create", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_dataloader_start", &[types::I64], None),
     ("nsl_dataloader_next_batch", &[types::I64], Some(types::I64)),
     ("nsl_dataloader_reset", &[types::I64], None),

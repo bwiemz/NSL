@@ -100,6 +100,11 @@ pub extern "C" fn nsl_tensor_ndim(tensor_ptr: i64) -> i64 {
 }
 
 #[no_mangle]
+pub extern "C" fn nsl_tensor_get_dtype(tensor_ptr: i64) -> i64 {
+    NslTensor::from_ptr(tensor_ptr).dtype as i64
+}
+
+#[no_mangle]
 pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let new_shape_nsl = NslList::from_ptr(new_shape_list);

@@ -1,5 +1,7 @@
 # models/coder50m/finetune.nsl
 # Stage 2: Finetune on NSL + general code mix
+#
+# Lower learning rate, same dropout/grad clipping as pretrain
 
 from model import NSLCoder
 from nsl.nn.losses import cross_entropy
@@ -12,10 +14,10 @@ let tokens = load_mmap("data/finetune/mixed_tokens.bin", 3)
 let loader = DataLoader(tokens, batch_size=16, seq_len=1024, shuffle=true, drop_last=true)
 
 train(model=m, epochs=2):
-    optimizer: AdamW(lr=0.00001, weight_decay=0.1)
+    optimizer: AdamW(lr=0.00001, weight_decay=0.1, beta1=0.9, beta2=0.95)
     scheduler: warmup_cosine(warmup_steps=100, total_steps=1220, min_lr=0.000001)
     step(batch):
-        let logits = m.forward(batch.input_ids)
+        let logits = m.forward_train(batch.input_ids, true)
         let loss = cross_entropy(logits, batch.labels)
     callbacks:
         on_step(step, loss):

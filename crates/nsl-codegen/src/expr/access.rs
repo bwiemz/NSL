@@ -118,6 +118,21 @@ impl Compiler<'_> {
             };
         }
 
+        // Dict-like member access: obj.field → nsl_dict_get_str(obj, "field")
+        // This supports train block batch access: batch.input_ids, batch.labels
+        {
+            // Ensure the key string is in the string pool
+            if !self.string_pool.contains_key(member_name.as_str()) {
+                self.intern_string(&member_name)?;
+            }
+            if let Ok(key_str) = self.compile_string_literal(builder, &member_name) {
+                let result = self.compile_call_by_name(builder, "nsl_dict_get_str", &[obj_val, key_str]);
+                if result.is_ok() {
+                    return result;
+                }
+            }
+        }
+
         Err(CodegenError::new(format!("member access not supported: .{member_name}")))
     }
 

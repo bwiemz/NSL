@@ -3,9 +3,10 @@
 #
 # Architecture: 8-layer decoder-only transformer with GQA + SwiGLU + RoPE
 #   - Grouped Query Attention (8 Q heads, 4 KV heads)
-#   - SwiGLU feedforward network
+#   - SwiGLU feedforward network with dropout
 #   - RMSNorm pre-normalization
 #   - Weight-tied embedding/LM head
+#   - Xavier weight initialization
 #   - ~50M parameters
 
 from nsl.nn.norms import RMSNorm
@@ -18,50 +19,67 @@ const N_LAYERS = 8
 const N_HEADS = 8
 const N_KV_HEADS = 4
 const D_FF = 1408
+const DROPOUT = 0.1
 
 # ─── SwiGLU Feedforward Network ───
 # SwiGLU(x) = (silu(x @ W_gate) * (x @ W_up)) @ W_down
-# Weight convention: [in_features, out_features], matmul as x @ W (no transpose)
+# Xavier init: randn * sqrt(2 / (fan_in + fan_out))
 
-model SwiGLUFFN(d_model: int, d_ff: int):
-    w_gate: Tensor = randn([d_model, d_ff])
-    w_up: Tensor = randn([d_model, d_ff])
-    w_down: Tensor = randn([d_ff, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
+    w_up: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
+    # Down projection scaled by 1/sqrt(2*N_LAYERS) for residual stream stability
+    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], 16.0)).item())
+    _dropout_p: Tensor = full([1], dropout_p)
 
-    fn forward(self, x: Tensor) -> Tensor:
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
         let gate = silu(x @ self.w_gate)
         let up = x @ self.w_up
-        return (gate * up) @ self.w_down
+        let out = (gate * up) @ self.w_down
+        return dropout(out, self._dropout_p.item(), training)
 
 # ─── Pre-norm Transformer Block ───
 # x -> RMSNorm -> GQA -> residual -> RMSNorm -> SwiGLU -> residual
 
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
     ffn_norm: RMSNorm = RMSNorm(d_model)
-    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
 
-    fn forward(self, x: Tensor) -> Tensor:
-        let h = x + self.attn.forward(self.attn_norm.forward(x))
-        return h + self.ffn.forward(self.ffn_norm.forward(h))
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x), training)
+        return h + self.ffn.forward(self.ffn_norm.forward(h), training)
 
 # ─── NSL-Coder-50M ───
 # Full model: Embedding -> N x TransformerBlock -> RMSNorm -> LM Head (weight-tied)
+# Embedding init: small normal (0.02 std) — standard for token embeddings
 
 model NSLCoder:
-    embed: Tensor = randn([49152, 512])
-    blocks: [TransformerBlock; 8] = TransformerBlock(512, 8, 4, 1408)
+    embed: Tensor = randn([49152, 512]) * full([1], 0.02)
+    blocks: [TransformerBlock; 8] = TransformerBlock(512, 8, 4, 1408, 0.1)
     norm: RMSNorm = RMSNorm(512)
 
     fn forward(self, input_ids: Tensor) -> Tensor:
-        # embedding_lookup requires 1D indices, returns [seq, d_model]
-        # Reshape to [1, seq, d_model] for batched attention
-        let emb = embedding_lookup(self.embed, input_ids)
-        let es = emb.shape
-        let x = emb.reshape([1, es[0], es[1]])
+        # Inference: input may be 1D [seq] or 2D [batch, seq]
+        let s = input_ids.shape
+        let ndim = input_ids.ndim
+        if ndim == 1:
+            let ids_2d = input_ids.reshape([1, s[0]])
+            return self.forward_train(ids_2d, false)
+        return self.forward_train(input_ids, false)
+
+    fn forward_train(self, input_ids: Tensor, training: bool) -> Tensor:
+        # DataLoader produces [batch, seq] — flatten to 1D for embedding_lookup
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        # emb is [batch*seq, d_model] — reshape to [batch, seq, d_model]
+        let x = emb.reshape([batch_size, seq_len, 512])
         for block in self.blocks:
-            x = block.forward(x)
+            x = block.forward(x, training)
         x = self.norm.forward(x)
         # Weight-tied LM head: reuse embedding matrix
         return x @ self.embed.transpose(0, 1)

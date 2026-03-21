@@ -115,7 +115,13 @@ pub fn try_synthesize_fused_checked(
 /// **ISA correctness:** `ex2.approx.f32` computes base-2 exp, so natural exp requires
 /// multiplying by log2(e) ~ 1.4427 first. Similarly, `lg2.approx.f32` computes base-2
 /// log, so natural log requires multiplying by ln(2) ~ 0.6931 after.
+/// Generate PTX for a fused elementwise kernel.
+/// `gpu_sm` sets the target SM version; defaults to 52 (Maxwell) for broad compat.
 pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<u8> {
+    synthesize_fused_ptx_sm(name, ops, num_inputs, 52)
+}
+
+pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_sm: u32) -> Vec<u8> {
     // log2(e) = 1.4426950408889634 -> IEEE 754 f32: 0x3FB8AA3B
     const LOG2_E_HEX: &str = "0f3FB8AA3B";
     // ln(2) = 0.6931471805599453 -> IEEE 754 f32: 0x3F317218
@@ -123,9 +129,9 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
 
     let mut ptx = String::new();
 
-    // Header
+    // Header — target SM version parameterized for hardware compat
     ptx.push_str(".version 7.0\n");
-    ptx.push_str(".target sm_52\n");
+    ptx.push_str(&format!(".target sm_{}\n", gpu_sm));
     ptx.push_str(".address_size 64\n\n");
 
     // Function signature: (output_ptr, input0_ptr, ..., inputN_ptr, num_elements)

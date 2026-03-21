@@ -62,6 +62,9 @@ impl DataLoaderConfig {
 struct DataLoader {
     data: *const f64,
     data_len: usize,
+    /// Source data dtype: 0=f64, 1=f32, 3=u16 (pretokenized).
+    /// When dtype=3, `data` is actually `*const u16` cast to `*const f64`.
+    data_dtype: u16,
     config: DataLoaderConfig,
     cursor: Arc<AtomicUsize>,
     stop_flag: Arc<AtomicBool>,
@@ -77,7 +80,7 @@ unsafe impl Send for DataLoader {}
 unsafe impl Sync for DataLoader {}
 
 impl DataLoader {
-    fn new(data: *const f64, data_len: usize, config: DataLoaderConfig) -> Self {
+    fn new(data: *const f64, data_len: usize, data_dtype: u16, config: DataLoaderConfig) -> Self {
         let tokens_per_batch = config.batch_size * config.seq_len;
         let total_batches = if tokens_per_batch > 0 {
             data_len / tokens_per_batch
@@ -88,6 +91,7 @@ impl DataLoader {
         DataLoader {
             data,
             data_len,
+            data_dtype,
             config,
             cursor: Arc::new(AtomicUsize::new(0)),
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -108,6 +112,7 @@ impl DataLoader {
         let num_workers = self.config.num_workers.max(1);
         let data_usize = self.data as usize; // Convert to usize for Send
         let data_len = self.data_len;
+        let data_dtype = self.data_dtype;
         let batch_size = self.config.batch_size;
         let seq_len = self.config.seq_len;
         let packing = self.config.packing;
@@ -156,6 +161,7 @@ impl DataLoader {
                             batch_id * tokens_per_batch,
                             batch_size,
                             seq_len,
+                            data_dtype,
                         )
                     };
 
@@ -192,17 +198,42 @@ fn build_simple_batch(
     offset: usize,
     batch_size: usize,
     seq_len: usize,
+    data_dtype: u16,
 ) -> i64 {
     let total = batch_size * seq_len;
     if offset + total > data_len {
         return 0;
     }
 
-    // Read input_ids
+    // Read input_ids — dtype-aware: f64(0), f32(1), u16(3)
     let mut input_ids = Vec::with_capacity(total);
-    for i in 0..total {
-        let val = unsafe { *data.add(offset + i) } as i64;
-        input_ids.push(val);
+    match data_dtype {
+        3 => {
+            // u16 pretokenized data (zero-copy mmap)
+            let src = data as *const u16;
+            if offset + total > data_len {
+                return 0;
+            }
+            for i in 0..total {
+                let val = unsafe { *src.add(offset + i) } as i64;
+                input_ids.push(val);
+            }
+        }
+        1 => {
+            // f32 data
+            let src = data as *const f32;
+            for i in 0..total {
+                let val = unsafe { *src.add(offset + i) } as i64;
+                input_ids.push(val);
+            }
+        }
+        _ => {
+            // f64 data (default)
+            for i in 0..total {
+                let val = unsafe { *data.add(offset + i) } as i64;
+                input_ids.push(val);
+            }
+        }
     }
 
     // Build labels: shifted by 1 within each sequence, -100 at last position
@@ -283,11 +314,12 @@ pub extern "C" fn nsl_dataloader_create(
     data_len: i64,
     config_ptr: i64,
     config_len: i64,
+    data_dtype: i64,
 ) -> i64 {
     let data = data_ptr as *const f64;
     let config =
         DataLoaderConfig::from_json(config_ptr as *const u8, config_len as usize);
-    let dl = DataLoader::new(data, data_len as usize, config);
+    let dl = DataLoader::new(data, data_len as usize, data_dtype as u16, config);
     Box::into_raw(Box::new(dl)) as i64
 }
 
@@ -414,6 +446,7 @@ mod tests {
             data.len() as i64,
             config_json.as_ptr() as i64,
             config_json.len() as i64,
+            0, // dtype=0 (f64)
         );
         assert!(dl_ptr != 0);
 
@@ -447,6 +480,7 @@ mod tests {
             data.len() as i64,
             config_json.as_ptr() as i64,
             config_json.len() as i64,
+            0, // dtype=0 (f64)
         );
 
         nsl_dataloader_start(dl_ptr);

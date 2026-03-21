@@ -99,6 +99,13 @@ impl PageTable {
             .filter(|&id| id != EVICTED_SENTINEL)
     }
 
+    /// Replace the block at `entry_index` with a new block ID.
+    /// Used by Copy-on-Write to atomically update the page table entry.
+    pub fn replace_block(&mut self, entry_index: usize, new_block: BlockId) {
+        assert!(entry_index < self.entries.len(), "replace_block: index out of bounds");
+        self.entries[entry_index] = new_block;
+    }
+
     // ── Eviction ──────────────────────────────────────────────────────────
 
     /// Remove blocks in the logical index range [start_idx, end_idx).

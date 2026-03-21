@@ -31,10 +31,8 @@ pub enum AdjointExpr {
     SiluBackward(VarId, VarId),
     /// Abs backward: sign(x) * grad
     SignMul(VarId, VarId),
-    /// Clamp backward: grad * (min <= x <= max). args: (grad, x, min, max)
-    ClampBackward(VarId, VarId, f64, f64),
-    /// Mean backward: scale grad by 1/N and broadcast. args: (grad, dim_size)
-    MeanBackward(VarId, i64),
+    /// Clamp backward: grad * (min <= x <= max)
+    ClampBackward(VarId, VarId),
 
     // Softmax/LogSoftmax backward
     /// Softmax backward: grad - sum(grad * y) * y  (y = softmax output)
@@ -88,8 +86,8 @@ pub enum AdjointExpr {
     L1Backward(VarId, VarId, VarId),
 
     // Attention backward
-    /// Scaled dot-product attention backward. args: (grad, Q, K, V, causal)
-    AttentionBackward(VarId, VarId, VarId, VarId, bool),
+    /// Scaled dot-product attention backward. args: (grad, Q, K, V)
+    AttentionBackward(VarId, VarId, VarId, VarId),
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
 
@@ -165,16 +163,10 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Broadcast(output_bar),
         }],
-        PrimalOp::Mean { dim: _ } => {
-            // The dimension size is needed for 1/N scaling.
-            // For now, use dim_size=0 as a sentinel — the lowering will treat 0 as "unknown,
-            // use a runtime query". The codegen can specialize when shape is statically known.
-            let dim_size = 0; // TODO: pass actual dim size from shape metadata
-            vec![InputAdjoint {
-                input_var: op.inputs[0],
-                expr: AdjointExpr::MeanBackward(output_bar, dim_size),
-            }]
-        }
+        PrimalOp::Mean { .. } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::ScaleBroadcast(output_bar, 1.0),
+        }],
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::Reshape(output_bar),
@@ -209,9 +201,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::SignMul(output_bar, op.inputs[0]),
         }],
-        PrimalOp::Clamp { min, max } => vec![InputAdjoint {
+        PrimalOp::Clamp { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::ClampBackward(output_bar, op.inputs[0], *min, *max),
+            expr: AdjointExpr::ClampBackward(output_bar, op.inputs[0]),
         }],
 
         // --- Softmax / LogSoftmax ---
@@ -233,9 +225,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             // gamma and beta adjoints are simple
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                // Pass `input` for mean/rstd slots — the lowering in source_ad.rs
-                // recomputes mean and rstd from input (since they aren't separate outputs).
-                expr: AdjointExpr::LayerNormBackward(output_bar, input, input, input),
+                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result),
             }];
             // gamma gradient: grad * normalized_input
             if op.inputs.len() > 1 {
@@ -257,7 +247,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             let input = op.inputs[0];
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                expr: AdjointExpr::BatchNormBackward(output_bar, input, input, input),
+                expr: AdjointExpr::BatchNormBackward(output_bar, input, op.result, op.result),
             }];
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
@@ -383,14 +373,15 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }
 
         // --- Attention ---
-        PrimalOp::ScaledDotProductAttention { causal } => {
+        PrimalOp::ScaledDotProductAttention { .. } => {
+            // Q, K, V are inputs[0..3]
             let q = op.inputs[0];
             let k = op.inputs[1];
             let v = op.inputs[2];
             vec![
-                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v, *causal) },
-                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v, *causal) },
-                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v, *causal) },
+                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
+                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
+                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
             ]
         }
         PrimalOp::RoPE { dim } => vec![InputAdjoint {
@@ -422,8 +413,7 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. } | PrimalOp::Split { .. } | PrimalOp::Slice { .. }
         | PrimalOp::RoPE { .. } | PrimalOp::RoPEInverse { .. }
-        | PrimalOp::AvgPool2d { .. }
-        | PrimalOp::FlashAttentionBackward { .. } => SavedRequirement::Nothing,
+        | PrimalOp::AvgPool2d { .. } => SavedRequirement::Nothing,
 
         // Save inputs — gradient depends on forward input values
         PrimalOp::Mul | PrimalOp::Div | PrimalOp::Matmul
@@ -542,10 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_backward() {
+    fn test_mean_scale_broadcasts() {
         let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::MeanBackward(100, _)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ScaleBroadcast(100, _)));
     }
 
     #[test]
@@ -676,7 +666,7 @@ mod tests {
         let op = make_op(1, PrimalOp::Clamp { min: 0.0, max: 1.0 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0, _, _)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0)));
         assert_eq!(saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }), SavedRequirement::Inputs);
     }
 
@@ -687,8 +677,7 @@ mod tests {
         let op = make_op(3, PrimalOp::LayerNorm { eps: 1e-5 }, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "LayerNorm should produce 3 adjoints (input, gamma, beta)");
-        // mean/rstd slots are now `input` (recomputed in the lowering)
-        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 0, 0)));
+        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 3, 3)));
         assert!(matches!(adj[1].expr, AdjointExpr::MulElementwise(100, 3))); // gamma grad
         assert!(matches!(adj[2].expr, AdjointExpr::Identity(100))); // beta grad
         assert_eq!(saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }), SavedRequirement::Inputs);
@@ -807,7 +796,7 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "Attention should produce 3 adjoints (Q, K, V)");
         for a in &adj {
-            assert!(matches!(a.expr, AdjointExpr::AttentionBackward(100, 0, 1, 2, true)));
+            assert!(matches!(a.expr, AdjointExpr::AttentionBackward(100, 0, 1, 2)));
         }
         assert_eq!(
             saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: true }),

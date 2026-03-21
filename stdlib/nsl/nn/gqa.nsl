@@ -1,23 +1,24 @@
 from nsl.nn.rope import RotaryEmbedding
 
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
     # Store dims as tensor fields for method access
     _d_model: Tensor = full([1], float(d_model))
     _n_heads: Tensor = full([1], float(n_heads))
     _n_kv_heads: Tensor = full([1], float(n_kv_heads))
     _head_dim: Tensor = full([1], float(d_model // n_heads))
     _n_rep: Tensor = full([1], float(n_heads // n_kv_heads))
+    _dropout_p: Tensor = full([1], dropout_p)
 
-    # Projections
-    wq: Tensor = randn([d_model, d_model])
-    wk: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)])
-    wv: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)])
-    wo: Tensor = randn([d_model, d_model])
+    # Projections — Xavier initialization: randn * sqrt(2 / (fan_in + fan_out))
+    wq: Tensor = randn([d_model, d_model]) * sqrt(full([1], 2.0 / float(d_model + d_model)))
+    wk: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * (d_model // n_heads))))
+    wv: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * (d_model // n_heads))))
+    wo: Tensor = randn([d_model, d_model]) * sqrt(full([1], 2.0 / float(d_model + d_model)))
 
     # RoPE
     rope: RotaryEmbedding = RotaryEmbedding(d_model // n_heads, 1024, 10000.0)
 
-    fn forward(self, x: Tensor) -> Tensor:
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
         let s = x.shape
         let batch = s[0]
         let seq_len = s[1]
@@ -26,6 +27,7 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int):
         let nkv = int(self._n_kv_heads.item())
         let hd = int(self._head_dim.item())
         let n_rep = int(self._n_rep.item())
+        let dp = self._dropout_p.item()
 
         # Project Q, K, V
         let q = x @ self.wq
@@ -42,9 +44,6 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int):
         let k_rope = self.rope.forward(k4, seq_len)
 
         # GQA: expand KV heads to match Q heads
-        # reshape [B, nkv, S, D] -> [B, nkv, 1, S, D]
-        # expand  [B, nkv, n_rep, S, D]
-        # reshape [B, nh, S, D]
         let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
         let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
         let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
@@ -57,12 +56,16 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int):
         let masked = scores + mask
         let attn_weights = softmax(masked, 3)
 
+        # Attention dropout (only during training)
+        let attn_drop = dropout(attn_weights, dp, training)
+
         # Weighted sum of values
-        let attn_out = attn_weights @ v_exp
+        let attn_out = attn_drop @ v_exp
 
         # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, d_model]
         let attn_t = attn_out.transpose(1, 2)
         let attn_flat = attn_t.reshape([batch, seq_len, dm])
 
-        # Output projection
-        return attn_flat @ self.wo
+        # Output projection + residual dropout
+        let out = attn_flat @ self.wo
+        return dropout(out, dp, training)

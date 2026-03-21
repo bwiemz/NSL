@@ -1187,7 +1187,9 @@ impl Compiler<'_> {
                 cranelift_codegen::ir::immediates::Offset32::new(0),
             );
 
-            let dl_ptr = self.compile_call_by_name(builder, "nsl_dataloader_create", &[tensor_data, tensor_len, config_ptr, config_len])?;
+            // Read tensor dtype via safe FFI call (avoids struct offset assumptions)
+            let tensor_dtype = self.compile_call_by_name(builder, "nsl_tensor_get_dtype", &[data_val])?;
+            let dl_ptr = self.compile_call_by_name(builder, "nsl_dataloader_create", &[tensor_data, tensor_len, config_ptr, config_len, tensor_dtype])?;
             self.compile_call_by_name(builder, "nsl_dataloader_start", &[dl_ptr])?;
             state.dataloader_vars.push(dl_ptr);
             return Ok(dl_ptr);

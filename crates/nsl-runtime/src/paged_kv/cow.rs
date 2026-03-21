@@ -14,10 +14,21 @@ pub fn branch_page_table(parent_table: &PageTable, allocator: &mut BlockAllocato
     child
 }
 
-/// Copy-on-write for a specific block.
-/// If refcount > 1, copies data to a new block and returns the new ID.
-/// If refcount == 1, returns the same block (already exclusively owned).
-pub fn cow_copy_block(block_id: BlockId, allocator: &mut BlockAllocator) -> Option<BlockId> {
+/// Copy-on-write for a specific block within a page table.
+///
+/// If refcount > 1, copies data to a new block, updates the page table entry
+/// at `entry_index` to point to the new block, and decrements the old block's
+/// refcount. If refcount == 1, returns the same block (already exclusively owned).
+///
+/// **SAFETY:** The caller must ensure no concurrent readers are accessing
+/// `page_table[entry_index]` during this operation. The page table update
+/// and refcount decrement are NOT atomic with respect to each other.
+pub fn cow_copy_block(
+    block_id: BlockId,
+    entry_index: usize,
+    page_table: &mut PageTable,
+    allocator: &mut BlockAllocator,
+) -> Option<BlockId> {
     if allocator.refcount(block_id) <= 1 {
         return Some(block_id);
     }
@@ -31,6 +42,9 @@ pub fn cow_copy_block(block_id: BlockId, allocator: &mut BlockAllocator) -> Opti
         let dst_v = allocator.v_block_ptr(new_id);
         std::ptr::copy_nonoverlapping(src_v as *const u8, dst_v as *mut u8, block_bytes);
     }
+    // Atomically update page table entry BEFORE decrementing old refcount.
+    // This ensures no reader sees the old block_id with a decremented refcount.
+    page_table.replace_block(entry_index, new_id);
     allocator.free(block_id); // decrement shared refcount
     Some(new_id)
 }
@@ -69,10 +83,10 @@ mod tests {
         let mut parent = PageTable::new(4);
         let b0 = alloc.alloc().unwrap();
         parent.push_block(b0);
-        let _child = branch_page_table(&parent, &mut alloc);
+        let mut child = branch_page_table(&parent, &mut alloc);
         assert_eq!(alloc.refcount(b0), 2);
 
-        let new_id = cow_copy_block(b0, &mut alloc).unwrap();
+        let new_id = cow_copy_block(b0, 0, &mut child, &mut alloc).unwrap();
         assert_ne!(new_id, b0);
         assert_eq!(alloc.refcount(b0), 1);
         assert_eq!(alloc.refcount(new_id), 1);

@@ -257,17 +257,15 @@ pub extern "C" fn nsl_load_mmap(path_ptr: i64, path_len: i64, dtype: i64) -> i64
             create_mmap_tensor(out_buf as *mut c_void, n_elements as i64, 0, 1)
         }
         3 => {
-            // u16 -> f64 conversion (pre-tokenized LLM datasets)
+            // u16: zero-copy mmap (pre-tokenized LLM datasets).
+            // Conversion to f64/f32 happens lazily per-batch in the DataLoader.
+            // dtype=3 signals to the DataLoader that the backing data is u16.
             let elem_size = std::mem::size_of::<u16>();
             let n_elements = byte_len / elem_size;
-            let out_buf = checked_alloc(n_elements * std::mem::size_of::<f64>()) as *mut f64;
-            let src = mmap.as_ptr() as *const u16;
-            for i in 0..n_elements {
-                unsafe {
-                    *out_buf.add(i) = *src.add(i) as f64;
-                }
-            }
-            create_mmap_tensor(out_buf as *mut c_void, n_elements as i64, 0, 1)
+            let data_ptr = mmap.as_ptr() as *mut c_void;
+            let _ = Box::into_raw(Box::new(mmap));
+            // Use dtype=3 (u16) so the DataLoader knows to convert per-batch
+            create_mmap_tensor(data_ptr, n_elements as i64, 3, 0)
         }
         _ => {
             eprintln!("nsl: nsl_load_mmap: unsupported dtype {}", dtype);

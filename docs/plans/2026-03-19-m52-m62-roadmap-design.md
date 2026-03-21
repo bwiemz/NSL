@@ -1,7 +1,7 @@
 # NeuralScript Development Roadmap: M52-M62
 
-**Date:** 2026-03-19 (revised 2026-03-20)
-**Status:** Active — M52, M53, M54, M55, M62 partially implemented (v0.9.0)
+**Date:** 2026-03-19 (revised 2026-03-21)
+**Status:** Active — M52 PRODUCTION, M53 PRODUCTION, M54 FRAMEWORK, M55 FUNCTIONAL, M62 PRODUCTION; M56-M61 NOT STARTED
 **Prerequisite:** v0.8.0 (M32-M51 complete, all b-milestones shipped)
 **Architecture:** Rust compiler + Rust runtime + NSL stdlib + Cranelift AOT + PTX GPU (no C/C++/Python)
 **Research validation:** 2026-03-20 — cross-referenced against NotebookLM research notebooks (competitive landscape, frontier features, performance theory)

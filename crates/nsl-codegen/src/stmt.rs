@@ -1487,12 +1487,18 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
 
-        // 7b. Declare step parameter (e.g. `batch`) as a variable in scope
-        // so that batch.input_ids / batch.labels resolve to field lookups.
+        // 7b. Declare step parameter (e.g. `batch`) and wire to DataLoader.
+        // Get next batch from the DataLoader — the step parameter IS the batch dict.
         let step_param_var = state.new_variable();
         builder.declare_var(step_param_var, cl_types::I64);
-        let null_ptr = builder.ins().iconst(cl_types::I64, 0);
-        builder.def_var(step_param_var, null_ptr);
+        let batch_val = if let Some(&dl_handle) = state.dataloader_vars.last() {
+            // DataLoader exists — call next_batch to get the batch dict
+            self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_handle])?
+        } else {
+            // No DataLoader — null (shouldn't happen in practice)
+            builder.ins().iconst(cl_types::I64, 0)
+        };
+        builder.def_var(step_param_var, batch_val);
         state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
 
         // Compile step body stmts

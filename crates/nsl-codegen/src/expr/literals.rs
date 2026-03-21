@@ -19,10 +19,12 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         s: &str,
     ) -> Result<Value, CodegenError> {
-        let data_id = *self
-            .string_pool
-            .get(s)
-            .ok_or_else(|| CodegenError::new(format!("string not in pool: {s:?}")))?;
+        // Auto-intern if not already in pool (handles strings inside train blocks,
+        // callbacks, and dict member access keys that the collection pass missed)
+        if !self.string_pool.contains_key(s) {
+            self.intern_string(s)?;
+        }
+        let data_id = self.string_pool[s];
         let gv = self.module.declare_data_in_func(data_id, builder.func);
         Ok(builder.ins().symbol_value(pointer_type(), gv))
     }

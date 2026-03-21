@@ -11,6 +11,7 @@ const HEAD_DIM = 64
 const D_FF = 1408
 const MAX_SEQ_LEN = 1024
 const ROPE_THETA = 10000.0
+const DROPOUT = 0.1
 
 # Pretrain hyperparameters
 const PRETRAIN_LR = 0.0003
@@ -19,7 +20,10 @@ const PRETRAIN_TOTAL_STEPS = 305000
 const PRETRAIN_MIN_LR = 0.00003
 const PRETRAIN_BATCH_SIZE = 32
 const PRETRAIN_WEIGHT_DECAY = 0.1
+const PRETRAIN_BETA1 = 0.9
+const PRETRAIN_BETA2 = 0.95
 const PRETRAIN_EPOCHS = 1
+const PRETRAIN_GRAD_CLIP = 1.0
 
 # Finetune hyperparameters
 const FINETUNE_LR = 0.00001
@@ -27,6 +31,8 @@ const FINETUNE_WARMUP = 100
 const FINETUNE_MIN_LR = 0.000001
 const FINETUNE_BATCH_SIZE = 16
 const FINETUNE_WEIGHT_DECAY = 0.1
+const FINETUNE_BETA1 = 0.9
+const FINETUNE_BETA2 = 0.95
 const FINETUNE_EPOCHS = 2
 
 # Inference
