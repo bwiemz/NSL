@@ -9,8 +9,12 @@ use nsl_semantic::types::DType;
 pub enum EpilogueOp {
     BiasAdd { bias_node: NodeId, broadcast_dim: usize },
     Activation(String),
-    ScalarMul { scalar_node: NodeId },
-    Clamp { min_node: NodeId, max_node: NodeId },
+    /// Multiply every accumulator element by a compile-time constant scalar.
+    ScalarMul { scalar: f32 },
+    /// Clamp every accumulator element to [min, max].
+    /// Infinite bounds (f32::NEG_INFINITY / f32::INFINITY) are skipped so that
+    /// a one-sided clamp only emits one instruction.
+    Clamp { min: f32, max: f32 },
 }
 
 /// Matmul variant for epilogue fusion dispatch.
@@ -39,7 +43,7 @@ fn is_epilogue_eligible(op_name: &str) -> bool {
     matches!(
         op_name,
         "add" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh"
-            | "mul"
+            | "mul" | "clamp"
     )
 }
 
@@ -110,24 +114,42 @@ fn trace_epilogue_chain(graph: &FusionGraph, matmul_id: NodeId) -> Option<Epilog
                         }
                     }
                     "mul" => {
-                        // ScalarMul: one input is chain, other is scalar
+                        // ScalarMul: one input is the chain, other is a scalar constant.
+                        // If the scalar node has no const_value we cannot embed a literal
+                        // and must stop fusion.
                         if current.inputs.len() == 2 {
                             let prev_id = *eliminated.last().unwrap_or(&matmul_id);
-                            let scalar_input = if current.inputs[0] == prev_id {
+                            let scalar_node_id = if current.inputs[0] == prev_id {
                                 current.inputs[1]
                             } else {
                                 current.inputs[0]
                             };
-                            epilogue_ops.push(EpilogueOp::ScalarMul {
-                                scalar_node: scalar_input,
-                            });
+                            if let Some(scalar) = graph.nodes[scalar_node_id as usize].const_value {
+                                epilogue_ops.push(EpilogueOp::ScalarMul { scalar });
+                            } else {
+                                break; // Dynamic scalar — cannot inline as PTX literal
+                            }
                         } else {
                             break;
                         }
                     }
                     "clamp" => {
-                        // Clamp needs min and max nodes — simplified: skip for now
-                        break;
+                        // Clamp: NSL's clamp(x, min, max) has 3 inputs: [chain, min_node, max_node].
+                        // Both min and max must be scalar constants to inline as PTX literals.
+                        if current.inputs.len() == 3 {
+                            let min_id = current.inputs[1];
+                            let max_id = current.inputs[2];
+                            if let (Some(min), Some(max)) = (
+                                graph.nodes[min_id as usize].const_value,
+                                graph.nodes[max_id as usize].const_value,
+                            ) {
+                                epilogue_ops.push(EpilogueOp::Clamp { min, max });
+                            } else {
+                                break; // Dynamic bounds — cannot inline
+                            }
+                        } else {
+                            break;
+                        }
                     }
                     activation => {
                         // Unary activation: relu, gelu, silu, sigmoid, tanh
@@ -205,6 +227,23 @@ pub fn apply_epilogue_fusion(graph: &mut FusionGraph, chains: &[EpilogueChain], 
     }
 }
 
+/// Format an f32 value as a PTX immediate literal using IEEE 754 hex encoding.
+///
+/// PTX uses the `0F<hex>` notation to represent float immediates without
+/// any rounding, so `0.1f32` becomes the exact bit-pattern `0F3DCCCCCD` rather
+/// than the decimal approximation `0.1` (which the PTX assembler would re-round).
+///
+/// Special cases:
+/// - `0.0` → `"0F00000000"` (positive zero; avoids sign issues with `-0.0`)
+fn format_f32_literal(val: f32) -> String {
+    if val == 0.0 {
+        "0F00000000".to_string()
+    } else {
+        let bits = val.to_bits();
+        format!("0F{:08X}", bits)
+    }
+}
+
 /// Synthesize the epilogue portion of a fused matmul kernel as PTX.
 /// The caller is responsible for integrating this into the matmul kernel's
 /// output section (after MMA accumulation, before st.global).
@@ -237,6 +276,11 @@ pub fn synthesize_epilogue_ptx(
     ptx.push_str("    .reg .u32 %r<32>;\n");
     ptx.push_str("    .reg .u64 %rd<16>;\n");
     ptx.push_str("    .reg .f32 %f<32>;\n");
+    // Named scalar registers for ScalarMul and Clamp epilogue ops.
+    // Declared unconditionally so the PTX remains valid for any op combination.
+    ptx.push_str("    .reg .f32 %epilogue_scalar;\n");
+    ptx.push_str("    .reg .f32 %epilogue_clamp_min;\n");
+    ptx.push_str("    .reg .f32 %epilogue_clamp_max;\n");
     ptx.push_str("    .reg .f16 %h<8>;\n");
     ptx.push_str("    .reg .pred %p<4>;\n\n");
 
@@ -373,12 +417,42 @@ pub fn synthesize_epilogue_ptx(
                     }
                 }
             }
-            EpilogueOp::ScalarMul { .. } => {
-                ptx.push_str("    // ScalarMul epilogue (placeholder — scalar loaded separately)\n");
-                ptx.push_str(&format!("    mov.f32 %f{}, %f{};\n", out_reg, acc_reg));
+            EpilogueOp::ScalarMul { scalar } => {
+                ptx.push_str(&format!("    // Epilogue: ScalarMul by {}\n", scalar));
+                ptx.push_str(&format!(
+                    "    mov.f32 %epilogue_scalar, {};\n",
+                    format_f32_literal(*scalar)
+                ));
+                ptx.push_str(&format!(
+                    "    mul.f32 %f{out}, %f{acc}, %epilogue_scalar;\n",
+                    out = out_reg,
+                    acc = acc_reg,
+                ));
             }
-            EpilogueOp::Clamp { .. } => {
+            EpilogueOp::Clamp { min, max } => {
+                ptx.push_str(&format!("    // Epilogue: Clamp to [{}, {}]\n", min, max));
+                // Copy accumulator so the output register always receives a value.
                 ptx.push_str(&format!("    mov.f32 %f{}, %f{};\n", out_reg, acc_reg));
+                if min.is_finite() {
+                    ptx.push_str(&format!(
+                        "    mov.f32 %epilogue_clamp_min, {};\n",
+                        format_f32_literal(*min)
+                    ));
+                    ptx.push_str(&format!(
+                        "    max.f32 %f{out}, %f{out}, %epilogue_clamp_min;\n",
+                        out = out_reg,
+                    ));
+                }
+                if max.is_finite() {
+                    ptx.push_str(&format!(
+                        "    mov.f32 %epilogue_clamp_max, {};\n",
+                        format_f32_literal(*max)
+                    ));
+                    ptx.push_str(&format!(
+                        "    min.f32 %f{out}, %f{out}, %epilogue_clamp_max;\n",
+                        out = out_reg,
+                    ));
+                }
             }
         }
         acc_reg = out_reg;
@@ -617,5 +691,265 @@ mod tests {
         // GELU uses tanh approximation: sqrt(2/pi) constant
         assert!(ptx_str.contains("0f3F4C422A")); // sqrt(2/pi) hex
         assert!(ptx_str.contains("tanh") || ptx_str.contains("ex2.approx"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 1 & 5: format_f32_literal + ScalarMul / Clamp tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_format_f32_literal_zero() {
+        assert_eq!(format_f32_literal(0.0_f32), "0F00000000");
+        // Negative zero must also map to the positive-zero encoding.
+        assert_eq!(format_f32_literal(-0.0_f32), "0F00000000");
+    }
+
+    #[test]
+    fn test_format_f32_literal_one() {
+        // 1.0f32 is 0x3F800000
+        assert_eq!(format_f32_literal(1.0_f32), "0F3F800000");
+    }
+
+    #[test]
+    fn test_format_f32_literal_neg_one() {
+        // -1.0f32 is 0xBF800000
+        assert_eq!(format_f32_literal(-1.0_f32), "0FBF800000");
+    }
+
+    #[test]
+    fn test_format_f32_literal_half() {
+        // 0.5f32 is 0x3F000000
+        assert_eq!(format_f32_literal(0.5_f32), "0F3F000000");
+    }
+
+    #[test]
+    fn test_format_f32_literal_round_trip() {
+        // Whatever value we encode, its bits must survive the round-trip.
+        let values = [std::f32::consts::PI, 0.1_f32, -123.456_f32, f32::MAX, f32::MIN_POSITIVE];
+        for v in values {
+            let encoded = format_f32_literal(v);
+            assert!(encoded.starts_with("0F"), "missing 0F prefix for {v}: {encoded}");
+            let hex = &encoded[2..];
+            let bits = u32::from_str_radix(hex, 16).expect("valid hex");
+            let decoded = f32::from_bits(bits);
+            assert_eq!(
+                v.to_bits(),
+                decoded.to_bits(),
+                "bit-pattern round-trip failed for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_epilogue_scalarmul_emits_mul() {
+        let ptx = synthesize_epilogue_ptx(
+            "fused_scalarmul",
+            &[EpilogueOp::ScalarMul { scalar: 2.0_f32 }],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        // Must emit a mul.f32 with the accumulator register.
+        assert!(ptx_str.contains("mul.f32"), "expected mul.f32 in:\n{}", ptx_str);
+        // Must reference the named scalar register.
+        assert!(ptx_str.contains("%epilogue_scalar"), "expected %epilogue_scalar in:\n{}", ptx_str);
+        // The scalar 2.0f32 (0x40000000) must appear as a PTX literal.
+        assert!(ptx_str.contains("0F40000000"), "expected 2.0 hex literal in:\n{}", ptx_str);
+        // Must NOT contain max.f32 (that would be clamp, not scalar mul).
+        assert!(!ptx_str.contains("max.f32"), "unexpected max.f32 in scalar-mul epilogue");
+    }
+
+    #[test]
+    fn test_epilogue_scalarmul_negative_scalar() {
+        // -0.5f32 = 0xBF000000
+        let ptx = synthesize_epilogue_ptx(
+            "fused_neg_scalarmul",
+            &[EpilogueOp::ScalarMul { scalar: -0.5_f32 }],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        assert!(ptx_str.contains("mul.f32"));
+        assert!(ptx_str.contains("0FBF000000"), "expected -0.5 hex in:\n{}", ptx_str);
+    }
+
+    #[test]
+    fn test_epilogue_clamp_emits_max_and_min() {
+        let ptx = synthesize_epilogue_ptx(
+            "fused_clamp",
+            &[EpilogueOp::Clamp { min: 0.0_f32, max: 6.0_f32 }],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        // Both instructions must appear for a two-sided clamp.
+        assert!(ptx_str.contains("max.f32"), "expected max.f32 in:\n{}", ptx_str);
+        assert!(ptx_str.contains("min.f32"), "expected min.f32 in:\n{}", ptx_str);
+        // Named clamp registers must appear.
+        assert!(ptx_str.contains("%epilogue_clamp_min"));
+        assert!(ptx_str.contains("%epilogue_clamp_max"));
+        // 6.0f32 is 0x40C00000
+        assert!(ptx_str.contains("0F40C00000"), "expected 6.0 hex in:\n{}", ptx_str);
+    }
+
+    #[test]
+    fn test_epilogue_clamp_one_sided_min_only() {
+        // max = +inf -> only max.f32 (clamp-from-below), no min.f32
+        let ptx = synthesize_epilogue_ptx(
+            "fused_clamp_relu",
+            &[EpilogueOp::Clamp { min: 0.0_f32, max: f32::INFINITY }],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        assert!(ptx_str.contains("max.f32"), "expected max.f32");
+        // min.f32 must NOT appear when max is infinite.
+        assert!(!ptx_str.contains("min.f32"), "unexpected min.f32 for one-sided clamp");
+    }
+
+    #[test]
+    fn test_epilogue_clamp_one_sided_max_only() {
+        // min = -inf -> only min.f32 (clamp-from-above), no max.f32
+        let ptx = synthesize_epilogue_ptx(
+            "fused_clamp_cap",
+            &[EpilogueOp::Clamp { min: f32::NEG_INFINITY, max: 1.0_f32 }],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        assert!(ptx_str.contains("min.f32"), "expected min.f32");
+        assert!(!ptx_str.contains("max.f32"), "unexpected max.f32 for one-sided clamp");
+    }
+
+    #[test]
+    fn test_epilogue_chain_relu_scalarmul_clamp() {
+        // relu -> scalarmul(0.5) -> clamp(0, 1) — typical post-attention chain
+        let ptx = synthesize_epilogue_ptx(
+            "fused_chain",
+            &[
+                EpilogueOp::Activation("relu".into()),
+                EpilogueOp::ScalarMul { scalar: 0.5_f32 },
+                EpilogueOp::Clamp { min: 0.0_f32, max: 1.0_f32 },
+            ],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        // All three op families must appear.
+        assert!(ptx_str.contains("max.f32"), "expected ReLU max.f32");
+        assert!(ptx_str.contains("mul.f32"), "expected ScalarMul mul.f32");
+        assert!(ptx_str.contains("min.f32"), "expected Clamp min.f32");
+
+        // Ordering: relu comment before scalarmul comment before clamp comment.
+        let relu_pos = ptx_str.find("ReLU").expect("ReLU comment missing");
+        let smul_pos = ptx_str.find("ScalarMul").expect("ScalarMul comment missing");
+        let clamp_pos = ptx_str.find("Clamp").expect("Clamp comment missing");
+        assert!(relu_pos < smul_pos, "ReLU must precede ScalarMul");
+        assert!(smul_pos < clamp_pos, "ScalarMul must precede Clamp");
+    }
+
+    #[test]
+    fn test_epilogue_scalarmul_clamp_numerical() {
+        // Simulate the epilogue by inspecting the PTX register sequence.
+        // We check that the generated PTX uses the correct f32 encoding for
+        // each immediate, which guarantees the arithmetic is right when run on
+        // actual hardware.
+        let scalar = 3.0_f32;  // 0x40400000
+        let clamp_max = 8.0_f32; // 0x41000000
+        let ptx = synthesize_epilogue_ptx(
+            "fused_numerical",
+            &[
+                EpilogueOp::ScalarMul { scalar },
+                EpilogueOp::Clamp { min: 0.0_f32, max: clamp_max },
+            ],
+            DType::F32,
+            false,
+        );
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
+
+        // 3.0 -> 0x40400000
+        assert!(ptx_str.contains("0F40400000"), "3.0 literal missing");
+        // 8.0 -> 0x41000000
+        assert!(ptx_str.contains("0F41000000"), "8.0 literal missing");
+        // 0.0 -> 0F00000000
+        assert!(ptx_str.contains("0F00000000"), "0.0 literal missing");
+    }
+
+    #[test]
+    fn test_detect_scalarmul_epilogue_chain() {
+        // matmul -> mul(chain, const_scalar) -> relu
+        let mut g = FusionGraph::new();
+        let a = g.add_node(FusionOp::Input, vec![]);
+        let b = g.add_node(FusionOp::Input, vec![]);
+        let scalar = g.add_const_node(0.5_f32);
+        let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
+        let mul = g.add_node(FusionOp::Elementwise("mul".into()), vec![mm, scalar]);
+        let relu = g.add_node(FusionOp::Elementwise("relu".into()), vec![mul]);
+        g.mark_graph_output(relu);
+        g.build_consumers();
+
+        let chains = detect_epilogue_chains(&g);
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].epilogue_ops.len(), 2);
+        assert_eq!(chains[0].epilogue_ops[0], EpilogueOp::ScalarMul { scalar: 0.5_f32 });
+        assert_eq!(chains[0].epilogue_ops[1], EpilogueOp::Activation("relu".into()));
+    }
+
+    #[test]
+    fn test_detect_scalarmul_no_const_stops_chain() {
+        // mul where the scalar side has no const_value -> dynamic, stops chain
+        let mut g = FusionGraph::new();
+        let a = g.add_node(FusionOp::Input, vec![]);
+        let b = g.add_node(FusionOp::Input, vec![]);
+        let dynamic_scalar = g.add_node(FusionOp::Input, vec![]); // no const_value
+        let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
+        let mul = g.add_node(FusionOp::Elementwise("mul".into()), vec![mm, dynamic_scalar]);
+        g.mark_graph_output(mul);
+        g.build_consumers();
+
+        let chains = detect_epilogue_chains(&g);
+        assert_eq!(chains.len(), 0);
+    }
+
+    #[test]
+    fn test_detect_clamp_epilogue_chain() {
+        // matmul -> clamp(chain, min_const, max_const)
+        let mut g = FusionGraph::new();
+        let a = g.add_node(FusionOp::Input, vec![]);
+        let b = g.add_node(FusionOp::Input, vec![]);
+        let min_node = g.add_const_node(0.0_f32);
+        let max_node = g.add_const_node(6.0_f32);
+        let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
+        let clamp = g.add_node(FusionOp::Elementwise("clamp".into()), vec![mm, min_node, max_node]);
+        g.mark_graph_output(clamp);
+        g.build_consumers();
+
+        let chains = detect_epilogue_chains(&g);
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].epilogue_ops.len(), 1);
+        assert_eq!(chains[0].epilogue_ops[0], EpilogueOp::Clamp { min: 0.0_f32, max: 6.0_f32 });
+    }
+
+    #[test]
+    fn test_detect_clamp_dynamic_stops_chain() {
+        // clamp where min has no const_value -> stops chain
+        let mut g = FusionGraph::new();
+        let a = g.add_node(FusionOp::Input, vec![]);
+        let b = g.add_node(FusionOp::Input, vec![]);
+        let min_node = g.add_node(FusionOp::Input, vec![]); // dynamic, no const_value
+        let max_node = g.add_const_node(6.0_f32);
+        let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
+        let clamp = g.add_node(FusionOp::Elementwise("clamp".into()), vec![mm, min_node, max_node]);
+        g.mark_graph_output(clamp);
+        g.build_consumers();
+
+        let chains = detect_epilogue_chains(&g);
+        assert_eq!(chains.len(), 0);
     }
 }

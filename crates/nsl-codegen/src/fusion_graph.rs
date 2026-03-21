@@ -33,6 +33,9 @@ pub struct FusionNode {
     pub shape: Option<Vec<usize>>,
     pub dtype: Option<DType>,
     pub no_fuse: bool,
+    /// Scalar constant value, if this node represents a compile-time f32 constant.
+    /// Set by the frontend when it lowers a literal into the fusion graph.
+    pub const_value: Option<f32>,
 }
 
 /// The fusion analysis DAG for a single function.
@@ -70,7 +73,15 @@ impl FusionGraph {
             shape: None,
             dtype: None,
             no_fuse: false,
+            const_value: None,
         });
+        id
+    }
+
+    /// Add a scalar constant node (e.g., a literal used as a ScalarMul argument).
+    pub fn add_const_node(&mut self, value: f32) -> NodeId {
+        let id = self.add_node(FusionOp::Other, vec![]);
+        self.nodes[id as usize].const_value = Some(value);
         id
     }
 
