@@ -20,6 +20,8 @@ pub enum OwnershipState {
     Consumed { at: Span, by: String },
     /// Tensor is @shared — refcounted, multiple uses allowed.
     Shared,
+    /// Tensor is a borrow (&T) — read-only access, cannot be consumed or mutated.
+    Borrowed,
 }
 
 impl OwnershipState {
@@ -30,6 +32,21 @@ impl OwnershipState {
     pub fn is_shared(&self) -> bool {
         matches!(self, OwnershipState::Shared)
     }
+
+    pub fn is_borrowed(&self) -> bool {
+        matches!(self, OwnershipState::Borrowed)
+    }
+}
+
+/// Tracks an active borrow on an owned variable.
+#[derive(Debug, Clone)]
+pub struct ActiveBorrow {
+    /// Symbol of the borrow variable (the `&x` reference).
+    pub borrow_sym: Symbol,
+    /// Symbol of the owned variable being borrowed.
+    pub owner_sym: Symbol,
+    /// Where the borrow was created.
+    pub created_at: Span,
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +63,8 @@ pub struct OwnershipChecker<'a> {
     loop_depth: u32,
     /// Symbols defined at each loop depth (for loop consumption checks).
     loop_defined: Vec<HashMap<Symbol, bool>>,
+    /// Active borrows: owner_sym → list of borrow symbols.
+    active_borrows: HashMap<Symbol, Vec<ActiveBorrow>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -58,6 +77,7 @@ impl<'a> OwnershipChecker<'a> {
             tensor_bindings: HashMap::new(),
             loop_depth: 0,
             loop_defined: Vec::new(),
+            active_borrows: HashMap::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -101,7 +121,27 @@ impl<'a> OwnershipChecker<'a> {
                         .with_label(at, "cannot use after move"),
                 );
             }
+            Some(OwnershipState::Borrowed) => {
+                // Cannot consume a borrow — it's read-only
+                self.diagnostics.push(
+                    Diagnostic::error(format!("cannot consume borrowed tensor '{name}' — borrows are read-only"))
+                        .with_label(at, "attempted to consume borrow"),
+                );
+            }
             Some(OwnershipState::Owned) | None => {
+                // Check for active borrows — cannot consume while borrowed
+                if self.has_active_borrows(sym) {
+                    let borrows = self.active_borrows.get(&sym).unwrap();
+                    let borrow_span = borrows[0].created_at;
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "cannot consume '{name}' — it has active borrows"
+                        ))
+                        .with_label(borrow_span, "borrowed here")
+                        .with_label(at, "attempted consumption"),
+                    );
+                    return;
+                }
                 // Check loop consumption
                 if self.loop_depth > 0 {
                     // Search ALL loop frames, not just innermost — a tensor defined
@@ -226,6 +266,72 @@ impl<'a> OwnershipChecker<'a> {
     pub fn exit_loop(&mut self) {
         self.loop_depth -= 1;
         self.loop_defined.pop();
+    }
+
+    // ─── Borrowing ──────────────────────────────────────────────────
+
+    /// Register a borrow variable (&x) that borrows from an owned variable.
+    /// The borrow is read-only and cannot be consumed.
+    pub fn register_borrow(&mut self, borrow_sym: Symbol, owner_sym: Symbol, span: Span) {
+        // Check owner is valid (owned or shared, not consumed)
+        if let Some(OwnershipState::Consumed { at, by }) = self.states.get(&owner_sym) {
+            let name = self.resolve_sym(owner_sym).to_string();
+            self.diagnostics.push(
+                Diagnostic::error(format!("cannot borrow '{name}' — already consumed"))
+                    .with_label(*at, format!("consumed here by '{by}'"))
+                    .with_label(span, "attempted borrow"),
+            );
+            return;
+        }
+
+        // Register the borrow variable as Borrowed state
+        self.states.insert(borrow_sym, OwnershipState::Borrowed);
+        self.tensor_bindings.insert(borrow_sym, span);
+
+        // Track the active borrow on the owner
+        self.active_borrows
+            .entry(owner_sym)
+            .or_default()
+            .push(ActiveBorrow {
+                borrow_sym,
+                owner_sym,
+                created_at: span,
+            });
+    }
+
+    /// Release all borrows associated with a scope exit.
+    /// Call when a borrow goes out of scope.
+    pub fn release_borrow(&mut self, borrow_sym: Symbol) {
+        // Find and remove from active borrows
+        for borrows in self.active_borrows.values_mut() {
+            borrows.retain(|b| b.borrow_sym != borrow_sym);
+        }
+        // Remove empty entries
+        self.active_borrows.retain(|_, v| !v.is_empty());
+    }
+
+    /// Check if a variable has any active borrows.
+    pub fn has_active_borrows(&self, sym: Symbol) -> bool {
+        self.active_borrows
+            .get(&sym)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Use a borrowed variable (read-only — does not consume).
+    pub fn use_borrow(&mut self, sym: Symbol, at: Span, _context: &str) {
+        if !self.tensor_bindings.contains_key(&sym) {
+            return;
+        }
+        match self.states.get(&sym) {
+            Some(OwnershipState::Borrowed) => {
+                // Read through borrow is always valid
+            }
+            _ => {
+                // Not a borrow — delegate to normal use
+                self.use_binding(sym, at, _context);
+            }
+        }
     }
 }
 
@@ -402,5 +508,135 @@ mod tests {
         checker.consume(x, sp(), "gelu");
 
         assert!(checker.diagnostics.is_empty());
+    }
+
+    // ── Borrowing tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_borrow_read_is_valid() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.register_borrow(x_ref, x, sp());
+        // Read through borrow is fine
+        checker.use_borrow(x_ref, sp(), "sum");
+        checker.use_borrow(x_ref, sp(), "mean");
+        assert!(checker.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_borrow_cannot_be_consumed() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.register_borrow(x_ref, x, sp());
+        // Trying to consume a borrow should fail
+        checker.consume(x_ref, sp(), "relu");
+        assert_eq!(checker.diagnostics.len(), 1);
+        assert!(checker.diagnostics[0].message.contains("borrowed tensor"));
+    }
+
+    #[test]
+    fn test_cannot_consume_while_borrowed() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.register_borrow(x_ref, x, sp());
+        // Cannot consume x while x_ref borrows it
+        checker.consume(x, sp(), "relu");
+        assert_eq!(checker.diagnostics.len(), 1);
+        assert!(checker.diagnostics[0].message.contains("active borrows"));
+    }
+
+    #[test]
+    fn test_consume_after_borrow_released() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.register_borrow(x_ref, x, sp());
+        checker.use_borrow(x_ref, sp(), "sum");
+        // Release the borrow
+        checker.release_borrow(x_ref);
+        // Now consumption is valid
+        checker.consume(x, sp(), "relu");
+        assert!(checker.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_borrows_allowed() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let a = Symbol(interner.get_or_intern("a"));
+        let b = Symbol(interner.get_or_intern("b"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.register_borrow(a, x, sp());
+        checker.register_borrow(b, x, sp());
+        // Multiple immutable borrows are fine
+        checker.use_borrow(a, sp(), "sum");
+        checker.use_borrow(b, sp(), "mean");
+        assert!(checker.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_borrow_in_loop_ok() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.enter_loop();
+        // Borrow in loop — reads are safe
+        checker.register_borrow(x_ref, x, sp());
+        checker.use_borrow(x_ref, sp(), "sum");
+        checker.release_borrow(x_ref);
+        checker.exit_loop();
+        assert!(checker.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_borrow_of_consumed_fails() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.consume(x, sp(), "relu");
+        // Cannot borrow after consumption
+        checker.register_borrow(x_ref, x, sp());
+        assert_eq!(checker.diagnostics.len(), 1);
+        assert!(checker.diagnostics[0].message.contains("already consumed"));
+    }
+
+    #[test]
+    fn test_has_active_borrows() {
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        assert!(!checker.has_active_borrows(x));
+
+        checker.register_borrow(x_ref, x, sp());
+        assert!(checker.has_active_borrows(x));
+
+        checker.release_borrow(x_ref);
+        assert!(!checker.has_active_borrows(x));
     }
 }
