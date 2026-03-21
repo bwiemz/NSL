@@ -88,8 +88,8 @@ pub enum AdjointExpr {
     L1Backward(VarId, VarId, VarId),
 
     // Attention backward
-    /// Scaled dot-product attention backward. args: (grad, Q, K, V)
-    AttentionBackward(VarId, VarId, VarId, VarId),
+    /// Scaled dot-product attention backward. args: (grad, Q, K, V, causal)
+    AttentionBackward(VarId, VarId, VarId, VarId, bool),
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
 
@@ -233,7 +233,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             // gamma and beta adjoints are simple
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result),
+                // Pass `input` for mean/rstd slots — the lowering in source_ad.rs
+                // recomputes mean and rstd from input (since they aren't separate outputs).
+                expr: AdjointExpr::LayerNormBackward(output_bar, input, input, input),
             }];
             // gamma gradient: grad * normalized_input
             if op.inputs.len() > 1 {
@@ -255,7 +257,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             let input = op.inputs[0];
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                expr: AdjointExpr::BatchNormBackward(output_bar, input, op.result, op.result),
+                expr: AdjointExpr::BatchNormBackward(output_bar, input, input, input),
             }];
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
@@ -381,15 +383,14 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }
 
         // --- Attention ---
-        PrimalOp::ScaledDotProductAttention { .. } => {
-            // Q, K, V are inputs[0..3]
+        PrimalOp::ScaledDotProductAttention { causal } => {
             let q = op.inputs[0];
             let k = op.inputs[1];
             let v = op.inputs[2];
             vec![
-                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
-                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
-                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
+                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v, *causal) },
+                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v, *causal) },
+                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v, *causal) },
             ]
         }
         PrimalOp::RoPE { dim } => vec![InputAdjoint {
@@ -686,7 +687,8 @@ mod tests {
         let op = make_op(3, PrimalOp::LayerNorm { eps: 1e-5 }, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "LayerNorm should produce 3 adjoints (input, gamma, beta)");
-        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 3, 3)));
+        // mean/rstd slots are now `input` (recomputed in the lowering)
+        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 0, 0)));
         assert!(matches!(adj[1].expr, AdjointExpr::MulElementwise(100, 3))); // gamma grad
         assert!(matches!(adj[2].expr, AdjointExpr::Identity(100))); // beta grad
         assert_eq!(saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }), SavedRequirement::Inputs);
@@ -805,7 +807,7 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "Attention should produce 3 adjoints (Q, K, V)");
         for a in &adj {
-            assert!(matches!(a.expr, AdjointExpr::AttentionBackward(100, 0, 1, 2)));
+            assert!(matches!(a.expr, AdjointExpr::AttentionBackward(100, 0, 1, 2, true)));
         }
         assert_eq!(
             saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: true }),

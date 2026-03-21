@@ -118,9 +118,19 @@ impl AdjointGenerator {
             AdjointExpr::MulElementwise(a, b) => (PrimalOp::Mul, vec![a, b]),
             AdjointExpr::MatmulTransposeLeft(a, b) => (PrimalOp::Matmul, vec![a, b]),
             AdjointExpr::MatmulTransposeRight(a, b) => (PrimalOp::Matmul, vec![a, b]),
-            AdjointExpr::Scale(v, _s) => (PrimalOp::Mul, vec![v]),
+            AdjointExpr::Scale(v, s) => {
+                let scale = self.emit_constant(s);
+                return self.emit_op(PrimalOp::Mul, vec![v, scale]);
+            }
             AdjointExpr::Broadcast(v) => (PrimalOp::Broadcast, vec![v]),
-            AdjointExpr::ScaleBroadcast(v, _n) => (PrimalOp::Broadcast, vec![v]),
+            AdjointExpr::ScaleBroadcast(v, n) => {
+                if n != 1.0 {
+                    let scale = self.emit_constant(n);
+                    let scaled = self.emit_op(PrimalOp::Mul, vec![v, scale]);
+                    return self.emit_op(PrimalOp::Broadcast, vec![scaled]);
+                }
+                (PrimalOp::Broadcast, vec![v])
+            }
             AdjointExpr::Transpose(v, d0, d1) => (PrimalOp::Transpose { dim0: d0, dim1: d1 }, vec![v]),
             AdjointExpr::Reshape(v) => (PrimalOp::Reshape { target_ndim: 0 }, vec![v]),
             AdjointExpr::ExpBackward(y_bar, y) => (PrimalOp::Mul, vec![y_bar, y]),
@@ -266,8 +276,18 @@ impl AdjointGenerator {
             }
 
             // LayerNormBackward: rstd * (grad - mean(grad) - x_hat * mean(grad * x_hat))
-            AdjointExpr::LayerNormBackward(y_bar, x, mean, rstd) => {
+            // mean/rstd are recomputed from input x (they aren't separate forward outputs).
+            AdjointExpr::LayerNormBackward(y_bar, x, _mean_placeholder, _rstd_placeholder) => {
+                // Recompute mean and rstd from input
+                let mean = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
+                let var = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x_sq]);
+                let eps = self.emit_constant(1e-5);
+                let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
+                let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
+                let one = self.emit_constant(1.0);
+                let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
                 let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
                 let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![grad_x_hat]);
@@ -278,9 +298,17 @@ impl AdjointGenerator {
                 return self.emit_op(PrimalOp::Mul, vec![grad_corrected, rstd]);
             }
 
-            // BatchNormBackward: same structure as LayerNorm but over batch dim
-            AdjointExpr::BatchNormBackward(y_bar, x, mean, rstd) => {
+            // BatchNormBackward: same as LayerNorm but over batch dim (dim=0)
+            AdjointExpr::BatchNormBackward(y_bar, x, _mean_ph, _rstd_ph) => {
+                let mean = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![x]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
+                let var = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![x_sq]);
+                let eps = self.emit_constant(1e-5);
+                let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
+                let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
+                let one = self.emit_constant(1.0);
+                let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
                 let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
                 let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![grad_x_hat]);
@@ -357,8 +385,8 @@ impl AdjointGenerator {
             }
 
             // AttentionBackward: emit FlashAttentionBackward fused kernel
-            AdjointExpr::AttentionBackward(y_bar, q, k, v) => {
-                return self.emit_op(PrimalOp::FlashAttentionBackward { causal: false }, vec![y_bar, q, k, v]);
+            AdjointExpr::AttentionBackward(y_bar, q, k, v, causal) => {
+                return self.emit_op(PrimalOp::FlashAttentionBackward { causal }, vec![y_bar, q, k, v]);
             }
 
             // RoPEBackward: inverse rotation (not negation!)
