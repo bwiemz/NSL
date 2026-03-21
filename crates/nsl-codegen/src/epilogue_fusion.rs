@@ -183,6 +183,15 @@ fn trace_epilogue_chain(graph: &FusionGraph, matmul_id: NodeId) -> Option<Epilog
         return None;
     }
 
+    // Profitability gate: limit epilogue chain length based on register pressure.
+    // Matmul already uses ~128 regs; each epilogue op adds ~4 regs.
+    // Exceeding the budget causes register spill → slower than separate kernel.
+    let max_ops = crate::cost_model::MAX_EPILOGUE_REGISTERS as usize / 4;
+    if epilogue_ops.len() > max_ops {
+        epilogue_ops.truncate(max_ops);
+        eliminated.truncate(max_ops);
+    }
+
     let output_node = *eliminated.last().unwrap();
     Some(EpilogueChain {
         matmul_node: matmul_id,

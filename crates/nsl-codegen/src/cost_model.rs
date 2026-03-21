@@ -437,6 +437,41 @@ pub fn estimate_register_pressure(ops: &[FusionOpDesc], max_allowed: u32) -> Reg
     }
 }
 
+/// Build a FusionOpDesc from an op name string.
+/// Uses per-op register estimates and a default data size.
+/// `data_bytes` is the size of the intermediate tensor in bytes.
+pub fn op_to_fusion_desc(op: &str, data_bytes: u64) -> FusionOpDesc {
+    let (output_regs, temp_regs) = match op {
+        "add" | "sub" | "mul" | "neg" | "abs" | "sign" => (2, 0),
+        "div" | "pow" => (2, 1),
+        "relu" | "clamp" => (2, 0),
+        "sigmoid" | "tanh" => (2, 2),  // exp + temp for denominator
+        "silu" | "gelu" => (2, 3),      // sigmoid + x*sig or erf approx
+        "exp" | "log" | "sqrt" => (2, 1),
+        "softmax" => (4, 4),            // max + sum + exp + output per row
+        "layernorm" | "rmsnorm" => (4, 4),
+        "bias_add" | "scalar_mul" | "residual_add" => (2, 0),
+        _ => (2, 2), // conservative default
+    };
+    FusionOpDesc {
+        flops: data_bytes as f64 / 4.0, // ~1 FLOP per f32 element for elementwise
+        bytes_read: data_bytes,
+        bytes_written: data_bytes,
+        output_regs,
+        temp_regs,
+    }
+}
+
+/// Estimate the max epilogue chain length for a GPU based on register budget.
+/// Matmul uses ~128 regs for the accumulator tile; remaining budget is for epilogue ops.
+pub fn max_epilogue_ops_for_gpu(gpu: &GpuSpec) -> usize {
+    let max_regs_per_thread = gpu.registers_per_sm / gpu.max_warps_per_sm;
+    let matmul_regs: u32 = 128;
+    let available = max_regs_per_thread.saturating_sub(matmul_regs);
+    // ~4 regs per elementwise epilogue op
+    (available / 4).max(2) as usize
+}
+
 /// Combined profitability + register check: should this chain be fused?
 ///
 /// Returns true if fusion is both profitable (AI improvement ≥ threshold)

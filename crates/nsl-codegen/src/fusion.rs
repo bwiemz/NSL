@@ -69,11 +69,35 @@ pub fn is_fusion_barrier(name: &str) -> bool {
 }
 
 /// Attempt to synthesize a fused PTX kernel for a chain of elementwise ops.
-/// Returns None if chain has fewer than 2 ops (no fusion benefit).
+/// Returns None if chain has fewer than 2 ops or if register pressure is too high.
+///
+/// `data_bytes` is the intermediate tensor size (for profitability estimation).
+/// Pass 0 to skip profitability check (backward compat).
 pub fn try_synthesize_fused(op_chain: &[&str], num_inputs: usize) -> Option<FusedKernel> {
+    try_synthesize_fused_checked(op_chain, num_inputs, 0, false)
+}
+
+/// Attempt to synthesize with profitability check based on register pressure.
+pub fn try_synthesize_fused_checked(
+    op_chain: &[&str],
+    num_inputs: usize,
+    data_bytes: u64,
+    force: bool,
+) -> Option<FusedKernel> {
     if op_chain.len() < 2 {
         return None;
     }
+
+    // Profitability gate: check register pressure and AI improvement
+    if data_bytes > 0 && !force {
+        let descs: Vec<crate::cost_model::FusionOpDesc> = op_chain.iter()
+            .map(|op| crate::cost_model::op_to_fusion_desc(op, data_bytes))
+            .collect();
+        if !crate::cost_model::should_fuse(&descs, false, crate::cost_model::MAX_FUSED_REGISTERS) {
+            return None;
+        }
+    }
+
     let name = format!("fused_{}", op_chain.join("_"));
     let ptx = synthesize_fused_ptx(&name, op_chain, num_inputs);
     Some(FusedKernel {

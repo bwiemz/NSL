@@ -29,6 +29,10 @@ pub enum BarrierReason {
     NoFuseAnnotation,
     DimensionMismatch,
     UnsupportedOp,
+    /// Fusion rejected because register pressure exceeds budget.
+    RegisterPressure { peak_regs: u32, max_regs: u32 },
+    /// Epilogue chain truncated at this op count.
+    EpilogueTruncated { kept: usize, total: usize },
 }
 
 impl fmt::Display for BarrierReason {
@@ -40,6 +44,10 @@ impl fmt::Display for BarrierReason {
             Self::NoFuseAnnotation => write!(f, "@no_fuse annotation"),
             Self::DimensionMismatch => write!(f, "dimension mismatch"),
             Self::UnsupportedOp => write!(f, "unsupported op"),
+            Self::RegisterPressure { peak_regs, max_regs } =>
+                write!(f, "register pressure ({peak_regs}/{max_regs} regs)"),
+            Self::EpilogueTruncated { kept, total } =>
+                write!(f, "epilogue truncated ({kept}/{total} ops kept)"),
         }
     }
 }
@@ -53,6 +61,10 @@ pub struct FusionEvent {
     pub eliminated_launches: u32,
     pub estimated_bytes_saved: u64,
     pub location: String,
+    /// Estimated peak register pressure for the fused kernel (0 if not computed).
+    pub estimated_regs: u32,
+    /// Estimated occupancy fraction for the fused kernel (0.0 if not computed).
+    pub estimated_occupancy: f64,
 }
 
 /// A blocked fusion opportunity.
@@ -100,10 +112,16 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
                 e.matched_ops.join(" + "),
                 e.strategy
             );
+            let reg_info = if e.estimated_regs > 0 {
+                format!(", regs={}, occupancy={:.0}%", e.estimated_regs, e.estimated_occupancy * 100.0)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "      Savings: {} eliminated launch(es), ~{}MB eliminated traffic",
+                "      Savings: {} eliminated launch(es), ~{}MB eliminated traffic{}",
                 e.eliminated_launches,
-                e.estimated_bytes_saved / (1024 * 1024)
+                e.estimated_bytes_saved / (1024 * 1024),
+                reg_info
             );
         }
 
@@ -158,6 +176,8 @@ mod tests {
             eliminated_launches: 2,
             estimated_bytes_saved: 32 * 1024 * 1024,
             location: "model.nsl:15".into(),
+            estimated_regs: 96,
+            estimated_occupancy: 0.62,
         };
         assert_eq!(event.eliminated_launches, 2);
     }
