@@ -102,13 +102,15 @@ impl GpuSpec {
 
     /// Returns the appropriate PTX version string for this GPU's features.
     pub fn ptx_version(&self) -> &'static str {
-        if self.sm_version >= 90 { "8.0" }
+        if self.sm_version >= 100 { "8.6" }  // Blackwell requires PTX ISA 8.6+
+        else if self.sm_version >= 90 { "8.0" }
         else { "7.0" }
     }
 
     /// Returns the PTX target string for this GPU.
     pub fn ptx_target(&self) -> &'static str {
-        if self.sm_version >= 90 { "sm_90" }
+        if self.sm_version >= 100 { "sm_100" }  // Blackwell
+        else if self.sm_version >= 90 { "sm_90" }
         else if self.sm_version >= 89 { "sm_89" }
         else if self.sm_version >= 87 { "sm_87" }
         else if self.sm_version >= 86 { "sm_86" }
@@ -372,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_database_has_all_gpus() {
-        assert_eq!(GPU_DATABASE.len(), 9);
+        assert_eq!(GPU_DATABASE.len(), 11);
         let names: Vec<&str> = GPU_DATABASE.iter().map(|g| g.name).collect();
         assert!(names.contains(&"A100-SXM"));
         assert!(names.contains(&"H100-SXM"));
@@ -381,6 +383,22 @@ mod tests {
         assert!(names.contains(&"L40S"));
         assert!(names.contains(&"Orin"));
         assert!(names.contains(&"Orin-NX"));
+        assert!(names.contains(&"B200"));
+        assert!(names.contains(&"B100"));
+    }
+
+    #[test]
+    fn test_blackwell_supports_mxfp8_and_fp4() {
+        let b200 = find_gpu("B200").unwrap();
+        assert!(b200.supports_mxfp8());
+        assert!(b200.supports_fp4());
+        assert!(b200.supports_wgmma());
+        assert!(b200.supports_fp8_mma());
+
+        let h100 = find_gpu("H100").unwrap();
+        assert!(!h100.supports_mxfp8());
+        assert!(!h100.supports_fp4());
+        assert!(h100.supports_wgmma());
     }
 
     #[test]
