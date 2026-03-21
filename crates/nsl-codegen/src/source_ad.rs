@@ -1127,4 +1127,103 @@ mod tests {
         });
         assert!(select_op.is_some(), "Select should reference the saved condition variable");
     }
+
+    // ---------------------------------------------------------------
+    // Task 3: Backward pass produces conditional adjoint selection
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn adjoint_of_select_produces_conditional_gradient() {
+        // Primal: x (param), 0.0 (const), cond = x > 0, t = x, e = 0.0, out = Select(cond, t, e)
+        // This is relu: f(x) = max(x, 0)
+        // Backward: d(out)/dx = cond ? 1 : 0
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Select, vec![2, 0, 1]),
+            ],
+            output: 3,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+
+        // The output (var 3) should have an adjoint
+        assert!(gen.adjoint_of(3).is_some(), "Output should have adjoint");
+
+        // The param x (var 0) should have an adjoint (from Select true-branch)
+        assert!(gen.adjoint_of(0).is_some(), "Param x should have adjoint through Select");
+
+        // Verify Select ops appear in adjoint list (for conditional gradient selection)
+        let has_select_in_adjoint = adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Select));
+        assert!(has_select_in_adjoint,
+            "Backward pass should contain Select ops for conditional adjoint selection");
+    }
+
+    #[test]
+    fn adjoint_select_has_zero_for_inactive_branch() {
+        // For Select(cond, a, b), backward should create:
+        //   adj_a = Select(cond, adj_out, 0)
+        //   adj_b = Select(cond, 0, adj_out)
+        // Verify zero constants are generated
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Select, vec![2, 0, 1]),
+            ],
+            output: 3,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+
+        // Should have Constant(0.0) ops in the adjoint for the zero branches
+        let zero_consts: Vec<_> = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Constant(v) if *v == 0.0))
+            .collect();
+        assert!(!zero_consts.is_empty(),
+            "Backward pass should contain Constant(0.0) for inactive branch adjoints");
+    }
+
+    #[test]
+    fn adjoint_quadratic_linear_branch() {
+        // f(x) = if x > 0 { x * x } else { -x }
+        // Primal ops: x(0), zero(1), cond(2)=x>0, t(3)=x*x, e(4)=-x, out(5)=Select(cond, t, e)
+        // d/dx for true branch (x*x): 2x
+        // d/dx for false branch (-x): -1
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Mul, vec![0, 0]),  // x * x (then-branch)
+                make_op(4, 4, PrimalOp::Neg, vec![0]),       // -x (else-branch)
+                make_op(5, 5, PrimalOp::Select, vec![2, 3, 4]),
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+
+        // x should have adjoint (from both Mul and Neg, gated by Select)
+        assert!(gen.adjoint_of(0).is_some(), "x should have an adjoint");
+        // The true result and false result should have adjoints
+        assert!(gen.adjoint_of(3).is_some(), "true-branch result (x*x) should have adjoint");
+        assert!(gen.adjoint_of(4).is_some(), "false-branch result (-x) should have adjoint");
+
+        // Both branch results' adjoints should be Select ops (conditional on saved cond)
+        let select_count = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(select_count >= 2,
+            "Should have at least 2 Select ops in backward (one per branch input), got {select_count}");
+    }
 }
