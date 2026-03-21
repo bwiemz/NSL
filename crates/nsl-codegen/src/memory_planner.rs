@@ -220,6 +220,111 @@ impl SlabPlan {
 /// GPU alignment for slab offsets (256 bytes).
 const SLAB_ALIGNMENT: u64 = 256;
 
+// ---------------------------------------------------------------------------
+// Rematerialization
+// ---------------------------------------------------------------------------
+
+/// A recomputation point: the tensor is freed early and recomputed later.
+#[derive(Debug, Clone)]
+pub struct RecompPoint {
+    /// The original tensor allocation that is being rematerialized.
+    pub original_alloc_id: TensorAllocId,
+    /// Program point where the tensor is freed early (before natural death).
+    pub evict_at: ProgramPoint,
+    /// Program point where the tensor is recomputed.
+    pub recompute_at: ProgramPoint,
+    /// Name of the operation to re-execute.
+    pub op_name: String,
+    /// Tensor allocations of the inputs (must be live at recompute_at).
+    pub input_alloc_ids: Vec<TensorAllocId>,
+}
+
+/// Descriptor of a tensor's producing operation, for rematerialization scoring.
+#[derive(Debug, Clone)]
+pub struct TensorOpInfo {
+    pub alloc_id: TensorAllocId,
+    pub op_name: String,
+    pub input_alloc_ids: Vec<TensorAllocId>,
+    pub dtype_bytes: u64,
+}
+
+/// Run the rematerialization pass: identify tensors to recompute and shorten their live ranges.
+///
+/// Returns a list of recomputation points and a modified set of allocations with shortened ranges.
+/// The caller should use the modified allocations for interference graph construction and slab assignment.
+pub fn rematerialize(
+    allocs: &[TensorAlloc],
+    op_infos: &[TensorOpInfo],
+    threshold: f64,
+) -> (Vec<TensorAlloc>, Vec<RecompPoint>) {
+    use crate::cost_model::{score_remat_candidate, RecomputeClass};
+
+    let mut modified_allocs: Vec<TensorAlloc> = allocs.to_vec();
+    let mut recomp_points: Vec<RecompPoint> = Vec::new();
+
+    // Score all candidates
+    let mut candidates: Vec<(usize, crate::cost_model::RematCandidate)> = Vec::new();
+
+    for info in op_infos {
+        let idx = info.alloc_id as usize;
+        if idx >= allocs.len() { continue; }
+        let alloc = &allocs[idx];
+        if !alloc.is_plannable() { continue; }
+
+        let live_range = alloc.death.saturating_sub(alloc.birth);
+        if live_range < 2 { continue; } // too short to benefit
+
+        // Check if all inputs are live at a potential recompute point
+        // (simplified: check if inputs are live at the original death - 1)
+        let recompute_at = alloc.death.saturating_sub(1);
+        let inputs_live = info.input_alloc_ids.iter().all(|&input_id| {
+            let iid = input_id as usize;
+            iid < allocs.len() && allocs[iid].death >= recompute_at
+        });
+
+        if let Some(candidate) = score_remat_candidate(
+            info.alloc_id,
+            alloc.size_bytes,
+            live_range,
+            &info.op_name,
+            info.dtype_bytes,
+            inputs_live,
+        ) {
+            if candidate.score >= threshold || candidate.recompute_class == RecomputeClass::Free {
+                candidates.push((idx, candidate));
+            }
+        }
+    }
+
+    // Sort by score descending (best candidates first)
+    candidates.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Apply: shorten live ranges for accepted candidates
+    for (idx, candidate) in &candidates {
+        let alloc = &allocs[*idx];
+        let evict_at = alloc.birth + (alloc.death - alloc.birth) / 3; // free after first third
+        let recompute_at = alloc.death.saturating_sub(1);
+
+        // Shorten the original allocation's death to evict_at
+        modified_allocs[*idx].death = evict_at;
+
+        // Find the op info for input IDs
+        let info = op_infos.iter().find(|i| i.alloc_id == candidate.alloc_id);
+        let input_ids = info.map(|i| i.input_alloc_ids.clone()).unwrap_or_default();
+        let op_name = info.map(|i| i.op_name.clone()).unwrap_or_default();
+
+        recomp_points.push(RecompPoint {
+            original_alloc_id: candidate.alloc_id,
+            evict_at,
+            recompute_at,
+            op_name,
+            input_alloc_ids: input_ids,
+        });
+    }
+
+    (modified_allocs, recomp_points)
+}
+
 /// Assign tensors to memory slots using best-fit-decreasing (BFD).
 ///
 /// For each tensor (sorted by size descending), scans ALL existing non-conflicting
@@ -829,5 +934,115 @@ mod tests {
         // 100 bytes -> 256 aligned, padding = 156
         assert_eq!(plan.padding_bytes, 156);
         assert!(plan.fragmentation_ratio() > 0.5);
+    }
+
+    // ── Rematerialization tests ──────────────────────────────────────
+
+    #[test]
+    fn test_remat_shortens_live_range() {
+        // Tensor produced by relu (cheap), large, long live range → good candidate
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "input".into(), size_bytes: 4096, birth: 0, death: 100,
+                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+            },
+            TensorAlloc {
+                id: 1, name: "relu_out".into(), size_bytes: 4096, birth: 5, death: 95,
+                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+            },
+        ];
+
+        let op_infos = vec![
+            TensorOpInfo {
+                alloc_id: 1, op_name: "relu".into(),
+                input_alloc_ids: vec![0], dtype_bytes: 4,
+            },
+        ];
+
+        let (modified, recomp_points) = rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
+
+        // relu_out should be a remat candidate (cheap, large range)
+        assert!(!recomp_points.is_empty(), "should have at least one recomp point");
+        assert_eq!(recomp_points[0].original_alloc_id, 1);
+
+        // Modified alloc should have shortened death
+        assert!(modified[1].death < allocs[1].death,
+            "death should be shortened: was {}, now {}", allocs[1].death, modified[1].death);
+    }
+
+    #[test]
+    fn test_remat_rejects_matmul() {
+        // matmul is expensive — should NOT be rematerialized
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "a".into(), size_bytes: 4096, birth: 0, death: 100,
+                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+            },
+            TensorAlloc {
+                id: 1, name: "mm_out".into(), size_bytes: 4096, birth: 5, death: 95,
+                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+            },
+        ];
+
+        let op_infos = vec![
+            TensorOpInfo {
+                alloc_id: 1, op_name: "matmul".into(),
+                input_alloc_ids: vec![0], dtype_bytes: 4,
+            },
+        ];
+
+        let (_, recomp_points) = rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
+        assert!(recomp_points.is_empty(), "matmul should NOT be rematerialized");
+    }
+
+    #[test]
+    fn test_remat_free_ops_always_accepted() {
+        // reshape is free — always accepted regardless of score
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "src".into(), size_bytes: 100, birth: 0, death: 100,
+                source_loc: String::new(), size_kind: SizeKind::Static(100),
+            },
+            TensorAlloc {
+                id: 1, name: "reshaped".into(), size_bytes: 100, birth: 5, death: 95,
+                source_loc: String::new(), size_kind: SizeKind::Static(100),
+            },
+        ];
+
+        let op_infos = vec![
+            TensorOpInfo {
+                alloc_id: 1, op_name: "reshape".into(),
+                input_alloc_ids: vec![0], dtype_bytes: 4,
+            },
+        ];
+
+        let (_, recomp_points) = rematerialize(&allocs, &op_infos, f64::MAX); // very high threshold
+        assert!(!recomp_points.is_empty(), "free ops should always be accepted");
+    }
+
+    #[test]
+    fn test_remat_inputs_must_be_live() {
+        // Input dies before recompute point → cannot rematerialize
+        let allocs = vec![
+            TensorAlloc {
+                id: 0, name: "input".into(), size_bytes: 4096, birth: 0, death: 10,
+                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+            },
+            TensorAlloc {
+                id: 1, name: "relu_out".into(), size_bytes: 4096, birth: 5, death: 95,
+                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+            },
+        ];
+
+        let op_infos = vec![
+            TensorOpInfo {
+                alloc_id: 1, op_name: "relu".into(),
+                input_alloc_ids: vec![0], dtype_bytes: 4,
+            },
+        ];
+
+        let (_, recomp_points) = rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
+        // Input dies at 10 but recompute point is at 94 — cannot remat
+        assert!(recomp_points.is_empty(), "cannot remat if inputs are dead");
     }
 }

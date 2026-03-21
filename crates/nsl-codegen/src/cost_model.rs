@@ -459,6 +459,137 @@ pub fn should_fuse(
 }
 
 // ---------------------------------------------------------------------------
+// Rematerialization cost estimation
+// ---------------------------------------------------------------------------
+
+/// Classification of an operation's recomputation cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecomputeClass {
+    /// Zero compute: reshape, view, broadcast, transpose (just metadata).
+    Free,
+    /// Cheap: elementwise (relu, add, mul, sigmoid, tanh, gelu, exp, log).
+    Cheap,
+    /// Moderate: reductions (layernorm, rmsnorm, softmax) — small but not free.
+    Moderate,
+    /// Expensive: matmul, attention, conv — never recompute.
+    Expensive,
+}
+
+/// Cost of recomputing a tensor instead of storing it.
+#[derive(Debug, Clone)]
+pub struct RecomputeCost {
+    /// Classification for quick filtering.
+    pub class: RecomputeClass,
+    /// Estimated FLOPs to recompute.
+    pub flops: f64,
+    /// Bytes of inputs that must be read for recomputation.
+    pub bytes_read: u64,
+}
+
+/// Classify an operation's recomputation cost by name.
+pub fn classify_recompute(op_name: &str) -> RecomputeClass {
+    match op_name {
+        "reshape" | "view" | "broadcast" | "transpose" | "unsqueeze" | "squeeze"
+        | "expand" | "contiguous" | "slice" => RecomputeClass::Free,
+
+        "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "exp" | "log" | "sqrt"
+        | "abs" | "neg" | "sign" | "clamp" | "add" | "sub" | "mul" | "div"
+        | "add_scalar" | "mul_scalar" => RecomputeClass::Cheap,
+
+        "softmax" | "layernorm" | "rmsnorm" | "sum" | "mean" | "reduce_max" => RecomputeClass::Moderate,
+
+        "matmul" | "batched_matmul" | "flash_attention" | "conv2d"
+        | "scatter" | "gather" | "sparse_matmul" => RecomputeClass::Expensive,
+
+        _ => RecomputeClass::Expensive, // unknown → don't recompute
+    }
+}
+
+/// Estimate recomputation cost for a named operation with given output size.
+pub fn recompute_cost(op_name: &str, output_elements: u64, dtype_bytes: u64) -> RecomputeCost {
+    let class = classify_recompute(op_name);
+    let flops = match class {
+        RecomputeClass::Free => 0.0,
+        RecomputeClass::Cheap => output_elements as f64, // ~1 FLOP per element
+        RecomputeClass::Moderate => 7.0 * output_elements as f64, // ~softmax cost
+        RecomputeClass::Expensive => 2.0 * output_elements as f64 * output_elements as f64, // quadratic
+    };
+    let bytes_read = match class {
+        RecomputeClass::Free => 0,
+        _ => output_elements * dtype_bytes, // at least read input
+    };
+    RecomputeCost { class, flops, bytes_read }
+}
+
+/// Rematerialization candidate for the memory planner.
+#[derive(Debug, Clone)]
+pub struct RematCandidate {
+    /// Which tensor allocation this applies to.
+    pub alloc_id: u32,
+    /// Bytes saved by freeing early (size * shortened range).
+    pub memory_saved_byte_steps: u64,
+    /// FLOPs cost to recompute.
+    pub recompute_flops: f64,
+    /// Score = memory_saved / recompute_flops (higher = better candidate).
+    pub score: f64,
+    /// Classification of the producing op.
+    pub recompute_class: RecomputeClass,
+    /// Whether all inputs are live at the recompute point.
+    pub inputs_live: bool,
+}
+
+/// Default minimum score for rematerialization acceptance.
+/// Units: byte·steps / FLOP. Higher means only very profitable remats.
+pub const REMAT_SCORE_THRESHOLD: f64 = 10.0;
+
+/// Score a tensor as a rematerialization candidate.
+///
+/// `tensor_bytes`: size of the tensor in bytes
+/// `live_range`: death - birth (in program points)
+/// `op_name`: the operation that produced the tensor
+/// `inputs_live`: whether inputs exist at the recompute point
+pub fn score_remat_candidate(
+    alloc_id: u32,
+    tensor_bytes: u64,
+    live_range: u32,
+    op_name: &str,
+    dtype_bytes: u64,
+    inputs_live: bool,
+) -> Option<RematCandidate> {
+    let cost = recompute_cost(op_name, tensor_bytes / dtype_bytes.max(1), dtype_bytes);
+
+    // Never recompute expensive ops
+    if cost.class == RecomputeClass::Expensive {
+        return None;
+    }
+
+    // Must have inputs available
+    if !inputs_live {
+        return None;
+    }
+
+    let memory_saved = tensor_bytes * live_range as u64;
+    let score = if cost.flops > 0.0 {
+        memory_saved as f64 / cost.flops
+    } else {
+        f64::INFINITY // free recompute → always profitable
+    };
+
+    if score < REMAT_SCORE_THRESHOLD && cost.class != RecomputeClass::Free {
+        return None; // below threshold
+    }
+
+    Some(RematCandidate {
+        alloc_id,
+        memory_saved_byte_steps: memory_saved,
+        recompute_flops: cost.flops,
+        score,
+        recompute_class: cost.class,
+        inputs_live,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Effective bandwidth under cache reuse
 // ---------------------------------------------------------------------------
 

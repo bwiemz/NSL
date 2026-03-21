@@ -99,7 +99,7 @@ fn flash_attention_ptx_has_logsumexp_param() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false,
+        tree_mask: false, gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -122,7 +122,7 @@ fn flash_attention_ptx_loads_logsumexp_base() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false,
+        tree_mask: false, gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -145,7 +145,7 @@ fn flash_attention_ptx_computes_logsumexp() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false,
+        tree_mask: false, gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -192,7 +192,7 @@ fn flash_attention_ptx_logsumexp_has_bounds_check() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false,
+        tree_mask: false, gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -215,7 +215,7 @@ fn flash_attention_ptx_logsumexp_register_declarations() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false,
+        tree_mask: false, gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
