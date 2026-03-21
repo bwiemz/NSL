@@ -127,7 +127,7 @@ pub fn rejection_sample(
     }
 }
 
-fn softmax_with_temperature(logits: &[f32], temperature: f32) -> Vec<f32> {
+pub(crate) fn softmax_with_temperature(logits: &[f32], temperature: f32) -> Vec<f32> {
     let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     // CRITICAL-3 fix: guard against all-masked (all -inf) or NaN logits
     if !max_val.is_finite() {

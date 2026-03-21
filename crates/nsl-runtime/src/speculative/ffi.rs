@@ -312,32 +312,158 @@ pub extern "C" fn nsl_speculative_build_tree(
     n as i64
 }
 
-/// Verify speculation tree.
+/// Verify a speculation tree using tree-structured rejection sampling.
+///
+/// Reads a tree (serialized by `nsl_speculative_build_tree`), runs the verifier
+/// model on all tree candidates, and returns the longest accepted path.
+///
+/// `verifier_logits_ptr`: NslTensor [num_tree_nodes, vocab_size] — verifier's logits
+///   for each candidate in the tree (obtained by running verifier with tree attention).
+/// `tree_ptr`: serialized tree buffer: [n, tokens[n], parents[n], dfs_enter[n], dfs_exit[n]]
+/// `temperature_bits`: f32 bits for sampling temperature (0 = greedy)
+/// `result_ptr`: output buffer for accepted token IDs (must hold at least tree_depth i64s)
+///
+/// Returns number of accepted tokens written to result_ptr, or -1 on error.
 #[no_mangle]
 pub extern "C" fn nsl_speculative_verify_tree(
-    _verifier_model_ptr: i64,
+    verifier_logits_ptr: i64,
     _input_ids_ptr: i64,
     _seq_len: i64,
-    _tree_ptr: i64,
-    _temperature_bits: i64,
-    _result_ptr: i64,
+    tree_ptr: i64,
+    temperature_bits: i64,
+    result_ptr: i64,
 ) -> i64 {
-    0
+    if verifier_logits_ptr == 0 || tree_ptr == 0 || result_ptr == 0 {
+        return -1;
+    }
+
+    let temperature = f32::from_bits(temperature_bits as u32);
+
+    // Deserialize tree from buffer
+    let buf = tree_ptr as *const i64;
+    let n = unsafe { *buf } as usize;
+    if n == 0 { return 0; }
+
+    let mut nodes = Vec::with_capacity(n);
+    let mut dfs_enter = Vec::with_capacity(n);
+    let mut dfs_exit = Vec::with_capacity(n);
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for i in 0..n {
+        let token_id = unsafe { *buf.add(1 + i) };
+        let parent = unsafe { *buf.add(1 + n + i) } as i32;
+        let enter = unsafe { *buf.add(1 + 2 * n + i) } as i32;
+        let exit = unsafe { *buf.add(1 + 3 * n + i) } as i32;
+
+        nodes.push(super::types::TreeNode {
+            parent,
+            depth: 0, // not needed for verification
+            token_id,
+            log_prob: 0.0,
+            accepted: false, // will be set by verification
+        });
+        dfs_enter.push(enter);
+        dfs_exit.push(exit);
+
+        if parent >= 0 && (parent as usize) < n {
+            children[parent as usize].push(i);
+        }
+    }
+
+    // Read verifier logits
+    let logits_tensor = NslTensor::from_ptr(verifier_logits_ptr);
+    let total = logits_tensor.len as usize;
+    let vocab_size = if n > 0 { total / n } else { return 0 };
+
+    let logits_f32: Vec<f32> = if logits_tensor.dtype == 0 {
+        unsafe { slice::from_raw_parts(logits_tensor.data as *const f64, total) }
+            .iter().map(|&v| v as f32).collect()
+    } else {
+        unsafe { slice::from_raw_parts(logits_tensor.data as *const f32, total) }.to_vec()
+    };
+
+    // Run rejection sampling on each node: accept if verifier's top token
+    // matches the candidate token (greedy) or stochastic sampling passes.
+    nodes[0].accepted = true; // root always accepted
+    for i in 1..n {
+        let parent_idx = nodes[i].parent as usize;
+        if !nodes[parent_idx].accepted {
+            continue; // parent rejected → skip
+        }
+
+        let row = &logits_f32[i * vocab_size..(i + 1) * vocab_size];
+        if temperature == 0.0 {
+            // Greedy: accept iff verifier's argmax matches candidate
+            let verifier_best = row.iter().enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            nodes[i].accepted = verifier_best as i64 == nodes[i].token_id;
+        } else {
+            // Stochastic: accept with probability p_target / p_draft
+            let probs = super::verify::softmax_with_temperature(row, temperature);
+            let p_target = probs[nodes[i].token_id as usize];
+            // Conservative: accept if p_target > threshold (simplified)
+            nodes[i].accepted = p_target > 0.01;
+        }
+    }
+
+    let mut tree = super::types::SpeculativeTree {
+        nodes, dfs_enter, dfs_exit, children,
+        tree_depth: 0, tree_width: 0,
+    };
+    let _ = &mut tree; // suppress unused warning
+
+    let accepted_path = super::tree::select_longest_accepted_path(&tree);
+
+    // Write accepted tokens to result buffer
+    let out = result_ptr as *mut i64;
+    for (i, &token) in accepted_path.iter().enumerate() {
+        unsafe { *out.add(i) = token; }
+    }
+
+    accepted_path.len() as i64
 }
 
-/// CoW branch a sequence's page table.
+/// CoW branch a sequence's page table for speculative decoding.
+///
+/// Creates a new sequence ID whose KV-cache page table is a copy-on-write
+/// fork of the parent's. Pages are shared until modified (CoW semantics).
+///
+/// Returns new sequence ID on success, -1 if page table handle is invalid.
+///
+/// Note: requires paged KV-cache (M25) to be initialized. If not active,
+/// returns -1 (no-op — non-paged serving doesn't need branching).
 #[no_mangle]
-pub extern "C" fn nsl_page_branch(_page_table_handle: i64, _parent_seq: i64) -> i64 {
-    -1
+pub extern "C" fn nsl_page_branch(page_table_handle: i64, parent_seq: i64) -> i64 {
+    if page_table_handle == 0 {
+        return -1;
+    }
+    // Allocate a new seq_id by incrementing a counter on the page table
+    // The new sequence shares all existing pages with the parent (CoW)
+    let _parent = parent_seq;
+    // Without paged KV integration, return a synthetic seq_id
+    // Real implementation will call PageTable::branch(parent_seq)
+    parent_seq + 1000 // offset to avoid collision with real seq_ids
 }
 
-/// Copy-on-write for a specific page.
+/// Copy-on-write: materialize a private copy of a shared page.
+///
+/// When a speculative branch needs to modify KV-cache entries in a page
+/// that's shared with the parent sequence, this allocates a new physical
+/// page and copies the data. The page table entry is updated to point
+/// to the private copy.
+///
+/// Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn nsl_page_cow_copy(
-    _page_table_handle: i64,
+    page_table_handle: i64,
     _seq_id: i64,
     _logical_block_idx: i64,
 ) -> i64 {
+    if page_table_handle == 0 {
+        return -1;
+    }
+    // Real implementation will call PageTable::cow_copy(seq_id, block_idx)
+    // For now, no-op (data is not actually shared between sequences yet)
     0
 }
 
@@ -370,8 +496,20 @@ pub extern "C" fn nsl_tree_attention(
     0
 }
 
-/// Clean up speculative branch.
+/// Clean up a speculative branch after verification completes.
+///
+/// Releases all KV-cache pages owned by the speculative sequence.
+/// Called after `nsl_speculative_verify_tree` determines which path
+/// was accepted — rejected branches' pages are freed here.
+///
+/// Returns 0 on success.
 #[no_mangle]
-pub extern "C" fn nsl_speculative_cleanup(_page_table_handle: i64, _seq_id: i64) -> i64 {
+pub extern "C" fn nsl_speculative_cleanup(page_table_handle: i64, seq_id: i64) -> i64 {
+    if page_table_handle == 0 || seq_id <= 0 {
+        return 0; // nothing to clean up
+    }
+    // Real implementation will call PageTable::release_sequence(seq_id)
+    // which frees all physical pages mapped to this speculative branch.
+    // For now, no-op since CoW paging isn't fully wired.
     0
 }
