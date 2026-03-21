@@ -357,10 +357,12 @@ pub extern "C" fn nsl_speculative_verify_tree(
 
         nodes.push(super::types::TreeNode {
             parent,
-            depth: 0, // not needed for verification
+            depth: 0,
             token_id,
             log_prob: 0.0,
-            accepted: false, // will be set by verification
+            value: 0.0,
+            accepted: false,
+            is_leaf: false,
         });
         dfs_enter.push(enter);
         dfs_exit.push(exit);

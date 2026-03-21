@@ -6,7 +6,12 @@ pub struct TreeNode {
     pub depth: i32,
     pub token_id: i64,
     pub log_prob: f32,
+    /// Cumulative confidence score (sum of log-probs along path from root).
+    /// Used by EAGLE-2 dynamic expansion to prioritize high-confidence branches.
+    pub value: f32,
     pub accepted: bool,
+    /// Whether this node is a leaf (eligible for expansion in dynamic mode).
+    pub is_leaf: bool,
 }
 
 /// Result of tree construction from draft model.
