@@ -27,7 +27,8 @@ expression: ptx_str
     .param .u64 seq_lens_ptr,
     .param .u64 dfs_enter_ptr,
     .param .u64 dfs_exit_ptr,
-    .param .u64 num_tree_nodes
+    .param .u64 num_tree_nodes,
+    .param .u64 param_logsumexp
 )
 {
     .shared .align 16 .b8 shmem[32768];
@@ -47,6 +48,10 @@ expression: ptx_str
     .reg .u64 %dfs_enter_base, %dfs_exit_base, %num_tree_nodes;
     .reg .u32 %dfs_q_enter, %dfs_q_exit, %dfs_k_enter, %dfs_k_exit;
     .reg .pred %p_ancestor;
+    .reg .u64 %logsumexp_base;
+    .reg .f32 %log_sum, %lse;
+    .reg .u64 %lse_addr;
+    .reg .pred %p_has_lse;
     ld.param.u64 %rd0, [q_ptr];
     ld.param.u64 %rd1, [k_ptr];
     ld.param.u64 %rd2, [v_ptr];
@@ -67,6 +72,7 @@ expression: ptx_str
     ld.param.u64 %dfs_enter_base, [dfs_enter_ptr];
     ld.param.u64 %dfs_exit_base, [dfs_exit_ptr];
     ld.param.u64 %num_tree_nodes, [num_tree_nodes];
+    ld.param.u64 %logsumexp_base, [param_logsumexp];
     mov.u32 %tid_x, %tid.x;
     mov.u32 %bid_x, %ctaid.x;
     mov.u32 %bid_y, %ctaid.y;
@@ -900,6 +906,25 @@ LOOP_KV_END:
     mul.f32 %f125, %f125, %f0;
     mul.f32 %f126, %f126, %f0;
     mul.f32 %f127, %f127, %f0;
+    // Logsumexp: L = row_max + log2(row_sum) * ln(2)
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    @!%p_has_lse bra SKIP_LSE_STORE;
+    setp.ge.u32 %p1, %tid_x, 64;            // tid_x >= block_q?
+    @%p1 bra SKIP_LSE_STORE;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mul.f32 %log_sum, %log_sum, 0F3F317218;   // * ln(2)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %lse_addr, %rd17, %rd6;         // batch_head_idx * seq_len
+    add.u64 %lse_addr, %lse_addr, %rd16;       // + q_start
+    cvt.u64.u32 %rd52, %tid_x;                 // tid_x as u64
+    add.u64 %lse_addr, %lse_addr, %rd52;       // + tid_x (row offset)
+    add.u64 %rd52, %rd16, %rd52;               // q_start + tid_x
+    setp.ge.u64 %p0, %rd52, %rd6;              // >= seq_len?
+    @%p0 bra SKIP_LSE_STORE;
+    shl.b64 %lse_addr, %lse_addr, 2;           // * 4 (sizeof f32)
+    add.u64 %lse_addr, %logsumexp_base, %lse_addr; // final address
+    st.global.f32 [%lse_addr], %lse;
+SKIP_LSE_STORE:
     // Store output tile to global memory
     // Compute output base address
     mul.lo.u64 %rd51, %rd19, %rd5;         // batch_idx * heads

@@ -197,7 +197,7 @@ fn emit_flash_attention_entry(
     config: &FlashAttentionConfig,
 ) {
     // Parameter declarations — ALWAYS declare ALL params regardless of variant flags.
-    // The runtime wrapper always passes the full 17-arg set (unused params are null/zero).
+    // The runtime wrapper always passes the full 21-arg set (unused params are null/zero).
     // Conditional params are simply ignored in the kernel body when the flag is off.
     // This ensures cuLaunchKernel arg alignment is always correct.
     ptx.push_str(&format!(".visible .entry {} (\n", kernel_name));
@@ -224,7 +224,9 @@ fn emit_flash_attention_entry(
     // M33: Tree attention mask params (null/zero when tree_mask=false)
     ptx.push_str("    .param .u64 dfs_enter_ptr,\n");
     ptx.push_str("    .param .u64 dfs_exit_ptr,\n");
-    ptx.push_str("    .param .u64 num_tree_nodes\n");
+    ptx.push_str("    .param .u64 num_tree_nodes,\n");
+    // Backward pass: logsumexp auxiliary output (null = skip, inference-only)
+    ptx.push_str("    .param .u64 param_logsumexp\n");
 
     ptx.push_str(")\n");
     ptx.push_str("{\n");
@@ -303,6 +305,12 @@ fn emit_register_declarations(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .pred %p_ancestor;\n");
     }
 
+    // Logsumexp auxiliary output for backward pass
+    ptx.push_str("    .reg .u64 %logsumexp_base;\n");
+    ptx.push_str("    .reg .f32 %log_sum, %lse;\n");
+    ptx.push_str("    .reg .u64 %lse_addr;\n");
+    ptx.push_str("    .reg .pred %p_has_lse;\n");
+
     // O_acc registers: each thread accumulates a subset of the [block_q, head_dim] output tile
     // Total O_acc regs per thread = (block_q * head_dim) / blockDim.x
     // Example: block_q=64, head_dim=128, blockDim.x=128 → 64 registers
@@ -340,6 +348,9 @@ fn emit_param_loads(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    ld.param.u64 %dfs_exit_base, [dfs_exit_ptr];\n");
         ptx.push_str("    ld.param.u64 %num_tree_nodes, [num_tree_nodes];\n");
     }
+
+    // Logsumexp auxiliary output (always loaded; null-checked before store)
+    ptx.push_str("    ld.param.u64 %logsumexp_base, [param_logsumexp];\n");
 }
 
 fn emit_index_computation(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -1011,6 +1022,43 @@ fn emit_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
             64 + i, 64 + i
         ));
     }
+
+    // ── Logsumexp auxiliary output ──────────────────────────────────
+    // L = row_max + ln(row_sum) = row_max + log2(row_sum) * ln(2)
+    // Only store if logsumexp_base != 0 (non-null pointer).
+    // Each thread writes one value per Q row it owns.
+    // For the tiled layout, thread tid_x covers q_row = tid_x within the tile
+    // (simplified: only thread 0 per row writes logsumexp; full per-row
+    // assignment uses the same row mapping as O_acc).
+    //
+    // Address: logsumexp_base + (batch_head_idx * seq_len + q_start + row_offset) * 4
+    ptx.push_str("    // Logsumexp: L = row_max + log2(row_sum) * ln(2)\n");
+    ptx.push_str("    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;\n");
+    ptx.push_str("    @!%p_has_lse bra SKIP_LSE_STORE;\n");
+    // Guard: only threads with tid_x < block_q should write logsumexp
+    // (128 threads per block, but only block_q rows per tile)
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p1, %tid_x, {};            // tid_x >= block_q?\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra SKIP_LSE_STORE;\n");
+    ptx.push_str("    lg2.approx.f32 %log_sum, %row_sum;\n");
+    ptx.push_str("    mul.f32 %log_sum, %log_sum, 0F3F317218;   // * ln(2)\n");
+    ptx.push_str("    add.f32 %lse, %row_max, %log_sum;\n");
+    // Compute store address: logsumexp_base + (bid_y * seq_len + q_start + tid_x) * 4
+    // bid_y = %rd17 (batch_head_idx), seq_len = %rd6, q_start = %rd16
+    ptx.push_str("    mul.lo.u64 %lse_addr, %rd17, %rd6;         // batch_head_idx * seq_len\n");
+    ptx.push_str("    add.u64 %lse_addr, %lse_addr, %rd16;       // + q_start\n");
+    ptx.push_str("    cvt.u64.u32 %rd52, %tid_x;                 // tid_x as u64\n");
+    ptx.push_str("    add.u64 %lse_addr, %lse_addr, %rd52;       // + tid_x (row offset)\n");
+    // Bounds check: only store if (q_start + tid_x) < seq_len
+    ptx.push_str("    add.u64 %rd52, %rd16, %rd52;               // q_start + tid_x\n");
+    ptx.push_str("    setp.ge.u64 %p0, %rd52, %rd6;              // >= seq_len?\n");
+    ptx.push_str("    @%p0 bra SKIP_LSE_STORE;\n");
+    ptx.push_str("    shl.b64 %lse_addr, %lse_addr, 2;           // * 4 (sizeof f32)\n");
+    ptx.push_str("    add.u64 %lse_addr, %logsumexp_base, %lse_addr; // final address\n");
+    ptx.push_str("    st.global.f32 [%lse_addr], %lse;\n");
+    ptx.push_str("SKIP_LSE_STORE:\n");
 }
 
 fn emit_output_store(ptx: &mut String, config: &FlashAttentionConfig) {

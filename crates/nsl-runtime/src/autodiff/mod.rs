@@ -78,6 +78,17 @@ pub enum TapeOp {
     Unsqueeze { input: i64, out: i64, input_shape: Vec<i64> },
     Expand { input: i64, out: i64, original_shape: Vec<i64> },
     Stack { inputs: Vec<i64>, out: i64, dim: i64 },
+    FlashAttention {
+        q: i64, k: i64, v: i64,
+        out: i64,
+        logsumexp: i64,
+        scale: f32,
+        batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+        causal: bool,
+        saved_q: i64,    // refcount-bumped for backward
+        saved_k: i64,
+        saved_v: i64,
+    },
 }
 
 pub(crate) struct Tape {
@@ -211,6 +222,13 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
                 for &inp in inputs {
                     tensor_free(inp);
                 }
+            }
+            TapeOp::FlashAttention { saved_q, saved_k, saved_v, out, logsumexp, .. } => {
+                tensor_free(*saved_q);
+                tensor_free(*saved_k);
+                tensor_free(*saved_v);
+                tensor_free(*out);
+                tensor_free(*logsumexp);
             }
             _ => {}
         }

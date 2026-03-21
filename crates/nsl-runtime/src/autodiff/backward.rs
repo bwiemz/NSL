@@ -1129,6 +1129,42 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     }
                 }
             }
+            TapeOp::FlashAttention {
+                q, k, v, out, logsumexp, scale,
+                batch, heads, seq_len, head_dim, causal,
+                saved_q, saved_k, saved_v,
+            } => {
+                if let Some(&g) = grad_map.get(out) {
+                    // Pack scale as i64 via f32::to_bits for FFI
+                    let scale_bits = scale.to_bits() as i64;
+                    let causal_i = if *causal { 1i64 } else { 0i64 };
+
+                    // Call CPU backward — returns NslList of [dq, dk, dv]
+                    let result_list = crate::flash_attention::nsl_flash_attention_backward(
+                        g,
+                        *saved_q, *saved_k, *saved_v,
+                        *out, *logsumexp,
+                        scale_bits,
+                        *batch, *heads, *seq_len, *head_dim,
+                        causal_i,
+                    );
+
+                    let list = crate::list::NslList::from_ptr(result_list);
+                    let dq_ptr = unsafe { *list.data.add(0) };
+                    let dk_ptr = unsafe { *list.data.add(1) };
+                    let dv_ptr = unsafe { *list.data.add(2) };
+
+                    accumulate_grad(&mut grad_map, *q, dq_ptr);
+                    accumulate_grad(&mut grad_map, *k, dk_ptr);
+                    accumulate_grad(&mut grad_map, *v, dv_ptr);
+
+                    // Free the list container (not the tensors — they're now in grad_map)
+                    // Set list data to null so nsl_list_free doesn't free the tensor pointers
+                    // Actually, just leak the small list allocation — nsl_list_free would
+                    // only free the data array, not the tensors inside.
+                    crate::list::nsl_list_free(result_list);
+                }
+            }
             TapeOp::BiasAdd { tensor, bias, out } => {
                 // grad_tensor = upstream grad (same shape as tensor [M, N])
                 // grad_bias = sum(upstream grad, dim=0) -> [N]
