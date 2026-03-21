@@ -36,7 +36,30 @@ pub fn parse_primary_type(p: &mut Parser) -> TypeExpr {
     // Immutable borrow: &Type
     if p.at(&TokenKind::Ampersand) {
         let start = p.advance().span;
+        // Reject &mut — mutable borrows are not supported yet
+        if p.at(&TokenKind::Mut) {
+            let end = p.advance().span;
+            p.diagnostics.push(
+                nsl_errors::Diagnostic::error("mutable borrows (`&mut T`) are not supported — use `&T` for read-only borrowing")
+                    .with_label(start.merge(end), "use `&T` instead of `&mut T`"),
+            );
+            // Parse the inner type anyway so the parser can continue
+            let inner = parse_primary_type(p);
+            let span = start.merge(inner.span);
+            return TypeExpr {
+                kind: TypeExprKind::Borrow(Box::new(inner)),
+                span,
+                id: p.next_node_id(),
+            };
+        }
         let inner = parse_primary_type(p);
+        // Reject &&T — nested borrows are not supported
+        if matches!(inner.kind, TypeExprKind::Borrow(_)) {
+            p.diagnostics.push(
+                nsl_errors::Diagnostic::error("nested borrows (`&&T`) are not supported — use a single `&T` borrow")
+                    .with_label(start.merge(inner.span), "remove the extra `&`"),
+            );
+        }
         let span = start.merge(inner.span);
         return TypeExpr {
             kind: TypeExprKind::Borrow(Box::new(inner)),
@@ -397,12 +420,41 @@ pub fn parse_type_no_borrow(p: &mut Parser) -> TypeExpr {
 }
 
 /// Recursively check for borrow types and emit an error if found.
+/// Walks into compound types (tuples, optionals, unions, functions, etc.)
+/// so that `(int, &str)` or `fn() -> &int` in return position are also caught.
 fn reject_borrow_in_type(ty: &TypeExpr, p: &mut Parser) {
-    if let TypeExprKind::Borrow(_) = &ty.kind {
-        p.diagnostics.push(
-            nsl_errors::Diagnostic::error("borrow types (`&T`) cannot appear in return position — borrows cannot escape function scope")
-                .with_label(ty.span, "borrow in return type"),
-        );
+    match &ty.kind {
+        TypeExprKind::Borrow(_) => {
+            p.diagnostics.push(
+                nsl_errors::Diagnostic::error("borrow types (`&T`) cannot appear in return position — borrows cannot escape function scope")
+                    .with_label(ty.span, "borrow in return type"),
+            );
+        }
+        TypeExprKind::Tuple(elems) => {
+            for elem in elems {
+                reject_borrow_in_type(elem, p);
+            }
+        }
+        TypeExprKind::Union(variants) => {
+            for variant in variants {
+                reject_borrow_in_type(variant, p);
+            }
+        }
+        TypeExprKind::Generic { args, .. } => {
+            for arg in args {
+                reject_borrow_in_type(arg, p);
+            }
+        }
+        TypeExprKind::Function { params, ret } => {
+            // Borrows in function *param* types are allowed; only reject in the return type.
+            reject_borrow_in_type(ret, p);
+            let _ = params; // params are fine
+        }
+        TypeExprKind::FixedArray { element_type, .. } => {
+            reject_borrow_in_type(element_type, p);
+        }
+        // Named, Tensor, Param, Buffer, Sparse, Wildcard — leaf types, never borrow
+        _ => {}
     }
 }
 

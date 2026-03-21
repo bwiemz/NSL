@@ -72,24 +72,32 @@ pub fn pointer_type() -> types::Type {
 }
 
 /// Check if an NSL type is a float type at the Cranelift level.
+/// Sees through borrow types: `&f32` is treated as `f32`.
 pub fn is_float_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Float | Type::F64 | Type::F32 | Type::Fp16 | Type::Bf16 | Type::Fp8E4m3 | Type::Fp8E5m2
-    )
+    match ty {
+        Type::Borrow(inner) => is_float_type(inner),
+        _ => matches!(
+            ty,
+            Type::Float | Type::F64 | Type::F32 | Type::Fp16 | Type::Bf16 | Type::Fp8E4m3 | Type::Fp8E5m2
+        ),
+    }
 }
 
 /// Check if an NSL type is an integer type at the Cranelift level.
+/// Sees through borrow types: `&int` is treated as `int`.
 pub fn is_int_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Int
-            | Type::Int4
-            | Type::Int8
-            | Type::Int16
-            | Type::Int32
-            | Type::Int64
-            | Type::Uint8
-            | Type::Bool
-    )
+    match ty {
+        Type::Borrow(inner) => is_int_type(inner),
+        _ => matches!(
+            ty,
+            Type::Int
+                | Type::Int4
+                | Type::Int8
+                | Type::Int16
+                | Type::Int32
+                | Type::Int64
+                | Type::Uint8
+                | Type::Bool
+        ),
+    }
 }

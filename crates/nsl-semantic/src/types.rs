@@ -380,8 +380,10 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
 
 /// Returns (family, rank) for numeric types. Family: 0=non-numeric, 1=int, 2=float.
 /// Widening is only allowed within the same family to prevent e.g. Int64 -> Fp8.
+/// Sees through borrow types: `&int` has the same rank as `int`.
 pub fn dtype_rank(ty: &Type) -> (u8, u8) {
     match ty {
+        Type::Borrow(inner) => dtype_rank(inner),
         Type::Int4 => (1, 1),
         Type::Uint8 => (1, 2),
         Type::Int8 => (1, 2),
