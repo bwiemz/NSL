@@ -1797,4 +1797,139 @@ mod tests {
             "Source AD adjoint must be tape-free (no Input ops), got {tape_inputs}");
     }
 
+    // ---------------------------------------------------------------
+    // Task 7: Source AD produces no tape push/pop for branching code.
+    //
+    // Tape-based AD would introduce Input("__tape_push__") / Param markers
+    // to record intermediate values at runtime.  Source AD encodes all
+    // branching information structurally via Condition + Select ops, so
+    // the adjoint Wengert list must be entirely free of tape markers.
+    //
+    // We verify this for three representative branching functions.
+    // ---------------------------------------------------------------
+    #[test]
+    fn source_ad_no_tape_ops_for_simple_branch() {
+        // f(x) = if x > 0 { x * x } else { -x }
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Mul, vec![0, 0]),
+                make_op(4, 4, PrimalOp::Neg, vec![0]),
+                make_op(5, 5, PrimalOp::Select, vec![2, 3, 4]),
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // Structural: must not contain Input ops (tape-push markers)
+        let has_tape_input = adjoint.ops.iter()
+            .any(|op| matches!(&op.op, PrimalOp::Input(_)));
+        assert!(!has_tape_input,
+            "Source AD adjoint for branching code must not contain tape Input ops");
+
+        // Must not contain Param ops (tape-checkpoint markers) beyond what primal already has
+        // (AdjointGenerator never introduces Param ops; it only uses Constant/Select/arithmetic)
+        let has_new_param = adjoint.ops.iter()
+            .any(|op| matches!(&op.op, PrimalOp::Param(_)));
+        assert!(!has_new_param,
+            "Source AD adjoint must not introduce new Param ops");
+
+        // Must contain Select ops to encode the branch gradient
+        let has_select = adjoint.ops.iter()
+            .any(|op| matches!(&op.op, PrimalOp::Select));
+        assert!(has_select,
+            "Source AD adjoint must use Select (not tape push/pop) for branch gradients");
+
+        // x must have an adjoint — the whole point of AD
+        assert!(gen.adjoint_of(0).is_some(), "x must have adjoint");
+    }
+
+    #[test]
+    fn source_ad_no_tape_ops_for_nested_branch() {
+        // Nested: if x > 0 { if x > 1 { x*x } else { x } } else { 0 }
+        // Flat Wengert (same as adjoint_nested_branches_propagates)
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Constant(1.0), vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                make_op(5, 5, PrimalOp::Mul, vec![0, 0]),
+                make_op(6, 6, PrimalOp::Select, vec![4, 5, 0]),
+                make_op(7, 7, PrimalOp::Select, vec![3, 6, 1]),
+            ],
+            output: 7,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // No tape-style ops in the backward pass
+        assert!(!adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Input(_))),
+            "Nested-branch adjoint must be tape-free");
+        assert!(!adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Param(_))),
+            "Nested-branch adjoint must not introduce Param ops");
+
+        // Must be richer in Select ops than a straight-line function would be
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Nested-branch adjoint should have >= 2 Select ops (source AD encodes branches \
+             structurally, not via tape), got {adj_selects}");
+    }
+
+    #[test]
+    fn source_ad_adjoint_op_count_dominated_by_arithmetic_not_tape() {
+        // For a branching function the adjoint ops should be entirely arithmetic /
+        // Select / Constant — zero tape-style bookkeeping.
+        //
+        // Tape AD would add O(branch_depth) Input ops for each checkpoint save.
+        // Source AD adds exactly 0.
+        //
+        // f(x) = if x > 0 { x } else { 0.01 * x }  (leaky ReLU)
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()),         vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.01),             vec![]),
+                make_op(2, 2, PrimalOp::Constant(0.0),              vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                make_op(4, 4, PrimalOp::Mul, vec![1, 0]),            // 0.01 * x
+                make_op(5, 5, PrimalOp::Select, vec![3, 0, 4]),      // cond ? x : 0.01*x
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // Count op types
+        let tape_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Input(_) | PrimalOp::Param(_)))
+            .count();
+        let structural_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op,
+                PrimalOp::Select | PrimalOp::Condition(_) | PrimalOp::Constant(_)))
+            .count();
+        let arithmetic_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op,
+                PrimalOp::Add | PrimalOp::Mul | PrimalOp::Neg | PrimalOp::Sub))
+            .count();
+
+        assert_eq!(tape_ops, 0,
+            "Source AD for leaky ReLU must have 0 tape ops, got {tape_ops}");
+        assert!(structural_ops + arithmetic_ops > 0,
+            "Adjoint must have actual gradient computation ops");
+
+        // x must have an adjoint
+        assert!(gen.adjoint_of(0).is_some(), "x must have an adjoint");
+    }
 }
