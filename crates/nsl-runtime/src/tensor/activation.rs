@@ -22,6 +22,24 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).exp() }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).exp() }; }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -76,6 +94,24 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).ln() }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).ln() }; }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -130,6 +166,24 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).sqrt() }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).sqrt() }; }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -184,6 +238,24 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).abs() }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).abs() }; }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -232,6 +304,30 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len {
+                    let v = unsafe { *d.add(i) };
+                    unsafe { *d.add(i) = if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 } };
+                }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len {
+                    let v = unsafe { *d.add(i) };
+                    unsafe { *d.add(i) = if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 } };
+                }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -272,6 +368,25 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) -> i64 {
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                let (mn, mx) = (min_val as f32, max_val as f32);
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).clamp(mn, mx) }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).clamp(min_val, max_val) }; }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -370,6 +485,30 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len {
+                    let v = unsafe { *d.add(i) };
+                    if v < 0.0 { unsafe { *d.add(i) = 0.0 }; }
+                }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len {
+                    let v = unsafe { *d.add(i) };
+                    if v < 0.0 { unsafe { *d.add(i) = 0.0 }; }
+                }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -417,6 +556,34 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                let c = (2.0_f32 / std::f32::consts::PI).sqrt();
+                for i in 0..len {
+                    let x = unsafe { *d.add(i) };
+                    let inner = c * (x + 0.044715_f32 * x * x * x);
+                    unsafe { *d.add(i) = 0.5_f32 * x * (1.0_f32 + inner.tanh()) };
+                }
+            } else {
+                let d = t.data as *mut f64;
+                let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+                for i in 0..len {
+                    let x = unsafe { *d.add(i) };
+                    let inner = c * (x + 0.044715 * x * x * x);
+                    unsafe { *d.add(i) = 0.5 * x * (1.0 + inner.tanh()) };
+                }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -462,6 +629,32 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len {
+                    let x = unsafe { *d.add(i) };
+                    let sig = 1.0_f32 / (1.0_f32 + (-x).exp());
+                    unsafe { *d.add(i) = x * sig };
+                }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len {
+                    let x = unsafe { *d.add(i) };
+                    let sig = 1.0 / (1.0 + (-x).exp());
+                    unsafe { *d.add(i) = x * sig };
+                }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -514,6 +707,30 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len {
+                    let x = unsafe { *d.add(i) };
+                    unsafe { *d.add(i) = 1.0_f32 / (1.0_f32 + (-x).exp()) };
+                }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len {
+                    let x = unsafe { *d.add(i) };
+                    unsafe { *d.add(i) = 1.0 / (1.0 + (-x).exp()) };
+                }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
@@ -570,6 +787,24 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
+    // FBIP: mutate in-place when uniquely owned
+    {
+        let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
+        if t.can_mutate_inplace() {
+            let len = t.len as usize;
+            if t.dtype == 1 {
+                let d = t.data as *mut f32;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).tanh() }; }
+            } else {
+                let d = t.data as *mut f64;
+                for i in 0..len { unsafe { *d.add(i) = (*d.add(i)).tanh() }; }
+            }
+            t.refcount.fetch_add(1, Ordering::SeqCst);
+            super::fbip_record_reuse();
+            return tensor_ptr;
+        }
+    }
+    super::fbip_record_alloc();
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;

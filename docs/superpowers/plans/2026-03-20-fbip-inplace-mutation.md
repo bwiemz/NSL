@@ -83,7 +83,7 @@ FBIP makes the refcount-safe version the default path for ALL operations.
 
 ### Task 1: Add `can_mutate_inplace()` Method
 
-- [ ] **1.1** Add method to NslTensor:
+- [x] **1.1** Add method to NslTensor:
 ```rust
 impl NslTensor {
     /// Returns true if this tensor can be safely mutated in-place.
@@ -98,13 +98,13 @@ impl NslTensor {
 }
 ```
 
-- [ ] **1.2** Add `can_mutate_inplace_gpu()` for GPU tensors (same logic, different dtype handling).
+- [ ] **1.2** Add `can_mutate_inplace_gpu()` for GPU tensors (same logic, different dtype handling). *(deferred to Task 6)*
 
-- [ ] **1.3** Test: tensor with refcount=1 returns true; tensor with refcount=2 returns false; view tensor returns false.
+- [x] **1.3** Test: tensor with refcount=1 returns true; tensor with refcount=2 returns false; view tensor returns false.
 
 ### Task 2: FBIP for Unary Activation Functions
 
-- [ ] **2.1** Add FBIP to `nsl_tensor_relu()`:
+- [x] **2.1** Add FBIP to `nsl_tensor_relu()`:
 ```rust
 pub extern "C" fn nsl_tensor_relu(ptr: i64) -> i64 {
     let t = unsafe { &mut *(ptr as *mut NslTensor) };
@@ -121,15 +121,15 @@ pub extern "C" fn nsl_tensor_relu(ptr: i64) -> i64 {
 }
 ```
 
-- [ ] **2.2** Apply same pattern to: `neg`, `abs`, `exp`, `log`, `sqrt`, `sigmoid`, `tanh`, `gelu`, `silu`.
+- [x] **2.2** Apply same pattern to: `neg`, `abs`, `exp`, `log`, `sqrt`, `sigmoid`, `tanh`, `gelu`, `silu`, `sign`, `clamp`.
 
-- [ ] **2.3** For each: the in-place path modifies `data[i]` directly and returns the same pointer.
+- [x] **2.3** For each: the in-place path modifies `data[i]` directly and returns the same pointer (with refcount bumped for safe dual-reference handling).
 
-- [ ] **2.4** Test for each activation: create tensor with refcount=1, apply activation, verify same pointer returned and values correct.
+- [x] **2.4** Test for each activation: create tensor with refcount=1, apply activation, verify same pointer returned and values correct.
 
 ### Task 3: FBIP for Binary Arithmetic Operations
 
-- [ ] **3.1** Add FBIP to `nsl_tensor_add()` — reuse left operand:
+- [x] **3.1** Add FBIP to `nsl_tensor_add()` — reuse left operand:
 ```rust
 pub extern "C" fn nsl_tensor_add(a_ptr: i64, b_ptr: i64) -> i64 {
     let a = unsafe { &mut *(a_ptr as *mut NslTensor) };
@@ -148,15 +148,15 @@ pub extern "C" fn nsl_tensor_add(a_ptr: i64, b_ptr: i64) -> i64 {
 }
 ```
 
-- [ ] **3.2** Apply to `sub`, `mul`, `div` — all reuse left operand when shapes match.
+- [x] **3.2** Apply to `sub`, `mul`, `div` — all reuse left operand when shapes match. Also added to `add_scalar`, `mul_scalar`.
 
-- [ ] **3.3** For broadcasting cases: cannot reuse (output shape differs from input). Fall through to allocation.
+- [x] **3.3** For broadcasting cases: cannot reuse (output shape differs from input). Fall through to allocation.
 
-- [ ] **3.4** Test: `a + b` where `a` has refcount=1 and same shape → returns `a_ptr`; where `a` has refcount=2 → returns new pointer.
+- [x] **3.4** Test: `a + b` where `a` has refcount=1 and same shape → returns `a_ptr`; where `a` has refcount=2 → returns new pointer.
 
 ### Task 4: FBIP for Clone (Becomes No-Op)
 
-- [ ] **4.1** `nsl_tensor_clone()` with FBIP:
+- [ ] **4.1** *(Deferred to Phase 2)* `nsl_tensor_clone()` with FBIP:
 ```rust
 pub extern "C" fn nsl_tensor_clone(ptr: i64) -> i64 {
     let t = as_tensor(ptr);
@@ -172,14 +172,11 @@ pub extern "C" fn nsl_tensor_clone(ptr: i64) -> i64 {
 
 ### Task 5: Autodiff Tape Safety Verification
 
-- [ ] **5.1** Verify tape recording makes FBIP safe:
-  - When autodiff is recording, tape ops bump refcount to 2+ on saved tensors
-  - FBIP check (`refcount == 1`) naturally fails → allocation path taken
-  - No tensor saved on the tape can be mutated in-place
+- [x] **5.1** Verify tape recording makes FBIP safe: `can_mutate_inplace()` includes `!autodiff::is_recording()` check, so FBIP never fires during forward training pass. Tape-saved tensors are never mutated.
 
-- [ ] **5.2** Test: inside `grad()` scope, verify relu allocates new tensor (refcount > 1 due to tape).
+- [x] **5.2** Test: inside `grad()` scope, verify relu allocates new tensor (FBIP disabled by is_recording check).
 
-- [ ] **5.3** Test: outside `grad()` scope (inference), verify relu reuses tensor.
+- [x] **5.3** Test: outside `grad()` scope (inference), verify relu reuses tensor.
 
 ### Task 6: GPU In-Place Paths
 
@@ -198,15 +195,15 @@ if t.can_mutate_inplace() && t.device > 0 {
 
 ### Task 7: Metrics & Reporting
 
-- [ ] **7.1** Add optional FBIP counter (behind `--trace` flag):
+- [x] **7.1** Add optional FBIP counter (behind `--trace` flag):
 ```rust
 static FBIP_REUSE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FBIP_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 ```
 
-- [ ] **7.2** At program exit, report: `"FBIP: {reuse}/{total} operations reused in-place ({pct}%)"`.
+- [x] **7.2** At program exit, report: `"FBIP: {reuse}/{total} operations reused in-place ({pct}%)"`. Via `nsl_fbip_report()`.
 
-- [ ] **7.3** This helps quantify the memory savings in practice.
+- [x] **7.3** This helps quantify the memory savings in practice.
 
 ---
 

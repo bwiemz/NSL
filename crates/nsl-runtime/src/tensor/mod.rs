@@ -26,6 +26,34 @@ use crate::list::{nsl_list_new, nsl_list_push, NslList};
 use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
 
 // ---------------------------------------------------------------------------
+// FBIP (Functional But In-Place) metrics — enabled by NSL_FBIP_TRACE=1
+// ---------------------------------------------------------------------------
+static FBIP_REUSE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FBIP_ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn fbip_record_reuse() {
+    FBIP_REUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn fbip_record_alloc() {
+    FBIP_ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Print FBIP statistics. Called at program exit when NSL_FBIP_TRACE=1.
+#[no_mangle]
+pub extern "C" fn nsl_fbip_report() {
+    let reuse = FBIP_REUSE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let alloc = FBIP_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let total = reuse + alloc;
+    if total > 0 {
+        let pct = (reuse as f64 / total as f64) * 100.0;
+        eprintln!("FBIP: {reuse}/{total} operations reused in-place ({pct:.1}%)");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Global training mode (thread-local)
 // ---------------------------------------------------------------------------
 thread_local! {
@@ -232,6 +260,34 @@ impl NslTensor {
         let dst = checked_alloc(n * std::mem::size_of::<i64>()) as *mut i64;
         unsafe { std::ptr::copy_nonoverlapping(src, dst, n); }
         dst
+    }
+
+    /// Returns true if this tensor can be safely mutated in-place (FBIP).
+    /// Requires: sole owner (refcount==1), owns data (not a view),
+    /// no dependent views (data_owner==0), contiguous layout, CPU device,
+    /// and autodiff tape is NOT recording (to preserve saved activations).
+    #[inline]
+    pub(crate) fn can_mutate_inplace(&self) -> bool {
+        self.refcount.load(Ordering::Acquire) == 1
+            && self.owns_data == 1
+            && self.data_owner == 0
+            && self.is_contiguous()
+            && self.device == 0
+            && !autodiff::is_recording()
+    }
+
+    /// Returns true if two tensors have identical shapes.
+    #[inline]
+    pub(crate) fn shape_eq(&self, other: &NslTensor) -> bool {
+        if self.ndim != other.ndim {
+            return false;
+        }
+        for i in 0..self.ndim as usize {
+            if unsafe { *self.shape.add(i) != *other.shape.add(i) } {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns true if the tensor has a contiguous row-major memory layout.
@@ -539,6 +595,8 @@ fn print_tensor_recursive(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
+    // Note: clone always allocates to maintain memory accounting invariants.
+    // (FBIP for clone is Phase 2 — requires codegen-level ownership tracking.)
     // Ensure we clone from contiguous data so non-contiguous views are handled correctly
     let c_ptr = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(c_ptr);
@@ -2205,5 +2263,251 @@ mod tests {
         nsl_tensor_free(tr);
         nsl_tensor_free(r1);
         nsl_tensor_free(t);
+    }
+
+    // === FBIP (Functional But In-Place) tests ===
+
+    /// Helper: create a 1D f64 tensor with given values, refcount=1, contiguous, CPU, owned.
+    fn make_f64_tensor(values: &[f64]) -> i64 {
+        let len = values.len();
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, len as i64);
+        let ptr = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let t = NslTensor::from_ptr(ptr);
+        for i in 0..len {
+            unsafe { *t.data_f64().add(i) = values[i] };
+        }
+        ptr
+    }
+
+    #[test]
+    fn test_fbip_can_mutate_inplace() {
+        let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
+        let t = NslTensor::from_ptr(ptr);
+        assert!(t.can_mutate_inplace(), "unique owned contiguous CPU tensor should be mutable in-place");
+
+        // Bump refcount — should no longer be mutable
+        t.refcount.fetch_add(1, Ordering::SeqCst);
+        assert!(!t.can_mutate_inplace(), "refcount>1 should prevent in-place mutation");
+        t.refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(ptr);
+    }
+
+    #[test]
+    fn test_fbip_relu_inplace() {
+        let ptr = make_f64_tensor(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
+        let result = activation::nsl_tensor_relu(ptr);
+        // FBIP: same pointer returned, refcount bumped to 2
+        assert_eq!(result, ptr, "relu should reuse tensor when refcount==1");
+        let t = NslTensor::from_ptr(result);
+        assert_eq!(t.refcount.load(Ordering::Relaxed), 2);
+        let vals: Vec<f64> = (0..5).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+        nsl_tensor_free(ptr);    // input ref
+        nsl_tensor_free(result); // output ref → frees
+    }
+
+    #[test]
+    fn test_fbip_relu_alloc_when_shared() {
+        let ptr = make_f64_tensor(&[-1.0, 2.0]);
+        // Bump refcount to simulate shared reference
+        NslTensor::from_ptr(ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        let result = activation::nsl_tensor_relu(ptr);
+        assert_ne!(result, ptr, "relu should allocate new tensor when refcount>1");
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![0.0, 2.0]);
+        // Original should be untouched
+        let orig = NslTensor::from_ptr(ptr);
+        assert_eq!(unsafe { *orig.data_f64().add(0) }, -1.0);
+        nsl_tensor_free(result);
+        NslTensor::from_ptr(ptr).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(ptr);
+    }
+
+    #[test]
+    fn test_fbip_exp_inplace() {
+        let ptr = make_f64_tensor(&[0.0, 1.0]);
+        let result = activation::nsl_tensor_exp(ptr);
+        assert_eq!(result, ptr);
+        let t = NslTensor::from_ptr(result);
+        assert!((unsafe { *t.data_f64().add(0) } - 1.0).abs() < 1e-10);
+        assert!((unsafe { *t.data_f64().add(1) } - std::f64::consts::E).abs() < 1e-10);
+        nsl_tensor_free(ptr);    // input ref
+        nsl_tensor_free(result); // output ref
+    }
+
+    #[test]
+    fn test_fbip_neg_inplace() {
+        let ptr = make_f64_tensor(&[1.0, -2.0, 0.0]);
+        let result = arithmetic::nsl_tensor_neg(ptr);
+        assert_eq!(result, ptr);
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![-1.0, 2.0, 0.0]);
+        nsl_tensor_free(ptr);
+        nsl_tensor_free(result);
+    }
+
+    #[test]
+    fn test_fbip_sigmoid_inplace() {
+        let ptr = make_f64_tensor(&[0.0]);
+        let result = activation::nsl_tensor_sigmoid(ptr);
+        assert_eq!(result, ptr);
+        let t = NslTensor::from_ptr(result);
+        assert!((unsafe { *t.data_f64().add(0) } - 0.5).abs() < 1e-10);
+        nsl_tensor_free(ptr);
+        nsl_tensor_free(result);
+    }
+
+    #[test]
+    fn test_fbip_tanh_inplace() {
+        let ptr = make_f64_tensor(&[0.0]);
+        let result = activation::nsl_tensor_tanh_act(ptr);
+        assert_eq!(result, ptr);
+        let t = NslTensor::from_ptr(result);
+        assert!((unsafe { *t.data_f64().add(0) }).abs() < 1e-10);
+        nsl_tensor_free(ptr);
+        nsl_tensor_free(result);
+    }
+
+    #[test]
+    fn test_fbip_add_inplace() {
+        let a = make_f64_tensor(&[1.0, 2.0, 3.0]);
+        let b = make_f64_tensor(&[10.0, 20.0, 30.0]);
+        let result = arithmetic::nsl_tensor_add(a, b);
+        assert_eq!(result, a, "add should reuse left operand when shapes match and refcount==1");
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![11.0, 22.0, 33.0]);
+        nsl_tensor_free(a);      // input ref
+        nsl_tensor_free(result); // output ref
+        nsl_tensor_free(b);
+    }
+
+    #[test]
+    fn test_fbip_add_alloc_when_shared() {
+        let a = make_f64_tensor(&[1.0, 2.0]);
+        let b = make_f64_tensor(&[10.0, 20.0]);
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        let result = arithmetic::nsl_tensor_add(a, b);
+        assert_ne!(result, a, "add should allocate new tensor when left has refcount>1");
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![11.0, 22.0]);
+        nsl_tensor_free(result);
+        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(a);
+        nsl_tensor_free(b);
+    }
+
+    #[test]
+    fn test_fbip_mul_inplace() {
+        let a = make_f64_tensor(&[2.0, 3.0, 4.0]);
+        let b = make_f64_tensor(&[10.0, 10.0, 10.0]);
+        let result = arithmetic::nsl_tensor_mul(a, b);
+        assert_eq!(result, a);
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![20.0, 30.0, 40.0]);
+        nsl_tensor_free(a);
+        nsl_tensor_free(result);
+        nsl_tensor_free(b);
+    }
+
+    #[test]
+    fn test_fbip_div_inplace() {
+        let a = make_f64_tensor(&[10.0, 20.0, 30.0]);
+        let b = make_f64_tensor(&[2.0, 4.0, 5.0]);
+        let result = arithmetic::nsl_tensor_div(a, b);
+        assert_eq!(result, a);
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![5.0, 5.0, 6.0]);
+        nsl_tensor_free(a);
+        nsl_tensor_free(result);
+        nsl_tensor_free(b);
+    }
+
+    #[test]
+    fn test_fbip_sub_inplace() {
+        let a = make_f64_tensor(&[10.0, 20.0]);
+        let b = make_f64_tensor(&[3.0, 7.0]);
+        let result = arithmetic::nsl_tensor_sub(a, b);
+        assert_eq!(result, a);
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![7.0, 13.0]);
+        nsl_tensor_free(a);
+        nsl_tensor_free(result);
+        nsl_tensor_free(b);
+    }
+
+    #[test]
+    fn test_clone_always_deep_copies() {
+        // Clone always deep copies (FBIP clone deferred to Phase 2 — requires codegen ownership)
+        let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
+        let result = nsl_tensor_clone(ptr);
+        assert_ne!(result, ptr, "clone should always deep copy at runtime level");
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+        nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
+    }
+
+    #[test]
+    fn test_fbip_add_scalar_inplace() {
+        let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
+        let result = arithmetic::nsl_tensor_add_scalar(ptr, 10.0);
+        assert_eq!(result, ptr);
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![11.0, 12.0, 13.0]);
+        nsl_tensor_free(ptr);
+        nsl_tensor_free(result);
+    }
+
+    #[test]
+    fn test_fbip_mul_scalar_inplace() {
+        let ptr = make_f64_tensor(&[2.0, 3.0, 4.0]);
+        let result = arithmetic::nsl_tensor_mul_scalar(ptr, 5.0);
+        assert_eq!(result, ptr);
+        let t = NslTensor::from_ptr(result);
+        let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        assert_eq!(vals, vec![10.0, 15.0, 20.0]);
+        nsl_tensor_free(ptr);
+        nsl_tensor_free(result);
+    }
+
+    #[test]
+    fn test_fbip_chained_ops_inplace() {
+        // Test that FBIP works for chained operations:
+        // After free(input), refcount drops back to 1 → next op can FBIP
+        let ptr = make_f64_tensor(&[-2.0, 3.0]);
+        let r1 = activation::nsl_tensor_relu(ptr);
+        assert_eq!(r1, ptr, "first op should FBIP");
+        nsl_tensor_free(ptr); // drop input ref → refcount=1
+        let r2 = activation::nsl_tensor_exp(r1);
+        assert_eq!(r2, r1, "second op should also FBIP after input freed");
+        nsl_tensor_free(r1); // drop r1 ref → refcount=1
+        // Values: relu([-2, 3]) = [0, 3], exp([0, 3]) = [1, e^3]
+        let t = NslTensor::from_ptr(r2);
+        assert!((unsafe { *t.data_f64().add(0) } - 1.0).abs() < 1e-10);
+        assert!((unsafe { *t.data_f64().add(1) } - (3.0_f64).exp()).abs() < 1e-10);
+        nsl_tensor_free(r2);
+    }
+
+    #[test]
+    fn test_fbip_autodiff_prevents_inplace() {
+        // When autodiff is recording, FBIP should NOT trigger
+        let ptr = make_f64_tensor(&[-1.0, 2.0]);
+        let params = crate::list::nsl_list_new();
+        crate::autodiff::nsl_tape_start(params);
+        let result = activation::nsl_tensor_relu(ptr);
+        crate::autodiff::nsl_tape_stop();
+        assert_ne!(result, ptr, "FBIP should not trigger during autodiff recording");
+        nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
     }
 }
