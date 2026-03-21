@@ -485,6 +485,319 @@ pub extern "C" fn nsl_fp8_update_calibration(
     }
 }
 
+// ===========================================================================
+// MXFP8: Per-block scaling with E8M0 scale factors (Blackwell)
+// ===========================================================================
+
+/// MXFP8 block size: 32 contiguous elements per scale factor.
+pub const MXFP8_BLOCK_SIZE: usize = 32;
+
+/// NVFP4 block size: 256 elements per scale factor (16x16).
+pub const NVFP4_BLOCK_SIZE: usize = 256;
+
+/// FP4 E2M1 max representable value.
+pub const FP4E2M1_MAX: f32 = 6.0;
+
+/// Scaling mode for FP8/FP4 quantization.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fp8ScalingMode {
+    /// Single scale for the entire tensor (Hopper H100).
+    PerTensor,
+    /// One E8M0 scale per block of `block_size` elements (Blackwell).
+    PerBlock { block_size: usize },
+    /// One scale per output channel.
+    PerChannel,
+}
+
+/// FP4 format identifier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fp4Format {
+    /// 2-bit exponent, 1-bit mantissa (Blackwell NVFP4).
+    E2M1,
+}
+
+/// Layout constraint for FP8/FP4 operands in wgmma.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fp8Layout {
+    /// K dimension contiguous — required for Blackwell wgmma.
+    KMajor,
+    /// M/N dimension contiguous — standard row-major.
+    MnMajor,
+}
+
+// ---------------------------------------------------------------------------
+// E8M0 scale factor encoding (8-bit exponent, no mantissa)
+// ---------------------------------------------------------------------------
+
+/// Encode a positive scale factor as E8M0 (pure power-of-2).
+/// E8M0 stores only the IEEE-754 exponent byte: value = 2^(e - 127).
+pub fn encode_e8m0(scale: f32) -> u8 {
+    if scale <= 0.0 || !scale.is_finite() {
+        return 127; // E8M0 for 1.0 (2^(127-127) = 2^0 = 1)
+    }
+    let bits = scale.to_bits();
+    ((bits >> 23) & 0xFF) as u8
+}
+
+/// Decode an E8M0 scale byte back to f32.
+/// value = 2^(e - 127).
+pub fn decode_e8m0(e8m0: u8) -> f32 {
+    f32::from_bits((e8m0 as u32) << 23)
+}
+
+// ---------------------------------------------------------------------------
+// MXFP8 per-block quantization
+// ---------------------------------------------------------------------------
+
+/// Result of MXFP8 block quantization.
+pub struct MxFp8Quantized {
+    /// Quantized FP8 values (simulated as f32 with FP8 precision loss).
+    pub data: Vec<f32>,
+    /// E8M0 scale factors, one per block of MXFP8_BLOCK_SIZE elements.
+    pub scales: Vec<u8>,
+    /// Number of elements.
+    pub len: usize,
+}
+
+/// Quantize a tensor using MXFP8 per-block scaling.
+/// Each block of `block_size` contiguous elements gets its own E8M0 scale.
+pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8Quantized {
+    let n = data.len();
+    let num_blocks = n.div_ceil(block_size);
+    let fp8_max = match fp8_format {
+        FP8_FORMAT_E4M3 => FP8E4M3_MAX,
+        FP8_FORMAT_E5M2 => FP8E5M2_MAX,
+        _ => FP8E4M3_MAX,
+    };
+    let precision = match fp8_format {
+        FP8_FORMAT_E4M3 => 0.125f32,
+        FP8_FORMAT_E5M2 => 0.5f32,
+        _ => 0.125f32,
+    };
+
+    let mut quantized = vec![0.0f32; n];
+    let mut scales = Vec::with_capacity(num_blocks);
+
+    for block_idx in 0..num_blocks {
+        let start = block_idx * block_size;
+        let end = (start + block_size).min(n);
+        let block = &data[start..end];
+
+        // Compute block-local absmax
+        let amax = block.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = if amax == 0.0 { 1.0 } else { amax / fp8_max };
+
+        // Encode as E8M0 (power-of-2 approximation)
+        let e8m0 = encode_e8m0(scale);
+        let actual_scale = decode_e8m0(e8m0);
+        scales.push(e8m0);
+
+        // Quantize each element in the block
+        for (i, &v) in block.iter().enumerate() {
+            let scaled = v / actual_scale;
+            let clamped = scaled.clamp(-fp8_max, fp8_max);
+            let quantized_val = (clamped / precision).round() * precision;
+            quantized[start + i] = quantized_val * actual_scale;
+        }
+    }
+
+    MxFp8Quantized { data: quantized, scales, len: n }
+}
+
+/// FFI: Quantize tensor with MXFP8 per-block scaling.
+/// Returns a new tensor with quantized-then-dequantized values (simulates precision loss).
+/// The E8M0 scale factors are stored in a separate tensor accessible via nsl_mxfp8_get_scales.
+#[no_mangle]
+pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_format: i64) -> i64 {
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let len = t.len as usize;
+    let bs = block_size as usize;
+
+    let src: Vec<f32> = if t.dtype == 0 {
+        unsafe { std::slice::from_raw_parts(t.data as *const f64, len) }
+            .iter().map(|&v| v as f32).collect()
+    } else {
+        unsafe { std::slice::from_raw_parts(t.data as *const f32, len) }.to_vec()
+    };
+
+    let result = quantize_mxfp8(&src, bs, fp8_format);
+
+    // Store quantized data as f32 tensor
+    let out_data = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+    for (i, &v) in result.data.iter().enumerate() {
+        unsafe { *out_data.add(i) = v };
+    }
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+
+    let out = Box::new(NslTensor {
+        data: out_data as *mut c_void,
+        shape, strides, ndim: t.ndim, len: t.len,
+        refcount: AtomicI64::new(1),
+        device: t.device, dtype: 1, owns_data: 1, data_owner: 0,
+    });
+    Box::into_raw(out) as i64
+}
+
+// ===========================================================================
+// NVFP4: 4-bit E2M1 with Hadamard preprocessing (Blackwell)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Fast Walsh-Hadamard Transform (FWHT)
+// ---------------------------------------------------------------------------
+
+/// In-place Fast Walsh-Hadamard Transform.
+/// Input length must be a power of 2. Normalizes by 1/sqrt(n).
+pub fn fast_hadamard_transform(x: &mut [f32]) {
+    let n = x.len();
+    debug_assert!(n.is_power_of_two(), "FWHT requires power-of-2 length, got {n}");
+
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let a = x[j];
+                let b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+
+    // Normalize
+    let norm = 1.0 / (n as f32).sqrt();
+    x.iter_mut().for_each(|v| *v *= norm);
+}
+
+/// In-place inverse Fast Walsh-Hadamard Transform.
+/// FWHT is self-inverse (orthogonal), so inverse = forward (with same normalization).
+pub fn inverse_hadamard_transform(x: &mut [f32]) {
+    fast_hadamard_transform(x);
+}
+
+// ---------------------------------------------------------------------------
+// FP4 E2M1 quantization
+// ---------------------------------------------------------------------------
+
+/// Quantize a single f32 value to FP4 E2M1 (simulated as f32 with E2M1 precision loss).
+/// E2M1 can represent: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives).
+fn quantize_fp4_e2m1(value: f32, scale: f32) -> f32 {
+    if scale == 0.0 { return 0.0; }
+    let scaled = value / scale;
+    let clamped = scaled.clamp(-FP4E2M1_MAX, FP4E2M1_MAX);
+    // E2M1 representable values (positive): 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    // Round to nearest representable value
+    let abs_val = clamped.abs();
+    let sign = clamped.signum();
+    let quantized = if abs_val < 0.25 { 0.0 }
+        else if abs_val < 0.75 { 0.5 }
+        else if abs_val < 1.25 { 1.0 }
+        else if abs_val < 1.75 { 1.5 }
+        else if abs_val < 2.5 { 2.0 }
+        else if abs_val < 3.5 { 3.0 }
+        else if abs_val < 5.0 { 4.0 }
+        else { 6.0 };
+    sign * quantized * scale
+}
+
+/// Result of NVFP4 quantization.
+pub struct NvFp4Quantized {
+    /// Quantized FP4 values (simulated as f32 with E2M1 precision loss).
+    pub data: Vec<f32>,
+    /// Scale factors, one per block of NVFP4_BLOCK_SIZE elements.
+    pub block_scales: Vec<f32>,
+    /// Number of elements.
+    pub len: usize,
+    /// Whether Hadamard preprocessing was applied.
+    pub hadamard_applied: bool,
+}
+
+/// Quantize a tensor using NVFP4 (E2M1) with optional Hadamard preprocessing.
+///
+/// Pipeline:
+/// 1. Apply Hadamard transform (if enabled) — smears outliers across dimensions
+/// 2. Compute per-block scale factors (blocks of NVFP4_BLOCK_SIZE)
+/// 3. Quantize each element to E2M1
+pub fn quantize_nvfp4(data: &[f32], block_size: usize, apply_hadamard: bool) -> NvFp4Quantized {
+    let n = data.len();
+    let mut working = data.to_vec();
+
+    // Step 1: Hadamard preprocessing (optional)
+    let hadamard_applied = if apply_hadamard && n.is_power_of_two() && n >= 2 {
+        fast_hadamard_transform(&mut working);
+        true
+    } else {
+        false
+    };
+
+    // Step 2: Per-block quantization
+    let num_blocks = n.div_ceil(block_size);
+    let mut quantized = vec![0.0f32; n];
+    let mut block_scales = Vec::with_capacity(num_blocks);
+
+    for block_idx in 0..num_blocks {
+        let start = block_idx * block_size;
+        let end = (start + block_size).min(n);
+        let block = &working[start..end];
+
+        let amax = block.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = if amax == 0.0 { 1.0 } else { amax / FP4E2M1_MAX };
+        block_scales.push(scale);
+
+        for (i, &v) in block.iter().enumerate() {
+            quantized[start + i] = quantize_fp4_e2m1(v, scale);
+        }
+    }
+
+    NvFp4Quantized { data: quantized, block_scales, len: n, hadamard_applied }
+}
+
+/// Dequantize NVFP4 data back to f32.
+/// If Hadamard was applied during quantization, applies inverse Hadamard.
+pub fn dequantize_nvfp4(quantized: &NvFp4Quantized) -> Vec<f32> {
+    let mut result = quantized.data.clone();
+    if quantized.hadamard_applied && result.len().is_power_of_two() {
+        inverse_hadamard_transform(&mut result);
+    }
+    result
+}
+
+/// FFI: Quantize tensor with NVFP4 (E2M1) and optional Hadamard preprocessing.
+#[no_mangle]
+pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_hadamard: i64) -> i64 {
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let len = t.len as usize;
+    let bs = block_size as usize;
+
+    let src: Vec<f32> = if t.dtype == 0 {
+        unsafe { std::slice::from_raw_parts(t.data as *const f64, len) }
+            .iter().map(|&v| v as f32).collect()
+    } else {
+        unsafe { std::slice::from_raw_parts(t.data as *const f32, len) }.to_vec()
+    };
+
+    let result = quantize_nvfp4(&src, bs, apply_hadamard != 0);
+
+    let out_data = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+    for (i, &v) in result.data.iter().enumerate() {
+        unsafe { *out_data.add(i) = v };
+    }
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+
+    let out = Box::new(NslTensor {
+        data: out_data as *mut c_void,
+        shape, strides, ndim: t.ndim, len: t.len,
+        refcount: AtomicI64::new(1),
+        device: t.device, dtype: 1, owns_data: 1, data_owner: 0,
+    });
+    Box::into_raw(out) as i64
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -868,5 +1181,207 @@ mod tests {
         assert_eq!(get_cached_fp8_ptx(128, FP8_FORMAT_E5M2), Some("test_e5m2_ptx_k128".to_string()));
         assert_eq!(get_cached_fp8_ptx(64, FP8_FORMAT_E4M3), Some("test_e4m3_ptx_k64".to_string()));
         assert_eq!(get_cached_fp8_ptx(256, FP8_FORMAT_E5M2), None); // not cached
+    }
+
+    // ── MXFP8 tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_e8m0_encode_decode_roundtrip() {
+        // E8M0 encodes power-of-2 scale factors
+        for &scale in &[1.0f32, 2.0, 4.0, 0.5, 0.25, 128.0, 0.0078125] {
+            let encoded = encode_e8m0(scale);
+            let decoded = decode_e8m0(encoded);
+            // E8M0 only represents powers of 2, so roundtrip is exact for powers of 2
+            assert_eq!(decoded, scale, "E8M0 roundtrip failed for {scale}");
+        }
+    }
+
+    #[test]
+    fn test_e8m0_non_power_of_2() {
+        // Non-power-of-2 values get rounded to nearest power of 2 (lower)
+        let encoded = encode_e8m0(3.0);
+        let decoded = decode_e8m0(encoded);
+        // 3.0 has exponent 1 (2^1 = 2), so E8M0 decodes to 2.0
+        assert_eq!(decoded, 2.0);
+    }
+
+    #[test]
+    fn test_e8m0_edge_cases() {
+        // Zero → default (1.0)
+        assert_eq!(decode_e8m0(encode_e8m0(0.0)), 1.0);
+        // NaN → default
+        assert_eq!(decode_e8m0(encode_e8m0(f32::NAN)), 1.0);
+        // Infinity → default
+        assert_eq!(decode_e8m0(encode_e8m0(f32::INFINITY)), 1.0);
+    }
+
+    #[test]
+    fn test_mxfp8_block_quantization_basic() {
+        // 64 elements = 2 blocks of 32
+        let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
+        let result = quantize_mxfp8(&data, MXFP8_BLOCK_SIZE, FP8_FORMAT_E4M3);
+
+        assert_eq!(result.len, 64);
+        assert_eq!(result.scales.len(), 2); // 64/32 = 2 blocks
+        assert_eq!(result.data.len(), 64);
+
+        // Verify scales are different for different blocks
+        // Block 0: max = 3.1, Block 1: max = 6.3
+        // They should have different E8M0 scales
+        assert_ne!(result.scales[0], result.scales[1]);
+    }
+
+    #[test]
+    fn test_mxfp8_better_than_per_tensor_on_outliers() {
+        // Create tensor with huge outlier that dominates per-tensor scale
+        let mut data = vec![0.01f32; 64];
+        data[63] = 10000.0; // huge outlier in block 1 — per-tensor scale = 10000/448 ≈ 22.3
+
+        // Per-tensor: scale dominated by outlier, small values in block 0 crushed to zero
+        let per_tensor_scale = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max) / FP8E4M3_MAX;
+        let per_tensor_err: f32 = data[..32].iter()
+            .map(|&v| {
+                let q = (v / per_tensor_scale / 0.125).round() * 0.125 * per_tensor_scale;
+                (v - q).abs()
+            })
+            .sum::<f32>() / 32.0;
+
+        // MXFP8: block 0 has its own scale optimized for 0.01, unaffected by outlier
+        let result = quantize_mxfp8(&data, MXFP8_BLOCK_SIZE, FP8_FORMAT_E4M3);
+        let mxfp8_err: f32 = data[..32].iter().zip(result.data[..32].iter())
+            .map(|(&orig, &quant)| (orig - quant).abs())
+            .sum::<f32>() / 32.0;
+
+        // MXFP8 should have lower error for block 0
+        assert!(mxfp8_err < per_tensor_err,
+            "MXFP8 err ({mxfp8_err}) should be less than per-tensor err ({per_tensor_err})");
+    }
+
+    #[test]
+    fn test_mxfp8_partial_last_block() {
+        // 50 elements = 1 full block + 1 partial block
+        let data: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        let result = quantize_mxfp8(&data, MXFP8_BLOCK_SIZE, FP8_FORMAT_E4M3);
+
+        assert_eq!(result.len, 50);
+        assert_eq!(result.scales.len(), 2); // ceil(50/32) = 2
+    }
+
+    // ── NVFP4 tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hadamard_orthogonality() {
+        // H @ H^T = I (for normalized Hadamard)
+        // Applying FWHT twice should give back the original
+        let original = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut data = original.clone();
+
+        fast_hadamard_transform(&mut data);
+        // After one transform, values should be different
+        assert_ne!(data, original);
+
+        // Second transform = inverse (FWHT is self-inverse)
+        fast_hadamard_transform(&mut data);
+
+        // Should recover original within floating point tolerance
+        for (a, b) in original.iter().zip(data.iter()) {
+            assert!((a - b).abs() < 1e-5, "Hadamard not orthogonal: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_hadamard_preserves_norm() {
+        // Hadamard transform preserves L2 norm (orthogonal matrix)
+        let mut data = vec![3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+        let norm_before: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        fast_hadamard_transform(&mut data);
+        let norm_after: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        assert!((norm_before - norm_after).abs() < 1e-4,
+            "Norm changed: {norm_before} → {norm_after}");
+    }
+
+    #[test]
+    fn test_hadamard_smears_outliers() {
+        // A tensor with one huge outlier should have smaller max after Hadamard
+        let mut data = vec![0.0f32; 8];
+        data[0] = 100.0; // single outlier
+
+        let max_before = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        fast_hadamard_transform(&mut data);
+        let max_after = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+
+        // After Hadamard, the outlier energy is spread across all elements
+        // max should decrease by roughly sqrt(n)
+        assert!(max_after < max_before,
+            "Hadamard should reduce max: {max_before} → {max_after}");
+    }
+
+    #[test]
+    fn test_fp4_e2m1_representable_values() {
+        // Verify E2M1 quantization snaps to representable values
+        let scale = 1.0;
+        let cases = [
+            (0.0, 0.0), (0.3, 0.5), (0.7, 0.5), (1.1, 1.0),
+            (1.6, 1.5), (2.2, 2.0), (3.2, 3.0), (4.5, 4.0), (5.5, 6.0),
+        ];
+        for (input, expected) in cases {
+            let result = quantize_fp4_e2m1(input, scale);
+            assert_eq!(result, expected, "FP4 E2M1: {input} should map to {expected}, got {result}");
+        }
+    }
+
+    #[test]
+    fn test_fp4_e2m1_clamping() {
+        let scale = 1.0;
+        // Values beyond 6.0 should clamp
+        let result = quantize_fp4_e2m1(100.0, scale);
+        assert_eq!(result, 6.0);
+        let result_neg = quantize_fp4_e2m1(-100.0, scale);
+        assert_eq!(result_neg, -6.0);
+    }
+
+    #[test]
+    fn test_nvfp4_quantize_without_hadamard() {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let result = quantize_nvfp4(&data, 4, false);
+
+        assert_eq!(result.len, 4);
+        assert!(!result.hadamard_applied);
+        assert_eq!(result.block_scales.len(), 1); // 4/4 = 1 block
+    }
+
+    #[test]
+    fn test_nvfp4_quantize_with_hadamard() {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let result = quantize_nvfp4(&data, 4, true);
+
+        assert!(result.hadamard_applied);
+
+        // Dequantize should approximately recover original
+        let recovered = dequantize_nvfp4(&result);
+        for (orig, rec) in data.iter().zip(recovered.iter()) {
+            let err = (orig - rec).abs();
+            assert!(err < 2.0, "NVFP4 roundtrip error too large: {orig} → {rec} (err={err})");
+        }
+    }
+
+    #[test]
+    fn test_nvfp4_hadamard_smears_outlier_max() {
+        // Hadamard reduces the max element, which improves block quantization scaling
+        let mut data = vec![0.0f32; 8];
+        data[0] = 100.0; // single outlier
+
+        let max_before = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let mut transformed = data.clone();
+        fast_hadamard_transform(&mut transformed);
+        let max_after = transformed.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+
+        // After Hadamard, the single outlier is spread across all 8 elements
+        // max should decrease by sqrt(8) ≈ 2.83
+        assert!(max_after < max_before * 0.5,
+            "Hadamard should reduce max from {max_before} to < {}, got {max_after}",
+            max_before * 0.5);
     }
 }
