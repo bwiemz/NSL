@@ -85,6 +85,157 @@ fn snapshot_flash_attention_tree_mask() {
 }
 
 // ---------------------------------------------------------------------------
+// FlashAttention logsumexp PTX tests (Phase 1 backward support)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn flash_attention_ptx_has_logsumexp_param() {
+    let config = nsl_codegen::flash_attention::FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+    };
+    let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
+    let ptx_str = String::from_utf8_lossy(&ptx);
+
+    // Verify param_logsumexp is declared in the kernel entry
+    assert!(
+        ptx_str.contains(".param .u64 param_logsumexp"),
+        "PTX must declare param_logsumexp parameter"
+    );
+}
+
+#[test]
+fn flash_attention_ptx_loads_logsumexp_base() {
+    let config = nsl_codegen::flash_attention::FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+    };
+    let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
+    let ptx_str = String::from_utf8_lossy(&ptx);
+
+    // Verify logsumexp_base is loaded from param
+    assert!(
+        ptx_str.contains("ld.param.u64 %logsumexp_base, [param_logsumexp]"),
+        "PTX must load logsumexp_base from param_logsumexp"
+    );
+}
+
+#[test]
+fn flash_attention_ptx_computes_logsumexp() {
+    let config = nsl_codegen::flash_attention::FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+    };
+    let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
+    let ptx_str = String::from_utf8_lossy(&ptx);
+
+    // Verify log2 approximation for computing ln(row_sum) via log2 * ln(2)
+    assert!(
+        ptx_str.contains("lg2.approx.f32 %log_sum, %row_sum"),
+        "PTX must compute log2(row_sum)"
+    );
+
+    // Verify multiplication by ln(2) constant (IEEE 754 hex: 0x3F317218)
+    assert!(
+        ptx_str.contains("0F3F317218"),
+        "PTX must multiply by ln(2) constant 0F3F317218"
+    );
+
+    // Verify L = row_max + log_sum
+    assert!(
+        ptx_str.contains("add.f32 %lse, %row_max, %log_sum"),
+        "PTX must compute lse = row_max + log_sum"
+    );
+
+    // Verify null-guard: setp.ne for logsumexp_base
+    assert!(
+        ptx_str.contains("setp.ne.u64 %p_has_lse, %logsumexp_base, 0"),
+        "PTX must null-check logsumexp_base before store"
+    );
+
+    // Verify global store of logsumexp value
+    assert!(
+        ptx_str.contains("st.global.f32 [%lse_addr], %lse"),
+        "PTX must store logsumexp to global memory"
+    );
+}
+
+#[test]
+fn flash_attention_ptx_logsumexp_has_bounds_check() {
+    let config = nsl_codegen::flash_attention::FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+    };
+    let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
+    let ptx_str = String::from_utf8_lossy(&ptx);
+
+    // Verify bounds check: only store if (q_start + tid_x) < seq_len
+    assert!(
+        ptx_str.contains("SKIP_LSE_STORE"),
+        "PTX must have SKIP_LSE_STORE label for bounds/null guard"
+    );
+}
+
+#[test]
+fn flash_attention_ptx_logsumexp_register_declarations() {
+    let config = nsl_codegen::flash_attention::FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+    };
+    let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
+    let ptx_str = String::from_utf8_lossy(&ptx);
+
+    // Verify register declarations for logsumexp computation
+    assert!(
+        ptx_str.contains(".reg .u64 %logsumexp_base"),
+        "PTX must declare %logsumexp_base register"
+    );
+    assert!(
+        ptx_str.contains(".reg .f32 %log_sum, %lse"),
+        "PTX must declare %log_sum and %lse registers"
+    );
+    assert!(
+        ptx_str.contains(".reg .pred %p_has_lse"),
+        "PTX must declare %p_has_lse predicate"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // KIR -> PTX backend snapshots
 // ---------------------------------------------------------------------------
 

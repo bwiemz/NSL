@@ -582,8 +582,19 @@ impl Compiler<'_> {
         let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim2])?;
         let head_dim = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
 
-        self.compile_call_by_name(builder, "nsl_flash_attention", &[
-            q_val, k_val, v_val, out_val, scale_val,
+        // Allocate logsumexp auxiliary tensor: shape [batch, heads, seq_len], dtype f32
+        // Used by backward pass; stored for later autodiff tape consumption.
+        let lse_shape = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        self.compile_call_by_name(builder, "nsl_list_push", &[lse_shape, batch])?;
+        self.compile_call_by_name(builder, "nsl_list_push", &[lse_shape, heads])?;
+        self.compile_call_by_name(builder, "nsl_list_push", &[lse_shape, seq_len])?;
+        let lse_val = self.compile_call_by_name(builder, "nsl_tensor_zeros", &[lse_shape])?;
+
+        // Call flash attention FFI — returns error code (i64), output written to out_val
+        let _err = self.compile_call_by_name(builder, "nsl_flash_attention", &[
+            q_val, k_val, v_val, out_val,
+            lse_val,                        // logsumexp auxiliary output
+            scale_val,
             batch, heads, seq_len, head_dim,
             null, null, null, null, // paged params (null for now)
             null, null,             // RoPE params (null for now)
@@ -591,7 +602,14 @@ impl Compiler<'_> {
             shmem_val,
             ptx_ptr, name_ptr,
             block_q_val, block_kv_val,
-        ])
+        ])?;
+
+        // Store logsumexp tensor for backward pass (autodiff tape will pick it up)
+        // TODO(Phase 2): Record lse_val in the tape alongside out_val
+        let _ = lse_val;
+
+        // Return the output tensor (not the FFI error code)
+        Ok(out_val)
     }
 
     pub(crate) fn compile_to_onnx(

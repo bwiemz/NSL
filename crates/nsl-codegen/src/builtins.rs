@@ -307,7 +307,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_kernel_profiler_stop",  &[],                                                         None),
     // FlashAttention-2 launch wrappers (M27)
     ("nsl_flash_attention", &[
-        types::I64, types::I64, types::I64, types::I64, types::I64,  // q, k, v, out, scale
+        types::I64, types::I64, types::I64, types::I64,              // q, k, v, out
+        types::I64,                                                   // logsumexp (backward aux, 0=skip)
+        types::I64,                                                   // scale
         types::I64, types::I64, types::I64, types::I64,              // batch, heads, seq_len, head_dim
         types::I64, types::I64, types::I64, types::I64,              // block_table, k_pool, v_pool, block_size
         types::I64, types::I64,                                       // cos, sin (RoPE)

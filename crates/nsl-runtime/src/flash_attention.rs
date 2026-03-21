@@ -17,7 +17,9 @@ use std::ffi::c_void;
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
-    out_ptr: i64, scale_bits: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,  // backward aux output (0 = skip, inference-only)
+    scale_bits: i64,
     batch: i64, heads: i64, seq_len: i64, head_dim: i64,
     block_table_ptr: i64,
     k_pool_ptr: i64, v_pool_ptr: i64,
@@ -60,8 +62,14 @@ pub extern "C" fn nsl_flash_attention(
         let mut sin = sin_ptr as u64;
         let mut sids = seq_ids_ptr as u64;
         let mut slens = seq_lens_ptr as u64;
+        // M33: tree mask params (null for non-tree-mask variants)
+        let mut dfs_enter: u64 = 0;
+        let mut dfs_exit: u64 = 0;
+        let mut num_tree_nodes: u64 = 0;
+        // Backward pass: logsumexp auxiliary output
+        let mut lse = logsumexp_ptr as u64;
 
-        let args: [*mut c_void; 17] = [
+        let args: [*mut c_void; 21] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -79,6 +87,10 @@ pub extern "C" fn nsl_flash_attention(
             &mut sin as *mut _ as *mut c_void,
             &mut sids as *mut _ as *mut c_void,
             &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
         ];
 
         let result = crate::cuda::inner::kernel_launch(
@@ -94,7 +106,7 @@ pub extern "C" fn nsl_flash_attention(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (q_ptr, k_ptr, v_ptr, out_ptr, scale_bits);
+        let _ = (q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale_bits);
         let _ = (batch, heads, seq_len, head_dim);
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
