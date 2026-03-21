@@ -856,4 +856,20 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             ret: Box::new(tensor_ret.clone()),
         },
     );
+
+    // Checkpoint I/O (M14): model_save(model, path), model_load(model, path)
+    def(
+        "model_save",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Str],
+            ret: Box::new(Type::Void),
+        },
+    );
+    def(
+        "model_load",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Str],
+            ret: Box::new(Type::Void),
+        },
+    );
 }

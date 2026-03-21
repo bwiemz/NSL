@@ -133,30 +133,31 @@ let result = c.to(cpu)  # each element = 3.0
 - Mixed-precision matmul (`nsl_qtensor_matmul_mixed`)
 - Model monomorphization: compiler synthesizes quantized model type
 - Glob-based `exclude` patterns to keep specific layers in full precision
-- **FP8 compute** — `@fp8_compute` decorator, E4M3/E5M2 scale management, FP8 Tensor Core matmul (v0.3.0)
-- **AWQ 4-bit** — `quant { dtype: awq4 }` with in-register dequantize-in-GEMM (v0.3.0)
-- **GPTQ 4-bit/8-bit** — `quant { dtype: gptq4 }` with Hessian-based optimal quantization (v0.3.0)
+- **FP8 compute** — `@fp8_compute` decorator, E4M3/E5M2 scale management, FP8 Tensor Core matmul (sm_90 MMA + Hopper wgmma), running-max EMA calibration
+- **AWQ 4-bit** — `quant { dtype: awq4 }` with in-register dequantize-in-GEMM
+- **GPTQ 4-bit/8-bit** — `quant { dtype: gptq4 }` with Hessian-based optimal quantization
 
 ### Production Inference *(shipped — v0.2.0)*
 - **Custom datatypes** — `datatype` block for user-defined numeric formats with PTX escape hatch
 - **Standalone export** — `nsl build --standalone` for zero-dependency inference binaries
 - **PagedAttention** — paged KV-cache with block allocation and CoW branching
-- **FlashAttention-2** — tiled attention with RoPE/GQA fusion and paged variant
+- **FlashAttention-2** — tiled attention with online softmax, MMA tensor cores (sm_80 `mma.sync` + sm_90 `wgmma.mma_async`), RoPE/GQA fusion, paged KV integration, tree-structured causal mask, logsumexp backward storage
 - **Dynamic shapes** — `Dim::Bounded` symbolic dimensions with stride-based codegen
 - **Continuous batching** — `serve` block DSL with chunked prefill and preemption
 - **Tensor parallelism** — `@shard` decorator with NCCL-backed all-reduce
-- **Graph-level fusion** — epilogue fusion, reduction fusion, `@fuse_graph` decorator
-- **`@autotune`** — build-time kernel parameter tuning with persistent cache
+- **Graph-level fusion** — epilogue fusion (bias+activation in matmul epilogue), reduction fusion (Welford merge for layernorm/softmax), `@fuse_graph` decorator, cost-guided profitability filtering
+- **`@autotune`** — build-time kernel parameter tuning with real GPU benchmarking and persistent cache
 
 ### Scaling & Optimization *(shipped — v0.3.0)*
 - **Mixture of Experts** — `@moe` decorator with top-k gating, capacity-based routing, aux loss
 - **Speculative decoding** — `@speculative` with tree attention, rejection sampling, Medusa heads
 - **Ring attention** — `@context_parallel` for cross-GPU sequence parallelism
-- **Memory planning** — compile-time tensor liveness analysis, interference graph, slab allocation
-- **Roofline cost model** — per-operation FLOP/byte analysis with GPU database (A100, H100, RTX-4090, etc.)
-- **Linear types semantics** — ownership checker for use-after-move detection, `@shared` escape hatch
+- **Memory planning** — compile-time tensor liveness analysis, interference graph, BFD slab allocation with 256-byte alignment
+- **Roofline cost model** — multi-level memory hierarchy (L1/L2/HBM bandwidth), occupancy estimation, per-op FLOP/byte analysis with GPU database (A100, H100, RTX-4090, etc.)
+- **Cost-guided fusion** — profitability analysis (arithmetic intensity improvement threshold), register pressure estimation, prevents counterproductive fusions
+- **Linear types semantics** — ownership checker for use-after-move detection, immutable borrow (`&T`) semantics, `@shared` escape hatch
 - **vmap analysis** — `@vmap` batch tracking, shape rewriting, matmul rewrite classification
-- **Source AD analysis** — Wengert list, reverse-mode adjoint rules, dead gradient elimination
+- **Source AD** — Wengert extraction, reverse-mode adjoint rules, if/else branch support with condition saving, dead gradient elimination
 
 ### Infrastructure *(v0.4.0–v0.8.0 — analysis + FFI layers + codegen wiring)*
 
@@ -176,12 +177,19 @@ let result = c.to(cpu)  # each element = 3.0
 - **Effect system** — effect inference, @pure/@deterministic/@checkpoint validation
 - **Snapshot + differential testing** — insta PTX snapshots, --disable-fusion oracle
 
-### Weight Intelligence & Interop *(v0.9.0 — NEW)*
+### Weight Intelligence & Interop *(v0.9.0)*
 
 - **Weight-aware compilation** — `nsl build --weights model.safetensors`: loads weights at compile time, sparsity analysis per matrix, constant folding through matmul/add/relu, dead weight elimination, SHA-256 integrity hash
 - **DLPack zero-copy bridge** — PyTorch/JAX tensor exchange without copying data (DLPack v0.8)
 - **C API** — `nsl build --shared-lib`: model lifecycle, forward pass, DLPack interop, error handling
-- **Unikernel infrastructure** — `nsl build --unikernel`: memory layout computation, linker script generation, boot config (actual bare-metal boot stub in progress)
+- **Unikernel infrastructure** — `nsl build --unikernel`: memory layout computation, linker script generation, boot config
+
+### Hopper GPU Optimization *(v0.9.0)*
+
+- **wgmma.mma_async** — 128-thread warp group MMA on H100/H200 for both FlashAttention and FP8 matmul (~37% more tensor core utilization vs mma.sync)
+- **FlashAttention backward** — logsumexp auxiliary storage, tiled backward kernel for dQ/dK/dV with attention probability recomputation
+- **FP8 E5M2 backward** — mixed-precision training: E4M3 forward (higher precision) + E5M2 backward (wider dynamic range for gradients), GPU MMA kernels for both directions
+- **Effect system Rng fix** — `@deterministic` now correctly allows explicit `Rng` parameter (controlled randomness)
 
 ### Test Framework
 - `@test` decorator marks functions as test cases
@@ -309,16 +317,41 @@ cargo run -p nsl-cli --features cuda -- run tests/m17_kernel_test.nsl
 cargo run -p nsl-cli --features cuda -- run tests/m17_gpu_training_test.nsl
 ```
 
+### Compile-Time Analysis
+
+```bash
+nsl check --perf file.nsl          # Roofline performance analysis
+nsl check --nan-analysis file.nsl  # NaN/Inf risk detection
+nsl check --deterministic file.nsl # Determinism verification
+nsl check --wcet file.nsl          # Worst-case execution time
+nsl check --weight-analysis file.nsl --weights model.safetensors
+```
+
+## Roadmap
+
+**Next priorities (unimplemented):**
+
+- FBIP (Functional But In-Place) — zero-allocation inference via refcount-checked in-place mutation
+- Effect polymorphism — effect variables on function types for correct higher-order effect propagation
+- Shape algebra bounds — Fourier-Motzkin elimination for symbolic dimension proofs
+- Memory planner rematerialization — trade compute for memory in training
+- WCET two-tier — FPGA certified path (GPU WCET is statistically bounded only)
+- ZK upgrade — lookup-native arithmetization (Jolt-style), folding accumulation, Mersenne-31 field
+- Sparse merge lattices — TACO-style co-iteration for sparse tensor operations
+
+**Future milestones (M56-M62):** Multi-agent shared memory, FPGA/neuromorphic backend, elastic fault tolerance, topology-aware routing, exabyte data streaming, cluster debugging, PyTorch FFI.
+
+See `docs/plans/` and `docs/summaries/` for details.
+
 ## Known Limitations
 
 - No REPL
 - CUDA required for GPU features (ROCm/Metal/WebGPU KIR foundation built, backends in progress)
 - Windows requires Visual Studio Build Tools for linking
-- Multi-backend KIR pipeline runs alongside existing direct PTX path (not yet default)
-- Source AD backward Cranelift emission and vmap call-site dispatch in progress
-- Pipeline parallelism train block codegen (actual 1F1B loop emission) in progress
-- Tensor debugger TUI (`nsl debug`) and GPU stats kernel deferred
-- 678 unit tests passing, clippy clean
+- GPU WCET provides statistical bounds only — hard real-time certification requires FPGA target (not yet implemented)
+- ZK circuits use v1 Halo2 scaffolding — upgrade to lookup-native/folding in progress
+- Autodiff backward rules cover ~11 operations (need ~40+ for full coverage)
+- Multi-backend (AMDGPU/Metal/WGSL) are codegen stubs — only PTX is production
 
 ## License
 
