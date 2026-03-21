@@ -513,4 +513,149 @@ mod tests {
         assert!(checker.has_explicit_rng("func_a"));
         assert!(!checker.has_explicit_rng("func_b"));
     }
+
+    // ── Effect polymorphism tests (M51c) ────────────────────────────────
+
+    use crate::types::Effect;
+
+    /// Helper to create a test Symbol from a u32 index.
+    fn test_sym(n: u32) -> nsl_ast::Symbol {
+        nsl_ast::Symbol(unsafe { std::mem::transmute::<u32, string_interner::DefaultSymbol>(n) })
+    }
+
+    #[test]
+    fn effect_pure_default() {
+        assert_eq!(Effect::pure(), Effect::Concrete(EffectSet::PURE));
+    }
+
+    #[test]
+    fn effect_inferred_default() {
+        assert_eq!(Effect::default(), Effect::Inferred);
+    }
+
+    #[test]
+    fn effect_var_has_vars() {
+        let sym = test_sym(99);
+        let eff = Effect::Var(sym);
+        assert!(eff.has_vars());
+    }
+
+    #[test]
+    fn effect_concrete_no_vars() {
+        let eff = Effect::Concrete(EffectSet::IO);
+        assert!(!eff.has_vars());
+    }
+
+    #[test]
+    fn effect_union_has_vars() {
+        let sym = test_sym(99);
+        let eff = Effect::Union(
+            Box::new(Effect::Var(sym)),
+            Box::new(Effect::Concrete(EffectSet::IO)),
+        );
+        assert!(eff.has_vars());
+    }
+
+    #[test]
+    fn effect_substitute_var_bound() {
+        let sym = test_sym(42);
+        let eff = Effect::Var(sym);
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(sym, EffectSet::IO);
+        assert_eq!(eff.substitute(&bindings), EffectSet::IO);
+    }
+
+    #[test]
+    fn effect_substitute_var_unbound() {
+        let sym = test_sym(42);
+        let eff = Effect::Var(sym);
+        let bindings = std::collections::HashMap::new();
+        // Unbound variables default to PURE
+        assert_eq!(eff.substitute(&bindings), EffectSet::PURE);
+    }
+
+    #[test]
+    fn effect_substitute_union() {
+        let sym = test_sym(42);
+        let eff = Effect::Union(
+            Box::new(Effect::Var(sym)),
+            Box::new(Effect::Concrete(EffectSet::MUTATION)),
+        );
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(sym, EffectSet::IO);
+        let result = eff.substitute(&bindings);
+        assert!(result.contains(EffectSet::IO));
+        assert!(result.contains(EffectSet::MUTATION));
+    }
+
+    #[test]
+    fn effect_substitute_concrete_passthrough() {
+        let eff = Effect::Concrete(EffectSet::RANDOM);
+        let bindings = std::collections::HashMap::new();
+        assert_eq!(eff.substitute(&bindings), EffectSet::RANDOM);
+    }
+
+    #[test]
+    fn effect_substitute_inferred_is_pure() {
+        let eff = Effect::Inferred;
+        let bindings = std::collections::HashMap::new();
+        assert_eq!(eff.substitute(&bindings), EffectSet::PURE);
+    }
+
+    #[test]
+    fn effect_collect_vars() {
+        let sym1 = test_sym(1);
+        let sym2 = test_sym(2);
+        let eff = Effect::Union(
+            Box::new(Effect::Var(sym1)),
+            Box::new(Effect::Var(sym2)),
+        );
+        let mut vars = Vec::new();
+        eff.collect_vars(&mut vars);
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&sym1));
+        assert!(vars.contains(&sym2));
+    }
+
+    #[test]
+    fn effect_checker_parametric_pure_call() {
+        // Simulates: map(double, xs) where double is @pure
+        // The effect variable E binds to {} (pure)
+        let sym_e = test_sym(100);
+        let effect = Effect::Var(sym_e);
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(sym_e, EffectSet::PURE);
+        let resolved = effect.substitute(&bindings);
+        assert!(resolved.is_pure());
+    }
+
+    #[test]
+    fn effect_checker_parametric_io_call() {
+        // Simulates: map(noisy_double, xs) where noisy_double has IO
+        // The effect variable E binds to {IO}
+        let sym_e = test_sym(100);
+        let effect = Effect::Var(sym_e);
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(sym_e, EffectSet::IO);
+        let resolved = effect.substitute(&bindings);
+        assert!(resolved.contains(EffectSet::IO));
+        assert!(!resolved.is_pure());
+    }
+
+    #[test]
+    fn effect_multiple_vars_independent() {
+        // fn combine(f: fn() | E1, g: fn() | E2) -> T | E1 | E2
+        let sym_e1 = test_sym(101);
+        let sym_e2 = test_sym(102);
+        let return_effect = Effect::Union(
+            Box::new(Effect::Var(sym_e1)),
+            Box::new(Effect::Var(sym_e2)),
+        );
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(sym_e1, EffectSet::IO);
+        bindings.insert(sym_e2, EffectSet::RANDOM);
+        let resolved = return_effect.substitute(&bindings);
+        assert!(resolved.contains(EffectSet::IO));
+        assert!(resolved.contains(EffectSet::RANDOM));
+    }
 }

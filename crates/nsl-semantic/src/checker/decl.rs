@@ -133,6 +133,7 @@ impl<'a> TypeChecker<'a> {
                         name: enum_def.name,
                         variants: Vec::new(), // filled in later
                     }),
+                    effect: Effect::Inferred,
                 }
             };
             self.declare_symbol(variant.name, variant_ty, variant.span, true, false);

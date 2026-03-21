@@ -46,10 +46,11 @@ pub enum TypeExprKind {
         format: Symbol,
     },
 
-    /// (A, B) -> C
+    /// (A, B) -> C | E
     Function {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
+        effect: Option<crate::decl::EffectExpr>,
     },
 
     /// A | B

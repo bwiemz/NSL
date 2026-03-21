@@ -48,6 +48,7 @@ pub struct TypeChecker<'a> {
     pub scopes: &'a mut ScopeMap,
     pub diagnostics: Vec<Diagnostic>,
     pub type_map: TypeMap,
+    pub effect_checker: crate::effects::EffectChecker,
     current_scope: ScopeId,
     current_return_type: Option<Type>,
     /// Pre-resolved types for imported symbols (from other modules).
@@ -63,6 +64,7 @@ impl<'a> TypeChecker<'a> {
             scopes,
             diagnostics: Vec::new(),
             type_map: HashMap::new(),
+            effect_checker: crate::effects::EffectChecker::new(),
             current_scope: ScopeId::ROOT,
             current_return_type: None,
             import_types: HashMap::new(),
@@ -163,9 +165,20 @@ impl<'a> TypeChecker<'a> {
             .as_ref()
             .map(|t| self.resolve_type(t))
             .unwrap_or(Type::Void);
+        let effect = if let Some(eff_expr) = &fn_def.return_effect {
+            let resolver = TypeResolver {
+                interner: self.interner,
+                scopes: self.scopes,
+                diagnostics: &mut self.diagnostics,
+            };
+            resolver.resolve_effect_expr(eff_expr, self.current_scope)
+        } else {
+            Effect::Inferred
+        };
         Type::Function {
             params,
             ret: Box::new(ret),
+            effect,
         }
     }
 

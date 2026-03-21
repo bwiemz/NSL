@@ -47,9 +47,17 @@ impl<'a> TypeResolver<'a> {
                 dtype: self.resolve_dtype(*dtype),
                 format: self.resolve_sparse_format(*format),
             },
-            TypeExprKind::Function { params, ret } => Type::Function {
-                params: params.iter().map(|p| self.resolve(p, scope)).collect(),
-                ret: Box::new(self.resolve(ret, scope)),
+            TypeExprKind::Function { params, ret, effect } => {
+                let resolved_effect = if let Some(eff_expr) = effect {
+                    self.resolve_effect_expr(eff_expr, scope)
+                } else {
+                    Effect::Inferred
+                };
+                Type::Function {
+                    params: params.iter().map(|p| self.resolve(p, scope)).collect(),
+                    ret: Box::new(self.resolve(ret, scope)),
+                    effect: resolved_effect,
+                }
             },
             TypeExprKind::Union(types) => {
                 Type::Union(types.iter().map(|t| self.resolve(t, scope)).collect())
@@ -256,6 +264,46 @@ impl<'a> TypeResolver<'a> {
             "csc" => SparseFormat::Csc,
             "bsr" => SparseFormat::Bsr,
             _ => SparseFormat::Unknown,
+        }
+    }
+
+    /// Resolve an effect expression into a semantic Effect.
+    pub fn resolve_effect_expr(&self, eff: &nsl_ast::decl::EffectExpr, _scope: ScopeId) -> Effect {
+        use nsl_ast::decl::EffectExpr;
+        use crate::effects::EffectSet;
+
+        match eff {
+            EffectExpr::Var(sym) => {
+                let name = self.interner.resolve(sym.0).unwrap_or("");
+                // Check if it's a known concrete effect name
+                match name {
+                    "IO" => Effect::Concrete(EffectSet::IO),
+                    "RANDOM" | "Random" => Effect::Concrete(EffectSet::RANDOM),
+                    "MUTATION" | "Mutation" => Effect::Concrete(EffectSet::MUTATION),
+                    "COMMUNICATION" | "Communication" => Effect::Concrete(EffectSet::COMMUNICATION),
+                    "PURE" | "Pure" => Effect::Concrete(EffectSet::PURE),
+                    _ => Effect::Var(*sym), // treat as effect variable
+                }
+            }
+            EffectExpr::Named(sym) => {
+                let name = self.interner.resolve(sym.0).unwrap_or("");
+                match name {
+                    "IO" => Effect::Concrete(EffectSet::IO),
+                    "RANDOM" | "Random" => Effect::Concrete(EffectSet::RANDOM),
+                    "MUTATION" | "Mutation" => Effect::Concrete(EffectSet::MUTATION),
+                    "COMMUNICATION" | "Communication" => Effect::Concrete(EffectSet::COMMUNICATION),
+                    _ => Effect::Concrete(EffectSet::PURE),
+                }
+            }
+            EffectExpr::Union(parts) => {
+                let resolved: Vec<Effect> = parts.iter()
+                    .map(|p| self.resolve_effect_expr(p, _scope))
+                    .collect();
+                // Fold into nested unions
+                resolved.into_iter().reduce(|a, b| {
+                    Effect::Union(Box::new(a), Box::new(b))
+                }).unwrap_or(Effect::pure())
+            }
         }
     }
 }

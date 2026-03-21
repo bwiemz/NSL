@@ -157,6 +157,7 @@ impl<'a> TypeChecker<'a> {
                 Type::Function {
                     params: param_types,
                     ret: Box::new(body_ty),
+                    effect: Effect::Inferred,
                 }
             }
             ExprKind::ListComp {

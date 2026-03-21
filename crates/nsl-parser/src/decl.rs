@@ -40,8 +40,10 @@ pub fn parse_fn_def_stmt(p: &mut Parser) -> Stmt {
         kind: StmtKind::FnDef(FnDef {
             name,
             type_params,
+            effect_params: vec![],
             params,
             return_type,
+            return_effect: None,
             body,
             is_async,
             span,
@@ -137,8 +139,10 @@ pub fn parse_model_def_stmt(p: &mut Parser) -> Stmt {
             members.push(ModelMember::Method(FnDef {
                 name: mname,
                 type_params: mtype_params,
+                effect_params: vec![],
                 params: mparams,
                 return_type,
+                return_effect: None,
                 body: body.clone(),
                 is_async,
                 span: method_start.merge(body.span),
@@ -354,8 +358,10 @@ pub fn parse_trait_def_stmt(p: &mut Parser) -> Stmt {
         methods.push(FnDef {
             name: mname,
             type_params: Vec::new(),
+            effect_params: vec![],
             params,
             return_type,
+            return_effect: None,
             body,
             is_async,
             span: method_start.merge(p.prev_span()),

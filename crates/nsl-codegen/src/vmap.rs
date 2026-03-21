@@ -228,8 +228,10 @@ impl<'a> VmapTransformer<'a> {
         let batched_fn = FnDef {
             name: fn_def.name, // placeholder — compiler interns batched_name later
             type_params: fn_def.type_params.clone(),
+            effect_params: fn_def.effect_params.clone(),
             params: fn_def.params.clone(), // params keep same names; shapes change at type level
             return_type: fn_def.return_type.clone(),
+            return_effect: fn_def.return_effect.clone(),
             body: batched_body,
             is_async: fn_def.is_async,
             span: fn_def.span,
