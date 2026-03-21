@@ -285,7 +285,11 @@ impl Compiler<'_> {
                 BinOp::Sub => "nsl_tensor_sub",
                 BinOp::Mul => "nsl_tensor_mul",
                 BinOp::Div => "nsl_tensor_div",
-                BinOp::MatMul => "nsl_tensor_matmul",
+                BinOp::MatMul => if state.is_fp8_compute {
+                    "nsl_fp8_matmul_training"
+                } else {
+                    "nsl_tensor_matmul"
+                },
                 _ => return Err(CodegenError::new(format!("unsupported tensor op: {op:?}"))),
             };
             let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs])?;

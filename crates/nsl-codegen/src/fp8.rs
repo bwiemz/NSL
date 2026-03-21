@@ -39,6 +39,33 @@ pub fn extract_fp8_compute_decorator<'a>(
 
 use crate::gpu_specs::GpuSpec;
 
+/// FP8 sub-format: E4M3 for forward (higher precision), E5M2 for backward (wider range).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Fp8Format {
+    /// 4-bit exponent, 3-bit mantissa. Max 448. Precision 0.125.
+    E4M3,
+    /// 5-bit exponent, 2-bit mantissa. Max 57344. Precision 0.5.
+    E5M2,
+}
+
+impl Fp8Format {
+    /// PTX format specifier string for MMA instructions.
+    pub fn ptx_str(&self) -> &'static str {
+        match self {
+            Fp8Format::E4M3 => "e4m3",
+            Fp8Format::E5M2 => "e5m2",
+        }
+    }
+
+    /// PTX kernel entry point name.
+    pub fn kernel_name(&self) -> &'static str {
+        match self {
+            Fp8Format::E4M3 => "nsl_fp8_matmul_kernel",
+            Fp8Format::E5M2 => "nsl_fp8_matmul_e5m2_kernel",
+        }
+    }
+}
+
 /// Compilation result for FP8 matmul: either an MMA kernel PTX or a fallback
 /// indicator for the runtime to dequantize and use standard f32 matmul.
 #[derive(Debug)]
@@ -56,10 +83,10 @@ pub enum Fp8MatmulStrategy {
 /// On sm_90+ (H100): emits FP8 MMA PTX kernel via `emit_fp8_matmul_ptx`.
 /// On older GPUs: returns `RuntimeFallback` — the runtime will dequantize
 /// to f32 and use the standard tiled matmul.
-pub fn compile_fp8_matmul(gpu: &GpuSpec, k: usize) -> Fp8MatmulStrategy {
+pub fn compile_fp8_matmul(gpu: &GpuSpec, k: usize, format: Fp8Format) -> Fp8MatmulStrategy {
     if gpu.supports_fp8_mma() && k.is_multiple_of(FP8_MMA_K) {
         Fp8MatmulStrategy::MmaKernel {
-            ptx: emit_fp8_matmul_ptx(k),
+            ptx: emit_fp8_matmul_ptx(k, format),
         }
     } else {
         Fp8MatmulStrategy::RuntimeFallback
@@ -79,12 +106,14 @@ const FP8_MMA_K: usize = 32;
 /// Emit a complete FP8 matmul PTX kernel for sm_90.
 ///
 /// C[M,N] = (A[M,K] @ B[K,N]) * scale_a * scale_b
-/// A and B are in E4M3 format (1 byte per element).
+/// A and B are in the specified FP8 format (1 byte per element).
 /// C is f32 output.
 ///
-/// Uses `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`.
+/// Format determines the MMA instruction:
+/// - E4M3: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`
+/// - E5M2: `mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32`
 #[allow(dead_code)]
-pub fn emit_fp8_matmul_ptx(k: usize) -> String {
+pub fn emit_fp8_matmul_ptx(k: usize, format: Fp8Format) -> String {
     use std::fmt::Write;
 
     let k_iters = k / FP8_MMA_K;
@@ -97,9 +126,10 @@ pub fn emit_fp8_matmul_ptx(k: usize) -> String {
     writeln!(ptx).unwrap();
 
     // Kernel entry
-    writeln!(ptx, ".visible .entry nsl_fp8_matmul_kernel(").unwrap();
-    writeln!(ptx, "    .param .u64 param_a,        // A matrix (e4m3, row-major)").unwrap();
-    writeln!(ptx, "    .param .u64 param_b,        // B matrix (e4m3, col-major)").unwrap();
+    let fmt = format.ptx_str();
+    writeln!(ptx, ".visible .entry {}(", format.kernel_name()).unwrap();
+    writeln!(ptx, "    .param .u64 param_a,        // A matrix ({}, row-major)", fmt).unwrap();
+    writeln!(ptx, "    .param .u64 param_b,        // B matrix ({}, col-major)", fmt).unwrap();
     writeln!(ptx, "    .param .u64 param_c,        // C matrix (f32, row-major)").unwrap();
     writeln!(ptx, "    .param .f32 param_scale_a,  // per-tensor scale for A").unwrap();
     writeln!(ptx, "    .param .f32 param_scale_b,  // per-tensor scale for B").unwrap();
@@ -116,7 +146,7 @@ pub fn emit_fp8_matmul_ptx(k: usize) -> String {
     writeln!(ptx, "    .reg .u32 %k_iter;").unwrap();
     writeln!(ptx, "    .reg .pred %pk;").unwrap();
     // MMA fragment registers
-    writeln!(ptx, "    // A-fragment: 4 .b32 (each holds 4 e4m3 = 4 bytes)").unwrap();
+    writeln!(ptx, "    // A-fragment: 4 .b32 (each holds 4 {} = 4 bytes)", fmt).unwrap();
     writeln!(ptx, "    .reg .b32 %a0, %a1, %a2, %a3;").unwrap();
     writeln!(ptx, "    // B-fragment: 2 .b32").unwrap();
     writeln!(ptx, "    .reg .b32 %b0, %b1;").unwrap();
@@ -149,7 +179,7 @@ pub fn emit_fp8_matmul_ptx(k: usize) -> String {
 
     // Compute base addresses for this thread block's tile
     // A tile: row = bid_y * 16, starting at A + row * K
-    writeln!(ptx, "    // A base: A + bid_y * 16 * K (bytes, since e4m3 = 1 byte)").unwrap();
+    writeln!(ptx, "    // A base: A + bid_y * 16 * K (bytes, since fp8 = 1 byte)").unwrap();
     writeln!(ptx, "    mul.lo.u32 %off, %bid_y, {};", FP8_MMA_M).unwrap();
     writeln!(ptx, "    mul.lo.u32 %off, %off, %K;").unwrap();
     writeln!(ptx, "    cvt.u64.u32 %addr_a, %off;").unwrap();
@@ -173,25 +203,25 @@ pub fn emit_fp8_matmul_ptx(k: usize) -> String {
     writeln!(ptx, "    mov.u32 %k_iter, 0;").unwrap();
     writeln!(ptx, "FP8_K_LOOP:").unwrap();
 
-    // Load A-fragment (4 .b32 = 16 bytes = 16 e4m3 values per thread)
+    // Load A-fragment (4 .b32 = 16 bytes = 16 fp8 values per thread)
     writeln!(ptx, "    ld.global.b32 %a0, [%addr_a + 0];").unwrap();
     writeln!(ptx, "    ld.global.b32 %a1, [%addr_a + 4];").unwrap();
     writeln!(ptx, "    ld.global.b32 %a2, [%addr_a + 8];").unwrap();
     writeln!(ptx, "    ld.global.b32 %a3, [%addr_a + 12];").unwrap();
 
-    // Load B-fragment (2 .b32 = 8 bytes = 8 e4m3 values per thread)
+    // Load B-fragment (2 .b32 = 8 bytes = 8 fp8 values per thread)
     writeln!(ptx, "    ld.global.b32 %b0, [%addr_b + 0];").unwrap();
     writeln!(ptx, "    ld.global.b32 %b1, [%addr_b + 4];").unwrap();
 
     // Issue FP8 MMA
-    writeln!(ptx, "    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32").unwrap();
+    writeln!(ptx, "    mma.sync.aligned.m16n8k32.row.col.f32.{fmt}.{fmt}.f32").unwrap();
     writeln!(ptx, "        {{%acc0, %acc1, %acc2, %acc3}},").unwrap();
     writeln!(ptx, "        {{%a0, %a1, %a2, %a3}},").unwrap();
     writeln!(ptx, "        {{%b0, %b1}},").unwrap();
     writeln!(ptx, "        {{%acc0, %acc1, %acc2, %acc3}};").unwrap();
 
-    // Advance pointers by K=32 bytes (32 e4m3 elements = 32 bytes)
-    writeln!(ptx, "    add.u64 %addr_a, %addr_a, {};  // 32 e4m3 elements", FP8_MMA_K).unwrap();
+    // Advance pointers by K=32 bytes (32 fp8 elements = 32 bytes)
+    writeln!(ptx, "    add.u64 %addr_a, %addr_a, {};  // 32 fp8 elements", FP8_MMA_K).unwrap();
     writeln!(ptx, "    add.u64 %addr_b, %addr_b, {};", FP8_MMA_K).unwrap();
 
     // Loop
@@ -238,8 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fp8_matmul_ptx_emission() {
-        let ptx = emit_fp8_matmul_ptx(128);
+    fn test_fp8_matmul_ptx_emission_e4m3() {
+        let ptx = emit_fp8_matmul_ptx(128, Fp8Format::E4M3);
 
         // Header
         assert!(ptx.contains(".version 8.0"), "PTX 8.0 for Hopper");
@@ -252,7 +282,7 @@ mod tests {
 
         // FP8 MMA instruction
         assert!(ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"),
-            "FP8 MMA instruction");
+            "E4M3 MMA instruction");
 
         // Fragment registers
         assert!(ptx.contains(".reg .b32 %a0, %a1, %a2, %a3"), "A-fragment regs");
@@ -273,6 +303,25 @@ mod tests {
     }
 
     #[test]
+    fn test_fp8_matmul_ptx_emission_e5m2() {
+        let ptx = emit_fp8_matmul_ptx(128, Fp8Format::E5M2);
+
+        // E5M2 kernel name
+        assert!(ptx.contains("nsl_fp8_matmul_e5m2_kernel"), "E5M2 kernel name");
+
+        // E5M2 MMA instruction
+        assert!(ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32"),
+            "E5M2 MMA instruction");
+        // Must NOT contain e4m3
+        assert!(!ptx.contains("e4m3"), "E5M2 PTX must not contain e4m3");
+
+        // Same geometry: scale, K-loop, store
+        assert!(ptx.contains("mul.f32 %acc0, %acc0, %scale"), "scale application");
+        assert!(ptx.contains("FP8_K_LOOP"), "K-dimension loop");
+        assert!(ptx.contains("st.global.f32"), "f32 output store");
+    }
+
+    #[test]
     fn test_fp8_mma_constants() {
         assert_eq!(FP8_MMA_M, 16);
         assert_eq!(FP8_MMA_N, 8);
@@ -282,7 +331,7 @@ mod tests {
     #[test]
     fn test_compile_fp8_matmul_sm90_emits_mma() {
         let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
-        let result = compile_fp8_matmul(h100, 128);
+        let result = compile_fp8_matmul(h100, 128, Fp8Format::E4M3);
         match result {
             Fp8MatmulStrategy::MmaKernel { ptx } => {
                 assert!(ptx.contains("mma.sync.aligned.m16n8k32"),
@@ -296,9 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_fp8_matmul_sm90_e5m2() {
+        let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
+        let result = compile_fp8_matmul(h100, 128, Fp8Format::E5M2);
+        match result {
+            Fp8MatmulStrategy::MmaKernel { ptx } => {
+                assert!(ptx.contains("e5m2.e5m2"), "E5M2 MMA format");
+                assert!(!ptx.contains("e4m3"), "Must not contain E4M3");
+            }
+            Fp8MatmulStrategy::RuntimeFallback => {
+                panic!("H100 should NOT fall back for E5M2");
+            }
+        }
+    }
+
+    #[test]
     fn test_compile_fp8_matmul_sm80_falls_back() {
         let a100 = crate::gpu_specs::find_gpu("A100-SXM").unwrap();
-        let result = compile_fp8_matmul(a100, 128);
+        let result = compile_fp8_matmul(a100, 128, Fp8Format::E4M3);
         assert!(matches!(result, Fp8MatmulStrategy::RuntimeFallback),
             "A100 (sm_80) should fall back to runtime");
     }
@@ -306,7 +370,7 @@ mod tests {
     #[test]
     fn test_compile_fp8_matmul_k_not_aligned_falls_back() {
         let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
-        let result = compile_fp8_matmul(h100, 100); // 100 not divisible by 32
+        let result = compile_fp8_matmul(h100, 100, Fp8Format::E4M3); // 100 not divisible by 32
         assert!(matches!(result, Fp8MatmulStrategy::RuntimeFallback),
             "K=100 not aligned to MMA_K=32, should fall back");
     }

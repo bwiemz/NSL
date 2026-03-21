@@ -60,6 +60,9 @@ pub struct FuncState {
     /// M38b: Ownership lowering state for linear types free-at-consumption.
     /// `Some` when `--linear-types` is active and the function has ownership metadata.
     pub ownership_lowering: Option<crate::ownership::OwnershipLowering>,
+    /// M35: True when compiling a function with @fp8_compute decorator.
+    /// MatMul ops use nsl_fp8_matmul_training for E5M2 backward tape recording.
+    pub is_fp8_compute: bool,
 }
 
 impl Default for FuncState {
@@ -85,6 +88,7 @@ impl FuncState {
             symbolic_dims: crate::dynamic_shapes::SymbolicDimTracker::new(),
             in_tape_region: false,
             ownership_lowering: None,
+            is_fp8_compute: false,
         }
     }
 

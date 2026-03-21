@@ -1164,6 +1164,31 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *bias, grad_bias);
                 }
             }
+            TapeOp::Fp8MatMul { a, b, out, saved_a, saved_b, scale_a, scale_b, k_dim, device } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let _ = (k_dim, device); // reserved for future GPU kernel caching
+
+                    // Compute fresh gradient scale (no EMA — gradients change every step)
+                    let scale_g = crate::fp8::calibrate_gradient_scale(g);
+
+                    // grad_A = G @ B^T  (both quantized to E5M2)
+                    let b_t = tensor_transpose(*saved_b, -2, -1);
+                    let grad_a = crate::fp8::fp8_matmul_e5m2_backward(
+                        g, b_t, scale_g, *scale_b,
+                    );
+                    tensor_free(b_t);
+
+                    // grad_B = A^T @ G  (both quantized to E5M2)
+                    let a_t = tensor_transpose(*saved_a, -2, -1);
+                    let grad_b = crate::fp8::fp8_matmul_e5m2_backward(
+                        a_t, g, *scale_a, scale_g,
+                    );
+                    tensor_free(a_t);
+
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                    accumulate_grad(&mut grad_map, *b, grad_b);
+                }
+            }
         }
     }
 

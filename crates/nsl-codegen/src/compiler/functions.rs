@@ -336,7 +336,7 @@ impl Compiler<'_> {
         for md in &model_defs {
             let model_name = self.resolve_sym(md.name).to_string();
             for member in &md.members {
-                if let ModelMember::Method(fn_def, _decos) = member {
+                if let ModelMember::Method(fn_def, decos) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
                     let (func_id, sig) = self.functions.get(&mangled)
@@ -358,6 +358,14 @@ impl Compiler<'_> {
                         builder.switch_to_block(entry);
                         builder.seal_block(entry);
                         state.current_block = Some(entry);
+
+                        // @fp8_compute on model method: use FP8 training matmul
+                        if decos.iter().any(|d| d.name.len() == 1 && self.resolve_sym(d.name[0]) == "fp8_compute")
+                            || self.features.fp8_compute_fns.contains(&method_name)
+                            || self.features.fp8_compute_fns.contains(&mangled)
+                        {
+                            state.is_fp8_compute = true;
+                        }
 
                         // First Cranelift param is self (pointer)
                         let self_val = builder.block_params(entry)[0];
