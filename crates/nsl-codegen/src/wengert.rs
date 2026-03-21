@@ -58,6 +58,10 @@ pub enum PrimalOp {
     // Attention
     ScaledDotProductAttention { causal: bool },
     RoPE { dim: usize },
+    /// Inverse rotation (rotate by -θ) — used in RoPE backward.
+    RoPEInverse { dim: usize },
+    /// Fused FlashAttention backward kernel. Runtime handles the 6-step decomposition.
+    FlashAttentionBackward { causal: bool },
     // Regularization
     Dropout { p: f64 },
     // Control flow
