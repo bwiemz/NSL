@@ -34,10 +34,27 @@ pub enum PrimalOp {
     // Shape ops
     Reshape { target_ndim: usize },
     Broadcast,
+    // Control flow
+    /// Conditional select: result = inputs[0] (cond) ? inputs[1] (true_val) : inputs[2] (false_val)
+    Select,
+    /// Boolean comparison (non-differentiable). Used to save branch conditions.
+    /// inputs = [lhs, rhs], stores the comparison kind.
+    Condition(CompareKind),
     // Markers
     Input(String),
     Param(String),
     Constant(f64),
+}
+
+/// Comparison operators for branch conditions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompareKind {
+    Gt,
+    Lt,
+    GtEq,
+    LtEq,
+    Eq,
+    NotEq,
 }
 
 /// Linearized forward computation graph.

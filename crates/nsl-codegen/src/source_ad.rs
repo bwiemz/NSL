@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
-use crate::wengert::{OpId, PrimalOp, VarId, WengertList, WengertOp};
+use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp};
 
 // M40b: Wengert extraction from typed AST
 use nsl_ast::expr::ExprKind;
@@ -109,6 +109,27 @@ impl AdjointGenerator {
             AdjointExpr::SqrtBackward(y_bar, y) => (PrimalOp::Div, vec![y_bar, y]),
             AdjointExpr::DivNumeratorBackward(y_bar, b) => (PrimalOp::Div, vec![y_bar, b]),
             AdjointExpr::DivDenominatorBackward(y_bar, a, b) => (PrimalOp::Mul, vec![y_bar, a, b]),
+            // SelectTrue: cond ? adj_out : 0
+            AdjointExpr::SelectTrue(y_bar, cond) => {
+                // Emit a zero constant first
+                let zero = self.next_var();
+                let zero_op = self.next_op();
+                self.adjoint_ops.push(WengertOp {
+                    id: zero_op, result: zero, op: PrimalOp::Constant(0.0),
+                    inputs: vec![], saved_for_backward: false, checkpointed: false,
+                });
+                (PrimalOp::Select, vec![cond, y_bar, zero])
+            }
+            // SelectFalse: !cond ? adj_out : 0, i.e. cond ? 0 : adj_out
+            AdjointExpr::SelectFalse(y_bar, cond) => {
+                let zero = self.next_var();
+                let zero_op = self.next_op();
+                self.adjoint_ops.push(WengertOp {
+                    id: zero_op, result: zero, op: PrimalOp::Constant(0.0),
+                    inputs: vec![], saved_for_backward: false, checkpointed: false,
+                });
+                (PrimalOp::Select, vec![cond, zero, y_bar])
+            }
         };
         self.adjoint_ops.push(WengertOp {
             id: op_id, result, op, inputs,
@@ -335,12 +356,10 @@ impl<'a> WengertExtractor<'a> {
                 false
             }
 
-            // If statements: mark as dynamic (data-dependent branches)
-            // Shape-dependent ifs could be resolved at compile time, but
-            // that requires type-level analysis deferred to M40c
-            StmtKind::If { .. } => {
-                self.is_static = false;
-                false
+            // If/else: extract both branches, emit Select ops for variables
+            // that differ between branches. The condition is saved for backward.
+            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+                self.extract_if(condition, then_block, elif_clauses, else_block.as_ref())
             }
 
             // Other statements pass through (assign, decorated, etc.)
@@ -365,6 +384,13 @@ impl<'a> WengertExtractor<'a> {
                     BinOp::Sub => PrimalOp::Sub,
                     BinOp::Mul => PrimalOp::Mul,
                     BinOp::Div => PrimalOp::Div,
+                    // Comparison operators (non-differentiable, used for branch conditions)
+                    BinOp::Gt => PrimalOp::Condition(CompareKind::Gt),
+                    BinOp::Lt => PrimalOp::Condition(CompareKind::Lt),
+                    BinOp::GtEq => PrimalOp::Condition(CompareKind::GtEq),
+                    BinOp::LtEq => PrimalOp::Condition(CompareKind::LtEq),
+                    BinOp::Eq => PrimalOp::Condition(CompareKind::Eq),
+                    BinOp::NotEq => PrimalOp::Condition(CompareKind::NotEq),
                     _ => return None, // Unsupported op for AD
                 };
                 self.list.ops.push(WengertOp {
@@ -471,6 +497,156 @@ impl<'a> WengertExtractor<'a> {
             // Anything else we can't extract -> fallback
             _ => None,
         }
+    }
+
+    /// Extract an if/else statement into the Wengert list.
+    ///
+    /// Strategy: flatten branches into linear SSA by extracting both branches
+    /// independently, then emitting `Select(cond, true_val, false_val)` ops
+    /// for any variables that differ between branches.
+    ///
+    /// For `if cond { return x*x } else { return -x }`, this produces:
+    ///   cond_var = Condition(Gt, x, 0)
+    ///   true_val = Mul(x, x)        // from then-branch
+    ///   false_val = Neg(x)           // from else-branch
+    ///   result = Select(cond_var, true_val, false_val)
+    ///
+    /// # Speculative (Eager) Evaluation of Both Branches
+    ///
+    /// **Both branches are eagerly evaluated**: all ops from both the then-branch
+    /// and the else-branch appear unconditionally in the Wengert list. Only the
+    /// `Select` op at the end chooses which result to use based on the condition.
+    ///
+    /// This design is **intentional** for two reasons:
+    /// 1. **SSA flattening**: the Wengert list is a linear DAG with no control flow;
+    ///    both paths must be materialized so that reverse-mode AD can propagate
+    ///    gradients through the chosen branch.
+    /// 2. **AD correctness**: the `SelectTrue`/`SelectFalse` adjoint rules mask
+    ///    gradient flow to the non-taken branch (multiplying by 0), which is the
+    ///    correct sub-gradient for a piecewise-linear selection.
+    ///
+    /// **Known limitation — side effects and expensive computations**: Because both
+    /// branches execute unconditionally, any side-effectful code (I/O, mutations,
+    /// random sampling) inside a branch will run on *every* evaluation regardless of
+    /// the condition. Similarly, expensive computations in the unused branch still
+    /// pay their full cost. This is a deliberate trade-off for AD correctness; users
+    /// with side-effectful branches should use the dynamic tape fallback (`@no_static`
+    /// or constructs that prevent static extraction) instead.
+    fn extract_if(
+        &mut self,
+        condition: &nsl_ast::expr::Expr,
+        then_block: &nsl_ast::stmt::Block,
+        elif_clauses: &[(nsl_ast::expr::Expr, nsl_ast::stmt::Block)],
+        else_block: Option<&nsl_ast::stmt::Block>,
+    ) -> bool {
+        // Extract the condition expression
+        let cond_var = match self.extract_expr(condition) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // Snapshot the current symbol -> var mapping before entering branches
+        let snapshot = self.symbol_to_var.clone();
+        let output_before = self.list.output;
+
+        // --- Extract then-branch ---
+        if !self.extract_stmts(&then_block.stmts) {
+            return false;
+        }
+        let then_symbols = self.symbol_to_var.clone();
+        let then_output = self.list.output;
+
+        // Restore snapshot for else-branch extraction
+        self.symbol_to_var = snapshot.clone();
+        self.list.output = output_before;
+
+        // --- Extract else-branch ---
+        // Handle elif as nested if/else: `elif c2: B2 else: B3` becomes
+        // `else: if c2: B2 else: B3` — we support at most simple else for now.
+        // If there are elif clauses, desugar the first one as a nested if.
+        if !elif_clauses.is_empty() {
+            // Desugar: elif chain becomes nested if/else.
+            // `elif c2: B2 elif c3: B3 else: B4` is treated as
+            // `else: if c2: B2 elif c3: B3 else: B4`, recursively.
+            let (elif_cond, elif_block) = &elif_clauses[0];
+            let remaining_elifs = &elif_clauses[1..];
+            // Pass the remaining elif clauses into the recursive call so the
+            // entire chain is desugared, not just the first level.
+            if !self.extract_if(elif_cond, elif_block, remaining_elifs, else_block) {
+                return false;
+            }
+        } else if let Some(else_blk) = else_block {
+            if !self.extract_stmts(&else_blk.stmts) {
+                return false;
+            }
+        }
+        // If no else block: variables retain their pre-branch values (identity)
+
+        let else_symbols = self.symbol_to_var.clone();
+        let else_output = self.list.output;
+
+        // --- Merge branches with Select ops ---
+        // Collect all symbols that exist in either branch
+        let all_symbols: HashSet<nsl_ast::Symbol> = then_symbols.keys()
+            .chain(else_symbols.keys())
+            .copied()
+            .collect();
+
+        for sym in &all_symbols {
+            let then_var = then_symbols.get(sym).copied();
+            let else_var = else_symbols.get(sym).copied();
+            let before_var = snapshot.get(sym).copied();
+
+            let tv = then_var.or(before_var);
+            let ev = else_var.or(before_var);
+
+            if let (Some(t), Some(e)) = (tv, ev) {
+                if t != e {
+                    // Different values in each branch — emit Select
+                    let result = self.alloc_var();
+                    self.list.ops.push(WengertOp {
+                        id: self.list.ops.len() as u32,
+                        result,
+                        op: PrimalOp::Select,
+                        inputs: vec![cond_var, t, e],
+                        saved_for_backward: false,
+                        checkpointed: false,
+                    });
+                    self.symbol_to_var.insert(*sym, result);
+                    // Propagate variable name
+                    if let Some(name) = self.list.var_names.get(&t).cloned()
+                        .or_else(|| self.list.var_names.get(&e).cloned())
+                    {
+                        self.list.var_names.insert(result, name);
+                    }
+                } else {
+                    // Same value in both branches — no Select needed
+                    self.symbol_to_var.insert(*sym, t);
+                }
+            }
+        }
+
+        // Handle output (return value) merging
+        if then_output != output_before || else_output != output_before {
+            let t_out = if then_output != output_before { then_output } else { output_before };
+            let e_out = if else_output != output_before { else_output } else { output_before };
+            if t_out != e_out {
+                let result = self.alloc_var();
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: PrimalOp::Select,
+                    inputs: vec![cond_var, t_out, e_out],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                self.list.output = result;
+            } else {
+                self.list.output = t_out;
+            }
+        }
+
+        true
     }
 
     /// Finalize extraction. Returns the WengertList if the graph is static.
@@ -689,5 +865,1088 @@ mod tests {
         let interner = Interner::new();
         let extractor = WengertExtractor::new(&interner);
         assert!(extractor.finalize().is_none());
+    }
+
+    // --- Helper: build AST nodes for if/else tests ---
+
+    fn dummy_span() -> nsl_errors::Span {
+        nsl_errors::Span::dummy()
+    }
+
+    fn make_ident_expr(sym: nsl_ast::Symbol) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::Ident(sym),
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_float_expr(v: f64) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::FloatLiteral(v),
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_binop_expr(
+        left: nsl_ast::expr::Expr,
+        op: nsl_ast::operator::BinOp,
+        right: nsl_ast::expr::Expr,
+    ) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_neg_expr(operand: nsl_ast::expr::Expr) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind: ExprKind::UnaryOp {
+                op: nsl_ast::operator::UnaryOp::Neg,
+                operand: Box::new(operand),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_return_stmt(expr: nsl_ast::expr::Expr) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::Return(Some(expr)),
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_let_stmt(
+        sym: nsl_ast::Symbol,
+        value: nsl_ast::expr::Expr,
+    ) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::VarDecl {
+                is_const: false,
+                pattern: nsl_ast::pattern::Pattern {
+                    kind: nsl_ast::pattern::PatternKind::Ident(sym),
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId::next(),
+                },
+                type_ann: None,
+                value: Some(value),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_block(stmts: Vec<nsl_ast::stmt::Stmt>) -> nsl_ast::stmt::Block {
+        nsl_ast::stmt::Block { stmts, span: dummy_span() }
+    }
+
+    fn make_if_stmt(
+        condition: nsl_ast::expr::Expr,
+        then_stmts: Vec<nsl_ast::stmt::Stmt>,
+        else_stmts: Option<Vec<nsl_ast::stmt::Stmt>>,
+    ) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::If {
+                condition,
+                then_block: make_block(then_stmts),
+                elif_clauses: vec![],
+                else_block: else_stmts.map(make_block),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    fn make_if_elif_stmt(
+        condition: nsl_ast::expr::Expr,
+        then_stmts: Vec<nsl_ast::stmt::Stmt>,
+        elif_cond: nsl_ast::expr::Expr,
+        elif_stmts: Vec<nsl_ast::stmt::Stmt>,
+        else_stmts: Option<Vec<nsl_ast::stmt::Stmt>>,
+    ) -> nsl_ast::stmt::Stmt {
+        nsl_ast::stmt::Stmt {
+            kind: StmtKind::If {
+                condition,
+                then_block: make_block(then_stmts),
+                elif_clauses: vec![(elif_cond, make_block(elif_stmts))],
+                else_block: else_stmts.map(make_block),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId::next(),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Task 1: Source AD accepts simple if/else (no longer marks dynamic)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_accepts_simple_if_else() {
+        // f(x) = if x > 0: return x else: return 0.0
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let then_stmts = vec![make_return_stmt(make_ident_expr(x_sym))];
+        let else_stmts = vec![make_return_stmt(make_float_expr(0.0))];
+        let if_stmt = make_if_stmt(cond, then_stmts, Some(else_stmts));
+
+        let result = extractor.extract_stmts(&[if_stmt]);
+        assert!(result, "Source AD should accept simple if/else");
+        assert!(extractor.is_static_graph(), "If/else should not make graph dynamic");
+
+        let list = extractor.finalize();
+        assert!(list.is_some(), "Should produce a valid WengertList");
+    }
+
+    #[test]
+    fn extract_still_rejects_while_loops() {
+        // Ensure while loops are still dynamic
+        let interner = Interner::new();
+        let mut extractor = WengertExtractor::new(&interner);
+
+        let while_stmt = nsl_ast::stmt::Stmt {
+            kind: StmtKind::While {
+                condition: nsl_ast::expr::Expr {
+                    kind: ExprKind::BoolLiteral(true),
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId(0),
+                },
+                body: make_block(vec![]),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId(1),
+        };
+
+        assert!(!extractor.extract_stmts(&[while_stmt]));
+        assert!(!extractor.is_static_graph());
+    }
+
+    #[test]
+    fn extract_still_rejects_for_loops() {
+        let interner = Interner::new();
+        let mut extractor = WengertExtractor::new(&interner);
+
+        let for_stmt = nsl_ast::stmt::Stmt {
+            kind: StmtKind::For {
+                pattern: nsl_ast::pattern::Pattern {
+                    kind: nsl_ast::pattern::PatternKind::Wildcard,
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId(0),
+                },
+                iterable: nsl_ast::expr::Expr {
+                    kind: ExprKind::IntLiteral(10),
+                    span: dummy_span(),
+                    id: nsl_ast::NodeId(0),
+                },
+                body: make_block(vec![]),
+            },
+            span: dummy_span(),
+            id: nsl_ast::NodeId(1),
+        };
+
+        assert!(!extractor.extract_stmts(&[for_stmt]));
+    }
+
+    // ---------------------------------------------------------------
+    // Task 2: Forward pass saves branch condition + emits Select
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_if_else_produces_select_op() {
+        // f(x) = if x > 0: return x*x else: return -x
+        // Should produce: cond = Condition(Gt, x, 0); t = Mul(x,x); e = Neg(x); out = Select(cond, t, e)
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let then_stmts = vec![make_return_stmt(make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        ))];
+        let else_stmts = vec![make_return_stmt(make_neg_expr(make_ident_expr(x_sym)))];
+        let if_stmt = make_if_stmt(cond, then_stmts, Some(else_stmts));
+
+        let result = extractor.extract_stmts(&[if_stmt]);
+        assert!(result, "Should extract if/else successfully");
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Verify a Condition op was emitted
+        let has_condition = list.ops.iter().any(|op| matches!(&op.op, PrimalOp::Condition(CompareKind::Gt)));
+        assert!(has_condition, "Should contain a Condition(Gt) op for `x > 0`");
+
+        // Verify a Select op was emitted
+        let select_ops: Vec<_> = list.ops.iter().filter(|op| matches!(&op.op, PrimalOp::Select)).collect();
+        assert!(!select_ops.is_empty(), "Should contain at least one Select op");
+
+        // The Select op should have 3 inputs: [cond, true_val, false_val]
+        for sel in &select_ops {
+            assert_eq!(sel.inputs.len(), 3, "Select should have 3 inputs (cond, true, false)");
+        }
+
+        // The output should be the Select result
+        let last_select = select_ops.last().unwrap();
+        assert_eq!(list.output, last_select.result, "Output should be the Select result");
+    }
+
+    #[test]
+    fn extract_if_else_condition_saved_as_var() {
+        // Verify the condition comparison result is captured in the Wengert list
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let then_stmts = vec![make_return_stmt(make_ident_expr(x_sym))];
+        let else_stmts = vec![make_return_stmt(make_float_expr(0.0))];
+        let if_stmt = make_if_stmt(cond, then_stmts, Some(else_stmts));
+
+        extractor.extract_stmts(&[if_stmt]);
+        let list = extractor.finalize().unwrap();
+
+        // Find the Condition op
+        let cond_op = list.ops.iter().find(|op| matches!(&op.op, PrimalOp::Condition(_))).unwrap();
+        let cond_var = cond_op.result;
+
+        // Find the Select op that uses this condition
+        let select_op = list.ops.iter().find(|op| {
+            matches!(&op.op, PrimalOp::Select) && op.inputs[0] == cond_var
+        });
+        assert!(select_op.is_some(), "Select should reference the saved condition variable");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 3: Backward pass produces conditional adjoint selection
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn adjoint_of_select_produces_conditional_gradient() {
+        // Primal: x (param), 0.0 (const), cond = x > 0, t = x, e = 0.0, out = Select(cond, t, e)
+        // This is relu: f(x) = max(x, 0)
+        // Backward: d(out)/dx = cond ? 1 : 0
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Select, vec![2, 0, 1]),
+            ],
+            output: 3,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+
+        // The output (var 3) should have an adjoint
+        assert!(gen.adjoint_of(3).is_some(), "Output should have adjoint");
+
+        // The param x (var 0) should have an adjoint (from Select true-branch)
+        assert!(gen.adjoint_of(0).is_some(), "Param x should have adjoint through Select");
+
+        // Verify Select ops appear in adjoint list (for conditional gradient selection)
+        let has_select_in_adjoint = adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Select));
+        assert!(has_select_in_adjoint,
+            "Backward pass should contain Select ops for conditional adjoint selection");
+    }
+
+    #[test]
+    fn adjoint_select_has_zero_for_inactive_branch() {
+        // For Select(cond, a, b), backward should create:
+        //   adj_a = Select(cond, adj_out, 0)
+        //   adj_b = Select(cond, 0, adj_out)
+        // Verify zero constants are generated
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Select, vec![2, 0, 1]),
+            ],
+            output: 3,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+
+        // Should have Constant(0.0) ops in the adjoint for the zero branches
+        let zero_consts: Vec<_> = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Constant(v) if *v == 0.0))
+            .collect();
+        assert!(!zero_consts.is_empty(),
+            "Backward pass should contain Constant(0.0) for inactive branch adjoints");
+    }
+
+    #[test]
+    fn adjoint_quadratic_linear_branch() {
+        // f(x) = if x > 0 { x * x } else { -x }
+        // Primal ops: x(0), zero(1), cond(2)=x>0, t(3)=x*x, e(4)=-x, out(5)=Select(cond, t, e)
+        // d/dx for true branch (x*x): 2x
+        // d/dx for false branch (-x): -1
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Mul, vec![0, 0]),  // x * x (then-branch)
+                make_op(4, 4, PrimalOp::Neg, vec![0]),       // -x (else-branch)
+                make_op(5, 5, PrimalOp::Select, vec![2, 3, 4]),
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+
+        // x should have adjoint (from both Mul and Neg, gated by Select)
+        assert!(gen.adjoint_of(0).is_some(), "x should have an adjoint");
+        // The true result and false result should have adjoints
+        assert!(gen.adjoint_of(3).is_some(), "true-branch result (x*x) should have adjoint");
+        assert!(gen.adjoint_of(4).is_some(), "false-branch result (-x) should have adjoint");
+
+        // Both branch results' adjoints should be Select ops (conditional on saved cond)
+        let select_count = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(select_count >= 2,
+            "Should have at least 2 Select ops in backward (one per branch input), got {select_count}");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 4: Nested if/else
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_nested_if_else() {
+        // f(x) = if x > 0 { if x > 1 { x*x*x } else { x*x } } else { 0 }
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        // Inner if: if x > 1 { x*x*x } else { x*x }
+        let inner_cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(1.0),
+        );
+        let x_cubed = make_binop_expr(
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Mul,
+                make_ident_expr(x_sym),
+            ),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let x_squared = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+
+        let inner_if = make_if_stmt(
+            inner_cond,
+            vec![make_return_stmt(x_cubed)],
+            Some(vec![make_return_stmt(x_squared)]),
+        );
+
+        // Outer if: if x > 0 { <inner_if> } else { 0 }
+        let outer_cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let outer_if = make_if_stmt(
+            outer_cond,
+            vec![inner_if],
+            Some(vec![make_return_stmt(make_float_expr(0.0))]),
+        );
+
+        let result = extractor.extract_stmts(&[outer_if]);
+        assert!(result, "Nested if/else should be extractable");
+        assert!(extractor.is_static_graph());
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Should have 2 Condition ops (one per if)
+        let cond_count = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .count();
+        assert_eq!(cond_count, 2, "Should have 2 Condition ops for nested if/else, got {cond_count}");
+
+        // Should have at least 2 Select ops (one per merge point)
+        let select_count = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(select_count >= 2, "Should have at least 2 Select ops, got {select_count}");
+    }
+
+    #[test]
+    fn adjoint_nested_branches_propagates() {
+        // Nested: if x > 0 { if x > 1 { x*x } else { x } } else { 0 }
+        // We build the flat Wengert for this manually:
+        //   x(0), zero(1), one(2)
+        //   cond_outer(3) = x > 0
+        //   cond_inner(4) = x > 1
+        //   t_inner(5) = x * x
+        //   inner_select(6) = Select(cond_inner, t_inner, x)  -- inner merge
+        //   outer_select(7) = Select(cond_outer, inner_select, zero) -- outer merge
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Constant(1.0), vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                make_op(5, 5, PrimalOp::Mul, vec![0, 0]),
+                make_op(6, 6, PrimalOp::Select, vec![4, 5, 0]),
+                make_op(7, 7, PrimalOp::Select, vec![3, 6, 1]),
+            ],
+            output: 7,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // x (var 0) should have an adjoint — gradient propagates through both Select ops
+        assert!(gen.adjoint_of(0).is_some(), "x should have adjoint through nested Select");
+
+        // The adjoint list should contain multiple Select ops (from both nesting levels)
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Adjoint should have >= 2 Select ops for nested branching, got {adj_selects}");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 5: If-without-else (identity for missing branch)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_if_without_else() {
+        // f(x):
+        //   let y = x
+        //   if x > 5: y = x * 2
+        //   return y
+        // For x > 5: f(x) = 2x, f'(x) = 2
+        // For x <= 5: f(x) = x, f'(x) = 1
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let y_sym = nsl_ast::Symbol(interner.get_or_intern("y"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        // let y = x
+        let let_y = make_let_stmt(y_sym, make_ident_expr(x_sym));
+
+        // if x > 5: let y = x * 2.0
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(5.0),
+        );
+        let x_times_2 = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_float_expr(2.0),
+        );
+        let reassign_y = make_let_stmt(y_sym, x_times_2);
+        let if_stmt = make_if_stmt(cond, vec![reassign_y], None); // No else!
+
+        // return y
+        let return_y = make_return_stmt(make_ident_expr(y_sym));
+
+        let result = extractor.extract_stmts(&[let_y, if_stmt, return_y]);
+        assert!(result, "If-without-else should be extractable");
+        assert!(extractor.is_static_graph());
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Should have a Select op that chooses between modified y (x*2) and original y (x)
+        let select_ops: Vec<_> = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .collect();
+        assert!(!select_ops.is_empty(),
+            "If-without-else should produce Select op (modified vs identity)");
+
+        // The Select should use the pre-branch value as the false (else) input
+        // This is the identity case — when condition is false, y retains its original value
+        let sel = select_ops.last().unwrap();
+        assert_eq!(sel.inputs.len(), 3);
+    }
+
+    #[test]
+    fn adjoint_if_without_else_identity_passthrough() {
+        // Manual Wengert for: y = x; if x > 5: y = x * 2; return y
+        //   x(0), five(1), two(2)
+        //   cond(3) = x > 5
+        //   modified_y(4) = x * 2
+        //   y_merged(5) = Select(cond, modified_y, x)  // else branch is identity (x)
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(5.0), vec![]),
+                make_op(2, 2, PrimalOp::Constant(2.0), vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(4, 4, PrimalOp::Mul, vec![0, 2]),  // x * 2
+                make_op(5, 5, PrimalOp::Select, vec![3, 4, 0]),  // cond ? x*2 : x
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // x should have an adjoint
+        assert!(gen.adjoint_of(0).is_some(), "x should have adjoint");
+
+        // The backward pass should produce Select ops for conditional adjoint
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 1,
+            "Backward should use Select for conditional adjoint, got {adj_selects}");
+    }
+
+    #[test]
+    fn extract_elif_desugars_to_nested() {
+        // f(x) = if x > 1: x*x*x  elif x > 0: x*x  else: 0
+        // This tests elif desugaring (single elif clause + else)
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let x_cubed = make_binop_expr(
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Mul,
+                make_ident_expr(x_sym),
+            ),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let x_squared = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+
+        let if_stmt = make_if_elif_stmt(
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Gt,
+                make_float_expr(1.0),
+            ),
+            vec![make_return_stmt(x_cubed)],
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Gt,
+                make_float_expr(0.0),
+            ),
+            vec![make_return_stmt(x_squared)],
+            Some(vec![make_return_stmt(make_float_expr(0.0))]),
+        );
+
+        let result = extractor.extract_stmts(&[if_stmt]);
+        assert!(result, "elif should be desugared and extractable");
+        assert!(extractor.is_static_graph());
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Should have 2 Condition ops (outer and elif)
+        let cond_count = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .count();
+        assert_eq!(cond_count, 2, "Should have 2 Condition ops for if/elif/else, got {cond_count}");
+    }
+
+    // ---------------------------------------------------------------
+    // Integration: end-to-end extraction + adjoint generation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn end_to_end_relu_extraction_and_adjoint() {
+        // Build AST for: if x > 0 { return x } else { return 0 }
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let if_stmt = make_if_stmt(
+            cond,
+            vec![make_return_stmt(make_ident_expr(x_sym))],
+            Some(vec![make_return_stmt(make_float_expr(0.0))]),
+        );
+
+        assert!(extractor.extract_stmts(&[if_stmt]));
+        let primal = extractor.finalize().unwrap();
+
+        // Generate adjoint
+        let max_primal_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
+        let mut gen = AdjointGenerator::new(max_primal_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // Verify the full pipeline works
+        assert!(!adjoint.ops.is_empty(), "Adjoint list should not be empty");
+        // x should have an adjoint
+        let x_var = primal.ops.iter()
+            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .map(|op| op.result)
+            .unwrap();
+        assert!(gen.adjoint_of(x_var).is_some(), "Param x should have adjoint in relu");
+    }
+
+    #[test]
+    fn end_to_end_quadratic_branch_extraction_and_adjoint() {
+        // Build AST for: if x > 0 { return x*x } else { return -x }
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let x_squared = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let neg_x = make_neg_expr(make_ident_expr(x_sym));
+        let if_stmt = make_if_stmt(
+            cond,
+            vec![make_return_stmt(x_squared)],
+            Some(vec![make_return_stmt(neg_x)]),
+        );
+
+        assert!(extractor.extract_stmts(&[if_stmt]));
+        let primal = extractor.finalize().unwrap();
+
+        let max_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        assert!(!adjoint.ops.is_empty());
+        // Both branches contribute to the adjoint of x
+        let x_var = primal.ops.iter()
+            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .map(|op| op.result)
+            .unwrap();
+        assert!(gen.adjoint_of(x_var).is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // Task 6: E2E-style tests for branching gradients
+    //
+    // These tests exercise the full pipeline (extractor → primal list →
+    // adjoint generator) for the three canonical patterns from the plan.
+    // Full NSL-file E2E tests are not practical without a live runtime,
+    // so we use the AST-level API which is exactly what the compiler uses.
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Task 6.1: Leaky ReLU
+    //   f(x) = if x > 0 { x } else { 0.01 * x }
+    //   f'(x) = 1.0  when x > 0
+    //   f'(x) = 0.01 when x <= 0
+    //
+    // Primal Wengert:
+    //   x(0), zero(1), alpha(2)=0.01
+    //   cond(3) = x > 0          Condition(Gt, x, zero)
+    //   scaled(4) = alpha * x    Mul(alpha, x)
+    //   out(5) = Select(cond, x, scaled)
+    //
+    // Backward:
+    //   adj(x) should come from Select(cond, 1·adj_out, 0.01·adj_out)
+    // ---------------------------------------------------------------
+    #[test]
+    fn leaky_relu_gradient_structure() {
+        // Build using the AST extractor to stay close to the real compiler path.
+        let mut interner = Interner::new();
+        let x_sym   = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let alpha_sym = nsl_ast::Symbol(interner.get_or_intern("alpha"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+        extractor.register_input(alpha_sym);
+
+        // cond: x > 0
+        let cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        // then branch: return x
+        let then_branch = vec![make_return_stmt(make_ident_expr(x_sym))];
+        // else branch: return alpha * x
+        let alpha_times_x = make_binop_expr(
+            make_ident_expr(alpha_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let else_branch = vec![make_return_stmt(alpha_times_x)];
+
+        let if_stmt = make_if_stmt(cond, then_branch, Some(else_branch));
+
+        let ok = extractor.extract_stmts(&[if_stmt]);
+        assert!(ok, "Leaky ReLU if/else should be extractable by source AD");
+        assert!(extractor.is_static_graph(), "Should remain static graph");
+
+        let primal = extractor.finalize().expect("Should produce WengertList");
+
+        // Structural checks on the primal
+        let cond_count = primal.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .count();
+        assert_eq!(cond_count, 1, "Leaky ReLU needs exactly 1 Condition op");
+
+        let select_count = primal.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert_eq!(select_count, 1, "Leaky ReLU needs exactly 1 Select op");
+
+        // Generate the adjoint
+        let max_var = primal.ops.iter().map(|op| op.result).max().unwrap_or(0);
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // x (the param) must have an adjoint
+        let x_var = primal.ops.iter()
+            .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
+            .map(|op| op.result)
+            .expect("x must be in primal");
+        assert!(gen.adjoint_of(x_var).is_some(),
+            "Param x should have an adjoint in leaky ReLU");
+
+        // The adjoint must use Select to conditionally route gradient
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 1,
+            "Leaky ReLU backward should use at least 1 Select op for conditional gradient, \
+             got {adj_selects}");
+
+        // There must be no tape-style Input ops in the adjoint (source AD is tape-free)
+        let tape_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Input(_)))
+            .count();
+        assert_eq!(tape_ops, 0,
+            "Source AD adjoint must not contain Input (tape-push) ops, got {tape_ops}");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 6.2: Nested clamp gradient
+    //   f(x, lo, hi) = if x < lo { lo } else { if x > hi { hi } else { x } }
+    //   f'(x) = 0  when x < lo  (gradient killed — lo is constant)
+    //   f'(x) = 0  when x > hi  (gradient killed — hi is constant)
+    //   f'(x) = 1  when lo <= x <= hi (pass-through)
+    //
+    // We build the flat Wengert directly (as the adjoint generator sees it):
+    //   x(0), lo(1), hi(2)
+    //   cond_low(3)  = x < lo       Condition(Lt)
+    //   cond_high(4) = x > hi       Condition(Gt)
+    //   inner(5) = Select(cond_high, hi, x)   -- inner if: x>hi ? hi : x
+    //   out(6)   = Select(cond_low, lo, inner) -- outer if: x<lo ? lo : inner
+    //
+    // In the true branch of cond_low the result is lo (Input, not Param of x),
+    // so x gets gradient 0 from that branch.  In the false branch x's gradient
+    // flows through inner_select, again gated by cond_high.
+    // ---------------------------------------------------------------
+    #[test]
+    fn nested_clamp_gradient_structure() {
+        // x is the param we differentiate w.r.t.; lo and hi are inputs (constants).
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()),  vec![]),
+                make_op(1, 1, PrimalOp::Input("lo".into()), vec![]),
+                make_op(2, 2, PrimalOp::Input("hi".into()), vec![]),
+                // cond_low = x < lo
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Lt), vec![0, 1]),
+                // cond_high = x > hi
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                // inner = cond_high ? hi : x
+                make_op(5, 5, PrimalOp::Select, vec![4, 2, 0]),
+                // out = cond_low ? lo : inner
+                make_op(6, 6, PrimalOp::Select, vec![3, 1, 5]),
+            ],
+            output: 6,
+            var_names: HashMap::new(),
+        };
+
+        let max_var = 6;
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // x must have an adjoint
+        assert!(gen.adjoint_of(0).is_some(),
+            "x should have an adjoint through the nested clamp Select chain");
+
+        // The adjoint should use multiple Select ops to gate the gradient
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Nested clamp backward needs >= 2 Select ops (one per nesting level), \
+             got {adj_selects}");
+
+        // lo (var 1) and hi (var 2) are Inputs — no gradient expected
+        // (they are not Params so AdjointGenerator will not produce a path to them
+        //  that matters for x's gradient, but the adjoint list should still be sound)
+        assert!(!adjoint.ops.is_empty(), "Adjoint list must not be empty");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 6.3: Multiple differentiable variables in branches
+    //   f(cond_flag, a, b) = if cond_flag > 0.5 { a * b } else { a + b }
+    //
+    // Gradient w.r.t. a:
+    //   true  branch: d(a*b)/da = b  → adjoint contributes b * adj_out
+    //   false branch: d(a+b)/da = 1  → adjoint contributes 1 * adj_out
+    //   Combined via Select: adj_a = Select(cond, b·adj_out, adj_out)
+    //
+    // Gradient w.r.t. b:
+    //   true  branch: d(a*b)/db = a  → a * adj_out
+    //   false branch: d(a+b)/db = 1  → adj_out
+    //   Combined via Select: adj_b = Select(cond, a·adj_out, adj_out)
+    //
+    // Primal Wengert (flat):
+    //   cond_raw(0), a(1), b(2)  — all Params
+    //   half(3) = Constant(0.5)
+    //   cond(4)  = cond_raw > 0.5
+    //   t_mul(5) = a * b
+    //   f_add(6) = a + b
+    //   out(7)   = Select(cond, t_mul, f_add)
+    // ---------------------------------------------------------------
+    #[test]
+    fn multi_variable_branch_adjoint_structure() {
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("cond_flag".into()), vec![]),
+                make_op(1, 1, PrimalOp::Param("a".into()), vec![]),
+                make_op(2, 2, PrimalOp::Param("b".into()), vec![]),
+                make_op(3, 3, PrimalOp::Constant(0.5), vec![]),
+                // cond = cond_flag > 0.5
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 3]),
+                // true branch: a * b
+                make_op(5, 5, PrimalOp::Mul, vec![1, 2]),
+                // false branch: a + b
+                make_op(6, 6, PrimalOp::Add, vec![1, 2]),
+                // output: Select(cond, t_mul, f_add)
+                make_op(7, 7, PrimalOp::Select, vec![4, 5, 6]),
+            ],
+            output: 7,
+            var_names: HashMap::new(),
+        };
+
+        let max_var = 7;
+        let mut gen = AdjointGenerator::new(max_var + 1);
+        let adjoint = gen.generate(&primal);
+
+        // Both a and b must have adjoints
+        assert!(gen.adjoint_of(1).is_some(), "Param a should have an adjoint");
+        assert!(gen.adjoint_of(2).is_some(), "Param b should have an adjoint");
+
+        // The true-branch result and false-branch result should have adjoints
+        assert!(gen.adjoint_of(5).is_some(), "True-branch Mul result should have adjoint");
+        assert!(gen.adjoint_of(6).is_some(), "False-branch Add result should have adjoint");
+
+        // The backward pass must contain Select ops (one per branch input of the primal Select)
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Multi-variable branch backward needs >= 2 Select ops, got {adj_selects}");
+
+        // No tape-style markers in source AD adjoint
+        let tape_inputs = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Input(_)))
+            .count();
+        assert_eq!(tape_inputs, 0,
+            "Source AD adjoint must be tape-free (no Input ops), got {tape_inputs}");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 7: Source AD produces no tape push/pop for branching code.
+    //
+    // Tape-based AD would introduce Input("__tape_push__") / Param markers
+    // to record intermediate values at runtime.  Source AD encodes all
+    // branching information structurally via Condition + Select ops, so
+    // the adjoint Wengert list must be entirely free of tape markers.
+    //
+    // We verify this for three representative branching functions.
+    // ---------------------------------------------------------------
+    #[test]
+    fn source_ad_no_tape_ops_for_simple_branch() {
+        // f(x) = if x > 0 { x * x } else { -x }
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(3, 3, PrimalOp::Mul, vec![0, 0]),
+                make_op(4, 4, PrimalOp::Neg, vec![0]),
+                make_op(5, 5, PrimalOp::Select, vec![2, 3, 4]),
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // Structural: must not contain Input ops (tape-push markers)
+        let has_tape_input = adjoint.ops.iter()
+            .any(|op| matches!(&op.op, PrimalOp::Input(_)));
+        assert!(!has_tape_input,
+            "Source AD adjoint for branching code must not contain tape Input ops");
+
+        // Must not contain Param ops (tape-checkpoint markers) beyond what primal already has
+        // (AdjointGenerator never introduces Param ops; it only uses Constant/Select/arithmetic)
+        let has_new_param = adjoint.ops.iter()
+            .any(|op| matches!(&op.op, PrimalOp::Param(_)));
+        assert!(!has_new_param,
+            "Source AD adjoint must not introduce new Param ops");
+
+        // Must contain Select ops to encode the branch gradient
+        let has_select = adjoint.ops.iter()
+            .any(|op| matches!(&op.op, PrimalOp::Select));
+        assert!(has_select,
+            "Source AD adjoint must use Select (not tape push/pop) for branch gradients");
+
+        // x must have an adjoint — the whole point of AD
+        assert!(gen.adjoint_of(0).is_some(), "x must have adjoint");
+    }
+
+    #[test]
+    fn source_ad_no_tape_ops_for_nested_branch() {
+        // Nested: if x > 0 { if x > 1 { x*x } else { x } } else { 0 }
+        // Flat Wengert (same as adjoint_nested_branches_propagates)
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Constant(1.0), vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                make_op(5, 5, PrimalOp::Mul, vec![0, 0]),
+                make_op(6, 6, PrimalOp::Select, vec![4, 5, 0]),
+                make_op(7, 7, PrimalOp::Select, vec![3, 6, 1]),
+            ],
+            output: 7,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // No tape-style ops in the backward pass
+        assert!(!adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Input(_))),
+            "Nested-branch adjoint must be tape-free");
+        assert!(!adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Param(_))),
+            "Nested-branch adjoint must not introduce Param ops");
+
+        // Must be richer in Select ops than a straight-line function would be
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Nested-branch adjoint should have >= 2 Select ops (source AD encodes branches \
+             structurally, not via tape), got {adj_selects}");
+    }
+
+    #[test]
+    fn source_ad_adjoint_op_count_dominated_by_arithmetic_not_tape() {
+        // For a branching function the adjoint ops should be entirely arithmetic /
+        // Select / Constant — zero tape-style bookkeeping.
+        //
+        // Tape AD would add O(branch_depth) Input ops for each checkpoint save.
+        // Source AD adds exactly 0.
+        //
+        // f(x) = if x > 0 { x } else { 0.01 * x }  (leaky ReLU)
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()),         vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.01),             vec![]),
+                make_op(2, 2, PrimalOp::Constant(0.0),              vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                make_op(4, 4, PrimalOp::Mul, vec![1, 0]),            // 0.01 * x
+                make_op(5, 5, PrimalOp::Select, vec![3, 0, 4]),      // cond ? x : 0.01*x
+            ],
+            output: 5,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // Count op types
+        let tape_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Input(_) | PrimalOp::Param(_)))
+            .count();
+        let structural_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op,
+                PrimalOp::Select | PrimalOp::Condition(_) | PrimalOp::Constant(_)))
+            .count();
+        let arithmetic_ops = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op,
+                PrimalOp::Add | PrimalOp::Mul | PrimalOp::Neg | PrimalOp::Sub))
+            .count();
+
+        assert_eq!(tape_ops, 0,
+            "Source AD for leaky ReLU must have 0 tape ops, got {tape_ops}");
+        assert!(structural_ops + arithmetic_ops > 0,
+            "Adjoint must have actual gradient computation ops");
+
+        // x must have an adjoint
+        assert!(gen.adjoint_of(0).is_some(), "x must have an adjoint");
     }
 }

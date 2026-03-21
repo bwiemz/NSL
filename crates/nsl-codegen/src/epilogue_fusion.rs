@@ -238,9 +238,9 @@ pub fn apply_epilogue_fusion(graph: &mut FusionGraph, chains: &[EpilogueChain], 
 ///
 /// Special cases:
 /// - `0.0` → `"0F00000000"` (positive zero)
-/// Note: `-0.0` is deliberately canonicalized to `+0.0`. In epilogue context,
-/// the result is immediately stored as a tensor value, so IEEE 754 sign
-/// differences between `+0.0` and `-0.0` have no practical impact.
+///   Note: `-0.0` is deliberately canonicalized to `+0.0`. In epilogue context,
+///   the result is immediately stored as a tensor value, so IEEE 754 sign
+///   differences between `+0.0` and `-0.0` have no practical impact.
 fn format_f32_literal(val: f32) -> String {
     if val == 0.0 {
         "0F00000000".to_string()
