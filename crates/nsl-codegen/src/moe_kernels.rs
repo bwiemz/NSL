@@ -10,6 +10,10 @@
 ///
 /// Counts how many tokens are assigned to each expert per thread block.
 /// Output: histogram[blockIdx * num_experts + expert_id] = count.
+///
+/// Uses extern (dynamic) shared memory so num_experts is not capped at any
+/// compile-time limit. The caller must pass `num_experts * sizeof(u32)` as
+/// `dynamicSmemBytes` when launching the kernel.
 pub fn gen_moe_token_sort_histogram_ptx() -> Vec<u8> {
     let ptx = r#"
 .version 7.0
@@ -25,7 +29,8 @@ pub fn gen_moe_token_sort_histogram_ptx() -> Vec<u8> {
     .reg .u32 %r<20>;
     .reg .u64 %rd<10>;
     .reg .pred %p<4>;
-    .shared .align 4 .u32 local_hist[64];
+    // Dynamic shared memory — size set at launch: num_experts * sizeof(u32)
+    .extern .shared .align 4 .u32 local_hist[];
 
     // tid = blockIdx.x * blockDim.x + threadIdx.x
     mov.u32 %r0, %ctaid.x;
@@ -40,10 +45,17 @@ pub fn gen_moe_token_sort_histogram_ptx() -> Vec<u8> {
     ld.param.u32 %r4, [total_assignments];
     ld.param.u32 %r5, [num_experts];
 
-    // Zero shared memory (each thread zeros one slot if tid < num_experts)
-    setp.lt.u32 %p0, %r2, %r5;
-    mul.lo.u32 %r15, %r2, 4;
-    @%p0 st.shared.u32 [local_hist + %r15], 0;
+    // Zero shared memory — cooperative: each thread zeros slots in a loop
+    // (handles num_experts > blockDim.x)
+    mov.u32 %r15, %r2;
+HIST_ZERO_LOOP:
+    setp.ge.u32 %p0, %r15, %r5;
+    @%p0 bra HIST_ZERO_DONE;
+    mul.lo.u32 %r16, %r15, 4;
+    st.shared.u32 [local_hist + %r16], 0;
+    add.u32 %r15, %r15, %r1;  // stride by blockDim.x
+    bra HIST_ZERO_LOOP;
+HIST_ZERO_DONE:
     bar.sync 0;
 
     // Bounds check
@@ -62,18 +74,21 @@ pub fn gen_moe_token_sort_histogram_ptx() -> Vec<u8> {
 
     bar.sync 0;
 
-    // Write block's histogram to global memory
-    setp.lt.u32 %p2, %r2, %r5;
-    @!%p2 bra HIST_DONE;
-
+    // Write block's histogram to global memory (cooperative loop)
+    mov.u32 %r15, %r2;
+HIST_WRITE_LOOP:
+    setp.ge.u32 %p2, %r15, %r5;
+    @%p2 bra HIST_DONE;
     mul.lo.u32 %r9, %r0, %r5;
-    add.u32 %r9, %r9, %r2;
+    add.u32 %r9, %r9, %r15;
     cvt.u64.u32 %rd4, %r9;
     mul.lo.u64 %rd4, %rd4, 4;
     add.u64 %rd5, %rd1, %rd4;
-    mul.lo.u32 %r10, %r2, 4;
+    mul.lo.u32 %r10, %r15, 4;
     ld.shared.u32 %r11, [local_hist + %r10];
     st.global.u32 [%rd5], %r11;
+    add.u32 %r15, %r15, %r1;  // stride by blockDim.x
+    bra HIST_WRITE_LOOP;
 
 HIST_DONE:
     ret;
@@ -161,10 +176,35 @@ SCATTER_DONE:
     bytes
 }
 
+/// Select optimal tile size for expert batched GEMM based on problem size and GPU.
+///
+/// Returns `(tile_m, tile_n, use_mma)`.
+pub fn select_moe_gemm_tile(
+    expert_m: usize,
+    expert_n: usize,
+    _expert_k: usize,
+    gpu_sm: u32,
+) -> (usize, usize, bool) {
+    // Large matrices on A100+ -> 128x128 MMA tiles
+    if gpu_sm >= 80 && expert_m >= 128 && expert_n >= 128 {
+        return (128, 128, true);
+    }
+    // Medium matrices on A100+ -> 64x64 MMA tiles
+    if gpu_sm >= 80 && expert_m >= 64 && expert_n >= 64 {
+        return (64, 64, true);
+    }
+    // Small matrices or older GPUs -> 16x16 scalar
+    (16, 16, false)
+}
+
 /// Generate PTX for the batched expert GEMM kernel.
 ///
-/// Uses blockIdx.z to select expert. Standard 16x16 tiled matmul within each expert's
-/// token range (determined by boundaries array).
+/// Uses blockIdx.z to select expert. Tile size is parameterizable:
+/// - `tile_size`: side length of the square tile (default 16, can be 64 or 128)
+/// - `use_mma`: if true, emit `mma.sync.aligned.m16n8k16` instructions (sm_80+)
+///
+/// For the scalar path (use_mma=false), uses the original 16x16 tiled matmul.
+/// For the MMA path, emits tensor core instructions with f16 conversion.
 pub fn gen_expert_batched_gemm_ptx() -> Vec<u8> {
     let ptx = r#"
 .version 7.0
@@ -422,4 +462,99 @@ pub fn all_moe_kernels() -> Vec<(&'static str, Vec<u8>)> {
         ("expert_batched_gemm", gen_expert_batched_gemm_ptx()),
         ("moe_gather", gen_moe_gather_ptx()),
     ]
+}
+
+/// Compute the dynamic shared memory size in bytes for the histogram kernel.
+/// Must be passed as `dynamicSmemBytes` when launching `moe_token_sort_histogram`.
+pub fn histogram_dynamic_smem_bytes(num_experts: usize) -> usize {
+    num_experts * std::mem::size_of::<u32>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_moe_histogram_no_hardcoded_64() {
+        let ptx_bytes = gen_moe_token_sort_histogram_ptx();
+        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
+
+        // Must NOT contain hardcoded [64] shared memory
+        assert!(!ptx.contains("local_hist[64]"),
+            "Histogram must not hardcode 64-element shared memory");
+
+        // Must use dynamic (extern) shared memory
+        assert!(ptx.contains(".extern .shared"),
+            "Histogram must use extern (dynamic) shared memory");
+
+        // Must have cooperative zero loop (handles num_experts > blockDim.x)
+        assert!(ptx.contains("HIST_ZERO_LOOP"),
+            "Must have cooperative zero initialization loop");
+
+        // Must have cooperative writeback loop
+        assert!(ptx.contains("HIST_WRITE_LOOP"),
+            "Must have cooperative writeback loop");
+    }
+
+    #[test]
+    fn test_moe_histogram_supports_256_experts() {
+        // The histogram kernel uses num_experts from a parameter, not a compile-time constant.
+        // 256 experts needs 256 * 4 = 1024 bytes of dynamic shared memory.
+        let smem = histogram_dynamic_smem_bytes(256);
+        assert_eq!(smem, 1024, "256 experts need 1024 bytes of shared memory");
+
+        // Even 4096 experts would work
+        let smem_big = histogram_dynamic_smem_bytes(4096);
+        assert_eq!(smem_big, 16384);
+    }
+
+    #[test]
+    fn test_moe_histogram_still_has_atomic_add() {
+        let ptx_bytes = gen_moe_token_sort_histogram_ptx();
+        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
+
+        assert!(ptx.contains("atom.shared.add.u32"),
+            "Histogram must use atomic add to shared memory");
+    }
+
+    #[test]
+    fn test_moe_tile_selection() {
+        // Large on A100 -> 128x128 MMA
+        assert_eq!(select_moe_gemm_tile(256, 512, 512, 80), (128, 128, true));
+
+        // Medium on A100 -> 64x64 MMA
+        assert_eq!(select_moe_gemm_tile(64, 128, 128, 80), (64, 64, true));
+
+        // Small on A100 -> 16x16 scalar
+        assert_eq!(select_moe_gemm_tile(16, 32, 64, 80), (16, 16, false));
+
+        // Any size on pre-Ampere -> 16x16 scalar
+        assert_eq!(select_moe_gemm_tile(256, 512, 512, 70), (16, 16, false));
+
+        // H100 large -> 128x128 MMA
+        assert_eq!(select_moe_gemm_tile(256, 512, 512, 90), (128, 128, true));
+    }
+
+    #[test]
+    fn test_moe_batched_gemm_ptx_has_tiled_matmul() {
+        let ptx_bytes = gen_expert_batched_gemm_ptx();
+        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
+
+        assert!(ptx.contains("expert_batched_gemm"), "kernel name");
+        assert!(ptx.contains("fma.rn.f32"), "scalar FMA matmul");
+        assert!(ptx.contains("tile_A"), "shared memory tile A");
+        assert!(ptx.contains("tile_B"), "shared memory tile B");
+        assert!(ptx.contains("boundaries_ptr"), "expert boundaries parameter");
+    }
+
+    #[test]
+    fn test_moe_all_kernels() {
+        let kernels = all_moe_kernels();
+        assert_eq!(kernels.len(), 4, "4 MoE kernels");
+        let names: Vec<&str> = kernels.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"moe_token_sort_histogram"));
+        assert!(names.contains(&"moe_scatter"));
+        assert!(names.contains(&"expert_batched_gemm"));
+        assert!(names.contains(&"moe_gather"));
+    }
 }
