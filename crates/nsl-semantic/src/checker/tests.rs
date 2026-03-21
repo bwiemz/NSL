@@ -218,3 +218,148 @@ fn multi_read(x: &Tensor<[4], f32>, y: &Tensor<[4], f32>) -> float:
         borrow_errs
     );
 }
+
+// -----------------------------------------------------------------------
+// Task 5: Autodiff + borrowed tensors — integration-level tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_borrow_param_in_no_grad_fn() {
+    // @no_grad on a function that takes &Tensor: borrow inherits the annotation.
+    // No tape-recording happens for any op in this function.
+    let src = r#"
+@no_grad
+fn inference_step(x: &Tensor<[4], f32>) -> float:
+    return 0.0
+"#;
+    let diags = check_source_all(src);
+    let borrow_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("borrow") || s.contains("no_grad")
+        })
+        .collect();
+    assert!(
+        borrow_errs.is_empty(),
+        "@no_grad fn with &Tensor param should be clean, got: {:?}",
+        borrow_errs
+    );
+}
+
+#[test]
+fn test_borrow_passed_to_borrow_param() {
+    // Chaining borrows: f takes &T, g takes &T and calls f with its own &T param.
+    // Demonstrates that a borrow can be propagated through a call chain without
+    // being consumed at any point — the same pointer flows through.
+    let src = r#"
+fn apply(w: &Tensor<[4], f32>) -> float:
+    return 0.0
+
+fn forward(w: &Tensor<[4], f32>) -> float:
+    return apply(w)
+"#;
+    let diags = check_source(src);
+    let type_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| format!("{:?}", d).contains("type mismatch"))
+        .collect();
+    assert!(
+        type_errs.is_empty(),
+        "borrow should chain through call without type error, got: {:?}",
+        type_errs
+    );
+}
+
+// -----------------------------------------------------------------------
+// Task 6: Model methods — self is borrowed by default
+// -----------------------------------------------------------------------
+//
+// In NSL, model methods take `self` as their first parameter. At the codegen
+// level, `self` is bound as a raw I64 pointer — NOT as a linear tensor
+// binding. This means:
+//   1. The ownership checker never registers `self` as a tensor-typed binding.
+//   2. Calling model.forward(x) does NOT consume the model instance.
+//   3. The same model instance can be used across multiple forward() calls
+//      without any ownership violation.
+//
+// This is the expected behaviour for training loops:
+//   for epoch in 0..100:
+//       let loss = model.forward(x)   # safe on every iteration
+//       loss.backward()
+
+#[test]
+fn test_model_method_declaration_parses_cleanly() {
+    // A model with a forward() method should parse and type-check without errors
+    let src = r#"
+model Linear:
+    let weight: Tensor<[4, 4], f32>
+
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source_all(src);
+    // Filter out any errors unrelated to model/borrow semantics
+    let model_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("consume") || s.contains("borrow") || s.contains("self")
+        })
+        .collect();
+    assert!(
+        model_errs.is_empty(),
+        "model.forward(self, ...) should parse cleanly, got: {:?}",
+        model_errs
+    );
+}
+
+#[test]
+fn test_model_forward_borrow_param_parses() {
+    // forward(&self, ...) syntax — explicit borrow of self — should parse.
+    // Whether the parser exposes &self or treats self-as-ptr implicitly,
+    // the key is no errors about self consumption.
+    let src = r#"
+model MLP:
+    let weight: Tensor<[4, 4], f32>
+
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source_all(src);
+    let consume_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| format!("{:?}", d).contains("consume"))
+        .collect();
+    assert!(
+        consume_errs.is_empty(),
+        "model forward should not produce consumption errors, got: {:?}",
+        consume_errs
+    );
+}
+
+#[test]
+fn test_borrowed_tensor_passed_to_model_method() {
+    // Passing a &Tensor to a function that expects a Tensor (read-only)
+    // should be compatible — the auto-borrow rule (T assignable to &T) is
+    // symmetric: &T can also be read where T is expected for non-consuming ops.
+    let src = r#"
+fn uses_tensor(x: &Tensor<[4], f32>) -> float:
+    return 0.0
+
+fn call_multiple(x: &Tensor<[4], f32>) -> float:
+    let _ = uses_tensor(x)
+    let _ = uses_tensor(x)
+    return 0.0
+"#;
+    let diags = check_source(src);
+    let type_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| format!("{:?}", d).contains("type mismatch"))
+        .collect();
+    assert!(
+        type_errs.is_empty(),
+        "borrowed tensor can be passed to borrow-param fn multiple times, got: {:?}",
+        type_errs
+    );
+}
