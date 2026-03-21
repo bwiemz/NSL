@@ -555,9 +555,10 @@ impl Compiler<'_> {
         let name_data_id = ctx.name_data_id;
         let block_q = ctx.config.block_q;
         let block_kv = ctx.config.block_kv;
+        let is_causal = ctx.config.causal;
         let shmem_bytes = crate::flash_attention::shared_mem_bytes(&ctx.config) as i64;
 
-        // Allocate output tensor (same shape as Q)
+        // Allocate output tensor (same shape as Q, same device)
         let out_val = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[q_val])?;
 
         // Get PTX and name pointers from .rodata
@@ -569,6 +570,7 @@ impl Compiler<'_> {
         let block_q_val = builder.ins().iconst(cl_types::I64, block_q);
         let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv);
         let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes);
+        let causal_val = builder.ins().iconst(cl_types::I64, if is_causal { 1 } else { 0 });
 
         let null = builder.ins().iconst(cl_types::I64, 0);
 
@@ -582,13 +584,19 @@ impl Compiler<'_> {
         let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim2])?;
         let head_dim = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
 
-        // Allocate logsumexp auxiliary tensor: shape [batch, heads, seq_len], dtype f32
-        // Used by backward pass; stored for later autodiff tape consumption.
+        // Allocate logsumexp auxiliary tensor: shape [batch, heads, seq_len]
+        // Must be on the same device as Q — the GPU kernel writes to it via st.global.f32,
+        // so it needs managed memory (cuMemAllocManaged) not regular CPU malloc.
+        // Strategy: allocate on CPU via nsl_tensor_zeros, then move to GPU via to_device.
+        // Flash attention always implies CUDA, so device=1 is safe.
         let lse_shape = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         self.compile_call_by_name(builder, "nsl_list_push", &[lse_shape, batch])?;
         self.compile_call_by_name(builder, "nsl_list_push", &[lse_shape, heads])?;
         self.compile_call_by_name(builder, "nsl_list_push", &[lse_shape, seq_len])?;
-        let lse_val = self.compile_call_by_name(builder, "nsl_tensor_zeros", &[lse_shape])?;
+        let lse_cpu = self.compile_call_by_name(builder, "nsl_tensor_zeros", &[lse_shape])?;
+        // Move to GPU so the PTX kernel can write to it (managed memory)
+        let cuda_device = builder.ins().iconst(cl_types::I64, 1);
+        let lse_val = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[lse_cpu, cuda_device])?;
 
         // Call flash attention FFI — returns error code (i64), output written to out_val
         let _err = self.compile_call_by_name(builder, "nsl_flash_attention", &[
@@ -602,10 +610,11 @@ impl Compiler<'_> {
             shmem_val,
             ptx_ptr, name_ptr,
             block_q_val, block_kv_val,
+            causal_val,
         ])?;
 
-        // Store logsumexp tensor for backward pass (autodiff tape will pick it up)
-        // TODO(Phase 2): Record lse_val in the tape alongside out_val
+        // Logsumexp is consumed by the runtime's tape recording in nsl_flash_attention.
+        // The TapeOp::FlashAttention variant is recorded there with the logsumexp pointer.
         let _ = lse_val;
 
         // Return the output tensor (not the FFI error code)

@@ -1029,6 +1029,13 @@ fn emit_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Logsumexp: L = row_max + log2(row_sum) * ln(2)\n");
     ptx.push_str("    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;\n");
     ptx.push_str("    @!%p_has_lse bra SKIP_LSE_STORE;\n");
+    // Guard: only threads with tid_x < block_q should write logsumexp
+    // (128 threads per block, but only block_q rows per tile)
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p1, %tid_x, {};            // tid_x >= block_q?\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra SKIP_LSE_STORE;\n");
     ptx.push_str("    lg2.approx.f32 %log_sum, %row_sum;\n");
     ptx.push_str("    mul.f32 %log_sum, %log_sum, 0F3F317218;   // * ln(2)\n");
     ptx.push_str("    add.f32 %lse, %row_max, %log_sum;\n");

@@ -317,6 +317,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         types::I64,                                                   // shared_mem_bytes
         types::I64, types::I64,                                       // ptx_ptr, name_ptr
         types::I64, types::I64,                                       // block_q, block_kv
+        types::I64,                                                   // causal (0=false, 1=true)
     ], Some(types::I64)),
     // M42b: Quantized FlashAttention (KV-cache in INT8/FP8)
     ("nsl_flash_attention_quantized", &[
