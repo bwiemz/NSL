@@ -202,6 +202,178 @@ pub fn select_optimal_format(m: usize, n: usize, nnz: usize, gpu: &GpuSpec) -> S
     }
 }
 
+// ---------------------------------------------------------------------------
+// TACO-style merge lattices for sparse co-iteration
+// ---------------------------------------------------------------------------
+
+/// Level format in the iteration graph: how to traverse one dimension of a tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelFormat {
+    /// Iterate 0..N (dense dimension).
+    Dense,
+    /// Iterate via ptr/idx arrays (CSR row_ptr + col_ind).
+    Compressed,
+    /// Iterate via coordinate array (COO).
+    Singleton,
+}
+
+/// One level in the iteration graph.
+#[derive(Debug, Clone)]
+pub struct IterLevel {
+    /// Which dimension of the tensor this level represents.
+    pub dimension: usize,
+    /// Storage format for this level.
+    pub format: LevelFormat,
+    /// Which other tensor operands co-iterate at this level.
+    pub merge_with: Vec<usize>,
+}
+
+/// Iteration graph: determines traversal order based on tensor formats.
+#[derive(Debug, Clone)]
+pub struct IterationGraph {
+    pub levels: Vec<IterLevel>,
+}
+
+/// Merge operation: intersection (mul) or union (add).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOp {
+    /// Both tensors must have non-zeros (element-wise multiply).
+    Intersection,
+    /// Either tensor has non-zeros (element-wise add).
+    Union,
+}
+
+/// What to compute at a lattice point.
+#[derive(Debug, Clone)]
+pub enum MergeExpr {
+    /// Both A and B contribute.
+    Both,
+    /// Only the first operand (A) contributes.
+    OnlyA,
+    /// Only the second operand (B) contributes.
+    OnlyB,
+}
+
+/// A point in the merge lattice.
+#[derive(Debug, Clone)]
+pub struct MergeLatticePoint {
+    /// Which operands participate at this point: [a_present, b_present].
+    pub iterators: [bool; 2],
+    /// What to compute.
+    pub expression: MergeExpr,
+}
+
+/// Merge lattice: generates the correct while-loop structure for co-iterating
+/// sparse dimensions.
+#[derive(Debug, Clone)]
+pub struct MergeLattice {
+    pub points: Vec<MergeLatticePoint>,
+    pub merge_op: MergeOp,
+}
+
+impl MergeLattice {
+    /// Build lattice for element-wise multiplication (intersection).
+    pub fn intersection() -> Self {
+        MergeLattice {
+            points: vec![
+                MergeLatticePoint {
+                    iterators: [true, true],
+                    expression: MergeExpr::Both,
+                },
+            ],
+            merge_op: MergeOp::Intersection,
+        }
+    }
+
+    /// Build lattice for element-wise addition (union).
+    pub fn union() -> Self {
+        MergeLattice {
+            points: vec![
+                MergeLatticePoint {
+                    iterators: [true, true],
+                    expression: MergeExpr::Both,
+                },
+                MergeLatticePoint {
+                    iterators: [true, false],
+                    expression: MergeExpr::OnlyA,
+                },
+                MergeLatticePoint {
+                    iterators: [false, true],
+                    expression: MergeExpr::OnlyB,
+                },
+            ],
+            merge_op: MergeOp::Union,
+        }
+    }
+}
+
+impl IterationGraph {
+    /// Build iteration graph for SpMV: CSR sparse [M,K] × dense vector [K].
+    pub fn spmv_csr() -> Self {
+        IterationGraph {
+            levels: vec![
+                IterLevel {
+                    dimension: 0,
+                    format: LevelFormat::Compressed,
+                    merge_with: vec![], // outer loop: iterate sparse rows
+                },
+                IterLevel {
+                    dimension: 1,
+                    format: LevelFormat::Dense, // inner: dense vector access
+                    merge_with: vec![1], // co-iterate with vector
+                },
+            ],
+        }
+    }
+
+    /// Build iteration graph for SpMM: CSR sparse [M,K] × dense [K,N].
+    pub fn spmm_csr() -> Self {
+        IterationGraph {
+            levels: vec![
+                IterLevel {
+                    dimension: 0,
+                    format: LevelFormat::Compressed,
+                    merge_with: vec![],
+                },
+                IterLevel {
+                    dimension: 1,
+                    format: LevelFormat::Compressed,
+                    merge_with: vec![1], // merge with dense K dimension
+                },
+            ],
+        }
+    }
+
+    /// Build iteration graph for sparse-sparse element-wise op.
+    pub fn elementwise_csr() -> Self {
+        IterationGraph {
+            levels: vec![
+                IterLevel {
+                    dimension: 0,
+                    format: LevelFormat::Compressed,
+                    merge_with: vec![1], // both tensors at row level
+                },
+                IterLevel {
+                    dimension: 1,
+                    format: LevelFormat::Compressed,
+                    merge_with: vec![1], // both tensors at column level
+                },
+            ],
+        }
+    }
+}
+
+/// Sparse FLOP estimation for the cost model.
+pub fn estimate_sparse_flops(op: SparseOp, nnz: usize, n: usize, nnz_b: usize) -> f64 {
+    match op {
+        SparseOp::MatVec => 2.0 * nnz as f64,           // one mul + one add per nz
+        SparseOp::MatMul => 2.0 * nnz as f64 * n as f64, // SpMM: per-column
+        SparseOp::Add => (nnz + nnz_b) as f64,            // merge cost
+        SparseOp::ScalarMul => nnz as f64,                // one mul per nz
+        SparseOp::StructuredMatMul => nnz as f64 * n as f64,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +542,41 @@ mod tests {
     fn test_select_format_fully_dense() {
         let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
         assert_eq!(select_optimal_format(1000, 1000, 1_000_000, gpu), SparseFormat::Dense);
+    }
+
+    // ── Merge lattice tests ──────────────────────────────────────
+
+    #[test]
+    fn intersection_lattice_one_point() {
+        let lat = MergeLattice::intersection();
+        assert_eq!(lat.merge_op, MergeOp::Intersection);
+        assert_eq!(lat.points.len(), 1);
+        assert_eq!(lat.points[0].iterators, [true, true]);
+    }
+
+    #[test]
+    fn union_lattice_three_points() {
+        let lat = MergeLattice::union();
+        assert_eq!(lat.merge_op, MergeOp::Union);
+        assert_eq!(lat.points.len(), 3);
+        // Both, A-only, B-only
+        assert_eq!(lat.points[0].iterators, [true, true]);
+        assert_eq!(lat.points[1].iterators, [true, false]);
+        assert_eq!(lat.points[2].iterators, [false, true]);
+    }
+
+    #[test]
+    fn spmv_iteration_graph() {
+        let ig = IterationGraph::spmv_csr();
+        assert_eq!(ig.levels.len(), 2);
+        assert_eq!(ig.levels[0].format, LevelFormat::Compressed);
+        assert_eq!(ig.levels[1].format, LevelFormat::Dense);
+    }
+
+    #[test]
+    fn sparse_flop_estimation() {
+        assert_eq!(estimate_sparse_flops(SparseOp::MatVec, 1000, 1, 0), 2000.0);
+        assert_eq!(estimate_sparse_flops(SparseOp::MatMul, 1000, 64, 0), 128000.0);
+        assert_eq!(estimate_sparse_flops(SparseOp::Add, 500, 0, 300), 800.0);
     }
 }
