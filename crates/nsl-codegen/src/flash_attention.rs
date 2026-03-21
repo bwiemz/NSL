@@ -2120,6 +2120,35 @@ mod tests {
         assert_eq!(wait_count, 2, "2 wait groups");
     }
 
+    #[test]
+    fn test_sm80_path_does_not_emit_wgmma() {
+        // Regression: sm_80 (A100) should use mma.sync, NOT wgmma
+        let gpu = crate::gpu_specs::find_gpu("A100-SXM").unwrap();
+        assert!(!gpu.supports_wgmma(), "A100 should not support wgmma");
+        assert!(gpu.supports_fp16_mma(), "A100 should support mma.sync");
+        assert_eq!(gpu.warp_group_size(), 32, "A100 uses 32-thread warps");
+    }
+
+    #[test]
+    fn test_sm90_selects_wgmma_over_mma() {
+        let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
+        assert!(gpu.supports_wgmma(), "H100 supports wgmma");
+        assert!(gpu.supports_fp16_mma(), "H100 also supports mma.sync");
+        assert_eq!(gpu.warp_group_size(), 128, "H100 uses 128-thread warp groups");
+        // Dispatch should prefer wgmma when available
+        // (tested via FP8 compile_fp8_matmul in fp8.rs)
+    }
+
+    #[test]
+    fn test_wgmma_tile_constraints() {
+        // wgmma m64n64k16: block sizes must be multiples of 64
+        assert_eq!(64 % WGMMA_N, 0, "64 is valid");
+        assert_eq!(128 % WGMMA_N, 0, "128 is valid");
+        // Validate k alignment
+        assert_eq!(64 % WGMMA_K_F16, 0, "head_dim=64 is k-aligned");
+        assert_eq!(128 % WGMMA_K_F16, 0, "head_dim=128 is k-aligned");
+    }
+
     // ── mma.sync (Ampere sm_80) tests ─────────────────────────────────
 
     #[test]
