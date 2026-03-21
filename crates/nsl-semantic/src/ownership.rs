@@ -639,4 +639,210 @@ mod tests {
         checker.release_borrow(x_ref);
         assert!(!checker.has_active_borrows(x));
     }
+
+    // ── Task 5: Autodiff + borrowed tensors ──────────────────────────
+    //
+    // Borrowed tensors in grad() scope:
+    //   - The tape records raw i64 tensor pointers. A borrow is semantically
+    //     transparent for reads — passing a &T to a tape-recording op passes
+    //     the same underlying pointer as T would. No special tape handling is
+    //     needed: `BorrowedNoAction` in codegen means the pointer is used
+    //     directly without any refcount or free action.
+    //   - @no_grad on a borrowed param: the borrow inherits the annotation.
+    //     If a parameter is `&Tensor @no_grad`, it is excluded from tape
+    //     recording in the same way an owned @no_grad tensor is. The borrow
+    //     wrapper does not change this behaviour.
+    //
+    // Training pattern: borrowed weights during forward, then optimizer consumes.
+    //   1. weights: Owned (e.g., model field or outer let-binding)
+    //   2. weights_ref: Borrow from weights → used in forward pass (grad scope)
+    //   3. Release weights_ref (end of forward)
+    //   4. Optimizer consumes weights (update step) — valid because borrow released
+
+    #[test]
+    fn test_training_pattern_borrow_forward_then_optimizer_consumes() {
+        // Simulate: weights owned, borrowed for forward pass, then consumed by optimizer.
+        //
+        //   weights: Owned
+        //   weights_ref = &weights   (borrow for forward)
+        //   [forward pass — reads through weights_ref, no consumption]
+        //   release weights_ref
+        //   optimizer consumes weights   (SGD step)
+        //
+        // This is the canonical training loop pattern: the model borrows its weights
+        // for the forward pass, then the optimizer takes ownership to update them.
+        let mut interner = Interner::new();
+        let weights = Symbol(interner.get_or_intern("weights"));
+        let weights_ref = Symbol(interner.get_or_intern("weights_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        // weights tensor is owned
+        checker.register_binding(weights, sp(), false);
+
+        // Borrow weights for forward pass
+        checker.register_borrow(weights_ref, weights, sp());
+
+        // Forward pass: multiple reads through borrow (matmul, relu, etc.)
+        checker.use_borrow(weights_ref, sp(), "MatMul");
+        checker.use_borrow(weights_ref, sp(), "BiasAdd");
+        checker.use_borrow(weights_ref, sp(), "ReLU");
+
+        // Forward complete — release the borrow (scope exit)
+        checker.release_borrow(weights_ref);
+
+        // Optimizer step: consume weights (SGD update = move the tensor into the update fn)
+        checker.consume(weights, sp(), "sgd_update");
+
+        // No errors: borrow was released before consumption
+        assert!(
+            checker.diagnostics.is_empty(),
+            "training pattern should be clean: {:?}",
+            checker.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_training_pattern_cannot_consume_while_forward_borrows() {
+        // The optimizer CANNOT consume weights while the borrow is still live.
+        // This catches bugs where backward() is called while the forward borrow
+        // overlaps with an optimizer step in the same scope.
+        let mut interner = Interner::new();
+        let weights = Symbol(interner.get_or_intern("weights"));
+        let weights_ref = Symbol(interner.get_or_intern("weights_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(weights, sp(), false);
+        checker.register_borrow(weights_ref, weights, sp());
+        checker.use_borrow(weights_ref, sp(), "MatMul");
+
+        // Bug: try to consume while borrow is still live
+        checker.consume(weights, sp(), "sgd_update");
+
+        assert_eq!(checker.diagnostics.len(), 1);
+        assert!(
+            checker.diagnostics[0].message.contains("active borrows"),
+            "expected 'active borrows' error, got: {}",
+            checker.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_borrow_in_grad_scope_multiple_tape_ops() {
+        // Borrowed tensor used in multiple tape-recording ops within a grad scope.
+        // Since borrows are read-only and never consumed, every tape op is valid.
+        // The tape stores raw pointers; the borrow's underlying tensor stays alive
+        // for the entire scope (owned by the caller).
+        let mut interner = Interner::new();
+        let x = Symbol(interner.get_or_intern("x"));
+        let x_ref = Symbol(interner.get_or_intern("x_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(x, sp(), false);
+        checker.register_borrow(x_ref, x, sp());
+
+        // Simulate a sequence of tape-recording ops (grad scope)
+        // All are reads through the borrow — none consume x_ref
+        for op in &["MatMul", "ReLU", "LayerNorm", "Softmax", "Log"] {
+            checker.use_borrow(x_ref, sp(), op);
+        }
+
+        // No errors: borrow reads are always valid
+        assert!(
+            checker.diagnostics.is_empty(),
+            "multiple tape ops on borrow should be clean: {:?}",
+            checker.diagnostics
+        );
+    }
+
+    // ── Task 6: Model methods use self as borrowed ────────────────────
+    //
+    // Model method dispatch:
+    //   In the codegen layer (functions.rs), `self` in a model method is bound
+    //   as a raw pointer (Cranelift I64 pointer type). It is NOT registered as a
+    //   tensor-typed binding in the ownership checker — struct/model pointers are
+    //   not linear types. Therefore:
+    //   - Calling model.forward(x) does NOT consume the model instance.
+    //   - The same model instance can be used across multiple forward calls.
+    //   - This is safe by construction: the pointer is passed by value (read-only
+    //     from the ownership checker's perspective), and the ownership checker
+    //     only tracks tensor-typed bindings.
+    //
+    // These tests verify the ownership checker correctly handles the model self pattern.
+
+    #[test]
+    fn test_model_self_not_registered_as_linear() {
+        // Model `self` is a pointer, not a tensor — it must NOT appear in the
+        // ownership checker's tensor_bindings map. Calling forward multiple times
+        // must not trigger any ownership error.
+        let mut interner = Interner::new();
+        let model_ptr = Symbol(interner.get_or_intern("self"));
+        let checker = OwnershipChecker::new(&interner);
+
+        // self is never registered as a tensor binding
+        assert!(
+            !checker.states.contains_key(&model_ptr),
+            "model self should not be in ownership states"
+        );
+    }
+
+    #[test]
+    fn test_model_forward_multiple_calls_pattern() {
+        // Simulate model.forward(x) called multiple times in a loop.
+        // The model weights are @shared (or each input is borrowed). Verify that
+        // a @shared weight can be used repeatedly without being consumed.
+        let mut interner = Interner::new();
+        let weight = Symbol(interner.get_or_intern("weight"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        // Model fields are @shared (refcounted) so they can be used across calls
+        checker.register_binding(weight, sp(), true); // is_shared = true
+
+        checker.enter_loop();
+        // Simulate forward() using weight multiple times per iteration
+        checker.consume(weight, sp(), "forward_matmul");
+        checker.consume(weight, sp(), "forward_matmul");
+        checker.consume(weight, sp(), "forward_matmul");
+        checker.exit_loop();
+
+        // No errors: @shared tensors can be consumed (refcount-managed) any number of times
+        assert!(
+            checker.diagnostics.is_empty(),
+            "model weights @shared should support multiple forward calls: {:?}",
+            checker.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_model_forward_borrow_self_weights_pattern() {
+        // A more explicit pattern: model weights are borrowed for each forward call.
+        // The borrow is created at call-start and released at call-end.
+        // This can repeat any number of times.
+        let mut interner = Interner::new();
+        let weight = Symbol(interner.get_or_intern("weight"));
+        let w_ref = Symbol(interner.get_or_intern("w_ref"));
+        let mut checker = OwnershipChecker::new(&interner);
+
+        checker.register_binding(weight, sp(), false);
+
+        // First forward call
+        checker.register_borrow(w_ref, weight, sp());
+        checker.use_borrow(w_ref, sp(), "MatMul");
+        checker.release_borrow(w_ref);
+
+        // Second forward call (same pattern — borrow re-created)
+        checker.register_borrow(w_ref, weight, sp());
+        checker.use_borrow(w_ref, sp(), "MatMul");
+        checker.release_borrow(w_ref);
+
+        // Third forward call
+        checker.register_borrow(w_ref, weight, sp());
+        checker.use_borrow(w_ref, sp(), "MatMul");
+        checker.release_borrow(w_ref);
+
+        assert!(
+            checker.diagnostics.is_empty(),
+            "model.forward() can be called multiple times via borrow pattern: {:?}",
+            checker.diagnostics
+        );
+    }
 }

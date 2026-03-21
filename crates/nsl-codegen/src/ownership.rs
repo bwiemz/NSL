@@ -351,4 +351,117 @@ mod tests {
         let decisions = lowering.decide(&x, false, None, false);
         assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
     }
+
+    // ── Task 5: Borrowed tensors in grad() scope — codegen decisions ─
+
+    #[test]
+    fn borrowed_in_grad_scope_no_action() {
+        // A borrowed tensor used in a tape-recording op: BorrowedNoAction.
+        // The tape records the raw pointer (same as the underlying owned tensor),
+        // and no free/refcount action is needed — the caller owns the tensor and
+        // keeps it alive for the borrow's lifetime.
+        let mut interner = Interner::new();
+        let w = make_sym(&mut interner, "w");
+        let w_ref = make_sym(&mut interner, "w_ref");
+        let mut lowering = OwnershipLowering::new();
+
+        // w is linear; w_ref is an active borrow of w
+        lowering.mark_linear(w);
+        lowering.active_borrows.insert(w, BorrowKind::Immutable { borrower: w_ref });
+
+        // Using w in a grad-scope DataRequired op (MatMul) — BorrowedNoAction
+        // because the borrow map entry for w takes priority.
+        let decisions = lowering.decide(&w, false, Some("MatMul"), false);
+        assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
+    }
+
+    #[test]
+    fn borrowed_in_grad_scope_no_action_shape_only() {
+        // Borrowed tensor in a ShapeOnly op (Add): still BorrowedNoAction.
+        // Both ShapeOnly and DataRequired ops get BorrowedNoAction for borrows —
+        // the caller keeps the tensor alive either way.
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let x_ref = make_sym(&mut interner, "x_ref");
+        let mut lowering = OwnershipLowering::new();
+
+        lowering.mark_linear(x);
+        lowering.active_borrows.insert(x, BorrowKind::Immutable { borrower: x_ref });
+
+        let decisions = lowering.decide(&x, false, Some("Add"), false);
+        assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
+    }
+
+    #[test]
+    fn no_grad_on_borrowed_param_frees_at_consumption() {
+        // @no_grad context: backward_access = None. A linear binding being consumed
+        // with no_grad active should FreeAtConsumption, same as without grad scope.
+        // This documents that @no_grad (backward_access = None) + linear consume
+        // = always free at consumption, regardless of borrow status of other tensors.
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let mut lowering = OwnershipLowering::new();
+
+        lowering.mark_linear(x);
+
+        // backward_access = None simulates @no_grad context
+        let decisions = lowering.decide(&x, true, None, false);
+        assert_eq!(decisions, vec![OwnershipDecision::FreeAtConsumption]);
+    }
+
+    // ── Task 6: Model methods — self pointer is never linear ─────────
+    //
+    // Model `self` is a raw I64 pointer in the Cranelift IR. It is never
+    // registered in OwnershipLowering (only tensor-typed bindings are).
+    // Therefore decide() is never called for self — no ownership action.
+    // The following tests verify that shared model weights (the dominant
+    // pattern for model fields) behave correctly across multiple forward calls.
+
+    #[test]
+    fn model_shared_weight_multiple_forward_calls() {
+        // Model weights are @shared — they can be used in forward() any number
+        // of times without being consumed. Each call gets RefcountManaged.
+        let mut interner = Interner::new();
+        let weight = make_sym(&mut interner, "weight");
+        let mut lowering = OwnershipLowering::new();
+
+        // Model fields are @shared by convention
+        lowering.mark_shared(weight);
+
+        // Three forward() calls each use weight (e.g., MatMul in forward pass)
+        for _ in 0..3 {
+            let decisions = lowering.decide(&weight, true, Some("MatMul"), false);
+            assert_eq!(
+                decisions,
+                vec![OwnershipDecision::RefcountManaged],
+                "shared weight should be RefcountManaged on every forward call"
+            );
+        }
+    }
+
+    #[test]
+    fn model_forward_borrow_then_optimizer_frees() {
+        // Training loop pattern:
+        //   1. weight borrowed for forward (BorrowedNoAction while borrow is active)
+        //   2. Borrow released after forward
+        //   3. Optimizer step: linear weight consumed → FreeAtConsumption
+        let mut interner = Interner::new();
+        let weight = make_sym(&mut interner, "weight");
+        let w_ref = make_sym(&mut interner, "w_ref");
+        let mut lowering = OwnershipLowering::new();
+
+        lowering.mark_linear(weight);
+
+        // Forward pass: borrow active
+        lowering.active_borrows.insert(weight, BorrowKind::Immutable { borrower: w_ref });
+        let fwd_decisions = lowering.decide(&weight, false, Some("MatMul"), false);
+        assert_eq!(fwd_decisions, vec![OwnershipDecision::BorrowedNoAction]);
+
+        // Release borrow (scope exit)
+        lowering.active_borrows.remove(&weight);
+
+        // Optimizer step: linear weight consumed (no grad context — @no_grad for update)
+        let opt_decisions = lowering.decide(&weight, true, None, false);
+        assert_eq!(opt_decisions, vec![OwnershipDecision::FreeAtConsumption]);
+    }
 }

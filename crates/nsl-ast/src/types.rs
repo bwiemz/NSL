@@ -66,6 +66,9 @@ pub enum TypeExprKind {
         element_type: Box<TypeExpr>,
         size: i64,
     },
+
+    /// Immutable borrow: &T
+    Borrow(Box<TypeExpr>),
 }
 
 #[derive(Debug, Clone, Serialize)]

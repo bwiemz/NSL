@@ -107,28 +107,55 @@ pub enum Type {
         element_model: Symbol,
         size: i64,
     },
+
+    /// Immutable borrow: &T — read-only access, cannot be consumed or mutated.
+    /// The inner type is the borrowed type (e.g., &Tensor<[N], f32> -> Borrow(Tensor{...})).
+    Borrow(Box<Type>),
 }
 
 impl Type {
     /// Returns true if this type is a tensor family type.
     pub fn is_tensor(&self) -> bool {
-        matches!(self, Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. })
+        match self {
+            Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } => true,
+            Type::Borrow(inner) => inner.is_tensor(),
+            _ => false,
+        }
     }
 
     /// Returns true if this is an error or unknown (suppresses cascading).
     pub fn is_indeterminate(&self) -> bool {
-        matches!(self, Type::Error | Type::Unknown)
+        match self {
+            Type::Error | Type::Unknown => true,
+            Type::Borrow(inner) => inner.is_indeterminate(),
+            _ => false,
+        }
     }
 
     /// Normalize Param/Buffer to Tensor for type-checking operations.
     /// Returns (shape, dtype, device) if this is a tensor-family type.
+    /// Sees through borrows: `&Tensor<...>` returns the inner tensor parts.
     pub fn as_tensor_parts(&self) -> Option<(&Shape, &DType, Device)> {
         match self {
             Type::Tensor { shape, dtype, device } => Some((shape, dtype, device.clone())),
             Type::Param { shape, dtype } => Some((shape, dtype, Device::Unknown)),
             Type::Buffer { shape, dtype } => Some((shape, dtype, Device::Unknown)),
+            Type::Borrow(inner) => inner.as_tensor_parts(),
             _ => None,
         }
+    }
+
+    /// Returns the inner type if this is a borrow, otherwise returns self.
+    pub fn strip_borrow(&self) -> &Type {
+        match self {
+            Type::Borrow(inner) => inner.strip_borrow(),
+            other => other,
+        }
+    }
+
+    /// Returns true if this is a borrow type.
+    pub fn is_borrow(&self) -> bool {
+        matches!(self, Type::Borrow(_))
     }
 }
 
@@ -266,6 +293,21 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
     if source == target {
         return true;
     }
+    // Borrow assignability rules:
+    // - &T -> &T: if inner types are assignable (handled by same-type check above for exact match)
+    // - T -> &T: auto-borrow — owned can be passed where borrow is expected
+    // - &T -> T: NOT allowed — cannot pass a borrow where owned/consumed is expected
+    if let Type::Borrow(target_inner) = target {
+        // Target expects a borrow: source can be either &T or owned T
+        let source_inner = source.strip_borrow();
+        return is_assignable(source_inner, target_inner);
+    }
+    if let Type::Borrow(source_inner) = source {
+        // Source is a borrow but target is owned: read-compatible for non-consuming operations.
+        // Allow &T -> T for read-only contexts (method calls, reads), but the ownership
+        // checker will catch actual consumption attempts.
+        return is_assignable(source_inner, target);
+    }
     // Safe widening: int -> float
     if matches!(source, Type::Int) && matches!(target, Type::Float) {
         return true;
@@ -338,8 +380,10 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
 
 /// Returns (family, rank) for numeric types. Family: 0=non-numeric, 1=int, 2=float.
 /// Widening is only allowed within the same family to prevent e.g. Int64 -> Fp8.
+/// Sees through borrow types: `&int` has the same rank as `int`.
 pub fn dtype_rank(ty: &Type) -> (u8, u8) {
     match ty {
+        Type::Borrow(inner) => dtype_rank(inner),
         Type::Int4 => (1, 1),
         Type::Uint8 => (1, 2),
         Type::Int8 => (1, 2),
@@ -463,6 +507,7 @@ pub fn display_type(ty: &Type) -> String {
         Type::Error => "error".into(),
         Type::NoneType => "None".into(),
         Type::FixedModelArray { size, .. } => format!("[model; {}]", size),
+        Type::Borrow(inner) => format!("&{}", display_type(inner)),
         _ => format!("{:?}", ty),
     }
 }
@@ -554,6 +599,85 @@ mod tests {
     fn wider_dtype_mixed() {
         assert_eq!(wider_dtype(DType::Fp16, DType::F32), DType::F32);
         assert_eq!(wider_dtype(DType::F32, DType::Fp16), DType::F32);
+    }
+
+    // ── Borrow type tests ──────────────────────────────────────────
+
+    #[test]
+    fn borrow_same_type_assignable() {
+        let borrow_int = Type::Borrow(Box::new(Type::Int));
+        assert!(is_assignable(&borrow_int, &borrow_int));
+    }
+
+    #[test]
+    fn owned_to_borrow_assignable() {
+        // T -> &T: auto-borrow
+        let owned = Type::Int;
+        let borrow_int = Type::Borrow(Box::new(Type::Int));
+        assert!(is_assignable(&owned, &borrow_int));
+    }
+
+    #[test]
+    fn borrow_to_owned_assignable_for_reads() {
+        // &T -> T: allowed for read-compatible contexts
+        let owned = Type::Int;
+        let borrow_int = Type::Borrow(Box::new(Type::Int));
+        assert!(is_assignable(&borrow_int, &owned));
+    }
+
+    #[test]
+    fn borrow_tensor_auto_borrow() {
+        let tensor = Type::Tensor {
+            shape: Shape { dims: vec![Dim::Concrete(4)] },
+            dtype: DType::F32,
+            device: Device::Unknown,
+        };
+        let borrow_tensor = Type::Borrow(Box::new(tensor.clone()));
+        // Owned tensor assignable to &Tensor
+        assert!(is_assignable(&tensor, &borrow_tensor));
+        // &Tensor assignable to &Tensor
+        assert!(is_assignable(&borrow_tensor, &borrow_tensor));
+    }
+
+    #[test]
+    fn borrow_display() {
+        let borrow_int = Type::Borrow(Box::new(Type::Int));
+        assert_eq!(display_type(&borrow_int), "&int");
+
+        let borrow_tensor = Type::Borrow(Box::new(Type::Tensor {
+            shape: Shape { dims: vec![Dim::Concrete(4)] },
+            dtype: DType::F32,
+            device: Device::Unknown,
+        }));
+        assert_eq!(display_type(&borrow_tensor), "&Tensor<[4], f32>");
+    }
+
+    #[test]
+    fn borrow_is_tensor() {
+        let tensor = Type::Tensor {
+            shape: Shape { dims: vec![Dim::Concrete(4)] },
+            dtype: DType::F32,
+            device: Device::Unknown,
+        };
+        let borrow = Type::Borrow(Box::new(tensor));
+        assert!(borrow.is_tensor());
+        assert!(borrow.is_borrow());
+    }
+
+    #[test]
+    fn borrow_strip_borrow() {
+        let inner = Type::Int;
+        let borrow = Type::Borrow(Box::new(inner.clone()));
+        assert_eq!(borrow.strip_borrow(), &inner);
+        // Non-borrow returns self
+        assert_eq!(inner.strip_borrow(), &inner);
+    }
+
+    #[test]
+    fn borrow_mismatched_types_not_assignable() {
+        let borrow_int = Type::Borrow(Box::new(Type::Int));
+        let borrow_str = Type::Borrow(Box::new(Type::Str));
+        assert!(!is_assignable(&borrow_int, &borrow_str));
     }
 }
 
