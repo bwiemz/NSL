@@ -1226,4 +1226,168 @@ mod tests {
         assert!(select_count >= 2,
             "Should have at least 2 Select ops in backward (one per branch input), got {select_count}");
     }
+
+    // ---------------------------------------------------------------
+    // Task 4: Nested if/else
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_nested_if_else() {
+        // f(x) = if x > 0 { if x > 1 { x*x*x } else { x*x } } else { 0 }
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        // Inner if: if x > 1 { x*x*x } else { x*x }
+        let inner_cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(1.0),
+        );
+        let x_cubed = make_binop_expr(
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Mul,
+                make_ident_expr(x_sym),
+            ),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let x_squared = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+
+        let inner_if = make_if_stmt(
+            inner_cond,
+            vec![make_return_stmt(x_cubed)],
+            Some(vec![make_return_stmt(x_squared)]),
+        );
+
+        // Outer if: if x > 0 { <inner_if> } else { 0 }
+        let outer_cond = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Gt,
+            make_float_expr(0.0),
+        );
+        let outer_if = make_if_stmt(
+            outer_cond,
+            vec![inner_if],
+            Some(vec![make_return_stmt(make_float_expr(0.0))]),
+        );
+
+        let result = extractor.extract_stmts(&[outer_if]);
+        assert!(result, "Nested if/else should be extractable");
+        assert!(extractor.is_static_graph());
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Should have 2 Condition ops (one per if)
+        let cond_count = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .count();
+        assert_eq!(cond_count, 2, "Should have 2 Condition ops for nested if/else, got {cond_count}");
+
+        // Should have at least 2 Select ops (one per merge point)
+        let select_count = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(select_count >= 2, "Should have at least 2 Select ops, got {select_count}");
+    }
+
+    #[test]
+    fn adjoint_nested_branches_propagates() {
+        // Nested: if x > 0 { if x > 1 { x*x } else { x } } else { 0 }
+        // We build the flat Wengert for this manually:
+        //   x(0), zero(1), one(2)
+        //   cond_outer(3) = x > 0
+        //   cond_inner(4) = x > 1
+        //   t_inner(5) = x * x
+        //   inner_select(6) = Select(cond_inner, t_inner, x)  -- inner merge
+        //   outer_select(7) = Select(cond_outer, inner_select, zero) -- outer merge
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
+                make_op(2, 2, PrimalOp::Constant(1.0), vec![]),
+                make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
+                make_op(4, 4, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
+                make_op(5, 5, PrimalOp::Mul, vec![0, 0]),
+                make_op(6, 6, PrimalOp::Select, vec![4, 5, 0]),
+                make_op(7, 7, PrimalOp::Select, vec![3, 6, 1]),
+            ],
+            output: 7,
+            var_names: HashMap::new(),
+        };
+
+        let mut gen = AdjointGenerator::new(20);
+        let adjoint = gen.generate(&primal);
+
+        // x (var 0) should have an adjoint — gradient propagates through both Select ops
+        assert!(gen.adjoint_of(0).is_some(), "x should have adjoint through nested Select");
+
+        // The adjoint list should contain multiple Select ops (from both nesting levels)
+        let adj_selects = adjoint.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .count();
+        assert!(adj_selects >= 2,
+            "Adjoint should have >= 2 Select ops for nested branching, got {adj_selects}");
+    }
+
+    #[test]
+    fn extract_elif_desugars_to_nested() {
+        // f(x) = if x > 1: x*x*x  elif x > 0: x*x  else: 0
+        // This tests elif desugaring (single elif clause + else)
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_param(x_sym);
+
+        let x_cubed = make_binop_expr(
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Mul,
+                make_ident_expr(x_sym),
+            ),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+        let x_squared = make_binop_expr(
+            make_ident_expr(x_sym),
+            nsl_ast::operator::BinOp::Mul,
+            make_ident_expr(x_sym),
+        );
+
+        let if_stmt = make_if_elif_stmt(
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Gt,
+                make_float_expr(1.0),
+            ),
+            vec![make_return_stmt(x_cubed)],
+            make_binop_expr(
+                make_ident_expr(x_sym),
+                nsl_ast::operator::BinOp::Gt,
+                make_float_expr(0.0),
+            ),
+            vec![make_return_stmt(x_squared)],
+            Some(vec![make_return_stmt(make_float_expr(0.0))]),
+        );
+
+        let result = extractor.extract_stmts(&[if_stmt]);
+        assert!(result, "elif should be desugared and extractable");
+        assert!(extractor.is_static_graph());
+
+        let list = extractor.finalize().expect("Should produce WengertList");
+
+        // Should have 2 Condition ops (outer and elif)
+        let cond_count = list.ops.iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .count();
+        assert_eq!(cond_count, 2, "Should have 2 Condition ops for if/elif/else, got {cond_count}");
+    }
 }
