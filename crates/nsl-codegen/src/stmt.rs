@@ -244,6 +244,9 @@ impl Compiler<'_> {
                             if dname == "no_grad" {
                                 let fname = self.resolve_sym(fn_def.name).to_string();
                                 self.no_grad_fns.insert(fname);
+                            } else if dname == "fp8_compute" {
+                                let fname = self.resolve_sym(fn_def.name).to_string();
+                                self.features.fp8_compute_fns.insert(fname);
                             } else if dname == "fuse" {
                                 // Validate that the body contains only fusible elementwise ops
                                 self.validate_fuse_body(fn_def)?;

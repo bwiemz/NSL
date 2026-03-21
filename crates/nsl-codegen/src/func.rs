@@ -110,6 +110,11 @@ impl Compiler<'_> {
                 self.compile_call_by_name(&mut builder, "nsl_tape_pause", &[])?;
             }
 
+            // @fp8_compute: use FP8 training matmul for E5M2 backward
+            if self.features.fp8_compute_fns.contains(&name) {
+                state.is_fp8_compute = true;
+            }
+
             // M38b: Set up ownership lowering for this function.
             // When --linear-types is active and the semantic pass produced ownership
             // metadata for this function, create an OwnershipLowering tracker and

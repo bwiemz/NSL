@@ -381,7 +381,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // --- M35: FP8 compute ---
     ("nsl_fp8_cast", &[types::I64, types::I64, types::F64], Some(types::I64)),
     ("nsl_fp8_matmul", &[types::I64, types::I64, types::F64, types::F64], Some(types::I64)),
+    ("nsl_fp8_matmul_training", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_fp8_compute_scale", &[types::I64, types::I64], Some(types::F64)),
+    ("nsl_fp8_quantize_e5m2", &[types::I64, types::F64], Some(types::I64)),
+    ("nsl_fp8_gradient_scale", &[types::I64], Some(types::F64)),
+    ("nsl_fp8_cache_e5m2_ptx", &[types::I64, types::I64], None),
     ("nsl_fp8_update_calibration", &[types::I64, types::I64, types::F64], Some(types::F64)),
     // --- M35: AWQ 4-bit quantization ---
     ("nsl_awq_quantize", &[types::I64, types::I64, types::I64], Some(types::I64)),

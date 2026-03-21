@@ -50,9 +50,6 @@ pub struct ShapeAlgebraSolver {
     /// Known divisibility facts: symbol is divisible by these divisors.
     divisibility: HashMap<Symbol, Vec<i64>>,
     /// Known range bounds: symbol in [lower, upper].
-    /// NOTE: Stored but not yet queried by prove_eq/prove_divisible.
-    /// prove_bound() and range reasoning deferred to M49b.
-    #[allow(dead_code)]
     bounds: HashMap<Symbol, (Option<i64>, Option<i64>)>,
     /// Known equalities between expressions.
     equalities: Vec<(DimExpr, DimExpr)>,
@@ -200,6 +197,36 @@ impl ShapeAlgebraSolver {
             }
         }
 
+        // Strategy 5: Bound-derived equality (if both sides have singleton bounds [v, v])
+        if let (DimExpr::Sym(a), DimExpr::Sym(b)) = (&sl, &sr) {
+            if let (Some((Some(lo_a), Some(hi_a))), Some((Some(lo_b), Some(hi_b))))
+                = (self.bounds.get(a), self.bounds.get(b))
+            {
+                if lo_a == hi_a && lo_b == hi_b && lo_a == lo_b {
+                    return Ok(());
+                }
+            }
+        }
+        // Also: symbol vs literal via bounds
+        if let DimExpr::Sym(s) = &sl {
+            if let DimExpr::Lit(v) = &sr {
+                if let Some((Some(lo), Some(hi))) = self.bounds.get(s) {
+                    if lo == hi && lo == v {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let DimExpr::Lit(v) = &sl {
+            if let DimExpr::Sym(s) = &sr {
+                if let Some((Some(lo), Some(hi))) = self.bounds.get(s) {
+                    if lo == hi && lo == v {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         Err(ProofFailure {
             goal: format!("{:?} == {:?}", lhs, rhs),
             attempts: vec![
@@ -207,6 +234,7 @@ impl ShapeAlgebraSolver {
                 "simplification".into(),
                 "concrete evaluation".into(),
                 "known equalities".into(),
+                "bound-derived equality".into(),
             ],
             reason: "insufficient information to prove equality".into(),
         })
@@ -266,6 +294,250 @@ impl ShapeAlgebraSolver {
                 "product factor analysis".into(),
             ],
             reason: format!("cannot prove {:?} is divisible by {}", expr, divisor),
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Bound-aware reasoning
+    // ---------------------------------------------------------------------------
+
+    /// Get the bounds for a symbol, if any.
+    pub fn get_bound(&self, sym: Symbol) -> Option<(Option<i64>, Option<i64>)> {
+        self.bounds.get(&sym).copied()
+    }
+
+    /// Compute upper bound of an expression from stored bounds and bindings.
+    pub fn upper_bound(&self, expr: &DimExpr) -> Option<i64> {
+        match expr {
+            DimExpr::Lit(v) => Some(*v),
+            DimExpr::Sym(s) => {
+                if let Some(&v) = self.bindings.get(s) {
+                    Some(v)
+                } else if let Some((_, hi)) = self.bounds.get(s) {
+                    *hi
+                } else {
+                    None
+                }
+            }
+            DimExpr::Add(a, b) => {
+                let ua = self.upper_bound(a)?;
+                let ub = self.upper_bound(b)?;
+                Some(ua + ub)
+            }
+            DimExpr::Mul(a, b) => {
+                let ua = self.upper_bound(a)?;
+                let ub = self.upper_bound(b)?;
+                // Only correct for non-negative bounds
+                if ua >= 0 && ub >= 0 { Some(ua * ub) } else { None }
+            }
+            _ => self.evaluate(expr),
+        }
+    }
+
+    /// Compute lower bound of an expression from stored bounds and bindings.
+    pub fn lower_bound(&self, expr: &DimExpr) -> Option<i64> {
+        match expr {
+            DimExpr::Lit(v) => Some(*v),
+            DimExpr::Sym(s) => {
+                if let Some(&v) = self.bindings.get(s) {
+                    Some(v)
+                } else if let Some((lo, _)) = self.bounds.get(s) {
+                    *lo
+                } else {
+                    None
+                }
+            }
+            DimExpr::Add(a, b) => {
+                let la = self.lower_bound(a)?;
+                let lb = self.lower_bound(b)?;
+                Some(la + lb)
+            }
+            DimExpr::Mul(a, b) => {
+                let la = self.lower_bound(a)?;
+                let lb = self.lower_bound(b)?;
+                if la >= 0 && lb >= 0 { Some(la * lb) } else { None }
+            }
+            _ => self.evaluate(expr),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Inequality proofs
+    // ---------------------------------------------------------------------------
+
+    /// Comparison operators for inequality proofs.
+    /// Try to prove `expr op value` (e.g., S <= 4096).
+    pub fn prove_le(&self, expr: &DimExpr, value: i64) -> Result<(), ProofFailure> {
+        // Strategy 1: concrete evaluation
+        if let Some(v) = self.evaluate(expr) {
+            return if v <= value { Ok(()) } else {
+                Err(ProofFailure {
+                    goal: format!("{:?} <= {}", expr, value),
+                    attempts: vec!["concrete evaluation".into()],
+                    reason: format!("{} > {}", v, value),
+                })
+            };
+        }
+
+        // Strategy 2: upper bound from bounds database
+        if let Some(ub) = self.upper_bound(expr) {
+            if ub <= value { return Ok(()); }
+        }
+
+        // Strategy 3: Fourier-Motzkin for transitive bounds
+        if self.fm_prove_le(expr, value) {
+            return Ok(());
+        }
+
+        Err(ProofFailure {
+            goal: format!("{:?} <= {}", expr, value),
+            attempts: vec!["concrete".into(), "upper bound".into(), "Fourier-Motzkin".into()],
+            reason: "insufficient information".into(),
+        })
+    }
+
+    /// Try to prove `expr >= value`.
+    pub fn prove_ge(&self, expr: &DimExpr, value: i64) -> Result<(), ProofFailure> {
+        if let Some(v) = self.evaluate(expr) {
+            return if v >= value { Ok(()) } else {
+                Err(ProofFailure {
+                    goal: format!("{:?} >= {}", expr, value),
+                    attempts: vec!["concrete evaluation".into()],
+                    reason: format!("{} < {}", v, value),
+                })
+            };
+        }
+
+        if let Some(lb) = self.lower_bound(expr) {
+            if lb >= value { return Ok(()); }
+        }
+
+        Err(ProofFailure {
+            goal: format!("{:?} >= {}", expr, value),
+            attempts: vec!["concrete".into(), "lower bound".into()],
+            reason: "insufficient information".into(),
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Fourier-Motzkin variable elimination (limited)
+    // ---------------------------------------------------------------------------
+
+    /// Try to prove `expr <= value` using transitive bound reasoning.
+    ///
+    /// Converts stored bounds into linear constraints and eliminates variables
+    /// to derive a bound on the target expression. Limited to simple symbol
+    /// expressions with ≤3 elimination steps to avoid exponential blowup.
+    fn fm_prove_le(&self, expr: &DimExpr, value: i64) -> bool {
+        // Only handle simple symbol case for now
+        let target_sym = match expr {
+            DimExpr::Sym(s) => *s,
+            _ => return false,
+        };
+
+        // Collect transitive upper bounds: if A <= B and B <= C and C <= value,
+        // then A <= value. Walk the equality chain.
+        // Simple implementation: check if any bound chain leads to <= value
+        self.fm_trace_upper(target_sym, value, &mut Vec::new(), 3)
+    }
+
+    /// Recursively trace upper bounds. `depth` limits recursion.
+    fn fm_trace_upper(&self, sym: Symbol, target: i64, visited: &mut Vec<Symbol>, depth: u32) -> bool {
+        if depth == 0 { return false; }
+        if visited.contains(&sym) { return false; }
+        visited.push(sym);
+
+        // Direct bound check
+        if let Some((_, Some(hi))) = self.bounds.get(&sym) {
+            if *hi <= target { return true; }
+        }
+
+        // Check if bound on sym is via another symbol (from equalities)
+        // e.g., assert_eq(A, B) and B has bound <= target
+        for (eq_l, eq_r) in &self.equalities {
+            if let DimExpr::Sym(s) = eq_l {
+                if *s == sym {
+                    if let DimExpr::Sym(other) = eq_r {
+                        if self.fm_trace_upper(*other, target, visited, depth - 1) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if let DimExpr::Sym(s) = eq_r {
+                if *s == sym {
+                    if let DimExpr::Sym(other) = eq_l {
+                        if self.fm_trace_upper(*other, target, visited, depth - 1) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    // ---------------------------------------------------------------------------
+    // Commutative normalization
+    // ---------------------------------------------------------------------------
+
+    /// Normalize a DimExpr by sorting commutative operands lexicographically.
+    /// This makes `A*B` and `B*A` compare as equal after normalization.
+    pub fn normalize(&self, expr: &DimExpr) -> DimExpr {
+        let simplified = self.simplify(expr);
+        self.normalize_inner(&simplified)
+    }
+
+    fn normalize_inner(&self, expr: &DimExpr) -> DimExpr {
+        match expr {
+            DimExpr::Lit(_) | DimExpr::Sym(_) => expr.clone(),
+            DimExpr::Add(a, b) => {
+                let na = self.normalize_inner(a);
+                let nb = self.normalize_inner(b);
+                // Sort: smaller debug representation first
+                if format!("{:?}", na) <= format!("{:?}", nb) {
+                    DimExpr::Add(Box::new(na), Box::new(nb))
+                } else {
+                    DimExpr::Add(Box::new(nb), Box::new(na))
+                }
+            }
+            DimExpr::Mul(a, b) => {
+                let na = self.normalize_inner(a);
+                let nb = self.normalize_inner(b);
+                if format!("{:?}", na) <= format!("{:?}", nb) {
+                    DimExpr::Mul(Box::new(na), Box::new(nb))
+                } else {
+                    DimExpr::Mul(Box::new(nb), Box::new(na))
+                }
+            }
+            DimExpr::Div(a, b) => {
+                DimExpr::Div(Box::new(self.normalize_inner(a)), Box::new(self.normalize_inner(b)))
+            }
+            DimExpr::Mod(a, b) => {
+                DimExpr::Mod(Box::new(self.normalize_inner(a)), Box::new(self.normalize_inner(b)))
+            }
+        }
+    }
+
+    /// Try to prove equality using normalization (handles commutativity).
+    pub fn prove_eq_normalized(&self, lhs: &DimExpr, rhs: &DimExpr) -> Result<(), ProofFailure> {
+        // Try standard proof first
+        if self.prove_eq(lhs, rhs).is_ok() {
+            return Ok(());
+        }
+
+        // Try normalized comparison
+        let nl = self.normalize(lhs);
+        let nr = self.normalize(rhs);
+        if nl == nr {
+            return Ok(());
+        }
+
+        Err(ProofFailure {
+            goal: format!("{:?} == {:?}", lhs, rhs),
+            attempts: vec!["standard proof".into(), "commutative normalization".into()],
+            reason: "insufficient information after normalization".into(),
         })
     }
 }
@@ -448,5 +720,137 @@ mod tests {
         let solver = ShapeAlgebraSolver::new();
         let expr = DimExpr::Div(Box::new(DimExpr::Lit(10)), Box::new(DimExpr::Lit(0)));
         assert_eq!(solver.evaluate(&expr), None);
+    }
+
+    // ── Bound reasoning tests (M49b) ──────────────────────────────────
+
+    #[test]
+    fn bound_derived_equality() {
+        let mut interner = Interner::new();
+        let s = make_sym(&mut interner, "S");
+        let mut solver = ShapeAlgebraSolver::new();
+        // S is exactly 32 (singleton bound)
+        solver.assert_bound(s, Some(32), Some(32));
+
+        assert!(solver.prove_eq(&DimExpr::Sym(s), &DimExpr::Lit(32)).is_ok(),
+            "S with bounds [32, 32] should equal 32");
+    }
+
+    #[test]
+    fn bound_derived_equality_two_symbols() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(a, Some(64), Some(64));
+        solver.assert_bound(b, Some(64), Some(64));
+
+        assert!(solver.prove_eq(&DimExpr::Sym(a), &DimExpr::Sym(b)).is_ok(),
+            "A=[64,64] and B=[64,64] should be equal");
+    }
+
+    #[test]
+    fn prove_le_from_bound() {
+        let mut interner = Interner::new();
+        let s = make_sym(&mut interner, "S");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(s, Some(1), Some(4096));
+
+        assert!(solver.prove_le(&DimExpr::Sym(s), 4096).is_ok(),
+            "S <= 4096 should hold when S in [1, 4096]");
+        assert!(solver.prove_le(&DimExpr::Sym(s), 8192).is_ok(),
+            "S <= 8192 should hold when S in [1, 4096]");
+        assert!(solver.prove_le(&DimExpr::Sym(s), 100).is_err(),
+            "S <= 100 cannot be proven when S upper bound is 4096");
+    }
+
+    #[test]
+    fn prove_ge_from_bound() {
+        let mut interner = Interner::new();
+        let s = make_sym(&mut interner, "S");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(s, Some(1), Some(4096));
+
+        assert!(solver.prove_ge(&DimExpr::Sym(s), 1).is_ok(),
+            "S >= 1 should hold when S in [1, 4096]");
+        assert!(solver.prove_ge(&DimExpr::Sym(s), 0).is_ok(),
+            "S >= 0 should hold when S >= 1");
+        assert!(solver.prove_ge(&DimExpr::Sym(s), 2).is_err(),
+            "S >= 2 cannot be proven when lower bound is 1");
+    }
+
+    #[test]
+    fn prove_le_concrete() {
+        let mut interner = Interner::new();
+        let d = make_sym(&mut interner, "D");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.bind(d, 768);
+
+        assert!(solver.prove_le(&DimExpr::Sym(d), 1000).is_ok());
+        assert!(solver.prove_le(&DimExpr::Sym(d), 768).is_ok());
+        assert!(solver.prove_le(&DimExpr::Sym(d), 500).is_err());
+    }
+
+    #[test]
+    fn upper_bound_of_product() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let mut solver = ShapeAlgebraSolver::new();
+        solver.assert_bound(a, Some(1), Some(32));
+        solver.assert_bound(b, Some(1), Some(64));
+
+        let prod = DimExpr::Mul(Box::new(DimExpr::Sym(a)), Box::new(DimExpr::Sym(b)));
+        assert_eq!(solver.upper_bound(&prod), Some(32 * 64));
+        assert!(solver.prove_le(&prod, 2048).is_ok());
+    }
+
+    #[test]
+    fn fm_transitive_bound() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let mut solver = ShapeAlgebraSolver::new();
+        // A == B (equality), B <= 1024
+        solver.assert_eq(DimExpr::Sym(a), DimExpr::Sym(b));
+        solver.assert_bound(b, Some(1), Some(1024));
+
+        // A <= 1024 via transitive: A == B, B <= 1024
+        assert!(solver.prove_le(&DimExpr::Sym(a), 1024).is_ok(),
+            "A <= 1024 via A == B, B <= 1024");
+    }
+
+    // ── Commutative normalization tests ──────────────────────────────
+
+    #[test]
+    fn normalize_commutative_mul() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let solver = ShapeAlgebraSolver::new();
+
+        let ab = DimExpr::Mul(Box::new(DimExpr::Sym(a)), Box::new(DimExpr::Sym(b)));
+        let ba = DimExpr::Mul(Box::new(DimExpr::Sym(b)), Box::new(DimExpr::Sym(a)));
+
+        let n_ab = solver.normalize(&ab);
+        let n_ba = solver.normalize(&ba);
+        assert_eq!(n_ab, n_ba, "A*B and B*A should normalize to same form");
+    }
+
+    #[test]
+    fn prove_eq_normalized_commutative() {
+        let mut interner = Interner::new();
+        let a = make_sym(&mut interner, "A");
+        let b = make_sym(&mut interner, "B");
+        let solver = ShapeAlgebraSolver::new();
+
+        let ab = DimExpr::Mul(Box::new(DimExpr::Sym(a)), Box::new(DimExpr::Sym(b)));
+        let ba = DimExpr::Mul(Box::new(DimExpr::Sym(b)), Box::new(DimExpr::Sym(a)));
+
+        // Standard prove_eq fails (different structure)
+        assert!(solver.prove_eq(&ab, &ba).is_err());
+        // Normalized prove_eq succeeds
+        assert!(solver.prove_eq_normalized(&ab, &ba).is_ok(),
+            "A*B == B*A should be provable via normalization");
     }
 }

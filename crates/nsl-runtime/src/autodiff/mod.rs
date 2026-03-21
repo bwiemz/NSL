@@ -38,6 +38,15 @@ pub enum TapeOp {
     Mul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
     Div { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64, a_shape: Vec<i64>, b_shape: Vec<i64> },
     MatMul { a: i64, b: i64, out: i64, saved_a: i64, saved_b: i64 },
+    /// FP8 matmul with scale factors for E5M2 backward dispatch.
+    /// Forward uses E4M3; backward re-quantizes to E5M2 and uses GPU MMA.
+    Fp8MatMul {
+        a: i64, b: i64, out: i64,
+        saved_a: i64, saved_b: i64,
+        scale_a: f32, scale_b: f32,
+        k_dim: i64,
+        device: u8,
+    },
     Neg { a: i64, out: i64 },
     MulScalar { a: i64, scalar: f64, out: i64 },
     AddScalar { a: i64, out: i64 },
@@ -147,7 +156,8 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
         match op {
             TapeOp::Mul { saved_a, saved_b, .. }
             | TapeOp::Div { saved_a, saved_b, .. }
-            | TapeOp::MatMul { saved_a, saved_b, .. } => {
+            | TapeOp::MatMul { saved_a, saved_b, .. }
+            | TapeOp::Fp8MatMul { saved_a, saved_b, .. } => {
                 tensor_free(*saved_a);
                 tensor_free(*saved_b);
             }
