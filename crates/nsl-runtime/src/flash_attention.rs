@@ -526,18 +526,17 @@ pub extern "C" fn nsl_flash_attention_backward(
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, total);
         }
-        let t = Box::new(NslTensor {
-            data: data_ptr as *mut std::ffi::c_void,
-            shape: shape_ptr,
+        let t = Box::new(NslTensor::new(
+            data_ptr as *mut std::ffi::c_void,
+            shape_ptr,
             strides,
             ndim,
-            len: total as i64,
-            refcount: std::sync::atomic::AtomicI64::new(1),
-            device: 0,
-            dtype: 1, // f32
-            owns_data: 1,
-            data_owner: 0,
-        });
+            total as i64,
+            0,
+            1,
+            1,
+            0,
+        ));
         Box::into_raw(t) as i64
     }
 

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::list::NslList;
 use crate::tensor::{
@@ -58,7 +57,17 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
             unsafe { *data.add(i) = if x > 0.0 { g } else { 0.0 } };
         }
     }
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 
@@ -103,7 +112,17 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
             unsafe { *data.add(i) = g * deriv };
         }
     }
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 
@@ -141,7 +160,17 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
             unsafe { *data.add(i) = g * deriv };
         }
     }
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 
@@ -175,7 +204,17 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
             unsafe { *data.add(i) = g * o * (1.0 - o) };
         }
     }
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 
@@ -209,7 +248,17 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
             unsafe { *data.add(i) = g * (1.0 - o * o) };
         }
     }
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 
@@ -275,7 +324,17 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         }
     }
 
-    let t = Box::new(NslTensor { data: data_raw, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: grad.device, dtype: out_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        grad.device,
+        out_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 
@@ -575,7 +634,17 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
             unsafe { *data.add(i) = g * m * scale };
         }
     }
-    let t = Box::new(NslTensor { data: data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1), device: 0, dtype: grad_dtype, owns_data: 1, data_owner: 0 });
+    let t = Box::new(NslTensor::new(
+        data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        grad_dtype,
+        1,
+        0,
+    ));
     Box::into_raw(t) as i64
 }
 

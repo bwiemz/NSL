@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicI64;
 use super::types::MoeRoutingResult;
 use super::router;
 use super::dispatch;
@@ -342,17 +341,17 @@ pub extern "C" fn nsl_moe_dispatch_full(
         }
     }
 
-    let result = Box::new(NslTensor {
+    let result = Box::new(NslTensor::new(
         data,
         shape,
         strides,
-        ndim: tokens.ndim,
-        len: output_len as i64,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: out_dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        tokens.ndim,
+        output_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
 
     Box::into_raw(result) as i64
 }

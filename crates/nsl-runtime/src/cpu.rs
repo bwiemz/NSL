@@ -2,7 +2,6 @@
 //! These are the original implementations extracted from tensor.rs.
 
 use std::ffi::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 use crate::tensor::NslTensor;
@@ -115,17 +114,17 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         unsafe { *data.add(flat) = op(*a.data_f64().add(a_idx), *b.data_f64().add(b_idx)) };
     }
 
-    let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let result = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
-        ndim: out_ndim as i64,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        out_ndim as i64,
+        out_len,
+        0,
+        0,
+        1,
+        0,
+    ));
     crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f64>());
     Box::into_raw(result) as i64
 }
@@ -243,17 +242,17 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         unsafe { *data.add(flat) = op(read_a(a_idx), read_b(b_idx)) };
     }
 
-    let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let result = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
-        ndim: out_ndim as i64,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+        out_ndim as i64,
+        out_len,
+        0,
+        1,
+        1,
+        0,
+    ));
     crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f32>());
     Box::into_raw(result) as i64
 }
@@ -355,17 +354,17 @@ pub extern "C" fn nsl_fused_elementwise_2(
 
             unsafe { *buf.add(i) = acc };
         }
-        let result = Box::new(NslTensor {
-            data: buf as *mut c_void,
-            shape: out_shape,
-            strides: out_strides,
-            ndim: a.ndim,
-            len: a.len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 1,
-            owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            buf as *mut c_void,
+            out_shape,
+            out_strides,
+            a.ndim,
+            a.len,
+            0,
+            1,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     } else {
         // f64 fallback — same logic
@@ -381,17 +380,17 @@ pub extern "C" fn nsl_fused_elementwise_2(
             }
             unsafe { *buf.add(i) = acc as f64 };
         }
-        let result = Box::new(NslTensor {
-            data: buf as *mut c_void,
-            shape: out_shape,
-            strides: out_strides,
-            ndim: a.ndim,
-            len: a.len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 0,
-            owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            buf as *mut c_void,
+            out_shape,
+            out_strides,
+            a.ndim,
+            a.len,
+            0,
+            0,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     }
 }
@@ -425,17 +424,17 @@ pub extern "C" fn nsl_fused_elementwise_1(
             }
             unsafe { *buf.add(i) = acc };
         }
-        let result = Box::new(NslTensor {
-            data: buf as *mut c_void,
-            shape: out_shape,
-            strides: out_strides,
-            ndim: a.ndim,
-            len: a.len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 1,
-            owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            buf as *mut c_void,
+            out_shape,
+            out_strides,
+            a.ndim,
+            a.len,
+            0,
+            1,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     } else {
         let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
@@ -447,17 +446,17 @@ pub extern "C" fn nsl_fused_elementwise_1(
             }
             unsafe { *buf.add(i) = acc as f64 };
         }
-        let result = Box::new(NslTensor {
-            data: buf as *mut c_void,
-            shape: out_shape,
-            strides: out_strides,
-            ndim: a.ndim,
-            len: a.len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 0,
-            owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            buf as *mut c_void,
+            out_shape,
+            out_strides,
+            a.ndim,
+            a.len,
+            0,
+            0,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     }
 }
@@ -539,17 +538,17 @@ pub extern "C" fn nsl_fused_matmul_epilogue(
         }
     }
 
-    let result = Box::new(NslTensor {
-        data: buf as *mut c_void,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: 2,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        buf as *mut c_void,
+        out_shape,
+        out_strides,
+        2,
+        out_len,
+        0,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(result)
 }
 
@@ -675,17 +674,17 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i6
     let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data = checked_alloc_zeroed((total as usize) * elem_size);
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
-        shape: shape_ptr,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
+        shape_ptr,
         strides,
         ndim,
-        len: total,
-        refcount: AtomicI64::new(1),
-        device: 0,
+        total,
+        0,
         dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 

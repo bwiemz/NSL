@@ -3,7 +3,6 @@
 //! These are small-data utilities for loading datasets into NSL programs.
 //! For large-scale training data, prefer the streaming DataLoader pipeline.
 
-use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -25,18 +24,17 @@ fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u16, owns_data: u8) ->
     unsafe { *shape_ptr = len };
     let strides = NslTensor::compute_strides(shape_ptr, 1);
 
-    let tensor = Box::new(NslTensor {
+    let tensor = Box::new(NslTensor::new(
         data,
-        shape: shape_ptr,
+        shape_ptr,
         strides,
-        ndim: 1,
+        1,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
+        0,
         dtype,
         owns_data,
-        data_owner: 0,
-    });
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 

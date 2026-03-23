@@ -293,17 +293,17 @@ pub extern "C" fn nsl_awq_matmul(
     }
     let strides = NslTensor::compute_strides(shape, 2);
 
-    let tensor = Box::new(NslTensor {
-        data: out_data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        out_data as *mut c_void,
         shape,
         strides,
-        ndim: 2,
-        len: out_len as i64,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+        2,
+        out_len as i64,
+        0,
+        1,
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 

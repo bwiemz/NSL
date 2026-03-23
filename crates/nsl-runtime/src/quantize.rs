@@ -522,17 +522,17 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
         }
     }
 
-    let out = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let out = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
-        len: total as i64,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        total as i64,
+        0,
+        0,
+        1,
+        0,
+    ));
     Box::into_raw(out) as i64
 }
 
@@ -611,16 +611,16 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
     let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
     unsafe { *strides = 1 };
 
-    let out = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let out = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
-        ndim: 1,
-        len: qt.ndim,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        1,
+        qt.ndim,
+        0,
+        0,
+        1,
+        0,
+    ));
     Box::into_raw(out) as i64
 }

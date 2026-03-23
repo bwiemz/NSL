@@ -1,7 +1,6 @@
 //! Tensor creation functions: zeros, ones, full, rand, randn, arange, scalar creation.
 
 use std::ffi::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::list::NslList;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
@@ -33,17 +32,17 @@ pub(crate) fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(tensor)
 }
 
@@ -73,17 +72,17 @@ pub(crate) fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        0,
+        1,
+        0,
+    ));
     NslTensor::publish(tensor)
 }
 
@@ -91,17 +90,17 @@ pub(crate) fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
 pub(crate) fn create_scalar_tensor(value: f64) -> i64 {
     let data = checked_alloc(std::mem::size_of::<f32>()) as *mut f32;
     unsafe { *data = value as f32 };
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
-        shape: std::ptr::null_mut(),
-        strides: std::ptr::null_mut(),
-        ndim: 0,
-        len: 1,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+        1,
+        0,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(tensor)
 }
 
@@ -112,17 +111,17 @@ pub(crate) fn create_scalar_tensor_dtype(value: f64, dtype: u16) -> i64 {
     } else {
         let data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
         unsafe { *data = value };
-        let tensor = Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape: std::ptr::null_mut(),
-            strides: std::ptr::null_mut(),
-            ndim: 0,
-            len: 1,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 0,
-            owns_data: 1, data_owner: 0,
-        });
+        let tensor = Box::new(NslTensor::new(
+            data as *mut c_void,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+        ));
         NslTensor::publish(tensor)
     }
 }
@@ -208,17 +207,17 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
         unsafe { *data.add(i) = (start + (i as f64) * step) as f32 };
     }
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(tensor)
 }
 
@@ -243,16 +242,16 @@ pub(crate) fn create_tensor_from_f64_data(data_slice: &[f64], shape_slice: &[i64
         std::ptr::copy_nonoverlapping(data_slice.as_ptr(), data, len as usize);
     }
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        0,
+        1,
+        0,
+    ));
     NslTensor::publish(tensor)
 }

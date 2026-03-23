@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicI64;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -76,17 +75,17 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
         data as *mut c_void
     };
 
-    let tensor = Box::new(NslTensor {
-        data: data_raw,
-        shape: shape_ptr,
+    let tensor = Box::new(NslTensor::new(
+        data_raw,
+        shape_ptr,
         strides,
         ndim,
-        len: total,
-        refcount: AtomicI64::new(1),
-        device: 0,
+        total,
+        0,
         dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 
@@ -156,17 +155,17 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
         }
     };
 
-    let tensor = Box::new(NslTensor {
-        data: data_raw,
-        shape: shape_ptr,
+    let tensor = Box::new(NslTensor::new(
+        data_raw,
+        shape_ptr,
         strides,
         ndim,
-        len: total,
-        refcount: AtomicI64::new(1),
+        total,
         device,
         dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 
@@ -188,17 +187,17 @@ pub(crate) fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
     let data = crate::memory::checked_alloc(data_size);
     unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size); }
 
-    let new_tensor = Box::new(NslTensor {
-        data: data as *mut std::ffi::c_void,
-        shape: shape_ptr,
+    let new_tensor = Box::new(NslTensor::new(
+        data as *mut std::ffi::c_void,
+        shape_ptr,
         strides,
         ndim,
-        len: total,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        total,
+        tensor.device,
+        tensor.dtype,
+        1,
+        0,
+    ));
     Box::into_raw(new_tensor) as i64
 }
 
@@ -258,17 +257,17 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
         let elem_size = res.element_size();
         let new_data_raw = checked_alloc((total as usize) * elem_size);
         unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw, (total as usize) * elem_size) };
-        let out = Box::new(NslTensor {
-            data: new_data_raw as *mut c_void,
-            shape: new_shape,
-            strides: new_strides,
-            ndim: orig_ndim as i64,
-            len: total,
-            refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: res.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        let out = Box::new(NslTensor::new(
+            new_data_raw as *mut c_void,
+            new_shape,
+            new_strides,
+            orig_ndim as i64,
+            total,
+            0,
+            res.dtype,
+            1,
+            0,
+        ));
         let out_ptr = Box::into_raw(out) as i64;
         if result != grad_ptr {
             tensor_free(result);

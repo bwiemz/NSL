@@ -358,12 +358,17 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
-    let out = Box::new(NslTensor {
-        data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: 1,
- owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
 
@@ -397,12 +402,17 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     let out_data = inner::alloc_managed(n * 4);
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
-    let out = Box::new(NslTensor {
-        data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: 1,
- owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
 
@@ -538,12 +548,17 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     }
     let strides = NslTensor::compute_strides(shape, 2);
 
-    let out = Box::new(NslTensor {
-        data: out_data, shape, strides,
-        ndim: 2, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: a.device, dtype: 1,
- owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        2,
+        out_len as i64,
+        a.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out);
 
     let mut a_data = a.data as u64;
@@ -588,12 +603,17 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     let out_data = inner::alloc_managed(n * 4);
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
-    let out = Box::new(NslTensor {
-        data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: 1,
- owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
 
@@ -632,12 +652,17 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
-    let out = Box::new(NslTensor {
-        data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
 
@@ -719,12 +744,17 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let out_data = inner::alloc_managed(n * 4);
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
-    let out = Box::new(NslTensor {
-        data: out_data, shape, strides,
-        ndim: a.ndim, len: a.len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
 
@@ -985,17 +1015,17 @@ DONE:
         let data = vec![1.0f64, 2.0, 3.0, 4.0];
         let shape = vec![4i64];
         let strides = vec![1i64];
-        let t = Box::new(NslTensor {
-            data: data.as_ptr() as *mut std::ffi::c_void,
-            shape: shape.as_ptr() as *mut i64,
-            strides: strides.as_ptr() as *mut i64,
-            ndim: 1,
-            len: 4,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 0,
-            owns_data: 1, data_owner: 0,
-        });
+        let t = Box::new(NslTensor::new(
+            data.as_ptr() as *mut std::ffi::c_void,
+            shape.as_ptr() as *mut i64,
+            strides.as_ptr() as *mut i64,
+            1,
+            4,
+            0,
+            0,
+            1,
+            0,
+        ));
         // Leak the vecs so the tensor can use them
         std::mem::forget(data);
         std::mem::forget(shape);
@@ -1030,13 +1060,17 @@ DONE:
         let a_data = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
         let a_shape = vec![2i64, 3];
         let a_strides = vec![3i64, 1];
-        let a = Box::new(NslTensor {
-            data: a_data.as_ptr() as *mut std::ffi::c_void,
-            shape: a_shape.as_ptr() as *mut i64,
-            strides: a_strides.as_ptr() as *mut i64,
-            ndim: 2, len: 6, refcount: AtomicI64::new(1), device: 0, dtype: 0,
- owns_data: 1, data_owner: 0,
-        });
+        let a = Box::new(NslTensor::new(
+            a_data.as_ptr() as *mut std::ffi::c_void,
+            a_shape.as_ptr() as *mut i64,
+            a_strides.as_ptr() as *mut i64,
+            2,
+            6,
+            0,
+            0,
+            1,
+            0,
+        ));
         std::mem::forget(a_data); std::mem::forget(a_shape); std::mem::forget(a_strides);
         let a_cpu = Box::into_raw(a) as i64;
 
@@ -1044,13 +1078,17 @@ DONE:
         let b_data = vec![7.0f64, 8.0, 9.0, 10.0, 11.0, 12.0];
         let b_shape = vec![3i64, 2];
         let b_strides = vec![2i64, 1];
-        let b = Box::new(NslTensor {
-            data: b_data.as_ptr() as *mut std::ffi::c_void,
-            shape: b_shape.as_ptr() as *mut i64,
-            strides: b_strides.as_ptr() as *mut i64,
-            ndim: 2, len: 6, refcount: AtomicI64::new(1), device: 0, dtype: 0,
- owns_data: 1, data_owner: 0,
-        });
+        let b = Box::new(NslTensor::new(
+            b_data.as_ptr() as *mut std::ffi::c_void,
+            b_shape.as_ptr() as *mut i64,
+            b_strides.as_ptr() as *mut i64,
+            2,
+            6,
+            0,
+            0,
+            1,
+            0,
+        ));
         std::mem::forget(b_data); std::mem::forget(b_shape); std::mem::forget(b_strides);
         let b_cpu = Box::into_raw(b) as i64;
 
@@ -1086,25 +1124,33 @@ DONE:
         let shape = vec![4i64];
         let strides = vec![1i64];
 
-        let a = Box::new(NslTensor {
-            data: a_data.as_ptr() as *mut std::ffi::c_void,
-            shape: shape.as_ptr() as *mut i64,
-            strides: strides.as_ptr() as *mut i64,
-            ndim: 1, len: 4, refcount: AtomicI64::new(1), device: 0, dtype: 0,
- owns_data: 1, data_owner: 0,
-        });
+        let a = Box::new(NslTensor::new(
+            a_data.as_ptr() as *mut std::ffi::c_void,
+            shape.as_ptr() as *mut i64,
+            strides.as_ptr() as *mut i64,
+            1,
+            4,
+            0,
+            0,
+            1,
+            0,
+        ));
         std::mem::forget(a_data); std::mem::forget(shape.clone()); std::mem::forget(strides.clone());
         let a_cpu = Box::into_raw(a) as i64;
 
         let shape2 = vec![4i64];
         let strides2 = vec![1i64];
-        let b = Box::new(NslTensor {
-            data: b_data.as_ptr() as *mut std::ffi::c_void,
-            shape: shape2.as_ptr() as *mut i64,
-            strides: strides2.as_ptr() as *mut i64,
-            ndim: 1, len: 4, refcount: AtomicI64::new(1), device: 0, dtype: 0,
- owns_data: 1, data_owner: 0,
-        });
+        let b = Box::new(NslTensor::new(
+            b_data.as_ptr() as *mut std::ffi::c_void,
+            shape2.as_ptr() as *mut i64,
+            strides2.as_ptr() as *mut i64,
+            1,
+            4,
+            0,
+            0,
+            1,
+            0,
+        ));
         std::mem::forget(b_data); std::mem::forget(shape2); std::mem::forget(strides2);
         let b_cpu = Box::into_raw(b) as i64;
 

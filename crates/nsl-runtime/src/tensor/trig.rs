@@ -2,7 +2,6 @@
 //! Used for RoPE (Rotary Position Embeddings) precomputation.
 
 use std::ffi::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 
@@ -40,10 +39,17 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     nsl_tensor_free(t_c);
     NslTensor::publish(result)
 }
@@ -80,10 +86,17 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     nsl_tensor_free(t_c);
     NslTensor::publish(result)
 }

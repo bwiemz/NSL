@@ -7,7 +7,6 @@
 //! All functions operate on NslTensor (f32, dtype=1) via raw pointers.
 //! GPU variants deferred to M48c.
 
-use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 use crate::tensor::NslTensor;
@@ -35,17 +34,17 @@ fn alloc_f32_tensor(shape: &[i64]) -> i64 {
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
     let data = checked_alloc_zeroed((len as usize) * 4) as *mut c_void;
 
-    let tensor = Box::new(NslTensor {
+    let tensor = Box::new(NslTensor::new(
         data,
-        shape: shape_ptr,
+        shape_ptr,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        1,
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 

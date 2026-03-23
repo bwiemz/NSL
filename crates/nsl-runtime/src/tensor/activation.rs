@@ -2,7 +2,7 @@
 //! exp, log, sqrt, abs, sign, clamp.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::autodiff;
 use crate::memory::checked_alloc;
@@ -69,10 +69,17 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -148,10 +155,17 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -227,10 +241,17 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -306,10 +327,17 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -391,10 +419,17 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     // sign is non-differentiable -- no tape recording
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
@@ -446,10 +481,17 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -498,10 +540,17 @@ pub(crate) fn nsl_tensor_clamp_backward(
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: input.device, dtype: input.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        input.device,
+        input.dtype,
+        1,
+        0,
+    ));
     NslTensor::publish(result)
 }
 
@@ -573,10 +622,17 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -651,10 +707,17 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -719,10 +782,17 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -800,10 +870,17 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -881,10 +958,17 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device, dtype: a.dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {

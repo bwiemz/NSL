@@ -2,7 +2,7 @@
 //! causal_mask, squeeze.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::autodiff;
 use crate::list::NslList;
@@ -365,17 +365,17 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
         buf as *mut c_void
     };
 
-    let out = Box::new(NslTensor {
+    let out = Box::new(NslTensor::new(
         data,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: out_ndim,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_len,
+        tensor.device,
+        tensor.dtype,
+        1,
+        0,
+    ));
     // NO tape recording -- select is used internally for stack backward
     NslTensor::publish(out)
 }
@@ -482,17 +482,17 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let out = Box::new(NslTensor {
+    let out = Box::new(NslTensor::new(
         data,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: out_ndim,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: first.device,
-        dtype: first.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_len,
+        first.device,
+        first.dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
     // Free contiguous copies
@@ -592,18 +592,17 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         tensor_ptr
     };
 
-    let out = Box::new(NslTensor {
-        data: tensor.data,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: target_ndim as i64,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 0, // view — does NOT own the data buffer
-        data_owner: true_owner, // back-pointer for cleanup (root-flattened)
-    });
+    let out = Box::new(NslTensor::new(
+        tensor.data,
+        out_shape,
+        out_strides,
+        target_ndim as i64,
+        out_len,
+        tensor.device,
+        tensor.dtype,
+        0,
+        true_owner,
+    ));
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
@@ -648,17 +647,17 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         }
     }
 
-    let out = Box::new(NslTensor {
-        data: data as *mut c_void,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: 2,
+    let out = Box::new(NslTensor::new(
+        data as *mut c_void,
+        out_shape,
+        out_strides,
+        2,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 1,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -735,17 +734,17 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         .map(|i| unsafe { *tensor.shape.add(i) })
         .collect();
 
-    let out = Box::new(NslTensor {
+    let out = Box::new(NslTensor::new(
         data,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: tensor.ndim,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        out_shape,
+        out_strides,
+        tensor.ndim,
+        out_len,
+        tensor.device,
+        tensor.dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
@@ -861,17 +860,17 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let out = Box::new(NslTensor {
+    let out = Box::new(NslTensor::new(
         data,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: out_ndim,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: first.device,
-        dtype: out_dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_len,
+        first.device,
+        out_dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
     // Free contiguous copies
@@ -970,17 +969,17 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
+    let result = Box::new(NslTensor::new(
         data,
         shape,
         strides,
-        ndim: tensor.ndim,
-        len: tensor.len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        tensor.ndim,
+        tensor.len,
+        tensor.device,
+        tensor.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
     result
@@ -1039,17 +1038,17 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             }
             unsafe { *buf.add(flat) = *t.data_f32().add(src_offset) };
         }
-        let result = Box::new(NslTensor {
-            data: buf as *mut c_void,
+        let result = Box::new(NslTensor::new(
+            buf as *mut c_void,
             shape,
-            strides: out_strides,
-            ndim: t.ndim,
+            out_strides,
+            t.ndim,
             len,
-            refcount: AtomicI64::new(1),
-            device: t.device,
-            dtype: t.dtype,
-            owns_data: 1, data_owner: 0,
-        });
+            t.device,
+            t.dtype,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     } else {
         // f64
@@ -1068,17 +1067,17 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             }
             unsafe { *buf.add(flat) = *t.data_f64().add(src_offset) };
         }
-        let result = Box::new(NslTensor {
-            data: buf as *mut c_void,
+        let result = Box::new(NslTensor::new(
+            buf as *mut c_void,
             shape,
-            strides: out_strides,
-            ndim: t.ndim,
+            out_strides,
+            t.ndim,
             len,
-            refcount: AtomicI64::new(1),
-            device: t.device,
-            dtype: t.dtype,
-            owns_data: 1, data_owner: 0,
-        });
+            t.device,
+            t.dtype,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     }
 }

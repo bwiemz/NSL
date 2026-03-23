@@ -3,7 +3,6 @@
 //! Provides byte-level and BPE tokenizers via the HuggingFace `tokenizers` crate.
 //! Tokenizer handles are stored as boxed `TokenizerKind` enums, converted to i64 pointers.
 
-use std::sync::atomic::AtomicI64;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -81,17 +80,17 @@ fn make_1d_tensor(values: &[f64]) -> i64 {
         unsafe { *data.add(i) = v };
     }
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        0,
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 
@@ -113,17 +112,17 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
         unsafe { *data.add(i) = v };
     }
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        0,
+        1,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 

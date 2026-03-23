@@ -474,18 +474,17 @@ mod tests {
         let mut data = [1.0, f64::NAN, 3.0];
         let mut shape_val: i64 = 3;
         let mut stride_val: i64 = 1;
-        let t = NslTensor {
-            data: data.as_mut_ptr() as *mut c_void,
-            shape: &mut shape_val as *mut i64,
-            strides: &mut stride_val as *mut i64,
-            ndim: 1,
-            len: 3,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 0,
-            owns_data: 0,
-            data_owner: 0,
-        };
+        let t = NslTensor::new(
+            data.as_mut_ptr() as *mut c_void,
+            &mut shape_val as *mut i64,
+            &mut stride_val as *mut i64,
+            1,
+            3,
+            0,
+            0,
+            0,
+            0,
+        );
 
         let ret = nsl_trace_record_op(0, 0, 0, &t as *const NslTensor as i64);
         assert_eq!(ret, 1, "should return 1 (NaN break)");

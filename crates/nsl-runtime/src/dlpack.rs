@@ -6,7 +6,6 @@
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 use crate::tensor::{NslTensor, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8};
@@ -269,18 +268,17 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
 
     let device = dl_device_to_nsl(&dl.device);
 
-    let tensor = Box::new(NslTensor {
+    let tensor = Box::new(NslTensor::new(
         data,
-        shape: shape_ptr,
-        strides: strides_ptr,
-        ndim: ndim as i64,
+        shape_ptr,
+        strides_ptr,
+        ndim as i64,
         len,
-        refcount: AtomicI64::new(1),
         device,
-        dtype: nsl_dtype,
-        owns_data: 0, // Borrowed — DLPack consumer owns the data.
-        data_owner: 0,
-    });
+        nsl_dtype,
+        0,
+        0,
+    ));
 
     Box::into_raw(tensor) as i64
 }
@@ -354,17 +352,17 @@ mod tests {
 
         let strides_ptr = NslTensor::compute_strides(shape_ptr, ndim as i64);
 
-        let tensor = Box::new(NslTensor {
-            data: data_ptr as *mut c_void,
-            shape: shape_ptr,
-            strides: strides_ptr,
-            ndim: ndim as i64,
+        let tensor = Box::new(NslTensor::new(
+            data_ptr as *mut c_void,
+            shape_ptr,
+            strides_ptr,
+            ndim as i64,
             len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: DTYPE_F64,
-            owns_data: 1, data_owner: 0,
-        });
+            0,
+            DTYPE_F64,
+            1,
+            0,
+        ));
 
         let ptr = Box::into_raw(tensor);
         (ptr, ptr as i64)
@@ -384,17 +382,17 @@ mod tests {
 
         let strides_ptr = NslTensor::compute_strides(shape_ptr, ndim as i64);
 
-        let tensor = Box::new(NslTensor {
-            data: data_ptr as *mut c_void,
-            shape: shape_ptr,
-            strides: strides_ptr,
-            ndim: ndim as i64,
+        let tensor = Box::new(NslTensor::new(
+            data_ptr as *mut c_void,
+            shape_ptr,
+            strides_ptr,
+            ndim as i64,
             len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: DTYPE_F32,
-            owns_data: 1, data_owner: 0,
-        });
+            0,
+            DTYPE_F32,
+            1,
+            0,
+        ));
 
         let ptr = Box::into_raw(tensor);
         (ptr, ptr as i64)
@@ -556,17 +554,17 @@ mod tests {
         let data_ptr = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
         unsafe { *data_ptr = 42.0; }
 
-        let tensor = Box::new(NslTensor {
-            data: data_ptr as *mut c_void,
-            shape: std::ptr::null_mut(),
-            strides: std::ptr::null_mut(),
-            ndim: 0,
-            len: 1,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: DTYPE_F64,
-            owns_data: 1, data_owner: 0,
-        });
+        let tensor = Box::new(NslTensor::new(
+            data_ptr as *mut c_void,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            1,
+            0,
+            DTYPE_F64,
+            1,
+            0,
+        ));
 
         let tensor_ptr = Box::into_raw(tensor) as i64;
 

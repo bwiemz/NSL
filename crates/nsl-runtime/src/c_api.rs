@@ -8,7 +8,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
-use std::sync::atomic::AtomicI64;
 #[cfg(feature = "interop")]
 use std::sync::atomic::Ordering;
 
@@ -446,18 +445,17 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
         }
         let strides = NslTensor::compute_strides(shape_ptr, ndim as i64);
 
-        let tensor = Box::new(NslTensor {
-            data: data_ptr as *mut c_void,
-            shape: shape_ptr,
+        let tensor = Box::new(NslTensor::new(
+            data_ptr as *mut c_void,
+            shape_ptr,
             strides,
-            ndim: ndim as i64,
+            ndim as i64,
             len,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 1, // f32
-            owns_data: 1,
-            data_owner: 0,
-        });
+            0,
+            1,
+            1,
+            0,
+        ));
         let ptr = Box::into_raw(tensor) as i64;
         weights.insert(name.to_string(), ptr);
         weight_ptrs.push(ptr);
@@ -523,18 +521,17 @@ fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     let len = NslTensor::total_elements(shape_ptr, desc.ndim as i64);
     let device = if desc.device_type > 0 { desc.device_id as u8 + 1 } else { 0 };
 
-    let tensor = Box::new(NslTensor {
-        data: desc.data,
-        shape: shape_ptr,
+    let tensor = Box::new(NslTensor::new(
+        desc.data,
+        shape_ptr,
         strides,
-        ndim: desc.ndim as i64,
+        desc.ndim as i64,
         len,
-        refcount: AtomicI64::new(1),
         device,
-        dtype: nsl_dtype,
-        owns_data: 0, // borrowed — C caller owns the data
-        data_owner: 0,
-    });
+        nsl_dtype,
+        0,
+        0,
+    ));
     Box::into_raw(tensor) as i64
 }
 

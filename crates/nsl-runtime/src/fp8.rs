@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -141,17 +140,17 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
     let strides = NslTensor::compute_strides(shape, t.ndim);
 
-    let out = Box::new(NslTensor {
-        data: result_data as *mut c_void,
+    let out = Box::new(NslTensor::new(
+        result_data as *mut c_void,
         shape,
         strides,
-        ndim: t.ndim,
-        len: t.len,
-        refcount: AtomicI64::new(1),
-        device: t.device,
-        dtype: 1, // f32 on CPU
-        owns_data: 1, data_owner: 0,
-    });
+        t.ndim,
+        t.len,
+        t.device,
+        1,
+        1,
+        0,
+    ));
     let out_ptr = Box::into_raw(out) as i64;
 
     // Register scale for this tensor
@@ -631,12 +630,17 @@ pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_forma
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
     let strides = NslTensor::compute_strides(shape, t.ndim);
 
-    let out = Box::new(NslTensor {
-        data: out_data as *mut c_void,
-        shape, strides, ndim: t.ndim, len: t.len,
-        refcount: AtomicI64::new(1),
-        device: t.device, dtype: 1, owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data as *mut c_void,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device,
+        1,
+        1,
+        0,
+    ));
     Box::into_raw(out) as i64
 }
 
@@ -789,12 +793,17 @@ pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_had
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
     let strides = NslTensor::compute_strides(shape, t.ndim);
 
-    let out = Box::new(NslTensor {
-        data: out_data as *mut c_void,
-        shape, strides, ndim: t.ndim, len: t.len,
-        refcount: AtomicI64::new(1),
-        device: t.device, dtype: 1, owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data as *mut c_void,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device,
+        1,
+        1,
+        0,
+    ));
     Box::into_raw(out) as i64
 }
 
@@ -980,17 +989,17 @@ mod tests {
         let shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *shape = 4 };
         let strides = crate::tensor::NslTensor::compute_strides(shape, 1);
-        let tensor = Box::new(crate::tensor::NslTensor {
-            data: data_ptr as *mut std::ffi::c_void,
+        let tensor = Box::new(crate::tensor::NslTensor::new(
+            data_ptr as *mut std::ffi::c_void,
             shape,
             strides,
-            ndim: 1,
-            len: 4,
-            refcount: AtomicI64::new(1),
-            device: 0,
-            dtype: 1,
-            owns_data: 1, data_owner: 0,
-        });
+            1,
+            4,
+            0,
+            1,
+            1,
+            0,
+        ));
         let ptr = Box::into_raw(tensor) as i64;
         let scale = calibrate_gradient_scale(ptr);
         let expected = 1.0 / FP8E5M2_MAX; // amax=1.0
@@ -1073,17 +1082,17 @@ mod tests {
             let shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
             unsafe { *shape = len as i64 };
             let strides = crate::tensor::NslTensor::compute_strides(shape, 1);
-            let tensor = Box::new(crate::tensor::NslTensor {
-                data: data_ptr as *mut std::ffi::c_void,
+            let tensor = Box::new(crate::tensor::NslTensor::new(
+                data_ptr as *mut std::ffi::c_void,
                 shape,
                 strides,
-                ndim: 1,
-                len: len as i64,
-                refcount: AtomicI64::new(1),
-                device: 0,
-                dtype: 1,
-                owns_data: 1, data_owner: 0,
-            });
+                1,
+                len as i64,
+                0,
+                1,
+                1,
+                0,
+            ));
             Box::into_raw(tensor) as i64
         };
 
@@ -1125,17 +1134,17 @@ mod tests {
             let shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
             unsafe { *shape = rows; *shape.add(1) = cols };
             let strides = crate::tensor::NslTensor::compute_strides(shape, 2);
-            let tensor = Box::new(crate::tensor::NslTensor {
-                data: data_ptr as *mut std::ffi::c_void,
+            let tensor = Box::new(crate::tensor::NslTensor::new(
+                data_ptr as *mut std::ffi::c_void,
                 shape,
                 strides,
-                ndim: 2,
-                len: len as i64,
-                refcount: AtomicI64::new(1),
-                device: 0,
-                dtype: 1,
-                owns_data: 1, data_owner: 0,
-            });
+                2,
+                len as i64,
+                0,
+                1,
+                1,
+                0,
+            ));
             Box::into_raw(tensor) as i64
         };
 

@@ -1,6 +1,5 @@
 //! M33: Speculative decoding FFI — rejection sampling on pre-computed logits.
 
-use std::sync::atomic::AtomicI64;
 use super::verify;
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -223,17 +222,17 @@ pub extern "C" fn nsl_speculative_decode_step(
     let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
     unsafe { *strides = 1 };
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
-        ndim: 1,
-        len: num_tokens as i64,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: 0,
-        owns_data: 1, data_owner: 0,
-    });
+        1,
+        num_tokens as i64,
+        0,
+        0,
+        1,
+        0,
+    ));
 
     Box::into_raw(tensor) as i64
 }

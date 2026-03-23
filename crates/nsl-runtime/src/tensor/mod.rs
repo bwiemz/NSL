@@ -15,7 +15,7 @@ pub use shape_ops::*;
 pub use activation::*;
 pub use trig::*;
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -134,8 +134,14 @@ pub extern "C" fn nsl_is_training() -> i8 {
     TRAINING_MODE.with(|t| t.get() as i8)
 }
 
+/// Magic marker for live NslTensor instances. Spells "NSLT" in ASCII.
+pub const TENSOR_MAGIC: u32 = 0x4E534C54;
+/// Poison value written into the magic field when a tensor is freed.
+pub const TENSOR_FREED: u32 = 0x0000DEAD;
+
 #[repr(C)]
 pub struct NslTensor {
+    pub(crate) magic: u32,          // MUST be first — 0x4E534C54 ("NSLT") when live, 0x0000DEAD after free
     pub(crate) data: *mut c_void,   // Opaque: CPU f64 or GPU f32
     pub(crate) shape: *mut i64,
     pub(crate) strides: *mut i64,
@@ -247,8 +253,51 @@ pub extern "C" fn nsl_finalize_dtype_registry() {
 }
 
 impl NslTensor {
+    /// Construct a new NslTensor, always setting `magic = TENSOR_MAGIC` and `refcount = 1`.
+    /// This is the ONLY correct way to create an NslTensor — do not use struct literal syntax.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        data: *mut c_void,
+        shape: *mut i64,
+        strides: *mut i64,
+        ndim: i64,
+        len: i64,
+        device: u8,
+        dtype: u16,
+        owns_data: u8,
+        data_owner: i64,
+    ) -> Self {
+        Self {
+            magic: TENSOR_MAGIC,
+            data,
+            shape,
+            strides,
+            ndim,
+            len,
+            refcount: AtomicI64::new(1),
+            device,
+            dtype,
+            owns_data,
+            data_owner,
+        }
+    }
+
+    /// Returns `true` if this tensor has the expected live magic marker.
+    #[inline]
+    #[allow(dead_code)] // intentional API for future safety assertions and debugging
+    pub(crate) fn is_valid(&self) -> bool {
+        self.magic == TENSOR_MAGIC
+    }
+
     pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
-        unsafe { &mut *(ptr as *mut NslTensor) }
+        let t = unsafe { &mut *(ptr as *mut NslTensor) };
+        debug_assert!(
+            t.magic == TENSOR_MAGIC,
+            "NslTensor::from_ptr: bad magic 0x{:08X} at ptr 0x{:X} — possible use-after-free or invalid pointer",
+            t.magic,
+            ptr
+        );
+        t
     }
 
     /// Finalize a boxed tensor: convert to raw pointer, register with scope, return i64.
@@ -437,17 +486,17 @@ impl NslTensor {
             }
         }
 
-        let result = Box::new(NslTensor {
-            data: new_data as *mut c_void,
-            shape: new_shape,
-            strides: new_strides,
-            ndim: tensor.ndim,
-            len: tensor.len,
-            refcount: AtomicI64::new(1),
-            device: tensor.device,
-            dtype: tensor.dtype,
-            owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            new_data as *mut c_void,
+            new_shape,
+            new_strides,
+            tensor.ndim,
+            tensor.len,
+            tensor.device,
+            tensor.dtype,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     }
 
@@ -483,18 +532,17 @@ impl NslTensor {
             source_ptr
         };
 
-        let tensor = Box::new(NslTensor {
-            data: source.data,
+        let tensor = Box::new(NslTensor::new(
+            source.data,
             shape,
             strides,
             ndim,
             len,
-            refcount: AtomicI64::new(1),
-            device: source.device,
-            dtype: source.dtype,
-            owns_data: 0,
-            data_owner: true_owner,
-        });
+            source.device,
+            source.dtype,
+            0,
+            true_owner,
+        ));
 
         NslTensor::publish(tensor)
     }
@@ -709,17 +757,17 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
     };
     unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size) };
 
-    let result = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let result = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: tensor.device,
-        dtype: tensor.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        tensor.device,
+        tensor.dtype,
+        1,
+        0,
+    ));
     nsl_tensor_free(c_ptr);
     NslTensor::publish(result)
 }
@@ -821,6 +869,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                 checked_free(strides_ptr as *mut u8, shape_size);
             }
             crate::fp8::remove_fp8_scale(tensor_ptr);
+            // Poison magic before drop so use-after-free is caught by from_ptr debug_assert.
+            (*(tensor_ptr as *mut NslTensor)).magic = TENSOR_FREED;
             drop(Box::from_raw(tensor_ptr as *mut NslTensor));
         }
     }
@@ -916,17 +966,17 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
 
         let strides = NslTensor::compute_strides(shape, ndim);
 
-        let tensor = Box::new(NslTensor {
+        let tensor = Box::new(NslTensor::new(
             data,
             shape,
             strides,
             ndim,
             len,
-            refcount: AtomicI64::new(1),
-            device: device as u8,
-            dtype: 1,
-            owns_data: 1, data_owner: 0,
-        });
+            device as u8,
+            1,
+            1,
+            0,
+        ));
         NslTensor::publish(tensor)
     }
     #[cfg(not(feature = "cuda"))]
@@ -1097,17 +1147,17 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         }
     }
 
-    let out = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void,
-        shape: out_shape,
-        strides: out_strides,
-        ndim: out_ndim,
-        len: out_len,
-        refcount: AtomicI64::new(1),
-        device: weight.device,
-        dtype: out_dtype,
-        owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_len,
+        weight.device,
+        out_dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
@@ -1200,22 +1250,43 @@ pub extern "C" fn nsl_tensor_layernorm(
         }
     }
 
-    let out = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        out_shape,
+        out_strides,
+        ndim as i64,
+        total as i64,
+        input.device,
+        in_dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
-    let mean_tensor = Box::new(NslTensor {
-        data: mean_data as *mut c_void, shape: mean_shape, strides: mean_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-    });
+    let mean_tensor = Box::new(NslTensor::new(
+        mean_data as *mut c_void,
+        mean_shape,
+        mean_strides,
+        1,
+        num_rows as i64,
+        0,
+        0,
+        1,
+        0,
+    ));
     let mean_ptr = NslTensor::publish(mean_tensor);
 
-    let inv_std_tensor = Box::new(NslTensor {
-        data: inv_std_data as *mut c_void, shape: inv_std_shape, strides: inv_std_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-    });
+    let inv_std_tensor = Box::new(NslTensor::new(
+        inv_std_data as *mut c_void,
+        inv_std_shape,
+        inv_std_strides,
+        1,
+        num_rows as i64,
+        0,
+        0,
+        1,
+        0,
+    ));
     let inv_std_ptr = NslTensor::publish(inv_std_tensor);
 
     if autodiff::is_recording() {
@@ -1283,16 +1354,30 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         }
     }
 
-    let out = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        out_shape,
+        out_strides,
+        ndim as i64,
+        total as i64,
+        input.device,
+        in_dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
-    let rms_tensor = Box::new(NslTensor {
-        data: rms_data as *mut c_void, shape: rms_shape, strides: rms_strides,
-        ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-    });
+    let rms_tensor = Box::new(NslTensor::new(
+        rms_data as *mut c_void,
+        rms_shape,
+        rms_strides,
+        1,
+        num_rows as i64,
+        0,
+        0,
+        1,
+        0,
+    ));
     let rms_ptr = NslTensor::publish(rms_tensor);
 
     if autodiff::is_recording() {
@@ -1355,16 +1440,30 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         }
     }
 
-    let result = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
     let result_ptr = NslTensor::publish(result);
 
-    let mask_tensor = Box::new(NslTensor {
-        data: mask_data as *mut c_void, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-    });
+    let mask_tensor = Box::new(NslTensor::new(
+        mask_data as *mut c_void,
+        mask_shape,
+        mask_strides,
+        ndim,
+        len as i64,
+        0,
+        0,
+        1,
+        0,
+    ));
     let mask_ptr = NslTensor::publish(mask_tensor);
 
     if autodiff::is_recording() {
@@ -1469,10 +1568,17 @@ pub extern "C" fn nsl_tensor_conv2d(
         }
     }
 
-    let result = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        out_shape,
+        out_strides,
+        4,
+        out_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
     let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
@@ -1558,10 +1664,17 @@ pub extern "C" fn nsl_tensor_maxpool2d(
         }
     }
 
-    let result = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
-        device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        out_shape,
+        out_strides,
+        4,
+        out_len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    ));
     let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
@@ -1624,10 +1737,17 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         }
     }
 
-    let out = Box::new(NslTensor {
-        data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
-        ndim: out_ndim, len: out_len, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
-    });
+    let out = Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_len,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
@@ -1672,10 +1792,17 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             crate::cuda::inner::prefetch_to_device(dst, dst_size, (target - 1) as i32);
             let shape = NslTensor::copy_shape(t.shape, t.ndim);
             let strides = NslTensor::compute_strides(shape, t.ndim);
-            let new_t = Box::new(NslTensor {
-                data: dst, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
-                device: target, dtype: 1, owns_data: 1, data_owner: 0,
-            });
+            let new_t = Box::new(NslTensor::new(
+                dst,
+                shape,
+                strides,
+                t.ndim,
+                t.len,
+                target,
+                1,
+                1,
+                0,
+            ));
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
@@ -1696,10 +1823,17 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             }
             let shape = NslTensor::copy_shape(t.shape, t.ndim);
             let strides = NslTensor::compute_strides(shape, t.ndim);
-            let new_t = Box::new(NslTensor {
-                data: dst_void, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
-                device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-            });
+            let new_t = Box::new(NslTensor::new(
+                dst_void,
+                shape,
+                strides,
+                t.ndim,
+                t.len,
+                0,
+                0,
+                1,
+                0,
+            ));
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
@@ -1907,11 +2041,17 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let shape_ptr = clone_shape(tensor.shape, tensor.ndim as usize);
         let strides_ptr = clone_shape(tensor.strides, tensor.ndim as usize);
 
-        let result = Box::new(NslTensor {
-            data: packed_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
-            ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-            dtype: target_dtype_id, owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            packed_data as *mut c_void,
+            shape_ptr,
+            strides_ptr,
+            tensor.ndim,
+            tensor.len,
+            tensor.device,
+            target_dtype_id,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     } else {
         let block_sz = info.block_size as usize;
@@ -1938,11 +2078,17 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let shape_ptr = clone_shape(tensor.shape, tensor.ndim as usize);
         let strides_ptr = clone_shape(tensor.strides, tensor.ndim as usize);
 
-        let result = Box::new(NslTensor {
-            data: packed_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
-            ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-            dtype: target_dtype_id, owns_data: 1, data_owner: 0,
-        });
+        let result = Box::new(NslTensor::new(
+            packed_data as *mut c_void,
+            shape_ptr,
+            strides_ptr,
+            tensor.ndim,
+            tensor.len,
+            tensor.device,
+            target_dtype_id,
+            1,
+            0,
+        ));
         NslTensor::publish(result)
     }
 }
@@ -2000,11 +2146,17 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
     let shape_ptr = clone_shape(tensor.shape, tensor.ndim as usize);
     let strides_ptr = clone_shape(tensor.strides, tensor.ndim as usize);
 
-    let result = Box::new(NslTensor {
-        data: out_data as *mut c_void, shape: shape_ptr, strides: strides_ptr,
-        ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
-        dtype: DTYPE_F64, owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        out_data as *mut c_void,
+        shape_ptr,
+        strides_ptr,
+        tensor.ndim,
+        tensor.len,
+        tensor.device,
+        DTYPE_F64,
+        1,
+        0,
+    ));
     NslTensor::publish(result)
 }
 

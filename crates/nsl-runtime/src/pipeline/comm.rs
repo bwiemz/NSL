@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::memory::checked_alloc;
@@ -224,18 +224,17 @@ fn deserialize_tensor(buf: &[u8]) -> i64 {
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let tensor = Box::new(NslTensor {
-        data: data as *mut c_void,
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
         shape,
         strides,
         ndim,
-        len: total_len,
-        refcount: AtomicI64::new(1),
+        total_len,
         device,
         dtype,
-        owns_data: 1,
-        data_owner: 0,
-    });
+        1,
+        0,
+    ));
 
     Box::into_raw(tensor) as i64
 }
@@ -460,12 +459,17 @@ mod tests {
         let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = 3; *strides.add(1) = 1 };
 
-        let tensor = Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 2, len: 6,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        });
+        let tensor = Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            2,
+            6,
+            0,
+            0,
+            1,
+            0,
+        ));
         let ptr = Box::into_raw(tensor) as i64;
 
         // Serialize
@@ -550,12 +554,17 @@ mod tests {
         let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = 1 };
 
-        let tensor = Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 1, len: 4,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        });
+        let tensor = Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            1,
+            4,
+            0,
+            0,
+            1,
+            0,
+        ));
         let send_ptr = Box::into_raw(tensor) as i64;
 
         // Serialize and send to stage 1 via backend

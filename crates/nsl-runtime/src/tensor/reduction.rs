@@ -1,10 +1,10 @@
 //! Tensor reduction operations: sum, mean, max, gather, softmax.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::autodiff;
-use crate::memory::{checked_alloc, checked_alloc_zeroed};
+use crate::memory::checked_alloc_zeroed;
 
 use super::creation::create_scalar_tensor_dtype;
 use super::{get_shape_vec, get_strides_vec, nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
@@ -491,12 +491,17 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
-        data, shape, strides, ndim, len, refcount: AtomicI64::new(1),
-        device: a.device,
-        dtype: a.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        len,
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {

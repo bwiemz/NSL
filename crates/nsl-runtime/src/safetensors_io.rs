@@ -137,18 +137,17 @@ pub(crate) fn allocate_f32_tensor(
         }
     };
 
-    NslTensor {
-        data: data_ptr,
-        shape: shape_ptr,
-        strides: strides_ptr,
+    NslTensor::new(
+        data_ptr,
+        shape_ptr,
+        strides_ptr,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
         device,
-        dtype: 1, // f32
-        owns_data: 1,
-        data_owner: 0,
-    }
+        1, // f32
+        1,
+        0,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

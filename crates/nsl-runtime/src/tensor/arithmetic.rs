@@ -1,7 +1,7 @@
 //! Tensor arithmetic operations: add, sub, mul, div, neg, scalar ops, matmul.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
@@ -368,17 +368,17 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
+    let result = Box::new(NslTensor::new(
         data,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: a.device,
-        dtype: a.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -454,17 +454,17 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
+    let result = Box::new(NslTensor::new(
         data,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: a.device,
-        dtype: a.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -532,17 +532,17 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor {
+    let result = Box::new(NslTensor::new(
         data,
         shape,
         strides,
         ndim,
         len,
-        refcount: AtomicI64::new(1),
-        device: a.device,
-        dtype: a.dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        a.device,
+        a.dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
@@ -728,17 +728,17 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         }
     }
 
-    let result = Box::new(NslTensor {
-        data: raw_data as *mut c_void,
+    let result = Box::new(NslTensor::new(
+        raw_data as *mut c_void,
         shape,
         strides,
-        ndim: out_nd as i64,
+        out_nd as i64,
         len,
-        refcount: AtomicI64::new(1),
-        device: 0,
-        dtype: out_dtype,
-        owns_data: 1, data_owner: 0,
-    });
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);

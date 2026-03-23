@@ -10,7 +10,6 @@
 //! - **Medusa**: Single backbone + multiple prediction heads, 1 forward pass
 
 use std::os::raw::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -220,12 +219,17 @@ impl DraftModelRunner {
         let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = 1 };
 
-        Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 1, len: 1,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        })
+        Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            1,
+            1,
+            0,
+            0,
+            1,
+            0,
+        ))
     }
 
     /// Create a 1D tensor from an existing data pointer.
@@ -234,12 +238,17 @@ impl DraftModelRunner {
         unsafe { *shape = len as i64 };
         let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = 1 };
-        Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 1, len: len as i64,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        })
+        Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            1,
+            len as i64,
+            0,
+            0,
+            1,
+            0,
+        ))
     }
 
     /// Create a 2D tensor [rows, cols] from an existing data pointer.
@@ -248,12 +257,17 @@ impl DraftModelRunner {
         unsafe { *shape = rows as i64; *shape.add(1) = cols as i64 };
         let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = cols as i64; *strides.add(1) = 1 };
-        Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 2, len: (rows * cols) as i64,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        })
+        Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            2,
+            (rows * cols) as i64,
+            0,
+            0,
+            1,
+            0,
+        ))
     }
 }
 
@@ -391,12 +405,17 @@ mod tests {
         let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = 1 };
 
-        let tensor = Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 1, len: vocab as i64,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        });
+        let tensor = Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            1,
+            vocab as i64,
+            0,
+            0,
+            1,
+            0,
+        ));
         Box::into_raw(tensor) as i64
     }
 
@@ -479,12 +498,17 @@ mod tests {
         unsafe { *shape = num_heads as i64; *shape.add(1) = vocab as i64 };
         let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *strides = vocab as i64; *strides.add(1) = 1 };
-        let tensor = Box::new(NslTensor {
-            data: data as *mut c_void,
-            shape, strides, ndim: 2, len: total as i64,
-            refcount: AtomicI64::new(1),
-            device: 0, dtype: 0, owns_data: 1, data_owner: 0,
-        });
+        let tensor = Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            2,
+            total as i64,
+            0,
+            0,
+            1,
+            0,
+        ));
         Box::into_raw(tensor) as i64
     }
 
