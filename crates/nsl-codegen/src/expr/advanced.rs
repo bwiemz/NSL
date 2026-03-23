@@ -349,6 +349,24 @@ impl Compiler<'_> {
         }
     }
 
+    /// Emit device transfer for all fields of a model struct.
+    /// Uses the runtime heuristic (nsl_model_to_device) which only transfers
+    /// confirmed tensors and skips non-tensor fields.
+    pub(crate) fn emit_model_to_device(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        model_name: &str,
+        model_ptr: Value,
+        device_val: Value,
+    ) -> Result<(), CodegenError> {
+        let layout = self.struct_layouts.get(model_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!("no layout for model '{model_name}' in .to(device)"))
+        })?;
+        let num_fields = builder.ins().iconst(cl_types::I64, layout.fields.len() as i64);
+        self.compile_call_by_name(builder, "nsl_model_to_device", &[model_ptr, num_fields, device_val])?;
+        Ok(())
+    }
+
     pub(crate) fn compile_model_method_call(
         &mut self,
         builder: &mut FunctionBuilder,

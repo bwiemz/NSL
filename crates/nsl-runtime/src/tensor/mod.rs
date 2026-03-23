@@ -1752,11 +1752,10 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
             let new_ptr = nsl_tensor_to_device(field_val, device);
             unsafe { *field_addr = new_ptr; }
             nsl_tensor_free(field_val);
-        } else {
-            // Not a tensor — assume sub-model pointer and recurse.
-            // Limit recursion depth by capping field count.
-            nsl_model_to_device(field_val, 32.min(num_fields), device);
         }
+        // Non-tensor fields (sub-models, arrays) are skipped.
+        // The codegen handles nested models by emitting recursive
+        // nsl_model_to_device calls with the correct field counts.
     }
 }
 

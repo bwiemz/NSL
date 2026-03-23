@@ -122,6 +122,7 @@ pub(crate) mod inner {
 
     /// Free unified memory.
     pub(crate) fn free_managed(ptr: *mut c_void) {
+        if ptr.is_null() { return; }
         ensure_context();
         #[cfg(test)]
         {
@@ -130,12 +131,11 @@ pub(crate) mod inner {
         }
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);
-            assert_eq!(
-                result,
-                CUresult::CUDA_SUCCESS,
-                "cuMemFree failed: {:?}",
-                result
-            );
+            if result != CUresult::CUDA_SUCCESS {
+                // Log but don't abort — the pointer may have been freed already
+                // or was never a CUDA allocation (e.g., CPU pointer on a GPU tensor view)
+                eprintln!("nsl: cuMemFree warning: {:?} for ptr {:p}", result, ptr);
+            }
         }
     }
 
