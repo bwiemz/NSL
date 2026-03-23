@@ -344,6 +344,15 @@ pub(crate) mod inner {
             unsafe { cuEventRecord(*start as CUevent, std::ptr::null_mut()); }
         }
 
+        // Validate launch dimensions
+        debug_assert!(grid[0] > 0 && grid[1] > 0 && grid[2] > 0,
+            "kernel_launch: invalid grid dimensions {:?}", grid);
+        debug_assert!(block[0] > 0 && block[1] > 0 && block[2] > 0,
+            "kernel_launch: invalid block dimensions {:?}", block);
+        debug_assert!(block[0] * block[1] * block[2] <= 1024,
+            "kernel_launch: block size {} exceeds max 1024 threads",
+            block[0] * block[1] * block[2]);
+
         // Launch kernel (no lock held)
         let mut kernel_args: Vec<*mut c_void> = args.to_vec();
         let res = unsafe {

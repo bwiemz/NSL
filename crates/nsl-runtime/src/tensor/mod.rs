@@ -1854,12 +1854,28 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
         if is_tensor {
             if t.device as i64 == device { continue; }
             let new_ptr = nsl_tensor_to_device(field_val, device);
+            if new_ptr == 0 {
+                eprintln!("[nsl] WARNING: failed to transfer tensor field {} to device {}", i, device);
+                continue;
+            }
             unsafe { *field_addr = new_ptr; }
             nsl_tensor_free(field_val);
         }
         // Non-tensor fields (sub-models, arrays) are skipped.
         // The codegen handles nested models by emitting recursive
         // nsl_model_to_device calls with the correct field counts.
+    }
+
+    // Sync after all transfers — surface any deferred errors from GPU copies
+    #[cfg(feature = "cuda")]
+    if device > 0 {
+        unsafe {
+            let result = cudarc::driver::sys::cuCtxSynchronize();
+            if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                eprintln!("[nsl] WARNING: CUDA error after model transfer to device {}: {:?}",
+                    device, result);
+            }
+        }
     }
 }
 
