@@ -248,17 +248,11 @@ fn build_simple_batch(
         }
     }
 
-    // Build standard causal mask (lower-triangular)
-    let mask_total = batch_size * seq_len * seq_len;
-    let mut mask = vec![-1e9f32; mask_total];
-    for b in 0..batch_size {
-        let mask_off = b * seq_len * seq_len;
-        for i in 0..seq_len {
-            for j in 0..=i {
-                mask[mask_off + i * seq_len + j] = 0.0;
-            }
-        }
-    }
+    // NOTE: Causal attention mask is NOT generated here.
+    // The model's GQA layer calls causal_mask(seq_len) internally, which creates
+    // a [seq_len, seq_len] mask that broadcasts across the batch dimension.
+    // Generating a [batch, seq, seq] mask here wastes 134MB/batch at batch=32,
+    // seq=1024 — pure PCIe/memory bandwidth waste for a static pattern.
 
     // Create tensors and dict (f32, dtype=1, to match default tensor dtype)
     let b = batch_size as i64;
@@ -278,20 +272,11 @@ fn build_simple_batch(
         unsafe { *lbl_data.add(i) = v as f32 };
     }
 
-    let mask_ptr = create_tensor_with_shape_rs_dtype(&[b, s, s], 1);
-    let mask_tensor = NslTensor::from_ptr(mask_ptr);
-    let mask_data = mask_tensor.data_f32();
-    for (i, &v) in mask.iter().enumerate() {
-        unsafe { *mask_data.add(i) = v };
-    }
-
     let dict = nsl_dict_new();
     let k_ids = nsl_str_from_rust("input_ids");
     let k_lbl = nsl_str_from_rust("labels");
-    let k_mask = nsl_str_from_rust("attention_mask");
     nsl_dict_set_str(dict, k_ids, ids_ptr);
     nsl_dict_set_str(dict, k_lbl, lbl_ptr);
-    nsl_dict_set_str(dict, k_mask, mask_ptr);
 
     dict
 }
@@ -459,7 +444,7 @@ mod tests {
             if batch == 0 {
                 break;
             }
-            assert_eq!(nsl_dict_len(batch), 3);
+            assert_eq!(nsl_dict_len(batch), 2); // input_ids + labels (no attention_mask)
             nsl_dict_free(batch);
             batch_count += 1;
         }

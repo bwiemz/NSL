@@ -104,7 +104,10 @@ pub fn pack_batch(
 /// Convert a `PackedBatch` into an NslDict with keys:
 /// - `"input_ids"`: tensor of shape `[B, S]`
 /// - `"labels"`: tensor of shape `[B, S]`
-/// - `"attention_mask"`: tensor of shape `[B, S, S]`
+/// - `"attention_mask"`: tensor of shape `[B, S, S]` (packed sequences need block-diagonal masks)
+///
+/// NOTE: Only packed batches include attention_mask. Standard (non-packed) batches
+/// omit it — the model's GQA layer generates causal_mask(seq_len) internally.
 pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     let b = batch.batch_size as i64;
     let s = batch.seq_len as i64;

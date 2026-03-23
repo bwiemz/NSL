@@ -57,6 +57,10 @@ pub struct FuncState {
     /// True when compiling a train block step body (inside tape recording).
     /// Suppresses freeing tensor temporaries since backward needs them alive.
     pub in_tape_region: bool,
+    /// True when inside a DataLoader for-loop with runtime scope tracking.
+    /// Suppresses codegen-level tensor_temporaries cleanup to avoid double-free
+    /// with scope_end (which handles all cleanup at end of each iteration).
+    pub in_scoped_loop: bool,
     /// M38b: Ownership lowering state for linear types free-at-consumption.
     /// `Some` when `--linear-types` is active and the function has ownership metadata.
     pub ownership_lowering: Option<crate::ownership::OwnershipLowering>,
@@ -91,6 +95,7 @@ impl FuncState {
             in_fuse_bypass: false,
             symbolic_dims: crate::dynamic_shapes::SymbolicDimTracker::new(),
             in_tape_region: false,
+            in_scoped_loop: false,
             ownership_lowering: None,
             is_fp8_compute: false,
             use_counts: None,

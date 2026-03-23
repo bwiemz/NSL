@@ -91,6 +91,19 @@ impl Compiler<'_> {
         if func_name == "range" {
             return self.compile_range_call(builder, state, args);
         }
+        // Benchmarking intrinsics: clock(), alloc_reset(), alloc_count(), alloc_bytes()
+        if func_name == "clock" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_clock", &[]);
+        }
+        if func_name == "alloc_reset" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_alloc_reset", &[]);
+        }
+        if func_name == "alloc_count" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_alloc_count", &[]);
+        }
+        if func_name == "alloc_bytes" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_alloc_bytes", &[]);
+        }
         if matches!(func_name.as_str(), "int" | "float" | "str" | "bool") {
             return self.compile_type_conversion(builder, state, &func_name, args);
         }

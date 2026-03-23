@@ -39,8 +39,7 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let len = input.len as usize;
     let ndim = input.ndim;
     let in_dtype = input.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(input.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
@@ -74,8 +73,7 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let len = input.len as usize;
     let ndim = input.ndim;
     let in_dtype = input.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(input.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
@@ -120,8 +118,7 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let len = input.len as usize;
     let ndim = input.ndim;
     let in_dtype = input.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(input.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(input.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
@@ -159,8 +156,7 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
@@ -194,8 +190,7 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
@@ -230,8 +225,7 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(out.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_size = len * elem_size;
@@ -562,8 +556,7 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     let len = grad.len as usize;
     let ndim = grad.ndim;
     let grad_dtype = grad.dtype;
-    let shape = crate::memory::checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(grad.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(grad.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if grad_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);

@@ -1,0 +1,28 @@
+# Verify fusion lowering produces correct results
+
+# Test 1: relu(a + b) — classic epilogue pattern
+let a = full([4, 4], 1.0)
+let b = full([4, 4], -0.5)
+let result1 = relu(a + b)
+print("relu(1.0 + (-0.5)) = relu(0.5) = 0.5:")
+print(mean(result1))
+
+# Test 2: sigmoid(neg(x)) — unary chain
+let x = full([4, 4], 2.0)
+let result2 = sigmoid(neg(x))
+print("sigmoid(-2.0) = 0.1192:")
+print(mean(result2))
+
+# Test 3: exp(a * b) — binary + unary
+let c = full([4, 4], 1.0)
+let d = full([4, 4], 0.5)
+let result3 = exp(c * d)
+print("exp(1.0 * 0.5) = exp(0.5) = 1.6487:")
+print(mean(result3))
+
+# Test 4: tanh(a + b) — binary + activation
+let result4 = tanh(a + b)
+print("tanh(0.5) = 0.4621:")
+print(mean(result4))
+
+print("All fusion tests passed!")

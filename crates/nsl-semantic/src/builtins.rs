@@ -74,6 +74,40 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // Benchmarking intrinsics
+    def(
+        "clock",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Float),
+            effect: Effect::Inferred,
+        },
+    );
+    def(
+        "alloc_reset",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
+        },
+    );
+    def(
+        "alloc_count",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
+    def(
+        "alloc_bytes",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
+
     // Tensor creation functions
     let tensor_ret = Type::Tensor {
         shape: Shape::unknown(),

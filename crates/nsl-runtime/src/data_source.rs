@@ -377,11 +377,12 @@ mod tests {
         );
         let tensor = NslTensor::from_ptr(tensor_ptr);
         assert_eq!(tensor.len, 4);
-        assert_eq!(tensor.owns_data, 1);
-        assert_eq!(tensor.dtype, 0); // converted to f64
+        assert_eq!(tensor.owns_data, 0); // mmap'd data — tensor does not own the buffer
+        assert_eq!(tensor.dtype, 3); // u16 zero-copy (no conversion to f64)
+        // Verify raw u16 data is accessible
         unsafe {
-            let data = tensor.data_f64();
-            assert_eq!(*data.add(2), 50256.0);
+            let data = tensor.data as *const u16;
+            assert_eq!(*data.add(2), 50256u16);
         }
     }
 }

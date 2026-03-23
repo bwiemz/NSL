@@ -1,39 +1,113 @@
 # models/coder50m/pretrain.nsl
-# Stage 1: Pretrain on 10B StarCoder tokens (from 30B corpus)
+# ============================================================================
+# NSL-Coder-50M — Stage 1 Pretraining
+# ============================================================================
+# Architecture: 8-layer decoder, D=512, H=8, KV=4, FF=1408, V=49152
+# Data: StarCoder pre-tokenized u16 tokens (mmap zero-copy)
+# Config: batch=1, seq=1024 (CPU); batch=32, seq=1024 (GPU)
 #
-# Training features:
-#   - AdamW with warmup cosine schedule (beta2=0.95 for stability)
-#   - Gradient clipping to max_norm=1.0 (automatic in train block)
-#   - Dropout 0.1 (attention + FFN, via training=true)
-#   - Xavier weight initialization
-#   - Checkpoint every 10k steps
-#
-# Data: StarCoder u16 pretokenized (30B tokens, we use first 10B)
-# Steps: 10B tokens / (32 batch * 1024 seq) = ~305k steps
+# Tracks: loss, tokens/sec, time/step, running average loss
+# Checkpoints: saves every 1000 steps to checkpoints/
+# ============================================================================
 
 from model import NSLCoder
 from nsl.nn.losses import cross_entropy
 
+# ── Initialize ──
 let m = NSLCoder()
-print("NSL-Coder-50M initialized (48.8M params, Xavier init, dropout=0.1)")
-print("Starting pretraining on 10B StarCoder tokens...")
+print("================================================================")
+print("  NSL-Coder-50M Pretraining")
+print("  48.8M parameters | 8 layers | D=512 | GQA 8Q/4KV")
+print("================================================================")
 
-# Load pretokenized StarCoder data (u16 format, mmap for 82GB file)
+# ── Data ──
 let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true, max_tokens=10000000000)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
 
-train(model=m, epochs=1):
-    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95)
-    scheduler: warmup_cosine(warmup_steps=3000, total_steps=305000, min_lr=0.00003)
-    step(batch):
-        let logits = m.forward_train(batch.input_ids, true)
-        let loss = cross_entropy(logits, batch.labels)
-    callbacks:
-        on_step(step, loss):
-            if step % 100 == 0:
-                print(loss)
-            if step % 10000 == 0:
-                model_save(m, "checkpoints/pretrain.nslm")
+# ── Metrics ──
+let step = 0
+let total_tokens = 0
+let running_loss = 0.0
+let run_start = clock()
+let step_start = clock()
+let log_interval = 10
+let checkpoint_interval = 1000
+let max_steps = 10000
 
-model_save(m, "checkpoints/pretrain_final.nslm")
-print("Pretraining complete.")
+print("")
+print("step | loss     | avg_loss | tok/s    | ms/step  | total_tok")
+print("-----|----------|----------|----------|----------|----------")
+
+for batch in loader:
+    let input_ids = batch.input_ids
+    let labels = batch.labels
+
+    # Forward pass
+    let logits = m.forward_train(input_ids, false)
+
+    # Compute loss: reshape [B, S, V] -> [B*S, V] for cross_entropy
+    let ls = logits.shape
+    let flat_logits = logits.reshape([ls[1], ls[2]])
+    let flat_labels = labels.reshape([ls[1]])
+    let loss = cross_entropy(flat_logits, flat_labels)
+    let loss_val = loss.item()
+
+    # Update metrics
+    total_tokens = total_tokens + 1024
+    running_loss = running_loss * 0.99 + loss_val * 0.01
+    if step == 0:
+        running_loss = loss_val
+
+    # Log
+    if step % log_interval == 0:
+        let now = clock()
+        let step_ms = (now - step_start) * 1000.0 / float(log_interval)
+        if step == 0:
+            step_ms = (now - step_start) * 1000.0
+        let elapsed = now - run_start
+        let tok_per_sec = 0.0
+        if elapsed > 0.0:
+            tok_per_sec = float(total_tokens) / elapsed
+
+        print(step)
+        print(loss_val)
+        print(running_loss)
+        print(tok_per_sec)
+        print(step_ms)
+        print(total_tokens)
+        print("")
+
+        step_start = clock()
+
+    # Checkpoint
+    if step > 0:
+        if step % checkpoint_interval == 0:
+            model_save(m, "checkpoints/coder50m_step_" + str(step) + ".nslm")
+            print("  [checkpoint saved at step " + str(step) + "]")
+
+    step = step + 1
+    if step >= max_steps:
+        break
+
+# ── Final summary ──
+let total_time = clock() - run_start
+print("")
+print("================================================================")
+print("  Training Complete")
+print("================================================================")
+print("Total steps:")
+print(step)
+print("Total tokens:")
+print(total_tokens)
+print("Total time (s):")
+print(total_time)
+print("Avg tokens/sec:")
+if total_time > 0.0:
+    print(float(total_tokens) / total_time)
+print("Final running loss:")
+print(running_loss)
+
+# Save final checkpoint
+model_save(m, "checkpoints/coder50m_final.nslm")
+print("Final checkpoint saved.")
+print("================================================================")

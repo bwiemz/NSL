@@ -1,0 +1,31 @@
+# Benchmark: DataLoader I/O Throughput (M19)
+# Measures raw batch delivery speed without model computation.
+# This determines if data loading is the bottleneck during training.
+#
+# Config: batch_size=32, seq_len=1024 (matches pretrain config)
+# Each batch: 32 * 1024 = 32,768 tokens
+# Each token: 2 bytes (u16) in mmap, 4 bytes (f32) after conversion
+# Batch data size: 32,768 * 4 = 128KB (input_ids) + 128KB (labels) + 128MB (attention_mask)
+#   Note: attention_mask is [32, 1024, 1024] = 128MB — this dominates!
+
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)
+
+print("DataLoader created, iterating batches...")
+
+let batch_count = 0
+for batch in loader:
+    let ids = batch.input_ids
+    let lbl = batch.labels
+    batch_count = batch_count + 1
+    if batch_count % 100 == 0:
+        print(batch_count)
+    if batch_count >= 500:
+        break
+
+print("Total batches delivered:")
+print(batch_count)
+print("DataLoader benchmark complete")
+# Throughput = batch_count * 32768 tokens / elapsed_time
+# Without a clock() builtin, measure wall-clock time externally:
+#   time nsl run benchmarks/bench_dataloader.nsl

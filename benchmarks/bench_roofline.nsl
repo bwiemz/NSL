@@ -1,0 +1,188 @@
+# ============================================================================
+# Roofline Cost Model Validation (M37)
+# ============================================================================
+# Analyzes the NSLCoder-50M forward pass using the same formulas as
+# nsl-codegen/src/cost_model.rs. Computes per-op FLOPs, bytes, arithmetic
+# intensity, and bound classification for each operation in the transformer.
+#
+# GPU target: H100-SXM (sm_90)
+#   Peak FP16: 989 TFLOPS
+#   HBM bandwidth: 3350 GB/s
+#   Ridge point (FP16): 295.2 FLOP/byte
+#   Ridge point (FP32): 20.0 FLOP/byte
+# ============================================================================
+
+# Model dimensions (NSLCoder-50M)
+const B = 1
+const S = 1024
+const D = 512
+const H = 8
+const KV = 4
+const HD = 64
+const FF = 1408
+const V = 49152
+const LAYERS = 8
+const DTYPE = 4
+
+# H100-SXM specs
+const PEAK_FP16_TFLOPS = 989.0
+const HBM_BW_GBS = 3350.0
+const RIDGE_FP32 = 20.0
+
+fn analyze_op(name: str, flops: int, bytes_read: int, bytes_written: int):
+    let total_bytes = bytes_read + bytes_written
+    let ai = 0.0
+    if total_bytes > 0:
+        ai = float(flops) / float(total_bytes)
+    let ridge = 20.0
+    let bound = "COMPUTE"
+    if ai < ridge * 0.8:
+        bound = "MEMORY"
+    if ai >= ridge * 0.8:
+        if ai <= ridge * 1.2:
+            bound = "BALANCED"
+    let compute_us = float(flops) / (989.0 * 1000000.0)
+    let mem_us = float(total_bytes) / (3350.0 * 1000.0)
+    let est_us = compute_us
+    if mem_us > compute_us:
+        est_us = mem_us
+    print(name)
+    print("  FLOPs:")
+    print(flops)
+    print("  Bytes (R+W):")
+    print(total_bytes)
+    print("  AI (FLOP/byte):")
+    print(ai)
+    print("  Bound:")
+    print(bound)
+    print("  Est time (us):")
+    print(est_us)
+    print("")
+
+print("================================================================")
+print("  NSLCoder-50M Roofline Analysis (H100-SXM, FP32, batch=1)")
+print("  Per-layer ops for 1 transformer block")
+print("================================================================")
+print("")
+
+# ── Per-layer analysis ──
+
+# 1. Q projection: [B*S, D] x [D, D] = [B*S, D]
+let m_qkv = B * S
+let k_qkv = D
+let n_q = D
+let flops_q = 2 * m_qkv * k_qkv * n_q
+let read_q = (m_qkv * k_qkv + k_qkv * n_q) * DTYPE
+let write_q = m_qkv * n_q * DTYPE
+analyze_op("Q projection [1024,512]x[512,512]", flops_q, read_q, write_q)
+
+# 2. K projection: [B*S, D] x [D, KV*HD]
+let n_k = KV * HD
+let flops_k = 2 * m_qkv * k_qkv * n_k
+let read_k = (m_qkv * k_qkv + k_qkv * n_k) * DTYPE
+let write_k = m_qkv * n_k * DTYPE
+analyze_op("K projection [1024,512]x[512,256]", flops_k, read_k, write_k)
+
+# 3. V projection (same as K)
+analyze_op("V projection [1024,512]x[512,256]", flops_k, read_k, write_k)
+
+# 4. Attention scores: [B,H,S,HD] x [B,H,HD,S] = [B,H,S,S]
+let flops_attn = 2 * B * H * S * HD * S
+let read_attn = B * H * (S * HD + HD * S) * DTYPE
+let write_attn = B * H * S * S * DTYPE
+analyze_op("Attention QK^T [1,8,1024,64]x[1,8,64,1024]", flops_attn, read_attn, write_attn)
+
+# 5. Softmax: [B, H, S, S] — 5 FLOPs/element (max, sub, exp, sum, div)
+let softmax_elems = B * H * S * S
+let flops_sm = 5 * softmax_elems
+let read_sm = softmax_elems * DTYPE
+let write_sm = softmax_elems * DTYPE
+analyze_op("Softmax [1,8,1024,1024]", flops_sm, read_sm, write_sm)
+
+# 6. Attention value: [B,H,S,S] x [B,H,S,HD] = [B,H,S,HD]
+let flops_av = 2 * B * H * S * S * HD
+let read_av = B * H * (S * S + S * HD) * DTYPE
+let write_av = B * H * S * HD * DTYPE
+analyze_op("Attention V [1,8,1024,1024]x[1,8,1024,64]", flops_av, read_av, write_av)
+
+# 7. Output projection: [B*S, D] x [D, D]
+analyze_op("Output projection [1024,512]x[512,512]", flops_q, read_q, write_q)
+
+# 8. RMSNorm: [B, S, D] — ~6 FLOPs/element (sq, mean, rsqrt, mul, scale)
+let norm_elems = B * S * D
+let flops_norm = 6 * norm_elems
+let read_norm = norm_elems * DTYPE + D * DTYPE
+let write_norm = norm_elems * DTYPE
+analyze_op("RMSNorm [1,1024,512]", flops_norm, read_norm, write_norm)
+
+# 9. FFN gate: [B*S, D] x [D, FF]
+let flops_gate = 2 * B * S * D * FF
+let read_gate = (B * S * D + D * FF) * DTYPE
+let write_gate = B * S * FF * DTYPE
+analyze_op("FFN W_gate [1024,512]x[512,1408]", flops_gate, read_gate, write_gate)
+
+# 10. FFN up (same dims)
+analyze_op("FFN W_up [1024,512]x[512,1408]", flops_gate, read_gate, write_gate)
+
+# 11. SiLU: [B, S, FF] — ~4 FLOPs/element
+let silu_elems = B * S * FF
+let flops_silu = 4 * silu_elems
+let read_silu = silu_elems * DTYPE
+let write_silu = silu_elems * DTYPE
+analyze_op("SiLU activation [1,1024,1408]", flops_silu, read_silu, write_silu)
+
+# 12. Gate * Up elementwise: [B, S, FF]
+let flops_mul = silu_elems
+let read_mul = 2 * silu_elems * DTYPE
+let write_mul = silu_elems * DTYPE
+analyze_op("Gate * Up [1,1024,1408]", flops_mul, read_mul, write_mul)
+
+# 13. FFN down: [B*S, FF] x [FF, D]
+let flops_down = 2 * B * S * FF * D
+let read_down = (B * S * FF + FF * D) * DTYPE
+let write_down = B * S * D * DTYPE
+analyze_op("FFN W_down [1024,1408]x[1408,512]", flops_down, read_down, write_down)
+
+# 14. Embedding lookup: [B*S] -> [B*S, D]
+let flops_emb = 0
+let read_emb = B * S * D * DTYPE
+let write_emb = B * S * D * DTYPE
+analyze_op("Embedding lookup [1024] -> [1024,512]", flops_emb, read_emb, write_emb)
+
+# 15. LM head (weight-tied): [B*S, D] x [D, V]
+let flops_lm = 2 * B * S * D * V
+let read_lm = (B * S * D + D * V) * DTYPE
+let write_lm = B * S * V * DTYPE
+analyze_op("LM head [1024,512]x[512,49152]", flops_lm, read_lm, write_lm)
+
+# ── Full forward pass totals ──
+let total_flops_per_layer = flops_q + flops_k + flops_k + flops_attn + flops_sm + flops_av + flops_q + flops_norm * 2 + flops_gate * 2 + flops_silu + flops_mul + flops_down
+let total_flops = total_flops_per_layer * LAYERS + flops_emb + flops_lm + flops_norm
+let total_bytes_per_layer = (read_q + write_q) * 2 + (read_k + write_k) * 2 + (read_attn + write_attn) + (read_sm + write_sm) + (read_av + write_av) + (read_norm + write_norm) * 2 + (read_gate + write_gate) * 2 + (read_silu + write_silu) + (read_mul + write_mul) + (read_down + write_down)
+
+print("================================================================")
+print("  FULL FORWARD PASS SUMMARY")
+print("================================================================")
+print("Total GFLOPs (full forward):")
+print(float(total_flops) / 1000000000.0)
+print("Per-layer GFLOPs:")
+print(float(total_flops_per_layer) / 1000000000.0)
+print("LM head GFLOPs:")
+print(float(flops_lm) / 1000000000.0)
+print("")
+print("Overall arithmetic intensity:")
+print(float(total_flops) / float(total_bytes_per_layer * LAYERS))
+print("")
+print("Theoretical H100 forward time (us):")
+let compute_time = float(total_flops) / (PEAK_FP16_TFLOPS * 1000000.0)
+let mem_time = float(total_bytes_per_layer * LAYERS) / (HBM_BW_GBS * 1000.0)
+print("  Compute-limited:")
+print(compute_time)
+print("  Memory-limited:")
+print(mem_time)
+print("  Bottleneck:")
+if compute_time > mem_time:
+    print("  COMPUTE BOUND")
+if mem_time >= compute_time:
+    print("  MEMORY BOUND")
+print("================================================================")

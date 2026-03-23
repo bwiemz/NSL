@@ -24,7 +24,8 @@
 #       Each batch is a Dict with keys:
 #           "input_ids"      [B, S] token ids
 #           "labels"          [B, S] shifted labels (-100 at boundaries)
-#           "attention_mask"  [B, S, S] causal/block-diagonal mask
+#       Note: causal attention mask is generated inside the model's GQA layer
+#       via causal_mask(seq_len), not in the DataLoader.
 
 fn data_version() -> int:
     return 1

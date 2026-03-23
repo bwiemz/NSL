@@ -139,6 +139,19 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor memory
     ("nsl_tensor_clone", &[types::I64], Some(types::I64)),
     ("nsl_tensor_free", &[types::I64], None),
+    ("nsl_tensor_retain", &[types::I64], None),
+    ("nsl_tensor_release", &[types::I64], None),
+    ("nsl_tensor_scope_begin", &[], None),
+    ("nsl_tensor_scope_end", &[types::I64], None),
+    // Fused elementwise operations (M31 fusion lowering)
+    ("nsl_fused_elementwise_2", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_fused_elementwise_1", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_fused_matmul_epilogue", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    // Timing and allocation tracking
+    ("nsl_clock", &[], Some(types::F64)),
+    ("nsl_alloc_reset", &[], Some(types::I64)),
+    ("nsl_alloc_count", &[], Some(types::I64)),
+    ("nsl_alloc_bytes", &[], Some(types::I64)),
     // FBIP Phase 2: unconditional in-place variants (compiler-guaranteed single-use)
     ("nsl_tensor_relu_inplace", &[types::I64], Some(types::I64)),
     ("nsl_tensor_exp_inplace", &[types::I64], Some(types::I64)),

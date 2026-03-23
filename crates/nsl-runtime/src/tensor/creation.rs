@@ -44,7 +44,7 @@ pub(crate) fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
         dtype: 1,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(tensor) as i64
+    NslTensor::publish(tensor)
 }
 
 /// Helper: create a tensor from a shape list, filling data with a given value (f64, dtype=0).
@@ -84,7 +84,7 @@ pub(crate) fn tensor_from_shape_list_f64(shape_list: i64, fill: f64) -> i64 {
         dtype: 0,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(tensor) as i64
+    NslTensor::publish(tensor)
 }
 
 /// Create a 0-d scalar tensor containing a single f32 value (dtype=1).
@@ -102,7 +102,7 @@ pub(crate) fn create_scalar_tensor(value: f64) -> i64 {
         dtype: 1,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(tensor) as i64
+    NslTensor::publish(tensor)
 }
 
 /// Create a 0-d scalar tensor with dtype-aware storage (dtype=0 -> f64, dtype=1 -> f32).
@@ -123,7 +123,7 @@ pub(crate) fn create_scalar_tensor_dtype(value: f64, dtype: u16) -> i64 {
             dtype: 0,
             owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(tensor) as i64
+        NslTensor::publish(tensor)
     }
 }
 
@@ -219,7 +219,7 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
         dtype: 1,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(tensor) as i64
+    NslTensor::publish(tensor)
 }
 
 /// Create a tensor from a raw f64 slice and shape array.
@@ -254,5 +254,5 @@ pub(crate) fn create_tensor_from_f64_data(data_slice: &[f64], shape_slice: &[i64
         dtype: 0,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(tensor) as i64
+    NslTensor::publish(tensor)
 }

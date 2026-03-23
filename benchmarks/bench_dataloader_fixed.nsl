@@ -1,0 +1,51 @@
+# DataLoader Throughput After Mask Removal
+# Compare batch_size=1 and batch_size=32
+
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+
+# Test 1: batch_size=32
+let loader32 = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)
+alloc_reset()
+let t0 = clock()
+let i = 0
+for batch in loader32:
+    let ids = batch.input_ids
+    i = i + 1
+    if i >= 500:
+        break
+let t1 = clock()
+let ms32 = (t1 - t0) * 1000.0
+let allocs32 = alloc_count()
+let bytes32 = alloc_bytes()
+print("batch_size=32, 500 batches:")
+print("  time_ms:")
+print(ms32)
+print("  batches/sec:")
+print(500000.0 / ms32)
+print("  tokens/sec:")
+print(500.0 * 32.0 * 1024.0 / ((t1 - t0)))
+print("  allocs:")
+print(allocs32)
+print("  MB allocated:")
+print(float(bytes32) / 1048576.0)
+
+# Test 2: batch_size=1
+let loader1 = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+alloc_reset()
+let t2 = clock()
+let j = 0
+for batch in loader1:
+    let ids = batch.input_ids
+    j = j + 1
+    if j >= 1000:
+        break
+let t3 = clock()
+let ms1 = (t3 - t2) * 1000.0
+print("")
+print("batch_size=1, 1000 batches:")
+print("  time_ms:")
+print(ms1)
+print("  batches/sec:")
+print(1000000.0 / ms1)
+print("  tokens/sec:")
+print(1000.0 * 1024.0 / (t3 - t2))

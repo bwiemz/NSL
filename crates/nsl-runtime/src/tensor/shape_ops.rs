@@ -377,7 +377,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
         owns_data: 1, data_owner: 0,
     });
     // NO tape recording -- select is used internally for stack backward
-    Box::into_raw(out) as i64
+    NslTensor::publish(out)
 }
 
 /// Stack a list of same-shape tensors along a NEW dimension at position `dim`.
@@ -493,7 +493,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         dtype: first.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     // Free contiguous copies
     for &cp in &contiguous_ptrs {
@@ -604,7 +604,7 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
         owns_data: 0, // view — does NOT own the data buffer
         data_owner: true_owner, // back-pointer for cleanup (root-flattened)
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
         let original_shape = unsafe {
@@ -638,11 +638,12 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         *out_shape.add(1) = seq_len;
     }
     let out_strides = NslTensor::compute_strides(out_shape, 2);
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+    // Use f32 (dtype=1) to match attention scores dtype and avoid promotion overhead
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
 
     for i in 0..n {
         for j in 0..n {
-            let val = if j <= i { 0.0_f64 } else { -1e9_f64 };
+            let val = if j <= i { 0.0_f32 } else { -1e9_f32 };
             unsafe { *data.add(i * n + j) = val };
         }
     }
@@ -655,10 +656,10 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
         len,
         refcount: AtomicI64::new(1),
         device: 0,
-        dtype: 0,
+        dtype: 1,
         owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(out) as i64
+    NslTensor::publish(out)
 }
 
 /// Slice a tensor along a dimension: extract elements [start, end) along dim.
@@ -745,7 +746,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         dtype: tensor.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Slice {
@@ -871,7 +872,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         dtype: out_dtype,
         owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     // Free contiguous copies
     for &cp in &contiguous_ptrs {
@@ -980,7 +981,7 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
         dtype: tensor.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let result = Box::into_raw(result) as i64;
+    let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
     result
 }
@@ -1049,7 +1050,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             dtype: t.dtype,
             owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(result) as i64
+        NslTensor::publish(result)
     } else {
         // f64
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
@@ -1078,6 +1079,6 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             dtype: t.dtype,
             owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(result) as i64
+        NslTensor::publish(result)
     }
 }

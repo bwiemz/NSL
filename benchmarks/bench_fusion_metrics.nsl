@@ -1,0 +1,30 @@
+# Graph Fusion Memory Bandwidth Test (M31)
+# Run FUSED:    nsl run benchmarks/bench_fusion_metrics.nsl
+# Run UNFUSED:  nsl run benchmarks/bench_fusion_metrics.nsl --disable-fusion
+
+fn ffn_block(x: Tensor, w1: Tensor, b1: Tensor, w2: Tensor, b2: Tensor) -> Tensor:
+    let h = relu(x @ w1 + b1)
+    return h @ w2 + b2
+
+let x = randn([256, 128])
+let w1 = randn([128, 512]) * full([1], 0.02)
+let b1 = zeros([512])
+let w2 = randn([512, 128]) * full([1], 0.02)
+let b2 = zeros([128])
+
+let _ = ffn_block(x, w1, b1, w2, b2)
+
+alloc_reset()
+let t0 = clock()
+let i = 0
+while i < 20:
+    let r = ffn_block(x, w1, b1, w2, b2)
+    i = i + 1
+let t1 = clock()
+
+print("total_ms:")
+print((t1 - t0) * 1000.0)
+print("allocs:")
+print(alloc_count())
+print("bytes:")
+print(alloc_bytes())

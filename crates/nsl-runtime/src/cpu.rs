@@ -126,6 +126,7 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         dtype: 0,
         owns_data: 1, data_owner: 0,
     });
+    crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f64>());
     Box::into_raw(result) as i64
 }
 
@@ -253,7 +254,301 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         dtype: 1,
         owns_data: 1, data_owner: 0,
     });
+    crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f32>());
     Box::into_raw(result) as i64
+}
+
+// ---------------------------------------------------------------------------
+// Fused elementwise operations
+// ---------------------------------------------------------------------------
+
+/// Op codes for fused elementwise chains.
+/// Encoded as i64 values passed from codegen via an NslList.
+pub const FUSED_OP_ADD: i64 = 0;
+pub const FUSED_OP_MUL: i64 = 1;
+pub const FUSED_OP_SUB: i64 = 2;
+pub const FUSED_OP_DIV: i64 = 3;
+pub const FUSED_OP_RELU: i64 = 4;
+pub const FUSED_OP_SIGMOID: i64 = 5;
+pub const FUSED_OP_TANH: i64 = 6;
+pub const FUSED_OP_NEG: i64 = 7;
+pub const FUSED_OP_EXP: i64 = 8;
+pub const FUSED_OP_LOG: i64 = 9;
+pub const FUSED_OP_SQRT: i64 = 10;
+pub const FUSED_OP_ABS: i64 = 11;
+pub const FUSED_OP_GELU: i64 = 12;
+pub const FUSED_OP_SILU: i64 = 13;
+
+/// Apply a single fused op to a scalar value.
+#[inline(always)]
+fn apply_fused_op_f32(op: i64, val: f32, rhs: f32) -> f32 {
+    match op {
+        FUSED_OP_ADD => val + rhs,
+        FUSED_OP_MUL => val * rhs,
+        FUSED_OP_SUB => val - rhs,
+        FUSED_OP_DIV => val / rhs,
+        FUSED_OP_RELU => val.max(0.0),
+        FUSED_OP_SIGMOID => 1.0 / (1.0 + (-val).exp()),
+        FUSED_OP_TANH => val.tanh(),
+        FUSED_OP_NEG => -val,
+        FUSED_OP_EXP => val.exp(),
+        FUSED_OP_LOG => val.ln(),
+        FUSED_OP_SQRT => val.sqrt(),
+        FUSED_OP_ABS => val.abs(),
+        FUSED_OP_GELU => {
+            // GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            let c = 0.7978845608_f32; // sqrt(2/pi)
+            val * 0.5 * (1.0 + (c * (val + 0.044715 * val * val * val)).tanh())
+        }
+        FUSED_OP_SILU => val * (1.0 / (1.0 + (-val).exp())),
+        _ => val,
+    }
+}
+
+/// Fused elementwise binary op: applies op_chain to `a op[0] b`, then unary ops.
+/// `a_ptr` and `b_ptr` are tensor pointers. `ops_ptr` is an NslList of op codes.
+/// `num_binary` is how many ops consume a second input (the rest are unary on the accumulator).
+///
+/// Example: relu(a + b) → ops=[ADD, RELU], num_binary=1
+///   result[i] = relu(a[i] + b[i])
+/// Zero intermediate allocations — one output tensor, one loop.
+#[no_mangle]
+pub extern "C" fn nsl_fused_elementwise_2(
+    a_ptr: i64,
+    b_ptr: i64,
+    ops_ptr: i64,
+    num_ops: i64,
+) -> i64 {
+    let a = NslTensor::from_ptr(a_ptr);
+    let b = NslTensor::from_ptr(b_ptr);
+    let ops_list = crate::list::NslList::from_ptr(ops_ptr);
+
+    let ops: Vec<i64> = (0..num_ops as usize)
+        .map(|i| unsafe { *ops_list.data.add(i) })
+        .collect();
+
+    // For now: same-shape fast path (no broadcast)
+    // Broadcasting would require the general multi-index iterator
+    let len = a.len as usize;
+    debug_assert_eq!(a.len, b.len, "fused_elementwise_2: shape mismatch");
+
+    let out_shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, a.ndim);
+
+    if a.dtype == 1 {
+        let buf = checked_alloc((len) * std::mem::size_of::<f32>()) as *mut f32;
+        let da = a.data as *const f32;
+        let db = b.data as *const f32;
+        for i in 0..len {
+            let a_val = unsafe { *da.add(i) };
+            let b_val = unsafe { *db.add(i) };
+
+            // First op is binary (uses a and b)
+            let mut acc = apply_fused_op_f32(ops[0], a_val, b_val);
+
+            // Remaining ops are unary (applied to accumulator)
+            for &op in &ops[1..] {
+                acc = apply_fused_op_f32(op, acc, 0.0);
+            }
+
+            unsafe { *buf.add(i) = acc };
+        }
+        let result = Box::new(NslTensor {
+            data: buf as *mut c_void,
+            shape: out_shape,
+            strides: out_strides,
+            ndim: a.ndim,
+            len: a.len,
+            refcount: AtomicI64::new(1),
+            device: 0,
+            dtype: 1,
+            owns_data: 1, data_owner: 0,
+        });
+        NslTensor::publish(result)
+    } else {
+        // f64 fallback — same logic
+        let buf = checked_alloc((len) * std::mem::size_of::<f64>()) as *mut f64;
+        let da = a.data as *const f64;
+        let db = b.data as *const f64;
+        for i in 0..len {
+            let a_val = unsafe { *da.add(i) } as f32;
+            let b_val = unsafe { *db.add(i) } as f32;
+            let mut acc = apply_fused_op_f32(ops[0], a_val, b_val);
+            for &op in &ops[1..] {
+                acc = apply_fused_op_f32(op, acc, 0.0);
+            }
+            unsafe { *buf.add(i) = acc as f64 };
+        }
+        let result = Box::new(NslTensor {
+            data: buf as *mut c_void,
+            shape: out_shape,
+            strides: out_strides,
+            ndim: a.ndim,
+            len: a.len,
+            refcount: AtomicI64::new(1),
+            device: 0,
+            dtype: 0,
+            owns_data: 1, data_owner: 0,
+        });
+        NslTensor::publish(result)
+    }
+}
+
+/// Fused unary elementwise: applies chain of unary ops to a single input.
+/// Example: sigmoid(neg(x)) → ops=[NEG, SIGMOID]
+#[no_mangle]
+pub extern "C" fn nsl_fused_elementwise_1(
+    a_ptr: i64,
+    ops_ptr: i64,
+    num_ops: i64,
+) -> i64 {
+    let a = NslTensor::from_ptr(a_ptr);
+    let ops_list = crate::list::NslList::from_ptr(ops_ptr);
+
+    let ops: Vec<i64> = (0..num_ops as usize)
+        .map(|i| unsafe { *ops_list.data.add(i) })
+        .collect();
+
+    let len = a.len as usize;
+    let out_shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, a.ndim);
+
+    if a.dtype == 1 {
+        let buf = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+        let da = a.data as *const f32;
+        for i in 0..len {
+            let mut acc = unsafe { *da.add(i) };
+            for &op in &ops {
+                acc = apply_fused_op_f32(op, acc, 0.0);
+            }
+            unsafe { *buf.add(i) = acc };
+        }
+        let result = Box::new(NslTensor {
+            data: buf as *mut c_void,
+            shape: out_shape,
+            strides: out_strides,
+            ndim: a.ndim,
+            len: a.len,
+            refcount: AtomicI64::new(1),
+            device: 0,
+            dtype: 1,
+            owns_data: 1, data_owner: 0,
+        });
+        NslTensor::publish(result)
+    } else {
+        let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+        let da = a.data as *const f64;
+        for i in 0..len {
+            let mut acc = unsafe { *da.add(i) } as f32;
+            for &op in &ops {
+                acc = apply_fused_op_f32(op, acc, 0.0);
+            }
+            unsafe { *buf.add(i) = acc as f64 };
+        }
+        let result = Box::new(NslTensor {
+            data: buf as *mut c_void,
+            shape: out_shape,
+            strides: out_strides,
+            ndim: a.ndim,
+            len: a.len,
+            refcount: AtomicI64::new(1),
+            device: 0,
+            dtype: 0,
+            owns_data: 1, data_owner: 0,
+        });
+        NslTensor::publish(result)
+    }
+}
+
+/// Fused matmul + epilogue: matmul(A, B) then apply bias+activation in one pass.
+/// Eliminates the intermediate matmul result tensor and the bias-add tensor.
+///
+/// `epilogue_ops` is an NslList of op codes to apply after each output element.
+/// `bias_ptr` is 0 if no bias (pure matmul + activation).
+#[no_mangle]
+pub extern "C" fn nsl_fused_matmul_epilogue(
+    a_ptr: i64,
+    b_ptr: i64,
+    bias_ptr: i64,
+    epilogue_ops_ptr: i64,
+    num_epilogue_ops: i64,
+) -> i64 {
+    let a = NslTensor::from_ptr(a_ptr);
+    let b = NslTensor::from_ptr(b_ptr);
+
+    if a.ndim < 2 || b.ndim < 2 {
+        eprintln!("nsl: fused_matmul_epilogue requires 2D+ tensors");
+        std::process::abort();
+    }
+
+    let m = unsafe { *a.shape.add(a.ndim as usize - 2) } as usize;
+    let k = unsafe { *a.shape.add(a.ndim as usize - 1) } as usize;
+    let n = unsafe { *b.shape.add(b.ndim as usize - 1) } as usize;
+
+    let epilogue_ops: Vec<i64> = if num_epilogue_ops > 0 && epilogue_ops_ptr != 0 {
+        let list = crate::list::NslList::from_ptr(epilogue_ops_ptr);
+        (0..num_epilogue_ops as usize)
+            .map(|i| unsafe { *list.data.add(i) })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let has_bias = bias_ptr != 0;
+    let bias_data: *const f32 = if has_bias {
+        let bt = NslTensor::from_ptr(bias_ptr);
+        bt.data as *const f32
+    } else {
+        std::ptr::null()
+    };
+
+    // Output shape: [M, N]
+    let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = m as i64;
+        *out_shape.add(1) = n as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out_len = (m * n) as i64;
+
+    // f32 path (most common for training)
+    let buf = checked_alloc_zeroed(m * n * std::mem::size_of::<f32>()) as *mut f32;
+
+    // Tiled matmul with fused epilogue
+    let a_data = a.data as *const f32;
+    let b_data = b.data as *const f32;
+
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0_f32;
+            for kk in 0..k {
+                acc += unsafe { *a_data.add(i * k + kk) * *b_data.add(kk * n + j) };
+            }
+
+            // Fused epilogue: bias then activation, all in registers
+            if has_bias {
+                acc += unsafe { *bias_data.add(j) };
+            }
+            for &op in &epilogue_ops {
+                acc = apply_fused_op_f32(op, acc, 0.0);
+            }
+
+            unsafe { *buf.add(i * n + j) = acc };
+        }
+    }
+
+    let result = Box::new(NslTensor {
+        data: buf as *mut c_void,
+        shape: out_shape,
+        strides: out_strides,
+        ndim: 2,
+        len: out_len,
+        refcount: AtomicI64::new(1),
+        device: 0,
+        dtype: 1,
+        owns_data: 1, data_owner: 0,
+    });
+    NslTensor::publish(result)
 }
 
 // ---------------------------------------------------------------------------

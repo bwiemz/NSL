@@ -1,0 +1,13 @@
+# DataLoader benchmark with batch_size=1 (no attention mask overhead)
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("Iterating 1000 batches (batch_size=1, seq_len=1024)...")
+let i = 0
+for batch in loader:
+    let ids = batch.input_ids
+    i = i + 1
+    if i >= 1000:
+        break
+print("Done:")
+print(i)

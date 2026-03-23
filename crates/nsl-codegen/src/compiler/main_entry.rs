@@ -58,6 +58,13 @@ impl Compiler<'_> {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
             let mut state = FuncState::new();
 
+            // Run use-count analysis on the main body for FBIP protection
+            let main_block = nsl_ast::stmt::Block {
+                stmts: top_level.clone(),
+                span: nsl_ast::Span::DUMMY,
+            };
+            state.use_counts = Some(crate::use_count::analyze_use_counts(&main_block));
+
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);
             builder.switch_to_block(entry);

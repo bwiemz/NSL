@@ -957,11 +957,15 @@ impl Compiler<'_> {
     /// Returns Ok(Some(val)) if fused, Ok(None) to fall through to normal compile.
     pub(crate) fn try_auto_fuse(
         &mut self,
-        _builder: &mut FunctionBuilder,
+        builder: &mut FunctionBuilder,
         state: &mut FuncState,
         expr: &Expr,
     ) -> Result<Option<Value>, CodegenError> {
-        if state.in_fuse_bypass {
+        if state.in_fuse_bypass || self.disable_fusion {
+            return Ok(None);
+        }
+        // Don't fuse during tape recording — autodiff needs individual op recordings
+        if state.in_tape_region {
             return Ok(None);
         }
 
@@ -971,13 +975,73 @@ impl Compiler<'_> {
         };
 
         if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve) {
-            // M26 fusible chain detected -- fall through for now
-            let _ = (ops, inputs);
-        }
+            if ops.len() >= 2 && inputs.len() >= 1 && inputs.len() <= 2 {
+                // Convert op names to runtime op codes
+                let op_codes: Vec<i64> = ops.iter().filter_map(|op| match op.as_str() {
+                    "add" => Some(0), // FUSED_OP_ADD
+                    "mul" => Some(1),
+                    "sub" => Some(2),
+                    "div" => Some(3),
+                    "relu" => Some(4),
+                    "sigmoid" => Some(5),
+                    "tanh" => Some(6),
+                    "neg" => Some(7),
+                    "exp" => Some(8),
+                    "log" => Some(9),
+                    "sqrt" => Some(10),
+                    "abs" => Some(11),
+                    "gelu" => Some(12),
+                    "silu" => Some(13),
+                    _ => None, // Unknown op — skip fusion
+                }).collect();
+                if op_codes.len() != ops.len() {
+                    return Ok(None); // Some op couldn't be fused — fall back
+                }
 
-        // M31: Full DAG-based fusion is invoked at function level, not per-expression.
-        // See compile_user_functions() for the function-level pipeline.
-        // Per-expression try_auto_fuse remains as M26 fallback.
+                // Check if all operand types are tensors
+                let all_tensors = inputs.iter().all(|inp| {
+                    let ty = self.node_type(inp.id).clone();
+                    ty.is_tensor() || ty.is_indeterminate()
+                });
+                if !all_tensors {
+                    return Ok(None);
+                }
+
+                // Compile inputs (bypass fusion to avoid infinite recursion)
+                state.in_fuse_bypass = true;
+                let compiled_inputs: Vec<Value> = inputs.iter()
+                    .map(|inp| self.compile_expr(builder, state, inp))
+                    .collect::<Result<Vec<_>, _>>()?;
+                state.in_fuse_bypass = false;
+
+                // Build op-codes list
+                let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                for &code in &op_codes {
+                    let code_val = builder.ins().iconst(cl_types::I64, code);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[ops_list, code_val])?;
+                }
+                let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
+
+                let result = if compiled_inputs.len() == 2 {
+                    // Binary + unary chain: nsl_fused_elementwise_2(a, b, ops, num_ops)
+                    self.compile_call_by_name(
+                        builder, "nsl_fused_elementwise_2",
+                        &[compiled_inputs[0], compiled_inputs[1], ops_list, num_ops],
+                    )?
+                } else {
+                    // Single input + unary chain: nsl_fused_elementwise_1(a, ops, num_ops)
+                    self.compile_call_by_name(
+                        builder, "nsl_fused_elementwise_1",
+                        &[compiled_inputs[0], ops_list, num_ops],
+                    )?
+                };
+
+                // Free the ops list (small allocation, not a tensor)
+                self.compile_call_by_name(builder, "nsl_list_free", &[ops_list])?;
+
+                return Ok(Some(result));
+            }
+        }
 
         Ok(None)
     }

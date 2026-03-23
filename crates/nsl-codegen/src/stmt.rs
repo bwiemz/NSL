@@ -1012,6 +1012,9 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
+        // Rely on codegen-level tensor_temporaries for per-statement cleanup.
+        // Do NOT use scope_begin/scope_end — it double-frees tensors that are
+        // already freed by free_tensor_temporaries in called functions.
         state.temp_scope_stack.push(state.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block });
         for s in &body.stmts {
@@ -1027,7 +1030,7 @@ impl Compiler<'_> {
             state.temp_scope_stack.pop();
         }
 
-        // Cleanup: free the batch dict, then loop back to header
+        // Cleanup: free batch dict, loop back
         builder.switch_to_block(cleanup_block);
         builder.seal_block(cleanup_block);
         state.current_block = Some(cleanup_block);
@@ -1035,7 +1038,7 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
         builder.ins().jump(header_block, &[]);
 
-        // Break exit: free the current batch dict, then stop the DataLoader
+        // Break exit: end tensor scope, free the current batch dict, then stop the DataLoader
         builder.switch_to_block(break_exit_block);
         builder.seal_block(break_exit_block);
         state.current_block = Some(break_exit_block);
@@ -1217,6 +1220,7 @@ impl Compiler<'_> {
         let mut model_sym: Option<nsl_ast::Symbol> = None;
         let mut epochs: i64 = 1;
         let mut grad_accumulation_steps: i64 = 1;
+        let mut grad_clip: f64 = f64::MAX; // default: no clipping
 
         for arg in &train.config {
             if let Some(name_sym) = arg.name {
@@ -1239,6 +1243,13 @@ impl Compiler<'_> {
                     "grad_accumulation" => {
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             grad_accumulation_steps = (*n).max(1);
+                        }
+                    }
+                    "grad_clip" => {
+                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                            grad_clip = *f;
+                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            grad_clip = *n as f64;
                         }
                     }
                     _ => {} // ignore unknown config for forward compat
@@ -1576,9 +1587,11 @@ impl Compiler<'_> {
         let false_val = builder.ins().iconst(cl_types::I8, 0);
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
-        // 7e2. Gradient clipping: clip global norm to 1.0 before optimizer step
-        let max_norm_val = builder.ins().f64const(1.0);
-        self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
+        // 7e2. Gradient clipping (only if grad_clip was specified)
+        if grad_clip < f64::MAX {
+            let max_norm_val = builder.ins().f64const(grad_clip);
+            self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
+        }
 
         // 7e3. Gradient accumulation gate: only step optimizer every N batches
         let optimizer_block = builder.create_block();

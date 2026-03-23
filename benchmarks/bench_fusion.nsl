@@ -1,0 +1,35 @@
+# Benchmark: Graph Fusion Memory Bandwidth (M31)
+# Tests epilogue fusion: matmul + bias + relu should fuse into a single pass.
+#
+# Run FUSED:    nsl run benchmarks/bench_fusion.nsl
+# Run UNFUSED:  nsl run benchmarks/bench_fusion.nsl --disable-fusion
+# Compare output values (should be identical) and observe compiler fusion report.
+
+fn fused_pattern(x: Tensor, w: Tensor, bias: Tensor) -> Tensor:
+    # This is the classic fusible epilogue: matmul → add → relu
+    # With fusion: 1 kernel pass, zero intermediate allocations
+    # Without fusion: 3 separate kernel calls, 2 intermediate tensors
+    let mm = x @ w
+    let biased = mm + bias
+    return relu(biased)
+
+fn multi_block(x: Tensor, w1: Tensor, b1: Tensor, w2: Tensor, b2: Tensor) -> Tensor:
+    # Two fusible blocks chained
+    let h = fused_pattern(x, w1, b1)
+    return fused_pattern(h, w2, b2)
+
+# Dimensions
+let x = randn([64, 128])
+let w1 = randn([128, 256]) * full([1], 0.02)
+let b1 = zeros([256])
+let w2 = randn([256, 64]) * full([1], 0.02)
+let b2 = zeros([64])
+
+# Run
+let result = multi_block(x, w1, b1, w2, b2)
+let s = result.shape
+print("Output shape:")
+print(s)
+print("Output mean:")
+print(mean(result))
+print("Fusion benchmark complete")

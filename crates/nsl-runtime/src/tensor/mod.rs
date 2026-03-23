@@ -15,7 +15,7 @@ pub use shape_ops::*;
 pub use activation::*;
 pub use trig::*;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -51,6 +51,70 @@ pub extern "C" fn nsl_fbip_report() {
         let pct = (reuse as f64 / total as f64) * 100.0;
         eprintln!("FBIP: {reuse}/{total} operations reused in-place ({pct:.1}%)");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor scope — lightweight arena for training loops
+// ---------------------------------------------------------------------------
+// Tracks all tensors allocated since scope_begin. scope_end frees any with
+// refcount==1 (temporaries). Tensors still referenced (model weights, outputs
+// explicitly kept) survive because their refcount > 1.
+thread_local! {
+    // Using UnsafeCell for zero-overhead scope tracking (no RefCell borrow checks).
+    // Safety: single-threaded access guaranteed by thread_local + no reentrancy during push.
+    static TENSOR_SCOPE: Cell<*mut Vec<i64>> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Begin a new tensor scope. All tensors allocated after this call will be
+/// tracked and eligible for cleanup when `nsl_tensor_scope_end` is called.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_scope_begin() {
+    let list = Box::new(Vec::<i64>::with_capacity(256));
+    TENSOR_SCOPE.with(|s| s.set(Box::into_raw(list)));
+}
+
+/// Register a newly-allocated tensor with the active scope (if any).
+#[inline]
+pub(crate) fn scope_track(tensor_ptr: i64) {
+    TENSOR_SCOPE.with(|s| {
+        let ptr = s.get();
+        if !ptr.is_null() {
+            unsafe { (*ptr).push(tensor_ptr) };
+        }
+    });
+}
+
+/// End the current tensor scope. Frees all tracked tensors that have
+/// refcount == 1 (i.e., no one else holds a reference).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_scope_end(keep: i64) {
+    let list_ptr = TENSOR_SCOPE.with(|s| {
+        let p = s.get();
+        s.set(std::ptr::null_mut()); // disable tracking before freeing
+        p
+    });
+    if list_ptr.is_null() {
+        eprintln!("[scope] WARNING: scope_end called with no active scope!");
+        return;
+    }
+    let list = unsafe { *Box::from_raw(list_ptr) };
+    let total = list.len();
+    let mut freed = 0usize;
+    let mut kept = 0usize;
+    for ptr in list {
+        if ptr == 0 || ptr == keep {
+            continue;
+        }
+        let tensor = NslTensor::from_ptr(ptr);
+        let rc = tensor.refcount.load(Ordering::SeqCst);
+        if rc <= 1 {
+            nsl_tensor_free(ptr);
+            freed += 1;
+        } else {
+            kept += 1;
+        }
+    }
+    eprintln!("[scope] tracked={total}, freed={freed}, kept={kept} (refcount>1)");
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +249,16 @@ pub extern "C" fn nsl_finalize_dtype_registry() {
 impl NslTensor {
     pub(crate) fn from_ptr(ptr: i64) -> &'static mut NslTensor {
         unsafe { &mut *(ptr as *mut NslTensor) }
+    }
+
+    /// Finalize a boxed tensor: convert to raw pointer, register with scope, return i64.
+    #[inline]
+    pub(crate) fn publish(tensor: Box<NslTensor>) -> i64 {
+        let bytes = (tensor.len as usize) * tensor.element_size();
+        crate::math::track_alloc(bytes);
+        let ptr = Box::into_raw(tensor) as i64;
+        scope_track(ptr);
+        ptr
     }
 
     #[inline]
@@ -374,7 +448,7 @@ impl NslTensor {
             dtype: tensor.dtype,
             owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(result) as i64
+        NslTensor::publish(result)
     }
 
     /// Create a view tensor that shares data with `source_ptr`.
@@ -422,7 +496,7 @@ impl NslTensor {
             data_owner: true_owner,
         });
 
-        Box::into_raw(tensor) as i64
+        NslTensor::publish(tensor)
     }
 }
 
@@ -607,6 +681,10 @@ fn print_tensor_recursive(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
+    if tensor_ptr == 0 {
+        eprintln!("nsl: clone called on null tensor");
+        std::process::abort();
+    }
     // Note: clone always allocates to maintain memory accounting invariants.
     // (FBIP for clone is Phase 2 — requires codegen-level ownership tracking.)
     // Ensure we clone from contiguous data so non-contiguous views are handled correctly
@@ -615,8 +693,7 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
     let ndim = tensor.ndim;
     let len = tensor.len;
 
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(tensor.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(tensor.shape, ndim);
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
@@ -644,7 +721,23 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         owns_data: 1, data_owner: 0,
     });
     nsl_tensor_free(c_ptr);
-    Box::into_raw(result) as i64
+    NslTensor::publish(result)
+}
+
+/// Increment refcount (used by codegen to protect multi-use variables from runtime FBIP).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
+    if tensor_ptr == 0 { return; }
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    tensor.refcount.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Decrement refcount without freeing (paired with nsl_tensor_retain).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
+    if tensor_ptr == 0 { return; }
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    tensor.refcount.fetch_sub(1, Ordering::SeqCst);
 }
 
 #[no_mangle]
@@ -737,8 +830,16 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
+    if dst_ptr == 0 || src_ptr == 0 {
+        eprintln!("nsl: copy_data called with null ptr (dst={}, src={})", dst_ptr, src_ptr);
+        return;
+    }
     let dst = NslTensor::from_ptr(dst_ptr);
     let src = NslTensor::from_ptr(src_ptr);
+    if dst.data.is_null() || src.data.is_null() {
+        eprintln!("nsl: copy_data null data pointer (dst.data={:?}, src.data={:?})", dst.data, src.data);
+        return;
+    }
     debug_assert!(dst.is_contiguous(), "copy_data requires contiguous dst");
     debug_assert!(src.is_contiguous(), "copy_data requires contiguous src");
     assert_eq!(
@@ -826,7 +927,7 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
             dtype: 1,
             owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(tensor) as i64
+        NslTensor::publish(tensor)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -898,6 +999,7 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     let mut sum_sq: f64 = 0.0;
     for g in 0..num_grads {
         let tensor_ptr = unsafe { *list.data.add(g) };
+        if tensor_ptr == 0 { continue; }
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.dtype == 1 {
             for i in 0..tensor.len as usize {
@@ -1006,7 +1108,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         dtype: out_dtype,
         owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1043,8 +1145,7 @@ pub extern "C" fn nsl_tensor_layernorm(
     let num_rows = total / n;
 
     let in_dtype = input.dtype;
-    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(input.shape, out_shape, ndim) };
+    let out_shape = NslTensor::copy_shape(input.shape, ndim as i64);
     let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
 
     let mean_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
@@ -1103,19 +1204,19 @@ pub extern "C" fn nsl_tensor_layernorm(
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
         ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     let mean_tensor = Box::new(NslTensor {
         data: mean_data as *mut c_void, shape: mean_shape, strides: mean_strides,
         ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
-    let mean_ptr = Box::into_raw(mean_tensor) as i64;
+    let mean_ptr = NslTensor::publish(mean_tensor);
 
     let inv_std_tensor = Box::new(NslTensor {
         data: inv_std_data as *mut c_void, shape: inv_std_shape, strides: inv_std_strides,
         ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
-    let inv_std_ptr = Box::into_raw(inv_std_tensor) as i64;
+    let inv_std_ptr = NslTensor::publish(inv_std_tensor);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1148,8 +1249,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
     let num_rows = total / n;
 
     let in_dtype = input.dtype;
-    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(input.shape, out_shape, ndim) };
+    let out_shape = NslTensor::copy_shape(input.shape, ndim as i64);
     let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
     let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc(total * elem_size);
@@ -1187,13 +1287,13 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
         ndim: ndim as i64, len: total as i64, refcount: AtomicI64::new(1), device: input.device, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     let rms_tensor = Box::new(NslTensor {
         data: rms_data as *mut c_void, shape: rms_shape, strides: rms_strides,
         ndim: 1, len: num_rows as i64, refcount: AtomicI64::new(1), device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
-    let rms_ptr = Box::into_raw(rms_tensor) as i64;
+    let rms_ptr = NslTensor::publish(rms_tensor);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1222,14 +1322,12 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
     let len = a.len as usize;
     let ndim = a.ndim;
     let in_dtype = a.dtype;
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc(len * elem_size);
 
-    let mask_shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, mask_shape, ndim as usize) };
+    let mask_shape = NslTensor::copy_shape(a.shape, ndim);
     let mask_strides = NslTensor::compute_strides(mask_shape, ndim);
     let mask_data = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
 
@@ -1261,13 +1359,13 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         data: out_data_raw as *mut c_void, shape, strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
         device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
-    let result_ptr = Box::into_raw(result) as i64;
+    let result_ptr = NslTensor::publish(result);
 
     let mask_tensor = Box::new(NslTensor {
         data: mask_data as *mut c_void, shape: mask_shape, strides: mask_strides, ndim, len: len as i64, refcount: AtomicI64::new(1),
         device: 0, dtype: 0, owns_data: 1, data_owner: 0,
     });
-    let mask_ptr = Box::into_raw(mask_tensor) as i64;
+    let mask_ptr = NslTensor::publish(mask_tensor);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1375,7 +1473,7 @@ pub extern "C" fn nsl_tensor_conv2d(
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
         device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
     });
-    let result_ptr = Box::into_raw(result) as i64;
+    let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1464,7 +1562,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides, ndim: 4, len: out_len as i64, refcount: AtomicI64::new(1),
         device: 0, dtype: in_dtype, owns_data: 1, data_owner: 0,
     });
-    let result_ptr = Box::into_raw(result) as i64;
+    let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1530,7 +1628,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         data: out_data_raw as *mut c_void, shape: out_shape, strides: out_strides,
         ndim: out_ndim, len: out_len, refcount: AtomicI64::new(1), device: 0, dtype: out_dtype, owns_data: 1, data_owner: 0,
     });
-    let out_ptr = Box::into_raw(out) as i64;
+    let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
         NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1578,7 +1676,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 data: dst, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
                 device: target, dtype: 1, owns_data: 1, data_owner: 0,
             });
-            return Box::into_raw(new_t) as i64;
+            return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
         { panic!("CUDA support not compiled"); }
@@ -1602,7 +1700,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 data: dst_void, shape, strides, ndim: t.ndim, len: t.len, refcount: AtomicI64::new(1),
                 device: 0, dtype: 0, owns_data: 1, data_owner: 0,
             });
-            return Box::into_raw(new_t) as i64;
+            return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
         { panic!("CUDA support not compiled"); }
@@ -1710,6 +1808,9 @@ pub extern "C" fn nsl_tensor_slice_assign(
 // ---------------------------------------------------------------------------
 
 fn clone_shape(src: *mut i64, ndim: usize) -> *mut i64 {
+    if ndim == 0 || src.is_null() {
+        return std::ptr::null_mut();
+    }
     let bytes = ndim * std::mem::size_of::<i64>();
     let dst = checked_alloc(bytes) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(src, dst, ndim); }
@@ -1761,7 +1862,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
             ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
             dtype: target_dtype_id, owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(result) as i64
+        NslTensor::publish(result)
     } else {
         let block_sz = info.block_size as usize;
         let innermost = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
@@ -1792,7 +1893,7 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
             ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
             dtype: target_dtype_id, owns_data: 1, data_owner: 0,
         });
-        Box::into_raw(result) as i64
+        NslTensor::publish(result)
     }
 }
 
@@ -1854,7 +1955,7 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
         ndim: tensor.ndim, len: tensor.len, refcount: AtomicI64::new(1), device: tensor.device,
         dtype: DTYPE_F64, owns_data: 1, data_owner: 0,
     });
-    Box::into_raw(result) as i64
+    NslTensor::publish(result)
 }
 
 // ---------------------------------------------------------------------------

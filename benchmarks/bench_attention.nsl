@@ -1,0 +1,47 @@
+# Benchmark: FlashAttention vs Naive Attention (M27)
+#
+# Compares:
+# 1. Naive attention: softmax((Q @ K^T) / sqrt(d)) @ V  — O(n²d) memory
+# 2. Scaled dot-product attention intrinsic (CPU FlashAttention path)
+#
+# The FlashAttention implementation tiles the computation to avoid
+# materializing the full [seq, seq] attention matrix.
+
+fn naive_attention(Q: Tensor, K: Tensor, V: Tensor, scale: float) -> Tensor:
+    # Manual naive path: materializes full attention matrix
+    let scores = Q @ K.transpose(2, 3)
+    let scaled = scores * scale
+    let attn = softmax(scaled, 3)
+    return attn @ V
+
+# Dimensions: batch=1, heads=4, seq=128, head_dim=32
+let B = 1
+let H = 4
+let S = 128
+let D = 32
+let scale = 1.0 / sqrt(full([1], float(D))).item()
+
+let Q = randn([B, H, S, D])
+let K = randn([B, H, S, D])
+let V = randn([B, H, S, D])
+
+# Test 1: Naive attention
+let naive_out = naive_attention(Q, K, V, scale)
+print("Naive attention output mean:")
+print(mean(naive_out))
+
+# Test 2: SDPA intrinsic (FlashAttention path)
+let flash_out = scaled_dot_product_attention(Q, K, V, scale)
+print("FlashAttention output mean:")
+print(mean(flash_out))
+
+# Test 3: Causal SDPA
+let causal_out = scaled_dot_product_attention(Q, K, V, scale, causal=true)
+print("Causal FlashAttention output mean:")
+print(mean(causal_out))
+
+# Memory comparison:
+# Naive: materializes [1, 4, 128, 128] = 256KB attention matrix (f32)
+# Flash: tiles over blocks, peak memory = O(block_size² * head_dim)
+print("Attention benchmark complete")
+print("Note: Both paths use CPU. GPU FlashAttention requires CUDA build.")

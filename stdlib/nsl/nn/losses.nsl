@@ -6,6 +6,8 @@ fn l1_loss(pred: Tensor, target: Tensor) -> Tensor:
     return mean(abs(pred - target))
 
 fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
+    # Expects 2D logits [N, vocab] and 1D targets [N]
+    # Caller must flatten 3D logits before calling.
     let max_val = reduce_max(logits, 1, 1)
     let shifted = logits - max_val
     let exp_sum = sum(exp(shifted), 1, 1)

@@ -417,8 +417,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
     // Normalize dim
@@ -498,7 +497,7 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
         dtype: a.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let result = Box::into_raw(result) as i64;
+    let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);

@@ -351,8 +351,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
     let data: *mut c_void = if a.dtype == 1 {
@@ -380,7 +379,7 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         dtype: a.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let result = Box::into_raw(result) as i64;
+    let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::Neg { a: a_ptr, out: result });
@@ -438,8 +437,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
     let data: *mut c_void = if a.dtype == 1 {
@@ -467,7 +465,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         dtype: a.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let result = Box::into_raw(result) as i64;
+    let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::AddScalar { a: a_ptr, out: result });
@@ -517,8 +515,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
     let ndim = a.ndim;
-    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(a.shape, shape, ndim as usize) };
+    let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
     let data: *mut c_void = if a.dtype == 1 {
@@ -546,7 +543,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
         dtype: a.dtype,
         owns_data: 1, data_owner: 0,
     });
-    let result = Box::into_raw(result) as i64;
+    let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::MulScalar {
@@ -742,7 +739,7 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
         dtype: out_dtype,
         owns_data: 1, data_owner: 0,
     });
-    let result = Box::into_raw(result) as i64;
+    let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {

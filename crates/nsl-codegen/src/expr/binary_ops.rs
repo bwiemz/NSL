@@ -91,7 +91,28 @@ impl Compiler<'_> {
             || (right_type.is_indeterminate() && !state.in_dtype_method
                 && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
-            return self.compile_tensor_binary_op(builder, state, lhs, rhs, op, left_is_tensor, right_is_tensor);
+            // FBIP safety: protect tensor operands from runtime in-place mutation
+            // when they come from named variables (Ident). The runtime FBIP check
+            // uses refcount==1, but the codegen can't guarantee refcount reflects
+            // all live aliases. Retain before the call, release after.
+            // This is always safe: worst case we skip one FBIP opportunity.
+            let protect_lhs = left_is_tensor && matches!(left.kind, nsl_ast::expr::ExprKind::Ident(_));
+            let protect_rhs = right_is_tensor && matches!(right.kind, nsl_ast::expr::ExprKind::Ident(_));
+
+            if protect_lhs {
+                self.compile_call_by_name(builder, "nsl_tensor_retain", &[lhs])?;
+            }
+            if protect_rhs {
+                self.compile_call_by_name(builder, "nsl_tensor_retain", &[rhs])?;
+            }
+            let result = self.compile_tensor_binary_op(builder, state, lhs, rhs, op, left_is_tensor, right_is_tensor)?;
+            if protect_lhs {
+                self.compile_call_by_name(builder, "nsl_tensor_release", &[lhs])?;
+            }
+            if protect_rhs {
+                self.compile_call_by_name(builder, "nsl_tensor_release", &[rhs])?;
+            }
+            return Ok(result);
         }
 
         // When semantic type is Unknown (e.g., inside dtype method bodies), fall back

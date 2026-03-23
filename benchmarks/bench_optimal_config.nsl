@@ -1,0 +1,77 @@
+# Optimal Config Sweep for NSLCoder-50M
+# System: 64GB RAM + RTX 5070 Ti (16GB VRAM)
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+print("NSLCoder-50M initialized")
+
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+
+# ── Config 1: batch=1, seq=512 ──
+let loader1 = DataLoader(tokens, batch_size=1, seq_len=512, shuffle=false, drop_last=true)
+alloc_reset()
+let t0 = clock()
+let s1 = 0
+for batch in loader1:
+    let logits = m.forward_train(batch.input_ids, false)
+    s1 = s1 + 1
+    if s1 >= 3:
+        break
+let t1 = clock()
+print("batch=1 seq=512: " + str((t1 - t0) * 1000.0 / 3.0) + " ms/step, " + str(3.0 * 512.0 / (t1 - t0)) + " tok/s")
+
+# ── Config 2: batch=1, seq=1024 ──
+let loader2 = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+alloc_reset()
+let t2 = clock()
+let s2 = 0
+for batch in loader2:
+    let logits = m.forward_train(batch.input_ids, false)
+    s2 = s2 + 1
+    if s2 >= 3:
+        break
+let t3 = clock()
+print("batch=1 seq=1024: " + str((t3 - t2) * 1000.0 / 3.0) + " ms/step, " + str(3.0 * 1024.0 / (t3 - t2)) + " tok/s")
+
+# ── Config 3: batch=2, seq=512 ──
+let loader3 = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+alloc_reset()
+let t4 = clock()
+let s3 = 0
+for batch in loader3:
+    let logits = m.forward_train(batch.input_ids, false)
+    s3 = s3 + 1
+    if s3 >= 3:
+        break
+let t5 = clock()
+print("batch=2 seq=512: " + str((t5 - t4) * 1000.0 / 3.0) + " ms/step, " + str(3.0 * 1024.0 / (t5 - t4)) + " tok/s")
+
+# ── Config 4: batch=2, seq=1024 ──
+let loader4 = DataLoader(tokens, batch_size=2, seq_len=1024, shuffle=false, drop_last=true)
+alloc_reset()
+let t6 = clock()
+let s4 = 0
+for batch in loader4:
+    let logits = m.forward_train(batch.input_ids, false)
+    s4 = s4 + 1
+    if s4 >= 3:
+        break
+let t7 = clock()
+print("batch=2 seq=1024: " + str((t7 - t6) * 1000.0 / 3.0) + " ms/step, " + str(3.0 * 2048.0 / (t7 - t6)) + " tok/s")
+
+# ── Config 5: batch=4, seq=512 ──
+let loader5 = DataLoader(tokens, batch_size=4, seq_len=512, shuffle=false, drop_last=true)
+alloc_reset()
+let t8 = clock()
+let s5 = 0
+for batch in loader5:
+    let logits = m.forward_train(batch.input_ids, false)
+    s5 = s5 + 1
+    if s5 >= 3:
+        break
+let t9 = clock()
+print("batch=4 seq=512: " + str((t9 - t8) * 1000.0 / 3.0) + " ms/step, " + str(3.0 * 2048.0 / (t9 - t8)) + " tok/s")
+
+print("sweep complete")
