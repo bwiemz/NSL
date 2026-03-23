@@ -327,10 +327,12 @@ pub extern "C" fn nsl_fused_elementwise_2(
         .map(|i| unsafe { *ops_list.data.add(i) })
         .collect();
 
-    // For now: same-shape fast path (no broadcast)
-    // Broadcasting would require the general multi-index iterator
+    // Same-shape fast path only — if shapes differ (broadcast), fall back to unfused ops.
+    // Return 0 to signal the caller that fusion was rejected at runtime.
+    if a.len != b.len {
+        return 0;
+    }
     let len = a.len as usize;
-    debug_assert_eq!(a.len, b.len, "fused_elementwise_2: shape mismatch");
 
     let out_shape = NslTensor::copy_shape(a.shape, a.ndim);
     let out_strides = NslTensor::compute_strides(out_shape, a.ndim);

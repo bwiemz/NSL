@@ -998,13 +998,22 @@ impl Compiler<'_> {
                     return Ok(None); // Some op couldn't be fused — fall back
                 }
 
-                // Check if all operand types are tensors
-                let all_tensors = inputs.iter().all(|inp| {
-                    let ty = self.node_type(inp.id).clone();
-                    ty.is_tensor() || ty.is_indeterminate()
+                // Only fuse when ALL inputs are confirmed tensors (not Unknown/Error).
+                // Unknown types could be scalars (struct fields, function returns)
+                // which would crash the fused tensor kernel.
+                let all_confirmed_tensors = inputs.iter().all(|inp| {
+                    self.node_type(inp.id).is_tensor()
                 });
-                if !all_tensors {
+                if !all_confirmed_tensors {
                     return Ok(None);
+                }
+
+                // Only fuse same-shape ops (no broadcast).
+                // Skip fusion for binary ops with 2 inputs — shapes might differ
+                // (e.g., tensor * scalar_tensor from Xavier init).
+                // Unary chains (1 input) are always safe.
+                if inputs.len() > 1 {
+                    return Ok(None); // TODO: add shape comparison when shapes are known
                 }
 
                 // Compile inputs (bypass fusion to avoid infinite recursion)
