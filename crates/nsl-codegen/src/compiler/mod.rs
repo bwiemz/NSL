@@ -272,7 +272,31 @@ impl<'a> Compiler<'a> {
             .finish(settings::Flags::new(flag_builder))
             .map_err(|e| CodegenError::new(format!("failed to build ISA: {e}")))?;
 
-        let call_conv = isa.default_call_conv();
+        // Detect calling convention from ISA, with Windows x64 safety override
+        let call_conv = {
+            let detected = isa.default_call_conv();
+            if std::env::var("NSL_DEBUG").is_ok() {
+                eprintln!("[nsl] Cranelift ISA call convention: {:?}", detected);
+            }
+            // Force WindowsFastcall on Windows x64 — Cranelift may misdetect
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            {
+                if detected != cranelift_codegen::isa::CallConv::WindowsFastcall {
+                    eprintln!(
+                        "[nsl] WARNING: Cranelift detected {:?} on Windows x64, \
+                         forcing WindowsFastcall for ABI correctness",
+                        detected
+                    );
+                    cranelift_codegen::isa::CallConv::WindowsFastcall
+                } else {
+                    detected
+                }
+            }
+            #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+            {
+                detected
+            }
+        };
 
         let builder = ObjectBuilder::new(
             isa,
