@@ -26,5 +26,9 @@ safetensors = "0.4"
 memmap2 = "0.9"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+[features]
+default = []
+cuda = ["nsl-codegen/cuda"]
+
 [dev-dependencies]
 tempfile = "3"

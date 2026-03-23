@@ -25,6 +25,10 @@ sha2 = "0.10"
 safetensors = "0.4"
 half = { version = "2.4", features = ["std"] }
 
+[features]
+default = []
+cuda = ["nsl-runtime/cuda"]
+
 [dev-dependencies]
 string-interner.workspace = true
 insta = { version = "1.40", features = ["yaml"] }
