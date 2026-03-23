@@ -733,6 +733,7 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         eprintln!("nsl: clone called on null tensor");
         std::process::abort();
     }
+    debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_clone: invalid tensor");
     // Note: clone always allocates to maintain memory accounting invariants.
     // (FBIP for clone is Phase 2 — requires codegen-level ownership tracking.)
     // Ensure we clone from contiguous data so non-contiguous views are handled correctly
@@ -1762,6 +1763,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 /// Transfer a tensor to a different device.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i64 {
+    debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_to_device: invalid tensor");
     let t = unsafe { &*(tensor_ptr as *const NslTensor) };
     let target = target_device as u8;
 
