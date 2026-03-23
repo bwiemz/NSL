@@ -1710,42 +1710,52 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
 }
 
 /// Transfer all tensor fields in a model struct to a target device.
-/// `model_ptr` is a raw pointer to the model struct (allocated by nsl_alloc).
-/// `num_fields` is the number of i64 fields (each is either a tensor pointer or a sub-model pointer).
-/// Each field at offset i*8 is checked: if it's a tensor, transfer it. If it's a sub-model,
-/// recurse into it. Detection heuristic: tensors have ndim >= 0 and len > 0 at a known layout.
+/// Walks i64 fields: if a field looks like a tensor (valid NslTensor header),
+/// transfers it. If it looks like a sub-model pointer, recurses.
+/// Uses conservative heuristics to avoid misinterpreting random memory as tensors.
 #[no_mangle]
 pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i64) {
-    if model_ptr == 0 { return; }
+    if model_ptr == 0 || num_fields <= 0 { return; }
     for i in 0..num_fields as usize {
         let field_addr = (model_ptr as usize + i * 8) as *mut i64;
         let field_val = unsafe { *field_addr };
         if field_val == 0 { continue; }
+        // Skip values that look like small integers (not heap pointers)
+        if (field_val as u64) < 0x10000 { continue; }
 
-        // Try to interpret as a tensor: check if the pointer looks like NslTensor
-        // (first field is `data: *mut c_void`, followed by shape/strides/ndim/len/refcount)
-        let maybe_tensor = unsafe { &*(field_val as *const NslTensor) };
+        // Probe: read the NslTensor header fields carefully
+        let ptr = field_val as *const NslTensor;
+        // Safety check: ensure the pointer is reasonably aligned (8-byte)
+        if (field_val as usize) % 8 != 0 { continue; }
 
-        // Heuristic: a valid tensor has ndim 0-8, len > 0, dtype < 256, owns_data 0 or 1
-        let looks_like_tensor = maybe_tensor.ndim >= 0
-            && maybe_tensor.ndim <= 8
-            && maybe_tensor.len > 0
-            && maybe_tensor.len < i64::MAX / 2
-            && maybe_tensor.dtype < 256
-            && (maybe_tensor.owns_data == 0 || maybe_tensor.owns_data == 1)
-            && maybe_tensor.refcount.load(std::sync::atomic::Ordering::Relaxed) > 0
-            && maybe_tensor.refcount.load(std::sync::atomic::Ordering::Relaxed) < 1000;
+        let t = unsafe { &*ptr };
 
-        if looks_like_tensor {
-            if maybe_tensor.device as i64 == device { continue; }
+        // Strict tensor heuristic:
+        // - data pointer is non-null and aligned
+        // - ndim in [0, 8]
+        // - len in [1, 1B]
+        // - dtype in [0, 6] (known dtypes only)
+        // - owns_data is 0 or 1
+        // - refcount in [1, 100]
+        let is_tensor =
+            !t.data.is_null()
+            && (t.data as usize) % 4 == 0
+            && t.ndim >= 0 && t.ndim <= 8
+            && t.len >= 1 && t.len <= 1_000_000_000
+            && t.dtype <= 6
+            && (t.owns_data == 0 || t.owns_data == 1)
+            && t.refcount.load(Ordering::Relaxed) >= 1
+            && t.refcount.load(Ordering::Relaxed) <= 100;
+
+        if is_tensor {
+            if t.device as i64 == device { continue; }
             let new_ptr = nsl_tensor_to_device(field_val, device);
             unsafe { *field_addr = new_ptr; }
             nsl_tensor_free(field_val);
         } else {
-            // Assume it's a sub-model pointer — recurse with a reasonable field count.
-            // Read the first 64 bytes to estimate how many i64 fields the sub-struct has.
-            // We use 32 as a safe upper bound (256 bytes / 8 bytes per field).
-            nsl_model_to_device(field_val, 32, device);
+            // Not a tensor — assume sub-model pointer and recurse.
+            // Limit recursion depth by capping field count.
+            nsl_model_to_device(field_val, 32.min(num_fields), device);
         }
     }
 }
