@@ -1004,7 +1004,7 @@ impl Compiler<'_> {
                 cranelift_codegen::ir::types::I64,
                 cranelift_codegen::ir::MemFlags::trusted(),
                 draft_tokens,
-                cranelift_codegen::ir::immediates::Offset32::new(32), // NslTensor.len offset
+                cranelift_codegen::ir::immediates::Offset32::new(40), // NslTensor.len offset (magic:0 + pad:4 + data:8 + shape:16 + strides:24 + ndim:32 → len:40)
             );
             let temp_bits = builder.ins().iconst(
                 cranelift_codegen::ir::types::I64,
@@ -1196,15 +1196,15 @@ impl Compiler<'_> {
                 cl_types::I64,
                 MemFlags::trusted(),
                 data_val,
-                cranelift_codegen::ir::immediates::Offset32::new(32),
+                cranelift_codegen::ir::immediates::Offset32::new(40), // NslTensor.len offset (magic+pad shifts +8)
             );
 
-            // Read tensor .data field (offset 0)
+            // Read tensor .data field (offset 8, after magic:u32 + 4-byte pad)
             let tensor_data = builder.ins().load(
                 cl_types::I64,
                 MemFlags::trusted(),
                 data_val,
-                cranelift_codegen::ir::immediates::Offset32::new(0),
+                cranelift_codegen::ir::immediates::Offset32::new(8),
             );
 
             // Read tensor dtype via safe FFI call (avoids struct offset assumptions)
