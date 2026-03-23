@@ -45,7 +45,7 @@ pub(crate) mod inner {
 
     /// Ensure the CUDA context is current on the calling thread.
     /// Must be called before any CUDA driver API call.
-    fn ensure_context() {
+    pub(crate) fn ensure_context() {
         let s = state();
         let guard = s.lock().unwrap();
         unsafe {
@@ -95,23 +95,23 @@ pub(crate) mod inner {
         })
     }
 
-    /// Allocate unified memory (accessible from both CPU and GPU).
+    /// Allocate GPU memory.
+    /// Uses cuMemAlloc (device-only) instead of cuMemAllocManaged (unified)
+    /// for Blackwell compatibility (CUDA 13.x cuMemAllocManaged has issues
+    /// with CUDA_ERROR_ILLEGAL_ADDRESS on RTX 5070 Ti).
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
         ensure_context();
         unsafe {
             let mut ptr: CUdeviceptr = 0;
-            let result = cuMemAllocManaged(
-                &mut ptr,
-                size_bytes,
-                CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
-            );
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
             assert_eq!(
                 result,
                 CUresult::CUDA_SUCCESS,
-                "cuMemAllocManaged({} bytes) failed: {:?}",
+                "cuMemAlloc({} bytes) failed: {:?}",
                 size_bytes,
                 result
             );
+            register_cuda_alloc(ptr as *mut c_void);
             #[cfg(test)]
             crate::memory::stats::cuda_alloc(size_bytes);
             #[cfg(test)]
@@ -120,9 +120,24 @@ pub(crate) mod inner {
         }
     }
 
+    // Track all CUDA allocations so we can validate frees
+    use std::collections::HashSet;
+
+    static CUDA_ALLOC_SET: std::sync::LazyLock<std::sync::Mutex<HashSet<usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+    pub(crate) fn register_cuda_alloc(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            CUDA_ALLOC_SET.lock().unwrap().insert(ptr as usize);
+        }
+    }
+
     /// Free unified memory.
+    /// Free GPU memory allocated by alloc_managed.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
+        let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        if !was_cuda { return; }
         ensure_context();
         #[cfg(test)]
         {
@@ -132,9 +147,7 @@ pub(crate) mod inner {
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);
             if result != CUresult::CUDA_SUCCESS {
-                // Log but don't abort — the pointer may have been freed already
-                // or was never a CUDA allocation (e.g., CPU pointer on a GPU tensor view)
-                eprintln!("nsl: cuMemFree warning: {:?} for ptr {:p}", result, ptr);
+                eprintln!("nsl: cuMemFree warning: {:?} for {:p}", result, ptr);
             }
         }
     }
