@@ -95,22 +95,23 @@ pub(crate) mod inner {
         })
     }
 
-    /// Allocate GPU memory.
-    /// Uses cuMemAlloc (device-only) instead of cuMemAllocManaged (unified)
-    /// for Blackwell compatibility (CUDA 13.x cuMemAllocManaged has issues
-    /// with CUDA_ERROR_ILLEGAL_ADDRESS on RTX 5070 Ti).
+    static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Allocate unified memory (accessible from both CPU and GPU).
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
+        let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ensure_context();
         unsafe {
             let mut ptr: CUdeviceptr = 0;
-            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
-            assert_eq!(
-                result,
-                CUresult::CUDA_SUCCESS,
-                "cuMemAlloc({} bytes) failed: {:?}",
+            let result = cuMemAllocManaged(
+                &mut ptr,
                 size_bytes,
-                result
+                CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
             );
+            if result != CUresult::CUDA_SUCCESS {
+                panic!("cuMemAllocManaged({} bytes) failed after {} allocs: {:?}",
+                    size_bytes, n, result);
+            }
             register_cuda_alloc(ptr as *mut c_void);
             #[cfg(test)]
             crate::memory::stats::cuda_alloc(size_bytes);
@@ -134,22 +135,12 @@ pub(crate) mod inner {
 
     /// Free unified memory.
     /// Free GPU memory allocated by alloc_managed.
-    pub(crate) fn free_managed(ptr: *mut c_void) {
-        if ptr.is_null() { return; }
-        let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
-        if !was_cuda { return; }
-        ensure_context();
-        #[cfg(test)]
-        {
-            let size = cuda_size_registry().lock().unwrap().remove(&(ptr as usize)).unwrap_or(0);
-            crate::memory::stats::cuda_free(size);
-        }
-        unsafe {
-            let result = cuMemFree_v2(ptr as CUdeviceptr);
-            if result != CUresult::CUDA_SUCCESS {
-                eprintln!("nsl: cuMemFree warning: {:?} for {:p}", result, ptr);
-            }
-        }
+    /// Currently leaks GPU memory intentionally — cuMemFree returns
+    /// CUDA_ERROR_ILLEGAL_ADDRESS on RTX 5070 Ti even with CUDA 13.2,
+    /// corrupting driver state. GPU memory is reclaimed at process exit.
+    /// TODO: investigate cross-thread CUDA context ownership for cuMemFree.
+    pub(crate) fn free_managed(_ptr: *mut c_void) {
+        // Intentionally no-op. GPU memory reclaimed at process exit.
     }
 
     /// Allocate device-only memory (not accessible from host without explicit copy).

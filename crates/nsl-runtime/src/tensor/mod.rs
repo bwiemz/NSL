@@ -1779,34 +1779,18 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     if t.device == 0 && target > 0 {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys::{cuMemcpyHtoD_v2, cuCtxSynchronize};
-            crate::cuda::inner::ensure_context();
-
-            // Prepare f32 staging buffer on CPU
-            let f32_size = len * std::mem::size_of::<f32>();
-            let staging = checked_alloc(f32_size) as *mut f32;
+            let dst_size = len * std::mem::size_of::<f32>();
+            let dst = crate::cuda::inner::alloc_managed(dst_size);
+            let dst_f32 = dst as *mut f32;
             if t.dtype == 1 {
-                unsafe { std::ptr::copy_nonoverlapping(t.data_f32(), staging, len); }
+                let src = t.data_f32();
+                unsafe { std::ptr::copy_nonoverlapping(src, dst_f32, len); }
             } else {
+                let src = t.data_f64();
                 for i in 0..len {
-                    unsafe { *staging.add(i) = *t.data_f64().add(i) as f32; }
+                    unsafe { *dst_f32.add(i) = *src.add(i) as f32; }
                 }
             }
-
-            // Allocate device memory and copy from CPU staging buffer
-            let dst = crate::cuda::inner::alloc_managed(f32_size);
-            unsafe {
-                let result = cuMemcpyHtoD_v2(
-                    dst as cudarc::driver::sys::CUdeviceptr,
-                    staging as *const std::ffi::c_void,
-                    f32_size,
-                );
-                assert_eq!(result, cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                    "cuMemcpyHtoD failed: {:?}", result);
-                cuCtxSynchronize();
-            }
-            unsafe { checked_free(staging as *mut u8, f32_size); }
-
             let shape = NslTensor::copy_shape(t.shape, t.ndim);
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor::new(
@@ -1821,31 +1805,13 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     if t.device > 0 && target == 0 {
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys::{cuMemcpyDtoH_v2, cuCtxSynchronize};
-            crate::cuda::inner::ensure_context();
-            unsafe { cuCtxSynchronize(); }
-
-            // Allocate CPU staging buffer and copy from GPU
-            let f32_size = len * std::mem::size_of::<f32>();
-            let staging = checked_alloc(f32_size) as *mut f32;
-            unsafe {
-                let result = cuMemcpyDtoH_v2(
-                    staging as *mut std::ffi::c_void,
-                    t.data as cudarc::driver::sys::CUdeviceptr,
-                    f32_size,
-                );
-                assert_eq!(result, cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-                    "cuMemcpyDtoH failed: {:?}", result);
-            }
-
-            // Convert f32 → f64 into output buffer
+            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            let src = t.data_f32();
             let dst_size = len * std::mem::size_of::<f64>();
             let dst = checked_alloc(dst_size) as *mut f64;
             for i in 0..len {
-                unsafe { *dst.add(i) = *staging.add(i) as f64; }
+                unsafe { *dst.add(i) = *src.add(i) as f64; }
             }
-            unsafe { checked_free(staging as *mut u8, f32_size); }
-
             let shape = NslTensor::copy_shape(t.shape, t.ndim);
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor::new(
