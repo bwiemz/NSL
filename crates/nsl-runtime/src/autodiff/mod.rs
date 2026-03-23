@@ -142,6 +142,21 @@ pub fn maybe_record(op: TapeOp) {
 /// `param_list` is an i64 pointer to an NslList of tensor pointers that are parameters.
 #[no_mangle]
 pub extern "C" fn nsl_tape_start(param_list: i64) {
+    // Pre-flight CUDA health check — surface any deferred errors before recording ops
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::{cuCtxSynchronize, CUresult};
+        unsafe {
+            let result = cuCtxSynchronize();
+            if result != CUresult::CUDA_SUCCESS {
+                eprintln!(
+                    "[nsl] WARNING: CUDA deferred error detected at tape_start: {:?}\n\
+                     A prior GPU operation failed. Re-run with --cuda-sync to identify it.",
+                    result
+                );
+            }
+        }
+    }
     TAPE.with(|t| {
         let mut tape = t.borrow_mut();
         // Release any saved tensor refs from a previous tape session

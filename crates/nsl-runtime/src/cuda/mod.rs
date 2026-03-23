@@ -123,8 +123,20 @@ pub(crate) mod inner {
                 CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
             );
             if result != CUresult::CUDA_SUCCESS {
-                panic!("cuMemAllocManaged({} bytes) failed after {} allocs: {:?}",
-                    size_bytes, n, result);
+                let msg = if matches!(result, CUresult::CUDA_ERROR_ILLEGAL_ADDRESS) {
+                    format!(
+                        "cuMemAllocManaged({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
+                         This is a DEFERRED error — a prior GPU kernel accessed invalid memory.\n\
+                         To identify the failing kernel, re-run with: nsl run --cuda-sync <file>\n\
+                         Allocation #{}", size_bytes, n
+                    )
+                } else {
+                    format!(
+                        "cuMemAllocManaged({} bytes) failed after {} allocs: {:?}",
+                        size_bytes, n, result
+                    )
+                };
+                panic!("{}", msg);
             }
             register_cuda_alloc(ptr as *mut c_void);
             #[cfg(test)]
@@ -163,13 +175,17 @@ pub(crate) mod inner {
         unsafe {
             let mut ptr: CUdeviceptr = 0;
             let result = cuMemAlloc_v2(&mut ptr, size_bytes);
-            assert_eq!(
-                result,
-                CUresult::CUDA_SUCCESS,
-                "cuMemAlloc_v2({} bytes) failed: {:?}",
-                size_bytes,
-                result
-            );
+            if result != CUresult::CUDA_SUCCESS {
+                if matches!(result, CUresult::CUDA_ERROR_ILLEGAL_ADDRESS) {
+                    panic!(
+                        "cuMemAlloc({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
+                         A prior GPU kernel accessed invalid memory.\n\
+                         Re-run with: nsl run --cuda-sync <file>",
+                        size_bytes
+                    );
+                }
+                panic!("cuMemAlloc({} bytes) failed: {:?}", size_bytes, result);
+            }
             ptr as *mut c_void
         }
     }
@@ -566,6 +582,17 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let k2 = b_shape[b.ndim as usize - 2] as u64;
     let n = b_shape[b.ndim as usize - 1] as u64;
     assert_eq!(k, k2, "matmul inner dimension mismatch: {} vs {}", k, k2);
+
+    debug_assert!(m > 0 && k > 0 && n > 0,
+        "gpu_matmul_f32: invalid dimensions m={}, k={}, n={}", m, k, n);
+
+    let a_len = a.len as u64;
+    let b_len = b.len as u64;
+    // Validate tensor sizes match declared dimensions
+    if (m * k) > a_len || (k * n) > b_len {
+        eprintln!("[nsl] gpu_matmul_f32: tensor size mismatch — A[{}x{}] needs {} elements (has {}), B[{}x{}] needs {} elements (has {})",
+            m, k, m*k, a_len, k, n, k*n, b_len);
+    }
 
     let out_len = (m * n) as usize;
     let out_data = inner::alloc_managed(out_len * 4); // f32 = 4 bytes
