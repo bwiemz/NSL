@@ -1844,9 +1844,9 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
 }
 
 /// Transfer all tensor fields in a model struct to a target device.
-/// Walks i64 fields: if a field looks like a tensor (valid NslTensor header),
-/// transfers it. If it looks like a sub-model pointer, recurses.
-/// Uses conservative heuristics to avoid misinterpreting random memory as tensors.
+/// Walks i64 fields: if a field is a live NslTensor (magic == TENSOR_MAGIC),
+/// transfers it to the requested device.
+/// Non-tensor fields (sub-models, scalars) are skipped.
 #[no_mangle]
 pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i64) {
     if model_ptr == 0 || num_fields <= 0 { return; }
@@ -1864,22 +1864,8 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
 
         let t = unsafe { &*ptr };
 
-        // Strict tensor heuristic:
-        // - data pointer is non-null and aligned
-        // - ndim in [0, 8]
-        // - len in [1, 1B]
-        // - dtype in [0, 6] (known dtypes only)
-        // - owns_data is 0 or 1
-        // - refcount in [1, 100]
-        let is_tensor =
-            !t.data.is_null()
-            && (t.data as usize) % 4 == 0
-            && t.ndim >= 0 && t.ndim <= 8
-            && t.len >= 1 && t.len <= 1_000_000_000
-            && t.dtype <= 6
-            && (t.owns_data == 0 || t.owns_data == 1)
-            && t.refcount.load(Ordering::Relaxed) >= 1
-            && t.refcount.load(Ordering::Relaxed) <= 100;
+        // Definitive tensor check: every live NslTensor has magic == TENSOR_MAGIC.
+        let is_tensor = t.magic == TENSOR_MAGIC;
 
         if is_tensor {
             if t.device as i64 == device { continue; }
