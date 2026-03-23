@@ -28,6 +28,16 @@ pub(crate) mod inner {
 
     static CUDA_STATE: OnceLock<Mutex<CudaState>> = OnceLock::new();
 
+    static CUDA_SYNC_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_cuda_sync_mode(enabled: bool) {
+        CUDA_SYNC_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn sync_mode_enabled() -> bool {
+        CUDA_SYNC_MODE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     use std::collections::HashMap as TestHashMap;
     #[cfg(test)]
@@ -86,6 +96,10 @@ pub(crate) mod inner {
                     "cuCtxSetCurrent failed: {:?}",
                     result
                 );
+                if std::env::var("NSL_CUDA_SYNC").map(|v| v == "1").unwrap_or(false) {
+                    CUDA_SYNC_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
+                }
                 Mutex::new(CudaState {
                     device,
                     context,
@@ -325,6 +339,19 @@ pub(crate) mod inner {
                 kernel_args.as_mut_ptr(), std::ptr::null_mut(),
             )
         };
+
+        // Sync after launch if sync mode is enabled (surfaces async GPU errors)
+        if sync_mode_enabled() {
+            let sync_result = unsafe { cuCtxSynchronize() };
+            if sync_result != CUresult::CUDA_SUCCESS {
+                let name_cstr = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const std::ffi::c_char) };
+                let name_str = name_cstr.to_string_lossy();
+                panic!(
+                    "[nsl] CUDA async error after kernel '{}' (grid={:?}, block={:?}, shared={}B): {:?}",
+                    name_str, grid, block, shared_mem_bytes, sync_result
+                );
+            }
+        }
 
         // Record stop event after launch
         if let Some((_, stop, _)) = &profiler_events {

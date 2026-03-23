@@ -184,6 +184,10 @@ enum Cli {
         #[arg(long)]
         fpga_device: Option<String>,
 
+        /// Synchronize after every CUDA kernel launch (debug: surfaces async GPU errors)
+        #[arg(long)]
+        cuda_sync: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -740,6 +744,7 @@ fn main() {
             do178c_report,
             wcet_target,
             fpga_device,
+            cuda_sync,
         } => {
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
@@ -934,6 +939,9 @@ fn main() {
                     if profile_kernels || profile {
                         cmd.env("NSL_PROFILE_KERNELS", "1");
                     }
+                    if cuda_sync {
+                        cmd.env("NSL_CUDA_SYNC", "1");
+                    }
 
                     // Pass through program args
                     if !args.is_empty() {
@@ -980,7 +988,7 @@ fn main() {
                     std::process::exit(1);
                 }
             } else {
-                run_run(&file, &args, profile_memory, profile_kernels, profile, &compile_opts);
+                run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, &compile_opts);
             }
         }
         Cli::Test { file, filter } => {
@@ -1743,7 +1751,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
     }
 }
 
-fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool, options: &nsl_codegen::CompileOptions) {
+fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool, cuda_sync: bool, options: &nsl_codegen::CompileOptions) {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
@@ -1772,6 +1780,9 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
     }
     if profile_kernels || profile {
         cmd.env("NSL_PROFILE_KERNELS", "1");
+    }
+    if cuda_sync {
+        cmd.env("NSL_CUDA_SYNC", "1");
     }
     let status = cmd
         .status()
@@ -1942,7 +1953,7 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
             // The NSL file should contain an export_model() function (or similar)
             // that calls to_onnx() internally. We just compile and run it.
             println!("Exporting ONNX from {}", file.display());
-            run_run(file, &[], false, false, false, &nsl_codegen::CompileOptions::default());
+            run_run(file, &[], false, false, false, false, &nsl_codegen::CompileOptions::default());
         }
         "safetensors" => {
             if ext != "nslm" {
