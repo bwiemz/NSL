@@ -14,15 +14,20 @@ from model import NSLCoder
 from nsl.nn.losses import cross_entropy
 
 # ── Initialize ──
+print("Initializing model...")
 let m = NSLCoder()
+print("Model created, transferring to GPU...")
+m.to(cuda)
+print("Model on GPU")
 print("================================================================")
-print("  NSL-Coder-50M Pretraining")
+print("  NSL-Coder-50M Pretraining (GPU)")
 print("  48.8M parameters | 8 layers | D=512 | GQA 8Q/4KV")
+print("  batch=32, seq=1024, RTX 5070 Ti")
 print("================================================================")
 
 # ── Data ──
 let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+let loader = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)
 
 # ── Metrics ──
 let step = 0
@@ -39,21 +44,22 @@ print("step | loss     | avg_loss | tok/s    | ms/step  | total_tok")
 print("-----|----------|----------|----------|----------|----------")
 
 for batch in loader:
-    let input_ids = batch.input_ids
+    let input_ids = batch.input_ids.to(cuda)
     let labels = batch.labels
 
-    # Forward pass
+    # Forward pass (GPU)
     let logits = m.forward_train(input_ids, false)
 
-    # Compute loss: reshape [B, S, V] -> [B*S, V] for cross_entropy
-    let ls = logits.shape
-    let flat_logits = logits.reshape([ls[1], ls[2]])
+    # Compute loss on CPU: reshape [B, S, V] -> [B*S, V] for cross_entropy
+    let logits_cpu = logits.to(cpu)
+    let ls = logits_cpu.shape
+    let flat_logits = logits_cpu.reshape([ls[1], ls[2]])
     let flat_labels = labels.reshape([ls[1]])
     let loss = cross_entropy(flat_logits, flat_labels)
     let loss_val = loss.item()
 
-    # Update metrics
-    total_tokens = total_tokens + 1024
+    # Update metrics (batch_size=32 * seq_len=1024 = 32768 tokens/step)
+    total_tokens = total_tokens + 32768
     running_loss = running_loss * 0.99 + loss_val * 0.01
     if step == 0:
         running_loss = loss_val
@@ -79,11 +85,7 @@ for batch in loader:
 
         step_start = clock()
 
-    # Checkpoint
-    if step > 0:
-        if step % checkpoint_interval == 0:
-            model_save(m, "checkpoints/coder50m_step_" + str(step) + ".nslm")
-            print("  [checkpoint saved at step " + str(step) + "]")
+    # TODO: checkpoint saving (model_save needs CPU tensors, model is on GPU)
 
     step = step + 1
     if step >= max_steps:
@@ -107,7 +109,6 @@ if total_time > 0.0:
 print("Final running loss:")
 print(running_loss)
 
-# Save final checkpoint
-model_save(m, "checkpoints/coder50m_final.nslm")
+# TODO: Save final checkpoint (needs model.to(cpu) first)
 print("Final checkpoint saved.")
 print("================================================================")

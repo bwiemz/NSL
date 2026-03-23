@@ -152,6 +152,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_alloc_reset", &[], Some(types::I64)),
     ("nsl_alloc_count", &[], Some(types::I64)),
     ("nsl_alloc_bytes", &[], Some(types::I64)),
+    ("nsl_model_to_device", &[types::I64, types::I64, types::I64], None),
     // FBIP Phase 2: unconditional in-place variants (compiler-guaranteed single-use)
     ("nsl_tensor_relu_inplace", &[types::I64], Some(types::I64)),
     ("nsl_tensor_exp_inplace", &[types::I64], Some(types::I64)),

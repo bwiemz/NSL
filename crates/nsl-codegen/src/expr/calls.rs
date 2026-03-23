@@ -44,6 +44,16 @@ impl Compiler<'_> {
             }
             if let Type::Model { name, .. } = &obj_type {
                 let model_name = self.resolve_sym(*name).to_string();
+                // Intercept .to(device) on models — transfer all tensor fields
+                if member_name == "to" && args.len() == 1 {
+                    let model_val = self.compile_expr(builder, state, object)?;
+                    let device_val = self.compile_expr(builder, state, &args[0].value)?;
+                    if let Some(layout) = self.struct_layouts.get(&model_name) {
+                        let num_fields = builder.ins().iconst(cl_types::I64, layout.fields.len() as i64);
+                        self.compile_call_by_name(builder, "nsl_model_to_device", &[model_val, num_fields, device_val])?;
+                        return Ok(model_val);
+                    }
+                }
                 return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
             }
             // Fallback for model array loop variables (type is Unknown but var was bound from model array)
