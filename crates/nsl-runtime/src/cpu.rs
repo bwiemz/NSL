@@ -671,7 +671,11 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i6
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
-    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = match dtype {
+        1 => std::mem::size_of::<f32>(),    // f32
+        4 => std::mem::size_of::<i32>(),    // i32 (token IDs)
+        _ => std::mem::size_of::<f64>(),    // f64 (default)
+    };
     let data = checked_alloc_zeroed((total as usize) * elem_size);
 
     let tensor = Box::new(NslTensor::new(

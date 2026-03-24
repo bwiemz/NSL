@@ -1557,7 +1557,22 @@ impl Compiler<'_> {
             batch_body_block = body_block;   // we're already in it
         }
 
-        // 7a. Set training mode = true, then start tape recording (PER BATCH)
+        // 7a. Prefetch batch tensors to GPU (if on GPU) to overlap
+        // page migration with tape setup. This reduces first-access latency
+        // from unified memory page faults.
+        if has_dataloader.is_some() {
+            let batch_val = builder.use_var(step_param_var);
+            // Prefetch input_ids and labels from the batch dict
+            let k_ids = self.compile_string_literal(builder, "input_ids")?;
+            let k_lbl = self.compile_string_literal(builder, "labels")?;
+            let ids_tensor = self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_ids])?;
+            let lbl_tensor = self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_lbl])?;
+            let device_1 = builder.ins().iconst(cl_types::I64, 1);
+            self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[ids_tensor, device_1])?;
+            self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
+        }
+
+        // Set training mode = true, then start tape recording (PER BATCH)
         let true_val = builder.ins().iconst(cl_types::I8, 1);
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
@@ -1595,6 +1610,13 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
         let false_val = builder.ins().iconst(cl_types::I8, 0);
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
+
+        // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
+        // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
+        if self.compile_options.debug_training {
+            let num_p = builder.ins().iconst(cl_types::I64, num_params as i64);
+            self.compile_call_by_name(builder, "nsl_debug_grad_checksum", &[grads_list, num_p])?;
+        }
 
         // 7e2. Gradient clipping (only if grad_clip was specified)
         if grad_clip < f64::MAX {

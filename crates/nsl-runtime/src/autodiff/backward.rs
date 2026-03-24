@@ -1314,3 +1314,55 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
     result_list
 }
+
+/// Debug training hook: print gradient checksums (sum of absolute values) per parameter.
+/// Detects NaN gradients, zero gradients, and misrouted gradient accumulation.
+/// Called when `--debug-training` is active.
+#[no_mangle]
+pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
+    let grads = NslList::from_ptr(grads_list);
+    let n = num_params as usize;
+    eprintln!("[debug-training] gradient checksums ({} params):", n);
+    for i in 0..n {
+        let grad_ptr = unsafe { *grads.data.add(i) };
+        if grad_ptr == 0 {
+            eprintln!("  param[{}]: NULL gradient", i);
+            continue;
+        }
+        let grad = NslTensor::from_ptr(grad_ptr);
+        let len = grad.len as usize;
+        let mut sum_abs: f64 = 0.0;
+        let mut has_nan = false;
+        let mut has_inf = false;
+        let mut all_zero = true;
+
+        if grad.dtype == 1 {
+            for j in 0..len {
+                let v = unsafe { *grad.data_f32().add(j) } as f64;
+                if v.is_nan() { has_nan = true; }
+                if v.is_infinite() { has_inf = true; }
+                if v != 0.0 { all_zero = false; }
+                sum_abs += v.abs();
+            }
+        } else {
+            for j in 0..len {
+                let v = unsafe { *grad.data_f64().add(j) };
+                if v.is_nan() { has_nan = true; }
+                if v.is_infinite() { has_inf = true; }
+                if v != 0.0 { all_zero = false; }
+                sum_abs += v.abs();
+            }
+        }
+
+        let status = if has_nan {
+            "NaN DETECTED"
+        } else if has_inf {
+            "Inf DETECTED"
+        } else if all_zero {
+            "ALL ZEROS"
+        } else {
+            "ok"
+        };
+        eprintln!("  param[{}]: sum|grad|={:.6e}  len={}  [{}]", i, sum_abs, len, status);
+    }
+}

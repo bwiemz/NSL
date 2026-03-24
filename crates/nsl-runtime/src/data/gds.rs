@@ -102,17 +102,23 @@ fn gds_read_mmap_fallback(
 /// On Linux, uses posix_fadvise(WILLNEED). On GDS, uses cuFileReadAsync with
 /// a prefetch stream.
 pub fn prefetch_hint(path: &Path, offset: u64, size: u64) {
-    // Best-effort — failure is silent
+    // Best-effort — failure is silent.
+    // Use raw syscall to avoid libc dependency.
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
+        const POSIX_FADV_WILLNEED: i32 = 3;
         if let Ok(file) = std::fs::File::open(path) {
             unsafe {
-                libc::posix_fadvise(
+                // libc::posix_fadvise equivalent via direct C ABI call
+                extern "C" {
+                    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+                }
+                posix_fadvise(
                     file.as_raw_fd(),
                     offset as i64,
                     size as i64,
-                    libc::POSIX_FADV_WILLNEED,
+                    POSIX_FADV_WILLNEED,
                 );
             }
         }

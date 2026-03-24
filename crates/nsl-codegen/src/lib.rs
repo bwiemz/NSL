@@ -120,6 +120,9 @@ pub struct CompileOptions {
     pub zk_solidity: bool,
     /// M55: Path to safetensors weight file used as ZK witness.
     pub zk_weights_path: Option<std::path::PathBuf>,
+    /// Debug training mode: disables fusion, disables FBIP, and emits
+    /// gradient checksum assertions after each backward pass.
+    pub debug_training: bool,
 }
 
 impl Default for CompileOptions {
@@ -156,6 +159,7 @@ impl Default for CompileOptions {
             zk_field: "m31".to_string(),
             zk_solidity: false,
             zk_weights_path: None,
+            debug_training: false,
         }
     }
 }

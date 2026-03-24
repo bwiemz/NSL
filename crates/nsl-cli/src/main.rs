@@ -140,6 +140,10 @@ enum Cli {
         #[arg(long)]
         tape_ad: bool,
 
+        /// Debug training: disable fusion + FBIP, emit gradient checksums
+        #[arg(long)]
+        debug_training: bool,
+
         /// M45: Enable tensor operation tracing (writes .nsl.trace binary)
         #[arg(long)]
         trace_ops: bool,
@@ -265,6 +269,10 @@ enum Cli {
         /// Force tape-based AD (disable source-to-source AD)
         #[arg(long)]
         tape_ad: bool,
+
+        /// Debug training: disable fusion + FBIP, emit gradient checksums
+        #[arg(long)]
+        debug_training: bool,
 
         /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
         #[arg(long)]
@@ -575,6 +583,7 @@ fn main() {
             target,
             disable_fusion,
             tape_ad: _tape_ad,
+            debug_training,
             distribute: _distribute,
             zero_stage: _zero_stage,
             deterministic: _deterministic,
@@ -687,6 +696,7 @@ fn main() {
                 zk_weights_path: zk_weights.clone(),
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
+                debug_training,
             };
 
             if standalone {
@@ -733,6 +743,7 @@ fn main() {
             target,
             disable_fusion,
             tape_ad,
+            debug_training,
             trace_ops,
             deterministic,
             distribute: _distribute,
@@ -779,6 +790,7 @@ fn main() {
                 zk_weights_path: None,
                 linear_types_enabled: false, // run command doesn't expose --linear-types
                 ownership_info: std::collections::HashMap::new(),
+                debug_training,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

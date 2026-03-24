@@ -112,9 +112,11 @@ pub fn try_synthesize_fused_checked(
 /// Each input is loaded once from global memory, all ops are register-to-register,
 /// output is stored once to global memory.
 ///
-/// **ISA correctness:** `ex2.approx.f32` computes base-2 exp, so natural exp requires
-/// multiplying by log2(e) ~ 1.4427 first. Similarly, `lg2.approx.f32` computes base-2
+/// **ISA correctness:** `ex2.f32` computes base-2 exp, so natural exp requires
+/// multiplying by log2(e) ~ 1.4427 first. Similarly, `lg2.f32` computes base-2
 /// log, so natural log requires multiplying by ln(2) ~ 0.6931 after.
+/// Full-precision variants (not `.approx`) are used to prevent gradient amplification
+/// from accumulated ULP errors, especially in softmax and cross-entropy backward.
 /// Generate PTX for a fused elementwise kernel.
 /// `gpu_sm` sets the target SM version; defaults to 52 (Maxwell) for broad compat.
 pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<u8> {
@@ -223,7 +225,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
             "pow" => {
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!(
-                    "    lg2.approx.f32 %f{}, %f{};\n",
+                    "    lg2.f32 %f{}, %f{};\n",
                     out_reg, lhs
                 ));
                 ptx.push_str(&format!(
@@ -231,7 +233,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg, out_reg, rhs
                 ));
                 ptx.push_str(&format!(
-                    "    ex2.approx.f32 %f{}, %f{};\n",
+                    "    ex2.f32 %f{}, %f{};\n",
                     out_reg, out_reg
                 ));
             }
@@ -259,14 +261,14 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg, src, out_reg
                 ));
                 ptx.push_str(&format!(
-                    "    ex2.approx.f32 %f{}, %f{};\n",
+                    "    ex2.f32 %f{}, %f{};\n",
                     out_reg, out_reg
                 ));
             }
             "log" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!(
-                    "    lg2.approx.f32 %f{}, %f{};\n",
+                    "    lg2.f32 %f{}, %f{};\n",
                     out_reg, src
                 ));
                 ptx.push_str(&format!(
@@ -284,7 +286,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
             "sqrt" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!(
-                    "    sqrt.approx.f32 %f{}, %f{};\n",
+                    "    sqrt.rn.f32 %f{}, %f{};\n",
                     out_reg, src
                 ));
             }
@@ -318,7 +320,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg + 1
                 ));
                 ptx.push_str(&format!(
-                    "    ex2.approx.f32 %f{}, %f{};\n",
+                    "    ex2.f32 %f{}, %f{};\n",
                     out_reg, out_reg
                 ));
                 ptx.push_str(&format!(
@@ -326,7 +328,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg, out_reg
                 ));
                 ptx.push_str(&format!(
-                    "    rcp.approx.f32 %f{}, %f{};\n",
+                    "    rcp.rn.f32 %f{}, %f{};\n",
                     out_reg, out_reg
                 ));
             }
@@ -349,7 +351,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg + 1
                 ));
                 ptx.push_str(&format!(
-                    "    ex2.approx.f32 %f{}, %f{};\n",
+                    "    ex2.f32 %f{}, %f{};\n",
                     out_reg, out_reg
                 ));
                 ptx.push_str(&format!(
@@ -357,7 +359,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg, out_reg
                 ));
                 ptx.push_str(&format!(
-                    "    rcp.approx.f32 %f{}, %f{};\n",
+                    "    rcp.rn.f32 %f{}, %f{};\n",
                     out_reg, out_reg
                 ));
                 ptx.push_str(&format!(
@@ -536,17 +538,17 @@ mod tests {
     fn test_synthesize_exp_uses_log2e_conversion() {
         let ptx = synthesize_fused_ptx("fused_add_exp", &["add", "exp"], 2);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
-        // exp uses log2(e) multiply before ex2.approx
+        // exp uses log2(e) multiply before ex2
         assert!(ptx_str.contains("0f3FB8AA3B")); // log2(e) hex
-        assert!(ptx_str.contains("ex2.approx.f32"));
+        assert!(ptx_str.contains("ex2.f32"));
     }
 
     #[test]
     fn test_synthesize_log_uses_ln2_conversion() {
         let ptx = synthesize_fused_ptx("fused_add_log", &["add", "log"], 2);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
-        // log uses lg2.approx then multiplies by ln(2)
-        assert!(ptx_str.contains("lg2.approx.f32"));
+        // log uses lg2 then multiplies by ln(2)
+        assert!(ptx_str.contains("lg2.f32"));
         assert!(ptx_str.contains("0f3F317218")); // ln(2) hex
     }
 
@@ -555,8 +557,8 @@ mod tests {
         let ptx = synthesize_fused_ptx("fused_add_sigmoid", &["add", "sigmoid"], 2);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         assert!(ptx_str.contains("neg.f32"));
-        assert!(ptx_str.contains("ex2.approx.f32"));
-        assert!(ptx_str.contains("rcp.approx.f32"));
+        assert!(ptx_str.contains("ex2.f32"));
+        assert!(ptx_str.contains("rcp.rn.f32"));
         assert!(ptx_str.contains("0f3F800000")); // 1.0
     }
 

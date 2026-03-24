@@ -2071,6 +2071,36 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     panic!("GPU-to-GPU transfer not yet supported");
 }
 
+/// Prefetch a unified-memory tensor to a GPU device asynchronously.
+/// This starts the page migration before the GPU actually accesses the data,
+/// reducing first-access latency from page faults. No-op on CPU tensors.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
+    if tensor_ptr == 0 {
+        return;
+    }
+    let _t = NslTensor::from_ptr(tensor_ptr);
+    #[cfg(feature = "cuda")]
+    {
+        if device > 0 && !_t.data.is_null() {
+            let elem_size = match _t.dtype {
+                1 => std::mem::size_of::<f32>(),
+                4 => std::mem::size_of::<i32>(),
+                _ => std::mem::size_of::<f64>(),
+            };
+            let size_bytes = _t.len as usize * elem_size;
+            if size_bytes > 0 {
+                crate::cuda::inner::prefetch_to_device(
+                    _t.data,
+                    size_bytes,
+                    (device - 1) as i32, // NSL device 1 = CUDA device 0
+                );
+            }
+        }
+    }
+    let _ = device; // suppress unused warning without cuda feature
+}
+
 /// Transfer all tensor fields in a model struct to a target device.
 /// Walks i64 fields: if a field is a live NslTensor (magic == TENSOR_MAGIC),
 /// transfers it to the requested device.

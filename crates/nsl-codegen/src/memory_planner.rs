@@ -36,6 +36,11 @@ pub struct TensorAlloc {
     pub source_loc: String,
     /// Whether this tensor's size is statically known or bounded.
     pub size_kind: SizeKind,
+    /// True if this tensor is saved for the backward pass (DataRequired ops).
+    /// When set, the slab planner must not reuse this tensor's slot until the
+    /// backward pass completes, preventing pointer-aliasing bugs in gradient
+    /// accumulation (where grad_map keys are tensor addresses).
+    pub saved_for_backward: bool,
 }
 
 impl TensorAlloc {
@@ -83,6 +88,11 @@ impl LivenessAnalyzer {
 
     /// Record a tensor allocation at the current program point.
     pub fn record_alloc(&mut self, name: &str, size_bytes: u64, size_kind: SizeKind, loc: &str) {
+        self.record_alloc_ex(name, size_bytes, size_kind, loc, false);
+    }
+
+    /// Record a tensor allocation with explicit saved-for-backward annotation.
+    pub fn record_alloc_ex(&mut self, name: &str, size_bytes: u64, size_kind: SizeKind, loc: &str, saved_for_backward: bool) {
         let id = self.allocs.len() as TensorAllocId;
         self.allocs.push(TensorAlloc {
             id,
@@ -92,6 +102,7 @@ impl LivenessAnalyzer {
             death: self.current_pp, // updated on each use
             source_loc: loc.to_string(),
             size_kind,
+            saved_for_backward,
         });
         self.live_set.insert(name.to_string(), id);
     }
@@ -137,6 +148,8 @@ pub struct InterferenceGraph {
 
 impl InterferenceGraph {
     /// Build interference graph from a set of tensor allocations.
+    /// Tensors marked `saved_for_backward` interfere with all other tensors
+    /// to prevent slab slot reuse that could alias gradient accumulation keys.
     pub fn build(allocs: &[TensorAlloc]) -> Self {
         let n = allocs.len();
         let mut adj = vec![HashSet::new(); n];
@@ -149,7 +162,12 @@ impl InterferenceGraph {
                 if !allocs[j].is_plannable() {
                     continue;
                 }
-                if intervals_overlap(&allocs[i], &allocs[j]) {
+                // Saved-for-backward tensors must never share a slab slot
+                // with any other tensor — their addresses are used as
+                // gradient map keys and must remain unique.
+                let force_interfere =
+                    allocs[i].saved_for_backward || allocs[j].saved_for_backward;
+                if force_interfere || intervals_overlap(&allocs[i], &allocs[j]) {
                     adj[i].insert(j as TensorAllocId);
                     adj[j].insert(i as TensorAllocId);
                 }
@@ -538,7 +556,7 @@ mod tests {
         let a = TensorAlloc {
             id: 0, name: "x".into(), size_bytes: 1024,
             birth: 0, death: 5, source_loc: "test:1".into(),
-            size_kind: SizeKind::Static(1024),
+            size_kind: SizeKind::Static(1024), saved_for_backward: false,
         };
         assert_eq!(a.plan_size(), Some(1024));
         assert!(a.is_plannable());
@@ -549,7 +567,7 @@ mod tests {
         let a = TensorAlloc {
             id: 0, name: "x".into(), size_bytes: 4096,
             birth: 0, death: 5, source_loc: "test:1".into(),
-            size_kind: SizeKind::Bounded { upper: 4096, symbolic_expr: "B*1024".into() },
+            size_kind: SizeKind::Bounded { upper: 4096, symbolic_expr: "B*1024".into() }, saved_for_backward: false,
         };
         assert_eq!(a.plan_size(), Some(4096));
         assert!(a.is_plannable());
@@ -560,7 +578,7 @@ mod tests {
         let a = TensorAlloc {
             id: 0, name: "x".into(), size_bytes: 0,
             birth: 0, death: 5, source_loc: "test:1".into(),
-            size_kind: SizeKind::Dynamic,
+            size_kind: SizeKind::Dynamic, saved_for_backward: false,
         };
         assert_eq!(a.plan_size(), None);
         assert!(!a.is_plannable());
@@ -645,9 +663,9 @@ mod tests {
 
     #[test]
     fn test_intervals_overlap() {
-        let a = TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(100) };
-        let b = TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(200) };
-        let c = TensorAlloc { id: 2, name: "c".into(), size_bytes: 150, birth: 6, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(150) };
+        let a = TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false };
+        let b = TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false };
+        let c = TensorAlloc { id: 2, name: "c".into(), size_bytes: 150, birth: 6, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(150), saved_for_backward: false };
 
         assert!(intervals_overlap(&a, &b));
         assert!(!intervals_overlap(&a, &c));
@@ -657,9 +675,9 @@ mod tests {
     #[test]
     fn test_interference_graph_construction() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(100) },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(200) },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 150, birth: 6, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(150) },
+            TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false },
+            TensorAlloc { id: 2, name: "c".into(), size_bytes: 150, birth: 6, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(150), saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
 
@@ -670,17 +688,17 @@ mod tests {
 
     #[test]
     fn test_interference_same_point_no_overlap() {
-        let a = TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 3, source_loc: "".into(), size_kind: SizeKind::Static(100) };
-        let b = TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(200) };
+        let a = TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 3, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false };
+        let b = TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false };
         assert!(!intervals_overlap(&a, &b));
     }
 
     #[test]
     fn test_interference_graph_skips_dynamic() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "static_a".into(), size_bytes: 100, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(100) },
-            TensorAlloc { id: 1, name: "dynamic_b".into(), size_bytes: 0, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Dynamic },
-            TensorAlloc { id: 2, name: "static_c".into(), size_bytes: 200, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(200) },
+            TensorAlloc { id: 0, name: "static_a".into(), size_bytes: 100, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "dynamic_b".into(), size_bytes: 0, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Dynamic, saved_for_backward: false },
+            TensorAlloc { id: 2, name: "static_c".into(), size_bytes: 200, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
 
@@ -694,9 +712,9 @@ mod tests {
     #[test]
     fn test_plan_slab_reuse() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 3, source_loc: "".into(), size_kind: SizeKind::Static(1024) },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 2048, birth: 1, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(2048) },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 512, birth: 4, death: 7, source_loc: "".into(), size_kind: SizeKind::Static(512) },
+            TensorAlloc { id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 3, source_loc: "".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "b".into(), size_bytes: 2048, birth: 1, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(2048), saved_for_backward: false },
+            TensorAlloc { id: 2, name: "c".into(), size_bytes: 512, birth: 4, death: 7, source_loc: "".into(), size_kind: SizeKind::Static(512), saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -716,8 +734,8 @@ mod tests {
     #[test]
     fn test_plan_slab_skips_dynamic() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "static_t".into(), size_bytes: 1024, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(1024) },
-            TensorAlloc { id: 1, name: "dynamic_t".into(), size_bytes: 0, birth: 2, death: 4, source_loc: "".into(), size_kind: SizeKind::Dynamic },
+            TensorAlloc { id: 0, name: "static_t".into(), size_bytes: 1024, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "dynamic_t".into(), size_bytes: 0, birth: 2, death: 4, source_loc: "".into(), size_kind: SizeKind::Dynamic, saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -739,9 +757,9 @@ mod tests {
     #[test]
     fn test_plan_slab_all_overlap() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(100) },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(200) },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 300, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(300) },
+            TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false },
+            TensorAlloc { id: 2, name: "c".into(), size_bytes: 300, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(300), saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -753,9 +771,9 @@ mod tests {
     #[test]
     fn test_plan_slab_sequential_full_reuse() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 2, source_loc: "".into(), size_kind: SizeKind::Static(1024) },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 512, birth: 3, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(512) },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 768, birth: 6, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(768) },
+            TensorAlloc { id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 2, source_loc: "".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "b".into(), size_bytes: 512, birth: 3, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(512), saved_for_backward: false },
+            TensorAlloc { id: 2, name: "c".into(), size_bytes: 768, birth: 6, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(768), saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -778,9 +796,9 @@ mod tests {
     #[test]
     fn test_format_memory_report() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "weight_q".into(), size_bytes: 4096, birth: 0, death: 10, source_loc: "model.nsl:5".into(), size_kind: SizeKind::Static(4096) },
-            TensorAlloc { id: 1, name: "hidden".into(), size_bytes: 2048, birth: 2, death: 6, source_loc: "model.nsl:8".into(), size_kind: SizeKind::Static(2048) },
-            TensorAlloc { id: 2, name: "output".into(), size_bytes: 1024, birth: 7, death: 10, source_loc: "model.nsl:12".into(), size_kind: SizeKind::Static(1024) },
+            TensorAlloc { id: 0, name: "weight_q".into(), size_bytes: 4096, birth: 0, death: 10, source_loc: "model.nsl:5".into(), size_kind: SizeKind::Static(4096), saved_for_backward: false },
+            TensorAlloc { id: 1, name: "hidden".into(), size_bytes: 2048, birth: 2, death: 6, source_loc: "model.nsl:8".into(), size_kind: SizeKind::Static(2048), saved_for_backward: false },
+            TensorAlloc { id: 2, name: "output".into(), size_bytes: 1024, birth: 7, death: 10, source_loc: "model.nsl:12".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -852,15 +870,15 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "big".into(), size_bytes: 1000, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(1000),
+                source_loc: String::new(), size_kind: SizeKind::Static(1000), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "medium".into(), size_bytes: 600, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(600),
+                source_loc: String::new(), size_kind: SizeKind::Static(600), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 2, name: "fits_medium".into(), size_bytes: 580, birth: 6, death: 10,
-                source_loc: String::new(), size_kind: SizeKind::Static(580),
+                source_loc: String::new(), size_kind: SizeKind::Static(580), saved_for_backward: false,
             },
         ];
 
@@ -884,11 +902,11 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(1024),
+                source_loc: String::new(), size_kind: SizeKind::Static(1024), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "b".into(), size_bytes: 512, birth: 6, death: 10,
-                source_loc: String::new(), size_kind: SizeKind::Static(512),
+                source_loc: String::new(), size_kind: SizeKind::Static(512), saved_for_backward: false,
             },
         ];
 
@@ -904,11 +922,11 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "aligned".into(), size_bytes: 256, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(256),
+                source_loc: String::new(), size_kind: SizeKind::Static(256), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "aligned2".into(), size_bytes: 512, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(512),
+                source_loc: String::new(), size_kind: SizeKind::Static(512), saved_for_backward: false,
             },
         ];
 
@@ -924,7 +942,7 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "unaligned".into(), size_bytes: 100, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(100),
+                source_loc: String::new(), size_kind: SizeKind::Static(100), saved_for_backward: false,
             },
         ];
 
@@ -944,11 +962,11 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "input".into(), size_bytes: 4096, birth: 0, death: 100,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "relu_out".into(), size_bytes: 4096, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
             },
         ];
 
@@ -976,11 +994,11 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "a".into(), size_bytes: 4096, birth: 0, death: 100,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "mm_out".into(), size_bytes: 4096, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
             },
         ];
 
@@ -1001,11 +1019,11 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "src".into(), size_bytes: 100, birth: 0, death: 100,
-                source_loc: String::new(), size_kind: SizeKind::Static(100),
+                source_loc: String::new(), size_kind: SizeKind::Static(100), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "reshaped".into(), size_bytes: 100, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(100),
+                source_loc: String::new(), size_kind: SizeKind::Static(100), saved_for_backward: false,
             },
         ];
 
@@ -1026,11 +1044,11 @@ mod tests {
         let allocs = vec![
             TensorAlloc {
                 id: 0, name: "input".into(), size_bytes: 4096, birth: 0, death: 10,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
             },
             TensorAlloc {
                 id: 1, name: "relu_out".into(), size_bytes: 4096, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096),
+                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
             },
         ];
 

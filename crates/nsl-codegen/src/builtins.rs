@@ -190,6 +190,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_zeros_like", &[types::I64], Some(types::I64)),
     // Gradient clipping (M14)
     ("nsl_clip_grad_norm", &[types::I64, types::F64], None),
+    // Debug training: gradient checksum (--debug-training)
+    ("nsl_debug_grad_checksum", &[types::I64, types::I64], None),
+    // Prefetch unified-memory tensor to GPU asynchronously
+    ("nsl_tensor_prefetch", &[types::I64, types::I64], None),
     // Checkpoint I/O (M14)
     ("nsl_model_save", &[types::I64, types::I64, types::I64, types::I64], None),
     ("nsl_model_load", &[types::I64, types::I64, types::I64], None),

@@ -339,7 +339,7 @@ impl<'a> Compiler<'a> {
             fusion_events: Vec::new(),
             fusion_barriers: Vec::new(),
             fusion_report_enabled: options.fusion_report,
-            disable_fusion: options.disable_fusion,
+            disable_fusion: options.disable_fusion || options.debug_training,
             slab_plan: None,
             features: FeatureConfigs::new(options),
         })

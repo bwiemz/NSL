@@ -63,7 +63,11 @@ impl Compiler<'_> {
                 stmts: top_level.clone(),
                 span: nsl_ast::Span::DUMMY,
             };
-            state.use_counts = Some(crate::use_count::analyze_use_counts(&main_block));
+            // Disable FBIP in debug_training mode to prevent in-place mutation
+            // of tensors needed by backward pass
+            if !self.compile_options.debug_training {
+                state.use_counts = Some(crate::use_count::analyze_use_counts(&main_block));
+            }
 
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);

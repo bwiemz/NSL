@@ -105,9 +105,9 @@ impl DataLoader {
     }
 
     fn start_workers(&mut self) {
-        self.stop_flag.store(false, Ordering::SeqCst);
-        self.cursor.store(0, Ordering::SeqCst);
-        self.expected_batch_id.store(0, Ordering::SeqCst);
+        self.stop_flag.store(false, Ordering::Release);
+        self.cursor.store(0, Ordering::Relaxed);
+        self.expected_batch_id.store(0, Ordering::Relaxed);
 
         let num_workers = self.config.num_workers.max(1);
         let data_usize = self.data as usize; // Convert to usize for Send
@@ -129,12 +129,13 @@ impl DataLoader {
                 let data_ptr = data_usize as *const f64;
 
                 loop {
-                    if stop_flag.load(Ordering::SeqCst) {
+                    if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
 
-                    // Atomically claim the next batch_id
-                    let batch_id = cursor.fetch_add(1, Ordering::SeqCst);
+                    // Atomically claim the next batch_id — Relaxed is sufficient
+                    // since batch IDs only need uniqueness, not ordering
+                    let batch_id = cursor.fetch_add(1, Ordering::Relaxed);
                     if batch_id >= total_batches {
                         // Put back so other workers also see exhaustion
                         break;
@@ -170,7 +171,9 @@ impl DataLoader {
                         let mut buf = reorder_buffer.lock().unwrap();
                         buf.insert(batch_id, dict_ptr);
                     }
-                    condvar.notify_all();
+                    // Only the main thread waits on this condvar — notify_one avoids
+                    // thundering-herd wakeups of worker threads
+                    condvar.notify_one();
                 }
             });
             self.worker_handles.push(handle);
@@ -178,7 +181,8 @@ impl DataLoader {
     }
 
     fn stop_workers(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
+        self.stop_flag.store(true, Ordering::Release);
+        // Wake all threads during shutdown so they can see the stop_flag
         self.condvar.notify_all();
         for handle in self.worker_handles.drain(..) {
             let _ = handle.join();
@@ -254,22 +258,27 @@ fn build_simple_batch(
     // Generating a [batch, seq, seq] mask here wastes 134MB/batch at batch=32,
     // seq=1024 — pure PCIe/memory bandwidth waste for a static pattern.
 
-    // Create tensors and dict (f32, dtype=1, to match default tensor dtype)
+    // Create tensors and dict using i32 (dtype=4) for token IDs.
+    // Token IDs are integers that only need 32 bits (vocab < 2^31).
+    // Using i32 instead of f32 halves bandwidth vs f64 and avoids
+    // precision loss for large token IDs (f32 mantissa is only 24 bits).
+    // The cast to float is deferred to the embedding lookup boundary.
     let b = batch_size as i64;
     let s = seq_len as i64;
 
-    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
+    // dtype=4 is i32 in NSL's type system
+    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 4);
     let ids_tensor = NslTensor::from_ptr(ids_ptr);
-    let ids_data = ids_tensor.data_f32();
+    let ids_data = ids_tensor.data as *mut i32;
     for (i, &v) in input_ids.iter().enumerate() {
-        unsafe { *ids_data.add(i) = v as f32 };
+        unsafe { *ids_data.add(i) = v as i32 };
     }
 
-    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
+    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 4);
     let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
-    let lbl_data = lbl_tensor.data_f32();
+    let lbl_data = lbl_tensor.data as *mut i32;
     for (i, &v) in labels.iter().enumerate() {
-        unsafe { *lbl_data.add(i) = v as f32 };
+        unsafe { *lbl_data.add(i) = v as i32 };
     }
 
     let dict = nsl_dict_new();
@@ -321,7 +330,7 @@ pub extern "C" fn nsl_dataloader_start(dl_ptr: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
     let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
-    let expected = dl.expected_batch_id.load(Ordering::SeqCst);
+    let expected = dl.expected_batch_id.load(Ordering::Relaxed);
 
     if expected >= dl.total_batches {
         return 0;
@@ -334,7 +343,7 @@ pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
             if let Some(ptr) = buf.remove(&expected) {
                 break ptr;
             }
-            if dl.stop_flag.load(Ordering::SeqCst) {
+            if dl.stop_flag.load(Ordering::Acquire) {
                 return 0;
             }
             // If all workers finished, do one final check — a worker may have
@@ -349,7 +358,7 @@ pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
         }
     };
 
-    dl.expected_batch_id.fetch_add(1, Ordering::SeqCst);
+    dl.expected_batch_id.fetch_add(1, Ordering::Relaxed);
     dict_ptr
 }
 
@@ -367,8 +376,8 @@ pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
         }
     }
 
-    dl.cursor.store(0, Ordering::SeqCst);
-    dl.expected_batch_id.store(0, Ordering::SeqCst);
+    dl.cursor.store(0, Ordering::Relaxed);
+    dl.expected_batch_id.store(0, Ordering::Relaxed);
     dl.start_workers();
 }
 
@@ -478,7 +487,9 @@ mod tests {
         let tensor_ptr = crate::dict::nsl_dict_get_str(batch, k);
         let tensor = NslTensor::from_ptr(tensor_ptr);
 
-        let ids_data = tensor.data_f32();
+        // Token IDs are stored as i32 (dtype=4)
+        assert_eq!(tensor.dtype, 4, "input_ids should be i32 dtype");
+        let ids_data = tensor.data as *const i32;
         for i in 0..4 {
             let val = unsafe { *ids_data.add(i) } as i64;
             assert_eq!(val, i as i64, "token at position {} should be {}", i, i);
