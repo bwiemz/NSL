@@ -587,6 +587,8 @@ impl<'a> TypeChecker<'a> {
                     _ => Type::Unknown,
                 }
             }
+            // Dict member access: batch.input_ids → returns the value type
+            Type::Dict(_key, val) => *val.clone(),
             Type::Error => Type::Error,
             Type::Unknown => Type::Unknown,
             _ => Type::Unknown,

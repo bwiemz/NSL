@@ -757,7 +757,10 @@ impl Compiler<'_> {
         }
 
         // DataLoader iteration: `for batch in loader:`
-        if matches!(iter_type, Type::Unknown) {
+        // Detect DataLoader by checking if the iterable variable was assigned from a DataLoader() call.
+        // The semantic type is List<Dict<Str, Tensor>> but the runtime handle is an opaque pointer,
+        // not a real list — we must use the DataLoader-specific iteration protocol.
+        if self.is_dataloader_iterable(iterable) || matches!(iter_type, Type::Unknown) {
             return self.compile_for_dataloader(builder, state, pattern, iterable, body);
         }
 
@@ -961,6 +964,12 @@ impl Compiler<'_> {
         builder.seal_block(exit_block);
         state.current_block = Some(exit_block);
         Ok(())
+    }
+
+    /// Check if an iterable expression is a DataLoader (typed as List<Dict<Str, Tensor>>).
+    fn is_dataloader_iterable(&self, iterable: &nsl_ast::expr::Expr) -> bool {
+        let ty = self.node_type(iterable.id).clone();
+        matches!(ty, Type::List(ref elem) if matches!(**elem, Type::Dict(_, _)))
     }
 
     // ── DataLoader for-loop ──────────────────────────────────────────

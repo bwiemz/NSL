@@ -2178,9 +2178,9 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
     // Free GPU metadata arrays
-    inner::free_managed(gpu_shape as *mut c_void, arr_bytes);
-    inner::free_managed(gpu_src_strides as *mut c_void, arr_bytes);
-    inner::free_managed(gpu_dst_strides as *mut c_void, arr_bytes);
+    inner::free_managed(gpu_shape as *mut c_void);
+    inner::free_managed(gpu_src_strides as *mut c_void);
+    inner::free_managed(gpu_dst_strides as *mut c_void);
 
     let out = Box::new(NslTensor::new(
         out_data, out_shape, out_strides,

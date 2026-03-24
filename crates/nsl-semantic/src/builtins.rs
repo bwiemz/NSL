@@ -766,11 +766,15 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // DataLoader returns an opaque handle; iterating it yields Dict<Str, Tensor> batches.
+    // We type the constructor return as List<Dict<Str, Tensor>> so that for-loop iteration
+    // naturally produces Dict<Str, Tensor> as the element type.
+    let batch_dict = Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()));
     def(
         "DataLoader",
         Type::Function {
             params: vec![Type::Unknown],
-            ret: Box::new(Type::Unknown),
+            ret: Box::new(Type::List(Box::new(batch_dict))),
             effect: Effect::Inferred,
         },
     );
