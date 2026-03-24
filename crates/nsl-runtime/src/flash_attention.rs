@@ -8,11 +8,96 @@
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
 #[cfg(feature = "cuda")]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::tensor::NslTensor;
 #[cfg(feature = "cuda")]
 use crate::autodiff;
+
+/// One-time log guard: prints the selected kernel variant (FA3 or FA2) only once.
+#[cfg(feature = "cuda")]
+static FA_VARIANT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Launch FlashAttention-3 (Hopper wgmma) kernel.
+/// Returns 0 on success, -1 if the launch failed (caller should fall back to FA2).
+#[cfg(feature = "cuda")]
+fn flash_attention_hopper(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64, logsumexp_ptr: i64,
+    scale: f32,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    causal: bool,
+) -> i64 {
+    use crate::cuda::kernels_hopper::{generate_flash_attention_3_ptx, FA3Config};
+
+    let block_q = 64;
+    let block_kv = 64;
+
+    let config = FA3Config {
+        block_q,
+        block_kv,
+        head_dim: head_dim as usize,
+        seq_len: seq_len as usize,
+        batch_heads: (batch * heads) as usize,
+        causal,
+        fp8: false,
+        scale,
+    };
+
+    // Generate PTX at runtime for this config
+    let ptx = generate_flash_attention_3_ptx(block_q, block_kv, head_dim as usize, causal, false);
+    let ptx_cstr = format!("{}\0", ptx);
+
+    let mut q_data = q_ptr as u64;
+    let mut k_data = k_ptr as u64;
+    let mut v_data = v_ptr as u64;
+    let mut o_data = out_ptr as u64;
+    let mut lse_data = if logsumexp_ptr != 0 {
+        logsumexp_ptr as u64
+    } else {
+        0u64
+    };
+    let mut scale_val = scale;
+    let mut seq_val = seq_len as u64;
+    let mut hd_val = head_dim as u64;
+    let mut num_kv = config.num_kv_tiles() as u64;
+
+    let args: [*mut c_void; 9] = [
+        &mut q_data   as *mut _ as *mut c_void,
+        &mut k_data   as *mut _ as *mut c_void,
+        &mut v_data   as *mut _ as *mut c_void,
+        &mut o_data   as *mut _ as *mut c_void,
+        &mut lse_data as *mut _ as *mut c_void,
+        &mut scale_val as *mut _ as *mut c_void,
+        &mut seq_val  as *mut _ as *mut c_void,
+        &mut hd_val   as *mut _ as *mut c_void,
+        &mut num_kv   as *mut _ as *mut c_void,
+    ];
+
+    let grid  = config.grid();
+    let block = config.block();
+    let shared = config.shared_mem_bytes();
+
+    let result = crate::cuda::inner::kernel_launch(
+        ptx_cstr.as_ptr(),
+        b"nsl_flash_attention_3\0".as_ptr(),
+        grid,
+        block,
+        &args,
+        shared,
+    );
+
+    if result as u32 != 0 {
+        eprintln!(
+            "[nsl] FA3 Hopper kernel launch failed ({:?}), falling back to FA2",
+            result
+        );
+        return -1;
+    }
+
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    0
+}
 
 /// FlashAttention-2 kernel launch wrapper.
 ///
@@ -100,14 +185,45 @@ pub extern "C" fn nsl_flash_attention(
             &mut lse as *mut _ as *mut c_void,
         ];
 
-        let result = crate::cuda::inner::kernel_launch(
-            ptx_ptr as *const u8,
-            name_ptr as *const u8,
-            [grid_x, grid_y, grid_z],
-            [block_x, block_y, block_z],
-            &args,
-            shared_mem_bytes as u32,
-        );
+        // ── Ampere / Hopper dispatch ──────────────────────────────────────────
+        // Detect SM version once; on Hopper (sm_90+) try FA3 (wgmma) first.
+        // If FA3 launch fails fall through to FA2 with the caller-supplied PTX.
+        let sm = crate::cuda::inner::detect_sm_version();
+        let fa3_ok = if sm >= 90 {
+            let fa3_result = flash_attention_hopper(
+                q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
+                f32::from_bits(scale_bits as u32),
+                batch, heads, seq_len, head_dim,
+                causal != 0,
+            );
+            if fa3_result == 0 {
+                if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[nsl] Using FlashAttention-3 (Hopper wgmma, sm_90a)");
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let result: i64 = if fa3_ok {
+            // FA3 already launched and synced; treat as success.
+            0
+        } else {
+            if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[nsl] Using FlashAttention-2 (Ampere mma.sync)");
+            }
+            crate::cuda::inner::kernel_launch(
+                ptx_ptr as *const u8,
+                name_ptr as *const u8,
+                [grid_x, grid_y, grid_z],
+                [block_x, block_y, block_z],
+                &args,
+                shared_mem_bytes as u32,
+            ) as i64
+        };
 
         // Record tape op for backward pass if recording
         if autodiff::is_recording() {
@@ -133,7 +249,7 @@ pub extern "C" fn nsl_flash_attention(
             });
         }
 
-        result as i64
+        result
     }
     #[cfg(not(feature = "cuda"))]
     {
