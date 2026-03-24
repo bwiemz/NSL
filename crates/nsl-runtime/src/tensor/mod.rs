@@ -1148,13 +1148,17 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         }
     }
 
+    // Output data was allocated via checked_alloc (CPU heap), so device must be 0.
+    // Even though the weight is on GPU, the embedding lookup runs on CPU
+    // (reading unified memory is fine from CPU). The output will be transferred
+    // to GPU by reconcile_device when the next GPU operation uses it.
     let out = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
         out_shape,
         out_strides,
         out_ndim,
         out_len,
-        weight.device,
+        0,  // CPU — data is in CPU heap, not CUDA unified memory
         out_dtype,
         1,
         0,
@@ -1251,13 +1255,14 @@ pub extern "C" fn nsl_tensor_layernorm(
         }
     }
 
+    // Output allocated via checked_alloc (CPU heap) — device must be 0
     let out = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
         out_shape,
         out_strides,
         ndim as i64,
         total as i64,
-        input.device,
+        0,  // CPU — data is in CPU heap, not CUDA memory
         in_dtype,
         1,
         0,
@@ -1355,13 +1360,14 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         }
     }
 
+    // Output allocated via checked_alloc (CPU heap) — device must be 0
     let out = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
         out_shape,
         out_strides,
         ndim as i64,
         total as i64,
-        input.device,
+        0,  // CPU — data is in CPU heap, not CUDA memory
         in_dtype,
         1,
         0,

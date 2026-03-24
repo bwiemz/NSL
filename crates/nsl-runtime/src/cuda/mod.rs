@@ -159,6 +159,11 @@ pub(crate) mod inner {
         }
     }
 
+    pub(crate) fn is_cuda_alloc(ptr: *mut c_void) -> bool {
+        if ptr.is_null() { return false; }
+        CUDA_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
+    }
+
     /// Free unified memory.
     /// Free GPU memory allocated by alloc_managed.
     /// Currently leaks GPU memory intentionally — cuMemFree returns
@@ -257,7 +262,7 @@ pub(crate) mod inner {
         unsafe {
             let location = CUmemLocation {
                 type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-                id: device_id,
+                __bindgen_anon_1: cudarc::driver::sys::CUmemLocation_st__bindgen_ty_1 { id: device_id },
             };
             let result = cuMemPrefetchAsync_v2(
                 ptr as CUdeviceptr,
@@ -635,6 +640,25 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let mut n_val = n;
     let mut k_val = k;
 
+    let block = 16i64; // 16x16 thread block
+    let grid_x = ((n as i64) + block - 1) / block;
+    let grid_y = ((m as i64) + block - 1) / block;
+
+    // Debug: log matmul parameters when cuda-sync is active
+    if inner::sync_mode_enabled() {
+        let a_registered = inner::is_cuda_alloc(a.data);
+        let b_registered = inner::is_cuda_alloc(b.data);
+        let c_registered = inner::is_cuda_alloc(out_data);
+        eprintln!(
+            "[nsl] gpu_matmul_f32: M={} K={} N={} grid=[{},{}] \
+             A(dev={},ptr={:#x},cuda={}) B(dev={},ptr={:#x},cuda={}) C(ptr={:#x},cuda={})",
+            m, k, n, grid_x, grid_y,
+            a.device, a_data, a_registered,
+            b.device, b_data, b_registered,
+            c_data, c_registered,
+        );
+    }
+
     let args = [
         &mut a_data as *mut _ as *mut std::ffi::c_void,
         &mut b_data as *mut _ as *mut std::ffi::c_void,
@@ -643,10 +667,6 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         &mut n_val as *mut _ as *mut std::ffi::c_void,
         &mut k_val as *mut _ as *mut std::ffi::c_void,
     ];
-
-    let block = 16i64; // 16x16 thread block
-    let grid_x = ((n as i64) + block - 1) / block;
-    let grid_y = ((m as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
         kernels::MATMUL_F32_PTX.as_ptr(),
