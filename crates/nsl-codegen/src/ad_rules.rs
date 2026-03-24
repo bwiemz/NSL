@@ -163,9 +163,13 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Broadcast(output_bar),
         }],
+        // Mean backward: broadcast(grad) / n.  The exact 1/n factor depends on the
+        // reduced dimension size which isn't available in the Wengert list.  The tape-based
+        // runtime backward (backward.rs) handles this correctly with num_elements.
+        // For source AD analysis, we emit Broadcast (correct structure, conservative scale).
         PrimalOp::Mean { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::ScaleBroadcast(output_bar, 1.0),
+            expr: AdjointExpr::Broadcast(output_bar),
         }],
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
@@ -532,10 +536,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_scale_broadcasts() {
+    fn test_mean_broadcasts() {
+        // Mean backward: broadcast grad (1/n scaling deferred to runtime tape backward)
         let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::ScaleBroadcast(100, _)));
+        assert!(matches!(adj[0].expr, AdjointExpr::Broadcast(100)));
     }
 
     #[test]
