@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 pub(crate) mod kernels;
 pub(crate) mod fused_kernels;
+pub(crate) mod kernels_hopper;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
@@ -108,6 +109,28 @@ pub(crate) mod inner {
                 })
             }
         })
+    }
+
+    /// Detect the SM compute capability of the current GPU.
+    /// Returns e.g. 90 for Hopper H100, 89 for Ada RTX 4090, 100 for Blackwell B200.
+    pub(crate) fn detect_sm_version() -> u32 {
+        let s = state();
+        let guard = s.lock().unwrap();
+        let mut major: i32 = 0;
+        let mut minor: i32 = 0;
+        unsafe {
+            cuDeviceGetAttribute(
+                &mut major,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                guard.device,
+            );
+            cuDeviceGetAttribute(
+                &mut minor,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                guard.device,
+            );
+        }
+        (major * 10 + minor) as u32
     }
 
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

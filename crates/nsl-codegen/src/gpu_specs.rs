@@ -108,19 +108,31 @@ impl GpuSpec {
     /// Returns the appropriate PTX version string for this GPU's features.
     pub fn ptx_version(&self) -> &'static str {
         if self.sm_version >= 100 { "8.6" }  // Blackwell requires PTX ISA 8.6+
-        else if self.sm_version >= 90 { "8.0" }
+        else if self.sm_version >= 90 { "8.4" }  // Required for wgmma, TMA, setmaxnreg, mbarrier
         else { "7.0" }
     }
 
     /// Returns the PTX target string for this GPU.
     pub fn ptx_target(&self) -> &'static str {
         if self.sm_version >= 100 { "sm_100" }  // Blackwell
-        else if self.sm_version >= 90 { "sm_90" }
+        else if self.sm_version >= 90 { "sm_90a" }  // Hopper with async features (wgmma, TMA)
         else if self.sm_version >= 89 { "sm_89" }
         else if self.sm_version >= 87 { "sm_87" }
         else if self.sm_version >= 86 { "sm_86" }
         else if self.sm_version >= 80 { "sm_80" }
         else { "sm_52" }
+    }
+
+    /// Returns true if the GPU supports TMA (Tensor Memory Accelerator, cp.async.bulk.tensor).
+    /// Requires sm_90 (H100/H200) or later.
+    pub fn supports_tma(&self) -> bool {
+        self.sm_version >= 90
+    }
+
+    /// Returns true if the GPU supports FP8 wgmma (wgmma.mma_async with e4m3/e5m2 inputs).
+    /// Requires sm_90 (H100/H200) or later.
+    pub fn supports_fp8_wgmma(&self) -> bool {
+        self.sm_version >= 90
     }
 
     /// Warp group size: 128 threads on Hopper (4 warps collaborate), 32 on older.
@@ -567,8 +579,8 @@ mod tests {
     #[test]
     fn test_ptx_target_selection() {
         let h100 = find_gpu("H100-SXM").unwrap();
-        assert_eq!(h100.ptx_target(), "sm_90");
-        assert_eq!(h100.ptx_version(), "8.0");
+        assert_eq!(h100.ptx_target(), "sm_90a");
+        assert_eq!(h100.ptx_version(), "8.4");
 
         let a100 = find_gpu("A100-SXM").unwrap();
         assert_eq!(a100.ptx_target(), "sm_80");
@@ -634,5 +646,36 @@ mod tests {
                 gpu.name, gpu.empirical_p95_ratio
             );
         }
+    }
+
+    #[test]
+    fn test_tma_requires_sm90() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert!(h100.supports_tma(), "H100 (sm_90) should support TMA");
+
+        let b200 = find_gpu("B200").unwrap();
+        assert!(b200.supports_tma(), "B200 (sm_100) should support TMA");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert!(!a100.supports_tma(), "A100 (sm_80) should NOT support TMA");
+
+        let rtx4090 = find_gpu("RTX-4090").unwrap();
+        assert!(!rtx4090.supports_tma(), "RTX-4090 (sm_89) should NOT support TMA");
+    }
+
+    #[test]
+    fn test_fp8_wgmma_requires_sm90() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert!(h100.supports_fp8_wgmma(), "H100 (sm_90) should support FP8 wgmma");
+
+        let a100 = find_gpu("A100-SXM").unwrap();
+        assert!(!a100.supports_fp8_wgmma(), "A100 (sm_80) should NOT support FP8 wgmma");
+    }
+
+    #[test]
+    fn test_hopper_ptx_target_is_sm90a() {
+        let h100 = find_gpu("H100-SXM").unwrap();
+        assert_eq!(h100.ptx_target(), "sm_90a", "Hopper needs sm_90a for async features");
+        assert_eq!(h100.ptx_version(), "8.4", "Hopper needs PTX 8.4 for wgmma/TMA/setmaxnreg");
     }
 }
