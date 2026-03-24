@@ -2114,6 +2114,81 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     (NslTensor::publish(out), NslTensor::publish(mask))
 }
 
+// ---------------------------------------------------------------------------
+// GPU Strided Copy (contiguous materialization on-device)
+// ---------------------------------------------------------------------------
+
+/// GPU strided copy: materializes a non-contiguous view into a contiguous tensor.
+/// Replaces the CPU round-trip (GPU→CPU copy→GPU) with a single on-device kernel.
+/// The kernel decomposes each flat output index into N-dim coords using dst_strides,
+/// then computes the source offset using the source's non-contiguous strides.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::STRIDED_COPY_F32_PTX;
+
+    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let ndim = t.ndim as usize;
+    let total = t.len as u64;
+
+    // Allocate contiguous output on GPU
+    let out_data = inner::alloc_managed(total as usize * 4); // f32
+    let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
+
+    // Upload shape, src_strides, and dst_strides to GPU-accessible memory
+    let arr_bytes = ndim * std::mem::size_of::<i64>();
+
+    let gpu_shape = inner::alloc_managed(arr_bytes) as *mut i64;
+    let gpu_src_strides = inner::alloc_managed(arr_bytes) as *mut i64;
+    let gpu_dst_strides = inner::alloc_managed(arr_bytes) as *mut i64;
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(t.shape, gpu_shape, ndim);
+        std::ptr::copy_nonoverlapping(t.strides, gpu_src_strides, ndim);
+        std::ptr::copy_nonoverlapping(out_strides, gpu_dst_strides, ndim);
+    }
+
+    let mut src_data = t.data as u64;
+    let mut dst_data = out_data as u64;
+    let mut shape_val = gpu_shape as u64;
+    let mut src_str_val = gpu_src_strides as u64;
+    let mut dst_str_val = gpu_dst_strides as u64;
+    let mut ndim_val = ndim as u64;
+    let mut total_val = total;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut src_data as *mut _ as *mut std::ffi::c_void,
+        &mut dst_data as *mut _ as *mut std::ffi::c_void,
+        &mut shape_val as *mut _ as *mut std::ffi::c_void,
+        &mut src_str_val as *mut _ as *mut std::ffi::c_void,
+        &mut dst_str_val as *mut _ as *mut std::ffi::c_void,
+        &mut ndim_val as *mut _ as *mut std::ffi::c_void,
+        &mut total_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((total as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        STRIDED_COPY_F32_PTX.as_ptr(), b"nsl_strided_copy_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    // Free GPU metadata arrays
+    inner::free_managed(gpu_shape as *mut c_void, arr_bytes);
+    inner::free_managed(gpu_src_strides as *mut c_void, arr_bytes);
+    inner::free_managed(gpu_dst_strides as *mut c_void, arr_bytes);
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides,
+        t.ndim, total as i64, t.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;

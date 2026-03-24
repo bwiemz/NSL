@@ -1097,15 +1097,20 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
         return tensor_ptr;
     }
 
-    // GPU redirect: for a non-contiguous GPU tensor, transfer to CPU (which materializes
-    // a fresh contiguous copy), then transfer back to GPU.
-    // nsl_tensor_to_device always creates a contiguous copy, so this is safe with no
-    // recursion risk (the CPU copy has device=0 and will take the CPU path below).
+    // GPU path: native on-device strided copy kernel (no CPU round-trip)
     if t.device > 0 {
-        let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-        let gpu_contig = super::nsl_tensor_to_device(cpu_t, t.device as i64);
-        super::nsl_tensor_free(cpu_t);
-        return gpu_contig;
+        #[cfg(feature = "cuda")]
+        {
+            return crate::cuda::gpu_strided_copy_f32(tensor_ptr);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Fallback: CPU round-trip
+            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+            let gpu_contig = super::nsl_tensor_to_device(cpu_t, t.device as i64);
+            super::nsl_tensor_free(cpu_t);
+            return gpu_contig;
+        }
     }
 
     // Materialize: walk through all elements using multi-dim coords and source strides
