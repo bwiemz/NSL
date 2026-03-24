@@ -419,7 +419,25 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     use crate::tensor::NslTensor;
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
-    assert_eq!(a.len, b.len, "GPU elementwise: length mismatch");
+    // Fall back to CPU broadcast path when shapes differ
+    if a.len != b.len {
+        // Transfer both to CPU, do broadcast op, transfer result back
+        let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
+        let b_cpu = if b.device > 0 { crate::tensor::nsl_tensor_to_device(b_ptr, 0) } else { b_ptr };
+        let op_fn: fn(f64, f64) -> f64 = match kernel_name.trim_end_matches('\0') {
+            "nsl_add_f32" => |x, y| x + y,
+            "nsl_sub_f32" => |x, y| x - y,
+            "nsl_mul_f32" => |x, y| x * y,
+            "nsl_div_f32" => |x, y| x / y,
+            _ => |x, y| x + y,
+        };
+        let result_cpu = crate::cpu::tensor_elementwise_op(a_cpu, b_cpu, op_fn);
+        let result_gpu = crate::tensor::nsl_tensor_to_device(result_cpu, a.device as i64);
+        if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
+        if b_cpu != b_ptr { crate::tensor::nsl_tensor_free(b_cpu); }
+        crate::tensor::nsl_tensor_free(result_cpu);
+        return result_gpu;
+    }
 
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
