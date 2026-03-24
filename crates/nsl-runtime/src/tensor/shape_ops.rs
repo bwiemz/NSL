@@ -294,6 +294,17 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
 /// Extract a hyperplane at `index` along `dim`, removing that dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i64 {
+    // GPU redirect: transfer to CPU, operate, transfer result back.
+    let t = NslTensor::from_ptr(tensor_ptr);
+    if t.device > 0 {
+        let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+        let result = nsl_tensor_select(cpu_t, dim, index);
+        let gpu_result = super::nsl_tensor_to_device(result, t.device as i64);
+        super::nsl_tensor_free(cpu_t);
+        super::nsl_tensor_free(result);
+        return gpu_result;
+    }
+
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
 
@@ -386,6 +397,33 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     let list = NslList::from_ptr(list_ptr);
     let num_tensors = list.len as usize;
     assert!(num_tensors > 0, "nsl_tensor_stack: empty tensor list");
+
+    // GPU redirect: if any tensor is on GPU, move all to CPU, stack, move result to GPU.
+    let source_device = {
+        let first = NslTensor::from_ptr(unsafe { *list.data });
+        first.device
+    };
+    if source_device > 0 {
+        // Transfer all inputs to CPU
+        let cpu_ptrs: Vec<i64> = (0..num_tensors)
+            .map(|i| super::nsl_tensor_to_device(unsafe { *list.data.add(i) }, 0))
+            .collect();
+        // Build a temporary NslList on the stack via the runtime list API
+        let tmp_list = crate::list::nsl_list_new();
+        for &cp in &cpu_ptrs {
+            crate::list::nsl_list_push(tmp_list, cp);
+        }
+        let cpu_result = nsl_tensor_stack(tmp_list, dim);
+        let gpu_result = super::nsl_tensor_to_device(cpu_result, source_device as i64);
+        // Free temporaries
+        super::nsl_tensor_free(cpu_result);
+        for &cp in &cpu_ptrs {
+            super::nsl_tensor_free(cp);
+        }
+        // Free temp list (NslList is just a heap allocation)
+        crate::list::nsl_list_free(tmp_list);
+        return gpu_result;
+    }
 
     // Ensure all input tensors are contiguous for correct flat indexing
     let contiguous_ptrs: Vec<i64> = (0..num_tensors)
@@ -664,6 +702,17 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
 /// Slice a tensor along a dimension: extract elements [start, end) along dim.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i64) -> i64 {
+    // GPU redirect: transfer to CPU, slice, transfer result back.
+    let t = NslTensor::from_ptr(tensor_ptr);
+    if t.device > 0 {
+        let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+        let result = nsl_tensor_slice(cpu_t, dim, start, end);
+        let gpu_result = super::nsl_tensor_to_device(result, t.device as i64);
+        super::nsl_tensor_free(cpu_t);
+        super::nsl_tensor_free(result);
+        return gpu_result;
+    }
+
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
 
@@ -766,6 +815,29 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let list = NslList::from_ptr(tensor_list);
     let num_tensors = list.len as usize;
     assert!(num_tensors > 0, "nsl_tensor_cat: empty tensor list");
+
+    // GPU redirect: if any tensor is on GPU, move all to CPU, cat, move result to GPU.
+    let source_device = {
+        let first = NslTensor::from_ptr(unsafe { *list.data });
+        first.device
+    };
+    if source_device > 0 {
+        let cpu_ptrs: Vec<i64> = (0..num_tensors)
+            .map(|i| super::nsl_tensor_to_device(unsafe { *list.data.add(i) }, 0))
+            .collect();
+        let tmp_list = crate::list::nsl_list_new();
+        for &cp in &cpu_ptrs {
+            crate::list::nsl_list_push(tmp_list, cp);
+        }
+        let cpu_result = nsl_tensor_cat(tmp_list, dim);
+        let gpu_result = super::nsl_tensor_to_device(cpu_result, source_device as i64);
+        super::nsl_tensor_free(cpu_result);
+        for &cp in &cpu_ptrs {
+            super::nsl_tensor_free(cp);
+        }
+        crate::list::nsl_list_free(tmp_list);
+        return gpu_result;
+    }
 
     // Ensure all inputs are contiguous for flat-indexed copy
     let contiguous_ptrs: Vec<i64> = (0..num_tensors)
@@ -919,6 +991,17 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
 ///   output[half..last_dim] = input[0..half]     (copy first half)
 #[no_mangle]
 pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
+    // GPU redirect: transfer to CPU, rotate, transfer result back.
+    let t_check = NslTensor::from_ptr(tensor_ptr);
+    if t_check.device > 0 {
+        let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+        let result = nsl_tensor_rotate_half(cpu_t);
+        let gpu_result = super::nsl_tensor_to_device(result, t_check.device as i64);
+        super::nsl_tensor_free(cpu_t);
+        super::nsl_tensor_free(result);
+        return gpu_result;
+    }
+
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
     let ndim = tensor.ndim as usize;
@@ -1012,6 +1095,17 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
         // Already contiguous -- bump refcount, return same pointer
         t.refcount.fetch_add(1, Ordering::SeqCst);
         return tensor_ptr;
+    }
+
+    // GPU redirect: for a non-contiguous GPU tensor, transfer to CPU (which materializes
+    // a fresh contiguous copy), then transfer back to GPU.
+    // nsl_tensor_to_device always creates a contiguous copy, so this is safe with no
+    // recursion risk (the CPU copy has device=0 and will take the CPU path below).
+    if t.device > 0 {
+        let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+        let gpu_contig = super::nsl_tensor_to_device(cpu_t, t.device as i64);
+        super::nsl_tensor_free(cpu_t);
+        return gpu_contig;
     }
 
     // Materialize: walk through all elements using multi-dim coords and source strides
