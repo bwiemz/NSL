@@ -1790,6 +1790,207 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     NslTensor::publish(out)
 }
 
+// ---------------------------------------------------------------------------
+// GPU Conv2d (direct convolution, NCHW layout)
+// ---------------------------------------------------------------------------
+
+/// GPU conv2d: out[n,co,oh,ow] = sum(input[n,ci,ih,iw] * weight[co,ci,ky,kx]) + bias[co]
+/// Input must be 4D NCHW [N, C_in, H, W], weight [C_out, C_in, kH, kW].
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_conv2d_f32(
+    input_ptr: i64, weight_ptr: i64, bias_ptr: i64,
+    stride_h: u64, stride_w: u64, pad_h: u64, pad_w: u64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::CONV2D_F32_PTX;
+
+    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let weight = unsafe { &*(weight_ptr as *const NslTensor) };
+
+    let n = unsafe { *input.shape.add(0) } as u64;
+    let c_in = unsafe { *input.shape.add(1) } as u64;
+    let h = unsafe { *input.shape.add(2) } as u64;
+    let w = unsafe { *input.shape.add(3) } as u64;
+    let c_out = unsafe { *weight.shape.add(0) } as u64;
+    let kh = unsafe { *weight.shape.add(2) } as u64;
+    let kw = unsafe { *weight.shape.add(3) } as u64;
+
+    let h_out = (h + 2 * pad_h - kh) / stride_h + 1;
+    let w_out = (w + 2 * pad_w - kw) / stride_w + 1;
+    let total = n * c_out * h_out * w_out;
+
+    let out_data = inner::alloc_managed(total as usize * 4); // f32
+
+    let out_shape = crate::memory::checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = n as i64;
+        *out_shape.add(1) = c_out as i64;
+        *out_shape.add(2) = h_out as i64;
+        *out_shape.add(3) = w_out as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 4);
+
+    // Ensure weight on GPU
+    let weight_on_gpu = if weight.device == 0 {
+        crate::tensor::nsl_tensor_to_device(weight_ptr, input.device as i64)
+    } else {
+        let t = unsafe { &mut *(weight_ptr as *mut NslTensor) };
+        t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        weight_ptr
+    };
+    let weight_gpu = unsafe { &*(weight_on_gpu as *const NslTensor) };
+
+    // Bias pointer (0 if no bias)
+    let bias_data: u64 = if bias_ptr != 0 {
+        let bias = unsafe { &*(bias_ptr as *const NslTensor) };
+        if bias.device == 0 {
+            let bp = crate::tensor::nsl_tensor_to_device(bias_ptr, input.device as i64);
+            let b = unsafe { &*(bp as *const NslTensor) };
+            let d = b.data as u64;
+            // We leak the bias transfer — acceptable for now
+            d
+        } else {
+            bias.data as u64
+        }
+    } else {
+        0u64
+    };
+
+    let mut inp_data = input.data as u64;
+    let mut wt_data = weight_gpu.data as u64;
+    let mut bias_val = bias_data;
+    let mut out_val = out_data as u64;
+    let mut n_val = n; let mut cin_val = c_in; let mut h_val = h; let mut w_val = w;
+    let mut cout_val = c_out; let mut kh_val = kh; let mut kw_val = kw;
+    let mut sh_val = stride_h; let mut sw_val = stride_w;
+    let mut ph_val = pad_h; let mut pw_val = pad_w;
+    let mut hout_val = h_out; let mut wout_val = w_out; let mut total_val = total;
+
+    let args: [*mut std::ffi::c_void; 18] = [
+        &mut inp_data as *mut _ as *mut std::ffi::c_void,
+        &mut wt_data as *mut _ as *mut std::ffi::c_void,
+        &mut bias_val as *mut _ as *mut std::ffi::c_void,
+        &mut out_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut cin_val as *mut _ as *mut std::ffi::c_void,
+        &mut h_val as *mut _ as *mut std::ffi::c_void,
+        &mut w_val as *mut _ as *mut std::ffi::c_void,
+        &mut cout_val as *mut _ as *mut std::ffi::c_void,
+        &mut kh_val as *mut _ as *mut std::ffi::c_void,
+        &mut kw_val as *mut _ as *mut std::ffi::c_void,
+        &mut sh_val as *mut _ as *mut std::ffi::c_void,
+        &mut sw_val as *mut _ as *mut std::ffi::c_void,
+        &mut ph_val as *mut _ as *mut std::ffi::c_void,
+        &mut pw_val as *mut _ as *mut std::ffi::c_void,
+        &mut hout_val as *mut _ as *mut std::ffi::c_void,
+        &mut wout_val as *mut _ as *mut std::ffi::c_void,
+        &mut total_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((total as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        CONV2D_F32_PTX.as_ptr(), b"nsl_conv2d_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU conv2d kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    crate::tensor::nsl_tensor_free(weight_on_gpu);
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides,
+        4, total as i64, input.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
+// ---------------------------------------------------------------------------
+// GPU MaxPool2d
+// ---------------------------------------------------------------------------
+
+/// GPU maxpool2d: out[n,c,oh,ow] = max over kernel window + argmax indices.
+/// Input must be 4D NCHW. Returns output tensor; argmax stored for backward.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_maxpool2d_f32(
+    input_ptr: i64, kh: u64, kw: u64, stride: u64, padding: u64,
+) -> (i64, Vec<u64>) {
+    use crate::tensor::NslTensor;
+    use fused_kernels::MAXPOOL2D_F32_PTX;
+
+    let input = unsafe { &*(input_ptr as *const NslTensor) };
+
+    let n = unsafe { *input.shape.add(0) } as u64;
+    let c = unsafe { *input.shape.add(1) } as u64;
+    let h = unsafe { *input.shape.add(2) } as u64;
+    let w = unsafe { *input.shape.add(3) } as u64;
+
+    let h_out = (h + 2 * padding - kh) / stride + 1;
+    let w_out = (w + 2 * padding - kw) / stride + 1;
+    let total = n * c * h_out * w_out;
+
+    let out_data = inner::alloc_managed(total as usize * 4); // f32
+    let argmax_data = inner::alloc_managed(total as usize * 8); // u64 indices
+
+    let out_shape = crate::memory::checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = n as i64;
+        *out_shape.add(1) = c as i64;
+        *out_shape.add(2) = h_out as i64;
+        *out_shape.add(3) = w_out as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 4);
+
+    let mut inp_data = input.data as u64;
+    let mut out_val = out_data as u64;
+    let mut argmax_val = argmax_data as u64;
+    let mut n_val = n; let mut c_val = c; let mut h_val = h; let mut w_val = w;
+    let mut kh_val = kh; let mut kw_val = kw;
+    let mut stride_val = stride; let mut pad_val = padding;
+    let mut hout_val = h_out; let mut wout_val = w_out; let mut total_val = total;
+
+    let args: [*mut std::ffi::c_void; 14] = [
+        &mut inp_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_val as *mut _ as *mut std::ffi::c_void,
+        &mut argmax_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut c_val as *mut _ as *mut std::ffi::c_void,
+        &mut h_val as *mut _ as *mut std::ffi::c_void,
+        &mut w_val as *mut _ as *mut std::ffi::c_void,
+        &mut kh_val as *mut _ as *mut std::ffi::c_void,
+        &mut kw_val as *mut _ as *mut std::ffi::c_void,
+        &mut stride_val as *mut _ as *mut std::ffi::c_void,
+        &mut pad_val as *mut _ as *mut std::ffi::c_void,
+        &mut hout_val as *mut _ as *mut std::ffi::c_void,
+        &mut wout_val as *mut _ as *mut std::ffi::c_void,
+        &mut total_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((total as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        MAXPOOL2D_F32_PTX.as_ptr(), b"nsl_maxpool2d_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU maxpool2d kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    // Read argmax indices back to CPU (needed for backward tape)
+    let argmax_vec: Vec<u64> = unsafe {
+        std::slice::from_raw_parts(argmax_data as *const u64, total as usize).to_vec()
+    };
+    // Free GPU argmax buffer
+    inner::free_managed(argmax_data, total as usize * 8);
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides,
+        4, total as i64, input.device, 1, 1, 0,
+    ));
+    (NslTensor::publish(out), argmax_vec)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;

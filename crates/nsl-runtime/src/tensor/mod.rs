@@ -1637,6 +1637,36 @@ pub extern "C" fn nsl_tensor_conv2d(
     stride_h: i64, stride_w: i64, pad_h: i64, pad_w: i64,
 ) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
+
+    // GPU dispatch: native conv2d kernel
+    if input.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            let c_input = nsl_tensor_contiguous(input_ptr);
+            let result = crate::cuda::gpu_conv2d_f32(
+                c_input, weight_ptr, bias_ptr,
+                stride_h as u64, stride_w as u64, pad_h as u64, pad_w as u64,
+            );
+            if c_input != input_ptr { nsl_tensor_free(c_input); }
+            // Record tape op on the result (same as CPU path)
+            if autodiff::is_recording() {
+                NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                let w = NslTensor::from_ptr(weight_ptr);
+                let sh = stride_h as usize; let sw = stride_w as usize;
+                let ph = pad_h as usize; let pw = pad_w as usize;
+                autodiff::maybe_record(autodiff::TapeOp::Conv2d {
+                    input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: result,
+                    saved_input: input_ptr, saved_weight: weight_ptr,
+                    stride_h: sh, stride_w: sw, pad_h: ph, pad_w: pw,
+                });
+            }
+            return result;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+
     let weight = NslTensor::from_ptr(weight_ptr);
 
     let n = unsafe { *input.shape.add(0) } as usize;
@@ -1751,6 +1781,35 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     input_ptr: i64, kernel_h: i64, kernel_w: i64, stride: i64, padding: i64,
 ) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
+
+    // GPU dispatch: native maxpool2d kernel
+    if input.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            let c_input = nsl_tensor_contiguous(input_ptr);
+            let (result, argmax_vec) = crate::cuda::gpu_maxpool2d_f32(
+                c_input, kernel_h as u64, kernel_w as u64, stride as u64, padding as u64,
+            );
+            if c_input != input_ptr { nsl_tensor_free(c_input); }
+            // Record tape op with argmax indices
+            if autodiff::is_recording() {
+                NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                let n = unsafe { *input.shape.add(0) } as i64;
+                let c = unsafe { *input.shape.add(1) } as i64;
+                let h = unsafe { *input.shape.add(2) } as i64;
+                let w = unsafe { *input.shape.add(3) } as i64;
+                let saved_argmax: Vec<usize> = argmax_vec.iter().map(|&x| x as usize).collect();
+                autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
+                    a: input_ptr, out: result, saved_argmax,
+                    input_shape: vec![n, c, h, w],
+                });
+            }
+            return result;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+
     let n = unsafe { *input.shape.add(0) } as usize;
     let c = unsafe { *input.shape.add(1) } as usize;
     let h = unsafe { *input.shape.add(2) } as usize;

@@ -931,3 +931,292 @@ pub(crate) const GATHER_F32_PTX: &str = "\
     st.global.f32 [%rd12], %f1;\n\
 G_DONE: ret;\n\
 }\0";
+
+// ---------------------------------------------------------------------------
+// GPU Conv2d (implicit GEMM, direct convolution)
+// Each thread computes one output element: out[n, co, oh, ow]
+// Grid:  (total_output_elements / 256 + 1, 1, 1) — 1D flat launch
+// Block: (256, 1, 1)
+// Params: input ptr, weight ptr, bias ptr (0=no bias), out ptr,
+//         N, C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w,
+//         H_out, W_out, total (all u64)
+//
+// Input layout: NCHW [N, C_in, H, W]
+// Weight layout: [C_out, C_in, kH, kW]
+// Output layout: NCHW [N, C_out, H_out, W_out]
+//
+// Target: sm_80 (Ampere base, compatible Ada sm_89, Hopper sm_90, Blackwell sm_100)
+// ---------------------------------------------------------------------------
+pub(crate) const CONV2D_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_conv2d_f32(\n\
+    .param .u64 inp, .param .u64 wt, .param .u64 bias, .param .u64 out,\n\
+    .param .u64 N, .param .u64 C_in, .param .u64 H, .param .u64 W,\n\
+    .param .u64 C_out, .param .u64 kH, .param .u64 kW,\n\
+    .param .u64 stride_h, .param .u64 stride_w,\n\
+    .param .u64 pad_h, .param .u64 pad_w,\n\
+    .param .u64 H_out, .param .u64 W_out, .param .u64 total\n\
+) {\n\
+    .reg .u64 %rd<32>;\n\
+    .reg .u32 %r<4>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .pred %p<4>;\n\
+    // Global thread index\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r2, %tid.x;\n\
+    add.u32 %r1, %r1, %r2;\n\
+    cvt.u64.u32 %rd0, %r1;\n\
+    // Load params\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [wt];\n\
+    ld.param.u64 %rd3, [bias];\n\
+    ld.param.u64 %rd4, [out];\n\
+    ld.param.u64 %rd5, [N];\n\
+    ld.param.u64 %rd6, [C_in];\n\
+    ld.param.u64 %rd7, [H];\n\
+    ld.param.u64 %rd8, [W];\n\
+    ld.param.u64 %rd9, [C_out];\n\
+    ld.param.u64 %rd10, [kH];\n\
+    ld.param.u64 %rd11, [kW];\n\
+    ld.param.u64 %rd12, [stride_h];\n\
+    ld.param.u64 %rd13, [stride_w];\n\
+    ld.param.u64 %rd14, [pad_h];\n\
+    ld.param.u64 %rd15, [pad_w];\n\
+    ld.param.u64 %rd16, [H_out];\n\
+    ld.param.u64 %rd17, [W_out];\n\
+    ld.param.u64 %rd18, [total];\n\
+    // Bounds check\n\
+    setp.ge.u64 %p1, %rd0, %rd18;\n\
+    @%p1 bra CONV_DONE;\n\
+    // Decompose flat index -> (n, co, oh, ow)\n\
+    // ow = idx % W_out\n\
+    rem.u64 %rd19, %rd0, %rd17;\n\
+    // tmp = idx / W_out\n\
+    div.u64 %rd20, %rd0, %rd17;\n\
+    // oh = tmp % H_out\n\
+    rem.u64 %rd21, %rd20, %rd16;\n\
+    // tmp2 = tmp / H_out\n\
+    div.u64 %rd22, %rd20, %rd16;\n\
+    // co = tmp2 % C_out\n\
+    rem.u64 %rd23, %rd22, %rd9;\n\
+    // n = tmp2 / C_out\n\
+    div.u64 %rd24, %rd22, %rd9;\n\
+    // Accumulator = 0\n\
+    mov.f32 %f1, 0f00000000;\n\
+    // Triple loop: ci, ky, kx\n\
+    mov.u64 %rd25, 0;\n\
+CONV_CI:\n\
+    setp.ge.u64 %p1, %rd25, %rd6;\n\
+    @%p1 bra CONV_BIAS;\n\
+    mov.u64 %rd26, 0;\n\
+CONV_KY:\n\
+    setp.ge.u64 %p1, %rd26, %rd10;\n\
+    @%p1 bra CONV_CI_INC;\n\
+    mov.u64 %rd27, 0;\n\
+CONV_KX:\n\
+    setp.ge.u64 %p1, %rd27, %rd11;\n\
+    @%p1 bra CONV_KY_INC;\n\
+    // ih = oh * stride_h + ky\n\
+    mul.lo.u64 %rd28, %rd21, %rd12;\n\
+    add.u64 %rd28, %rd28, %rd26;\n\
+    // iw = ow * stride_w + kx\n\
+    mul.lo.u64 %rd29, %rd19, %rd13;\n\
+    add.u64 %rd29, %rd29, %rd27;\n\
+    // Padding check: ih >= pad_h && iw >= pad_w && ih-pad_h < H && iw-pad_w < W\n\
+    setp.lt.u64 %p2, %rd28, %rd14;\n\
+    @%p2 bra CONV_KX_INC;\n\
+    setp.lt.u64 %p2, %rd29, %rd15;\n\
+    @%p2 bra CONV_KX_INC;\n\
+    sub.u64 %rd28, %rd28, %rd14;\n\
+    sub.u64 %rd29, %rd29, %rd15;\n\
+    setp.ge.u64 %p2, %rd28, %rd7;\n\
+    @%p2 bra CONV_KX_INC_RESTORE;\n\
+    setp.ge.u64 %p2, %rd29, %rd8;\n\
+    @%p2 bra CONV_KX_INC_RESTORE;\n\
+    // input[n, ci, ih-pad, iw-pad]\n\
+    mul.lo.u64 %rd30, %rd24, %rd6;\n\
+    add.u64 %rd30, %rd30, %rd25;\n\
+    mul.lo.u64 %rd30, %rd30, %rd7;\n\
+    add.u64 %rd30, %rd30, %rd28;\n\
+    mul.lo.u64 %rd30, %rd30, %rd8;\n\
+    add.u64 %rd30, %rd30, %rd29;\n\
+    shl.b64 %rd30, %rd30, 2;\n\
+    add.u64 %rd30, %rd1, %rd30;\n\
+    ld.global.f32 %f2, [%rd30];\n\
+    // weight[co, ci, ky, kx]\n\
+    mul.lo.u64 %rd31, %rd23, %rd6;\n\
+    add.u64 %rd31, %rd31, %rd25;\n\
+    mul.lo.u64 %rd31, %rd31, %rd10;\n\
+    // Restore ky from pre-subtraction: ky is still in %rd26, kx in %rd27\n\
+    add.u64 %rd31, %rd31, %rd26;\n\
+    mul.lo.u64 %rd31, %rd31, %rd11;\n\
+    add.u64 %rd31, %rd31, %rd27;\n\
+    shl.b64 %rd31, %rd31, 2;\n\
+    add.u64 %rd31, %rd2, %rd31;\n\
+    ld.global.f32 %f3, [%rd31];\n\
+    fma.rn.f32 %f1, %f2, %f3, %f1;\n\
+    // Restore ih,iw for next iteration (we subtracted pad above)\n\
+    add.u64 %rd28, %rd28, %rd14;\n\
+    add.u64 %rd29, %rd29, %rd15;\n\
+    bra CONV_KX_INC;\n\
+CONV_KX_INC_RESTORE:\n\
+    // Restore ih/iw after failed bounds check (pad was already subtracted)\n\
+    add.u64 %rd28, %rd28, %rd14;\n\
+    add.u64 %rd29, %rd29, %rd15;\n\
+CONV_KX_INC:\n\
+    add.u64 %rd27, %rd27, 1;\n\
+    bra CONV_KX;\n\
+CONV_KY_INC:\n\
+    add.u64 %rd26, %rd26, 1;\n\
+    bra CONV_KY;\n\
+CONV_CI_INC:\n\
+    add.u64 %rd25, %rd25, 1;\n\
+    bra CONV_CI;\n\
+CONV_BIAS:\n\
+    // Add bias if non-null\n\
+    setp.eq.u64 %p3, %rd3, 0;\n\
+    @%p3 bra CONV_STORE;\n\
+    shl.b64 %rd30, %rd23, 2;\n\
+    add.u64 %rd30, %rd3, %rd30;\n\
+    ld.global.f32 %f2, [%rd30];\n\
+    add.f32 %f1, %f1, %f2;\n\
+CONV_STORE:\n\
+    // Store out[flat_idx]\n\
+    shl.b64 %rd30, %rd0, 2;\n\
+    add.u64 %rd30, %rd4, %rd30;\n\
+    st.global.f32 [%rd30], %f1;\n\
+CONV_DONE: ret;\n\
+}\0";
+
+// ---------------------------------------------------------------------------
+// GPU MaxPool2d
+// Each thread computes one output element: out[n, c, oh, ow] = max over window
+// Also stores argmax index for backward pass.
+// Grid:  (total_output_elements / 256 + 1, 1, 1) — 1D flat launch
+// Block: (256, 1, 1)
+// Params: input ptr, out ptr, argmax ptr (i64 indices),
+//         N, C, H, W, kH, kW, stride, padding, H_out, W_out, total (all u64)
+//
+// Target: sm_80 (compatible sm_89, sm_90, sm_100 Blackwell)
+// ---------------------------------------------------------------------------
+pub(crate) const MAXPOOL2D_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_maxpool2d_f32(\n\
+    .param .u64 inp, .param .u64 out, .param .u64 argmax,\n\
+    .param .u64 N, .param .u64 C, .param .u64 H, .param .u64 W,\n\
+    .param .u64 kH, .param .u64 kW,\n\
+    .param .u64 stride, .param .u64 padding,\n\
+    .param .u64 H_out, .param .u64 W_out, .param .u64 total\n\
+) {\n\
+    .reg .u64 %rd<24>;\n\
+    .reg .u32 %r<4>;\n\
+    .reg .f32 %f<3>;\n\
+    .reg .pred %p<4>;\n\
+    // Global thread index\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r2, %tid.x;\n\
+    add.u32 %r1, %r1, %r2;\n\
+    cvt.u64.u32 %rd0, %r1;\n\
+    // Load params\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [argmax];\n\
+    ld.param.u64 %rd4, [N];\n\
+    ld.param.u64 %rd5, [C];\n\
+    ld.param.u64 %rd6, [H];\n\
+    ld.param.u64 %rd7, [W];\n\
+    ld.param.u64 %rd8, [kH];\n\
+    ld.param.u64 %rd9, [kW];\n\
+    ld.param.u64 %rd10, [stride];\n\
+    ld.param.u64 %rd11, [padding];\n\
+    ld.param.u64 %rd12, [H_out];\n\
+    ld.param.u64 %rd13, [W_out];\n\
+    ld.param.u64 %rd14, [total];\n\
+    // Bounds check\n\
+    setp.ge.u64 %p1, %rd0, %rd14;\n\
+    @%p1 bra MP_DONE;\n\
+    // Decompose flat index -> (n, c, oh, ow)\n\
+    rem.u64 %rd15, %rd0, %rd13;\n\
+    div.u64 %rd16, %rd0, %rd13;\n\
+    rem.u64 %rd17, %rd16, %rd12;\n\
+    div.u64 %rd18, %rd16, %rd12;\n\
+    rem.u64 %rd19, %rd18, %rd5;\n\
+    div.u64 %rd20, %rd18, %rd5;\n\
+    // max_val = -inf, max_idx = 0\n\
+    mov.f32 %f1, 0fFF800000;\n\
+    mov.u64 %rd21, 0;\n\
+    // Loop over kernel window\n\
+    mov.u64 %rd22, 0;\n\
+MP_KY:\n\
+    setp.ge.u64 %p1, %rd22, %rd8;\n\
+    @%p1 bra MP_WRITE;\n\
+    mov.u64 %rd23, 0;\n\
+MP_KX:\n\
+    setp.ge.u64 %p1, %rd23, %rd9;\n\
+    @%p1 bra MP_KY_INC;\n\
+    // ih = oh * stride + ky, iw = ow * stride + kx\n\
+    mul.lo.u64 %rd16, %rd17, %rd10;\n\
+    add.u64 %rd16, %rd16, %rd22;\n\
+    mul.lo.u64 %rd18, %rd15, %rd10;\n\
+    add.u64 %rd18, %rd18, %rd23;\n\
+    // Padding check\n\
+    setp.lt.u64 %p2, %rd16, %rd11;\n\
+    @%p2 bra MP_KX_INC;\n\
+    setp.lt.u64 %p2, %rd18, %rd11;\n\
+    @%p2 bra MP_KX_INC;\n\
+    sub.u64 %rd16, %rd16, %rd11;\n\
+    sub.u64 %rd18, %rd18, %rd11;\n\
+    setp.ge.u64 %p2, %rd16, %rd6;\n\
+    @%p2 bra MP_KX_INC;\n\
+    setp.ge.u64 %p2, %rd18, %rd7;\n\
+    @%p2 bra MP_KX_INC;\n\
+    // input_idx = n*C*H*W + c*H*W + ih*W + iw\n\
+    mul.lo.u64 %rd16, %rd20, %rd5;\n\
+    add.u64 %rd16, %rd16, %rd19;\n\
+    mul.lo.u64 %rd16, %rd16, %rd6;\n\
+    // ih was computed above but we used %rd16 — recompute\n\
+    mul.lo.u64 %rd18, %rd17, %rd10;\n\
+    add.u64 %rd18, %rd18, %rd22;\n\
+    sub.u64 %rd18, %rd18, %rd11;\n\
+    add.u64 %rd16, %rd16, %rd18;\n\
+    mul.lo.u64 %rd16, %rd16, %rd7;\n\
+    mul.lo.u64 %rd18, %rd15, %rd10;\n\
+    add.u64 %rd18, %rd18, %rd23;\n\
+    sub.u64 %rd18, %rd18, %rd11;\n\
+    add.u64 %rd16, %rd16, %rd18;\n\
+    // Load input value\n\
+    shl.b64 %rd18, %rd16, 2;\n\
+    add.u64 %rd18, %rd1, %rd18;\n\
+    ld.global.f32 %f2, [%rd18];\n\
+    // Compare with max\n\
+    setp.le.f32 %p3, %f2, %f1;\n\
+    @%p3 bra MP_KX_INC;\n\
+    mov.f32 %f1, %f2;\n\
+    mov.u64 %rd21, %rd16;\n\
+MP_KX_INC:\n\
+    add.u64 %rd23, %rd23, 1;\n\
+    bra MP_KX;\n\
+MP_KY_INC:\n\
+    add.u64 %rd22, %rd22, 1;\n\
+    bra MP_KY;\n\
+MP_WRITE:\n\
+    // Store max value\n\
+    shl.b64 %rd16, %rd0, 2;\n\
+    add.u64 %rd16, %rd2, %rd16;\n\
+    st.global.f32 [%rd16], %f1;\n\
+    // Store argmax index (as u64)\n\
+    shl.b64 %rd16, %rd0, 3;\n\
+    add.u64 %rd16, %rd3, %rd16;\n\
+    st.global.u64 [%rd16], %rd21;\n\
+MP_DONE: ret;\n\
+}\0";
