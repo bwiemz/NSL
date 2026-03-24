@@ -690,29 +690,27 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     ));
     let out_ptr = Box::into_raw(out);
 
-    // Compute per-batch strides for A and B
-    // A has batch shape a_batch; if a_batch is smaller or has 1s, stride is 0 for that dim
-    let a_mat_stride = (m * k) as usize;
-    let b_mat_stride = (k * n) as usize;
-    let c_mat_stride = (m * n) as usize;
+    // Compute per-batch strides (elements, not bytes)
+    let a_mat_stride = m * k; // elements per batch slice in A
+    let b_mat_stride = k * n; // elements per batch slice in B
+    let c_mat_stride = m * n; // elements per batch slice in C
 
-    // Determine if A and B broadcast: A broadcasts if its total batch < total_batch
+    // Broadcast: stride=0 means A or B is shared across all batches
     let a_total_batch: u64 = a_batch.iter().product::<i64>().max(1) as u64;
     let b_total_batch: u64 = b_batch.iter().product::<i64>().max(1) as u64;
+    let stride_a = if a_total_batch == 1 { 0u64 } else { a_mat_stride };
+    let stride_b = if b_total_batch == 1 { 0u64 } else { b_mat_stride };
+    let stride_c = c_mat_stride;
 
-    let block = 16i64;
-    let grid_x = ((n as i64) + block - 1) / block;
-    let grid_y = ((m as i64) + block - 1) / block;
+    if total_batch == 1 {
+        // Non-batched: use original 2D matmul kernel (simpler, no z-grid overhead)
+        let block = 16i64;
+        let grid_x = ((n as i64) + block - 1) / block;
+        let grid_y = ((m as i64) + block - 1) / block;
 
-    // Launch one kernel per batch slice
-    for batch_idx in 0..total_batch as usize {
-        // A offset: if A has no batch dims or broadcasts, reuse same slice
-        let a_idx = if a_total_batch == 1 { 0 } else { batch_idx };
-        let b_idx = if b_total_batch == 1 { 0 } else { batch_idx };
-
-        let mut a_data = (a.data as usize + a_idx * a_mat_stride * 4) as u64;
-        let mut b_data = (b.data as usize + b_idx * b_mat_stride * 4) as u64;
-        let mut c_data = (out_data as usize + batch_idx * c_mat_stride * 4) as u64;
+        let mut a_data = a.data as u64;
+        let mut b_data = b.data as u64;
+        let mut c_data = out_data as u64;
         let mut m_val = m;
         let mut n_val = n;
         let mut k_val = k;
@@ -733,7 +731,46 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             [block, block, 1],
             &args, 0,
         );
-        assert_eq!(result as u32, 0, "GPU matmul kernel failed at batch {}: {}", batch_idx, result as u32);
+        assert_eq!(result as u32, 0, "GPU matmul kernel failed: {}", result as u32);
+    } else {
+        // Batched: single launch with blockIdx.z = batch dimension
+        let block = 16i64;
+        let grid_x = ((n as i64) + block - 1) / block;
+        let grid_y = ((m as i64) + block - 1) / block;
+        let grid_z = total_batch as i64;
+
+        let mut a_data = a.data as u64;
+        let mut b_data = b.data as u64;
+        let mut c_data = out_data as u64;
+        let mut m_val = m;
+        let mut n_val = n;
+        let mut k_val = k;
+        let mut batch_val = total_batch;
+        let mut sa_val = stride_a;
+        let mut sb_val = stride_b;
+        let mut sc_val = stride_c;
+
+        let args: [*mut std::ffi::c_void; 10] = [
+            &mut a_data as *mut _ as *mut std::ffi::c_void,
+            &mut b_data as *mut _ as *mut std::ffi::c_void,
+            &mut c_data as *mut _ as *mut std::ffi::c_void,
+            &mut m_val as *mut _ as *mut std::ffi::c_void,
+            &mut n_val as *mut _ as *mut std::ffi::c_void,
+            &mut k_val as *mut _ as *mut std::ffi::c_void,
+            &mut batch_val as *mut _ as *mut std::ffi::c_void,
+            &mut sa_val as *mut _ as *mut std::ffi::c_void,
+            &mut sb_val as *mut _ as *mut std::ffi::c_void,
+            &mut sc_val as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let result = inner::kernel_launch(
+            fused_kernels::BMM_F32_PTX.as_ptr(),
+            b"nsl_bmm_f32\0".as_ptr(),
+            [grid_x, grid_y, grid_z],
+            [block, block, 1],
+            &args, 0,
+        );
+        assert_eq!(result as u32, 0, "GPU BMM kernel failed: {}", result as u32);
     }
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
