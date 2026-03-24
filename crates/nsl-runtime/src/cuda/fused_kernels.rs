@@ -782,3 +782,152 @@ RMS_NORM_LOOP:\n\
     bra RMS_NORM_LOOP;\n\
 RMS_DONE: ret;\n\
 }\0";
+
+// ---------------------------------------------------------------------------
+// GPU Scatter-Add (for embedding backward / gradient accumulation)
+// Thread (i, j): atomicAdd(out[indices[i], j], src[i, j])
+// Grid:  (ceil(num_indices / 16), ceil(embed_dim / 16), 1)
+// Block: (16, 16, 1)
+// Params: src ptr (grad), indices ptr, out ptr (grad_weight),
+//         num_indices (u64), embed_dim (u64), vocab_size (u64)
+//
+// Uses atomicAdd (atom.global.add.f32) since multiple indices may alias
+// the same row in the output — this is the standard embedding backward pattern.
+//
+// Target: sm_80 (Ampere base, compatible with Ada Lovelace sm_89, Hopper sm_90, Blackwell sm_100)
+// ---------------------------------------------------------------------------
+pub(crate) const SCATTER_ADD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_scatter_add_f32(\n\
+    .param .u64 src, .param .u64 indices, .param .u64 out,\n\
+    .param .u64 num_indices, .param .u64 embed_dim, .param .u64 vocab_size\n\
+) {\n\
+    .reg .u64 %rd<16>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f1;\n\
+    .reg .pred %p<3>;\n\
+    // i = blockIdx.x * blockDim.x + threadIdx.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r2, %tid.x;\n\
+    add.u32 %r1, %r1, %r2;\n\
+    // j = blockIdx.y * blockDim.y + threadIdx.y\n\
+    mov.u32 %r3, %ctaid.y;\n\
+    mov.u32 %r4, %ntid.y;\n\
+    mul.lo.u32 %r3, %r3, %r4;\n\
+    mov.u32 %r4, %tid.y;\n\
+    add.u32 %r3, %r3, %r4;\n\
+    // Load params\n\
+    ld.param.u64 %rd1, [src];\n\
+    ld.param.u64 %rd2, [indices];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [num_indices];\n\
+    ld.param.u64 %rd5, [embed_dim];\n\
+    ld.param.u64 %rd6, [vocab_size];\n\
+    // Bounds check: i < num_indices, j < embed_dim\n\
+    cvt.u64.u32 %rd7, %r1;\n\
+    cvt.u64.u32 %rd8, %r3;\n\
+    setp.ge.u64 %p1, %rd7, %rd4;\n\
+    @%p1 bra SA_DONE;\n\
+    setp.ge.u64 %p2, %rd8, %rd5;\n\
+    @%p2 bra SA_DONE;\n\
+    // Load index: idx = (int)indices[i]\n\
+    shl.b64 %rd9, %rd7, 2;\n\
+    add.u64 %rd9, %rd2, %rd9;\n\
+    ld.global.f32 %f1, [%rd9];\n\
+    cvt.rzi.u64.f32 %rd10, %f1;\n\
+    // Bounds check: idx < vocab_size\n\
+    setp.ge.u64 %p1, %rd10, %rd6;\n\
+    @%p1 bra SA_DONE;\n\
+    // Load src[i, j] = src[i * embed_dim + j]\n\
+    mul.lo.u64 %rd11, %rd7, %rd5;\n\
+    add.u64 %rd11, %rd11, %rd8;\n\
+    shl.b64 %rd11, %rd11, 2;\n\
+    add.u64 %rd11, %rd1, %rd11;\n\
+    ld.global.f32 %f1, [%rd11];\n\
+    // Atomic add: out[idx, j] += src[i, j]\n\
+    // out_addr = out + (idx * embed_dim + j) * 4\n\
+    mul.lo.u64 %rd12, %rd10, %rd5;\n\
+    add.u64 %rd12, %rd12, %rd8;\n\
+    shl.b64 %rd12, %rd12, 2;\n\
+    add.u64 %rd12, %rd3, %rd12;\n\
+    atom.global.add.f32 %f1, [%rd12], %f1;\n\
+SA_DONE: ret;\n\
+}\0";
+
+// ---------------------------------------------------------------------------
+// GPU Gather (general dim-0 gather for any 2D+ tensor)
+// Thread (i, j): out[i, j] = input[indices[i], j]
+// Grid:  (ceil(num_indices / 16), ceil(inner_dim / 16), 1)
+// Block: (16, 16, 1)
+// Params: input ptr, indices ptr, out ptr,
+//         num_indices (u64), inner_dim (u64), input_rows (u64)
+//
+// Identical to embedding lookup but with explicit bounds checking on input_rows.
+// Target: sm_80 (compatible sm_89, sm_90, sm_100 Blackwell)
+// ---------------------------------------------------------------------------
+pub(crate) const GATHER_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_gather_f32(\n\
+    .param .u64 input, .param .u64 indices, .param .u64 out,\n\
+    .param .u64 num_indices, .param .u64 inner_dim, .param .u64 input_rows\n\
+) {\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<2>;\n\
+    .reg .pred %p<3>;\n\
+    // i = blockIdx.x * blockDim.x + threadIdx.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r2, %tid.x;\n\
+    add.u32 %r1, %r1, %r2;\n\
+    // j = blockIdx.y * blockDim.y + threadIdx.y\n\
+    mov.u32 %r3, %ctaid.y;\n\
+    mov.u32 %r4, %ntid.y;\n\
+    mul.lo.u32 %r3, %r3, %r4;\n\
+    mov.u32 %r4, %tid.y;\n\
+    add.u32 %r3, %r3, %r4;\n\
+    // Load params\n\
+    ld.param.u64 %rd1, [input];\n\
+    ld.param.u64 %rd2, [indices];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [num_indices];\n\
+    ld.param.u64 %rd5, [inner_dim];\n\
+    ld.param.u64 %rd6, [input_rows];\n\
+    // Bounds check\n\
+    cvt.u64.u32 %rd7, %r1;\n\
+    cvt.u64.u32 %rd8, %r3;\n\
+    setp.ge.u64 %p1, %rd7, %rd4;\n\
+    @%p1 bra G_DONE;\n\
+    setp.ge.u64 %p2, %rd8, %rd5;\n\
+    @%p2 bra G_DONE;\n\
+    // Load index: idx = (int)indices[i]\n\
+    shl.b64 %rd9, %rd7, 2;\n\
+    add.u64 %rd9, %rd2, %rd9;\n\
+    ld.global.f32 %f1, [%rd9];\n\
+    cvt.rzi.u64.f32 %rd10, %f1;\n\
+    // Bounds check: idx < input_rows\n\
+    setp.ge.u64 %p1, %rd10, %rd6;\n\
+    @%p1 bra G_DONE;\n\
+    // Load input[idx, j]\n\
+    mul.lo.u64 %rd11, %rd10, %rd5;\n\
+    add.u64 %rd11, %rd11, %rd8;\n\
+    shl.b64 %rd11, %rd11, 2;\n\
+    add.u64 %rd11, %rd1, %rd11;\n\
+    ld.global.f32 %f1, [%rd11];\n\
+    // Store out[i, j]\n\
+    mul.lo.u64 %rd12, %rd7, %rd5;\n\
+    add.u64 %rd12, %rd12, %rd8;\n\
+    shl.b64 %rd12, %rd12, 2;\n\
+    add.u64 %rd12, %rd3, %rd12;\n\
+    st.global.f32 [%rd12], %f1;\n\
+G_DONE: ret;\n\
+}\0";

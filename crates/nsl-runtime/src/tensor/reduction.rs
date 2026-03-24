@@ -457,10 +457,21 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
 /// Gather along a dimension: output[b] = tensor[b, indices[b]] (for dim=1, 2D input).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64) -> i64 {
-    // GPU dispatch: transfer both tensors to CPU, compute, transfer result back.
+    // GPU dispatch: native GPU gather kernel (dim 0) or CPU-redirect (other dims).
     {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.device > 0 {
+            let ndim = tensor.ndim;
+            let d = if dim < 0 { ndim + dim } else { dim };
+            #[cfg(feature = "cuda")]
+            if d == 0 {
+                // Native GPU gather along dim 0
+                let t_c = nsl_tensor_contiguous(tensor_ptr);
+                let result = crate::cuda::gpu_gather_f32(t_c, indices_ptr);
+                if t_c != tensor_ptr { super::nsl_tensor_free(t_c); }
+                return result;
+            }
+            // Fallback for non-zero dims: CPU redirect
             let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
             let cpu_i = super::nsl_tensor_to_device(indices_ptr, 0);
             let result = nsl_tensor_gather(cpu_t, dim, cpu_i);

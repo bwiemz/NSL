@@ -1606,6 +1606,190 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     NslTensor::publish(out)
 }
 
+// ---------------------------------------------------------------------------
+// GPU Scatter-Add (embedding backward / index-based gradient accumulation)
+// ---------------------------------------------------------------------------
+
+/// GPU scatter_add: out[indices[i], j] += src[i, j] for all (i, j).
+/// Uses atomicAdd for thread safety (multiple indices may alias the same row).
+/// `out` must be pre-zeroed. Both src and indices must be on GPU.
+/// Returns a new GPU tensor of shape [vocab_size, embed_dim].
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_scatter_add_f32(
+    src_ptr: i64,
+    indices_ptr: i64,
+    vocab_size: u64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::SCATTER_ADD_F32_PTX;
+
+    let src = unsafe { &*(src_ptr as *const NslTensor) };
+    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+
+    let num_indices = unsafe { *indices.shape.add(0) } as u64;
+    let embed_dim = unsafe { *src.shape.add(src.ndim as usize - 1) } as u64;
+
+    // Allocate output: [vocab_size, embed_dim], zeroed
+    let out_elems = (vocab_size * embed_dim) as usize;
+    let out_data = inner::alloc_managed(out_elems * 4); // f32
+    // Zero the output (scatter_add accumulates into it)
+    unsafe {
+        std::ptr::write_bytes(out_data as *mut u8, 0, out_elems * 4);
+    }
+
+    // Ensure indices are on GPU
+    let indices_on_gpu = if indices.device == 0 {
+        crate::tensor::nsl_tensor_to_device(indices_ptr, src.device as i64)
+    } else {
+        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        indices_ptr
+    };
+    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+
+    let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = vocab_size as i64;
+        *out_shape.add(1) = embed_dim as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+
+    let mut s_data = src.data as u64;
+    let mut i_data = indices_gpu.data as u64;
+    let mut o_data = out_data as u64;
+    let mut n_indices = num_indices;
+    let mut emb_dim = embed_dim;
+    let mut vocab = vocab_size;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut s_data as *mut _ as *mut std::ffi::c_void,
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_indices as *mut _ as *mut std::ffi::c_void,
+        &mut emb_dim as *mut _ as *mut std::ffi::c_void,
+        &mut vocab as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block_x = 16i64;
+    let block_y = 16i64;
+    let grid_x = ((num_indices as i64) + block_x - 1) / block_x;
+    let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
+
+    let result = inner::kernel_launch(
+        SCATTER_ADD_F32_PTX.as_ptr(), b"nsl_scatter_add_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU scatter_add kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    crate::tensor::nsl_tensor_free(indices_on_gpu);
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        (vocab_size * embed_dim) as i64,
+        src.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+// ---------------------------------------------------------------------------
+// GPU Gather (general dim-0 gather)
+// ---------------------------------------------------------------------------
+
+/// GPU gather along dim 0: out[i, :] = input[indices[i], :].
+/// Works on any 2D+ tensor — flattens trailing dims into `inner_dim`.
+/// Both input and indices must be on GPU (f32).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::GATHER_F32_PTX;
+
+    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+
+    let input_rows = unsafe { *input.shape.add(0) } as u64;
+    let inner_dim: u64 = if input.ndim >= 2 {
+        (1..input.ndim as usize).map(|d| unsafe { *input.shape.add(d) } as u64).product()
+    } else {
+        1
+    };
+    let num_indices = indices.len as u64;
+
+    // Allocate output: [num_indices, inner_dim]
+    let out_elems = (num_indices * inner_dim) as usize;
+    let out_data = inner::alloc_managed(out_elems * 4); // f32
+
+    // Ensure indices on GPU
+    let indices_on_gpu = if indices.device == 0 {
+        crate::tensor::nsl_tensor_to_device(indices_ptr, input.device as i64)
+    } else {
+        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        indices_ptr
+    };
+    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+
+    // Build output shape: [num_indices, dim1, dim2, ...]
+    let out_ndim = input.ndim;
+    let out_shape = crate::memory::checked_alloc(out_ndim as usize * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = num_indices as i64;
+        for d in 1..out_ndim as usize {
+            *out_shape.add(d) = *input.shape.add(d);
+        }
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+
+    let mut i_data = input.data as u64;
+    let mut idx_data = indices_gpu.data as u64;
+    let mut o_data = out_data as u64;
+    let mut n_idx = num_indices;
+    let mut inner = inner_dim;
+    let mut rows = input_rows;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut idx_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_idx as *mut _ as *mut std::ffi::c_void,
+        &mut inner as *mut _ as *mut std::ffi::c_void,
+        &mut rows as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block_x = 16i64;
+    let block_y = 16i64;
+    let grid_x = ((num_indices as i64) + block_x - 1) / block_x;
+    let grid_y = ((inner_dim as i64) + block_y - 1) / block_y;
+
+    let result = inner::kernel_launch(
+        GATHER_F32_PTX.as_ptr(), b"nsl_gather_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU gather kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    crate::tensor::nsl_tensor_free(indices_on_gpu);
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        out_ndim,
+        (num_indices * inner_dim) as i64,
+        input.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
