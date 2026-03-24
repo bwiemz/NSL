@@ -15,7 +15,7 @@
 // ---------------------------------------------------------------------------
 pub(crate) const EMBEDDING_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_embedding_f32(\n\
@@ -73,7 +73,7 @@ DONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const BIAS_ADD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_bias_add_f32(\n\
@@ -121,7 +121,7 @@ DONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const SOFTMAX_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_softmax_f32(\n\
@@ -256,7 +256,7 @@ DONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const SUM_DIM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sum_dim_f32(\n\
@@ -310,7 +310,9 @@ SUM_LOOP:\n\
 SUM_DONE:\n\
     // Store partial sum to shared memory\n\
     mul.lo.u32 %r3, %r2, 4;\n\
-    st.shared.f32 [sdata + %r3], %f1;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
     bar.sync 0;\n\
     // Tree reduction in shared memory\n\
     mov.u32 %r4, 128;\n\
@@ -322,10 +324,16 @@ REDUCE_LOOP:\n\
     mul.lo.u32 %r5, %r2, 4;\n\
     add.u32 %r6, %r2, %r4;\n\
     mul.lo.u32 %r6, %r6, 4;\n\
-    ld.shared.f32 %f2, [sdata + %r5];\n\
-    ld.shared.f32 %f3, [sdata + %r6];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    ld.shared.f32 %f2, [%r7];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f3, [%r7];\n\
     add.f32 %f2, %f2, %f3;\n\
-    st.shared.f32 [sdata + %r5], %f2;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    st.shared.f32 [%r7], %f2;\n\
 SKIP_REDUCE:\n\
     bar.sync 0;\n\
     shr.u32 %r4, %r4, 1;\n\
@@ -351,7 +359,7 @@ DONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const MAX_DIM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_max_dim_f32(\n\
@@ -396,7 +404,9 @@ MAX_LOOP:\n\
     bra MAX_LOOP;\n\
 MAX_DONE:\n\
     mul.lo.u32 %r3, %r2, 4;\n\
-    st.shared.f32 [sdata + %r3], %f1;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
     bar.sync 0;\n\
     mov.u32 %r4, 128;\n\
 REDUCE_LOOP:\n\
@@ -407,10 +417,16 @@ REDUCE_LOOP:\n\
     mul.lo.u32 %r5, %r2, 4;\n\
     add.u32 %r6, %r2, %r4;\n\
     mul.lo.u32 %r6, %r6, 4;\n\
-    ld.shared.f32 %f2, [sdata + %r5];\n\
-    ld.shared.f32 %f3, [sdata + %r6];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    ld.shared.f32 %f2, [%r7];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f3, [%r7];\n\
     max.f32 %f2, %f2, %f3;\n\
-    st.shared.f32 [sdata + %r5], %f2;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    st.shared.f32 [%r7], %f2;\n\
 SKIP_REDUCE:\n\
     bar.sync 0;\n\
     shr.u32 %r4, %r4, 1;\n\
@@ -434,7 +450,7 @@ DONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const GLOBAL_SUM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_global_sum_f32(\n\
@@ -465,7 +481,9 @@ GSUM_LOOP:\n\
     bra GSUM_LOOP;\n\
 GSUM_DONE:\n\
     mul.lo.u32 %r3, %r2, 4;\n\
-    st.shared.f32 [sdata + %r3], %f1;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
     bar.sync 0;\n\
     mov.u32 %r4, 128;\n\
 GREDUCE_LOOP:\n\
@@ -476,10 +494,16 @@ GREDUCE_LOOP:\n\
     mul.lo.u32 %r5, %r2, 4;\n\
     add.u32 %r6, %r2, %r4;\n\
     mul.lo.u32 %r6, %r6, 4;\n\
-    ld.shared.f32 %f2, [sdata + %r5];\n\
-    ld.shared.f32 %f3, [sdata + %r6];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    ld.shared.f32 %f2, [%r7];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f3, [%r7];\n\
     add.f32 %f2, %f2, %f3;\n\
-    st.shared.f32 [sdata + %r5], %f2;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    st.shared.f32 [%r7], %f2;\n\
 GSKIP:\n\
     bar.sync 0;\n\
     shr.u32 %r4, %r4, 1;\n\
@@ -505,7 +529,7 @@ GDONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const LAYERNORM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_layernorm_f32(\n\
@@ -552,7 +576,9 @@ LN_MEAN_LOOP:\n\
     bra LN_MEAN_LOOP;\n\
 LN_MEAN_DONE:\n\
     mul.lo.u32 %r3, %r2, 4;\n\
-    st.shared.f32 [sdata + %r3], %f1;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
     bar.sync 0;\n\
     // Reduce sum for mean (thread 0)\n\
     setp.ne.u32 %p3, %r2, 0;\n\
@@ -563,7 +589,9 @@ LN_RMEAN:\n\
     setp.ge.u32 %p2, %r4, %r5;\n\
     @%p2 bra LN_DMEAN;\n\
     mul.lo.u32 %r6, %r4, 4;\n\
-    ld.shared.f32 %f3, [sdata + %r6];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f3, [%r7];\n\
     add.f32 %f1, %f1, %f3;\n\
     add.u32 %r4, %r4, 1;\n\
     bra LN_RMEAN;\n\
@@ -592,7 +620,9 @@ LN_VAR_LOOP:\n\
     bra LN_VAR_LOOP;\n\
 LN_VAR_DONE:\n\
     mul.lo.u32 %r3, %r2, 4;\n\
-    st.shared.f32 [sdata + %r3], %f1;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
     bar.sync 0;\n\
     // Reduce sum for variance (thread 0)\n\
     @%p3 bra LN_SKIP_VAR;\n\
@@ -601,7 +631,9 @@ LN_RVAR:\n\
     setp.ge.u32 %p2, %r4, %r5;\n\
     @%p2 bra LN_DVAR;\n\
     mul.lo.u32 %r6, %r4, 4;\n\
-    ld.shared.f32 %f3, [sdata + %r6];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f3, [%r7];\n\
     add.f32 %f1, %f1, %f3;\n\
     add.u32 %r4, %r4, 1;\n\
     bra LN_RVAR;\n\
@@ -653,7 +685,7 @@ LN_DONE: ret;\n\
 // ---------------------------------------------------------------------------
 pub(crate) const RMSNORM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_80\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_rmsnorm_f32(\n\
@@ -700,7 +732,9 @@ RMS_SQ_LOOP:\n\
     bra RMS_SQ_LOOP;\n\
 RMS_SQ_DONE:\n\
     mul.lo.u32 %r3, %r2, 4;\n\
-    st.shared.f32 [sdata + %r3], %f1;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
     bar.sync 0;\n\
     // Reduce sum_sq (thread 0)\n\
     setp.ne.u32 %p3, %r2, 0;\n\
@@ -711,7 +745,9 @@ RMS_RLOOP:\n\
     setp.ge.u32 %p2, %r4, %r5;\n\
     @%p2 bra RMS_RDONE;\n\
     mul.lo.u32 %r6, %r4, 4;\n\
-    ld.shared.f32 %f4, [sdata + %r6];\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f4, [%r7];\n\
     add.f32 %f1, %f1, %f4;\n\
     add.u32 %r4, %r4, 1;\n\
     bra RMS_RLOOP;\n\
