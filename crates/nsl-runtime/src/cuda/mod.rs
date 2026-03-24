@@ -1279,6 +1279,333 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
     NslTensor::publish(out)
 }
 
+/// GPU per-dimension sum reduction. Input must be on GPU (f32), contiguous.
+/// Returns a new GPU tensor with the reduced dimension removed (or kept as 1 if keepdim).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::SUM_DIM_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+
+    let reduce_size = shape_slice[dim] as u64;
+
+    // Compute outer = product of dims before dim
+    let outer: u64 = shape_slice[..dim].iter().map(|&s| s as u64).product::<u64>().max(1);
+    // Compute inner = product of dims after dim
+    let inner: u64 = shape_slice[dim + 1..].iter().map(|&s| s as u64).product::<u64>().max(1);
+
+    let out_total = (outer * inner) as usize;
+    let out_data = inner::alloc_managed(out_total * 4); // f32
+
+    // Build output shape
+    let out_shape_vec: Vec<i64> = if keepdim {
+        shape_slice.iter().enumerate()
+            .map(|(i, &s)| if i == dim { 1 } else { s })
+            .collect()
+    } else {
+        shape_slice.iter().enumerate()
+            .filter(|&(i, _)| i != dim)
+            .map(|(_, &s)| s)
+            .collect()
+    };
+
+    let out_ndim = out_shape_vec.len() as i64;
+    let out_shape = crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &v) in out_shape_vec.iter().enumerate() {
+        unsafe { *out_shape.add(i) = v };
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut outer_val = outer;
+    let mut reduce_val = reduce_size;
+    let mut inner_val = inner;
+
+    let args: [*mut std::ffi::c_void; 5] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut outer_val as *mut _ as *mut std::ffi::c_void,
+        &mut reduce_val as *mut _ as *mut std::ffi::c_void,
+        &mut inner_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = out_total as i64;
+
+    let result = inner::kernel_launch(
+        SUM_DIM_F32_PTX.as_ptr(), b"nsl_sum_dim_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU sum_dim kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_total as i64,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+/// GPU global sum reduction (all elements to a single scalar). Input must be on GPU (f32), contiguous.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::GLOBAL_SUM_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let n = t.len as u64;
+
+    let out_data = inner::alloc_managed(4); // single f32
+
+    let out_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *out_shape = 1 };
+    let out_strides = NslTensor::compute_strides(out_shape, 1);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut n_val = n;
+
+    let args: [*mut std::ffi::c_void; 3] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = 1i64;
+
+    let result = inner::kernel_launch(
+        GLOBAL_SUM_F32_PTX.as_ptr(), b"nsl_global_sum_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU global_sum kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        1,
+        1,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+/// GPU per-dimension max reduction. Input must be on GPU (f32), contiguous.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::MAX_DIM_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+
+    let reduce_size = shape_slice[dim] as u64;
+    let outer: u64 = shape_slice[..dim].iter().map(|&s| s as u64).product::<u64>().max(1);
+    let inner: u64 = shape_slice[dim + 1..].iter().map(|&s| s as u64).product::<u64>().max(1);
+
+    let out_total = (outer * inner) as usize;
+    let out_data = inner::alloc_managed(out_total * 4);
+
+    let out_shape_vec: Vec<i64> = if keepdim {
+        shape_slice.iter().enumerate()
+            .map(|(i, &s)| if i == dim { 1 } else { s })
+            .collect()
+    } else {
+        shape_slice.iter().enumerate()
+            .filter(|&(i, _)| i != dim)
+            .map(|(_, &s)| s)
+            .collect()
+    };
+
+    let out_ndim = out_shape_vec.len() as i64;
+    let out_shape = crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &v) in out_shape_vec.iter().enumerate() {
+        unsafe { *out_shape.add(i) = v };
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut outer_val = outer;
+    let mut reduce_val = reduce_size;
+    let mut inner_val = inner;
+
+    let args: [*mut std::ffi::c_void; 5] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut outer_val as *mut _ as *mut std::ffi::c_void,
+        &mut reduce_val as *mut _ as *mut std::ffi::c_void,
+        &mut inner_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = out_total as i64;
+
+    let result = inner::kernel_launch(
+        MAX_DIM_F32_PTX.as_ptr(), b"nsl_max_dim_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU max_dim kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_total as i64,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+/// GPU LayerNorm: fused mean + variance + normalize + scale + shift.
+/// Input, gamma, beta must all be on GPU (f32), contiguous.
+/// Normalizes along the last dimension.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, eps: f32) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::LAYERNORM_F32_PTX;
+
+    let t = NslTensor::from_ptr(input_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (t.len as u64) / cols;
+
+    let total = t.len as usize;
+    let out_data = inner::alloc_managed(total * 4);
+    let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
+
+    let g = NslTensor::from_ptr(gamma_ptr);
+    let b = NslTensor::from_ptr(beta_ptr);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut g_data = g.data as u64;
+    let mut b_data = b.data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+        &mut eps_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = rows as i64;
+
+    let result = inner::kernel_launch(
+        LAYERNORM_F32_PTX.as_ptr(), b"nsl_layernorm_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU layernorm kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        t.ndim,
+        t.len,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+/// GPU RMSNorm: fused rms + normalize + scale.
+/// Input, gamma must be on GPU (f32), contiguous.
+/// Normalizes along the last dimension.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::RMSNORM_F32_PTX;
+
+    let t = NslTensor::from_ptr(input_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (t.len as u64) / cols;
+
+    let total = t.len as usize;
+    let out_data = inner::alloc_managed(total * 4);
+    let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
+
+    let g = NslTensor::from_ptr(gamma_ptr);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut g_data = g.data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+        &mut eps_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = rows as i64;
+
+    let result = inner::kernel_launch(
+        RMSNORM_F32_PTX.as_ptr(), b"nsl_rmsnorm_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        t.ndim,
+        t.len,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
