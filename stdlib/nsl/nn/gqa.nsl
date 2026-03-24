@@ -49,18 +49,9 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout
         let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
         let v_exp = v5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
 
-        # Attention: QK^T / sqrt(d) + causal mask
-        let scale_denom = sqrt(full([1], float(hd)))
-        let scores = (q_rope @ k_exp.transpose(2, 3)) / scale_denom
-        let mask = causal_mask(seq_len)
-        let masked = scores + mask
-        let attn_weights = softmax(masked, 3)
-
-        # Attention dropout (only during training)
-        let attn_drop = dropout(attn_weights, dp, training)
-
-        # Weighted sum of values
-        let attn_out = attn_drop @ v_exp
+        # Fused attention: uses FlashAttention when on GPU, naive when on CPU
+        let scale = 1.0 / sqrt(float(hd))
+        let attn_out = scaled_dot_product_attention(q_rope, k_exp, v_exp, scale, true)
 
         # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, d_model]
         let attn_t = attn_out.transpose(1, 2)

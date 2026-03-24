@@ -1199,6 +1199,63 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     NslTensor::publish(out)
 }
 
+/// GPU softmax along the last dimension. One thread block per row.
+/// Input must be on GPU (f32). Output allocated via alloc_managed.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::SOFTMAX_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+
+    // Softmax along last dimension
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (t.len as u64) / cols;
+
+    let total = t.len as usize;
+    let out_data = inner::alloc_managed(total * 4); // f32
+    let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+
+    let args: [*mut std::ffi::c_void; 4] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    // One block per row, 256 threads per block
+    let block = 256i64;
+    let grid = rows as i64;
+
+    let result = inner::kernel_launch(
+        SOFTMAX_F32_PTX.as_ptr(), b"nsl_softmax_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2, // shared mem: smax[256] + ssum[256]
+    );
+    assert_eq!(result as u32, 0, "GPU softmax kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        t.ndim,
+        t.len,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;

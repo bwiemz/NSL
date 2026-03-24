@@ -463,10 +463,27 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 /// Softmax along a dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
-    // GPU dispatch: transfer to CPU, compute, transfer back.
+    // GPU dispatch: native GPU softmax kernel (last dim) or CPU-redirect (other dims)
     {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.device > 0 {
+            // Normalize dim
+            let ndim = tensor.ndim;
+            let d = if dim < 0 { ndim + dim } else { dim };
+            // Native GPU kernel for last-dim softmax (the common case)
+            if d == ndim - 1 {
+                #[cfg(feature = "cuda")]
+                {
+                    // Ensure contiguous for GPU kernel
+                    let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
+                    let result = crate::cuda::gpu_softmax_f32(c_ptr);
+                    if c_ptr != tensor_ptr {
+                        super::nsl_tensor_free(c_ptr);
+                    }
+                    return result;
+                }
+            }
+            // Non-last-dim: CPU redirect
             let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
             let result = nsl_tensor_softmax(cpu_t, dim);
             let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
