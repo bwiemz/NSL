@@ -22,12 +22,12 @@ print("Model on GPU")
 print("================================================================")
 print("  NSL-Coder-50M Pretraining (GPU)")
 print("  48.8M parameters | 8 layers | D=512 | GQA 8Q/4KV")
-print("  batch=32, seq=1024, RTX 5070 Ti")
+print("  batch=4, seq=1024, RTX 5070 Ti")
 print("================================================================")
 
 # ── Data ──
 let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)
+let loader = DataLoader(tokens, batch_size=4, seq_len=1024, shuffle=false, drop_last=true)
 
 # ── Metrics ──
 let step = 0
@@ -50,16 +50,16 @@ for batch in loader:
     # Forward pass (GPU)
     let logits = m.forward_train(input_ids, false)
 
-    # Compute loss on CPU
+    # Compute loss on CPU: [B, S, V] -> [B*S, V]
     let logits_cpu = logits.to(cpu)
     let ls = logits_cpu.shape
-    let flat_logits = logits_cpu.reshape([ls[1], ls[2]])
-    let flat_labels = labels.reshape([ls[1]])
+    let flat_logits = logits_cpu.reshape([ls[0] * ls[1], ls[2]])
+    let flat_labels = labels.reshape([ls[0] * ls[1]])
     let loss = cross_entropy(flat_logits, flat_labels)
     let loss_val = loss.item()
 
-    # Update metrics (batch_size=32 * seq_len=1024 = 32768 tokens/step)
-    total_tokens = total_tokens + 32768
+    # Update metrics (batch_size=4 * seq_len=1024 = 4096 tokens/step)
+    total_tokens = total_tokens + 4096
     running_loss = running_loss * 0.99 + loss_val * 0.01
     if step == 0:
         running_loss = loss_val

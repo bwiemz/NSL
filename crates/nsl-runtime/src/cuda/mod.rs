@@ -164,14 +164,19 @@ pub(crate) mod inner {
         CUDA_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
     }
 
-    /// Free unified memory.
-    /// Free GPU memory allocated by alloc_managed.
-    /// Currently leaks GPU memory intentionally — cuMemFree returns
-    /// CUDA_ERROR_ILLEGAL_ADDRESS on RTX 5070 Ti even with CUDA 13.2,
-    /// corrupting driver state. GPU memory is reclaimed at process exit.
-    /// TODO: investigate cross-thread CUDA context ownership for cuMemFree.
-    pub(crate) fn free_managed(_ptr: *mut c_void) {
-        // Intentionally no-op. GPU memory reclaimed at process exit.
+    /// Free unified memory allocated by alloc_managed.
+    /// Uses tracking set to prevent double-free and skip non-CUDA pointers.
+    pub(crate) fn free_managed(ptr: *mut c_void) {
+        if ptr.is_null() { return; }
+        let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        if !was_cuda { return; }
+        ensure_context();
+        unsafe {
+            let result = cuMemFree_v2(ptr as CUdeviceptr);
+            if result != CUresult::CUDA_SUCCESS {
+                eprintln!("nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
+            }
+        }
     }
 
     /// Allocate device-only memory (not accessible from host without explicit copy).
