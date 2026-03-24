@@ -3,8 +3,7 @@
 
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
-#[cfg(feature = "cuda")]
-use std::sync::atomic::{AtomicI64, Ordering};
+// AtomicI64 and Ordering used by inner module functions when cuda feature is enabled
 
 pub(crate) mod kernels;
 pub(crate) mod fused_kernels;
@@ -638,41 +637,52 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
     let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
 
-    let m = a_shape[a.ndim as usize - 2] as u64;
-    let k = a_shape[a.ndim as usize - 1] as u64;
-    let k2 = b_shape[b.ndim as usize - 2] as u64;
-    let n = b_shape[b.ndim as usize - 1] as u64;
+    let a_nd = a.ndim as usize;
+    let b_nd = b.ndim as usize;
+
+    let m = a_shape[a_nd - 2] as u64;
+    let k = a_shape[a_nd - 1] as u64;
+    let k2 = b_shape[b_nd - 2] as u64;
+    let n = b_shape[b_nd - 1] as u64;
     assert_eq!(k, k2, "matmul inner dimension mismatch: {} vs {}", k, k2);
 
-    debug_assert!(m > 0 && k > 0 && n > 0,
-        "gpu_matmul_f32: invalid dimensions m={}, k={}, n={}", m, k, n);
+    // Compute broadcast batch dimensions (all dims before last two)
+    let a_batch = &a_shape[..a_nd - 2];
+    let b_batch = &b_shape[..b_nd - 2];
+    let max_batch_nd = a_batch.len().max(b_batch.len());
 
-    let a_len = a.len as u64;
-    let b_len = b.len as u64;
-    // Validate tensor sizes match declared dimensions
-    if (m * k) > a_len || (k * n) > b_len {
-        eprintln!("[nsl] gpu_matmul_f32: tensor size mismatch — A[{}x{}] needs {} elements (has {}), B[{}x{}] needs {} elements (has {})",
-            m, k, m*k, a_len, k, n, k*n, b_len);
+    let mut out_batch: Vec<i64> = Vec::with_capacity(max_batch_nd);
+    for i in 0..max_batch_nd {
+        let a_dim = if i < max_batch_nd - a_batch.len() { 1 } else { a_batch[i - (max_batch_nd - a_batch.len())] };
+        let b_dim = if i < max_batch_nd - b_batch.len() { 1 } else { b_batch[i - (max_batch_nd - b_batch.len())] };
+        assert!(a_dim == b_dim || a_dim == 1 || b_dim == 1,
+            "matmul batch dim mismatch at {}: {} vs {}", i, a_dim, b_dim);
+        out_batch.push(a_dim.max(b_dim));
     }
 
-    let out_len = (m * n) as usize;
-    let out_data = inner::alloc_managed(out_len * 4); // f32 = 4 bytes
+    let total_batch: u64 = out_batch.iter().product::<i64>().max(1) as u64;
+    let out_nd = out_batch.len() + 2;
 
-    // Output shape [M, N]
-    let shape_layout = std::alloc::Layout::array::<i64>(2).unwrap();
-    let shape = unsafe { std::alloc::alloc(shape_layout) as *mut i64 };
-    unsafe {
-        *shape.add(0) = m as i64;
-        *shape.add(1) = n as i64;
+    // Build output shape: batch_dims + [m, n]
+    let mut out_shape_vec: Vec<i64> = out_batch.clone();
+    out_shape_vec.push(m as i64);
+    out_shape_vec.push(n as i64);
+
+    let out_total = (total_batch * m * n) as usize;
+    let out_data = inner::alloc_managed(out_total * 4); // f32
+
+    let shape = crate::memory::checked_alloc(out_nd * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in out_shape_vec.iter().enumerate() {
+        unsafe { *shape.add(i) = s };
     }
-    let strides = NslTensor::compute_strides(shape, 2);
+    let strides = NslTensor::compute_strides(shape, out_nd as i64);
 
     let out = Box::new(NslTensor::new(
         out_data,
         shape,
         strides,
-        2,
-        out_len as i64,
+        out_nd as i64,
+        out_total as i64,
         a.device,
         1,
         1,
@@ -680,49 +690,51 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     ));
     let out_ptr = Box::into_raw(out);
 
-    let mut a_data = a.data as u64;
-    let mut b_data = b.data as u64;
-    let mut c_data = out_data as u64;
-    let mut m_val = m;
-    let mut n_val = n;
-    let mut k_val = k;
+    // Compute per-batch strides for A and B
+    // A has batch shape a_batch; if a_batch is smaller or has 1s, stride is 0 for that dim
+    let a_mat_stride = (m * k) as usize;
+    let b_mat_stride = (k * n) as usize;
+    let c_mat_stride = (m * n) as usize;
 
-    let block = 16i64; // 16x16 thread block
+    // Determine if A and B broadcast: A broadcasts if its total batch < total_batch
+    let a_total_batch: u64 = a_batch.iter().product::<i64>().max(1) as u64;
+    let b_total_batch: u64 = b_batch.iter().product::<i64>().max(1) as u64;
+
+    let block = 16i64;
     let grid_x = ((n as i64) + block - 1) / block;
     let grid_y = ((m as i64) + block - 1) / block;
 
-    // Debug: log matmul parameters when cuda-sync is active
-    if inner::sync_mode_enabled() {
-        let a_registered = inner::is_cuda_alloc(a.data);
-        let b_registered = inner::is_cuda_alloc(b.data);
-        let c_registered = inner::is_cuda_alloc(out_data);
-        eprintln!(
-            "[nsl] gpu_matmul_f32: M={} K={} N={} grid=[{},{}] \
-             A(dev={},ptr={:#x},cuda={}) B(dev={},ptr={:#x},cuda={}) C(ptr={:#x},cuda={})",
-            m, k, n, grid_x, grid_y,
-            a.device, a_data, a_registered,
-            b.device, b_data, b_registered,
-            c_data, c_registered,
+    // Launch one kernel per batch slice
+    for batch_idx in 0..total_batch as usize {
+        // A offset: if A has no batch dims or broadcasts, reuse same slice
+        let a_idx = if a_total_batch == 1 { 0 } else { batch_idx };
+        let b_idx = if b_total_batch == 1 { 0 } else { batch_idx };
+
+        let mut a_data = (a.data as usize + a_idx * a_mat_stride * 4) as u64;
+        let mut b_data = (b.data as usize + b_idx * b_mat_stride * 4) as u64;
+        let mut c_data = (out_data as usize + batch_idx * c_mat_stride * 4) as u64;
+        let mut m_val = m;
+        let mut n_val = n;
+        let mut k_val = k;
+
+        let args = [
+            &mut a_data as *mut _ as *mut std::ffi::c_void,
+            &mut b_data as *mut _ as *mut std::ffi::c_void,
+            &mut c_data as *mut _ as *mut std::ffi::c_void,
+            &mut m_val as *mut _ as *mut std::ffi::c_void,
+            &mut n_val as *mut _ as *mut std::ffi::c_void,
+            &mut k_val as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let result = inner::kernel_launch(
+            kernels::MATMUL_F32_PTX.as_ptr(),
+            "nsl_matmul_f32\0".as_ptr(),
+            [grid_x, grid_y, 1],
+            [block, block, 1],
+            &args, 0,
         );
+        assert_eq!(result as u32, 0, "GPU matmul kernel failed at batch {}: {}", batch_idx, result as u32);
     }
-
-    let args = [
-        &mut a_data as *mut _ as *mut std::ffi::c_void,
-        &mut b_data as *mut _ as *mut std::ffi::c_void,
-        &mut c_data as *mut _ as *mut std::ffi::c_void,
-        &mut m_val as *mut _ as *mut std::ffi::c_void,
-        &mut n_val as *mut _ as *mut std::ffi::c_void,
-        &mut k_val as *mut _ as *mut std::ffi::c_void,
-    ];
-
-    let result = inner::kernel_launch(
-        kernels::MATMUL_F32_PTX.as_ptr(),
-        "nsl_matmul_f32\0".as_ptr(),
-        [grid_x, grid_y, 1],
-        [block, block, 1],
-        &args, 0,
-    );
-    assert_eq!(result as u32, 0, "GPU matmul kernel failed: {}", result as u32);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
     out_ptr as i64
@@ -1982,7 +1994,7 @@ pub(crate) fn gpu_maxpool2d_f32(
         std::slice::from_raw_parts(argmax_data as *const u64, total as usize).to_vec()
     };
     // Free GPU argmax buffer
-    inner::free_managed(argmax_data, total as usize * 8);
+    inner::free_managed(argmax_data);
 
     let out = Box::new(NslTensor::new(
         out_data, out_shape, out_strides,

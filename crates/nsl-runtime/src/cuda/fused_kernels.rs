@@ -134,6 +134,7 @@ pub(crate) const SOFTMAX_F32_PTX: &str = "\
     .reg .pred %p<4>;\n\
     .shared .f32 smax[256];\n\
     .shared .f32 ssum[256];\n\
+    .reg .u32 %r8;\n\
     ld.param.u64 %rd1, [inp];\n\
     ld.param.u64 %rd2, [out];\n\
     ld.param.u64 %rd3, [rows];\n\
@@ -167,7 +168,7 @@ MAX_DONE:\n\
     // Store local max to shared memory\n\
     cvt.u32.u64 %r3, %rd6;\n\
     mul.lo.u32 %r3, %r3, 4;\n\
-    st.shared.f32 [smax + %r3], %f1;\n\
+    mov.u32 %r8, smax; add.u32 %r8, %r8, %r3; st.shared.f32 [%r8], %f1;\n\
     bar.sync 0;\n\
     // Reduce shared memory max (thread 0 only, simple sequential)\n\
     setp.ne.u32 %p3, %r2, 0;\n\
@@ -178,7 +179,7 @@ REDUCE_MAX:\n\
     setp.ge.u32 %p2, %r4, %r5;\n\
     @%p2 bra DONE_MAX_REDUCE;\n\
     mul.lo.u32 %r6, %r4, 4;\n\
-    ld.shared.f32 %f3, [smax + %r6];\n\
+    mov.u32 %r8, smax; add.u32 %r8, %r8, %r6; ld.shared.f32 %f3, [%r8];\n\
     max.f32 %f1, %f1, %f3;\n\
     add.u32 %r4, %r4, 1;\n\
     bra REDUCE_MAX;\n\
@@ -210,7 +211,7 @@ EXP_DONE:\n\
     // Store partial sum to shared memory\n\
     cvt.u32.u64 %r3, %rd6;\n\
     mul.lo.u32 %r3, %r3, 4;\n\
-    st.shared.f32 [ssum + %r3], %f4;\n\
+    mov.u32 %r8, ssum; add.u32 %r8, %r8, %r3; st.shared.f32 [%r8], %f4;\n\
     bar.sync 0;\n\
     // Reduce shared memory sum (thread 0)\n\
     @%p3 bra SKIP_SUM_REDUCE;\n\
@@ -219,7 +220,7 @@ REDUCE_SUM:\n\
     setp.ge.u32 %p2, %r4, %r5;\n\
     @%p2 bra DONE_SUM_REDUCE;\n\
     mul.lo.u32 %r6, %r4, 4;\n\
-    ld.shared.f32 %f5, [ssum + %r6];\n\
+    mov.u32 %r8, ssum; add.u32 %r8, %r8, %r6; ld.shared.f32 %f5, [%r8];\n\
     add.f32 %f4, %f4, %f5;\n\
     add.u32 %r4, %r4, 1;\n\
     bra REDUCE_SUM;\n\
