@@ -1105,6 +1105,16 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         std::process::abort();
     }
 
+    // GPU path: launch fused embedding kernel when weight is on GPU.
+    if weight.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            return crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr);
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+
     let vocab_size = unsafe { *weight.shape.add(0) } as usize;
     let embed_dim = unsafe { *weight.shape.add(1) } as usize;
     let seq_len = unsafe { *indices.shape.add(0) } as usize;
@@ -1186,6 +1196,30 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 pub extern "C" fn nsl_tensor_layernorm(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64, eps: f64,
 ) -> i64 {
+    // GPU path: CPU-redirect to ensure correct device tag on output.
+    // A full fused PTX layernorm (shared-memory warp reduction) is deferred.
+    {
+        let input_ref = NslTensor::from_ptr(input_ptr);
+        if input_ref.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                let target_device = input_ref.device as i64;
+                let cpu_input = nsl_tensor_to_device(input_ptr, 0);
+                let cpu_weight = nsl_tensor_to_device(weight_ptr, 0);
+                let cpu_bias = nsl_tensor_to_device(bias_ptr, 0);
+                let cpu_result = nsl_tensor_layernorm(cpu_input, cpu_weight, cpu_bias, eps);
+                let gpu_result = nsl_tensor_to_device(cpu_result, target_device);
+                nsl_tensor_free(cpu_input);
+                nsl_tensor_free(cpu_weight);
+                nsl_tensor_free(cpu_bias);
+                nsl_tensor_free(cpu_result);
+                return gpu_result;
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
+
     let input_ref = NslTensor::from_ptr(input_ptr);
     let need_contig = !input_ref.is_contiguous();
     let effective_input_ptr = if need_contig { NslTensor::make_contiguous(input_ptr) } else { input_ptr };
@@ -1313,6 +1347,28 @@ pub extern "C" fn nsl_tensor_layernorm(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) -> i64 {
+    // GPU path: CPU-redirect to ensure correct device tag on output.
+    // A full fused PTX rmsnorm (shared-memory warp reduction) is deferred.
+    {
+        let input_ref = NslTensor::from_ptr(input_ptr);
+        if input_ref.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                let target_device = input_ref.device as i64;
+                let cpu_input = nsl_tensor_to_device(input_ptr, 0);
+                let cpu_weight = nsl_tensor_to_device(weight_ptr, 0);
+                let cpu_result = nsl_tensor_rmsnorm(cpu_input, cpu_weight, eps);
+                let gpu_result = nsl_tensor_to_device(cpu_result, target_device);
+                nsl_tensor_free(cpu_input);
+                nsl_tensor_free(cpu_weight);
+                nsl_tensor_free(cpu_result);
+                return gpu_result;
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
+
     let input_ref = NslTensor::from_ptr(input_ptr);
     let need_contig = !input_ref.is_contiguous();
     let effective_input_ptr = if need_contig { NslTensor::make_contiguous(input_ptr) } else { input_ptr };
@@ -1703,6 +1759,16 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 
     if tensor.ndim != 2 { eprintln!("nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim); std::process::abort(); }
     if bias.ndim != 1 { eprintln!("nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+
+    // GPU path: launch fused bias_add kernel when tensor is on GPU.
+    if tensor.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            return crate::cuda::gpu_bias_add(tensor_ptr, bias_ptr);
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
 
     let rows = unsafe { *tensor.shape.add(0) } as usize;
     let cols = unsafe { *tensor.shape.add(1) } as usize;

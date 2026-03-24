@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 pub(crate) mod kernels;
+pub(crate) mod fused_kernels;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
@@ -825,6 +826,83 @@ pub(crate) fn gpu_silu_backward(grad: i64, input: i64) -> i64 {
     )
 }
 
+/// GPU clamp forward: out[i] = clamp(in[i], lo, hi)
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4);
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let mut lo_val = lo;
+    let mut hi_val = hi;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut lo_val as *mut _ as *mut std::ffi::c_void,
+        &mut hi_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::CLAMP_F32_PTX.as_ptr(),
+        "nsl_clamp_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU clamp kernel failed: {}", result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    out_ptr as i64
+}
+
+/// GPU clamp forward in-place: writes clamp result back to input buffer.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let n = a.len as usize;
+
+    let mut a_data = a.data as u64;
+    let mut c_data = a.data as u64; // output = input buffer
+    let mut n_val = n as u64;
+    let mut lo_val = lo;
+    let mut hi_val = hi;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut lo_val as *mut _ as *mut std::ffi::c_void,
+        &mut hi_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::CLAMP_F32_PTX.as_ptr(),
+        "nsl_clamp_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU clamp inplace kernel failed: {}", result as u32);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f32) -> i64 {
     use crate::tensor::NslTensor;
@@ -941,6 +1019,166 @@ pub extern "C" fn nsl_kernel_launch(
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU Embedding Lookup
+// ---------------------------------------------------------------------------
+
+/// GPU embedding lookup: weight is on GPU (f32), indices may be CPU or GPU.
+/// Allocates output via alloc_managed and launches the embedding PTX kernel.
+/// Returns a GPU tensor (device = weight.device).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::EMBEDDING_F32_PTX;
+
+    let weight = unsafe { &*(weight_ptr as *const NslTensor) };
+    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+
+    let vocab_size = unsafe { *weight.shape.add(0) } as u64;
+    let embed_dim = unsafe { *weight.shape.add(1) } as u64;
+    let seq_len = unsafe { *indices.shape.add(0) } as u64;
+    let _ = vocab_size; // bounds checked by CPU fallback before we get here
+
+    let out_elems = (seq_len * embed_dim) as usize;
+    let out_data = inner::alloc_managed(out_elems * 4); // f32 = 4 bytes
+
+    // Ensure indices are on GPU (f32, unified memory)
+    let indices_on_gpu = if indices.device == 0 {
+        crate::tensor::nsl_tensor_to_device(indices_ptr, weight.device as i64)
+    } else {
+        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        indices_ptr
+    };
+    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+
+    let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = seq_len as i64;
+        *out_shape.add(1) = embed_dim as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+
+    let mut w_data = weight.data as u64;
+    let mut i_data = indices_gpu.data as u64;
+    let mut o_data = out_data as u64;
+    let mut seq_val = seq_len;
+    let mut emb_val = embed_dim;
+
+    let args: [*mut std::ffi::c_void; 5] = [
+        &mut w_data as *mut _ as *mut std::ffi::c_void,
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut seq_val as *mut _ as *mut std::ffi::c_void,
+        &mut emb_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    // 2D grid: x=seq, y=embed — each block is 16x16 threads
+    let block_x = 16i64;
+    let block_y = 16i64;
+    let grid_x = ((seq_len as i64) + block_x - 1) / block_x;
+    let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
+
+    let result = inner::kernel_launch(
+        EMBEDDING_F32_PTX.as_ptr(), b"nsl_embedding_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU embedding kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    crate::tensor::nsl_tensor_free(indices_on_gpu);
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        (seq_len * embed_dim) as i64,
+        weight.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+// ---------------------------------------------------------------------------
+// GPU Bias Add
+// ---------------------------------------------------------------------------
+
+/// GPU bias_add: out[i,j] = tensor[i,j] + bias[j].
+/// Both tensor and bias must be on GPU (f32). Allocates output via alloc_managed.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::BIAS_ADD_F32_PTX;
+
+    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let bias_ref = unsafe { &*(bias_ptr as *const NslTensor) };
+
+    let rows = unsafe { *tensor.shape.add(0) } as u64;
+    let cols = unsafe { *tensor.shape.add(1) } as u64;
+    let total = rows * cols;
+
+    let out_data = inner::alloc_managed((total as usize) * 4);
+
+    // Ensure bias is on GPU
+    let bias_on_gpu = if bias_ref.device == 0 {
+        crate::tensor::nsl_tensor_to_device(bias_ptr, tensor.device as i64)
+    } else {
+        let t = unsafe { &mut *(bias_ptr as *mut NslTensor) };
+        t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        bias_ptr
+    };
+    let bias_gpu = unsafe { &*(bias_on_gpu as *const NslTensor) };
+
+    let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = rows as i64;
+        *out_shape.add(1) = cols as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+
+    let mut t_data = tensor.data as u64;
+    let mut b_data = bias_gpu.data as u64;
+    let mut o_data = out_data as u64;
+    let mut total_val = total;
+    let mut cols_val = cols;
+
+    let args: [*mut std::ffi::c_void; 5] = [
+        &mut t_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut total_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((total as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        BIAS_ADD_F32_PTX.as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    crate::tensor::nsl_tensor_free(bias_on_gpu);
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        total as i64,
+        tensor.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
 }
 
 #[cfg(all(test, feature = "cuda"))]

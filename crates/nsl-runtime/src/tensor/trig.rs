@@ -12,10 +12,12 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
         if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIN_F32_PTX, "nsl_sin_f32\0");
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
-            #[cfg(feature = "cuda")]
-            { panic!("GPU tensor_sin not yet implemented"); }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -59,10 +61,12 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
     {
         let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
         if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::COS_F32_PTX, "nsl_cos_f32\0");
+            }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
-            #[cfg(feature = "cuda")]
-            { panic!("GPU tensor_cos not yet implemented"); }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);

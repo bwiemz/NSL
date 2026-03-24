@@ -438,6 +438,23 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                if ta.can_mutate_inplace_gpu() {
+                    crate::cuda::gpu_clamp_f32_inplace(tensor_ptr, min_val as f32, max_val as f32);
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    return tensor_ptr;
+                }
+                return crate::cuda::gpu_clamp_f32(tensor_ptr, min_val as f32, max_val as f32);
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     // FBIP: mutate in-place when uniquely owned
     {
         let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
@@ -652,6 +669,23 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                if ta.can_mutate_inplace_gpu() {
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    return tensor_ptr;
+                }
+                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     // FBIP: mutate in-place when uniquely owned
     {
         let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
@@ -731,6 +765,23 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
+    {
+        let ta = unsafe { &*(tensor_ptr as *const NslTensor) };
+        if ta.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                if ta.can_mutate_inplace_gpu() {
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    super::fbip_record_reuse();
+                    return tensor_ptr;
+                }
+                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
     // FBIP: mutate in-place when uniquely owned
     {
         let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
