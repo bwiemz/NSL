@@ -1196,24 +1196,80 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 pub extern "C" fn nsl_tensor_layernorm(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64, eps: f64,
 ) -> i64 {
-    // GPU path: CPU-redirect to ensure correct device tag on output.
-    // A full fused PTX layernorm (shared-memory warp reduction) is deferred.
+    // GPU path: native fused LayerNorm kernel.
     {
         let input_ref = NslTensor::from_ptr(input_ptr);
         if input_ref.device > 0 {
             #[cfg(feature = "cuda")]
             {
                 let target_device = input_ref.device as i64;
-                let cpu_input = nsl_tensor_to_device(input_ptr, 0);
-                let cpu_weight = nsl_tensor_to_device(weight_ptr, 0);
-                let cpu_bias = nsl_tensor_to_device(bias_ptr, 0);
-                let cpu_result = nsl_tensor_layernorm(cpu_input, cpu_weight, cpu_bias, eps);
-                let gpu_result = nsl_tensor_to_device(cpu_result, target_device);
-                nsl_tensor_free(cpu_input);
-                nsl_tensor_free(cpu_weight);
-                nsl_tensor_free(cpu_bias);
-                nsl_tensor_free(cpu_result);
-                return gpu_result;
+                // Ensure input is contiguous on GPU
+                let c_input = nsl_tensor_contiguous(input_ptr);
+                // Ensure gamma/beta are on GPU
+                let g_gpu = nsl_tensor_to_device(weight_ptr, target_device);
+                let b_gpu = nsl_tensor_to_device(bias_ptr, target_device);
+                let result = crate::cuda::gpu_layernorm_f32(c_input, g_gpu, b_gpu, eps as f32);
+                if c_input != input_ptr { nsl_tensor_free(c_input); }
+                // Clean up device transfers if they created new tensors
+                if g_gpu != weight_ptr { nsl_tensor_free(g_gpu); }
+                if b_gpu != bias_ptr { nsl_tensor_free(b_gpu); }
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    // For backward, we need mean/inv_std which are computed on CPU fallback.
+                    // Record the tape op with the original pointers; backward will use CPU redirect.
+                    let input = NslTensor::from_ptr(input_ptr);
+                    let ndim = input.ndim as usize;
+                    let n = unsafe { *input.shape.add(ndim - 1) } as usize;
+                    let num_rows = (input.len as usize) / n;
+                    // Compute mean/inv_std on CPU for the backward pass
+                    let cpu_input = nsl_tensor_to_device(input_ptr, 0);
+                    let ci = NslTensor::from_ptr(cpu_input);
+                    let mean_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+                    unsafe { *mean_shape = num_rows as i64 };
+                    let mean_strides = NslTensor::compute_strides(mean_shape, 1);
+                    let mean_data = crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+                    let inv_std_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+                    unsafe { *inv_std_shape = num_rows as i64 };
+                    let inv_std_strides = NslTensor::compute_strides(inv_std_shape, 1);
+                    let inv_std_data = crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+                    for row in 0..num_rows {
+                        let base = row * n;
+                        let mut sum = 0.0_f64;
+                        for j in 0..n {
+                            let x = if ci.dtype == 1 { unsafe { *ci.data_f32().add(base + j) as f64 } }
+                                    else { unsafe { *ci.data_f64().add(base + j) } };
+                            sum += x;
+                        }
+                        let mean_val = sum / n as f64;
+                        let mut var = 0.0_f64;
+                        for j in 0..n {
+                            let x = if ci.dtype == 1 { unsafe { *ci.data_f32().add(base + j) as f64 } }
+                                    else { unsafe { *ci.data_f64().add(base + j) } };
+                            let diff = x - mean_val;
+                            var += diff * diff;
+                        }
+                        var /= n as f64;
+                        unsafe {
+                            *mean_data.add(row) = mean_val;
+                            *inv_std_data.add(row) = 1.0 / (var + eps).sqrt();
+                        }
+                    }
+                    nsl_tensor_free(cpu_input);
+                    let mean_tensor = Box::new(NslTensor::new(
+                        mean_data as *mut c_void, mean_shape, mean_strides, 1, num_rows as i64, 0, 0, 1, 0,
+                    ));
+                    let mean_ptr = NslTensor::publish(mean_tensor);
+                    let inv_std_tensor = Box::new(NslTensor::new(
+                        inv_std_data as *mut c_void, inv_std_shape, inv_std_strides, 1, num_rows as i64, 0, 0, 1, 0,
+                    ));
+                    let inv_std_ptr = NslTensor::publish(inv_std_tensor);
+                    autodiff::maybe_record(autodiff::TapeOp::LayerNorm {
+                        input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: result,
+                        saved_input: input_ptr, saved_mean: mean_ptr, saved_inv_std: inv_std_ptr, saved_weight: weight_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -1347,22 +1403,53 @@ pub extern "C" fn nsl_tensor_layernorm(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) -> i64 {
-    // GPU path: CPU-redirect to ensure correct device tag on output.
-    // A full fused PTX rmsnorm (shared-memory warp reduction) is deferred.
+    // GPU path: native fused RMSNorm kernel.
     {
         let input_ref = NslTensor::from_ptr(input_ptr);
         if input_ref.device > 0 {
             #[cfg(feature = "cuda")]
             {
                 let target_device = input_ref.device as i64;
-                let cpu_input = nsl_tensor_to_device(input_ptr, 0);
-                let cpu_weight = nsl_tensor_to_device(weight_ptr, 0);
-                let cpu_result = nsl_tensor_rmsnorm(cpu_input, cpu_weight, eps);
-                let gpu_result = nsl_tensor_to_device(cpu_result, target_device);
-                nsl_tensor_free(cpu_input);
-                nsl_tensor_free(cpu_weight);
-                nsl_tensor_free(cpu_result);
-                return gpu_result;
+                let c_input = nsl_tensor_contiguous(input_ptr);
+                let g_gpu = nsl_tensor_to_device(weight_ptr, target_device);
+                let result = crate::cuda::gpu_rmsnorm_f32(c_input, g_gpu, eps as f32);
+                if c_input != input_ptr { nsl_tensor_free(c_input); }
+                if g_gpu != weight_ptr { nsl_tensor_free(g_gpu); }
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    // Compute rms on CPU for backward pass
+                    let input = NslTensor::from_ptr(input_ptr);
+                    let ndim = input.ndim as usize;
+                    let n = unsafe { *input.shape.add(ndim - 1) } as usize;
+                    let num_rows = (input.len as usize) / n;
+                    let cpu_input = nsl_tensor_to_device(input_ptr, 0);
+                    let ci = NslTensor::from_ptr(cpu_input);
+                    let rms_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+                    unsafe { *rms_shape = num_rows as i64 };
+                    let rms_strides = NslTensor::compute_strides(rms_shape, 1);
+                    let rms_data = crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+                    for row in 0..num_rows {
+                        let base = row * n;
+                        let mut sum_sq = 0.0_f64;
+                        for j in 0..n {
+                            let x = if ci.dtype == 1 { unsafe { *ci.data_f32().add(base + j) as f64 } }
+                                    else { unsafe { *ci.data_f64().add(base + j) } };
+                            sum_sq += x * x;
+                        }
+                        unsafe { *rms_data.add(row) = (sum_sq / n as f64 + eps).sqrt() };
+                    }
+                    nsl_tensor_free(cpu_input);
+                    let rms_tensor = Box::new(NslTensor::new(
+                        rms_data as *mut c_void, rms_shape, rms_strides, 1, num_rows as i64, 0, 0, 1, 0,
+                    ));
+                    let rms_ptr = NslTensor::publish(rms_tensor);
+                    autodiff::maybe_record(autodiff::TapeOp::RMSNorm {
+                        input: input_ptr, weight: weight_ptr, out: result,
+                        saved_input: input_ptr, saved_rms: rms_ptr, saved_weight: weight_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }

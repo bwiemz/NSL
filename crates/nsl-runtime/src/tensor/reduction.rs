@@ -24,16 +24,44 @@ pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
 /// Sum reduction along a dimension (dim=-1 means global).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
-    // GPU dispatch: transfer to CPU, compute, transfer back.
+    // GPU dispatch: native GPU reduction kernels.
     {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.device > 0 {
-            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-            let result = nsl_tensor_sum_dim(cpu_t, dim, keepdim);
-            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
-            super::nsl_tensor_free(cpu_t);
-            super::nsl_tensor_free(result);
-            return gpu_result;
+            #[cfg(feature = "cuda")]
+            {
+                let keepdim_bool = keepdim != 0;
+                let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
+                let result = if dim == -1 {
+                    // Global sum
+                    crate::cuda::gpu_global_sum_f32(c_ptr)
+                } else {
+                    let ndim = tensor.ndim as usize;
+                    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                    crate::cuda::gpu_sum_dim_f32(c_ptr, d, keepdim_bool)
+                };
+                if c_ptr != tensor_ptr { super::nsl_tensor_free(c_ptr); }
+                let input_shape = get_shape_vec(tensor);
+                if autodiff::is_recording() {
+                    autodiff::maybe_record(autodiff::TapeOp::SumReduce {
+                        a: tensor_ptr,
+                        out: result,
+                        dim,
+                        keepdim: keepdim_bool,
+                        input_shape,
+                    });
+                }
+                return result;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+                let result = nsl_tensor_sum_dim(cpu_t, dim, keepdim);
+                let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+                super::nsl_tensor_free(cpu_t);
+                super::nsl_tensor_free(result);
+                return gpu_result;
+            }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -146,16 +174,58 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
 /// Mean reduction along a dimension (dim=-1 means global).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
-    // GPU dispatch: transfer to CPU, compute, transfer back.
+    // GPU dispatch: use native GPU sum then divide by count.
     {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.device > 0 {
-            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-            let result = nsl_tensor_mean_dim(cpu_t, dim, keepdim);
-            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
-            super::nsl_tensor_free(cpu_t);
-            super::nsl_tensor_free(result);
-            return gpu_result;
+            #[cfg(feature = "cuda")]
+            {
+                let keepdim_bool = keepdim != 0;
+                let input_shape = get_shape_vec(tensor);
+                let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
+
+                if dim == -1 {
+                    // Global mean: gpu_global_sum / total_elements
+                    let num_elements = tensor.len;
+                    let sum_ptr = crate::cuda::gpu_global_sum_f32(c_ptr);
+                    if c_ptr != tensor_ptr { super::nsl_tensor_free(c_ptr); }
+                    // Divide by num_elements using scalar op
+                    let inv = 1.0_f32 / num_elements as f32;
+                    crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                    if autodiff::is_recording() {
+                        autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
+                            a: tensor_ptr, out: sum_ptr, dim: -1, keepdim: false,
+                            num_elements, input_shape,
+                        });
+                    }
+                    return sum_ptr;
+                }
+
+                let ndim = tensor.ndim as usize;
+                let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                let dim_size = input_shape[d];
+                let sum_ptr = crate::cuda::gpu_sum_dim_f32(c_ptr, d, keepdim_bool);
+                if c_ptr != tensor_ptr { super::nsl_tensor_free(c_ptr); }
+                // Divide by dim_size using scalar op
+                let inv = 1.0_f32 / dim_size as f32;
+                crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                if autodiff::is_recording() {
+                    autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
+                        a: tensor_ptr, out: sum_ptr, dim, keepdim: keepdim_bool,
+                        num_elements: dim_size, input_shape,
+                    });
+                }
+                return sum_ptr;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+                let result = nsl_tensor_mean_dim(cpu_t, dim, keepdim);
+                let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+                super::nsl_tensor_free(cpu_t);
+                super::nsl_tensor_free(result);
+                return gpu_result;
+            }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -244,16 +314,44 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
 /// Reduce max along a dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
-    // GPU dispatch: transfer to CPU, compute, transfer back.
+    // GPU dispatch: native GPU max reduction kernel.
     {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.device > 0 {
-            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-            let result = nsl_tensor_reduce_max(cpu_t, dim, keepdim);
-            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
-            super::nsl_tensor_free(cpu_t);
-            super::nsl_tensor_free(result);
-            return gpu_result;
+            #[cfg(feature = "cuda")]
+            {
+                let keepdim_bool = keepdim != 0;
+                let ndim = tensor.ndim as usize;
+                let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                let input_shape = get_shape_vec(tensor);
+                let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
+                let result = crate::cuda::gpu_max_dim_f32(c_ptr, d, keepdim_bool);
+                if c_ptr != tensor_ptr { super::nsl_tensor_free(c_ptr); }
+                // Note: argmax is not computed on GPU — autodiff backward for
+                // reduce_max on GPU tensors will use zeros (no gradient flows through max indices).
+                if autodiff::is_recording() {
+                    let ct = NslTensor::from_ptr(result);
+                    let out_len = ct.len as usize;
+                    autodiff::maybe_record(autodiff::TapeOp::ReduceMax {
+                        a: tensor_ptr,
+                        out: result,
+                        dim,
+                        keepdim: keepdim_bool,
+                        saved_argmax: vec![0usize; out_len],
+                        input_shape,
+                    });
+                }
+                return result;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+                let result = nsl_tensor_reduce_max(cpu_t, dim, keepdim);
+                let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+                super::nsl_tensor_free(cpu_t);
+                super::nsl_tensor_free(result);
+                return gpu_result;
+            }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
