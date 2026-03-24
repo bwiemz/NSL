@@ -24,6 +24,18 @@ pub extern "C" fn nsl_tensor_mean(tensor_ptr: i64) -> i64 {
 /// Sum reduction along a dimension (dim=-1 means global).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
+    // GPU dispatch: transfer to CPU, compute, transfer back.
+    {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+            let result = nsl_tensor_sum_dim(cpu_t, dim, keepdim);
+            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+            super::nsl_tensor_free(cpu_t);
+            super::nsl_tensor_free(result);
+            return gpu_result;
+        }
+    }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
     let input_shape = get_shape_vec(tensor);
@@ -134,6 +146,18 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
 /// Mean reduction along a dimension (dim=-1 means global).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
+    // GPU dispatch: transfer to CPU, compute, transfer back.
+    {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+            let result = nsl_tensor_mean_dim(cpu_t, dim, keepdim);
+            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+            super::nsl_tensor_free(cpu_t);
+            super::nsl_tensor_free(result);
+            return gpu_result;
+        }
+    }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
     let input_shape = get_shape_vec(tensor);
@@ -220,6 +244,18 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
 /// Reduce max along a dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64) -> i64 {
+    // GPU dispatch: transfer to CPU, compute, transfer back.
+    {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+            let result = nsl_tensor_reduce_max(cpu_t, dim, keepdim);
+            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+            super::nsl_tensor_free(cpu_t);
+            super::nsl_tensor_free(result);
+            return gpu_result;
+        }
+    }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let tensor = NslTensor::from_ptr(t_c);
     let input_shape = get_shape_vec(tensor);
@@ -323,6 +359,20 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
 /// Gather along a dimension: output[b] = tensor[b, indices[b]] (for dim=1, 2D input).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64) -> i64 {
+    // GPU dispatch: transfer both tensors to CPU, compute, transfer result back.
+    {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+            let cpu_i = super::nsl_tensor_to_device(indices_ptr, 0);
+            let result = nsl_tensor_gather(cpu_t, dim, cpu_i);
+            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+            super::nsl_tensor_free(cpu_t);
+            super::nsl_tensor_free(cpu_i);
+            super::nsl_tensor_free(result);
+            return gpu_result;
+        }
+    }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
     let i_c = nsl_tensor_contiguous(indices_ptr);
     let tensor = NslTensor::from_ptr(t_c);
@@ -413,6 +463,18 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 /// Softmax along a dimension.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
+    // GPU dispatch: transfer to CPU, compute, transfer back.
+    {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+            let result = nsl_tensor_softmax(cpu_t, dim);
+            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+            super::nsl_tensor_free(cpu_t);
+            super::nsl_tensor_free(result);
+            return gpu_result;
+        }
+    }
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len;
