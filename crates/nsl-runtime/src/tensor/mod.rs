@@ -1553,6 +1553,32 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
         return nsl_tensor_clone(tensor_ptr);
     }
 
+    // GPU dispatch: native dropout kernel with per-element PRNG
+    {
+        let t = NslTensor::from_ptr(tensor_ptr);
+        if t.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+                let (result_ptr, mask_ptr) = crate::cuda::gpu_dropout_f32(c_ptr, p);
+                if c_ptr != tensor_ptr { nsl_tensor_free(c_ptr); }
+                // Record tape op for backward
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Dropout {
+                        a: tensor_ptr, out: result_ptr, saved_mask: mask_ptr,
+                        scale: 1.0 / (1.0 - p),
+                    });
+                } else {
+                    nsl_tensor_free(mask_ptr);
+                }
+                return result_ptr;
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        }
+    }
+
     let a = NslTensor::from_ptr(tensor_ptr);
     let len = a.len as usize;
     let ndim = a.ndim;

@@ -1991,6 +1991,80 @@ pub(crate) fn gpu_maxpool2d_f32(
     (NslTensor::publish(out), argmax_vec)
 }
 
+// ---------------------------------------------------------------------------
+// GPU Dropout (inverted dropout with per-element PRNG)
+// ---------------------------------------------------------------------------
+
+/// GPU dropout: out[i] = keep ? input[i] * scale : 0, mask[i] = keep ? 1 : 0.
+/// Uses a hash-based PRNG seeded from a global counter for per-element randomness.
+/// Returns (output_ptr, mask_ptr) — mask is f32 on GPU for backward pass.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
+    use crate::tensor::NslTensor;
+    use fused_kernels::DROPOUT_F32_PTX;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Global seed counter — incremented per dropout call for unique masks
+    static DROPOUT_SEED: AtomicU64 = AtomicU64::new(42);
+
+    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let len = input.len as u64;
+    let ndim = input.ndim;
+
+    // Allocate output and mask on GPU
+    let out_data = inner::alloc_managed(len as usize * 4); // f32
+    let mask_data = inner::alloc_managed(len as usize * 4); // f32 mask
+
+    let out_shape = NslTensor::copy_shape(input.shape, ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, ndim);
+    let mask_shape = NslTensor::copy_shape(input.shape, ndim);
+    let mask_strides = NslTensor::compute_strides(mask_shape, ndim);
+
+    // threshold: hash values below this → keep (inverted: keep probability = 1-p)
+    // u32::MAX * (1-p) gives the threshold
+    let threshold = ((1.0 - p) * u32::MAX as f64) as u32;
+    let scale = (1.0 / (1.0 - p)) as f32;
+    let seed = DROPOUT_SEED.fetch_add(len, Ordering::SeqCst);
+
+    let mut inp_data = input.data as u64;
+    let mut out_val = out_data as u64;
+    let mut mask_val = mask_data as u64;
+    let mut len_val = len;
+    let mut thresh_val = threshold;
+    let mut scale_val = scale;
+    let mut seed_val = seed;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut inp_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_val as *mut _ as *mut std::ffi::c_void,
+        &mut mask_val as *mut _ as *mut std::ffi::c_void,
+        &mut len_val as *mut _ as *mut std::ffi::c_void,
+        &mut thresh_val as *mut _ as *mut std::ffi::c_void,
+        &mut scale_val as *mut _ as *mut std::ffi::c_void,
+        &mut seed_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((len as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        DROPOUT_F32_PTX.as_ptr(), b"nsl_dropout_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU dropout kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides,
+        ndim, len as i64, input.device, 1, 1, 0,
+    ));
+    let mask = Box::new(NslTensor::new(
+        mask_data, mask_shape, mask_strides,
+        ndim, len as i64, input.device, 1, 1, 0,
+    ));
+    (NslTensor::publish(out), NslTensor::publish(mask))
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
