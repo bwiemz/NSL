@@ -42,10 +42,14 @@ pub enum AdjointExpr {
 
     // Normalization backward
     /// LayerNorm backward: 3 adjoint components for input, gamma, beta
-    /// args: (grad, input, mean, rstd)
-    LayerNormBackward(VarId, VarId, VarId, VarId),
+    /// args: (grad, input, mean_unused, rstd_unused, eps)
+    LayerNormBackward(VarId, VarId, VarId, VarId, f64),
     /// BatchNorm backward: similar to LayerNorm but over batch dimension
-    BatchNormBackward(VarId, VarId, VarId, VarId),
+    /// args: (grad, input, mean_unused, rstd_unused, eps)
+    BatchNormBackward(VarId, VarId, VarId, VarId, f64),
+    /// Gamma gradient for normalization: grad * x_hat where x_hat = (x - mean) / std
+    /// args: (grad, input, eps, dim) — recomputes x_hat from input
+    NormGammaBackward(VarId, VarId, f64, i64),
 
     // Regularization
     /// Dropout backward: grad * mask / (1-p).  args: (grad, mask)
@@ -68,8 +72,8 @@ pub enum AdjointExpr {
     SliceBackward(VarId, i64, i64, i64),
 
     // Convolution/pooling backward
-    /// Conv2d backward for input: conv_transpose(grad, weight)
-    ConvTransposeInput(VarId, VarId),
+    /// Conv2d backward for input: conv_transpose(grad, weight, stride, padding)
+    ConvTransposeInput(VarId, VarId, usize, usize),
     /// Conv2d backward for weight: conv(input^T, grad)
     ConvTransposeWeight(VarId, VarId),
     /// MaxPool backward: grad * (input == max_value). args: (grad, argmax_indices)
@@ -228,18 +232,17 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // LayerNorm(input, gamma, beta) -> output
         // Backward needs: grad, input, saved_mean (inputs[3]), saved_rstd (inputs[4])
         // For simplicity, we save input and use the output's VarId for mean/rstd
-        PrimalOp::LayerNorm { .. } => {
+        PrimalOp::LayerNorm { eps } => {
             let input = op.inputs[0];
-            // gamma and beta adjoints are simple
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result),
+                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result, *eps),
             }];
-            // gamma gradient: grad * normalized_input
+            // gamma gradient: grad * x_hat (normalized input, NOT the output)
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::MulElementwise(output_bar, op.result),
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1),
                 });
             }
             // beta gradient: identity (grad flows through)
@@ -251,16 +254,17 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             }
             adjoints
         }
-        PrimalOp::BatchNorm { .. } => {
+        PrimalOp::BatchNorm { eps, .. } => {
             let input = op.inputs[0];
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                expr: AdjointExpr::BatchNormBackward(output_bar, input, op.result, op.result),
+                expr: AdjointExpr::BatchNormBackward(output_bar, input, op.result, op.result, *eps),
             }];
+            // gamma gradient: grad * x_hat (normalized input, NOT the output)
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::MulElementwise(output_bar, op.result),
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, 0),
                 });
             }
             if op.inputs.len() > 2 {
@@ -333,10 +337,10 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }],
 
         // --- Convolution ---
-        PrimalOp::Conv2d { .. } => vec![
+        PrimalOp::Conv2d { stride, padding } => vec![
             InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::ConvTransposeInput(output_bar, op.inputs[1]),
+                expr: AdjointExpr::ConvTransposeInput(output_bar, op.inputs[1], *stride, *padding),
             },
             InputAdjoint {
                 input_var: op.inputs[1],
@@ -686,8 +690,8 @@ mod tests {
         let op = make_op(3, PrimalOp::LayerNorm { eps: 1e-5 }, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "LayerNorm should produce 3 adjoints (input, gamma, beta)");
-        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 3, 3)));
-        assert!(matches!(adj[1].expr, AdjointExpr::MulElementwise(100, 3))); // gamma grad
+        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 3, 3, _)));
+        assert!(matches!(adj[1].expr, AdjointExpr::NormGammaBackward(100, 0, _, -1))); // gamma grad
         assert!(matches!(adj[2].expr, AdjointExpr::Identity(100))); // beta grad
         assert_eq!(saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }), SavedRequirement::Inputs);
     }
@@ -750,7 +754,7 @@ mod tests {
         let op = make_op(2, PrimalOp::Conv2d { stride: 1, padding: 0 }, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 2, "Conv2d should produce 2 adjoints (input, weight)");
-        assert!(matches!(adj[0].expr, AdjointExpr::ConvTransposeInput(100, 1)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ConvTransposeInput(100, 1, 1, 0)));
         assert!(matches!(adj[1].expr, AdjointExpr::ConvTransposeWeight(0, 100)));
     }
 

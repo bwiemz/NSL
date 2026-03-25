@@ -269,14 +269,14 @@ impl AdjointGenerator {
             // Recomputes mean/rstd from input (not op.result) for correctness.
             // Every Mean{dim} reduction MUST be followed by Broadcast before use in
             // Sub/Mul with full-shape tensors to avoid shape mismatch.
-            AdjointExpr::LayerNormBackward(y_bar, x, _mean_unused, _rstd_unused) => {
-                // Recompute mean and rstd from input
+            AdjointExpr::LayerNormBackward(y_bar, x, _mean_unused, _rstd_unused, eps_val) => {
+                // Recompute mean and rstd from input (standard approach, matches PyTorch)
                 let mean = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x]);
                 let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
                 let var = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x_sq]);
-                let eps = self.emit_constant(1e-5);
+                let eps = self.emit_constant(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
                 let one = self.emit_constant(1.0);
@@ -299,14 +299,14 @@ impl AdjointGenerator {
             // Recomputes mean/rstd from input for correctness.
             // Every Mean{dim} reduction MUST be followed by Broadcast before use in
             // Sub/Mul with full-shape tensors to avoid shape mismatch.
-            AdjointExpr::BatchNormBackward(y_bar, x, _mean_unused, _rstd_unused) => {
+            AdjointExpr::BatchNormBackward(y_bar, x, _mean_unused, _rstd_unused, eps_val) => {
                 // Recompute mean and rstd from input over batch dimension
                 let mean = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![x]);
                 let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
                 let var = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![x_sq]);
-                let eps = self.emit_constant(1e-5);
+                let eps = self.emit_constant(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
                 let one = self.emit_constant(1.0);
@@ -323,6 +323,27 @@ impl AdjointGenerator {
                 let t1 = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad_bc]);
                 let t2 = self.emit_op(PrimalOp::Sub, vec![t1, correction]);
                 self.emit_op(PrimalOp::Mul, vec![t2, rstd_bc])
+            }
+
+            // --- Normalization gamma backward: grad * x_hat ---
+            // Recomputes x_hat = (x - mean) / std from input to get the correct
+            // normalized values (NOT the output, which is gamma * x_hat + beta).
+            AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim) => {
+                let mean = self.emit_op(PrimalOp::Mean { dim: Some(dim) }, vec![x]);
+                let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
+                let var = self.emit_op(PrimalOp::Mean { dim: Some(dim) }, vec![x_sq]);
+                let eps = self.emit_constant(eps_val);
+                let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
+                let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
+                let one = self.emit_constant(1.0);
+                let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
+                let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
+                // dgamma = sum(grad * x_hat, dim=reduction_dim)
+                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
+                self.emit_op(PrimalOp::Sum { dim: Some(dim) }, vec![grad_x_hat])
             }
 
             // --- Dropout backward: grad * mask * (1/(1-p)) ---
@@ -363,8 +384,8 @@ impl AdjointGenerator {
             }
 
             // --- Conv/Pool backward ---
-            AdjointExpr::ConvTransposeInput(y_bar, weight) => {
-                self.emit_op(PrimalOp::ConvTranspose2d { stride: 1, padding: 0 }, vec![y_bar, weight])
+            AdjointExpr::ConvTransposeInput(y_bar, weight, stride, padding) => {
+                self.emit_op(PrimalOp::ConvTranspose2d { stride, padding }, vec![y_bar, weight])
             }
             AdjointExpr::ConvTransposeWeight(input, y_bar) => {
                 self.emit_op(PrimalOp::Matmul, vec![input, y_bar])
