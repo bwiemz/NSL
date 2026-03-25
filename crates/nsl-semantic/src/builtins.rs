@@ -1012,4 +1012,78 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+
+    // Source-AD backward lowering helpers (Task 2 of source-AD training backend)
+    // nsl_tensor_compare(a, b, cmp_kind) -> tensor  — elementwise 0/1 comparison
+    def(
+        "nsl_tensor_compare",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_where(cond, true_val, false_val) -> tensor  — ternary select
+    def(
+        "nsl_tensor_where",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone()],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_scalar(val) -> tensor  — create 0-dim scalar tensor
+    def(
+        "nsl_tensor_scalar",
+        Type::Function {
+            params: vec![Type::Float],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_pad_zero(tensor, dim, pad_before, pad_after) -> tensor
+    def(
+        "nsl_tensor_pad_zero",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int, Type::Int, Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_scatter_add(src, indices, dim) -> tensor  — embedding backward
+    def(
+        "nsl_tensor_scatter_add",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_logsoftmax(tensor, dim) -> tensor
+    def(
+        "nsl_tensor_logsoftmax",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_repeat(tensor, kernel) -> tensor  — spatial repeat for avgpool backward
+    def(
+        "nsl_tensor_repeat",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+    // nsl_tensor_rope_inverse(tensor, dim) -> tensor  — inverse RoPE rotation
+    def(
+        "nsl_tensor_rope_inverse",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
 }
