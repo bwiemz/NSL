@@ -140,6 +140,10 @@ enum Cli {
         #[arg(long)]
         tape_ad: bool,
 
+        /// Use compile-time source-to-source AD instead of runtime tape AD
+        #[arg(long)]
+        source_ad: bool,
+
         /// Debug training: disable fusion + FBIP, emit gradient checksums
         #[arg(long)]
         debug_training: bool,
@@ -269,6 +273,10 @@ enum Cli {
         /// Force tape-based AD (disable source-to-source AD)
         #[arg(long)]
         tape_ad: bool,
+
+        /// Use compile-time source-to-source AD instead of runtime tape AD
+        #[arg(long)]
+        source_ad: bool,
 
         /// Debug training: disable fusion + FBIP, emit gradient checksums
         #[arg(long)]
@@ -583,6 +591,7 @@ fn main() {
             target,
             disable_fusion,
             tape_ad: _tape_ad,
+            source_ad: _source_ad,
             debug_training,
             distribute: _distribute,
             zero_stage: _zero_stage,
@@ -666,6 +675,7 @@ fn main() {
                 target,
                 disable_fusion,
                 tape_ad: _tape_ad,
+                source_ad: _source_ad,
                 trace_ops: false,
                 nan_analysis: false,
                 deterministic: _deterministic,
@@ -743,6 +753,7 @@ fn main() {
             target,
             disable_fusion,
             tape_ad,
+            source_ad,
             debug_training,
             trace_ops,
             deterministic,
@@ -767,6 +778,7 @@ fn main() {
                 target,
                 disable_fusion,
                 tape_ad,
+                source_ad,
                 trace_ops,
                 nan_analysis: false,
                 deterministic,

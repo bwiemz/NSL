@@ -158,7 +158,7 @@ impl FeatureConfigs {
             linear_types_enabled: options.linear_types_enabled,
             ownership_info: options.ownership_info.clone(),
             vmap_configs: HashMap::new(),
-            source_ad_enabled: !options.tape_ad,
+            source_ad_enabled: options.source_ad,
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,
