@@ -1009,6 +1009,28 @@ impl<'a> WengertExtractor<'a> {
             .filter_map(|sym| self.symbol_to_var.get(sym).copied())
             .collect()
     }
+
+    /// Get the symbol-to-VarId mapping for resolving primal vars to Cranelift Values.
+    pub fn symbol_var_map(&self) -> &HashMap<nsl_ast::Symbol, VarId> {
+        &self.symbol_to_var
+    }
+
+    /// Get VarIds for model parameters (unordered).
+    pub fn param_var_ids(&self) -> Vec<(nsl_ast::Symbol, VarId)> {
+        self.param_symbols.iter()
+            .filter_map(|sym| self.symbol_to_var.get(sym).map(|vid| (*sym, *vid)))
+            .collect()
+    }
+
+    /// Get the next available VarId (for AdjointGenerator::new start_var).
+    pub fn next_var_id(&self) -> VarId {
+        self.next_var
+    }
+
+    /// Access the extracted WengertList.
+    pub fn wengert_list(&self) -> &WengertList {
+        &self.list
+    }
 }
 
 #[cfg(test)]
