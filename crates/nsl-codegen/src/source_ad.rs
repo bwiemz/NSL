@@ -371,16 +371,18 @@ impl AdjointGenerator {
 
             // --- Shape backward ops ---
             AdjointExpr::ConcatSplit(y_bar, dim, offset, size) => {
-                self.emit_op(PrimalOp::Slice { dim, start: offset as i64, end: (offset + size) as i64 }, vec![y_bar])
+                self.emit_op(PrimalOp::Slice { dim, start: offset as i64, end: (offset + size) as i64, orig_dim_size: 0 }, vec![y_bar])
             }
             AdjointExpr::SplitConcat(y_bar, _dim) => {
                 // Split backward = concat the gradient pieces (handled by accumulate_adjoint)
                 self.emit_op(PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar])
             }
-            AdjointExpr::SliceBackward(y_bar, dim, start, _end) => {
+            AdjointExpr::SliceBackward(y_bar, dim, start, end, orig_dim_size) => {
                 // Slice backward = zero-pad grad into original shape along the sliced dim.
-                // TODO: pad_after requires original shape — runtime infers from accumulation target
-                self.emit_op(PrimalOp::PadZero { dim, pad_before: start, pad_after: 0 }, vec![y_bar])
+                // pad_before = start (zeros before the slice region)
+                // pad_after = orig_dim_size - end (zeros after the slice region)
+                let pad_after = orig_dim_size - end;
+                self.emit_op(PrimalOp::PadZero { dim, pad_before: start, pad_after }, vec![y_bar])
             }
 
             // --- Conv/Pool backward ---

@@ -38,7 +38,7 @@ pub enum PrimalOp {
     Broadcast,
     Concat { dim: i64 },
     Split { dim: i64, chunks: usize },
-    Slice { dim: i64, start: i64, end: i64 },
+    Slice { dim: i64, start: i64, end: i64, orig_dim_size: i64 },
     /// Zero-pad a sliced gradient back to the original shape along a dimension.
     PadZero { dim: i64, pad_before: i64, pad_after: i64 },
     // Indexing

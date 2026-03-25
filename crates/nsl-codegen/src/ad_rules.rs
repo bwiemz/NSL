@@ -68,8 +68,9 @@ pub enum AdjointExpr {
     ConcatSplit(VarId, i64, usize, usize),
     /// Split backward: concat grads along dim
     SplitConcat(VarId, i64),
-    /// Slice backward: zero-pad grad into original shape. args: (grad, dim, start, end)
-    SliceBackward(VarId, i64, i64, i64),
+    /// Slice backward: zero-pad grad into original shape.
+    /// args: (grad, dim, start, end, orig_dim_size)
+    SliceBackward(VarId, i64, i64, i64, i64),
 
     // Convolution/pooling backward
     /// Conv2d backward for input: conv_transpose(grad, weight, stride, padding)
@@ -331,9 +332,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 expr: AdjointExpr::SplitConcat(output_bar, *dim),
             }]
         }
-        PrimalOp::Slice { dim, start, end } => vec![InputAdjoint {
+        PrimalOp::Slice { dim, start, end, orig_dim_size } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::SliceBackward(output_bar, *dim, *start, *end),
+            expr: AdjointExpr::SliceBackward(output_bar, *dim, *start, *end, *orig_dim_size),
         }],
 
         // --- Convolution ---
@@ -741,10 +742,10 @@ mod tests {
 
     #[test]
     fn test_slice_backward() {
-        let op = make_op(1, PrimalOp::Slice { dim: 0, start: 2, end: 5 }, vec![0]);
+        let op = make_op(1, PrimalOp::Slice { dim: 0, start: 2, end: 5, orig_dim_size: 10 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::SliceBackward(100, 0, 2, 5)));
+        assert!(matches!(adj[0].expr, AdjointExpr::SliceBackward(100, 0, 2, 5, 10)));
     }
 
     // --- Tier 3: Compound ops ---
@@ -841,7 +842,7 @@ mod tests {
     fn test_saved_new_nothing_ops() {
         assert_eq!(saved_for_backward(&PrimalOp::Concat { dim: 0 }), SavedRequirement::Nothing);
         assert_eq!(saved_for_backward(&PrimalOp::Split { dim: 0, chunks: 2 }), SavedRequirement::Nothing);
-        assert_eq!(saved_for_backward(&PrimalOp::Slice { dim: 0, start: 0, end: 5 }), SavedRequirement::Nothing);
+        assert_eq!(saved_for_backward(&PrimalOp::Slice { dim: 0, start: 0, end: 5, orig_dim_size: 10 }), SavedRequirement::Nothing);
         assert_eq!(saved_for_backward(&PrimalOp::AvgPool2d { kernel: 2, stride: 2 }), SavedRequirement::Nothing);
         assert_eq!(saved_for_backward(&PrimalOp::RoPE { dim: 64 }), SavedRequirement::Nothing);
     }
