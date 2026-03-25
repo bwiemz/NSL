@@ -323,10 +323,29 @@ impl NslTensor {
     }
 
     #[inline]
+    pub(crate) fn data_i32(&self) -> *mut i32 {
+        assert_eq!(self.dtype, 4, "data_i32() called on non-i32 tensor (dtype={})", self.dtype);
+        self.data as *mut i32
+    }
+
+    /// Read element at index `i` as an integer index value.
+    /// Handles dtype 0 (f64), 1 (f32), and 4 (i32).
+    /// Used by embedding_lookup, gather, and their backward passes.
+    #[inline]
+    pub(crate) fn read_index(&self, i: usize) -> i64 {
+        match self.dtype {
+            4 => unsafe { *(self.data as *const i32).add(i) as i64 },
+            1 => unsafe { *(self.data as *const f32).add(i) as i64 },
+            _ => unsafe { *(self.data as *const f64).add(i) as i64 },
+        }
+    }
+
+    #[inline]
     pub(crate) fn element_size(&self) -> usize {
         match self.dtype {
             DTYPE_F64 => std::mem::size_of::<f64>(),
             DTYPE_F32 => std::mem::size_of::<f32>(),
+            4 => std::mem::size_of::<i32>(),  // i32 token IDs
             id if id >= DTYPE_CUSTOM_START => {
                 get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
             }
@@ -1131,16 +1150,8 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
 
-    let read_idx = |i: usize| -> i64 {
-        if indices.dtype == 1 {
-            unsafe { *indices.data_f32().add(i) as i64 }
-        } else {
-            unsafe { *indices.data_f64().add(i) as i64 }
-        }
-    };
-
     for i in 0..seq_len {
-        let raw_idx = read_idx(i);
+        let raw_idx = indices.read_index(i);
         if raw_idx < 0 || raw_idx >= vocab_size as i64 {
             eprintln!(
                 "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
@@ -2023,6 +2034,25 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     if t.device == 0 && target > 0 {
         #[cfg(feature = "cuda")]
         {
+            // i32 tensors (token IDs): bitwise copy to GPU, preserving dtype
+            if t.dtype == 4 {
+                let dst_size = len * std::mem::size_of::<i32>();
+                let dst = crate::cuda::inner::alloc_managed(dst_size);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        t.data as *const u8,
+                        dst as *mut u8,
+                        dst_size,
+                    );
+                }
+                let shape = NslTensor::copy_shape(t.shape, t.ndim);
+                let strides = NslTensor::compute_strides(shape, t.ndim);
+                let new_t = Box::new(NslTensor::new(
+                    dst, shape, strides, t.ndim, t.len, target, 4, 1, 0,
+                ));
+                return NslTensor::publish(new_t);
+            }
+
             let dst_size = len * std::mem::size_of::<f32>();
             let dst = crate::cuda::inner::alloc_managed(dst_size);
             let dst_f32 = dst as *mut f32;
@@ -2050,6 +2080,27 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         #[cfg(feature = "cuda")]
         {
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+            // i32 tensors (token IDs): bitwise copy back to CPU
+            if t.dtype == 4 {
+                let dst_size = len * std::mem::size_of::<i32>();
+                let dst = checked_alloc(dst_size);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        t.data as *const u8,
+                        dst,
+                        dst_size,
+                    );
+                }
+                let shape = NslTensor::copy_shape(t.shape, t.ndim);
+                let strides = NslTensor::compute_strides(shape, t.ndim);
+                let new_t = Box::new(NslTensor::new(
+                    dst as *mut std::ffi::c_void,
+                    shape, strides, t.ndim, t.len, 0, 4, 1, 0,
+                ));
+                return NslTensor::publish(new_t);
+            }
+
             let src = t.data_f32();
             let dst_size = len * std::mem::size_of::<f64>();
             let dst = checked_alloc(dst_size) as *mut f64;

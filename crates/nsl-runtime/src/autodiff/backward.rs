@@ -1076,8 +1076,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
                     // Scatter-add: for each position i, add grad_out[i, :] to grad_w[idx[i], :]
                     for i in 0..total_indices {
-                        let idx = if idx_t.dtype == 1 { (unsafe { *idx_t.data_f32().add(i) }) as usize }
-                                  else { (unsafe { *idx_t.data_f64().add(i) }) as usize };
+                        let idx = idx_t.read_index(i) as usize;
                         if idx < vocab_size {
                             for j in 0..embed_dim {
                                 if grad_w_dtype == 1 {

@@ -428,8 +428,7 @@ pub(crate) fn scatter_gather_grad(
     // grad=[batch], output[b, indices[b]] += grad[b]
     let batch = indices.len as usize;
     for b in 0..batch {
-        let idx = if indices.dtype == 1 { (unsafe { *indices.data_f32().add(b) }) as usize }
-                  else { (unsafe { *indices.data_f64().add(b) }) as usize };
+        let idx = indices.read_index(b) as usize;
         let mut out_offset = 0usize;
         if input_shape.len() == 2 && dim == 1 {
             out_offset = b * out_strides[0] + idx * out_strides[1];

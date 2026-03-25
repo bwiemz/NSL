@@ -521,18 +521,9 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     let result_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&out_shape, tensor.dtype);
     let result = NslTensor::from_ptr(result_ptr);
 
-    // Helper: read index from indices tensor (always treat as integer index)
-    let read_idx = |i: usize| -> usize {
-        if indices.dtype == 1 {
-            unsafe { *indices.data_f32().add(i) as usize }
-        } else {
-            unsafe { *indices.data_f64().add(i) as usize }
-        }
-    };
-
     // General N-D gather along dimension d:
     for o in 0..outer {
-        let idx = read_idx(o);
+        let idx = indices.read_index(o) as usize;
         if idx >= gather_dim_size {
             eprintln!(
                 "nsl: gather index {} out of bounds for dim {} with size {}",

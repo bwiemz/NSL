@@ -1121,7 +1121,6 @@ pub extern "C" fn nsl_kernel_launch(
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::EMBEDDING_F32_PTX;
 
     let weight = unsafe { &*(weight_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
@@ -1134,7 +1133,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let out_elems = (seq_len * embed_dim) as usize;
     let out_data = inner::alloc_managed(out_elems * 4); // f32 = 4 bytes
 
-    // Ensure indices are on GPU (f32, unified memory)
+    // Ensure indices are on GPU (preserving dtype — may be i32 or f32)
     let indices_on_gpu = if indices.device == 0 {
         crate::tensor::nsl_tensor_to_device(indices_ptr, weight.device as i64)
     } else {
@@ -1171,8 +1170,16 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let grid_x = ((seq_len as i64) + block_x - 1) / block_x;
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
+    // Select kernel based on indices dtype: i32 indices use ld.global.s32,
+    // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+        (fused_kernels::EMBEDDING_I32IDX_PTX, b"nsl_embedding_i32idx\0")
+    } else {
+        (fused_kernels::EMBEDDING_F32_PTX, b"nsl_embedding_f32\0")
+    };
+
     let result = inner::kernel_launch(
-        EMBEDDING_F32_PTX.as_ptr(), b"nsl_embedding_f32\0".as_ptr(),
+        ptx.as_ptr(), kernel_name.as_ptr(),
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU embedding kernel failed: {:?}", result);
@@ -1816,8 +1823,15 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     let grid_x = ((num_indices as i64) + block_x - 1) / block_x;
     let grid_y = ((inner_dim as i64) + block_y - 1) / block_y;
 
+    // Select kernel based on indices dtype: i32 uses ld.global.s32
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+        (fused_kernels::GATHER_I32IDX_PTX, b"nsl_gather_i32idx\0")
+    } else {
+        (GATHER_F32_PTX, b"nsl_gather_f32\0")
+    };
+
     let result = inner::kernel_launch(
-        GATHER_F32_PTX.as_ptr(), b"nsl_gather_f32\0".as_ptr(),
+        ptx.as_ptr(), kernel_name.as_ptr(),
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU gather kernel failed: {:?}", result);
