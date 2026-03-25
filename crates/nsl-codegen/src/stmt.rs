@@ -1632,9 +1632,24 @@ impl Compiler<'_> {
                 }
 
                 // 7. Lower adjoint to Cranelift IR
-                let grad_vars = crate::wengert_lower::compile_wengert_ops(
+                // If lowering fails (e.g. unsupported op), fall back to tape AD.
+                // Note: at this point the forward pass is already emitted, so we
+                // cannot cleanly re-run through tape. Instead we propagate the error
+                // with a clear diagnostic so the user can disable --source-ad.
+                let grad_vars = match crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, &adjoint, &primal_vars,
-                )?;
+                ) {
+                    Ok(gv) => gv,
+                    Err(e) => {
+                        eprintln!(
+                            "[nsl] source AD lowering failed ({}), \
+                             falling back to tape AD is not possible after forward emit; \
+                             rerun without --source-ad",
+                            e
+                        );
+                        return Err(e);
+                    }
+                };
 
                 // 8. Collect parameter gradients into grads_list (NslList)
                 let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
