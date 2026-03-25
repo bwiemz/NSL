@@ -1572,44 +1572,93 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
         }
 
-        // Set training mode = true, then start tape recording (PER BATCH)
-        let true_val = builder.ins().iconst(cl_types::I8, 1);
-        self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
-        self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
+        // ── 7b. Forward pass + backward pass ─────────────────────────
+        // When source AD is enabled, attempt compile-time backward graph
+        // generation. If extraction fails (dynamic control flow), fall back
+        // to the tape-based AD path.
+        let (grads_list, loss_val) = if self.features.source_ad_enabled {
+            // === Source AD path (compile-time backward) ===
+            eprintln!("[nsl] Using source-to-source AD for backward pass");
 
-        // Compile step body stmts
-        // Suppress tensor temporary cleanup — tape holds raw pointers to intermediates.
-        state.in_tape_region = true;
-        for stmt in &step_body.stmts {
-            self.compile_stmt(builder, state, stmt)?;
-        }
-        state.in_tape_region = false;
+            // 1. Set training mode
+            let true_val = builder.ins().iconst(cl_types::I8, 1);
+            self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
 
-        // 7c. Find loss variable — look for "loss" in state.variables by name
-        let loss_val = {
-            let mut found = None;
-            for (sym, (var, _)) in &state.variables {
-                if self.resolve_sym(*sym) == "loss" {
-                    found = Some(builder.use_var(*var));
-                    break;
+            // 2. Try to extract Wengert list from step body
+            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+            let extraction_ok = extractor.extract_stmts(&step_body.stmts);
+
+            if !extraction_ok {
+                // Source AD extraction failed — fall back to tape
+                eprintln!("[nsl] source AD extraction failed, falling back to tape-based AD");
+
+                // Undo training mode — tape path sets it itself
+                let false_val = builder.ins().iconst(cl_types::I8, 0);
+                self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
+
+                self.compile_tape_backward(builder, state, step_body, param_list)?
+            } else {
+                // 3. Compile forward pass normally (no tape wrapping)
+                state.in_tape_region = false;
+                for stmt in &step_body.stmts {
+                    self.compile_stmt(builder, state, stmt)?;
                 }
+
+                // 4. Find loss variable
+                let loss_val = {
+                    let mut found = None;
+                    for (sym, (var, _)) in &state.variables {
+                        if self.resolve_sym(*sym) == "loss" {
+                            found = Some(builder.use_var(*var));
+                            break;
+                        }
+                    }
+                    found.ok_or_else(|| {
+                        CodegenError::new("train step body must assign to a variable named 'loss'")
+                    })?
+                };
+
+                // 5. Generate adjoint backward graph
+                let start_var = extractor.next_var_id();
+                let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+                let adjoint = gen.generate(extractor.wengert_list());
+
+                // 6. Build VarMap: map symbolic VarIds to Cranelift Values
+                let mut primal_vars = crate::wengert_lower::VarMap::new();
+                for (sym, vid) in extractor.symbol_var_map() {
+                    if let Some(&(cvar, _)) = state.variables.get(sym) {
+                        primal_vars.insert(*vid, builder.use_var(cvar));
+                    }
+                }
+
+                // 7. Lower adjoint to Cranelift IR
+                let grad_vars = crate::wengert_lower::compile_wengert_ops(
+                    self, builder, state, &adjoint, &primal_vars,
+                )?;
+
+                // 8. Collect parameter gradients into grads_list (NslList)
+                let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                for field in &layout.fields {
+                    // Find the param's symbol -> VarId -> adjoint VarId -> Cranelift Value
+                    let grad_val = extractor
+                        .param_var_ids()
+                        .iter()
+                        .find(|(sym, _)| self.resolve_sym(*sym) == field.name)
+                        .and_then(|(_, vid)| gen.adjoint_of(*vid))
+                        .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
+                        .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                    self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
+                }
+
+                let false_val = builder.ins().iconst(cl_types::I8, 0);
+                self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
+
+                (grads, loss_val)
             }
-            found.ok_or_else(|| {
-                CodegenError::new("train step body must assign to a variable named 'loss'")
-            })?
+        } else {
+            // === Tape AD path (runtime backward) ===
+            self.compile_tape_backward(builder, state, step_body, param_list)?
         };
-
-        // 7d. Run backward pass
-        let grads_list = self.compile_call_by_name(
-            builder,
-            "nsl_tape_backward",
-            &[loss_val, param_list],
-        )?;
-
-        // 7e. Stop tape and restore eval mode
-        self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
-        let false_val = builder.ins().iconst(cl_types::I8, 0);
-        self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
@@ -1972,6 +2021,57 @@ impl Compiler<'_> {
         }
 
         Ok(())
+    }
+
+    /// Emit the tape-based AD backward pass: tape_start, compile forward,
+    /// find loss, tape_backward, tape_stop. Returns `(grads_list, loss_val)`.
+    fn compile_tape_backward(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        step_body: &nsl_ast::stmt::Block,
+        param_list: Value,
+    ) -> Result<(Value, Value), CodegenError> {
+        // Set training mode = true, then start tape recording
+        let true_val = builder.ins().iconst(cl_types::I8, 1);
+        self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
+        self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
+
+        // Compile step body stmts
+        // Suppress tensor temporary cleanup — tape holds raw pointers to intermediates.
+        state.in_tape_region = true;
+        for stmt in &step_body.stmts {
+            self.compile_stmt(builder, state, stmt)?;
+        }
+        state.in_tape_region = false;
+
+        // Find loss variable — look for "loss" in state.variables by name
+        let loss_val = {
+            let mut found = None;
+            for (sym, (var, _)) in &state.variables {
+                if self.resolve_sym(*sym) == "loss" {
+                    found = Some(builder.use_var(*var));
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                CodegenError::new("train step body must assign to a variable named 'loss'")
+            })?
+        };
+
+        // Run backward pass
+        let grads_list = self.compile_call_by_name(
+            builder,
+            "nsl_tape_backward",
+            &[loss_val, param_list],
+        )?;
+
+        // Stop tape and restore eval mode
+        self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
+        let false_val = builder.ins().iconst(cl_types::I8, 0);
+        self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
+
+        Ok((grads_list, loss_val))
     }
 
     /// M43b: Emit pipeline-parallel training loop.
