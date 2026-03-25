@@ -135,14 +135,29 @@ pub(crate) mod inner {
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// Allocate unified memory (accessible from both CPU and GPU).
+    /// Uses a size-bucketed pool to recycle recently freed allocations,
+    /// reducing cuMemAllocManaged syscall overhead and page table churn.
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
+        // Try pool first — avoids expensive cuMemAllocManaged syscall
+        if let Some(ptr) = pool_try_alloc(size_bytes) {
+            #[cfg(test)]
+            crate::memory::stats::cuda_alloc(size_bytes);
+            return ptr;
+        }
+
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ensure_context();
+        // Pool miss — allocate the bucket size so it's reusable later
+        let actual_size = if size_bytes <= POOL_MAX_ALLOC && size_bytes > 0 {
+            bucket_size(size_bytes)
+        } else {
+            size_bytes
+        };
         unsafe {
             let mut ptr: CUdeviceptr = 0;
             let result = cuMemAllocManaged(
                 &mut ptr,
-                size_bytes,
+                actual_size,
                 CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
             );
             if result != CUresult::CUDA_SUCCESS {
@@ -161,12 +176,17 @@ pub(crate) mod inner {
                 };
                 panic!("{}", msg);
             }
-            register_cuda_alloc(ptr as *mut c_void);
+            let cptr = ptr as *mut c_void;
+            register_cuda_alloc(cptr);
+            // Track bucket size for pool return
+            if actual_size <= POOL_MAX_ALLOC && actual_size > 0 {
+                POOL_SIZE_MAP.lock().unwrap().insert(cptr as usize, actual_size);
+            }
             #[cfg(test)]
             crate::memory::stats::cuda_alloc(size_bytes);
             #[cfg(test)]
             cuda_size_registry().lock().unwrap().insert(ptr as usize, size_bytes);
-            ptr as *mut c_void
+            cptr
         }
     }
 
@@ -187,12 +207,92 @@ pub(crate) mod inner {
         CUDA_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
     }
 
+    // ------------------------------------------------------------------
+    // Unified memory pool: caches freed allocations by size bucket to
+    // avoid repeated cuMemAllocManaged syscalls, which are expensive on
+    // Windows (page table operations) and cause OOM-like freezes when
+    // the OS can't reclaim pages fast enough.
+    //
+    // Bucket strategy: round up to next power-of-2 so allocations of
+    // similar sizes reuse the same pool entry. Pool is bounded per
+    // bucket (max 8 cached blocks) to prevent unbounded memory growth.
+    // ------------------------------------------------------------------
+
+    use std::collections::VecDeque;
+
+    const POOL_MAX_PER_BUCKET: usize = 8;
+    /// Maximum individual allocation size to pool (256 MB). Larger allocations
+    /// bypass the pool and go directly to cuMemAllocManaged/cuMemFree.
+    const POOL_MAX_ALLOC: usize = 256 * 1024 * 1024;
+
+    struct ManagedPool {
+        /// Map from bucket_size -> list of (ptr, actual_alloc_size) free blocks
+        buckets: HashMap<usize, VecDeque<*mut c_void>>,
+    }
+    unsafe impl Send for ManagedPool {}
+
+    static MANAGED_POOL: std::sync::LazyLock<std::sync::Mutex<ManagedPool>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(ManagedPool {
+            buckets: HashMap::new(),
+        }));
+
+    /// Map from ptr -> bucket_size for returning to pool on free.
+    static POOL_SIZE_MAP: std::sync::LazyLock<std::sync::Mutex<HashMap<usize, usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    fn bucket_size(requested: usize) -> usize {
+        if requested == 0 { return 0; }
+        // Round up to next power of 2, minimum 4096
+        let min = 4096usize;
+        let s = requested.max(min);
+        s.next_power_of_two()
+    }
+
+    /// Try to get a cached allocation from the pool.
+    fn pool_try_alloc(size_bytes: usize) -> Option<*mut c_void> {
+        if size_bytes == 0 || size_bytes > POOL_MAX_ALLOC { return None; }
+        let bsize = bucket_size(size_bytes);
+        let mut pool = MANAGED_POOL.lock().unwrap();
+        if let Some(deque) = pool.buckets.get_mut(&bsize) {
+            if let Some(ptr) = deque.pop_front() {
+                // Track for return-to-pool on free
+                POOL_SIZE_MAP.lock().unwrap().insert(ptr as usize, bsize);
+                register_cuda_alloc(ptr);
+                return Some(ptr);
+            }
+        }
+        None
+    }
+
+    /// Return an allocation to the pool instead of calling cuMemFree.
+    fn pool_try_return(ptr: *mut c_void) -> bool {
+        let bsize = {
+            let mut map = POOL_SIZE_MAP.lock().unwrap();
+            match map.remove(&(ptr as usize)) {
+                Some(s) => s,
+                None => return false,
+            }
+        };
+        if bsize > POOL_MAX_ALLOC { return false; }
+        let mut pool = MANAGED_POOL.lock().unwrap();
+        let deque = pool.buckets.entry(bsize).or_insert_with(VecDeque::new);
+        if deque.len() < POOL_MAX_PER_BUCKET {
+            deque.push_back(ptr);
+            true
+        } else {
+            // Pool full for this bucket — actually free
+            false
+        }
+    }
+
     /// Free unified memory allocated by alloc_managed.
-    /// Uses tracking set to prevent double-free and skip non-CUDA pointers.
+    /// Returns to pool if eligible, otherwise calls cuMemFree.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
         let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         if !was_cuda { return; }
+        // Try returning to pool first
+        if pool_try_return(ptr) { return; }
         ensure_context();
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);

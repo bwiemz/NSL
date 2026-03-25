@@ -784,7 +784,15 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     // Pause recording during backward (don't tape gradient computation)
     TAPE.with(|t| t.borrow_mut().pause_depth += 1);
 
-    let ops = TAPE.with(|t| t.borrow().ops.clone());
+    // Take ownership of tape ops (drain instead of clone) to enable eager
+    // freeing of saved tensors during backward. This reduces peak memory by
+    // releasing saved activations as soon as they're consumed, rather than
+    // holding all of them until tape_stop(). Since we own the ops, tape_stop()
+    // will see an empty ops vec and skip release_tape_op_refs().
+    let mut ops: Vec<TapeOp> = TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+        std::mem::take(&mut tape.ops)
+    });
 
     // grad_map: tensor_ptr -> gradient tensor ptr
     let mut grad_map: HashMap<i64, i64> = HashMap::new();
@@ -793,8 +801,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     let seed = ones_like(loss_ptr);
     grad_map.insert(loss_ptr, seed);
 
-    // Walk tape in reverse, applying chain rule
-    for op in ops.iter().rev() {
+    // Walk tape in reverse, applying chain rule.
+    // We iterate in reverse by index so we can mutate ops to zero out saved
+    // tensor pointers after consuming them (eager free for peak memory reduction).
+    ops.reverse();
+    for op in ops.iter_mut() {
         match op {
             TapeOp::Add { a, b, out, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
@@ -823,6 +834,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let g_clone2 = tensor_clone(g);
                     let grad_a_full = tensor_mul(g_clone1, *saved_b);
                     let grad_b_full = tensor_mul(g_clone2, *saved_a);
+                    // Eagerly free saved tensors
+                    tensor_free(*saved_a);
+                    tensor_free(*saved_b);
+                    *saved_a = 0;
+                    *saved_b = 0;
                     tensor_free(g_clone1);
                     tensor_free(g_clone2);
                     let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
@@ -835,9 +851,6 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             }
             TapeOp::Div { a, b, out, saved_a, saved_b, a_shape, b_shape } => {
                 if let Some(&g) = grad_map.get(out) {
-                    // Clone g upfront for both grad_a and grad_b computations.
-                    // Must happen before any accumulate_grad call, which may free g
-                    // if *a == *out (the gradient for *out is g itself).
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
 
@@ -853,6 +866,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     tensor_free(g_clone2);
                     let neg_ga = tensor_mul(neg_g, *saved_a);
                     let b_sq = tensor_mul(*saved_b, *saved_b);
+                    // Eagerly free saved tensors after last use
+                    tensor_free(*saved_a);
+                    tensor_free(*saved_b);
+                    *saved_a = 0;
+                    *saved_b = 0;
                     let grad_b_full = tensor_div(neg_ga, b_sq);
                     tensor_free(neg_g);
                     tensor_free(neg_ga);
@@ -868,6 +886,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     // Use -2,-1 to transpose the last two dims (correct for batched matmul)
                     let b_t = tensor_transpose(*saved_b, -2, -1);
                     let a_t = tensor_transpose(*saved_a, -2, -1);
+                    // Eagerly free saved tensors — they're no longer needed after transpose
+                    tensor_free(*saved_a);
+                    tensor_free(*saved_b);
+                    *saved_a = 0;
+                    *saved_b = 0;
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
                     let grad_a = tensor_matmul(g_clone1, b_t);
@@ -1062,10 +1085,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let idx_t = crate::tensor::NslTensor::from_ptr(*saved_indices);
                     let vocab_size = unsafe { *w.shape.add(0) } as usize;
                     let embed_dim = unsafe { *w.shape.add(1) } as usize;
-                    // Use total element count so 2D indices [batch, seq_len] are handled correctly
                     let total_indices = idx_t.len as usize;
 
-                    // Create zero gradient with same shape as weight [vocab_size, embed_dim]
                     let w_shape_list = tensor_shape(*saved_weight);
                     let grad_w = tensor_zeros(w_shape_list);
                     crate::list::nsl_list_free(w_shape_list);
@@ -1074,7 +1095,6 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let g_t = crate::tensor::NslTensor::from_ptr(g);
                     let grad_w_dtype = grad_w_t.dtype;
 
-                    // Scatter-add: for each position i, add grad_out[i, :] to grad_w[idx[i], :]
                     for i in 0..total_indices {
                         let idx = idx_t.read_index(i) as usize;
                         if idx < vocab_size {
@@ -1091,6 +1111,12 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         }
                     }
 
+                    // Eagerly free saved tensors
+                    tensor_free(*saved_weight);
+                    tensor_free(*saved_indices);
+                    *saved_weight = 0;
+                    *saved_indices = 0;
+
                     accumulate_grad(&mut grad_map, *weight, grad_w);
                 }
             }
@@ -1106,6 +1132,15 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             TapeOp::LayerNorm { input, weight, bias, out, saved_input, saved_mean, saved_inv_std, saved_weight } => {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_input = layernorm_backward(g, *saved_input, *saved_mean, *saved_inv_std, *saved_weight);
+                    // Eagerly free saved tensors
+                    tensor_free(*saved_input);
+                    tensor_free(*saved_mean);
+                    tensor_free(*saved_inv_std);
+                    tensor_free(*saved_weight);
+                    *saved_input = 0;
+                    *saved_mean = 0;
+                    *saved_inv_std = 0;
+                    *saved_weight = 0;
                     accumulate_grad(&mut grad_map, *input, grad_input.0);
                     accumulate_grad(&mut grad_map, *weight, grad_input.1);
                     accumulate_grad(&mut grad_map, *bias, grad_input.2);
@@ -1114,6 +1149,13 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             TapeOp::RMSNorm { input, weight, out, saved_input, saved_rms, saved_weight } => {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_result = rmsnorm_backward(g, *saved_input, *saved_rms, *saved_weight);
+                    // Eagerly free saved tensors
+                    tensor_free(*saved_input);
+                    tensor_free(*saved_rms);
+                    tensor_free(*saved_weight);
+                    *saved_input = 0;
+                    *saved_rms = 0;
+                    *saved_weight = 0;
                     accumulate_grad(&mut grad_map, *input, grad_result.0);
                     accumulate_grad(&mut grad_map, *weight, grad_result.1);
                 }
@@ -1130,6 +1172,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let (grad_input, grad_weight, grad_bias) = conv2d_backward(
                         g, *saved_input, *saved_weight, *stride_h, *stride_w, *pad_h, *pad_w,
                     );
+                    // Eagerly free saved tensors
+                    tensor_free(*saved_input);
+                    tensor_free(*saved_weight);
+                    *saved_input = 0;
+                    *saved_weight = 0;
                     accumulate_grad(&mut grad_map, *input, grad_input);
                     accumulate_grad(&mut grad_map, *weight, grad_weight);
                     if *bias != 0 {
@@ -1196,11 +1243,9 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 saved_q, saved_k, saved_v,
             } => {
                 if let Some(&g) = grad_map.get(out) {
-                    // Pack scale as i64 via f32::to_bits for FFI
                     let scale_bits = scale.to_bits() as i64;
                     let causal_i = if *causal { 1i64 } else { 0i64 };
 
-                    // Call CPU backward — returns NslList of [dq, dk, dv]
                     let result_list = crate::flash_attention::nsl_flash_attention_backward(
                         g,
                         *saved_q, *saved_k, *saved_v,
@@ -1209,6 +1254,18 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         *batch, *heads, *seq_len, *head_dim,
                         causal_i,
                     );
+
+                    // Eagerly free saved Q, K, V and intermediates
+                    tensor_free(*saved_q);
+                    tensor_free(*saved_k);
+                    tensor_free(*saved_v);
+                    tensor_free(*out);
+                    tensor_free(*logsumexp);
+                    *saved_q = 0;
+                    *saved_k = 0;
+                    *saved_v = 0;
+                    *out = 0;
+                    *logsumexp = 0;
 
                     let list = crate::list::NslList::from_ptr(result_list);
                     let dq_ptr = unsafe { *list.data.add(0) };
@@ -1219,10 +1276,6 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *k, dk_ptr);
                     accumulate_grad(&mut grad_map, *v, dv_ptr);
 
-                    // Free the list container (not the tensors — they're now in grad_map)
-                    // Set list data to null so nsl_list_free doesn't free the tensor pointers
-                    // Actually, just leak the small list allocation — nsl_list_free would
-                    // only free the data array, not the tensors inside.
                     crate::list::nsl_list_free(result_list);
                 }
             }
@@ -1263,20 +1316,22 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             }
             TapeOp::Fp8MatMul { a, b, out, saved_a, saved_b, scale_a, scale_b, k_dim, device } => {
                 if let Some(&g) = grad_map.get(out) {
-                    let _ = (k_dim, device); // reserved for future GPU kernel caching
+                    let _ = (k_dim, device);
 
-                    // Compute fresh gradient scale (no EMA — gradients change every step)
                     let scale_g = crate::fp8::calibrate_gradient_scale(g);
 
-                    // grad_A = G @ B^T  (both quantized to E5M2)
                     let b_t = tensor_transpose(*saved_b, -2, -1);
                     let grad_a = crate::fp8::fp8_matmul_e5m2_backward(
                         g, b_t, scale_g, *scale_b,
                     );
                     tensor_free(b_t);
 
-                    // grad_B = A^T @ G  (both quantized to E5M2)
                     let a_t = tensor_transpose(*saved_a, -2, -1);
+                    // Eagerly free saved tensors after transpose
+                    tensor_free(*saved_a);
+                    tensor_free(*saved_b);
+                    *saved_a = 0;
+                    *saved_b = 0;
                     let grad_b = crate::fp8::fp8_matmul_e5m2_backward(
                         a_t, g, *scale_a, scale_g,
                     );
@@ -1310,6 +1365,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     for (_, grad_tensor) in grad_map {
         tensor_free(grad_tensor);
     }
+
+    // Release any saved tensor refs that weren't eagerly freed during backward
+    // (ops whose output had no gradient, or ops we didn't add eager-free to).
+    // Zeroed-out pointers (from eager free) are skipped by tensor_free(0).
+    super::release_tape_op_refs(&ops);
 
     result_list
 }
