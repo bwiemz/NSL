@@ -26,6 +26,8 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
     let a = NslTensor::from_ptr(a_c);
     let b = NslTensor::from_ptr(b_c);
     let len = a.len as usize;
+    let b_len = b.len as usize;
+    assert!(b_len >= len, "nsl_tensor_compare: b tensor too short ({} < {})", b_len, len);
     let ndim = a.ndim;
     let dtype = a.dtype;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -103,6 +105,8 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     let fv = NslTensor::from_ptr(false_c);
 
     let len = tv.len as usize;
+    assert!(cond.len as usize >= len, "nsl_tensor_where: cond tensor too short ({} < {})", cond.len, len);
+    assert!(fv.len as usize >= len, "nsl_tensor_where: false tensor too short ({} < {})", fv.len, len);
     let ndim = tv.ndim;
     let dtype = tv.dtype;
     let shape = NslTensor::copy_shape(tv.shape, ndim);
