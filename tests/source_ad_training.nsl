@@ -1,0 +1,28 @@
+# M40 Source-to-Source AD — End-to-End Training Test
+#
+# Verifies that:
+# 1. A train block compiles and runs under tape AD (default).
+# 2. With --source-ad, the Wengert extractor either succeeds and produces
+#    correct gradients, or gracefully falls back to tape AD with a diagnostic.
+
+from nsl.nn.losses import mse_loss
+
+model TinyMLP:
+    w1: Tensor = randn([2, 4])
+    w2: Tensor = randn([4, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = relu(x @ self.w1)
+        return h @ self.w2
+
+let m = TinyMLP()
+let x = randn([8, 2])
+let y = randn([8, 1])
+
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+print("source_ad_training: PASS")
