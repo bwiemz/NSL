@@ -31,8 +31,8 @@ pub enum AdjointExpr {
     SiluBackward(VarId, VarId),
     /// Abs backward: sign(x) * grad
     SignMul(VarId, VarId),
-    /// Clamp backward: grad * (min <= x <= max)
-    ClampBackward(VarId, VarId),
+    /// Clamp backward: grad * (min <= x <= max), with actual min/max bounds
+    ClampBackward(VarId, VarId, f64, f64),
 
     // Softmax/LogSoftmax backward
     /// Softmax backward: grad - sum(grad * y) * y  (y = softmax output)
@@ -85,9 +85,13 @@ pub enum AdjointExpr {
     /// L1 backward: sign(pred - target)/n. args: (grad, pred, target)
     L1Backward(VarId, VarId, VarId),
 
-    // Attention backward
-    /// Scaled dot-product attention backward. args: (grad, Q, K, V)
-    AttentionBackward(VarId, VarId, VarId, VarId),
+    // Attention backward — per-component (Q, K, V) for correct causal masking
+    /// Attention backward for Q: args: (grad, Q, K, V, causal)
+    AttentionBackwardQ(VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for K: args: (grad, Q, K, V, causal)
+    AttentionBackwardK(VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for V: args: (grad, Q, K, V, causal)
+    AttentionBackwardV(VarId, VarId, VarId, VarId, bool),
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
 
@@ -205,9 +209,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::SignMul(output_bar, op.inputs[0]),
         }],
-        PrimalOp::Clamp { .. } => vec![InputAdjoint {
+        PrimalOp::Clamp { min, max } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::ClampBackward(output_bar, op.inputs[0]),
+            expr: AdjointExpr::ClampBackward(output_bar, op.inputs[0], *min, *max),
         }],
 
         // --- Softmax / LogSoftmax ---
@@ -377,15 +381,15 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }
 
         // --- Attention ---
-        PrimalOp::ScaledDotProductAttention { .. } => {
+        PrimalOp::ScaledDotProductAttention { causal } => {
             // Q, K, V are inputs[0..3]
             let q = op.inputs[0];
             let k = op.inputs[1];
             let v = op.inputs[2];
             vec![
-                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
-                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
-                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackward(output_bar, q, k, v) },
+                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackwardQ(output_bar, q, k, v, *causal) },
+                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackwardK(output_bar, q, k, v, *causal) },
+                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackwardV(output_bar, q, k, v, *causal) },
             ]
         }
         PrimalOp::RoPE { dim } => vec![InputAdjoint {
@@ -671,7 +675,7 @@ mod tests {
         let op = make_op(1, PrimalOp::Clamp { min: 0.0, max: 1.0 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0, _, _)));
         assert_eq!(saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }), SavedRequirement::Inputs);
     }
 
@@ -800,9 +804,9 @@ mod tests {
         let op = make_op(3, PrimalOp::ScaledDotProductAttention { causal: true }, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "Attention should produce 3 adjoints (Q, K, V)");
-        for a in &adj {
-            assert!(matches!(a.expr, AdjointExpr::AttentionBackward(100, 0, 1, 2)));
-        }
+        assert!(matches!(adj[0].expr, AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, true)));
+        assert!(matches!(adj[1].expr, AdjointExpr::AttentionBackwardK(100, 0, 1, 2, true)));
+        assert!(matches!(adj[2].expr, AdjointExpr::AttentionBackwardV(100, 0, 1, 2, true)));
         assert_eq!(
             saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: true }),
             SavedRequirement::Inputs

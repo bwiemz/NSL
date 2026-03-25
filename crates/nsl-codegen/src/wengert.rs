@@ -39,6 +39,8 @@ pub enum PrimalOp {
     Concat { dim: i64 },
     Split { dim: i64, chunks: usize },
     Slice { dim: i64, start: i64, end: i64 },
+    /// Zero-pad a sliced gradient back to the original shape along a dimension.
+    PadZero { dim: i64, pad_before: i64, pad_after: i64 },
     // Indexing
     Gather { dim: i64 },
     ScatterAdd { dim: i64 },
@@ -51,12 +53,18 @@ pub enum PrimalOp {
     AvgPool2d { kernel: usize, stride: usize },
     // Convolution
     Conv2d { stride: usize, padding: usize },
+    /// Transposed convolution (deconvolution) — used in Conv2d backward for input gradient.
+    ConvTranspose2d { stride: usize, padding: usize },
+    /// Repeat (upsample) tensor elements by kernel factor — used in AvgPool backward.
+    Repeat { kernel: usize },
     // Loss functions
     CrossEntropyLoss,
     MSELoss,
     L1Loss,
     // Attention
     ScaledDotProductAttention { causal: bool },
+    /// Extract one component (0=dQ, 1=dK, 2=dV) from FlashAttention backward.
+    FlashAttentionBackwardExtract { causal: bool, component: u8 },
     RoPE { dim: usize },
     /// Inverse RoPE rotation (rotate by -θ) — used in backward pass.
     RoPEInverse { dim: usize },

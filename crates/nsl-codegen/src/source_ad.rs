@@ -231,57 +231,98 @@ impl AdjointGenerator {
             }
 
             // --- Clamp backward: grad * (min <= x <= max) ---
-            AdjointExpr::ClampBackward(y_bar, x) => {
-                // For now, pass through grad (clamp derivative is 1 in range, 0 outside)
-                // Full implementation needs min/max bounds from forward pass
+            // Derivative is 1 when x is in [min, max], 0 outside.
+            // Implemented as chained Selects: pass grad only if x >= min AND x <= max.
+            AdjointExpr::ClampBackward(y_bar, x, min, max) => {
                 let zero = self.emit_constant(0.0);
-                let cond = self.emit_op(PrimalOp::Condition(CompareKind::Gt), vec![x, zero]);
-                self.emit_op(PrimalOp::Select, vec![cond, y_bar, y_bar])
+                let min_val = self.emit_constant(min);
+                let max_val = self.emit_constant(max);
+                let ge_min = self.emit_op(PrimalOp::Condition(CompareKind::GtEq), vec![x, min_val]);
+                let le_max = self.emit_op(PrimalOp::Condition(CompareKind::LtEq), vec![x, max_val]);
+                let pass_if_le_max = self.emit_op(PrimalOp::Select, vec![le_max, y_bar, zero]);
+                self.emit_op(PrimalOp::Select, vec![ge_min, pass_if_le_max, zero])
             }
 
             // --- Softmax backward: s * (grad - dot(grad, s)) where s = softmax output ---
+            // The Sum{dim:-1} reduces the last dimension, so we must Broadcast
+            // back to the full shape before subtracting from the un-reduced grad.
             AdjointExpr::SoftmaxBackward(y_bar, y) => {
                 let dot = self.emit_op(PrimalOp::Mul, vec![y_bar, y]);
                 let dot_sum = self.emit_op(PrimalOp::Sum { dim: Some(-1) }, vec![dot]);
-                let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum]);
+                let dot_sum_bc = self.emit_op(PrimalOp::Broadcast, vec![dot_sum]);
+                let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum_bc]);
                 self.emit_op(PrimalOp::Mul, vec![y, diff])
             }
 
-            // --- LogSoftmax backward: grad - softmax(x) * sum(grad) ---
+            // --- LogSoftmax backward: grad - exp(y) * sum(grad) ---
+            // The Sum{dim:-1} reduces the last dimension, so we must Broadcast
+            // back to the full shape before multiplying with exp(y).
             AdjointExpr::LogSoftmaxBackward(y_bar, y) => {
                 let exp_y = self.emit_op(PrimalOp::Exp, vec![y]);
                 let grad_sum = self.emit_op(PrimalOp::Sum { dim: Some(-1) }, vec![y_bar]);
-                let correction = self.emit_op(PrimalOp::Mul, vec![exp_y, grad_sum]);
+                let grad_sum_bc = self.emit_op(PrimalOp::Broadcast, vec![grad_sum]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![exp_y, grad_sum_bc]);
                 self.emit_op(PrimalOp::Sub, vec![y_bar, correction])
             }
 
-            // --- LayerNorm backward: simplified — dx = rstd * (grad - mean(grad) - x_hat * mean(grad * x_hat)) ---
-            // where x_hat = (x - mean) * rstd
-            // Full 3-component gradient (dx, dgamma, dbeta) requires the forward params.
-            // Here we emit the dx component which is the most critical for training.
-            AdjointExpr::LayerNormBackward(y_bar, x, mean, rstd) => {
-                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
-                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
-                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                let mean_grad_x_hat = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![grad_x_hat]);
+            // --- LayerNorm backward: dx = rstd * (grad - mean(grad) - x_hat * mean(grad * x_hat)) ---
+            // Recomputes mean/rstd from input (not op.result) for correctness.
+            // Every Mean{dim} reduction MUST be followed by Broadcast before use in
+            // Sub/Mul with full-shape tensors to avoid shape mismatch.
+            AdjointExpr::LayerNormBackward(y_bar, x, _mean_unused, _rstd_unused) => {
+                // Recompute mean and rstd from input
+                let mean = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x]);
+                let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
+                let var = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x_sq]);
+                let eps = self.emit_constant(1e-5);
+                let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
+                let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
+                let one = self.emit_constant(1.0);
+                let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
+                let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
+                // Compute gradient corrections
                 let mean_grad = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![y_bar]);
-                let x_hat_correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_grad_x_hat]);
-                let grad_minus_mean = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad]);
-                let grad_corrected = self.emit_op(PrimalOp::Sub, vec![grad_minus_mean, x_hat_correction]);
-                self.emit_op(PrimalOp::Mul, vec![grad_corrected, rstd])
+                let mean_grad_bc = self.emit_op(PrimalOp::Broadcast, vec![mean_grad]);
+                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
+                let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![grad_x_hat]);
+                let mean_gxh_bc = self.emit_op(PrimalOp::Broadcast, vec![mean_gxh]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh_bc]);
+                let t1 = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad_bc]);
+                let t2 = self.emit_op(PrimalOp::Sub, vec![t1, correction]);
+                self.emit_op(PrimalOp::Mul, vec![t2, rstd_bc])
             }
 
-            // --- BatchNorm backward: same structure as LayerNorm but over batch dim ---
-            AdjointExpr::BatchNormBackward(y_bar, x, mean, rstd) => {
-                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
-                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
-                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                let mean_grad_x_hat = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![grad_x_hat]);
+            // --- BatchNorm backward: same structure as LayerNorm but over batch dim (dim=0) ---
+            // Recomputes mean/rstd from input for correctness.
+            // Every Mean{dim} reduction MUST be followed by Broadcast before use in
+            // Sub/Mul with full-shape tensors to avoid shape mismatch.
+            AdjointExpr::BatchNormBackward(y_bar, x, _mean_unused, _rstd_unused) => {
+                // Recompute mean and rstd from input over batch dimension
+                let mean = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![x]);
+                let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
+                let var = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![x_sq]);
+                let eps = self.emit_constant(1e-5);
+                let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
+                let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
+                let one = self.emit_constant(1.0);
+                let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
+                let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
+                // Compute gradient corrections
                 let mean_grad = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![y_bar]);
-                let x_hat_correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_grad_x_hat]);
-                let grad_minus_mean = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad]);
-                let grad_corrected = self.emit_op(PrimalOp::Sub, vec![grad_minus_mean, x_hat_correction]);
-                self.emit_op(PrimalOp::Mul, vec![grad_corrected, rstd])
+                let mean_grad_bc = self.emit_op(PrimalOp::Broadcast, vec![mean_grad]);
+                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
+                let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(0) }, vec![grad_x_hat]);
+                let mean_gxh_bc = self.emit_op(PrimalOp::Broadcast, vec![mean_gxh]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh_bc]);
+                let t1 = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad_bc]);
+                let t2 = self.emit_op(PrimalOp::Sub, vec![t1, correction]);
+                self.emit_op(PrimalOp::Mul, vec![t2, rstd_bc])
             }
 
             // --- Dropout backward: grad * mask * (1/(1-p)) ---
@@ -315,15 +356,15 @@ impl AdjointGenerator {
                 // Split backward = concat the gradient pieces (handled by accumulate_adjoint)
                 self.emit_op(PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar])
             }
-            AdjointExpr::SliceBackward(y_bar, _dim, _start, _end) => {
-                // Slice backward = zero-pad grad into original shape
-                // Full implementation needs original tensor shape; for now, pass through
-                self.emit_op(PrimalOp::Broadcast, vec![y_bar])
+            AdjointExpr::SliceBackward(y_bar, dim, start, _end) => {
+                // Slice backward = zero-pad grad into original shape along the sliced dim.
+                // TODO: pad_after requires original shape — runtime infers from accumulation target
+                self.emit_op(PrimalOp::PadZero { dim, pad_before: start, pad_after: 0 }, vec![y_bar])
             }
 
             // --- Conv/Pool backward ---
             AdjointExpr::ConvTransposeInput(y_bar, weight) => {
-                self.emit_op(PrimalOp::Matmul, vec![y_bar, weight])
+                self.emit_op(PrimalOp::ConvTranspose2d { stride: 1, padding: 0 }, vec![y_bar, weight])
             }
             AdjointExpr::ConvTransposeWeight(input, y_bar) => {
                 self.emit_op(PrimalOp::Matmul, vec![input, y_bar])
@@ -333,9 +374,11 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices])
             }
             AdjointExpr::AvgPoolBackward(y_bar, pool_size) => {
+                // Repeat (upsample) each element to cover the pool region,
+                // then scale by 1/pool_size to distribute the gradient evenly.
+                let repeated = self.emit_op(PrimalOp::Repeat { kernel: pool_size }, vec![y_bar]);
                 let scale = self.emit_constant(1.0 / pool_size as f64);
-                let scaled = self.emit_op(PrimalOp::Mul, vec![y_bar, scale]);
-                self.emit_op(PrimalOp::Broadcast, vec![scaled])
+                self.emit_op(PrimalOp::Mul, vec![repeated, scale])
             }
 
             // --- CrossEntropy backward: softmax(logits) - one_hot(targets) ---
@@ -347,7 +390,9 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Sub, vec![softmax_out, targets])
             }
 
-            // --- MSE backward: 2*(pred - target)/n * grad ---
+            // --- MSE backward for reduction='sum': d/d(pred) = 2*(pred - target) * grad_output ---
+            // For reduction='mean', the user's NSL code divides by N before loss,
+            // which propagates 1/N through grad_output automatically.
             AdjointExpr::MSEBackward(y_bar, pred, target) => {
                 let diff = self.emit_op(PrimalOp::Sub, vec![pred, target]);
                 let two = self.emit_constant(2.0);
@@ -355,7 +400,9 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![y_bar, scaled_diff])
             }
 
-            // --- L1 backward: sign(pred - target) * grad ---
+            // --- L1 backward for reduction='sum': d/d(pred) = sign(pred - target) * grad_output ---
+            // For reduction='mean', the user's NSL code divides by N before loss,
+            // which propagates 1/N through grad_output automatically.
             AdjointExpr::L1Backward(y_bar, pred, target) => {
                 let diff = self.emit_op(PrimalOp::Sub, vec![pred, target]);
                 let zero = self.emit_constant(0.0);
@@ -366,15 +413,17 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![y_bar, sign])
             }
 
-            // --- Attention backward: complex multi-component (dQ, dK, dV) ---
-            // For source-to-source AD, emit approximate backward via matmul decomposition.
-            // Full FlashAttention backward uses logsumexp and is handled by the runtime.
-            AdjointExpr::AttentionBackward(y_bar, _q, k, v) => {
-                // dV = attn_weights^T @ grad_output (approximated as K^T @ grad)
-                let dv = self.emit_op(PrimalOp::Matmul, vec![k, y_bar]);
-                let _ = dv; // dV gradient accumulated separately
-                // Return approximate dQ contribution
-                self.emit_op(PrimalOp::Matmul, vec![y_bar, v])
+            // --- Attention backward: per-component extraction from fused kernel ---
+            // Each component (dQ=0, dK=1, dV=2) is extracted via a dedicated op
+            // that carries the causal flag so the runtime can apply the correct mask.
+            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, causal) => {
+                self.emit_op(PrimalOp::FlashAttentionBackwardExtract { causal, component: 0 }, vec![y_bar, q, k, v])
+            }
+            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, causal) => {
+                self.emit_op(PrimalOp::FlashAttentionBackwardExtract { causal, component: 1 }, vec![y_bar, q, k, v])
+            }
+            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, causal) => {
+                self.emit_op(PrimalOp::FlashAttentionBackwardExtract { causal, component: 2 }, vec![y_bar, q, k, v])
             }
 
             // --- RoPE backward: apply inverse rotation (rotate by -θ) ---
