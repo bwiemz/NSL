@@ -73,7 +73,8 @@ fn lower_single_op(
         }
         PrimalOp::Constant(val) => {
             let v = builder.ins().f64const(*val);
-            return call(compiler, builder, "nsl_tensor_scalar", &[v]);
+            let dt = builder.ins().iconst(cl_types::I64, 1); // f32 default
+            return call(compiler, builder, "nsl_tensor_scalar", &[v, dt]);
         }
         _ => {}
     }

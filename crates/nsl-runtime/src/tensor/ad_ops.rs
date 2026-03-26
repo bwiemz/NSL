@@ -156,24 +156,31 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
 }
 
 // ---------------------------------------------------------------------------
-// 3. nsl_tensor_scalar — create a 0-dim scalar tensor (dtype matches runtime default f32)
+// 3. nsl_tensor_scalar — create a 0-dim scalar tensor
 // ---------------------------------------------------------------------------
 
-/// Create a 0-dimensional scalar tensor holding a single f32 value.
-/// The tensor has `ndim=0`, `len=1`, and `dtype=1` (f32), matching the
-/// default creation dtype used throughout the runtime.
+/// Create a 0-dimensional scalar tensor holding a single value.
+/// `dtype`: 0 = f64, 1 = f32. Matches the graph's working precision to avoid
+/// silent precision loss in mixed-dtype backward computations.
 #[no_mangle]
-pub extern "C" fn nsl_tensor_scalar(val: f64) -> i64 {
-    let data = checked_alloc(std::mem::size_of::<f32>()) as *mut f32;
-    unsafe { *data = val as f32 };
+pub extern "C" fn nsl_tensor_scalar(val: f64, dtype: i64) -> i64 {
+    let (data, dt): (*mut c_void, u16) = if dtype == 1 {
+        let buf = checked_alloc(std::mem::size_of::<f32>()) as *mut f32;
+        unsafe { *buf = val as f32 };
+        (buf as *mut c_void, 1)
+    } else {
+        let buf = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
+        unsafe { *buf = val };
+        (buf as *mut c_void, 0)
+    };
     let result = Box::new(NslTensor::new(
-        data as *mut c_void,
+        data,
         std::ptr::null_mut(), // 0-dim: no shape array
         std::ptr::null_mut(), // 0-dim: no strides array
         0,                    // ndim
         1,                    // len = 1 element
         0,                    // device = CPU
-        1,                    // dtype = f32
+        dt,                   // dtype matches request
         1,                    // owns_data
         0,                    // data_owner
     ));
@@ -758,14 +765,26 @@ mod tests {
     }
 
     #[test]
-    fn test_tensor_scalar_creation() {
-        let s = nsl_tensor_scalar(3.14);
+    fn test_tensor_scalar_creation_f32() {
+        let s = nsl_tensor_scalar(3.14, 1); // dtype=1 (f32)
         let t = NslTensor::from_ptr(s);
         assert_eq!(t.ndim, 0);
         assert_eq!(t.len, 1);
-        assert_eq!(t.dtype, 1); // f32
+        assert_eq!(t.dtype, 1);
         let val = unsafe { *t.data_f32() };
         assert!((val - 3.14_f32).abs() < 1e-5_f32);
+        nsl_tensor_free(s);
+    }
+
+    #[test]
+    fn test_tensor_scalar_creation_f64() {
+        let s = nsl_tensor_scalar(3.14159265358979, 0); // dtype=0 (f64)
+        let t = NslTensor::from_ptr(s);
+        assert_eq!(t.ndim, 0);
+        assert_eq!(t.len, 1);
+        assert_eq!(t.dtype, 0);
+        let val = unsafe { *t.data_f64() };
+        assert!((val - 3.14159265358979_f64).abs() < 1e-14_f64);
         nsl_tensor_free(s);
     }
 
