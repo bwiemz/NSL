@@ -494,6 +494,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_reduce_sum_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_reduce_mean_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_scatter_add_deterministic", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // --- M46: Global deterministic mode flag + RNG seeding ---
+    ("nsl_set_deterministic", &[types::I64], Some(types::I64)),
+    ("nsl_rng_seed", &[types::I64], Some(types::I64)),
     // --- M48: Multimodal primitives ---
     ("nsl_patch_embed", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_mel_spectrogram", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
@@ -512,6 +515,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_sparse_spmv", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_sparse_coo_to_csr", &[types::I64], Some(types::I64)),
     ("nsl_sparse_coo_to_csc", &[types::I64], Some(types::I64)),
+    ("nsl_sparse_csr_to_csc", &[types::I64], Some(types::I64)),
+    ("nsl_sparse_csc_to_csr", &[types::I64], Some(types::I64)),
+    ("nsl_sparse_csr_to_coo", &[types::I64], Some(types::I64)),
+    ("nsl_sparse_csc_to_coo", &[types::I64], Some(types::I64)),
     ("nsl_sparse_add", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_sparse_mul", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_sparse_free", &[types::I64], Some(types::I64)),
@@ -533,6 +540,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_model_forward", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_model_forward_dlpack", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_model_backward", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_model_enable_grad", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_model_get_version", &[], Some(types::I64)),
     ("nsl_get_last_error", &[], Some(types::I64)),
     ("nsl_clear_error", &[], Some(types::I64)),

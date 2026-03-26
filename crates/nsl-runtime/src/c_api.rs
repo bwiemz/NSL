@@ -92,6 +92,11 @@ pub struct NslModel {
     /// Path the weights were loaded from (for diagnostics).
     #[allow(dead_code)]
     weights_path: String,
+    /// Whether to record the tape during the next forward pass (for backward).
+    grad_enabled: bool,
+    /// Output tensor pointers saved from the most recent grad-enabled forward pass.
+    /// Used to seed the backward pass.
+    last_forward_outputs: Vec<i64>,
 }
 
 impl Drop for NslModel {
@@ -183,6 +188,8 @@ pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
         weight_ptrs,
         forward_fn: None,
         weights_path: path_str.to_string(),
+        grad_enabled: false,
+        last_forward_outputs: Vec::new(),
     });
     Box::into_raw(model) as i64
 }
@@ -279,8 +286,27 @@ pub extern "C" fn nsl_model_forward(
         }
     }
 
+    // If grad recording is enabled, start the tape over the weight parameters
+    // so that the backward pass can replay it.
+    let grad_enabled = model.grad_enabled;
+    if grad_enabled {
+        let param_list = crate::list::nsl_list_new();
+        for &wptr in &model.weight_ptrs {
+            crate::list::nsl_list_push(param_list, wptr);
+        }
+        crate::autodiff::nsl_tape_start(param_list);
+        crate::list::nsl_list_free(param_list);
+    }
+
     // Call forward function
     let output_tensor_ptrs = forward_fn(&model.weight_ptrs, &input_ptrs);
+
+    // Save forward outputs for the backward pass (before writing to output descs,
+    // since nsl_tensor_to_desc only borrows the pointer — the tensor stays alive).
+    if grad_enabled {
+        let model_mut = unsafe { &mut *(model_ptr as *mut NslModel) };
+        model_mut.last_forward_outputs = output_tensor_ptrs.clone();
+    }
 
     // Write results to output descriptors
     if num_outputs > 0 && outputs_ptr != 0 {
@@ -557,39 +583,127 @@ fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
 // M62b: Backward pass FFI
 // ---------------------------------------------------------------------------
 
-/// Run the model backward pass, computing gradients of the loss w.r.t. inputs.
+/// Enable or disable tape recording during subsequent forward passes.
+///
+/// When `enable` is non-zero, the next call to `nsl_model_forward` will
+/// start recording the autodiff tape over the model's weight tensors.
+/// Call `nsl_model_backward` afterwards to replay the tape and compute
+/// parameter gradients.
+///
+/// Returns 0 on success, -1 if model_ptr is null.
+#[no_mangle]
+pub extern "C" fn nsl_model_enable_grad(model_ptr: i64, enable: i64) -> i64 {
+    if model_ptr == 0 {
+        set_error("nsl_model_enable_grad: null model pointer\0".to_string());
+        return -1;
+    }
+    let model = unsafe { &mut *(model_ptr as *mut NslModel) };
+    model.grad_enabled = enable != 0;
+    0
+}
+
+/// Run the model backward pass, computing gradients w.r.t. all weight parameters.
+///
+/// This function replays the tape recorded during the most recent grad-enabled
+/// forward pass (`nsl_model_enable_grad` + `nsl_model_forward`), computing
+/// ∂loss/∂param for every weight in the model.
 ///
 /// Parameters:
-///   model_ptr:        NslModel* handle
-///   grad_outputs_ptr: DLManagedTensor* array of gradient tensors (loss w.r.t. outputs)
-///   num_grad_outputs: number of gradient output tensors
-///   grad_inputs_ptr:  output buffer for DLManagedTensor* gradient tensors
-///   num_grad_inputs:  output — number of gradient input tensors written
+///   model_ptr:            NslModel* handle
+///   grad_outputs_ptr:     (reserved) upstream gradient tensors — currently unused;
+///                         the loss scalar is taken directly from the forward output
+///   num_grad_outputs:     number of upstream gradient tensors (reserved)
+///   grad_inputs_ptr:      pointer to a caller-allocated array of NslTensorDesc that
+///                         will be filled with one gradient descriptor per weight;
+///                         pass 0 to query the count only
+///   num_grad_inputs_ptr:  output — written with the number of weight gradients
 ///
-/// Returns: 0 on success, negative on error.
+/// Returns: 0 on success, negative on error (message in thread-local).
 ///
-/// Note: This is a stub for M62b. Full backward support requires wiring to NSL's
-/// tape-based AD system, which expects the forward pass to have been recorded.
-/// The gradient bridge in Python (nslpy.autograd) calls this and falls back to
-/// returning None gradients if it fails.
+/// Typical usage (from Python/C bridge):
+///   nsl_model_enable_grad(model, 1);
+///   nsl_model_forward(model, inputs, n, outputs, n_out);
+///   nsl_model_backward(model, 0, 0, grad_buf, &num_grads);
+///   nsl_model_enable_grad(model, 0);  // optional: disable for inference
 #[no_mangle]
 pub extern "C" fn nsl_model_backward(
     model_ptr: i64,
     _grad_outputs_ptr: i64,
     _num_grad_outputs: i64,
-    _grad_inputs_ptr: i64,
-    num_grad_inputs: i64,
+    grad_inputs_ptr: i64,
+    num_grad_inputs_ptr: i64,
 ) -> i64 {
     if model_ptr == 0 {
+        set_error("nsl_model_backward: null model pointer\0".to_string());
         return -1;
     }
-    // Write 0 grad inputs (stub — no gradients computed yet)
-    if num_grad_inputs != 0 {
-        unsafe { *(num_grad_inputs as *mut i64) = 0 };
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+
+    if !model.grad_enabled {
+        set_error("nsl_model_backward: grad not enabled — call nsl_model_enable_grad(model, 1) before nsl_model_forward\0".to_string());
+        return -1;
     }
-    // TODO: Wire to NSL's tape-based or source-to-source AD backward pass.
-    // The forward pass would need to record a tape, then backward replays it.
-    // For now, the Python autograd bridge catches the error and returns None grads.
+
+    if model.last_forward_outputs.is_empty() {
+        set_error("nsl_model_backward: no forward pass recorded — call nsl_model_forward with grad enabled first\0".to_string());
+        return -1;
+    }
+
+    // Build the param list for tape_backward — same weights that were registered at tape_start.
+    let param_list = crate::list::nsl_list_new();
+    for &wptr in &model.weight_ptrs {
+        crate::list::nsl_list_push(param_list, wptr);
+    }
+
+    // Use the first forward output as the loss tensor.
+    // For standard training this is a scalar loss; for multi-output models the
+    // caller should pass grad_outputs to scale/combine, but that is reserved for
+    // a future revision. Chain-rule seeding from the scalar loss is sufficient
+    // for all current NSL training patterns.
+    let loss_ptr = model.last_forward_outputs[0];
+
+    // Run backward — this drains the tape ops and returns one gradient per param.
+    let grads_list = crate::autodiff::nsl_tape_backward(loss_ptr, param_list);
+
+    // Reset tape to clean state (recording=false, ops/param_set cleared).
+    crate::autodiff::nsl_tape_stop();
+
+    let num_params = model.weight_ptrs.len();
+
+    // Write gradient count to caller's output pointer.
+    if num_grad_inputs_ptr != 0 {
+        unsafe { *(num_grad_inputs_ptr as *mut i64) = num_params as i64 };
+    }
+
+    // Fill gradient descriptors if the caller provided a buffer.
+    if grad_inputs_ptr != 0 && num_params > 0 {
+        let out_descs = unsafe {
+            std::slice::from_raw_parts_mut(grad_inputs_ptr as *mut NslTensorDesc, num_params)
+        };
+        for (i, desc) in out_descs.iter_mut().enumerate() {
+            let grad_ptr = crate::list::nsl_list_get(grads_list, i as i64);
+            if grad_ptr != 0 {
+                nsl_tensor_to_desc(grad_ptr, desc);
+            }
+        }
+    }
+
+    // Clear the saved forward outputs now that backward is done.
+    // SAFETY: we hold a shared reference to model above but no longer read it,
+    // and last_forward_outputs is only mutated by this function and nsl_model_forward
+    // (never concurrently — the C API is single-threaded per the M62 contract).
+    {
+        let model_mut = unsafe { &mut *(model_ptr as *mut NslModel) };
+        model_mut.last_forward_outputs.clear();
+    }
+
+    // The gradient tensors in grads_list are referenced by the descriptors we
+    // filled above (the descriptors borrow the tensor data pointers). We free the
+    // list wrapper but leave the tensors alive — the caller owns them via the
+    // NslTensorDesc.data pointers and is responsible for freeing them.
+    crate::list::nsl_list_free(grads_list);
+    crate::list::nsl_list_free(param_list);
+
     0
 }
 
@@ -710,5 +824,128 @@ mod tests {
     #[test]
     fn test_get_weight_null_model() {
         assert_eq!(nsl_model_get_weight(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_enable_grad_null_model() {
+        assert_eq!(nsl_model_enable_grad(0, 1), -1);
+    }
+
+    #[test]
+    fn test_backward_null_model() {
+        assert_eq!(nsl_model_backward(0, 0, 0, 0, 0), -1);
+    }
+
+    #[test]
+    fn test_backward_without_enable_grad() {
+        // Build a minimal NslModel directly (no weights file needed).
+        let model = Box::new(NslModel {
+            version: 2,
+            weights: HashMap::new(),
+            weight_ptrs: vec![],
+            forward_fn: None,
+            weights_path: String::new(),
+            grad_enabled: false,
+            last_forward_outputs: vec![],
+        });
+        let model_ptr = Box::into_raw(model) as i64;
+
+        // Backward without enabling grad must fail with a meaningful error.
+        let ret = nsl_model_backward(model_ptr, 0, 0, 0, 0);
+        assert_eq!(ret, -1);
+
+        // Error message should mention enable_grad.
+        let err_ptr = nsl_get_last_error() as *const std::os::raw::c_char;
+        let err_msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap_or("");
+        assert!(err_msg.contains("grad not enabled"), "unexpected error: {err_msg}");
+
+        unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
+        nsl_clear_error();
+    }
+
+    #[test]
+    fn test_backward_without_forward() {
+        // Build a model with grad enabled but no prior forward pass.
+        let model = Box::new(NslModel {
+            version: 2,
+            weights: HashMap::new(),
+            weight_ptrs: vec![],
+            forward_fn: None,
+            weights_path: String::new(),
+            grad_enabled: true,
+            last_forward_outputs: vec![],
+        });
+        let model_ptr = Box::into_raw(model) as i64;
+
+        let ret = nsl_model_backward(model_ptr, 0, 0, 0, 0);
+        assert_eq!(ret, -1);
+
+        let err_ptr = nsl_get_last_error() as *const std::os::raw::c_char;
+        let err_msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap_or("");
+        assert!(err_msg.contains("no forward pass recorded"), "unexpected error: {err_msg}");
+
+        unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
+        nsl_clear_error();
+    }
+
+    #[test]
+    fn test_backward_with_tape_e2e() {
+        use std::ffi::c_void;
+        use crate::memory::checked_alloc;
+        use crate::tensor::NslTensor;
+
+        // Build a single-weight model: weight = [2.0] (f64 scalar).
+        // forward(w) = w * 3  → loss = w * 3
+        // d(loss)/d(w) = 3
+        let weight_data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
+        unsafe { *weight_data = 2.0_f64 };
+        let weight_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *weight_shape = 1 };
+        let weight_strides = NslTensor::compute_strides(weight_shape, 1);
+        let weight_tensor = Box::new(NslTensor::new(
+            weight_data as *mut c_void,
+            weight_shape,
+            weight_strides,
+            1,
+            1,
+            0,  // CPU
+            0,  // f64
+            1,  // owns_data
+            0,
+        ));
+        let weight_ptr = Box::into_raw(weight_tensor) as i64;
+
+        // Forward fn: loss = weight * 3
+        let fwd: ForwardFn = Box::new(move |weights: &[i64], _inputs: &[i64]| {
+            let w = weights[0];
+            let out = crate::tensor::nsl_tensor_mul_scalar(w, 3.0_f64);
+            vec![out]
+        });
+
+        let mut weights = HashMap::new();
+        weights.insert("w".to_string(), weight_ptr);
+
+        let model = Box::new(NslModel {
+            version: 2,
+            weights,
+            weight_ptrs: vec![weight_ptr],
+            forward_fn: Some(fwd),
+            weights_path: String::new(),
+            grad_enabled: false,
+            last_forward_outputs: vec![],
+        });
+        let model_ptr = Box::into_raw(model) as i64;
+
+        // Enable grad, run forward, run backward.
+        assert_eq!(nsl_model_enable_grad(model_ptr, 1), 0);
+        assert_eq!(nsl_model_forward(model_ptr, 0, 0, 0, 0), 0);
+
+        let mut num_grads: i64 = 0;
+        let ret = nsl_model_backward(model_ptr, 0, 0, 0, &mut num_grads as *mut i64 as i64);
+        assert_eq!(ret, 0, "backward returned error");
+        assert_eq!(num_grads, 1, "expected 1 gradient (one weight)");
+
+        // Cleanup: destroy the model (frees weight tensor).
+        nsl_model_destroy(model_ptr);
     }
 }
