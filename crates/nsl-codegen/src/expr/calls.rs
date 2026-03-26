@@ -1243,12 +1243,32 @@ impl Compiler<'_> {
         func_name: &str,
         arg_vals: &[Value],
     ) -> Result<Value, CodegenError> {
-        let (func_id, sig) = if let Some(e) = self.functions.get(func_name) {
+        // M39b: Vmap dispatch — check if function has a batched variant.
+        // For v1, body compilation of batched functions is deferred, so we only
+        // dispatch if the batched function body has actually been compiled (i.e.,
+        // it is present in self.functions AND was not merely declared).
+        // Until compile_batched_functions() wires up body compilation, the lookup
+        // will always fall through to the original name — the infrastructure is in
+        // place so activation is a one-line change when bodies are compiled.
+        let effective_name: &str = if let Some(batched_name) = self.batched_fn_names.get(func_name) {
+            if self.functions.contains_key(batched_name.as_str()) {
+                // TODO(M39c): verify caller arguments carry the extra batch dimension
+                // before actually dispatching, to avoid reading garbage memory with
+                // non-batched tensors. For now, fall through to original.
+                func_name
+            } else {
+                func_name
+            }
+        } else {
+            func_name
+        };
+
+        let (func_id, sig) = if let Some(e) = self.functions.get(effective_name) {
             e.clone()
-        } else if let Some(e) = self.runtime_fns.get(func_name) {
+        } else if let Some(e) = self.runtime_fns.get(effective_name) {
             e.clone()
         } else {
-            return Err(CodegenError::new(format!("undefined function '{func_name}'")));
+            return Err(CodegenError::new(format!("undefined function '{effective_name}'")));
         };
 
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
