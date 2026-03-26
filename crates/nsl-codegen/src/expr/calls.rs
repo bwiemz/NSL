@@ -1001,8 +1001,18 @@ impl Compiler<'_> {
             let logits_val = self.compile_expr(builder, state, &args[1].value)?;
             let _experts_val = self.compile_expr(builder, state, &args[2].value)?;
 
-            // Look up MoE config from decorator extraction
-            let config = self.features.moe_configs.values().next().cloned();
+            // Look up MoE config from decorator extraction, using model name prefix
+            // from the mangled function name ("ModelName__method_name") to correctly
+            // resolve the right config in multi-layer models instead of grabbing an
+            // arbitrary entry via .values().next().
+            let config = state.current_function_name.as_ref()
+                .and_then(|fn_name| {
+                    // Model methods are mangled as "ModelName__method_name"
+                    let model_prefix = fn_name.split("__").next().unwrap_or("");
+                    self.features.moe_configs.iter()
+                        .find(|(key, _)| key.starts_with(model_prefix))
+                        .map(|(_, info)| info.clone())
+                });
             let (num_experts, top_k, capacity_factor) = match config {
                 Some(info) => (info.num_experts, info.top_k, info.capacity_factor),
                 None => (8, 2, 1.25f32), // defaults
