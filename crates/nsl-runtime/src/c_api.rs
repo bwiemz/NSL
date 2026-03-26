@@ -500,6 +500,12 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
     Err(format!("safetensors loading requires --features interop (path: '{path}')"))
 }
 
+/// Public wrapper for `desc_to_nsl_tensor` — used by disaggregated workers
+/// to convert model forward outputs back to NslTensor pointers.
+pub fn desc_to_nsl_tensor_pub(desc: &NslTensorDesc) -> i64 {
+    desc_to_nsl_tensor(desc)
+}
+
 /// Convert an NslTensorDesc (C API) into an NslTensor pointer.
 /// The resulting tensor borrows the data buffer — caller must not free the
 /// original data while the tensor is live.

@@ -2,7 +2,8 @@
 //!
 //! Each worker runs as a separate OS process. The loops receive messages
 //! from the router, process requests, and send results back.
-//! For now these are FFI entry points that the codegen's role dispatch calls.
+//! Workers call the model's forward pass via `nsl_model_forward` when a
+//! valid `model_ptr` is provided, falling back to stub behavior otherwise.
 
 use std::sync::Mutex;
 
@@ -148,6 +149,174 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
 }
 
 // ---------------------------------------------------------------------------
+// Model forward helpers
+// ---------------------------------------------------------------------------
+
+/// Call the model's forward pass via the C API.
+///
+/// `model_ptr`: opaque NslModel handle (from `nsl_model_create`)
+/// `input_tensor_ptr`: NslTensor* containing the input (e.g., token IDs)
+///
+/// Returns a Vec of output NslTensor pointers (caller must free them),
+/// or an empty Vec if the model has no registered forward function.
+fn call_model_forward(model_ptr: i64, input_tensor_ptr: i64) -> Vec<i64> {
+    use crate::c_api::NslTensorDesc;
+    use crate::tensor::NslTensor;
+
+    if model_ptr == 0 || input_tensor_ptr == 0 {
+        return Vec::new();
+    }
+
+    // Build an NslTensorDesc from the input tensor
+    let tensor = NslTensor::from_ptr(input_tensor_ptr);
+    let input_desc = NslTensorDesc {
+        data: tensor.data,
+        shape: tensor.shape,
+        strides: tensor.strides,
+        ndim: tensor.ndim as i32,
+        dtype: crate::c_api::nsl_dtype_to_capi(tensor.dtype),
+        device_type: if tensor.device > 0 { 1 } else { 0 },
+        device_id: if tensor.device > 0 { (tensor.device - 1) as i32 } else { 0 },
+    };
+
+    // Prepare output descriptor
+    let mut output_desc = NslTensorDesc {
+        data: std::ptr::null_mut(),
+        shape: std::ptr::null_mut(),
+        strides: std::ptr::null_mut(),
+        ndim: 0,
+        dtype: 0,
+        device_type: 0,
+        device_id: 0,
+    };
+
+    let rc = crate::c_api::nsl_model_forward(
+        model_ptr,
+        &input_desc as *const NslTensorDesc as i64,
+        1, // num_inputs
+        &mut output_desc as *mut NslTensorDesc as i64,
+        1, // num_outputs
+    );
+
+    if rc != 0 {
+        return Vec::new();
+    }
+
+    // If the output desc was populated (non-null data), convert to tensor pointer
+    if !output_desc.data.is_null() && output_desc.ndim > 0 {
+        let out_ptr = crate::c_api::desc_to_nsl_tensor_pub(&output_desc);
+        if out_ptr != 0 {
+            return vec![out_ptr];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Create a 1-D NslTensor containing token IDs from a raw pointer.
+///
+/// `token_ids_ptr`: pointer to an array of i64 token IDs (0 = no tokens available)
+/// `num_tokens`: number of tokens
+///
+/// Returns an NslTensor* (as i64) with shape [num_tokens] and dtype f64 (NSL default).
+/// The tensor owns a copy of the data. Returns 0 if token_ids_ptr is null/zero.
+fn create_token_tensor(token_ids_ptr: i64, num_tokens: u32) -> i64 {
+    use crate::tensor::NslTensor;
+    use crate::memory::checked_alloc;
+
+    if token_ids_ptr == 0 || num_tokens == 0 {
+        return 0;
+    }
+
+    let n = num_tokens as usize;
+    let data_bytes = n * std::mem::size_of::<f64>();
+    let data_ptr = checked_alloc(data_bytes) as *mut f64;
+
+    // Copy token IDs (i64) into f64 buffer (NSL's default CPU dtype)
+    let src = token_ids_ptr as *const i64;
+    for i in 0..n {
+        unsafe { *data_ptr.add(i) = *src.add(i) as f64; }
+    }
+
+    let shape_ptr = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *shape_ptr = n as i64; }
+
+    let strides_ptr = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *strides_ptr = 1; }
+
+    let tensor = Box::new(NslTensor::new(
+        data_ptr as *mut std::ffi::c_void,
+        shape_ptr,
+        strides_ptr,
+        1,      // ndim
+        n as i64,
+        0,      // device = CPU
+        0,      // dtype = f64
+        1,      // owns_data
+        0,      // data_owner
+    ));
+    NslTensor::publish(tensor)
+}
+
+/// Sample a single token ID from a logits tensor via argmax.
+///
+/// `logits_ptr`: NslTensor* with shape [..., vocab_size] (last dim is vocab)
+///
+/// Returns the token ID with the highest logit value.
+fn sample_argmax(logits_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+
+    if logits_ptr == 0 {
+        return 0;
+    }
+
+    let tensor = NslTensor::from_ptr(logits_ptr);
+    let len = tensor.len as usize;
+    if len == 0 {
+        return 0;
+    }
+
+    // Read logits as f64 or f32 depending on dtype
+    let mut best_idx: usize = 0;
+    let mut best_val: f64 = f64::NEG_INFINITY;
+
+    if tensor.dtype == 0 {
+        // f64
+        let data = unsafe { std::slice::from_raw_parts(tensor.data as *const f64, len) };
+        // Argmax over the last dimension (last `vocab_size` elements)
+        let vocab_size = if tensor.ndim > 0 {
+            (unsafe { *tensor.shape.add(tensor.ndim as usize - 1) }) as usize
+        } else {
+            len
+        };
+        let start = len.saturating_sub(vocab_size);
+        for (i, &v) in data[start..].iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+    } else {
+        // f32
+        let data = unsafe { std::slice::from_raw_parts(tensor.data as *const f32, len) };
+        let vocab_size = if tensor.ndim > 0 {
+            (unsafe { *tensor.shape.add(tensor.ndim as usize - 1) }) as usize
+        } else {
+            len
+        };
+        let start = len.saturating_sub(vocab_size);
+        for (i, &v) in data[start..].iter().enumerate() {
+            if (v as f64) > best_val {
+                best_val = v as f64;
+                best_idx = i;
+            }
+        }
+    }
+
+    best_idx as i64
+}
+
+// ---------------------------------------------------------------------------
 // Prefill worker loop
 // ---------------------------------------------------------------------------
 
@@ -166,7 +335,7 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
 #[no_mangle]
 pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
     // Verify role
-    let (rank, _model_ptr) = {
+    let (rank, model_ptr) = {
         let guard = match WORKER_CTX.lock() {
             Ok(g) => g,
             Err(_) => return -1,
@@ -191,32 +360,35 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
     let kv_backend = SharedMemBackend::new(rank);
 
     // Prefill processing loop — runs until Shutdown or timeout with no work
-    loop {
-        // Wait for a message from the router (100ms timeout for clean shutdown)
-        let msg = match recv_message_timeout(100) {
-            Some(m) => m,
-            None => {
-                // No message within timeout — check if we should shut down
-                // For test/single-iteration mode, exit cleanly
-                break;
-            }
-        };
-
+    while let Some(msg) = recv_message_timeout(100) {
         match msg {
             RouterMessage::StartPrefill {
                 request_id,
-                token_ids_ptr: _,
+                token_ids_ptr,
                 num_tokens,
                 target_decode_rank,
             } => {
                 // Step 1: Run model forward pass on prompt tokens.
-                // This would call the compiled model function via model_ptr.
-                // For now, simulate by computing KV cache size.
-                let num_blocks = (num_tokens as u64 + config.block_size as u64 - 1)
-                    / config.block_size as u64;
+                // When model_ptr is valid, call the registered forward function
+                // which populates the KV cache as a side effect.
+                if model_ptr != 0 {
+                    let input_tensor = create_token_tensor(token_ids_ptr, num_tokens);
+                    if input_tensor != 0 {
+                        let outputs = call_model_forward(model_ptr, input_tensor);
+                        // Free output logits — prefill only needs KV cache side effect
+                        for out_ptr in &outputs {
+                            if *out_ptr != 0 {
+                                crate::tensor::nsl_tensor_free(*out_ptr);
+                            }
+                        }
+                        crate::tensor::nsl_tensor_free(input_tensor);
+                    }
+                }
+
+                let num_blocks = (num_tokens as u64).div_ceil(config.block_size as u64);
 
                 // Step 2: Build KV transfer header and block entries
-                let header = KvTransferHeader {
+                let mut header = KvTransferHeader {
                     magic: KV_TRANSFER_MAGIC,
                     request_id,
                     num_layers: config.num_layers,
@@ -229,6 +401,7 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
                     _padding: 0,
                     total_bytes: 0,
                 };
+                header.total_bytes = header.compute_kv_bytes();
 
                 let mut entries = Vec::with_capacity(num_blocks as usize);
                 for i in 0..num_blocks as u32 {
@@ -245,14 +418,17 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
                 }
 
                 // Step 3: Transfer KV cache to decode worker.
-                // In a real implementation, k_data/v_data would point to the
-                // BlockAllocator's memory. For now, send empty data.
+                // When model_ptr != 0 the forward pass has populated KV cache
+                // memory. For now we still send the header + entries (the
+                // SharedMemBackend will copy any non-null K/V data). A future
+                // change will wire nsl_kv_serialize to extract actual block
+                // data from the BlockAllocator.
                 let _rc = kv_backend.send_kv(
                     target_decode_rank,
                     &header,
                     &entries,
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null(), // TODO: wire to BlockAllocator K data
+                    std::ptr::null(), // TODO: wire to BlockAllocator V data
                 );
 
                 // Step 4: Notify router that prefill is complete
@@ -290,7 +466,7 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
     // Verify role
-    let (rank, _model_ptr) = {
+    let (rank, model_ptr) = {
         let guard = match WORKER_CTX.lock() {
             Ok(g) => g,
             Err(_) => return -1,
@@ -311,8 +487,9 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
         WorkerConfig::default()
     };
 
-    // Active sequences being decoded: request_id -> (tokens_generated, max_tokens)
-    let mut active_sequences: std::collections::HashMap<u64, (u32, u32)> = std::collections::HashMap::new();
+    // Active sequences being decoded: request_id -> (tokens_generated, max_tokens, last_token_id)
+    let mut active_sequences: std::collections::HashMap<u64, (u32, u32, i64)> =
+        std::collections::HashMap::new();
 
     // KV transfer backend for receiving from prefill workers
     let _kv_backend = SharedMemBackend::new(rank);
@@ -329,9 +506,41 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                 }
                 // Process one decode step per active sequence
                 let mut completed = Vec::new();
-                for (&request_id, (tokens_generated, max_tokens)) in active_sequences.iter_mut() {
-                    // Step 2: Run model decode step (stub: generate sequential token IDs)
-                    let token_id = *tokens_generated as i64 + 100;
+                for (&request_id, (tokens_generated, max_tokens, last_token_id)) in active_sequences.iter_mut() {
+                    // Step 2: Run model decode step.
+                    // When model_ptr is valid, pass the last token through the model
+                    // and sample from the output logits.
+                    let token_id = if model_ptr != 0 {
+                        // Create a 1-element tensor with the last generated token
+                        let single_token = [*last_token_id];
+                        let input_tensor = create_token_tensor(
+                            single_token.as_ptr() as i64,
+                            1,
+                        );
+                        if input_tensor != 0 {
+                            let outputs = call_model_forward(model_ptr, input_tensor);
+                            crate::tensor::nsl_tensor_free(input_tensor);
+                            if let Some(&logits_ptr) = outputs.first() {
+                                let sampled = sample_argmax(logits_ptr);
+                                for out_ptr in &outputs {
+                                    if *out_ptr != 0 {
+                                        crate::tensor::nsl_tensor_free(*out_ptr);
+                                    }
+                                }
+                                sampled
+                            } else {
+                                // Forward returned no outputs — fall back to stub
+                                *tokens_generated as i64 + 100
+                            }
+                        } else {
+                            *tokens_generated as i64 + 100
+                        }
+                    } else {
+                        // Stub: generate sequential token IDs when no model is loaded
+                        *tokens_generated as i64 + 100
+                    };
+
+                    *last_token_id = token_id;
                     *tokens_generated += 1;
 
                     let is_eos = token_id == config.eos_token_id
@@ -369,8 +578,10 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                 temperature_bits: _,
                 top_p_bits: _,
             } => {
-                // Admit new sequence into active set
-                active_sequences.insert(request_id, (0, max_tokens));
+                // Admit new sequence into active set.
+                // last_token_id starts at 0 (BOS); prefill would have set this
+                // via the KV transfer but for stub mode we use 0.
+                active_sequences.insert(request_id, (0, max_tokens, 0));
             }
             _ => {
                 // Unexpected message — ignore
