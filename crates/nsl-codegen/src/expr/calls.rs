@@ -762,6 +762,68 @@ impl Compiler<'_> {
                 return self.compile_flash_attention_call(builder, q_val, k_val, v_val, scale_val);
             }
 
+            // M34: Check for context parallelism (ring attention)
+            // Look up config using the model name prefix from the mangled function name
+            // ("ModelName__method_name"), mirroring the MoE/speculative patterns.
+            let cp_config = state.current_function_name.as_ref()
+                .and_then(|fn_name| {
+                    let model_prefix = fn_name.split("__").next().unwrap_or("");
+                    self.features.context_parallel_configs.iter()
+                        .find(|(key, _)| key.starts_with(model_prefix))
+                        .map(|(_, info)| info.clone())
+                });
+
+            if let Some(cp_info) = cp_config {
+                eprintln!("[nsl] Context parallelism active: ring_size={}", cp_info.ring_size);
+
+                // Initialize context parallel context:
+                // nsl_cp_init(ring_size, local_seq_len, num_heads, num_kv_heads, head_dim, dtype)
+                // Pass zeros for dims inferred by runtime; dtype=1 means f32.
+                let ring_size = builder.ins().iconst(cl_types::I64, cp_info.ring_size as i64);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                let dtype_val = builder.ins().iconst(cl_types::I64, 1); // f32
+                let cp_ctx = self.compile_call_by_name(
+                    builder,
+                    "nsl_cp_init",
+                    &[ring_size, zero, zero, zero, zero, dtype_val],
+                )?;
+
+                // Partition Q across the ring:
+                // nsl_sequence_partition(tensor, batch, seq_len, hidden, ring_size, rank, overlap)
+                // Runtime infers dims from tensor shape; rank=0 (host rank), overlap=0.
+                let q_part = self.compile_call_by_name(
+                    builder,
+                    "nsl_sequence_partition",
+                    &[q_val, zero, zero, zero, ring_size, zero, zero],
+                )?;
+
+                // Ring attention core:
+                // nsl_ring_attention(cp_ctx, q_part, k, v, scale, causal,
+                //                    null, null, null, null, null, null, null)
+                // Trailing nulls are reserved for future paged/GQA extensions.
+                let causal_flag = builder.ins().iconst(cl_types::I64, if causal { 1 } else { 0 });
+                let null = builder.ins().iconst(cl_types::I64, 0);
+                let ring_result = self.compile_call_by_name(
+                    builder,
+                    "nsl_ring_attention",
+                    &[cp_ctx, q_part, k_val, v_val, scale_val, causal_flag,
+                      null, null, null, null, null, null, null],
+                )?;
+
+                // Gather partitioned outputs back to full sequence:
+                // nsl_sequence_gather(result, ring_size, batch, seq_len, hidden, rank, overlap, null)
+                let output = self.compile_call_by_name(
+                    builder,
+                    "nsl_sequence_gather",
+                    &[ring_result, ring_size, zero, zero, zero, zero, zero, null],
+                )?;
+
+                // Destroy context parallel context.
+                self.compile_call_by_name(builder, "nsl_cp_destroy", &[cp_ctx])?;
+
+                return Ok(output);
+            }
+
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
