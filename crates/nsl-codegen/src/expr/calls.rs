@@ -19,7 +19,7 @@ impl Compiler<'_> {
         state: &mut FuncState,
         callee: &Expr,
         args: &[nsl_ast::expr::Arg],
-        _call_expr: &Expr,
+        call_expr: &Expr,
     ) -> Result<Value, CodegenError> {
         // Intercept method calls (e.g., s.upper()) before extracting func_name
         if let ExprKind::MemberAccess { object, member } = &callee.kind {
@@ -71,6 +71,24 @@ impl Compiler<'_> {
                 return self.compile_indirect_call(builder, state, callee, args);
             }
         };
+
+        // M39b: matmul rewrite dispatch — VmapTransformer records (NodeId → target_name)
+        // for matmul call sites that need batched semantics.  "batched_matmul" and
+        // "batched_matmul_right" are logical names; both currently lower to
+        // nsl_tensor_matmul which handles broadcast/batched shapes natively.
+        // Future milestones (M39c+) will wire specialised batched kernels here.
+        if let Some(rewrite_target) = self.matmul_rewrites.get(&call_expr.id).cloned() {
+            let rt_name = match rewrite_target.as_str() {
+                "batched_matmul" | "batched_matmul_right" => "nsl_tensor_matmul",
+                other => other, // forward any future named variants unchanged
+            };
+            if args.len() < 2 {
+                return Err(CodegenError::new("matmul rewrite: expected at least 2 arguments"));
+            }
+            let lhs = self.compile_expr(builder, state, &args[0].value)?;
+            let rhs = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_traced_call(builder, rt_name, &[lhs, rhs]);
+        }
 
         // Check if this is a kernel call (compiled GPU kernel)
         if let Some((ptx_data_id, name_data_id)) = self.kernel_ptx_data.get(&func_name).cloned() {
