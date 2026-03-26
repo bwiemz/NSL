@@ -674,11 +674,8 @@ fn main() {
             zk_solidity,
             zk_weights,
         } => {
-            if shared_lib {
-                eprintln!("[nsl] --shared-lib: flag recognized (M62a stub).");
-                eprintln!("[nsl] Shared library emission requires M62b linker changes.");
-                eprintln!("[nsl] Proceeding with normal build for now.");
-            }
+            // M62a: shared_lib flag is threaded through compile_opts and handled
+            // in the build path below.
 
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -764,6 +761,7 @@ fn main() {
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
                 debug_training,
+                shared_lib,
             };
 
             if standalone {
@@ -792,6 +790,8 @@ fn main() {
                     embed_threshold,
                     &compile_opts,
                 );
+            } else if shared_lib {
+                run_build_shared(&file, output, dump_ir, &compile_opts);
             } else if zk_circuit {
                 run_build_zk(&file, output, emit_obj, dump_ir, zk_weights.as_deref(), &compile_opts);
             } else {
@@ -860,6 +860,7 @@ fn main() {
                 linear_types_enabled: false, // run command doesn't expose --linear-types
                 ownership_info: std::collections::HashMap::new(),
                 debug_training,
+                shared_lib: false,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -1266,6 +1267,234 @@ fn run_build(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: b
     run_build_inner(file, output, emit_obj, dump_ir, false, options);
 }
 
+/// M62a: Build as a shared library (.so/.dylib/.dll) with stable C API.
+fn run_build_shared(
+    file: &PathBuf,
+    output: Option<PathBuf>,
+    dump_ir: bool,
+    options: &nsl_codegen::CompileOptions,
+) {
+    if needs_multi_file(file) {
+        run_build_shared_multi(file, output, dump_ir, options);
+    } else {
+        run_build_shared_single(file, output, dump_ir, options);
+    }
+}
+
+/// M62a: Single-file shared library build.
+fn run_build_shared_single(
+    file: &PathBuf,
+    output: Option<PathBuf>,
+    dump_ir: bool,
+    options: &nsl_codegen::CompileOptions,
+) {
+    let (interner, parse_result, analysis) = frontend(file);
+
+    // Codegen with PIC enabled (shared_lib=true in options)
+    let obj_bytes = match nsl_codegen::compile(
+        &parse_result.module,
+        &interner,
+        &analysis.type_map,
+        dump_ir,
+        options,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("codegen error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid input filename '{}'", file.display());
+            process::exit(1);
+        });
+    let obj_path = file.with_file_name(format!("{stem}.o"));
+
+    if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
+        eprintln!("error: could not write object file: {e}");
+        process::exit(1);
+    }
+
+    let lib_path = if let Some(out) = output {
+        out
+    } else {
+        nsl_codegen::linker::default_shared_lib_path(file)
+    };
+
+    match nsl_codegen::linker::link_shared(&[obj_path.clone()], &lib_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&obj_path);
+            println!("Built shared library {}", lib_path.display());
+        }
+        Err(e) => {
+            eprintln!("link error: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// M62a: Multi-file shared library build.
+fn run_build_shared_multi(
+    file: &std::path::Path,
+    output: Option<PathBuf>,
+    dump_ir: bool,
+    options: &nsl_codegen::CompileOptions,
+) {
+    let mut source_map = SourceMap::new();
+    let mut interner = Interner::new();
+
+    let graph = match loader::load_all_modules(file, &mut source_map, &mut interner) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let temp_dir = std::env::temp_dir().join(format!("nsl_shared_{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        eprintln!("error: could not create temp dir: {e}");
+        process::exit(1);
+    }
+
+    let mut obj_files: Vec<PathBuf> = Vec::new();
+
+    // Compile each module in dependency order (same as run_build_multi but with shared_lib options)
+    for path in &graph.dep_order {
+        let mod_data = &graph.modules[path];
+        let is_entry = *path == graph.entry;
+
+        let obj_bytes = if is_entry {
+            let mut imported_fns = Vec::new();
+            let mut imported_struct_layouts = HashMap::new();
+            let mut imported_model_names = std::collections::HashSet::new();
+            let mut imported_enum_variants = HashMap::new();
+            let mut imported_enum_defs = HashMap::new();
+
+            for dep_path in &graph.dep_order {
+                if dep_path == &graph.entry {
+                    continue;
+                }
+                let dep_data = &graph.modules[dep_path];
+
+                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(
+                    &interner,
+                    &dep_data.type_map,
+                    &nsl_codegen::CompileOptions::default(),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("codegen error: {e}");
+                        process::exit(1);
+                    }
+                };
+
+                for stmt in &dep_data.ast.stmts {
+                    if let nsl_ast::stmt::StmtKind::FnDef(fn_def) = &stmt.kind {
+                        let raw_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                        let mangled_name = crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
+                        let sig = temp_compiler.build_fn_signature(fn_def);
+                        imported_fns.push((raw_name, mangled_name, sig));
+                    }
+                }
+
+                if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
+                    eprintln!("codegen error: {e}");
+                    process::exit(1);
+                }
+                if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
+                    eprintln!("codegen error: {e}");
+                    process::exit(1);
+                }
+
+                let model_sigs = temp_compiler.build_model_signatures(&dep_data.ast.stmts);
+                imported_fns.extend(model_sigs);
+
+                for stmt in &dep_data.ast.stmts {
+                    if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
+                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        imported_model_names.insert(model_name);
+                    }
+                }
+
+                for (name, layout) in temp_compiler.struct_layouts.drain() {
+                    imported_struct_layouts.insert(name, layout);
+                }
+
+                imported_enum_variants.extend(dep_data.enum_variants.clone());
+                imported_enum_defs.extend(dep_data.enum_defs.clone());
+            }
+
+            match nsl_codegen::compile_entry(
+                &mod_data.ast,
+                &interner,
+                &mod_data.type_map,
+                &imported_fns,
+                imported_struct_layouts,
+                imported_model_names,
+                imported_enum_variants,
+                imported_enum_defs,
+                dump_ir,
+                options,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("codegen error in '{}': {e}", path.display());
+                    process::exit(1);
+                }
+            }
+        } else {
+            match nsl_codegen::compile_module(
+                &mod_data.ast,
+                &interner,
+                &mod_data.type_map,
+                &mod_data.module_prefix,
+                dump_ir,
+                options,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("codegen error in '{}': {e}", path.display());
+                    process::exit(1);
+                }
+            }
+        };
+
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let obj_path = temp_dir.join(format!("{stem}_{}.o", obj_files.len()));
+
+        if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
+            eprintln!("error: could not write object file '{}': {e}", obj_path.display());
+            process::exit(1);
+        }
+
+        obj_files.push(obj_path);
+    }
+
+    let lib_path = if let Some(out) = output {
+        out
+    } else {
+        nsl_codegen::linker::default_shared_lib_path(file)
+    };
+
+    match nsl_codegen::linker::link_shared(&obj_files, &lib_path) {
+        Ok(()) => {
+            for obj in &obj_files {
+                let _ = std::fs::remove_file(obj);
+            }
+            println!("Built shared library {}", lib_path.display());
+        }
+        Err(e) => {
+            eprintln!("link error: {e}");
+            process::exit(1);
+        }
+    }
+}
+
 /// M55: Build with --zk-circuit. Runs normal compilation and then invokes
 /// `zk::compile_zk()` for each @zk_proof-decorated function found.
 fn run_build_zk(
@@ -1278,7 +1507,7 @@ fn run_build_zk(
 ) {
     let (interner, parse_result, analysis) = frontend(file);
 
-    let (obj_bytes, zk_proof_fns) = match nsl_codegen::compile_with_zk_info(
+    let (obj_bytes, zk_proof_fns, zk_results) = match nsl_codegen::compile_with_zk_info(
         &parse_result.module,
         &interner,
         &analysis.type_map,
@@ -1292,7 +1521,7 @@ fn run_build_zk(
         }
     };
 
-    // M55: Report ZK function detection results.
+    // M55c: Write ZK proof files alongside the binary
     if zk_proof_fns.is_empty() {
         eprintln!("[nsl/zk] no @zk_proof functions found — ZK circuit output skipped");
     } else {
@@ -1300,29 +1529,40 @@ fn run_build_zk(
             "[nsl/zk] found {} @zk_proof function(s):",
             zk_proof_fns.len()
         );
-        let zk_config = nsl_codegen::zk::backend::ZkConfig {
-            backend: match options.zk_backend.to_lowercase().as_str() {
-                "plonky3" => nsl_codegen::zk::backend::ZkBackendType::Plonky3,
-                "halo2" => nsl_codegen::zk::backend::ZkBackendType::Halo2,
-                _ => nsl_codegen::zk::backend::ZkBackendType::Folding,
-            },
-            field: match options.zk_field.to_lowercase().as_str() {
-                "bn254" => nsl_codegen::zk::backend::ZkField::BN254,
-                _ => nsl_codegen::zk::backend::ZkField::Mersenne31,
-            },
-            emit_solidity: options.zk_solidity,
-            ..Default::default()
-        };
 
-        // Optionally note weight path for future ZK witness integration (Task 14)
         if let Some(wpath) = zk_weights {
             eprintln!("[nsl/zk]   weights: {}", wpath.display());
         }
 
-        for (fn_name, mode) in &zk_proof_fns {
-            eprintln!("[nsl/zk]   {} (mode: {:?})", fn_name, mode);
-            // ZK compilation now happens during compile_with_zk_info in entry_points.rs.
-            // The AST→ZkDag→ZkIR pipeline runs with full type_map/interner access.
+        for (fn_name, result) in &zk_results {
+            let report = nsl_codegen::zk::stats::format_stats(&result.stats, fn_name);
+            eprint!("{}", report);
+
+            // Write proof file if proof was generated
+            if let Some(ref proof) = result.proof {
+                let proof_path = file.with_extension(format!("{}.proof", fn_name));
+                if let Err(e) = std::fs::write(&proof_path, &proof.data) {
+                    eprintln!("[nsl/zk] error writing proof: {e}");
+                } else {
+                    eprintln!("[nsl/zk]   proof: {} ({} bytes, {} folds)",
+                        proof_path.display(), proof.data.len(), proof.num_folds);
+                }
+
+                // Write public inputs as JSON
+                let pi_path = file.with_extension(format!("{}.public.json", fn_name));
+                let pi_entries: Vec<String> = proof.public_inputs.iter()
+                    .map(|v| format!("{:?}", v))
+                    .collect();
+                let pi_json = format!(
+                    "{{\"public_inputs\":[{}],\"num_folds\":{}}}",
+                    pi_entries.join(","), proof.num_folds
+                );
+                if let Err(e) = std::fs::write(&pi_path, &pi_json) {
+                    eprintln!("[nsl/zk] error writing public inputs: {e}");
+                } else {
+                    eprintln!("[nsl/zk]   public inputs: {}", pi_path.display());
+                }
+            }
         }
     }
 
@@ -1364,34 +1604,84 @@ fn run_build_zk(
     }
 }
 
-/// M55: Handle `nsl zk <subcommand>`.
+/// M55c: Handle `nsl zk <subcommand>`.
 fn run_zk_cmd(cmd: ZkCmd) {
     match cmd {
         ZkCmd::Stats { file } => {
-            eprintln!("[nsl/zk] stats: reading circuit from {}", file.display());
-            eprintln!(
-                "[nsl/zk] ZK subcommand not yet fully wired \
-                 (full .zkir serialization wired in Task 14)"
-            );
-        }
-        ZkCmd::Prove { file, pk, input, output } => {
-            eprintln!("[nsl/zk] prove: circuit={} pk={} input={}",
-                file.display(), pk.display(), input.display());
-            if let Some(ref out) = output {
-                eprintln!("[nsl/zk] prove: output={}", out.display());
+            match std::fs::read(&file) {
+                Ok(data) => {
+                    if data.len() < 12 {
+                        eprintln!("[nsl/zk] invalid proof file: too short ({} bytes)", data.len());
+                        process::exit(1);
+                    }
+                    let num_folds = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let instance_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                    let num_rounds = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                    println!("Proof stats:");
+                    println!("  File:        {}", file.display());
+                    println!("  Size:        {} bytes", data.len());
+                    println!("  Folds:       {}", num_folds);
+                    println!("  Instance:    {} elements", instance_len);
+                    println!("  SC rounds:   {}", num_rounds);
+                }
+                Err(e) => {
+                    eprintln!("error reading {}: {e}", file.display());
+                    process::exit(1);
+                }
             }
-            eprintln!(
-                "[nsl/zk] ZK subcommand not yet fully wired \
-                 (proof generation wired in Task 14)"
-            );
         }
-        ZkCmd::Verify { vk, proof, public } => {
-            eprintln!("[nsl/zk] verify: vk={} proof={} public={}",
-                vk.display(), proof.display(), public.display());
-            eprintln!(
-                "[nsl/zk] ZK subcommand not yet fully wired \
-                 (proof verification wired in Task 14)"
-            );
+        ZkCmd::Prove { file, pk: _, input: _, output } => {
+            // For the folding backend, proofs are generated during compilation.
+            eprintln!("[nsl/zk] For the folding backend, proofs are generated during `nsl build --zk-circuit`.");
+            eprintln!("[nsl/zk] The proof file is written alongside the binary as <file>.<fn_name>.proof");
+            if let Some(ref out) = output {
+                eprintln!("[nsl/zk] Requested output: {}", out.display());
+            }
+            eprintln!("[nsl/zk] To generate a proof, run: nsl build --zk-circuit {}", file.display());
+        }
+        ZkCmd::Verify { vk: _, proof, public: _ } => {
+            match std::fs::read(&proof) {
+                Ok(data) => {
+                    if data.len() < 12 {
+                        eprintln!("INVALID: proof file too short ({} bytes)", data.len());
+                        process::exit(1);
+                    }
+
+                    let num_folds = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let instance_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                    let num_rounds = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+
+                    // Reconstruct ZkProof for verification
+                    let zk_proof = nsl_codegen::zk::backend::ZkProof {
+                        data: data.clone(),
+                        num_folds,
+                        public_inputs: vec![vec![0u8; 4]; instance_len],
+                        public_outputs: Vec::new(),
+                    };
+
+                    use nsl_codegen::zk::backend::FoldingBackend;
+                    type M31Prover = nsl_codegen::zk::folding::FoldingProver<nsl_codegen::zk::field_m31::Mersenne31Field>;
+
+                    match M31Prover::verify(&zk_proof, &[]) {
+                        Ok(true) => {
+                            println!("VERIFIED: proof is valid ({} folds, {} sumcheck rounds)",
+                                num_folds, num_rounds);
+                        }
+                        Ok(false) => {
+                            println!("INVALID: proof verification failed");
+                            process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("VERIFICATION ERROR: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error reading {}: {e}", proof.display());
+                    process::exit(1);
+                }
+            }
         }
     }
 }

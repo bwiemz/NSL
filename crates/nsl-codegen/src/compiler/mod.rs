@@ -281,6 +281,13 @@ impl<'a> Compiler<'a> {
             .set("opt_level", "speed")
             .map_err(|e| CodegenError::new(e.to_string()))?;
 
+        // M62a: Enable position-independent code for shared library emission.
+        if options.shared_lib {
+            flag_builder
+                .set("is_pic", "true")
+                .map_err(|e| CodegenError::new(format!("failed to enable PIC: {e}")))?;
+        }
+
         let isa_builder = cranelift_native::builder()
             .map_err(|e| CodegenError::new(format!("failed to create ISA builder: {e}")))?;
         let isa = isa_builder

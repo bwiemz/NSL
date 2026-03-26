@@ -264,6 +264,144 @@ fn find_c_compiler() -> Result<String, CodegenError> {
     ))
 }
 
+/// M62a: Link multiple object files into a shared library (.so/.dylib/.dll).
+pub fn link_shared(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), CodegenError> {
+    let runtime_lib = find_runtime_lib()?;
+
+    if cfg!(target_os = "windows") {
+        link_shared_msvc(obj_paths, output_path, &runtime_lib)
+            .or_else(|_| link_shared_gcc(obj_paths, output_path, &runtime_lib))
+    } else {
+        link_shared_gcc(obj_paths, output_path, &runtime_lib)
+    }
+}
+
+/// M62a: Link a shared library using gcc/cc/clang (-shared flag).
+fn link_shared_gcc(
+    obj_paths: &[PathBuf],
+    output_path: &Path,
+    runtime_lib: &Path,
+) -> Result<(), CodegenError> {
+    let cc = find_c_compiler()?;
+
+    let mut cmd = Command::new(&cc);
+    cmd.arg("-shared");
+    cmd.arg("-o").arg(output_path);
+    for obj_path in obj_paths {
+        cmd.arg(obj_path);
+    }
+    cmd.arg(runtime_lib);
+
+    if cfg!(target_os = "linux") {
+        cmd.arg("-lm");
+        cmd.arg("-lpthread");
+        cmd.arg("-ldl");
+        // Set SONAME so the dynamic linker can identify the library
+        if let Some(filename) = output_path.file_name() {
+            cmd.arg(format!("-Wl,-soname,{}", filename.to_string_lossy()));
+        }
+    }
+
+    // macOS: inject platform version since Cranelift object files lack LC_BUILD_VERSION
+    if cfg!(target_os = "macos") {
+        cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
+    }
+
+    // Link CUDA driver library if available
+    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+        let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
+        if cuda_lib.is_dir() {
+            cmd.arg(format!("-L{}", cuda_lib.display()));
+            cmd.arg("-lcuda");
+        }
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| CodegenError::new(format!("failed to run linker '{cc}': {e}")))?;
+
+    if !status.success() {
+        return Err(CodegenError::new(format!(
+            "linker '{cc}' failed (exit: {status})"
+        )));
+    }
+
+    Ok(())
+}
+
+/// M62a: Link a shared library using MSVC toolchain (link.exe /DLL).
+fn link_shared_msvc(
+    obj_paths: &[PathBuf],
+    output_path: &Path,
+    runtime_lib: &Path,
+) -> Result<(), CodegenError> {
+    let msvc = find_msvc()?;
+
+    let mut cmd = Command::new(&msvc.link);
+    cmd.arg("/nologo")
+        .arg("/DLL")
+        .arg(format!("/OUT:{}", output_path.display()));
+    for obj_path in obj_paths {
+        cmd.arg(obj_path);
+    }
+    cmd.arg(runtime_lib);
+
+    // Add library paths
+    for lib_path in &msvc.lib_paths {
+        cmd.arg(format!("/LIBPATH:{}", lib_path.display()));
+    }
+
+    // Required system libraries for the Rust static lib
+    cmd.args([
+        "msvcrt.lib",
+        "legacy_stdio_definitions.lib",
+        "kernel32.lib",
+        "advapi32.lib",
+        "bcrypt.lib",
+        "ntdll.lib",
+        "userenv.lib",
+        "ws2_32.lib",
+        "synchronization.lib",
+        "shell32.lib",
+        "ole32.lib",
+        "/NODEFAULTLIB:LIBCMT",
+    ]);
+
+    // Link CUDA driver library if available
+    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+        let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
+        if cuda_lib.is_dir() {
+            cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
+            cmd.arg("cuda.lib");
+        }
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| CodegenError::new(format!("failed to run link.exe: {e}")))?;
+
+    if !status.success() {
+        return Err(CodegenError::new(format!(
+            "link.exe failed (exit: {status})"
+        )));
+    }
+
+    Ok(())
+}
+
+/// M62a: Determine default shared library output path from input .nsl path.
+pub fn default_shared_lib_path(input: &Path) -> PathBuf {
+    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    if cfg!(target_os = "windows") {
+        parent.join(format!("{stem}.dll"))
+    } else if cfg!(target_os = "macos") {
+        parent.join(format!("lib{stem}.dylib"))
+    } else {
+        parent.join(format!("lib{stem}.so"))
+    }
+}
+
 /// Determine default output path from input .nsl path.
 pub fn default_output_path(input: &Path) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default();

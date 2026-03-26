@@ -126,6 +126,8 @@ pub struct CompileOptions {
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
+    /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
+    pub shared_lib: bool,
 }
 
 impl Default for CompileOptions {
@@ -164,6 +166,7 @@ impl Default for CompileOptions {
             zk_solidity: false,
             zk_weights_path: None,
             debug_training: false,
+            shared_lib: false,
         }
     }
 }
