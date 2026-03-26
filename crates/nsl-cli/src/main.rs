@@ -282,6 +282,10 @@ enum Cli {
         #[arg(long)]
         debug_training: bool,
 
+        /// M45: Run compile-time NaN/Inf risk analysis before codegen
+        #[arg(long)]
+        nan_analysis: bool,
+
         /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
         #[arg(long)]
         distribute: Option<String>,
@@ -650,6 +654,7 @@ fn main() {
             tape_ad: _tape_ad,
             source_ad: _source_ad,
             debug_training,
+            nan_analysis,
             distribute: _distribute,
             zero_stage: _zero_stage,
             deterministic: _deterministic,
@@ -731,7 +736,7 @@ fn main() {
                 tape_ad: _tape_ad,
                 source_ad: _source_ad,
                 trace_ops: false,
-                nan_analysis: false,
+                nan_analysis,
                 deterministic: _deterministic,
                 // M52: When --standalone, weights are handled by standalone pipeline;
                 // otherwise pass through for weight-aware compilation
@@ -1819,6 +1824,26 @@ fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
 /// Single-file build (backward compatible, fast path).
 fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool, options: &nsl_codegen::CompileOptions) {
     let (interner, parse_result, analysis) = frontend(file);
+
+    // M45: Run compile-time NaN risk analysis before codegen if --nan-analysis is set.
+    if options.nan_analysis {
+        let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
+        analyzer.analyze_module(&parse_result.module, &interner);
+        if analyzer.diagnostics.is_empty() {
+            eprintln!("note: --nan-analysis: no NaN/Inf risks detected");
+        } else {
+            eprintln!(
+                "note: --nan-analysis: {} warning(s) detected",
+                analyzer.diagnostics.len()
+            );
+            let mut sm = nsl_errors::SourceMap::new();
+            let src = std::fs::read_to_string(file).unwrap_or_default();
+            sm.add_file(file.display().to_string(), src);
+            for diag in &analyzer.diagnostics {
+                sm.emit_diagnostic(diag);
+            }
+        }
+    }
 
     // Codegen
     let obj_bytes = match nsl_codegen::compile(

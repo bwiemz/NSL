@@ -386,6 +386,16 @@ impl Compiler<'_> {
                             state.is_fp8_compute = true;
                         }
 
+                        // M35: @quantize on the model — log active quantization config for
+                        // this method. The config is used by the caller (e.g., serve engine)
+                        // to select the appropriate runtime dequantization path.
+                        if let Some(qcfg) = self.features.quant_configs.get(&model_name) {
+                            eprintln!(
+                                "[nsl] M35: compiling '{}' with quantization — dtype={}, group_size={}",
+                                method_name, qcfg.dtype, qcfg.group_size
+                            );
+                        }
+
                         // First Cranelift param is self (pointer)
                         let self_val = builder.block_params(entry)[0];
                         // Find the "self" symbol from the AST params

@@ -1636,6 +1636,8 @@ impl Compiler<'_> {
     }
 
     /// Annotate sparsity hints when one operand is a known sparse weight.
+    /// Stores a `SparsityHint` keyed by the Cranelift Value's u32 index (cast to NodeId)
+    /// so that downstream passes can inspect per-matmul sparsity decisions.
     fn annotate_sparsity_hints(
         &mut self,
         state: &FuncState,
@@ -1643,6 +1645,9 @@ impl Compiler<'_> {
         rhs: Value,
         op: BinOp,
     ) {
+        use nsl_ast::NodeId;
+        use crate::weight_aware::SparsityHint;
+
         if op != BinOp::MatMul { return; }
         let wmap = match self.features.weight_map {
             Some(ref w) => w,
@@ -1652,32 +1657,62 @@ impl Compiler<'_> {
         // Check RHS weight for sparsity
         if let Some(key) = state.weight_values.get(&rhs) {
             if let Some(entry) = wmap.get(key) {
-                if let Some(ref info) = entry.sparsity() {
+                let hint = if let Some(ref info) = entry.sparsity() {
                     if info.use_sparse_kernel {
                         if let Some(ref csr) = info.csr {
                             eprintln!(
                                 "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
                                 key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                             );
+                            SparsityHint::Sparse {
+                                weight_name: key.clone(),
+                                nnz: csr.nnz,
+                                nrows: csr.nrows,
+                                ncols: csr.ncols,
+                                sparsity: info.near_zero_fraction,
+                            }
+                        } else {
+                            SparsityHint::Dense
                         }
+                    } else {
+                        SparsityHint::Dense
                     }
-                }
+                } else {
+                    SparsityHint::Dense
+                };
+                // Key by rhs Value's u32 index (NodeId namespace is disjoint from
+                // Cranelift Value namespace; this is a codegen-internal hint only).
+                self.features.sparsity_hints.insert(NodeId(rhs.as_u32()), hint);
             }
         }
 
         // Check LHS weight for sparsity
         if let Some(key) = state.weight_values.get(&lhs) {
             if let Some(entry) = wmap.get(key) {
-                if let Some(ref info) = entry.sparsity() {
+                let hint = if let Some(ref info) = entry.sparsity() {
                     if info.use_sparse_kernel {
                         if let Some(ref csr) = info.csr {
                             eprintln!(
                                 "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
                                 key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                             );
+                            SparsityHint::Sparse {
+                                weight_name: key.clone(),
+                                nnz: csr.nnz,
+                                nrows: csr.nrows,
+                                ncols: csr.ncols,
+                                sparsity: info.near_zero_fraction,
+                            }
+                        } else {
+                            SparsityHint::Dense
                         }
+                    } else {
+                        SparsityHint::Dense
                     }
-                }
+                } else {
+                    SparsityHint::Dense
+                };
+                self.features.sparsity_hints.insert(NodeId(lhs.as_u32()), hint);
             }
         }
     }

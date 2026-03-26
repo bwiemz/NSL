@@ -266,6 +266,48 @@ impl Compiler<'_> {
 
     pub fn collect_models(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
         for stmt in stmts {
+            // M35: Scan for top-level @quantize(dtype=..., group_size=...) decorators on model blocks.
+            // Syntax: `@quantize(dtype="awq4", group_size=128)\nmodel MyModel: ...`
+            if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
+                if let StmtKind::ModelDef(md) = &inner.kind {
+                    let model_name = self.resolve_sym(md.name).to_string();
+                    for deco in decorators {
+                        if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "quantize" {
+                            let mut dtype = "awq4".to_string();
+                            let mut group_size: i64 = 128;
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.resolve_sym(*name_sym).to_string();
+                                        match aname.as_str() {
+                                            "dtype" => {
+                                                if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                                    dtype = s.clone();
+                                                }
+                                            }
+                                            "group_size" => {
+                                                if let nsl_ast::expr::ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                    group_size = *n;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "[nsl] M35: @quantize on model '{}' — dtype={}, group_size={}",
+                                model_name, dtype, group_size
+                            );
+                            self.features.quant_configs.insert(
+                                model_name.clone(),
+                                super::QuantConfig { dtype, group_size },
+                            );
+                        }
+                    }
+                }
+            }
+
             if let StmtKind::ModelDef(md) = &stmt.kind {
                 let name = self.resolve_sym(md.name).to_string();
                 let mut fields = Vec::new();
