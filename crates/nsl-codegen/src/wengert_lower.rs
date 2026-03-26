@@ -147,16 +147,19 @@ fn lower_single_op(
         // === Shape ops (5 ops) ===
         PrimalOp::Concat { dim } => {
             // Runtime nsl_tensor_cat takes (tensor_list_ptr, dim).
-            // In the Wengert graph, Concat has two tensor inputs.
-            // We need to pass both tensors; use a two-tensor cat helper.
-            // For now, the simplest correct approach: the runtime cat expects
-            // an NslList pointer. We approximate by using add (which broadcasts)
-            // for concat in the backward graph context. This is a known approximation.
+            // Construct an NslList from all inputs, then pass to cat.
+            let list = call(compiler, builder, "nsl_list_new", &[])?;
+            for &inp in &inputs {
+                call(compiler, builder, "nsl_list_push", &[list, inp])?;
+            }
             let d = builder.ins().iconst(cl_types::I64, *dim);
-            call(compiler, builder, "nsl_tensor_cat", &[inputs[0], d])
+            let result = call(compiler, builder, "nsl_tensor_cat", &[list, d])?;
+            call(compiler, builder, "nsl_list_free", &[list])?;
+            Ok(result)
         }
         PrimalOp::Split { .. } => {
-            // Split in backward context: pass through
+            // Split is a forward-only op — its backward is Concat (via SplitConcat adjoint).
+            // If Split appears in an adjoint graph, it's from re-execution; clone is correct.
             call(compiler, builder, "nsl_tensor_clone", &[inputs[0]])
         }
         PrimalOp::Slice { dim, start, end, .. } => {
