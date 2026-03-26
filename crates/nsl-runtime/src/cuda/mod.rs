@@ -1890,6 +1890,104 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
     NslTensor::publish(out)
 }
 
+// ---------------------------------------------------------------------------
+// M46c: Deterministic GPU scatter_add — output-centric, no atomics
+// ---------------------------------------------------------------------------
+
+/// GPU deterministic scatter_add: out[row, col] = input[row, col] + sum(src[i, col] for all i where indices[i] == row).
+/// Each output element is computed by exactly one thread that scans all input indices sequentially.
+/// Guarantees bit-identical results regardless of GPU scheduling (no atomics).
+/// All tensors must be on GPU (f32).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_det_scatter_add_f32(
+    input_ptr: i64,
+    indices_ptr: i64,
+    src_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::DET_SCATTER_ADD_F32_PTX;
+
+    let input = NslTensor::from_ptr(input_ptr);
+    let src = unsafe { &*(src_ptr as *const NslTensor) };
+    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+
+    let input_ndim = input.ndim as usize;
+    let input_shape = unsafe { std::slice::from_raw_parts(input.shape, input_ndim) };
+
+    // input is [vocab_size, embed_dim] (or [vocab_size] for 1D)
+    let vocab_size = input_shape[0] as u64;
+    let embed_dim = if input_ndim >= 2 { input_shape[1] as u64 } else { 1u64 };
+
+    let num_indices = indices.len as u64;
+
+    // Allocate output: same shape as input
+    let out_elems = (vocab_size * embed_dim) as usize;
+    let out_data = inner::alloc_managed(out_elems * 4); // f32
+
+    // Build output shape (same as input)
+    let out_ndim = input_ndim;
+    let out_shape = crate::memory::checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..out_ndim {
+        unsafe { *out_shape.add(i) = input_shape[i] };
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim as i64);
+
+    // Ensure indices are on GPU
+    let indices_on_gpu = if indices.device == 0 {
+        crate::tensor::nsl_tensor_to_device(indices_ptr, input.device as i64)
+    } else {
+        let t = unsafe { &mut *(indices_ptr as *mut NslTensor) };
+        t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        indices_ptr
+    };
+    let indices_gpu = unsafe { &*(indices_on_gpu as *const NslTensor) };
+
+    let mut s_data = src.data as u64;
+    let mut i_data = indices_gpu.data as u64;
+    let mut in_data = input.data as u64;
+    let mut o_data = out_data as u64;
+    let mut n_indices = num_indices;
+    let mut emb_dim = embed_dim;
+    let mut vocab = vocab_size;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut s_data as *mut _ as *mut std::ffi::c_void,
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_indices as *mut _ as *mut std::ffi::c_void,
+        &mut emb_dim as *mut _ as *mut std::ffi::c_void,
+        &mut vocab as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block_x = 16i64;
+    let block_y = 16i64;
+    let grid_x = ((vocab_size as i64) + block_x - 1) / block_x;
+    let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
+
+    let result = inner::kernel_launch(
+        DET_SCATTER_ADD_F32_PTX.as_ptr(), b"nsl_det_scatter_add_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU det_scatter_add kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    crate::tensor::nsl_tensor_free(indices_on_gpu);
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        out_ndim as i64,
+        out_elems as i64,
+        input.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
 /// GPU per-dimension max reduction. Input must be on GPU (f32), contiguous.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {

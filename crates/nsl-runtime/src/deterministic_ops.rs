@@ -1,4 +1,4 @@
-//! M46/M46b: Deterministic runtime operation variants.
+//! M46/M46b/M46c: Deterministic runtime operation variants.
 //!
 //! These are called when --deterministic is active, replacing the default
 //! non-deterministic GPU kernels with bit-reproducible alternatives.
@@ -6,8 +6,12 @@
 //! GPU deterministic kernels (M46b):
 //! - **Sum/Mean**: Sequential single-thread PTX kernels (`nsl_det_global_sum_f32`,
 //!   `nsl_det_sum_dim_f32`) that accumulate in fixed ascending order.
-//! - **Scatter_add**: CPU fallback (sort indices, sequential accumulate).
-//!   GPU-native sort-based PTX deferred to M46c.
+//!
+//! GPU deterministic kernels (M46c):
+//! - **Scatter_add**: Output-centric GPU kernel (`nsl_det_scatter_add_f32`).
+//!   One thread per (output_row, col) pair; each thread scans ALL input indices
+//!   sequentially, accumulating matching values. No atomics, no sorting —
+//!   deterministic because each output element is owned by exactly one thread.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -168,26 +172,30 @@ pub extern "C" fn nsl_tensor_scatter_add_deterministic(
 
     let input_tensor = crate::tensor::NslTensor::from_ptr(input);
 
-    // GPU path: transfer to CPU, run deterministic scatter_add, transfer back
+    // GPU path: use deterministic output-centric kernel (M46c) — no atomics, no CPU fallback
     if input_tensor.device > 0 {
-        let device = input_tensor.device as i64;
-        let cpu_input = crate::tensor::nsl_tensor_to_device(input, 0);
-        let cpu_indices = crate::tensor::nsl_tensor_to_device(indices, 0);
-        let cpu_src = crate::tensor::nsl_tensor_to_device(src, 0);
+        #[cfg(feature = "cuda")]
+        {
+            return crate::cuda::gpu_det_scatter_add_f32(input, indices, src);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Non-CUDA builds: transfer to CPU, run deterministic scatter_add, transfer back
+            let device = input_tensor.device as i64;
+            let cpu_input = crate::tensor::nsl_tensor_to_device(input, 0);
+            let cpu_indices = crate::tensor::nsl_tensor_to_device(indices, 0);
+            let cpu_src = crate::tensor::nsl_tensor_to_device(src, 0);
 
-        // Run the CPU sort-based scatter_add
-        let cpu_result = nsl_tensor_scatter_add_deterministic_cpu(cpu_input, cpu_indices, cpu_src);
+            let cpu_result = nsl_tensor_scatter_add_deterministic_cpu(cpu_input, cpu_indices, cpu_src);
+            let gpu_result = crate::tensor::nsl_tensor_to_device(cpu_result, device);
 
-        // Transfer result back to GPU
-        let gpu_result = crate::tensor::nsl_tensor_to_device(cpu_result, device);
+            crate::tensor::nsl_tensor_free(cpu_input);
+            crate::tensor::nsl_tensor_free(cpu_indices);
+            crate::tensor::nsl_tensor_free(cpu_src);
+            crate::tensor::nsl_tensor_free(cpu_result);
 
-        // Cleanup CPU temporaries
-        crate::tensor::nsl_tensor_free(cpu_input);
-        crate::tensor::nsl_tensor_free(cpu_indices);
-        crate::tensor::nsl_tensor_free(cpu_src);
-        crate::tensor::nsl_tensor_free(cpu_result);
-
-        return gpu_result;
+            return gpu_result;
+        }
     }
 
     // CPU path: sort-based deterministic scatter_add
