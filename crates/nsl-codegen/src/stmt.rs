@@ -108,6 +108,117 @@ impl Compiler<'_> {
         Ok(Some(tensor))
     }
 
+    /// Recursively destructure patterns from a list/tuple value.
+    /// Each `PatternKind::Ident` binds a variable, `Wildcard` is skipped,
+    /// `Tuple`/`List` recurse into nested `nsl_list_get` calls, and
+    /// `Struct` destructures by field name via `nsl_dict_get`.
+    fn compile_destructure_patterns(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        patterns: &[nsl_ast::pattern::Pattern],
+        container_val: cranelift_codegen::ir::Value,
+    ) -> Result<(), CodegenError> {
+        let get_id = self.runtime_fns["nsl_list_get"].0;
+        let get_ref = self.module.declare_func_in_func(get_id, builder.func);
+
+        for (i, sub_pat) in patterns.iter().enumerate() {
+            match &sub_pat.kind {
+                PatternKind::Ident(sym) => {
+                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                    let call = builder.ins().call(get_ref, &[container_val, idx]);
+                    let elem = builder.inst_results(call)[0];
+                    let var = state.new_variable();
+                    builder.declare_var(var, cl_types::I64);
+                    builder.def_var(var, elem);
+                    state.variables.insert(*sym, (var, cl_types::I64));
+                }
+                PatternKind::Wildcard => {}
+                PatternKind::Tuple(nested) | PatternKind::List(nested) => {
+                    // Extract the i-th element, then recurse into it
+                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                    let call = builder.ins().call(get_ref, &[container_val, idx]);
+                    let nested_val = builder.inst_results(call)[0];
+                    self.compile_destructure_patterns(builder, state, nested, nested_val)?;
+                }
+                PatternKind::Struct { fields, .. } => {
+                    // Extract the i-th element (the struct/dict), then destructure fields
+                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                    let call = builder.ins().call(get_ref, &[container_val, idx]);
+                    let struct_val = builder.inst_results(call)[0];
+                    for field in fields {
+                        let field_name = self.resolve_sym(field.name).to_string();
+                        // Ensure string is in pool, then get pointer for dict lookup
+                        if !self.string_pool.contains_key(field_name.as_str()) {
+                            self.intern_string(&field_name)?;
+                        }
+                        let key_str = self.compile_string_literal(builder, &field_name)?;
+                        let field_val = self.compile_call_by_name(
+                            builder, "nsl_dict_get_str", &[struct_val, key_str],
+                        )?;
+                        if let Some(ref pat) = field.pattern {
+                            // Nested pattern: { x: (a, b) } → destructure the field value
+                            match &pat.kind {
+                                PatternKind::Ident(sym) => {
+                                    let var = state.new_variable();
+                                    builder.declare_var(var, cl_types::I64);
+                                    builder.def_var(var, field_val);
+                                    state.variables.insert(*sym, (var, cl_types::I64));
+                                }
+                                PatternKind::Tuple(nested) | PatternKind::List(nested) => {
+                                    self.compile_destructure_patterns(builder, state, nested, field_val)?;
+                                }
+                                PatternKind::Wildcard => {}
+                                _ => {
+                                    return Err(CodegenError::new(format!(
+                                        "unsupported nested pattern in struct field '{}'", field_name
+                                    )));
+                                }
+                            }
+                        } else {
+                            // Simple field binding: { name } binds `name` to the value
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            builder.def_var(var, field_val);
+                            state.variables.insert(field.name, (var, cl_types::I64));
+                        }
+                    }
+                }
+                PatternKind::Typed { pattern, .. } => {
+                    // Type annotation is semantic-only — recurse into the inner pattern
+                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                    let call = builder.ins().call(get_ref, &[container_val, idx]);
+                    let elem = builder.inst_results(call)[0];
+                    match &pattern.kind {
+                        PatternKind::Ident(sym) => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            builder.def_var(var, elem);
+                            state.variables.insert(*sym, (var, cl_types::I64));
+                        }
+                        PatternKind::Tuple(nested) | PatternKind::List(nested) => {
+                            self.compile_destructure_patterns(builder, state, nested, elem)?;
+                        }
+                        PatternKind::Wildcard => {}
+                        _ => {
+                            return Err(CodegenError::new("unsupported typed pattern variant"));
+                        }
+                    }
+                }
+                PatternKind::Rest(_) => {
+                    // Rest patterns (...rest) — skip for now (would need slice extraction)
+                    // TODO: implement rest pattern as nsl_list_slice(container, i, len)
+                }
+                _ => {
+                    return Err(CodegenError::new(format!(
+                        "unsupported pattern kind in destructuring at position {}", i
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn compile_stmt(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -180,33 +291,58 @@ impl Compiler<'_> {
                             self.closure_info.insert(sym, count);
                         }
                     }
-                    PatternKind::Tuple(sub_patterns) => {
+                    PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
                         let tuple_val = if let Some(expr) = value {
                             self.compile_expr(builder, state, expr)?
                         } else {
-                            return Err(CodegenError::new("tuple destructuring requires a value"));
+                            return Err(CodegenError::new("tuple/list destructuring requires a value"));
                         };
 
-                        let get_id = self.runtime_fns["nsl_list_get"].0;
-                        let get_ref = self.module.declare_func_in_func(get_id, builder.func);
-
-                        for (i, sub_pat) in sub_patterns.iter().enumerate() {
-                            match &sub_pat.kind {
-                                PatternKind::Ident(sym) => {
-                                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
-                                    let call = builder.ins().call(get_ref, &[tuple_val, idx]);
-                                    let elem = builder.inst_results(call)[0];
-                                    let var = state.new_variable();
-                                    builder.declare_var(var, cl_types::I64);
-                                    builder.def_var(var, elem);
-                                    state.variables.insert(*sym, (var, cl_types::I64));
+                        self.compile_destructure_patterns(builder, state, &sub_patterns, tuple_val)?;
+                    }
+                    PatternKind::Struct { fields, .. } => {
+                        // Top-level struct destructuring: let { x, y } = expr
+                        let struct_val = if let Some(expr) = value {
+                            self.compile_expr(builder, state, expr)?
+                        } else {
+                            return Err(CodegenError::new("struct destructuring requires a value"));
+                        };
+                        for field in fields {
+                            let field_name = self.resolve_sym(field.name).to_string();
+                            if !self.string_pool.contains_key(field_name.as_str()) {
+                                self.intern_string(&field_name)?;
+                            }
+                            let key_str = self.compile_string_literal(builder, &field_name)?;
+                            let field_val = self.compile_call_by_name(
+                                builder, "nsl_dict_get_str", &[struct_val, key_str],
+                            )?;
+                            if let Some(ref pat) = field.pattern {
+                                match &pat.kind {
+                                    PatternKind::Ident(sym) => {
+                                        let var = state.new_variable();
+                                        builder.declare_var(var, cl_types::I64);
+                                        builder.def_var(var, field_val);
+                                        state.variables.insert(*sym, (var, cl_types::I64));
+                                    }
+                                    PatternKind::Tuple(nested) | PatternKind::List(nested) => {
+                                        self.compile_destructure_patterns(builder, state, nested, field_val)?;
+                                    }
+                                    PatternKind::Wildcard => {}
+                                    _ => {
+                                        return Err(CodegenError::new(format!(
+                                            "unsupported pattern in struct field '{}'", field_name
+                                        )));
+                                    }
                                 }
-                                PatternKind::Wildcard => {}
-                                _ => return Err(CodegenError::new("nested destructuring not yet supported")),
+                            } else {
+                                let var = state.new_variable();
+                                builder.declare_var(var, cl_types::I64);
+                                builder.def_var(var, field_val);
+                                state.variables.insert(field.name, (var, cl_types::I64));
                             }
                         }
                     }
-                    _ => return Err(CodegenError::new("only ident and tuple patterns supported")),
+                    _ => return Err(CodegenError::new("only ident, tuple, list, and struct patterns supported")),
                 }
             }
 
