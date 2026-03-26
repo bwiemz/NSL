@@ -57,7 +57,8 @@ impl Compiler<'_> {
                 let shape = match param.type_ann.as_ref().map(|t| &t.kind) {
                     Some(TypeExprKind::Tensor { shape, .. })
                     | Some(TypeExprKind::Param { shape, .. })
-                    | Some(TypeExprKind::Buffer { shape, .. }) => shape,
+                    | Some(TypeExprKind::Buffer { shape, .. })
+                    | Some(TypeExprKind::Sparse { shape, .. }) => shape,
                     _ => continue,
                 };
                 let param_val = builder.block_params(entry)[i];

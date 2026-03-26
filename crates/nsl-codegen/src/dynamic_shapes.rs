@@ -57,7 +57,13 @@ impl Default for SymbolicDimTracker {
     }
 }
 
-/// Extract symbolic dims from a shape, yielding (dim_index, DimInfo) pairs.
+/// Extract symbolic dims from a semantic-layer [`Shape`], yielding `(dim_index, DimInfo)` pairs.
+///
+/// Note: runtime assertion emission in `func.rs` (`compile_fn_def_named`) reads directly
+/// from the AST's `DimExpr` on each parameter's type annotation — that is the primary
+/// wiring path. This helper operates on post-type-check [`Dim`] values and is provided
+/// for consumers that work at the semantic layer (e.g. future passes that operate on
+/// the type map rather than the AST).
 pub fn extract_symbolic_dims(shape: &Shape) -> Vec<(usize, DimInfo)> {
     let mut result = Vec::new();
     for (i, dim) in shape.dims.iter().enumerate() {
