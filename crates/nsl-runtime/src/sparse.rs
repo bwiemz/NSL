@@ -144,8 +144,71 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
 
     let fmt = match format {
         1 => SparseFmtId::Csr,
+        3 => SparseFmtId::Bsr,
         _ => SparseFmtId::Coo,
     };
+
+    // BSR: block sparse row with default 16x16 blocks
+    if fmt == SparseFmtId::Bsr {
+        let br = 16usize; // block_rows
+        let bc = 16usize; // block_cols
+        let nblk_rows = (rows + br - 1) / br;
+        let nblk_cols = (cols + bc - 1) / bc;
+
+        // Scan blocks: a block is nonzero if any element in it exceeds threshold
+        let mut block_row_ptrs = vec![0i64; nblk_rows + 1];
+        let mut block_col_indices: Vec<i64> = Vec::new();
+        let mut block_values: Vec<f64> = Vec::new(); // stored as flat dense blocks
+
+        for br_idx in 0..nblk_rows {
+            let r_start = br_idx * br;
+            let r_end = (r_start + br).min(rows);
+            for bc_idx in 0..nblk_cols {
+                let c_start = bc_idx * bc;
+                let c_end = (c_start + bc).min(cols);
+                // Check if block has any nonzero
+                let mut has_nonzero = false;
+                for r in r_start..r_end {
+                    for c in c_start..c_end {
+                        if data[r * cols + c].abs() >= threshold {
+                            has_nonzero = true;
+                            break;
+                        }
+                    }
+                    if has_nonzero { break; }
+                }
+                if has_nonzero {
+                    block_col_indices.push(bc_idx as i64);
+                    // Store full block (padded with zeros if at boundary)
+                    for r in 0..br {
+                        for c in 0..bc {
+                            let gr = r_start + r;
+                            let gc = c_start + c;
+                            let v = if gr < rows && gc < cols { data[gr * cols + gc] } else { 0.0 };
+                            block_values.push(v);
+                        }
+                    }
+                }
+            }
+            block_row_ptrs[br_idx + 1] = block_col_indices.len() as i64;
+        }
+
+        let num_blocks = block_col_indices.len();
+        let val_bytes: Vec<u8> = block_values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+        let sparse = Box::new(NslSparseTensor {
+            format: SparseFmtId::Bsr as u8,
+            device: 0, dtype: 0, ndim: 2,
+            nnz: num_blocks as i64, // nnz = number of nonzero blocks
+            rows: rows as i64, cols: cols as i64,
+            data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+            indices_0: Box::into_raw(block_row_ptrs.into_boxed_slice()) as *mut i64,
+            indices_1: Box::into_raw(block_col_indices.into_boxed_slice()) as *mut i64,
+            block_rows: br as i32, block_cols: bc as i32,
+            refcount: AtomicI64::new(1), owns_data: 1,
+        });
+        return Box::into_raw(sparse) as i64;
+    }
 
     if fmt == SparseFmtId::Csr {
         // Convert COO to CSR: build row_ptr array
@@ -234,6 +297,35 @@ pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
                 }
             }
         }
+        Some(SparseFmtId::Bsr) => {
+            let br = sparse.block_rows as usize;
+            let bc = sparse.block_cols as usize;
+            if br == 0 || bc == 0 { return 0; }
+            let nblk_rows = (rows + br - 1) / br;
+            let num_blocks = sparse.nnz as usize;
+            let block_size = br * bc;
+            let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
+            let block_col_indices = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
+            let block_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
+
+            for blk_r in 0..nblk_rows {
+                let start = block_row_ptrs[blk_r] as usize;
+                let end = block_row_ptrs[blk_r + 1] as usize;
+                for blk_idx in start..end {
+                    let blk_c = block_col_indices[blk_idx] as usize;
+                    let val_base = blk_idx * block_size;
+                    for r in 0..br {
+                        for c in 0..bc {
+                            let gr = blk_r * br + r;
+                            let gc = blk_c * bc + c;
+                            if gr < rows && gc < cols {
+                                dense[gr * cols + gc] = block_vals[val_base + r * bc + c];
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => return 0,
     }
 
@@ -280,6 +372,25 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
     // Verify dimension compatibility: sparse cols == dense rows
     if sparse.cols as usize != k { return 0; }
 
+    // GPU dispatch: if dense tensor is on GPU, use GPU sparse kernels
+    #[cfg(feature = "cuda")]
+    if dense.device > 0 {
+        return match SparseFmtId::from_u8(sparse.format) {
+            Some(SparseFmtId::Csr) => crate::cuda::gpu_csr_spmm_f32_from_sparse(sparse, dense_ptr),
+            Some(SparseFmtId::Coo) => crate::cuda::gpu_coo_spmm_f32(sparse, dense_ptr),
+            Some(SparseFmtId::Bsr) => crate::cuda::gpu_bsr_spmm_f32(sparse, dense_ptr),
+            _ => {
+                // Unsupported format on GPU: fall through to CPU
+                let cpu_dense = crate::tensor::nsl_tensor_to_device(dense_ptr, 0);
+                let result = nsl_sparse_spmm(sparse_ptr, cpu_dense);
+                let gpu_result = crate::tensor::nsl_tensor_to_device(result, dense.device as i64);
+                crate::tensor::nsl_tensor_free(cpu_dense);
+                crate::tensor::nsl_tensor_free(result);
+                gpu_result
+            }
+        };
+    }
+
     let d_data = unsafe { std::slice::from_raw_parts(dense.data as *const f64, k * n) };
     let s_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     let mut output = vec![0.0f64; m * n];
@@ -313,6 +424,39 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
                 }
             }
         }
+        Some(SparseFmtId::Bsr) => {
+            let br = sparse.block_rows as usize;
+            let bc = sparse.block_cols as usize;
+            if br == 0 || bc == 0 { return 0; }
+            let nblk_rows = (m + br - 1) / br;
+            let num_blocks = nnz; // nnz = number of nonzero blocks
+            let block_size = br * bc;
+            let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
+            let block_col_indices = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
+            let block_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
+
+            for blk_r in 0..nblk_rows {
+                let start = block_row_ptrs[blk_r] as usize;
+                let end = block_row_ptrs[blk_r + 1] as usize;
+                for blk_idx in start..end {
+                    let blk_c = block_col_indices[blk_idx] as usize;
+                    let val_base = blk_idx * block_size;
+                    for r in 0..br {
+                        let gr = blk_r * br + r;
+                        if gr >= m { continue; }
+                        for c_inner in 0..bc {
+                            let gk = blk_c * bc + c_inner;
+                            if gk >= k { continue; }
+                            let a_val = block_vals[val_base + r * bc + c_inner];
+                            if a_val == 0.0 { continue; }
+                            for j in 0..n {
+                                output[gr * n + j] += a_val * d_data[gk * n + j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => return 0,
     }
 
@@ -327,23 +471,33 @@ pub extern "C" fn nsl_sparse_free(sparse_ptr: i64) -> i64 {
     if sparse.owns_data == 1 {
         let n = sparse.nnz as usize;
 
-        // BUG-1 fix: CSR indices_0 is row_ptr with length (rows+1), not nnz.
-        // COO indices_0 is row_indices with length nnz.
-        let idx0_len = if sparse.format == SparseFmtId::Csr as u8 {
-            sparse.rows as usize + 1
+        // Format-aware array lengths:
+        // - CSR: indices_0 = row_ptr (rows+1), indices_1 = col_indices (nnz), data = nnz * 8
+        // - CSC: indices_0 = col_ptr (cols+1), indices_1 = row_indices (nnz), data = nnz * 8
+        // - COO: indices_0 = row_indices (nnz), indices_1 = col_indices (nnz), data = nnz * 8
+        // - BSR: indices_0 = block_row_ptrs (nblk_rows+1), indices_1 = block_col_indices (nnz),
+        //        data = nnz * block_rows * block_cols * 8
+        let (idx0_len, idx1_len, data_bytes) = if sparse.format == SparseFmtId::Bsr as u8 {
+            let br = sparse.block_rows as usize;
+            let bc = sparse.block_cols as usize;
+            let nblk_rows = if br > 0 { (sparse.rows as usize + br - 1) / br } else { 0 };
+            (nblk_rows + 1, n, n * br * bc * 8)
+        } else if sparse.format == SparseFmtId::Csr as u8 {
+            (sparse.rows as usize + 1, n, n * 8)
+        } else if sparse.format == SparseFmtId::Csc as u8 {
+            (sparse.cols as usize + 1, n, n * 8)
         } else {
-            n
+            (n, n, n * 8)
         };
 
         if !sparse.indices_0.is_null() && idx0_len > 0 {
             let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_0, idx0_len)) };
         }
-        if !sparse.indices_1.is_null() && n > 0 {
-            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_1, n)) };
+        if !sparse.indices_1.is_null() && idx1_len > 0 {
+            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.indices_1, idx1_len)) };
         }
-        if !sparse.data.is_null() && n > 0 {
-            let bytes = n * 8;
-            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.data, bytes)) };
+        if !sparse.data.is_null() && data_bytes > 0 {
+            let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(sparse.data, data_bytes)) };
         }
     }
     // Box::from_raw above already freed the NslSparseTensor struct
@@ -482,6 +636,230 @@ pub extern "C" fn nsl_sparse_coo_to_csc(coo_ptr: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// CSR ↔ CSC direct conversion (without going through COO)
+// ---------------------------------------------------------------------------
+
+/// Convert CSR sparse tensor to CSC format.
+/// CSR: row_ptr[rows+1], col_indices[nnz], values[nnz]
+/// CSC: col_ptr[cols+1], row_indices[nnz], values[nnz] (reordered)
+#[no_mangle]
+pub extern "C" fn nsl_sparse_csr_to_csc(csr_ptr: i64) -> i64 {
+    if csr_ptr == 0 { return 0; }
+    let csr = unsafe { &*(csr_ptr as *const NslSparseTensor) };
+    if csr.format != SparseFmtId::Csr as u8 { return 0; }
+    let rows = csr.rows as usize;
+    let cols = csr.cols as usize;
+    let nnz = csr.nnz as usize;
+
+    if nnz == 0 {
+        let col_ptr = vec![0i64; cols + 1];
+        let sparse = Box::new(NslSparseTensor {
+            format: SparseFmtId::Csc as u8,
+            device: csr.device, dtype: csr.dtype, ndim: 2,
+            nnz: 0, rows: csr.rows, cols: csr.cols,
+            data: std::ptr::null_mut(),
+            indices_0: Box::into_raw(col_ptr.into_boxed_slice()) as *mut i64,
+            indices_1: std::ptr::null_mut(),
+            block_rows: 0, block_cols: 0,
+            refcount: AtomicI64::new(1), owns_data: 1,
+        });
+        return Box::into_raw(sparse) as i64;
+    }
+
+    let row_ptr = unsafe { std::slice::from_raw_parts(csr.indices_0, rows + 1) };
+    let col_idx = unsafe { std::slice::from_raw_parts(csr.indices_1, nnz) };
+    let vals = unsafe { std::slice::from_raw_parts(csr.data as *const f64, nnz) };
+
+    // Count entries per column
+    let mut col_counts = vec![0usize; cols];
+    for &c in col_idx {
+        col_counts[c as usize] += 1;
+    }
+
+    // Build col_ptr (prefix sum)
+    let mut col_ptr = vec![0i64; cols + 1];
+    for i in 0..cols {
+        col_ptr[i + 1] = col_ptr[i] + col_counts[i] as i64;
+    }
+
+    // Fill row_indices and values in CSC order
+    let mut out_row_indices = vec![0i64; nnz];
+    let mut out_vals = vec![0.0f64; nnz];
+    let mut write_pos = vec![0usize; cols]; // current write position per column
+
+    for r in 0..rows {
+        let start = row_ptr[r] as usize;
+        let end = row_ptr[r + 1] as usize;
+        for idx in start..end {
+            let c = col_idx[idx] as usize;
+            let pos = col_ptr[c] as usize + write_pos[c];
+            out_row_indices[pos] = r as i64;
+            out_vals[pos] = vals[idx];
+            write_pos[c] += 1;
+        }
+    }
+
+    let val_bytes: Vec<u8> = out_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let sparse = Box::new(NslSparseTensor {
+        format: SparseFmtId::Csc as u8,
+        device: csr.device, dtype: csr.dtype, ndim: 2,
+        nnz: csr.nnz, rows: csr.rows, cols: csr.cols,
+        data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+        indices_0: Box::into_raw(col_ptr.into_boxed_slice()) as *mut i64,
+        indices_1: Box::into_raw(out_row_indices.into_boxed_slice()) as *mut i64,
+        block_rows: 0, block_cols: 0,
+        refcount: AtomicI64::new(1), owns_data: 1,
+    });
+    Box::into_raw(sparse) as i64
+}
+
+/// Convert CSC sparse tensor to CSR format.
+/// CSC: col_ptr[cols+1], row_indices[nnz], values[nnz]
+/// CSR: row_ptr[rows+1], col_indices[nnz], values[nnz] (reordered)
+#[no_mangle]
+pub extern "C" fn nsl_sparse_csc_to_csr(csc_ptr: i64) -> i64 {
+    if csc_ptr == 0 { return 0; }
+    let csc = unsafe { &*(csc_ptr as *const NslSparseTensor) };
+    if csc.format != SparseFmtId::Csc as u8 { return 0; }
+    let rows = csc.rows as usize;
+    let cols = csc.cols as usize;
+    let nnz = csc.nnz as usize;
+
+    if nnz == 0 {
+        let row_ptr = vec![0i64; rows + 1];
+        let sparse = Box::new(NslSparseTensor {
+            format: SparseFmtId::Csr as u8,
+            device: csc.device, dtype: csc.dtype, ndim: 2,
+            nnz: 0, rows: csc.rows, cols: csc.cols,
+            data: std::ptr::null_mut(),
+            indices_0: Box::into_raw(row_ptr.into_boxed_slice()) as *mut i64,
+            indices_1: std::ptr::null_mut(),
+            block_rows: 0, block_cols: 0,
+            refcount: AtomicI64::new(1), owns_data: 1,
+        });
+        return Box::into_raw(sparse) as i64;
+    }
+
+    let col_ptr = unsafe { std::slice::from_raw_parts(csc.indices_0, cols + 1) };
+    let row_idx = unsafe { std::slice::from_raw_parts(csc.indices_1, nnz) };
+    let vals = unsafe { std::slice::from_raw_parts(csc.data as *const f64, nnz) };
+
+    // Count entries per row
+    let mut row_counts = vec![0usize; rows];
+    for &r in row_idx {
+        row_counts[r as usize] += 1;
+    }
+
+    // Build row_ptr (prefix sum)
+    let mut row_ptr = vec![0i64; rows + 1];
+    for i in 0..rows {
+        row_ptr[i + 1] = row_ptr[i] + row_counts[i] as i64;
+    }
+
+    // Fill col_indices and values in CSR order
+    let mut out_col_indices = vec![0i64; nnz];
+    let mut out_vals = vec![0.0f64; nnz];
+    let mut write_pos = vec![0usize; rows];
+
+    for c in 0..cols {
+        let start = col_ptr[c] as usize;
+        let end = col_ptr[c + 1] as usize;
+        for idx in start..end {
+            let r = row_idx[idx] as usize;
+            let pos = row_ptr[r] as usize + write_pos[r];
+            out_col_indices[pos] = c as i64;
+            out_vals[pos] = vals[idx];
+            write_pos[r] += 1;
+        }
+    }
+
+    let val_bytes: Vec<u8> = out_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let sparse = Box::new(NslSparseTensor {
+        format: SparseFmtId::Csr as u8,
+        device: csc.device, dtype: csc.dtype, ndim: 2,
+        nnz: csc.nnz, rows: csc.rows, cols: csc.cols,
+        data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+        indices_0: Box::into_raw(row_ptr.into_boxed_slice()) as *mut i64,
+        indices_1: Box::into_raw(out_col_indices.into_boxed_slice()) as *mut i64,
+        block_rows: 0, block_cols: 0,
+        refcount: AtomicI64::new(1), owns_data: 1,
+    });
+    Box::into_raw(sparse) as i64
+}
+
+/// Convert CSR to COO format.
+#[no_mangle]
+pub extern "C" fn nsl_sparse_csr_to_coo(csr_ptr: i64) -> i64 {
+    if csr_ptr == 0 { return 0; }
+    let csr = unsafe { &*(csr_ptr as *const NslSparseTensor) };
+    if csr.format != SparseFmtId::Csr as u8 { return 0; }
+    let rows = csr.rows as usize;
+    let nnz = csr.nnz as usize;
+
+    let row_ptr = unsafe { std::slice::from_raw_parts(csr.indices_0, rows + 1) };
+    let col_idx = unsafe { std::slice::from_raw_parts(csr.indices_1, nnz) };
+    let vals = unsafe { std::slice::from_raw_parts(csr.data as *const f64, nnz) };
+
+    let mut row_indices = vec![0i64; nnz];
+    for r in 0..rows {
+        let start = row_ptr[r] as usize;
+        let end = row_ptr[r + 1] as usize;
+        for idx in start..end {
+            row_indices[idx] = r as i64;
+        }
+    }
+
+    let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let sparse = Box::new(NslSparseTensor {
+        format: SparseFmtId::Coo as u8,
+        device: csr.device, dtype: csr.dtype, ndim: 2,
+        nnz: csr.nnz, rows: csr.rows, cols: csr.cols,
+        data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+        indices_0: Box::into_raw(row_indices.into_boxed_slice()) as *mut i64,
+        indices_1: Box::into_raw(col_idx.to_vec().into_boxed_slice()) as *mut i64,
+        block_rows: 0, block_cols: 0,
+        refcount: AtomicI64::new(1), owns_data: 1,
+    });
+    Box::into_raw(sparse) as i64
+}
+
+/// Convert CSC to COO format.
+#[no_mangle]
+pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
+    if csc_ptr == 0 { return 0; }
+    let csc = unsafe { &*(csc_ptr as *const NslSparseTensor) };
+    if csc.format != SparseFmtId::Csc as u8 { return 0; }
+    let cols = csc.cols as usize;
+    let nnz = csc.nnz as usize;
+
+    let col_ptr = unsafe { std::slice::from_raw_parts(csc.indices_0, cols + 1) };
+    let row_idx = unsafe { std::slice::from_raw_parts(csc.indices_1, nnz) };
+    let vals = unsafe { std::slice::from_raw_parts(csc.data as *const f64, nnz) };
+
+    let mut col_indices = vec![0i64; nnz];
+    for c in 0..cols {
+        let start = col_ptr[c] as usize;
+        let end = col_ptr[c + 1] as usize;
+        for idx in start..end {
+            col_indices[idx] = c as i64;
+        }
+    }
+
+    let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let sparse = Box::new(NslSparseTensor {
+        format: SparseFmtId::Coo as u8,
+        device: csc.device, dtype: csc.dtype, ndim: 2,
+        nnz: csc.nnz, rows: csc.rows, cols: csc.cols,
+        data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
+        indices_0: Box::into_raw(row_idx.to_vec().into_boxed_slice()) as *mut i64,
+        indices_1: Box::into_raw(col_indices.into_boxed_slice()) as *mut i64,
+        block_rows: 0, block_cols: 0,
+        refcount: AtomicI64::new(1), owns_data: 1,
+    });
+    Box::into_raw(sparse) as i64
+}
+
+// ---------------------------------------------------------------------------
 // SpMV: sparse matrix × dense vector → dense vector
 // ---------------------------------------------------------------------------
 
@@ -499,6 +877,24 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
     // Vector must be 1D or 2D with second dim = 1
     let vec_len = vec_t.len as usize;
     if vec_len != k { return 0; }
+
+    // GPU dispatch
+    #[cfg(feature = "cuda")]
+    if vec_t.device > 0 {
+        return match SparseFmtId::from_u8(sparse.format) {
+            Some(SparseFmtId::Csr) => crate::cuda::gpu_csr_spmv_f32(sparse, vec_ptr),
+            Some(SparseFmtId::Coo) => crate::cuda::gpu_coo_spmv_f32(sparse, vec_ptr),
+            _ => {
+                // Unsupported: fall back to CPU
+                let cpu_vec = crate::tensor::nsl_tensor_to_device(vec_ptr, 0);
+                let result = nsl_sparse_spmv(sparse_ptr, cpu_vec);
+                let gpu_result = crate::tensor::nsl_tensor_to_device(result, vec_t.device as i64);
+                crate::tensor::nsl_tensor_free(cpu_vec);
+                crate::tensor::nsl_tensor_free(result);
+                gpu_result
+            }
+        };
+    }
 
     let x = unsafe { std::slice::from_raw_parts(vec_t.data as *const f64, k) };
     let s_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
@@ -523,6 +919,37 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
             let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
             for i in 0..nnz {
                 output[row_idx[i] as usize] += s_vals[i] * x[col_idx[i] as usize];
+            }
+        }
+        Some(SparseFmtId::Bsr) => {
+            let br = sparse.block_rows as usize;
+            let bc = sparse.block_cols as usize;
+            if br == 0 || bc == 0 { return 0; }
+            let nblk_rows = (m + br - 1) / br;
+            let num_blocks = nnz;
+            let block_size = br * bc;
+            let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
+            let block_col_indices = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
+            let block_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
+
+            for blk_r in 0..nblk_rows {
+                let start = block_row_ptrs[blk_r] as usize;
+                let end = block_row_ptrs[blk_r + 1] as usize;
+                for blk_idx in start..end {
+                    let blk_c = block_col_indices[blk_idx] as usize;
+                    let val_base = blk_idx * block_size;
+                    for r in 0..br {
+                        let gr = blk_r * br + r;
+                        if gr >= m { continue; }
+                        let mut sum = 0.0;
+                        for c_inner in 0..bc {
+                            let gk = blk_c * bc + c_inner;
+                            if gk >= k { continue; }
+                            sum += block_vals[val_base + r * bc + c_inner] * x[gk];
+                        }
+                        output[gr] += sum;
+                    }
+                }
             }
         }
         _ => return 0,

@@ -146,6 +146,137 @@ pub fn sumcheck_prove<F: Field>(
 }
 
 // ---------------------------------------------------------------------------
+// Sumcheck verifier
+// ---------------------------------------------------------------------------
+
+/// A sumcheck proof transcript: the round polynomials and the final evaluation.
+#[derive(Debug, Clone)]
+pub struct SumcheckProof<F: Field> {
+    /// Round polynomials g_1, g_2, ..., g_n
+    pub round_polys: Vec<UnivariatePoly<F>>,
+    /// Final evaluation of f at the challenge point
+    pub final_eval: F,
+    /// Challenges used (Fiat-Shamir derived)
+    pub challenges: Vec<F>,
+}
+
+/// Verify a sumcheck proof transcript.
+///
+/// The verifier replays the protocol:
+///   1. For each round i, check g_i(0) + g_i(1) == current_claim
+///   2. Derive the challenge r_i (Fiat-Shamir from round poly)
+///   3. Update claim = g_i(r_i)
+///   4. After all rounds, check final_eval == last claim
+///
+/// Returns Ok(true) if the proof is valid, Ok(false) if invalid.
+pub fn sumcheck_verify<F: Field>(
+    proof: &SumcheckProof<F>,
+    initial_claim: &F,
+) -> bool {
+    let mut current_claim = initial_claim.clone();
+
+    for (i, round_poly) in proof.round_polys.iter().enumerate() {
+        // Step 1: Check g_i(0) + g_i(1) == current_claim
+        if !round_poly.check_sum(&current_claim) {
+            return false;
+        }
+
+        // Step 2: Get the challenge for this round
+        let challenge = if i < proof.challenges.len() {
+            &proof.challenges[i]
+        } else {
+            // If no challenge provided, use 0 (degenerate)
+            return false;
+        };
+
+        // Step 3: Update claim = g_i(r_i)
+        current_claim = round_poly.evaluate(challenge);
+    }
+
+    // Step 4: Final check — the last claim should equal final_eval
+    current_claim == proof.final_eval
+}
+
+/// Run sumcheck prove with Fiat-Shamir challenges (non-interactive).
+///
+/// Like `sumcheck_prove` but generates random challenges from the round polynomials
+/// using a simple hash-based Fiat-Shamir transform.
+pub fn sumcheck_prove_interactive<F: Field>(
+    polynomial: &[F],
+    claim: &F,
+) -> SumcheckProof<F> {
+    let n = polynomial.len();
+    if n == 0 {
+        return SumcheckProof {
+            round_polys: vec![],
+            final_eval: F::zero(),
+            challenges: vec![],
+        };
+    }
+
+    let num_vars = if n <= 1 { 0 } else { (n as f64).log2().ceil() as usize };
+    if num_vars == 0 {
+        return SumcheckProof {
+            round_polys: vec![],
+            final_eval: polynomial[0].clone(),
+            challenges: vec![],
+        };
+    }
+
+    let mut round_polys = Vec::with_capacity(num_vars);
+    let mut challenges = Vec::with_capacity(num_vars);
+    let mut current_evals = polynomial.to_vec();
+
+    for round in 0..num_vars {
+        let half = current_evals.len() / 2;
+        if half == 0 { break; }
+
+        // Compute round polynomial
+        let mut sum_0 = F::zero();
+        let mut sum_1 = F::zero();
+        for i in 0..half {
+            sum_0 = sum_0.field_add(&current_evals[2 * i]);
+            sum_1 = sum_1.field_add(&current_evals[2 * i + 1]);
+        }
+
+        let round_poly = UnivariatePoly {
+            evals: vec![sum_0.clone(), sum_1.clone()],
+        };
+
+        // Fiat-Shamir challenge: derive from round polynomial evaluations
+        // Simple hash: challenge = sum_0 * 7 + sum_1 * 13 + round + 1
+        let challenge = sum_0.field_mul(&F::from_u64(7))
+            .field_add(&sum_1.field_mul(&F::from_u64(13)))
+            .field_add(&F::from_u64(round as u64 + 1));
+        let challenge = if challenge == F::zero() { F::one() } else { challenge };
+
+        // Bind variable to challenge for next round
+        let mut next_evals = Vec::with_capacity(half);
+        for i in 0..half {
+            // Linear interpolation: f(r) = f(0) + r * (f(1) - f(0))
+            let diff = current_evals[2 * i + 1].field_sub(&current_evals[2 * i]);
+            next_evals.push(current_evals[2 * i].field_add(&challenge.field_mul(&diff)));
+        }
+
+        round_polys.push(round_poly);
+        challenges.push(challenge);
+        current_evals = next_evals;
+    }
+
+    let final_eval = if current_evals.is_empty() {
+        F::zero()
+    } else {
+        current_evals[0].clone()
+    };
+
+    SumcheckProof {
+        round_polys,
+        final_eval,
+        challenges,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

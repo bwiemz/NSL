@@ -155,6 +155,21 @@ impl Compiler<'_> {
                             state.variables.insert(sym, (var, cl_type));
                         }
 
+                        // M50: Track sparse tensor variables for end-to-end dispatch.
+                        // Check if the RHS is a call to a sparse function or has Type::Sparse.
+                        if let Some(expr) = value {
+                            let is_sparse_type = matches!(self.node_type(expr.id), nsl_semantic::types::Type::Sparse { .. });
+                            let is_sparse_call = if let ExprKind::Call { callee, .. } = &expr.kind {
+                                if let ExprKind::Ident(fn_sym) = &callee.kind {
+                                    let fn_name = self.resolve_sym(*fn_sym);
+                                    fn_name.contains("sparse") || fn_name == "from_dense"
+                                } else { false }
+                            } else { false };
+                            if is_sparse_type || is_sparse_call {
+                                state.sparse_vars.insert(sym);
+                            }
+                        }
+
                         // Free intermediate tensor temporaries (keep init_val which is now owned by the variable)
                         self.free_tensor_temporaries(builder, state, Some(init_val));
                         // M38b: Free linear tensors consumed during this let-binding's RHS

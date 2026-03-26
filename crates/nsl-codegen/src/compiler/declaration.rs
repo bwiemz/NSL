@@ -105,6 +105,8 @@ impl Compiler<'_> {
                 // M55: Extract @zk_proof from bare function decorators
                 if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
                     self.features.zk_proof_fns.insert(raw_name.clone(), mode);
+                    // Store the FnDef AST for ZK compilation after normal codegen
+                    self.features.zk_fn_defs.insert(raw_name.clone(), fn_def.clone());
                 }
                 // M55: Extract @zk_lookup from function decorators
                 if let Some((ib, ob)) = crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym)) {

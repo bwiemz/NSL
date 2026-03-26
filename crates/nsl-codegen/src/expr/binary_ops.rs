@@ -91,9 +91,14 @@ impl Compiler<'_> {
             || (right_type.is_indeterminate() && !state.in_dtype_method
                 && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
-            // M50: Extract sparse flags for sparse operation dispatch
-            let left_is_sparse = matches!(left_type, Type::Sparse { .. });
-            let right_is_sparse = matches!(right_type, Type::Sparse { .. });
+            // M50: Extract sparse flags for sparse operation dispatch.
+            // Check semantic type AND runtime sparse_vars tracking (for values
+            // created by sparse_from_dense where the type checker doesn't
+            // assign Type::Sparse).
+            let left_is_sparse = matches!(left_type, Type::Sparse { .. })
+                || matches!(&left.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.sparse_vars.contains(sym));
+            let right_is_sparse = matches!(right_type, Type::Sparse { .. })
+                || matches!(&right.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.sparse_vars.contains(sym));
 
             // FBIP safety: protect tensor operands from runtime in-place mutation
             // when they come from named variables (Ident). The runtime FBIP check

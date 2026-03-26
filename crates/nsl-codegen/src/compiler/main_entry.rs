@@ -82,6 +82,14 @@ impl Compiler<'_> {
             let init_ref = self.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[argc_val, argv_val]);
 
+            // M46: Set global deterministic mode flag + seed RNG at program start
+            if self.compile_options.deterministic {
+                let one = builder.ins().iconst(cl_types::I64, 1);
+                self.compile_call_by_name(&mut builder, "nsl_set_deterministic", &[one])?;
+                let seed = builder.ins().iconst(cl_types::I64, 42);
+                self.compile_call_by_name(&mut builder, "nsl_rng_seed", &[seed])?;
+            }
+
             // Register custom dtypes before user code runs
             self.emit_dtype_registration(&mut builder, stmts)?;
 

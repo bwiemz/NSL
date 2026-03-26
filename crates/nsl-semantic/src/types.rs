@@ -172,7 +172,7 @@ impl Type {
     /// Returns true if this type is a tensor family type.
     pub fn is_tensor(&self) -> bool {
         match self {
-            Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } => true,
+            Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } | Type::Sparse { .. } => true,
             Type::Borrow(inner) => inner.is_tensor(),
             _ => false,
         }

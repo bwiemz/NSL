@@ -702,15 +702,32 @@ pub extern "C" fn nsl_tensor_causal_mask(seq_len: i64) -> i64 {
 /// Slice a tensor along a dimension: extract elements [start, end) along dim.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i64) -> i64 {
-    // GPU redirect: transfer to CPU, slice, transfer result back.
+    // GPU: native on-device slice kernel (no CPU round-trip)
     let t = NslTensor::from_ptr(tensor_ptr);
     if t.device > 0 {
-        let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-        let result = nsl_tensor_slice(cpu_t, dim, start, end);
-        let gpu_result = super::nsl_tensor_to_device(result, t.device as i64);
-        super::nsl_tensor_free(cpu_t);
-        super::nsl_tensor_free(result);
-        return gpu_result;
+        #[cfg(feature = "cuda")]
+        {
+            let ndim = t.ndim as usize;
+            let d = if dim < 0 { (t.ndim + dim) as usize } else { dim as usize };
+            let s = if start < 0 { (unsafe { *t.shape.add(d) } + start) as usize } else { start as usize };
+            let dim_size = unsafe { *t.shape.add(d) };
+            let e = if end < 0 { (dim_size + end) as usize }
+                    else if end > dim_size { dim_size as usize }
+                    else { end as usize };
+            let slice_len = e.saturating_sub(s);
+            if slice_len == 0 {
+                // Empty slice: fall back to CPU path for correct empty tensor handling
+                let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+                let result = nsl_tensor_slice(cpu_t, dim, start, end);
+                let gpu_result = super::nsl_tensor_to_device(result, t.device as i64);
+                super::nsl_tensor_free(cpu_t);
+                super::nsl_tensor_free(result);
+                return gpu_result;
+            }
+            return crate::cuda::gpu_slice_f32_with_shape(tensor_ptr, d, s, slice_len);
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
     }
 
     let tensor = NslTensor::from_ptr(tensor_ptr);

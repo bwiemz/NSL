@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::{self, types as cl_types};
 use cranelift_frontend::Variable;
 use nsl_ast::Symbol;
@@ -81,6 +81,10 @@ pub struct FuncState {
     /// M52b: Maps Cranelift Value → weight name in WeightMap.
     /// Set when compile_member_access loads a model weight field that exists in the WeightMap.
     pub weight_values: HashMap<cranelift_codegen::ir::Value, String>,
+    /// M50: Set of Symbol names that are known sparse tensor variables.
+    /// Populated when codegen emits sparse_from_dense, sparse_coo, or format conversion calls
+    /// assigned to a variable. Checked during binary op dispatch to route to sparse ops.
+    pub sparse_vars: HashSet<Symbol>,
     /// M44: Name of the function currently being compiled.
     /// Used by generate() to look up @grammar decorator configs.
     pub current_function_name: Option<String>,
@@ -115,6 +119,7 @@ impl FuncState {
             use_counts: None,
             slab_ptr_var: None,
             weight_values: HashMap::new(),
+            sparse_vars: HashSet::new(),
             current_function_name: None,
         }
     }

@@ -136,6 +136,7 @@ impl Field for Mersenne31Field {
     #[inline] fn field_neg(&self) -> Self { self.neg() }
     #[inline] fn from_u64(val: u64) -> Self { Mersenne31Field::from_u64(val) }
     fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
+    fn from_bytes(bytes: &[u8]) -> Self { Mersenne31Field::from_bytes(bytes) }
     fn field_name() -> &'static str { "Mersenne31" }
 }
 

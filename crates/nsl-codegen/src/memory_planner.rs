@@ -640,15 +640,19 @@ fn walk_stmt(
                     let name = name_str.to_string();
                     // Type map stores types on expr IDs, not stmt IDs.
                     // Check the RHS expression's type for tensor shape info.
+                    // Only plan GPU tensors (device = Cuda) — CPU tensors use heap.
                     let expr_ty = value.as_ref().and_then(|v| type_map.get(&v.id));
                     if let Some(ty) = expr_ty {
-                        if let Some((shape, dtype, _device)) = ty.as_tensor_parts() {
-                            if let Some((size_bytes, size_kind)) = compute_tensor_bytes(shape, dtype) {
-                                if size_bytes > 0 {
-                                    let loc = format!("byte {}", stmt.span.start.0);
-                                    analyzer.record_alloc(&name, size_bytes, size_kind, &loc);
-                                    let id = analyzer.current_pp();
-                                    name_to_id.insert(name, id);
+                        if let Some((shape, dtype, device)) = ty.as_tensor_parts() {
+                            let is_gpu = matches!(device, nsl_semantic::types::Device::Cuda(_));
+                            if is_gpu {
+                                if let Some((size_bytes, size_kind)) = compute_tensor_bytes(shape, dtype) {
+                                    if size_bytes > 0 {
+                                        let loc = format!("byte {}", stmt.span.start.0);
+                                        analyzer.record_alloc(&name, size_bytes, size_kind, &loc);
+                                        let id = analyzer.current_pp();
+                                        name_to_id.insert(name, id);
+                                    }
                                 }
                             }
                         }

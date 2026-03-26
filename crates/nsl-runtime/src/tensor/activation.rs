@@ -1054,10 +1054,21 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
 // owned via use-count analysis. No allocation, no refcount bump, no branch.
 
 macro_rules! define_inplace_unary {
-    ($name:ident, $op_f32:expr, $op_f64:expr) => {
+    ($name:ident, $op_f32:expr, $op_f64:expr, $ptx:expr, $kernel_name:literal) => {
         #[no_mangle]
         pub extern "C" fn $name(ptr: i64) -> i64 {
             let t = unsafe { &mut *(ptr as *mut NslTensor) };
+            // GPU path: dispatch to GPU kernel (device memory not CPU-accessible)
+            if t.device > 0 {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::gpu_elementwise_unary_inplace(ptr, $ptx, $kernel_name);
+                    super::fbip_record_reuse();
+                    return ptr;
+                }
+                #[cfg(not(feature = "cuda"))]
+                { panic!("CUDA support not compiled"); }
+            }
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -1082,20 +1093,31 @@ macro_rules! define_inplace_unary {
     };
 }
 
-define_inplace_unary!(nsl_tensor_relu_inplace, |v: f32| if v > 0.0 { v } else { 0.0_f32 }, |v: f64| if v > 0.0 { v } else { 0.0 });
-define_inplace_unary!(nsl_tensor_exp_inplace, |v: f32| v.exp(), |v: f64| v.exp());
-define_inplace_unary!(nsl_tensor_log_inplace, |v: f32| v.ln(), |v: f64| v.ln());
-define_inplace_unary!(nsl_tensor_sqrt_inplace, |v: f32| v.sqrt(), |v: f64| v.sqrt());
-define_inplace_unary!(nsl_tensor_abs_inplace, |v: f32| v.abs(), |v: f64| v.abs());
-define_inplace_unary!(nsl_tensor_sigmoid_inplace, |v: f32| 1.0_f32 / (1.0_f32 + (-v).exp()), |v: f64| 1.0 / (1.0 + (-v).exp()));
-define_inplace_unary!(nsl_tensor_tanh_inplace, |v: f32| v.tanh(), |v: f64| v.tanh());
-define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v);
-define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 });
+define_inplace_unary!(nsl_tensor_relu_inplace, |v: f32| if v > 0.0 { v } else { 0.0_f32 }, |v: f64| if v > 0.0 { v } else { 0.0 }, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0");
+define_inplace_unary!(nsl_tensor_exp_inplace, |v: f32| v.exp(), |v: f64| v.exp(), crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0");
+define_inplace_unary!(nsl_tensor_log_inplace, |v: f32| v.ln(), |v: f64| v.ln(), crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0");
+define_inplace_unary!(nsl_tensor_sqrt_inplace, |v: f32| v.sqrt(), |v: f64| v.sqrt(), crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0");
+define_inplace_unary!(nsl_tensor_abs_inplace, |v: f32| v.abs(), |v: f64| v.abs(), crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0");
+define_inplace_unary!(nsl_tensor_sigmoid_inplace, |v: f32| 1.0_f32 / (1.0_f32 + (-v).exp()), |v: f64| 1.0 / (1.0 + (-v).exp()), crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0");
+define_inplace_unary!(nsl_tensor_tanh_inplace, |v: f32| v.tanh(), |v: f64| v.tanh(), crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
+define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0");
 
 /// GELU in-place.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
     let t = unsafe { &mut *(ptr as *mut NslTensor) };
+    // GPU path: dispatch to GPU kernel
+    if t.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::gpu_elementwise_unary_inplace(ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+            super::fbip_record_reuse();
+            return ptr;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
     let len = t.len as usize;
     if t.dtype == 1 {
         let d = t.data as *mut f32;
@@ -1122,6 +1144,17 @@ pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
     let t = unsafe { &mut *(ptr as *mut NslTensor) };
+    // GPU path: dispatch to GPU kernel
+    if t.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::gpu_elementwise_unary_inplace(ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+            super::fbip_record_reuse();
+            return ptr;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
     let len = t.len as usize;
     if t.dtype == 1 {
         let d = t.data as *mut f32;

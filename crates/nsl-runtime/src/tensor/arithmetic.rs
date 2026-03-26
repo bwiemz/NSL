@@ -555,6 +555,81 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
     result
 }
 
+// === Sparse matrix multiply (M52c: weight-aware CSR SpMM) ===
+
+/// CSR sparse matmul: C = A_sparse @ B_dense
+/// CSR arrays are passed as device pointers (uploaded by codegen from .rodata).
+/// Returns a new dense tensor C[nrows, N] where N is B's last dim.
+#[no_mangle]
+pub extern "C" fn nsl_sparse_matmul(
+    row_ptrs_ptr: i64,
+    col_indices_ptr: i64,
+    values_ptr: i64,
+    b_ptr: i64,
+    nrows: i64,
+    ncols: i64,
+    nnz: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let b = NslTensor::from_ptr(b_ptr);
+        if b.device > 0 {
+            let last_dim = if b.ndim >= 2 {
+                unsafe { *b.shape.add(b.ndim as usize - 1) }
+            } else { 1 };
+            let n_out = last_dim as usize;
+
+            let out_total = nrows as usize * n_out;
+            let out_data = crate::cuda::inner::alloc_managed(out_total * 4);
+            crate::cuda::inner::memset_d8(out_data, out_total * 4);
+
+            let mut rp = row_ptrs_ptr as u64;
+            let mut ci = col_indices_ptr as u64;
+            let mut v = values_ptr as u64;
+            let mut bd = b.data as u64;
+            let mut cd = out_data as u64;
+            let mut m = nrows as u64;
+            let mut n = n_out as u64;
+
+            let args: [*mut std::ffi::c_void; 7] = [
+                &mut rp as *mut _ as *mut std::ffi::c_void,
+                &mut ci as *mut _ as *mut std::ffi::c_void,
+                &mut v as *mut _ as *mut std::ffi::c_void,
+                &mut bd as *mut _ as *mut std::ffi::c_void,
+                &mut cd as *mut _ as *mut std::ffi::c_void,
+                &mut m as *mut _ as *mut std::ffi::c_void,
+                &mut n as *mut _ as *mut std::ffi::c_void,
+            ];
+
+            let block = 256i64;
+            let grid_x = nrows;
+            let grid_y = ((n_out as i64) + block - 1) / block;
+
+            let result = crate::cuda::inner::kernel_launch(
+                crate::cuda::fused_kernels::CSR_SPMM_F32_PTX.as_ptr(),
+                b"nsl_csr_spmm_f32\0".as_ptr(),
+                [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
+            );
+            assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
+            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+            let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+            unsafe {
+                *out_shape = nrows;
+                *out_shape.add(1) = n_out as i64;
+            }
+            let out_strides = NslTensor::compute_strides(out_shape, 2);
+            let out = Box::new(NslTensor::new(
+                out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0,
+            ));
+            return NslTensor::publish(out);
+        }
+    }
+    // CPU fallback: use dense matmul
+    eprintln!("[nsl] sparse_matmul: CPU fallback (sparse kernels are GPU-only)");
+    nsl_tensor_matmul(values_ptr, b_ptr) // approximate fallback
+}
+
 // === Matrix multiply ===
 
 #[no_mangle]

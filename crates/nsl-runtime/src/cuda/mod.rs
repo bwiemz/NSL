@@ -149,6 +149,18 @@ pub(crate) mod inner {
         }
 
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Async alloc path: use cuMemAllocAsync when enabled (avoids device-wide sync)
+        if async_alloc_enabled() {
+            let ptr = alloc_async(size_bytes);
+            if !ptr.is_null() {
+                #[cfg(test)]
+                crate::memory::stats::cuda_alloc(size_bytes);
+                return ptr;
+            }
+            // Fallback: async alloc failed, use sync path below
+        }
+
         ensure_context();
         // Pool miss — allocate the bucket size so it's reusable later
         let actual_size = if size_bytes <= POOL_MAX_ALLOC && size_bytes > 0 {
@@ -284,8 +296,14 @@ pub(crate) mod inner {
 
     /// Free device memory allocated by alloc_managed.
     /// Returns to pool if eligible, otherwise calls cuMemFree.
+    /// Routes async-allocated pointers to cuMemFreeAsync.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
+        // Check if this was async-allocated before removing from general set
+        if is_async_alloc(ptr) {
+            free_async(ptr);
+            return;
+        }
         let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         if !was_cuda { return; }
         // Try returning to pool first
@@ -297,6 +315,141 @@ pub(crate) mod inner {
                 eprintln!("nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Pinned staging pool: caches page-locked host memory buffers for
+    // CPU↔GPU transfers. Avoids repeated cuMemAllocHost/cuMemFreeHost
+    // syscalls during training loops (~50+ transfers per step).
+    // ------------------------------------------------------------------
+
+    const PINNED_POOL_MAX_PER_BUCKET: usize = 4;
+    const PINNED_POOL_MAX_ALLOC: usize = 64 * 1024 * 1024; // 64 MB
+
+    struct PinnedPool {
+        buckets: HashMap<usize, VecDeque<*mut c_void>>,
+    }
+    unsafe impl Send for PinnedPool {}
+
+    static PINNED_POOL: std::sync::LazyLock<std::sync::Mutex<PinnedPool>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(PinnedPool {
+            buckets: HashMap::new(),
+        }));
+
+    /// Get a pinned (page-locked) staging buffer. Reuses pooled buffers.
+    pub(crate) fn staging_alloc(size_bytes: usize) -> *mut c_void {
+        if size_bytes == 0 { return std::ptr::null_mut(); }
+        if size_bytes > PINNED_POOL_MAX_ALLOC {
+            return alloc_pinned(size_bytes);
+        }
+        let bsize = bucket_size(size_bytes);
+        {
+            let mut pool = PINNED_POOL.lock().unwrap();
+            if let Some(deque) = pool.buckets.get_mut(&bsize) {
+                if let Some(ptr) = deque.pop_front() {
+                    return ptr;
+                }
+            }
+        }
+        alloc_pinned(bsize) // allocate at bucket size for reuse
+    }
+
+    /// Return a pinned staging buffer to the pool.
+    pub(crate) fn staging_free(ptr: *mut c_void, size_bytes: usize) {
+        if ptr.is_null() { return; }
+        if size_bytes > PINNED_POOL_MAX_ALLOC {
+            free_pinned(ptr);
+            return;
+        }
+        let bsize = bucket_size(size_bytes);
+        let mut pool = PINNED_POOL.lock().unwrap();
+        let deque = pool.buckets.entry(bsize).or_insert_with(VecDeque::new);
+        if deque.len() < PINNED_POOL_MAX_PER_BUCKET {
+            deque.push_back(ptr);
+        } else {
+            drop(pool);
+            free_pinned(ptr);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stream-ordered async allocation (cudaMallocAsync fallback)
+    // Opt-in via NSL_ASYNC_ALLOC=1. Uses CUDA driver's built-in memory
+    // pool to avoid device-wide synchronization on allocation.
+    // ------------------------------------------------------------------
+
+    static ASYNC_ALLOC_ENABLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static ASYNC_ALLOC_CHECKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Check if async allocation is enabled and supported.
+    fn async_alloc_enabled() -> bool {
+        if !ASYNC_ALLOC_CHECKED.load(std::sync::atomic::Ordering::Relaxed) {
+            let env_enabled = std::env::var("NSL_ASYNC_ALLOC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if env_enabled {
+                // Probe: try to query the default memory pool
+                let s = state();
+                let guard = s.lock().unwrap();
+                let supported = unsafe {
+                    let mut pool: CUmemoryPool = std::ptr::null_mut();
+                    let r = cuDeviceGetDefaultMemPool(&mut pool, guard.device);
+                    r == CUresult::CUDA_SUCCESS && !pool.is_null()
+                };
+                if supported {
+                    ASYNC_ALLOC_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[nsl] Async GPU allocation ENABLED (cuMemAllocAsync)");
+                } else {
+                    eprintln!("[nsl] NSL_ASYNC_ALLOC=1 but driver does not support memory pools — using sync alloc");
+                }
+            }
+            ASYNC_ALLOC_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        ASYNC_ALLOC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Track async-allocated pointers (freed via cuMemFreeAsync, not cuMemFree)
+    static ASYNC_ALLOC_SET: std::sync::LazyLock<std::sync::Mutex<HashSet<usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+    /// Allocate device memory asynchronously on the default stream.
+    pub(crate) fn alloc_async(size_bytes: usize) -> *mut c_void {
+        ensure_context();
+        unsafe {
+            let mut ptr: CUdeviceptr = 0;
+            let result = cuMemAllocAsync(&mut ptr, size_bytes, std::ptr::null_mut());
+            if result != CUresult::CUDA_SUCCESS {
+                // Fallback to synchronous allocation
+                return alloc_managed(size_bytes);
+            }
+            let cptr = ptr as *mut c_void;
+            register_cuda_alloc(cptr);
+            ASYNC_ALLOC_SET.lock().unwrap().insert(cptr as usize);
+            cptr
+        }
+    }
+
+    /// Free device memory that was allocated via cuMemAllocAsync.
+    pub(crate) fn free_async(ptr: *mut c_void) {
+        if ptr.is_null() { return; }
+        CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        ASYNC_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        ensure_context();
+        unsafe {
+            let result = cuMemFreeAsync(ptr as CUdeviceptr, std::ptr::null_mut());
+            if result != CUresult::CUDA_SUCCESS {
+                // Fallback: try synchronous free
+                let _ = cuMemFree_v2(ptr as CUdeviceptr);
+            }
+        }
+    }
+
+    /// Check if a pointer was async-allocated.
+    pub(crate) fn is_async_alloc(ptr: *mut c_void) -> bool {
+        if ptr.is_null() { return false; }
+        ASYNC_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
     }
 
     /// Allocate device-only memory (not accessible from host without explicit copy).
@@ -2272,8 +2425,603 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
 }
 
 // ---------------------------------------------------------------------------
+// GPU Slice (native on-device slicing, no CPU round-trip)
+// ---------------------------------------------------------------------------
+
+/// GPU slice: extracts a contiguous sub-range along one dimension without
+/// transferring to CPU. Replaces the GPU→CPU→slice→CPU→GPU round-trip.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_slice_f32(tensor_ptr: i64, dim: usize, start: usize) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::GPU_SLICE_F32_PTX;
+
+    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let ndim = t.ndim as usize;
+
+    // Compute output shape: same as source but with sliced dim size
+    let src_shape: Vec<i64> = (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+    let src_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
+
+    // The caller already computed the slice end; we receive start and use
+    // the output shape from the caller. For the kernel, we need the OUTPUT shape.
+    // Since shape_ops.rs passes us the original tensor + dim + start,
+    // we need to determine slice_len from the caller. Instead, let's compute
+    // everything here based on the tensor and dimension info.
+    // For a simple contiguous slice [start:end], the output dim is (end - start).
+    // The caller in shape_ops.rs will pass us the pre-computed output shape.
+    // For now, compute based on the source tensor info.
+
+    // Actually, the better approach: the caller passes us the output shape directly.
+    // Let me restructure to receive output_dim_size.
+    let _ = (tensor_ptr, dim, start, ndim, src_shape, src_strides);
+    // This function is called from gpu_slice_f32_with_shape below.
+    unreachable!("use gpu_slice_f32_with_shape instead");
+}
+
+/// GPU slice with explicit output shape: extracts a sub-range along `dim` starting
+/// at `start` with `slice_len` elements along that dimension.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_slice_f32_with_shape(
+    tensor_ptr: i64,
+    dim: usize,
+    start: usize,
+    slice_len: usize,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::GPU_SLICE_F32_PTX;
+
+    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let ndim = t.ndim as usize;
+
+    // Build output shape (same as source except dim has slice_len)
+    let out_shape = crate::memory::checked_alloc((ndim) * std::mem::size_of::<i64>()) as *mut i64;
+    let mut total: i64 = 1;
+    for i in 0..ndim {
+        let s = if i == dim { slice_len as i64 } else { unsafe { *t.shape.add(i) } };
+        unsafe { *out_shape.add(i) = s };
+        total *= s;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
+    let out_data = inner::alloc_managed(total as usize * 4); // f32
+
+    // Upload metadata arrays to device
+    let arr_bytes = ndim * std::mem::size_of::<i64>();
+    let gpu_shape = inner::alloc_managed(arr_bytes);
+    let gpu_src_strides = inner::alloc_managed(arr_bytes);
+    let gpu_dst_strides = inner::alloc_managed(arr_bytes);
+
+    inner::memcpy_htod(gpu_shape, out_shape as *const std::ffi::c_void, arr_bytes);
+    inner::memcpy_htod(gpu_src_strides, t.strides as *const std::ffi::c_void, arr_bytes);
+    inner::memcpy_htod(gpu_dst_strides, out_strides as *const std::ffi::c_void, arr_bytes);
+
+    let mut src_data = t.data as u64;
+    let mut dst_data = out_data as u64;
+    let mut shape_val = gpu_shape as u64;
+    let mut src_str_val = gpu_src_strides as u64;
+    let mut dst_str_val = gpu_dst_strides as u64;
+    let mut ndim_val = ndim as u64;
+    let mut total_val = total as u64;
+    let mut dim_val = dim as u64;
+    let mut start_val = start as u64;
+
+    let args: [*mut std::ffi::c_void; 9] = [
+        &mut src_data as *mut _ as *mut std::ffi::c_void,
+        &mut dst_data as *mut _ as *mut std::ffi::c_void,
+        &mut shape_val as *mut _ as *mut std::ffi::c_void,
+        &mut src_str_val as *mut _ as *mut std::ffi::c_void,
+        &mut dst_str_val as *mut _ as *mut std::ffi::c_void,
+        &mut ndim_val as *mut _ as *mut std::ffi::c_void,
+        &mut total_val as *mut _ as *mut std::ffi::c_void,
+        &mut dim_val as *mut _ as *mut std::ffi::c_void,
+        &mut start_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((total as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        GPU_SLICE_F32_PTX.as_ptr(), b"nsl_slice_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU slice kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    // Free GPU metadata arrays
+    inner::free_managed(gpu_shape);
+    inner::free_managed(gpu_src_strides);
+    inner::free_managed(gpu_dst_strides);
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides,
+        ndim as i64, total, t.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
+// ---------------------------------------------------------------------------
+// M50: GPU Sparse SpMM / SpMV dispatch helpers
+// These take NslSparseTensor + NslTensor and launch the appropriate kernel.
+// ---------------------------------------------------------------------------
+
+/// GPU CSR SpMM from NslSparseTensor: uploads CSR arrays to device, launches kernel.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
+    let m = sparse.rows as usize;
+    let nnz = sparse.nnz as usize;
+
+    let out_total = m * n_out;
+    let out_data = inner::alloc_managed(out_total * 4);
+    inner::memset_d8(out_data, out_total * 4);
+
+    // Convert and upload CSR arrays
+    let rp_bytes = (m + 1) * 4;
+    let ci_bytes = nnz * 4;
+    let v_bytes = nnz * 4;
+
+    let gpu_rp = inner::alloc_managed(rp_bytes);
+    let gpu_ci = inner::alloc_managed(ci_bytes);
+    let gpu_v = inner::alloc_managed(v_bytes);
+
+    // row_ptrs: i64 → u32
+    let staging_rp = crate::memory::checked_alloc(rp_bytes) as *mut u32;
+    let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
+    for i in 0..m + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
+    inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
+    crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+
+    // col_indices: i64 → u32
+    let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
+    let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
+    for i in 0..nnz { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
+    inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
+    crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+
+    // values: f64 → f32
+    let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
+    let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
+    for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
+    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+
+    let mut rp = gpu_rp as u64;
+    let mut ci = gpu_ci as u64;
+    let mut v = gpu_v as u64;
+    let mut bd = b.data as u64;
+    let mut cd = out_data as u64;
+    let mut m_val = m as u64;
+    let mut n_val = n_out as u64;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut rp as *mut _ as *mut std::ffi::c_void,
+        &mut ci as *mut _ as *mut std::ffi::c_void,
+        &mut v as *mut _ as *mut std::ffi::c_void,
+        &mut bd as *mut _ as *mut std::ffi::c_void,
+        &mut cd as *mut _ as *mut std::ffi::c_void,
+        &mut m_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid_x = m as i64;
+    let grid_y = ((n_out as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        fused_kernels::CSR_SPMM_F32_PTX.as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed");
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    inner::free_managed(gpu_rp);
+    inner::free_managed(gpu_ci);
+    inner::free_managed(gpu_v);
+
+    let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
+    unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0));
+    NslTensor::publish(out)
+}
+
+/// GPU COO SpMM: C[M,N] = A_coo @ B[K,N]. Uploads COO arrays to device, launches kernel.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
+    let m = sparse.rows as usize;
+    let nnz = sparse.nnz as usize;
+
+    let out_total = m * n_out;
+    let out_data = inner::alloc_managed(out_total * 4);
+    inner::memset_d8(out_data, out_total * 4);
+
+    // Upload COO arrays: row_indices(i64), col_indices(i64), values(f32)
+    let ri_bytes = nnz * 8; // i64
+    let ci_bytes = nnz * 8;
+    let v_bytes = nnz * 4;  // f32
+
+    let gpu_ri = inner::alloc_managed(ri_bytes);
+    let gpu_ci = inner::alloc_managed(ci_bytes);
+    let gpu_v = inner::alloc_managed(v_bytes);
+
+    // Convert f64 values to f32 for GPU, upload indices as-is (i64)
+    inner::memcpy_htod(gpu_ri, sparse.indices_0 as *const std::ffi::c_void, ri_bytes);
+    inner::memcpy_htod(gpu_ci, sparse.indices_1 as *const std::ffi::c_void, ci_bytes);
+    // Values: sparse stores f64 on CPU, need f32 for GPU kernel
+    let staging = crate::memory::checked_alloc(v_bytes) as *mut f32;
+    let src_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
+    for i in 0..nnz { unsafe { *staging.add(i) = src_vals[i] as f32; } }
+    inner::memcpy_htod(gpu_v, staging as *const std::ffi::c_void, v_bytes);
+    crate::memory::checked_free(staging as *mut u8, v_bytes);
+
+    let mut ri_val = gpu_ri as u64;
+    let mut ci_val = gpu_ci as u64;
+    let mut v_val = gpu_v as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = out_data as u64;
+    let mut n_val = n_out as u64;
+    let mut nnz_val = nnz as u64;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut ri_val as *mut _ as *mut std::ffi::c_void,
+        &mut ci_val as *mut _ as *mut std::ffi::c_void,
+        &mut v_val as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut nnz_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((nnz as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        fused_kernels::COO_SPMM_F32_PTX.as_ptr(), b"nsl_coo_spmm_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU COO SpMM kernel failed");
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    inner::free_managed(gpu_ri);
+    inner::free_managed(gpu_ci);
+    inner::free_managed(gpu_v);
+
+    let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
+    unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0));
+    NslTensor::publish(out)
+}
+
+/// GPU CSR SpMV: y[M] = A_csr @ x[K]. One thread per row.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let x = unsafe { &*(vec_ptr as *const NslTensor) };
+    let m = sparse.rows as usize;
+    let nnz = sparse.nnz as usize;
+
+    let out_data = inner::alloc_managed(m * 4);
+    inner::memset_d8(out_data, m * 4);
+
+    // Upload CSR: row_ptrs as u32, col_indices as u32, values as f32
+    let rp_bytes = (m + 1) * 4;
+    let ci_bytes = nnz * 4;
+    let v_bytes = nnz * 4;
+
+    let gpu_rp = inner::alloc_managed(rp_bytes);
+    let gpu_ci = inner::alloc_managed(ci_bytes);
+    let gpu_v = inner::alloc_managed(v_bytes);
+
+    // Convert i64 row_ptrs/col_indices to u32 for GPU, f64 values to f32
+    let staging_rp = crate::memory::checked_alloc(rp_bytes) as *mut u32;
+    let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
+    for i in 0..m + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
+    inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
+    crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+
+    let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
+    let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
+    for i in 0..nnz { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
+    inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
+    crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+
+    let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
+    let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
+    for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
+    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+
+    let mut rp = gpu_rp as u64;
+    let mut ci = gpu_ci as u64;
+    let mut v = gpu_v as u64;
+    let mut xd = x.data as u64;
+    let mut yd = out_data as u64;
+    let mut m_val = m as u64;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut rp as *mut _ as *mut std::ffi::c_void,
+        &mut ci as *mut _ as *mut std::ffi::c_void,
+        &mut v as *mut _ as *mut std::ffi::c_void,
+        &mut xd as *mut _ as *mut std::ffi::c_void,
+        &mut yd as *mut _ as *mut std::ffi::c_void,
+        &mut m_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((m as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        fused_kernels::CSR_SPMV_F32_PTX.as_ptr(), b"nsl_csr_spmv_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU CSR SpMV kernel failed");
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    inner::free_managed(gpu_rp);
+    inner::free_managed(gpu_ci);
+    inner::free_managed(gpu_v);
+
+    let out_shape = crate::memory::checked_alloc(8) as *mut i64;
+    unsafe { *out_shape = m as i64; }
+    let out_strides = NslTensor::compute_strides(out_shape, 1);
+    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 1, m as i64, x.device, 1, 1, 0));
+    NslTensor::publish(out)
+}
+
+/// GPU BSR SpMM: C[M,N] = A_bsr @ B[K,N]. Uploads BSR arrays, launches kernel.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let b = unsafe { &*(dense_ptr as *const NslTensor) };
+    let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
+    let m = sparse.rows as usize;
+    let br = sparse.block_rows as usize;
+    let bc = sparse.block_cols as usize;
+    if br == 0 || bc == 0 { return 0; }
+    let nblk_rows = (m + br - 1) / br;
+    let num_blocks = sparse.nnz as usize;
+    let block_size = br * bc;
+
+    let out_total = m * n_out;
+    let out_data = inner::alloc_managed(out_total * 4);
+    inner::memset_d8(out_data, out_total * 4);
+
+    // Upload BSR arrays: row_ptrs(u32), col_indices(u32), values(f32)
+    let rp_bytes = (nblk_rows + 1) * 4;
+    let ci_bytes = num_blocks * 4;
+    let v_bytes = num_blocks * block_size * 4;
+
+    let gpu_rp = inner::alloc_managed(rp_bytes);
+    let gpu_ci = inner::alloc_managed(ci_bytes);
+    let gpu_v = inner::alloc_managed(v_bytes);
+
+    // Convert i64 → u32 for row_ptrs
+    let staging_rp = crate::memory::checked_alloc(rp_bytes) as *mut u32;
+    let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
+    for i in 0..nblk_rows + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
+    inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
+    crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+
+    // Convert i64 → u32 for col_indices
+    let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
+    let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
+    for i in 0..num_blocks { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
+    inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
+    crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+
+    // Convert f64 → f32 for values
+    let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
+    let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
+    for i in 0..num_blocks * block_size { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
+    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+
+    let mut rp = gpu_rp as u64;
+    let mut ci = gpu_ci as u64;
+    let mut v = gpu_v as u64;
+    let mut bd = b.data as u64;
+    let mut cd = out_data as u64;
+    let mut n_val = n_out as u64;
+    let mut br_val = br as u64;
+    let mut bc_val = bc as u64;
+    let mut nblk_val = nblk_rows as u64;
+
+    let args: [*mut std::ffi::c_void; 9] = [
+        &mut rp as *mut _ as *mut std::ffi::c_void,
+        &mut ci as *mut _ as *mut std::ffi::c_void,
+        &mut v as *mut _ as *mut std::ffi::c_void,
+        &mut bd as *mut _ as *mut std::ffi::c_void,
+        &mut cd as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut br_val as *mut _ as *mut std::ffi::c_void,
+        &mut bc_val as *mut _ as *mut std::ffi::c_void,
+        &mut nblk_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block_x = 256i64.min(n_out as i64).max(1);
+    let grid_x = nblk_rows as i64;
+    let grid_y = ((n_out as i64) + block_x - 1) / block_x;
+    let result = inner::kernel_launch(
+        fused_kernels::BSR_SPMM_F32_PTX.as_ptr(), b"nsl_bsr_spmm_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block_x, br as i64, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU BSR SpMM kernel failed");
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    inner::free_managed(gpu_rp);
+    inner::free_managed(gpu_ci);
+    inner::free_managed(gpu_v);
+
+    let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
+    unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0));
+    NslTensor::publish(out)
+}
+
+/// GPU COO SpMV: y[M] = A_coo @ x[K]. One thread per nonzero, atomic add.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    let x = unsafe { &*(vec_ptr as *const NslTensor) };
+    let m = sparse.rows as usize;
+    let nnz = sparse.nnz as usize;
+
+    let out_data = inner::alloc_managed(m * 4);
+    inner::memset_d8(out_data, m * 4);
+
+    let ri_bytes = nnz * 8;
+    let ci_bytes = nnz * 8;
+    let v_bytes = nnz * 4;
+
+    let gpu_ri = inner::alloc_managed(ri_bytes);
+    let gpu_ci = inner::alloc_managed(ci_bytes);
+    let gpu_v = inner::alloc_managed(v_bytes);
+
+    inner::memcpy_htod(gpu_ri, sparse.indices_0 as *const std::ffi::c_void, ri_bytes);
+    inner::memcpy_htod(gpu_ci, sparse.indices_1 as *const std::ffi::c_void, ci_bytes);
+    let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
+    let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
+    for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
+    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+
+    let mut ri = gpu_ri as u64;
+    let mut ci = gpu_ci as u64;
+    let mut v = gpu_v as u64;
+    let mut xd = x.data as u64;
+    let mut yd = out_data as u64;
+    let mut nnz_v = nnz as u64;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut ri as *mut _ as *mut std::ffi::c_void,
+        &mut ci as *mut _ as *mut std::ffi::c_void,
+        &mut v as *mut _ as *mut std::ffi::c_void,
+        &mut xd as *mut _ as *mut std::ffi::c_void,
+        &mut yd as *mut _ as *mut std::ffi::c_void,
+        &mut nnz_v as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((nnz as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        fused_kernels::COO_SPMV_F32_PTX.as_ptr(), b"nsl_coo_spmv_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU COO SpMV kernel failed");
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    inner::free_managed(gpu_ri);
+    inner::free_managed(gpu_ci);
+    inner::free_managed(gpu_v);
+
+    let out_shape = crate::memory::checked_alloc(8) as *mut i64;
+    unsafe { *out_shape = m as i64; }
+    let out_strides = NslTensor::compute_strides(out_shape, 1);
+    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 1, m as i64, x.device, 1, 1, 0));
+    NslTensor::publish(out)
+}
+
+// ---------------------------------------------------------------------------
 // GPU Strided Copy (contiguous materialization on-device)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GPU CSR Sparse MatMul (M52c: weight-aware sparse kernel)
+// ---------------------------------------------------------------------------
+
+/// CSR SpMM: C[M,N] = A_sparse[M,K] @ B_dense[K,N]
+/// CSR arrays (row_ptrs, col_indices, values) are host pointers — uploaded to device.
+/// B is a device tensor pointer. Returns a new dense tensor C.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sparse_matmul_csr_f32(
+    row_ptrs: &[u32],
+    col_indices: &[u32],
+    values_f32: &[f32],
+    b_ptr: i64,
+    nrows: usize,
+    ncols: usize,
+    nnz: usize,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::CSR_SPMM_F32_PTX;
+
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    // B must be 2D: [K, N]
+    let last_dim = if b.ndim >= 2 {
+        unsafe { *b.shape.add(b.ndim as usize - 1) }
+    } else {
+        1
+    };
+    let n_out = last_dim as usize;
+
+    // Allocate output C[nrows, n_out]
+    let out_total = nrows * n_out;
+    let out_data = inner::alloc_managed(out_total * 4); // f32
+    inner::memset_d8(out_data, out_total * 4);
+
+    // Upload CSR arrays to device
+    let rp_bytes = (nrows + 1) * std::mem::size_of::<u32>();
+    let ci_bytes = nnz * std::mem::size_of::<u32>();
+    let val_bytes = nnz * std::mem::size_of::<f32>();
+
+    let gpu_row_ptrs = inner::alloc_managed(rp_bytes);
+    let gpu_col_indices = inner::alloc_managed(ci_bytes);
+    let gpu_values = inner::alloc_managed(val_bytes);
+
+    inner::memcpy_htod(gpu_row_ptrs, row_ptrs.as_ptr() as *const std::ffi::c_void, rp_bytes);
+    inner::memcpy_htod(gpu_col_indices, col_indices.as_ptr() as *const std::ffi::c_void, ci_bytes);
+    inner::memcpy_htod(gpu_values, values_f32.as_ptr() as *const std::ffi::c_void, val_bytes);
+
+    let mut rp_val = gpu_row_ptrs as u64;
+    let mut ci_val = gpu_col_indices as u64;
+    let mut v_val = gpu_values as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = out_data as u64;
+    let mut m_val = nrows as u64;
+    let mut n_val = n_out as u64;
+
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut rp_val as *mut _ as *mut std::ffi::c_void,
+        &mut ci_val as *mut _ as *mut std::ffi::c_void,
+        &mut v_val as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut m_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    // Grid: [nrows, ceil(N/256), 1], Block: [256, 1, 1]
+    let block = 256i64;
+    let grid_x = nrows as i64;
+    let grid_y = ((n_out as i64) + block - 1) / block;
+
+    let result = inner::kernel_launch(
+        CSR_SPMM_F32_PTX.as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
+        [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    // Free device CSR arrays
+    inner::free_managed(gpu_row_ptrs);
+    inner::free_managed(gpu_col_indices);
+    inner::free_managed(gpu_values);
+
+    // Build output tensor [nrows, n_out]
+    let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape = nrows as i64;
+        *out_shape.add(1) = n_out as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
 
 /// GPU strided copy: materializes a non-contiguous view into a contiguous tensor.
 /// Replaces the CPU round-trip (GPU→CPU copy→GPU) with a single on-device kernel.

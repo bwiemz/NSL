@@ -191,6 +191,39 @@ pub struct WeightEntry {
 }
 
 impl WeightEntry {
+    /// Compute the quantization scale for this weight tensor.
+    /// scale = max(|w|) / dtype_max, used for FP8/INT8 quantization.
+    /// Returns None for floating-point weights that don't need scaling.
+    pub fn compute_scale(&self) -> Option<f32> {
+        let dtype_max = match self.dtype {
+            WeightDType::F8E4M3 => 448.0_f32,  // E4M3 max representable
+            WeightDType::F8E5M2 => 57344.0_f32, // E5M2 max representable
+            WeightDType::I8 => 127.0_f32,
+            WeightDType::I32 => return None, // integer weights, no scaling
+            _ => return None, // F16/BF16/F32/F64 don't need explicit scaling
+        };
+        // Compute max absolute value
+        let bw = self.dtype.byte_width();
+        let mut max_abs: f64 = 0.0;
+        for i in 0..self.num_elements {
+            let offset = i * bw;
+            if offset + bw > self.data.len() { break; }
+            let val = self.dtype.to_f64(&self.data[offset..offset + bw]).abs();
+            if val > max_abs { max_abs = val; }
+        }
+        if max_abs < 1e-12 { return Some(1.0); } // avoid division by zero
+        Some((max_abs / dtype_max as f64) as f32)
+    }
+
+    /// Convert this weight entry to a ConstTensor for constant folding.
+    pub fn to_const_tensor(&self) -> ConstTensor {
+        ConstTensor {
+            data: self.data.clone(),
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+
     /// Compute sparsity statistics for this weight tensor.
     /// Results are cached on first call.
     pub fn analyze_sparsity(&mut self, config: &WeightAwareConfig) -> &SparsityInfo {

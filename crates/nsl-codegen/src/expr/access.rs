@@ -100,6 +100,20 @@ impl Compiler<'_> {
                             obj_val,
                             field.offset as i32,
                         );
+                        // M52b: Tag this value as a known weight if it exists in the WeightMap.
+                        // Try common naming conventions: "model.field", "field", etc.
+                        if let Some(ref wmap) = self.features.weight_map {
+                            let candidates = [
+                                format!("{}.{}", model_name, member_name),
+                                member_name.clone(),
+                            ];
+                            for key in &candidates {
+                                if wmap.get(key).is_some() {
+                                    state.weight_values.insert(val, key.clone());
+                                    break;
+                                }
+                            }
+                        }
                         return Ok(val);
                     }
                 }

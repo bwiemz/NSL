@@ -39,6 +39,8 @@ pub trait Field: Clone + std::fmt::Debug + PartialEq + Sized + Send + Sync {
     fn from_u64(val: u64) -> Self;
     /// Serialize to a byte vector.
     fn to_bytes_vec(&self) -> Vec<u8>;
+    /// Deserialize from bytes.
+    fn from_bytes(bytes: &[u8]) -> Self;
     /// Name of this field (for diagnostics).
     fn field_name() -> &'static str;
 }
@@ -53,6 +55,7 @@ impl Field for FieldElement {
     #[inline] fn field_neg(&self) -> Self { FieldElement::zero().sub(self) }
     #[inline] fn from_u64(val: u64) -> Self { FieldElement::from_u64(val) }
     fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
+    fn from_bytes(bytes: &[u8]) -> Self { FieldElement::from_bytes(bytes) }
     fn field_name() -> &'static str { "BN254" }
 }
 

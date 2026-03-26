@@ -2149,14 +2149,14 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 // f32→f32: direct host-to-device copy
                 crate::cuda::inner::memcpy_htod(dst, t.data, dst_size);
             } else {
-                // f64→f32: convert on CPU into temp buffer, then copy to device
-                let staging = checked_alloc(dst_size) as *mut f32;
+                // f64→f32: convert on CPU into pinned staging buffer, then copy to device
+                let staging = crate::cuda::inner::staging_alloc(dst_size) as *mut f32;
                 let src = t.data_f64();
                 for i in 0..len {
                     unsafe { *staging.add(i) = *src.add(i) as f32; }
                 }
                 crate::cuda::inner::memcpy_htod(dst, staging as *const std::ffi::c_void, dst_size);
-                checked_free(staging as *mut u8, dst_size);
+                crate::cuda::inner::staging_free(staging as *mut std::ffi::c_void, dst_size);
             }
             let shape = NslTensor::copy_shape(t.shape, t.ndim);
             let strides = NslTensor::compute_strides(shape, t.ndim);
@@ -2192,9 +2192,9 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 return NslTensor::publish(new_t);
             }
 
-            // f32 (GPU) → f64 (CPU): copy to staging, then convert
+            // f32 (GPU) → f64 (CPU): copy to pinned staging, then convert
             let src_size = len * std::mem::size_of::<f32>();
-            let staging = checked_alloc(src_size) as *mut f32;
+            let staging = crate::cuda::inner::staging_alloc(src_size) as *mut f32;
             crate::cuda::inner::memcpy_dtoh(
                 staging as *mut std::ffi::c_void,
                 t.data,
@@ -2205,7 +2205,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             for i in 0..len {
                 unsafe { *dst.add(i) = *staging.add(i) as f64; }
             }
-            checked_free(staging as *mut u8, src_size);
+            crate::cuda::inner::staging_free(staging as *mut std::ffi::c_void, src_size);
             let shape = NslTensor::copy_shape(t.shape, t.ndim);
             let strides = NslTensor::compute_strides(shape, t.ndim);
             let new_t = Box::new(NslTensor::new(
@@ -2249,6 +2249,33 @@ pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
         }
     }
     let _ = device; // suppress unused warning without cuda feature
+}
+
+/// Create a tensor whose data points to static .rodata memory (compile-time constant).
+/// The tensor has `owns_data = 0` — the data is never freed (it's embedded in the binary).
+/// Used by M52 weight constant folding to embed folded tensors.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_from_static(
+    data_ptr: i64,
+    shape_list: i64,
+    dtype: i64,
+) -> i64 {
+    let list = crate::list::NslList::from_ptr(shape_list);
+    let ndim = list.len;
+    let mut len: i64 = 1;
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim as usize {
+        let dim = unsafe { *list.data.add(i) };
+        unsafe { *shape.add(i) = dim };
+        len *= dim;
+    }
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    // owns_data = 0: static data, never freed
+    let tensor = NslTensor::new(
+        data_ptr as *mut c_void, shape, strides, ndim, len, 0, dtype as u16, 0, 0,
+    );
+    NslTensor::publish(Box::new(tensor))
 }
 
 /// Create a tensor whose data points into a pre-allocated slab.

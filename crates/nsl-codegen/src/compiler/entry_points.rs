@@ -52,6 +52,24 @@ pub fn compile(
                     crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
                 }
 
+                // M52d: Compute and store quantization scales for FP8/INT8 weights
+                {
+                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                    for name in &names {
+                        if let Some(entry) = wmap.get(name) {
+                            if let Some(scale) = entry.compute_scale() {
+                                compiler.weight_scales.insert(name.clone(), scale);
+                            }
+                        }
+                    }
+                    if !compiler.weight_scales.is_empty() {
+                        eprintln!(
+                            "[nsl] M52d: computed compile-time scales for {} quantized weights",
+                            compiler.weight_scales.len()
+                        );
+                    }
+                }
+
                 eprintln!(
                     "[nsl] loaded {} weights from {} (SHA-256: {})",
                     wmap.len(),
@@ -235,6 +253,26 @@ pub fn compile_with_zk_info(
 
     // Capture ZK fn map before finalize() consumes the compiler.
     let zk_proof_fns = compiler.features.zk_proof_fns.clone();
+
+    // M55: Compile @zk_proof functions to ZK circuits
+    for (fn_name, mode) in &zk_proof_fns {
+        if let Some(fn_def) = compiler.features.zk_fn_defs.get(fn_name) {
+            let zk_config = crate::zk::backend::ZkConfig::default();
+            match crate::zk::compile_zk(fn_def, mode.clone(), &zk_config, type_map, interner) {
+                Ok(result) => {
+                    eprintln!(
+                        "[nsl] M55: compiled ZK circuit for '{}' — {} constraints, proof ~{} KB",
+                        fn_name,
+                        result.stats.num_constraints,
+                        result.stats.estimated_proof_size_bytes / 1024,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[nsl] M55: ZK compilation warning for '{}': {}", fn_name, e);
+                }
+            }
+        }
+    }
 
     let bytes = compiler.finalize()?;
     Ok((bytes, zk_proof_fns))
