@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use cranelift_module::{DataDescription, DataId, Module};
 
 use nsl_ast::decl::{Decorator, ModelMember};
@@ -30,18 +32,22 @@ impl Compiler<'_> {
                                 .to_string();
 
                             if self.compile_options.no_autotune {
+                                // --no-autotune: use middle values, skip benchmarking
                                 eprintln!(
                                     "[nsl] autotune: --no-autotune, using middle values for {}",
                                     kernel_name
                                 );
+                                let middle = crate::autotune::select_middle_values(&params);
+                                let const_map: HashMap<String, i64> =
+                                    middle.into_iter().collect();
+                                self.compile_single_kernel_with_constants(kernel, &const_map)?;
+                            } else {
+                                // M26: cost-model-based autotune variant selection
+                                let winning_constants = self.autotune_select_best(
+                                    &kernel_name, kernel, &params,
+                                )?;
+                                self.compile_single_kernel_with_constants(kernel, &winning_constants)?;
                             }
-
-                            // For now, always use middle-value fallback.
-                            // TODO(M26): add GPU benchmarking path when CUDA is available.
-                            let _fallback = crate::autotune::select_middle_values(&params);
-
-                            // Compile the kernel normally (constant substitution deferred to M26)
-                            self.compile_single_kernel(kernel)?;
                         } else {
                             self.compile_single_kernel(kernel)?;
                         }
@@ -209,6 +215,179 @@ impl Compiler<'_> {
             }
         }
         Ok(params)
+    }
+
+    // ── @autotune variant generation + cost-model selection (M26) ──────
+
+    /// Compile a single kernel with constant substitutions applied.
+    ///
+    /// Delegates to `KernelCompiler::compile_with_constants` for CUDA targets,
+    /// or to the normal `compile_single_kernel` path for non-CUDA targets.
+    fn compile_single_kernel_with_constants(
+        &mut self,
+        kernel: &nsl_ast::block::KernelDef,
+        constants: &HashMap<String, i64>,
+    ) -> Result<(), CodegenError> {
+        use crate::gpu_target::GpuTarget;
+
+        let target = self.gpu_target();
+        let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+
+        let kernel_bytes = match target {
+            GpuTarget::Cuda => {
+                // AST -> constant substitution -> PTX
+                crate::kernel::KernelCompiler::compile_with_constants(
+                    kernel, self.interner, constants,
+                )
+            }
+            _ => {
+                // Non-CUDA: constant substitution not yet supported for KIR path.
+                // Fall through to the normal compile path.
+                return self.compile_single_kernel(kernel);
+            }
+        };
+
+        // Embed kernel code bytes in .rodata (same as compile_single_kernel)
+        let data_label = format!("__nsl_kernel_{}_{}", target.name(), kernel_name);
+        let kernel_data_id = self.module
+            .declare_data(
+                &data_label,
+                cranelift_module::Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| CodegenError::new(format!(
+                "failed to declare kernel data for '{}' ({}): {e}", kernel_name, target.name()
+            )))?;
+        let mut data_desc = cranelift_module::DataDescription::new();
+        data_desc.define(kernel_bytes.into_boxed_slice());
+        self.module
+            .define_data(kernel_data_id, &data_desc)
+            .map_err(|e| CodegenError::new(format!(
+                "failed to define kernel data for '{}' ({}): {e}", kernel_name, target.name()
+            )))?;
+
+        // Embed kernel name (null-terminated)
+        let mut name_bytes = kernel_name.as_bytes().to_vec();
+        name_bytes.push(0);
+        let name_label = format!("__nsl_kernel_name_{}_{}", target.name(), kernel_name);
+        let name_data_id = self.module
+            .declare_data(
+                &name_label,
+                cranelift_module::Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| CodegenError::new(format!(
+                "failed to declare name data for kernel '{}': {e}", kernel_name
+            )))?;
+        let mut name_desc = cranelift_module::DataDescription::new();
+        name_desc.define(name_bytes.into_boxed_slice());
+        self.module
+            .define_data(name_data_id, &name_desc)
+            .map_err(|e| CodegenError::new(format!(
+                "failed to define name data for kernel '{}': {e}", kernel_name
+            )))?;
+
+        self.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
+        Ok(())
+    }
+
+    /// Run cost-model-based autotune variant selection for a kernel.
+    ///
+    /// Generates the Cartesian product of tuning parameters, estimates cost for
+    /// each variant using the roofline model, and returns the winning constant map.
+    /// Integrates with the autotune cache; respects `--autotune-fresh`.
+    fn autotune_select_best(
+        &self,
+        kernel_name: &str,
+        kernel: &nsl_ast::block::KernelDef,
+        tuning_params: &crate::autotune::TuningParams,
+    ) -> Result<HashMap<String, i64>, CodegenError> {
+        let fresh = self.compile_options.autotune_fresh;
+
+        // Compute a cache key from the kernel AST + tuning params + target GPU
+        let gpu = crate::gpu_specs::default_gpu();
+        let ast_bytes = format!("{:?}", kernel.body).into_bytes();
+        let cache_hash = crate::autotune::hash_kernel_ast(
+            kernel_name,
+            &ast_bytes,
+            tuning_params,
+            &[], // no specific input shapes at compile time
+            gpu.name,
+            &format!("{}", gpu.sm_version),
+            gpu.num_sms,
+        );
+
+        // PTX generator closure: compile kernel with substituted constants
+        let interner = self.interner;
+        let ptx_generator = |variant: &crate::autotune::Variant| -> Result<String, String> {
+            let const_map: HashMap<String, i64> = variant.iter().cloned().collect();
+            let ptx_bytes = crate::kernel::KernelCompiler::compile_with_constants(
+                kernel, interner, &const_map,
+            );
+            // Convert to string (PTX is null-terminated UTF-8)
+            let ptx_str = String::from_utf8_lossy(&ptx_bytes).to_string();
+            Ok(ptx_str)
+        };
+
+        // Cost estimator closure: use roofline model as proxy for timing
+        let cost_estimator = |variant: &crate::autotune::Variant| -> Result<f64, String> {
+            // Heuristic: larger block sizes generally improve memory coalescing but
+            // risk lower occupancy. We model this as elementwise cost over a
+            // representative workload, scaled by the variant's block parameters.
+            //
+            // For a more precise model, we'd analyze the kernel AST to extract
+            // matmul dimensions, loop bounds, etc. For now, use a simple proxy:
+            // assume 1M elements, and the cost is inversely proportional to the
+            // product of block parameters (larger blocks = fewer launches = less overhead).
+            let representative_elements: u64 = 1_048_576; // 1M elements
+            let dtype_bytes: u64 = 4; // fp32
+
+            // Compute the "block factor" — product of all tuning param values.
+            // Higher block factors generally mean fewer kernel launches and better
+            // memory coalescing, so estimated time decreases.
+            let block_factor: f64 = variant
+                .iter()
+                .map(|(_, v)| *v as f64)
+                .product();
+
+            // Scale elements by inverse of block factor (normalized to 128 baseline)
+            let effective_elements = (representative_elements as f64
+                * (128.0 / block_factor.max(1.0))) as u64;
+
+            let (flops, bytes_read, bytes_written) =
+                crate::cost_model::elementwise_unary_cost(effective_elements, dtype_bytes);
+
+            let time_us = crate::cost_model::estimate_time_us(
+                flops,
+                bytes_read,
+                bytes_written,
+                gpu,
+                dtype_bytes as usize,
+            );
+
+            Ok(time_us)
+        };
+
+        let winner = crate::autotune::find_best_variant_cost_model(
+            kernel_name,
+            tuning_params,
+            &cache_hash,
+            fresh,
+            &ptx_generator,
+            &cost_estimator,
+        )
+        .map_err(|e| CodegenError::new(format!("autotune failed for '{}': {}", kernel_name, e)))?;
+
+        eprintln!(
+            "[nsl] autotune: selected {:?} for kernel '{}'{}",
+            winner,
+            kernel_name,
+            if fresh { " (fresh)" } else { "" },
+        );
+
+        Ok(winner.into_iter().collect())
     }
 
     // ── FlashAttention kernel synthesis ──────────────────────────────

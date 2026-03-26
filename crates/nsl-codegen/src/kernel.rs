@@ -44,6 +44,110 @@ impl KernelCompiler {
         }
     }
 
+    /// Compile a KernelDef with constant substitutions applied.
+    ///
+    /// Clones the kernel AST, walks all expressions replacing `Ident` nodes
+    /// whose names appear in `constants` with `IntLiteral` values, then compiles
+    /// the modified AST to PTX. Used by @autotune to generate one PTX variant
+    /// per parameter combination (e.g., BLOCK_SIZE=128, TILE_SIZE=32).
+    pub fn compile_with_constants(
+        kernel: &KernelDef,
+        interner: &Interner,
+        constants: &HashMap<String, i64>,
+    ) -> Vec<u8> {
+        if constants.is_empty() {
+            return Self::compile(kernel, interner);
+        }
+
+        // Clone the kernel and substitute constants throughout the body
+        let mut kernel_clone = kernel.clone();
+        Self::substitute_block_constants(&mut kernel_clone.body, interner, constants);
+        Self::compile(&kernel_clone, interner)
+    }
+
+    /// Walk a Block, substituting Ident nodes matching constant names with IntLiteral.
+    fn substitute_block_constants(
+        block: &mut Block,
+        interner: &Interner,
+        constants: &HashMap<String, i64>,
+    ) {
+        for stmt in &mut block.stmts {
+            Self::substitute_stmt_constants(stmt, interner, constants);
+        }
+    }
+
+    /// Walk a Stmt, substituting constants in all nested expressions.
+    fn substitute_stmt_constants(
+        stmt: &mut Stmt,
+        interner: &Interner,
+        constants: &HashMap<String, i64>,
+    ) {
+        match &mut stmt.kind {
+            StmtKind::VarDecl { value: Some(expr), .. } => {
+                Self::substitute_expr_constants(expr, interner, constants);
+            }
+            StmtKind::Expr(expr) => {
+                Self::substitute_expr_constants(expr, interner, constants);
+            }
+            StmtKind::Assign { target, value, .. } => {
+                Self::substitute_expr_constants(target, interner, constants);
+                Self::substitute_expr_constants(value, interner, constants);
+            }
+            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+                Self::substitute_expr_constants(condition, interner, constants);
+                Self::substitute_block_constants(then_block, interner, constants);
+                for (elif_cond, elif_block) in elif_clauses {
+                    Self::substitute_expr_constants(elif_cond, interner, constants);
+                    Self::substitute_block_constants(elif_block, interner, constants);
+                }
+                if let Some(else_blk) = else_block {
+                    Self::substitute_block_constants(else_blk, interner, constants);
+                }
+            }
+            StmtKind::Return(Some(expr)) => {
+                Self::substitute_expr_constants(expr, interner, constants);
+            }
+            _ => {}
+        }
+    }
+
+    /// Recursively substitute Ident nodes matching constant names with IntLiteral.
+    fn substitute_expr_constants(
+        expr: &mut Expr,
+        interner: &Interner,
+        constants: &HashMap<String, i64>,
+    ) {
+        match &mut expr.kind {
+            ExprKind::Ident(sym) => {
+                if let Some(name) = interner.resolve(sym.0) {
+                    if let Some(&value) = constants.get(name) {
+                        expr.kind = ExprKind::IntLiteral(value);
+                    }
+                }
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                Self::substitute_expr_constants(left, interner, constants);
+                Self::substitute_expr_constants(right, interner, constants);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                Self::substitute_expr_constants(operand, interner, constants);
+            }
+            ExprKind::Call { callee, args } => {
+                Self::substitute_expr_constants(callee, interner, constants);
+                for arg in args {
+                    Self::substitute_expr_constants(&mut arg.value, interner, constants);
+                }
+            }
+            ExprKind::Subscript { object, index } => {
+                Self::substitute_expr_constants(object, interner, constants);
+                if let SubscriptKind::Index(idx_expr) = index.as_mut() {
+                    Self::substitute_expr_constants(idx_expr, interner, constants);
+                }
+            }
+            _ => {} // Literals and other leaf nodes: no substitution needed
+        }
+    }
+
     /// Compile a KernelDef into a null-terminated PTX byte string.
     pub fn compile(kernel: &KernelDef, interner: &Interner) -> Vec<u8> {
         let mut kc = KernelCompiler::new();

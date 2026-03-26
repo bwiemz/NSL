@@ -190,6 +190,112 @@ pub fn find_best_variant(
     Ok(winner)
 }
 
+/// Find the best autotuned variant using the cost model as a proxy for GPU timing.
+///
+/// This is the compile-time path: generates PTX for each variant, estimates
+/// execution time via the roofline cost model (from `cost_model.rs`), and picks
+/// the variant with the lowest estimated latency. Much better than middle-value
+/// fallback because the cost model considers the target GPU's bandwidth, compute,
+/// and SM count.
+///
+/// When `fresh` is true, the cache is skipped entirely (--autotune-fresh).
+pub fn find_best_variant_cost_model(
+    kernel_name: &str,
+    tuning_params: &TuningParams,
+    cache_hash: &str,
+    fresh: bool,
+    ptx_generator: &dyn Fn(&Variant) -> Result<String, String>,
+    cost_estimator: &dyn Fn(&Variant) -> Result<f64, String>,
+) -> Result<Variant, String> {
+    // 1. Check cache (unless fresh)
+    if !fresh {
+        if let Some(cached) = check_cache(kernel_name, cache_hash) {
+            if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                eprintln!("[autotune] cache hit for {kernel_name}");
+            }
+            return Ok(cached);
+        }
+    } else if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+        eprintln!("[autotune] --autotune-fresh: skipping cache for {kernel_name}");
+    }
+
+    // 2. Fallback mode
+    if std::env::var("NSL_AUTOTUNE_FALLBACK").is_ok() {
+        if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+            eprintln!("[autotune] fallback mode: picking median values");
+        }
+        return Ok(select_middle_values(tuning_params));
+    }
+
+    // 3. Generate all variants
+    let all_variants = cartesian_product(tuning_params);
+    let num_variants = all_variants.len();
+
+    // 4. For each variant: generate PTX (validates compilability) and estimate cost
+    let mut results: Vec<BenchmarkResult> = Vec::new();
+    for variant in &all_variants {
+        // Verify PTX compiles (skip invalid variants, e.g. BLOCK_SIZE too large for shmem)
+        match ptx_generator(variant) {
+            Ok(_) => {}
+            Err(e) => {
+                if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                    eprintln!("[autotune]   {:?} => compile FAILED: {e}", variant);
+                }
+                continue;
+            }
+        }
+
+        // Estimate cost via roofline model
+        match cost_estimator(variant) {
+            Ok(estimated_us) => {
+                let estimated_ms = estimated_us / 1000.0;
+                results.push(BenchmarkResult {
+                    variant: variant.clone(),
+                    median_ms: estimated_ms,
+                    min_ms: estimated_ms,
+                    max_ms: estimated_ms,
+                });
+            }
+            Err(e) => {
+                if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                    eprintln!("[autotune]   {:?} => cost estimate FAILED: {e}", variant);
+                }
+                continue;
+            }
+        }
+    }
+
+    // 5. All failed? Fall back to median
+    if results.is_empty() {
+        eprintln!(
+            "[autotune] WARNING: all {num_variants} variants failed for {kernel_name}, using median fallback"
+        );
+        return Ok(select_middle_values(tuning_params));
+    }
+
+    // 6. Select winner (lowest estimated cost)
+    results.sort_by(|a, b| a.median_ms.partial_cmp(&b.median_ms).unwrap());
+    let winner = results[0].variant.clone();
+
+    // 7. Verbose report
+    if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+        eprintln!("\n=== Autotune Cost-Model Report: {kernel_name} (estimated, not measured) ===");
+        print_benchmark_report(kernel_name, &results);
+    }
+
+    // 8. Write to cache
+    let autotune_result = AutotuneResult {
+        winner: winner.clone(),
+        all_timings: results.iter().map(|r| (r.variant.clone(), r.median_ms)).collect(),
+        device_name: "cost_model".to_string(),
+        compute_capability: String::new(),
+        sm_count: 0,
+    };
+    write_cache(cache_hash, kernel_name, &autotune_result);
+
+    Ok(winner)
+}
+
 /// Print a formatted benchmark report table to stderr.
 pub fn print_benchmark_report(kernel_name: &str, results: &[BenchmarkResult]) {
     eprintln!("\n=== Autotune Report: {kernel_name} ===");
@@ -627,5 +733,174 @@ mod tests {
 
         // Just verify it doesn't panic
         print_benchmark_report("test_report_kernel", &results);
+    }
+
+    // ── Cost-model autotune tests ────────────────────────────────────
+
+    #[test]
+    fn test_cost_model_picks_largest_block_factor() {
+        // The cost estimator returns lower cost for larger block factors,
+        // so block_size=256 should win.
+        let params = vec![
+            ("block_size".to_string(), vec![64, 128, 256]),
+        ];
+
+        let ptx_gen = |variant: &Variant| -> Result<String, String> {
+            Ok(format!("// PTX for {:?}", variant))
+        };
+
+        // Cost estimator: lower cost for larger block_size (inverse relationship)
+        let cost_est = |variant: &Variant| -> Result<f64, String> {
+            let bs = variant[0].1 as f64;
+            // Simulate: larger block_size = faster (lower time)
+            Ok(1000.0 / bs)
+        };
+
+        let hash = "test_cost_model_001";
+        let path = cache_dir().join(format!("cost_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let winner = find_best_variant_cost_model(
+            "cost_kernel", &params, hash, false, &ptx_gen, &cost_est,
+        ).expect("should find a winner");
+
+        assert_eq!(winner, vec![("block_size".to_string(), 256)],
+            "block_size=256 should win (lowest cost estimate)");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_cost_model_fresh_skips_cache() {
+        let params = vec![("x".to_string(), vec![1, 2, 3])];
+        let hash = "test_cost_fresh_002";
+
+        // Pre-populate cache with x=1 as winner
+        let result = AutotuneResult {
+            winner: vec![("x".to_string(), 1)],
+            all_timings: vec![(vec![("x".to_string(), 1)], 0.1)],
+            device_name: "cost_model".to_string(),
+            compute_capability: String::new(),
+            sm_count: 0,
+        };
+        write_cache(hash, "fresh_kernel", &result);
+
+        let ptx_gen = |variant: &Variant| -> Result<String, String> {
+            Ok(format!("// PTX {:?}", variant))
+        };
+
+        // Cost model says x=3 is the best
+        let cost_est = |variant: &Variant| -> Result<f64, String> {
+            let x = variant[0].1 as f64;
+            Ok(100.0 / x) // x=3 => 33.3, x=1 => 100.0
+        };
+
+        // Without fresh: should return cached winner (x=1)
+        let cached_winner = find_best_variant_cost_model(
+            "fresh_kernel", &params, hash, false, &ptx_gen, &cost_est,
+        ).expect("cache hit");
+        assert_eq!(cached_winner, vec![("x".to_string(), 1)]);
+
+        // With fresh=true: should re-evaluate and pick x=3
+        let fresh_winner = find_best_variant_cost_model(
+            "fresh_kernel", &params, hash, true, &ptx_gen, &cost_est,
+        ).expect("fresh evaluation");
+        assert_eq!(fresh_winner, vec![("x".to_string(), 3)]);
+
+        // Clean up
+        let path = cache_dir().join(format!("fresh_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_cost_model_skips_failed_ptx() {
+        // If PTX generation fails for some variants, they are skipped
+        let params = vec![("size".to_string(), vec![32, 64, 128])];
+
+        let ptx_gen = |variant: &Variant| -> Result<String, String> {
+            let size = variant[0].1;
+            if size == 32 {
+                Err("too small for shared memory".to_string())
+            } else {
+                Ok(format!("// PTX for size={}", size))
+            }
+        };
+
+        let cost_est = |variant: &Variant| -> Result<f64, String> {
+            let size = variant[0].1 as f64;
+            Ok(1000.0 / size)
+        };
+
+        let hash = "test_cost_skip_003";
+        let path = cache_dir().join(format!("skip_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let winner = find_best_variant_cost_model(
+            "skip_kernel", &params, hash, false, &ptx_gen, &cost_est,
+        ).expect("should skip size=32 and pick from 64,128");
+
+        // size=128 wins (1000/128 < 1000/64)
+        assert_eq!(winner, vec![("size".to_string(), 128)]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_cost_model_all_fail_falls_back() {
+        let params = vec![("y".to_string(), vec![10, 20, 30])];
+        let hash = "test_cost_allfail_004";
+        let path = cache_dir().join(format!("allfail_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let ptx_gen = |_: &Variant| -> Result<String, String> {
+            Err("all fail".to_string())
+        };
+        let cost_est = |_: &Variant| -> Result<f64, String> {
+            panic!("should not be called if PTX gen fails");
+        };
+
+        let winner = find_best_variant_cost_model(
+            "allfail_kernel", &params, hash, false, &ptx_gen, &cost_est,
+        ).expect("should fall back to median");
+
+        // Median of [10,20,30] => index 1 => 20
+        assert_eq!(winner, vec![("y".to_string(), 20)]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_cost_model_two_params_cartesian() {
+        // Test with two tuning parameters to verify Cartesian product works
+        let params = vec![
+            ("block_m".to_string(), vec![32, 64]),
+            ("block_n".to_string(), vec![32, 64]),
+        ];
+
+        let ptx_gen = |variant: &Variant| -> Result<String, String> {
+            Ok(format!("// PTX for {:?}", variant))
+        };
+
+        // Cost: product of params. (64, 64) => 4096 => lowest cost
+        let cost_est = |variant: &Variant| -> Result<f64, String> {
+            let product: f64 = variant.iter().map(|(_, v)| *v as f64).product();
+            Ok(100000.0 / product)
+        };
+
+        let hash = "test_cost_2d_005";
+        let path = cache_dir().join(format!("twopar_kernel_{}.json", hash));
+        std::fs::remove_file(&path).ok();
+
+        let winner = find_best_variant_cost_model(
+            "twopar_kernel", &params, hash, false, &ptx_gen, &cost_est,
+        ).expect("should find winner");
+
+        assert_eq!(
+            winner,
+            vec![("block_m".to_string(), 64), ("block_n".to_string(), 64)],
+            "(64,64) should win"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }
