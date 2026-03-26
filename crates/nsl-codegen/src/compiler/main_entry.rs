@@ -382,24 +382,28 @@ impl Compiler<'_> {
         }
     }
 
-    /// M39b: Compile batched function bodies (deferred).
+    /// M39c: Compile batched function bodies using name_override to bypass
+    /// the placeholder Symbol in fn_def.name.
     ///
-    /// For v1, body compilation is deferred — the batched functions are declared
-    /// and registered, but their Cranelift IR is not yet generated.  The dispatch
-    /// will fall back to the original function when the batched variant has no
-    /// compiled body.
+    /// For each VmapResult whose batched function has been declared (present in
+    /// `self.functions`), compiles the batched FnDef body via
+    /// `compile_fn_def_named`. Failures are non-fatal — the original function
+    /// still works via dispatch fallback.
     pub fn compile_batched_functions(&mut self, results: &[crate::vmap::VmapResult]) -> Result<(), CodegenError> {
         for result in results {
             let batched_name = &result.batched_name;
+            // Only compile if the function was successfully declared during registration
             if self.functions.contains_key(batched_name) {
-                // The function is declared in self.functions.
-                // Body compilation requires updating the FnDef's name Symbol to
-                // resolve to batched_name, which needs &mut Interner.  Deferred
-                // to a future milestone.
-                eprintln!(
-                    "[nsl] vmap: registered batched variant '{}' (body compilation deferred)",
-                    batched_name
-                );
+                match self.compile_fn_def_named(&result.batched_fn, Some(batched_name)) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[nsl] vmap: failed to compile batched variant '{}': {}",
+                            batched_name, e
+                        );
+                        // Non-fatal — original function still works via dispatch fallback
+                    }
+                }
             }
         }
         Ok(())

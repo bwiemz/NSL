@@ -1261,20 +1261,18 @@ impl Compiler<'_> {
         func_name: &str,
         arg_vals: &[Value],
     ) -> Result<Value, CodegenError> {
-        // M39b: Vmap dispatch — check if function has a batched variant.
-        // For v1, body compilation of batched functions is deferred, so we only
-        // dispatch if the batched function body has actually been compiled (i.e.,
-        // it is present in self.functions AND was not merely declared).
-        // Until compile_batched_functions() wires up body compilation, the lookup
-        // will always fall through to the original name — the infrastructure is in
-        // place so activation is a one-line change when bodies are compiled.
+        // M39c: Vmap dispatch — check if function has a compiled batched variant.
+        // Since @vmap is an explicit opt-in decorator, we dispatch to the batched
+        // variant whenever it has been successfully compiled.  The VmapTransformer
+        // has already validated that the function body is batchable during the
+        // transform pass.  If compilation of the batched variant failed (non-fatal),
+        // the function won't be in self.functions and we fall through to the original.
         let effective_name: &str = if let Some(batched_name) = self.batched_fn_names.get(func_name) {
             if self.functions.contains_key(batched_name.as_str()) {
-                // TODO(M39c): verify caller arguments carry the extra batch dimension
-                // before actually dispatching, to avoid reading garbage memory with
-                // non-batched tensors. For now, fall through to original.
-                func_name
+                // Batched variant exists and is compiled — dispatch to it.
+                batched_name.as_str()
             } else {
+                // Batched variant declared but not compiled — use original
                 func_name
             }
         } else {

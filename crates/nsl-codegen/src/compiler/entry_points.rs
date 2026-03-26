@@ -85,6 +85,8 @@ pub fn compile(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M39c: Compile batched function bodies (after user functions, before main)
+    compiler.compile_batched_functions(&vmap_results)?;
     // M36: Memory planner — compile-time slab allocation for GPU tensors.
     // Run BEFORE compile_main so the slab plan is available during codegen.
     {
@@ -208,6 +210,8 @@ pub fn compile_with_zk_info(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M39c: Compile batched function bodies
+    compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
 
@@ -263,6 +267,8 @@ pub fn compile_standalone(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M39c: Compile batched function bodies
+    compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_standalone_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
 
@@ -299,6 +305,8 @@ pub fn compile_test(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M39c: Compile batched function bodies
+    compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_pending_lambdas()?;
     let test_fns = compiler.test_fns.clone();
     if test_fns.is_empty() {
@@ -361,6 +369,8 @@ pub fn compile_module_with_imports(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M39c: Compile batched function bodies
+    compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_pending_lambdas()?;
     compiler.finalize()
 }
@@ -414,6 +424,8 @@ pub fn compile_entry(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M39c: Compile batched function bodies
+    compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     // M53: Run WCET analysis for @real_time functions

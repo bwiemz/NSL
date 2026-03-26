@@ -12,7 +12,15 @@ use crate::error::CodegenError;
 
 impl Compiler<'_> {
     pub fn compile_fn_def(&mut self, fn_def: &FnDef) -> Result<(), CodegenError> {
-        let name = self.resolve_sym(fn_def.name).to_string();
+        self.compile_fn_def_named(fn_def, None)
+    }
+
+    pub fn compile_fn_def_named(&mut self, fn_def: &FnDef, name_override: Option<&str>) -> Result<(), CodegenError> {
+        let name = if let Some(override_name) = name_override {
+            override_name.to_string()
+        } else {
+            self.resolve_sym(fn_def.name).to_string()
+        };
         let (func_id, sig) = self.functions[&name].clone();
 
         let mut ctx = Context::for_function(Function::with_name_signature(
