@@ -82,6 +82,10 @@ impl Compiler<'_> {
                 if let Some((ib, ob)) = crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym)) {
                     self.features.zk_lookup_fns.insert(raw_name.clone(), (ib, ob));
                 }
+                // M39: Extract @vmap from function decorators
+                if let Some(vmap_config) = crate::vmap::extract_vmap_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                    self.features.vmap_configs.insert(raw_name.clone(), vmap_config);
+                }
             }
         }
 

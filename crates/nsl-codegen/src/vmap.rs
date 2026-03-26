@@ -23,10 +23,67 @@ pub enum BatchStatus {
 pub struct VmapConfig {
     /// Position where the batch dimension is inserted (0 = leading).
     pub batch_dim: usize,
-    /// Symbol for the batch dimension name (default: "Batch").
-    pub batch_sym: Symbol,
+    /// Name of the batch dimension (default: "Batch").
+    /// Stored as a `String` because the extractor only has `&Interner` (immutable)
+    /// and cannot intern new symbols.  The compiler converts this to a `Symbol`
+    /// when `&mut Interner` is available.
+    pub batch_dim_name: String,
     /// Parameters annotated @invariant — excluded from batch dim insertion.
     pub invariant_params: HashSet<Symbol>,
+}
+
+// ---------------------------------------------------------------------------
+// Decorator extraction
+// ---------------------------------------------------------------------------
+
+/// Extract `@vmap` configuration from a function's decorators.
+///
+/// Does NOT require `&mut Interner` — stores `batch_dim` as a `usize` and the
+/// batch dimension name as a `String`.  `invariant_params` is left empty here;
+/// the compiler can populate it later when it has `&mut Interner`.
+pub fn extract_vmap_decorator<'a>(
+    decorators: &[nsl_ast::decl::Decorator],
+    resolve_sym: &dyn Fn(Symbol) -> &'a str,
+) -> Option<VmapConfig> {
+    use nsl_ast::expr::ExprKind;
+
+    for d in decorators {
+        if d.name.len() == 1 {
+            let name = resolve_sym(d.name[0]);
+            if name == "vmap" {
+                let mut batch_dim = 0usize;
+                let mut batch_dim_name = "Batch".to_string();
+
+                if let Some(ref args) = d.args {
+                    for arg in args {
+                        if let Some(name_sym) = arg.name {
+                            let arg_name = resolve_sym(name_sym);
+                            match arg_name {
+                                "batch_dim" => {
+                                    if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                        batch_dim = *n as usize;
+                                    }
+                                }
+                                "batch_name" => {
+                                    if let ExprKind::StringLiteral(ref s) = arg.value.kind {
+                                        batch_dim_name = s.clone();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                return Some(VmapConfig {
+                    batch_dim,
+                    batch_dim_name,
+                    invariant_params: HashSet::new(),
+                });
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -709,13 +766,13 @@ mod tests {
         let mut interner = Interner::new();
         let x = sym(&mut interner, "x");
         let w = sym(&mut interner, "W");
-        let batch_sym = sym(&mut interner, "Batch");
+        let _batch_sym = sym(&mut interner, "Batch");
 
         let mut invariants = HashSet::new();
         invariants.insert(w);
         let config = VmapConfig {
             batch_dim: 0,
-            batch_sym,
+            batch_dim_name: "Batch".to_string(),
             invariant_params: invariants,
         };
 

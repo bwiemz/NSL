@@ -302,10 +302,11 @@ impl Compiler<'_> {
     /// M39b: Apply vmap AST transformations to produce batched function variants.
     ///
     /// For each function with a @vmap config, clones the FnDef, runs the
-    /// VmapTransformer, and returns the batched variants.
+    /// VmapTransformer, and returns full [`VmapResult`]s (batched FnDef +
+    /// batched name + matmul rewrites).
     /// Must be called before compile_user_functions().
-    pub fn apply_vmap_transforms(&self, module: &nsl_ast::Module) -> Vec<nsl_ast::decl::FnDef> {
-        let mut batched_fns = Vec::new();
+    pub fn apply_vmap_transforms(&self, module: &nsl_ast::Module) -> Vec<crate::vmap::VmapResult> {
+        let mut results = Vec::new();
 
         for stmt in &module.stmts {
             let fn_def = match &stmt.kind {
@@ -329,7 +330,7 @@ impl Compiler<'_> {
                     );
                     match transformer.transform(fn_def) {
                         Ok(result) => {
-                            batched_fns.push(result.batched_fn);
+                            results.push(result);
                         }
                         Err(e) => {
                             eprintln!("vmap transform error for '{}': {}", name, e);
@@ -339,6 +340,68 @@ impl Compiler<'_> {
             }
         }
 
-        batched_fns
+        results
+    }
+
+    /// M39b: Register batched function variants produced by [`apply_vmap_transforms`].
+    ///
+    /// For each `VmapResult`, declares the batched function in the Cranelift module
+    /// (using the original function's signature), records the original→batched name
+    /// mapping, and stores matmul rewrite targets.
+    ///
+    /// Body compilation is deferred — the functions are declared (have a `FuncId`)
+    /// but their bodies are not yet compiled.  Call-site dispatch will fall back to
+    /// the original function if the batched variant has no compiled body.
+    pub fn register_batched_functions(&mut self, results: &[crate::vmap::VmapResult]) {
+        for result in results {
+            let batched_name = &result.batched_name;
+            let original_name = batched_name.trim_end_matches("_batched");
+
+            if let Some((_, sig)) = self.functions.get(original_name) {
+                let sig_clone = sig.clone();
+                let mangled = super::mangle_name(&self.module_prefix, batched_name);
+                match self.module.declare_function(
+                    &mangled,
+                    Linkage::Local,
+                    &sig_clone,
+                ) {
+                    Ok(func_id) => {
+                        self.functions.insert(batched_name.clone(), (func_id, sig_clone));
+                        self.batched_fn_names.insert(original_name.to_string(), batched_name.clone());
+                    }
+                    Err(e) => {
+                        eprintln!("[nsl] vmap: failed to declare '{}': {}", batched_name, e);
+                    }
+                }
+            }
+
+            // Store matmul rewrites for later use during call-site dispatch
+            for (node_id, target) in &result.matmul_rewrites {
+                self.matmul_rewrites.insert(*node_id, target.clone());
+            }
+        }
+    }
+
+    /// M39b: Compile batched function bodies (deferred).
+    ///
+    /// For v1, body compilation is deferred — the batched functions are declared
+    /// and registered, but their Cranelift IR is not yet generated.  The dispatch
+    /// will fall back to the original function when the batched variant has no
+    /// compiled body.
+    pub fn compile_batched_functions(&mut self, results: &[crate::vmap::VmapResult]) -> Result<(), CodegenError> {
+        for result in results {
+            let batched_name = &result.batched_name;
+            if self.functions.contains_key(batched_name) {
+                // The function is declared in self.functions.
+                // Body compilation requires updating the FnDef's name Symbol to
+                // resolve to batched_name, which needs &mut Interner.  Deferred
+                // to a future milestone.
+                eprintln!(
+                    "[nsl] vmap: registered batched variant '{}' (body compilation deferred)",
+                    batched_name
+                );
+            }
+        }
+        Ok(())
     }
 }

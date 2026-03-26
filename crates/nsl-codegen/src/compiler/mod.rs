@@ -224,6 +224,12 @@ pub struct Compiler<'a> {
     /// Populated by the memory planner before compile_main.
     pub slab_name_offsets: HashMap<String, u64>,
 
+    // ── vmap batched function registry (M39) ─────────────────────────
+    /// Maps original function name → batched variant name (e.g. "foo" → "foo_batched").
+    pub batched_fn_names: HashMap<String, String>,
+    /// Maps AST NodeId of matmul call sites → target batched callee name.
+    pub matmul_rewrites: HashMap<NodeId, String>,
+
     // ── Feature configs (M30-M55 decorators) ─────────────────────────
     /// All feature-specific decorator state extracted into a single sub-struct.
     /// Access via `self.features.field_name`.
@@ -345,6 +351,8 @@ impl<'a> Compiler<'a> {
             disable_fusion: options.disable_fusion || options.debug_training,
             slab_plan: None,
             slab_name_offsets: HashMap::new(),
+            batched_fn_names: HashMap::new(),
+            matmul_rewrites: HashMap::new(),
             features: FeatureConfigs::new(options),
         })
     }
