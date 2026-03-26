@@ -185,6 +185,11 @@ unsafe fn from_handle(handle: i64) -> &'static Mutex<KvCacheManager> {
 }
 
 /// Create a new CPU-backed KV-cache manager and return an opaque handle.
+///
+/// The `compress_scheme`, `compress_window`, and `compress_sinks` parameters carry the
+/// M42 KV compression policy extracted from `@kv_compress` decorators at compile time.
+/// `compress_scheme == 0` means no compression (pass-through).  Non-zero values are
+/// stored on the manager for use by future compression-aware eviction logic.
 #[no_mangle]
 pub extern "C" fn nsl_kv_cache_init(
     num_blocks: i64,
@@ -192,6 +197,9 @@ pub extern "C" fn nsl_kv_cache_init(
     num_heads: i64,
     head_dim: i64,
     num_layers: i64,
+    compress_scheme: i64,
+    compress_window: i64,
+    compress_sinks: i64,
 ) -> i64 {
     let mgr = KvCacheManager::new(
         num_blocks as usize,
@@ -200,12 +208,23 @@ pub extern "C" fn nsl_kv_cache_init(
         head_dim as usize,
         num_layers as usize,
     );
+    if compress_scheme > 0 {
+        eprintln!(
+            "[nsl-runtime] KV cache compression: scheme={}, window={}, sinks={}",
+            compress_scheme, compress_window, compress_sinks
+        );
+        // TODO(M42): plumb compress_scheme/window/sinks into KvCacheManager fields
+        // when the compression eviction path is implemented.
+    }
+    let _ = (compress_scheme, compress_window, compress_sinks);
     let boxed = Box::new(Mutex::new(mgr));
     Box::into_raw(boxed) as i64
 }
 
 /// Create a new GPU-backed KV-cache manager and return an opaque handle.
 /// Falls back to CPU if the `cuda` feature is not enabled.
+///
+/// See [`nsl_kv_cache_init`] for the meaning of the `compress_*` parameters.
 #[no_mangle]
 pub extern "C" fn nsl_kv_cache_init_gpu(
     num_blocks: i64,
@@ -213,6 +232,9 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
     num_heads: i64,
     head_dim: i64,
     num_layers: i64,
+    compress_scheme: i64,
+    compress_window: i64,
+    compress_sinks: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -223,6 +245,13 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
             head_dim as usize,
             num_layers as usize,
         );
+        if compress_scheme > 0 {
+            eprintln!(
+                "[nsl-runtime] KV cache compression (GPU): scheme={}, window={}, sinks={}",
+                compress_scheme, compress_window, compress_sinks
+            );
+        }
+        let _ = (compress_scheme, compress_window, compress_sinks);
         let boxed = Box::new(Mutex::new(mgr));
         Box::into_raw(boxed) as i64
     }
@@ -231,7 +260,8 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
         eprintln!(
             "nsl: nsl_kv_cache_init_gpu called but CUDA feature is disabled, falling back to CPU"
         );
-        nsl_kv_cache_init(num_blocks, block_size, num_heads, head_dim, num_layers)
+        nsl_kv_cache_init(num_blocks, block_size, num_heads, head_dim, num_layers,
+                          compress_scheme, compress_window, compress_sinks)
     }
 }
 

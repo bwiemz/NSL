@@ -200,6 +200,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_gpu_slab_destroy", &[], None),
     ("nsl_gpu_slab_active", &[], Some(types::I64)),
     ("nsl_tensor_from_slab", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    // M52b: Create tensor from static .rodata data (compile-time constant folded)
+    ("nsl_tensor_from_static", &[types::I64, types::I64, types::I64], Some(types::I64)),
     // Checkpoint I/O (M14)
     ("nsl_model_save", &[types::I64, types::I64, types::I64, types::I64], None),
     ("nsl_model_load", &[types::I64, types::I64, types::I64], None),
@@ -322,8 +324,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_standalone_arg_float_default", &[types::I64, types::I64, types::I64],                         Some(types::I64)),
     ("nsl_standalone_args_finish",       &[],                                                            None),
     // Paged KV-cache (M25)
-    ("nsl_kv_cache_init",       &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
-    ("nsl_kv_cache_init_gpu",   &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_cache_init",       &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_cache_init_gpu",   &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_kv_cache_alloc_seq",  &[types::I64],                                                 Some(types::I64)),
     ("nsl_kv_cache_append",     &[types::I64, types::I64],                                     Some(types::I64)),
     ("nsl_kv_cache_k_ptr",      &[types::I64, types::I64, types::I64],                         Some(types::I64)),

@@ -151,6 +151,30 @@ impl Compiler<'_> {
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
             }
+            // M42: For kv_cache_init variants, append KV compression params.
+            // Use the first policy found across all models (v1: single-policy heuristic).
+            if func_name == "kv_cache_init" || func_name == "kv_cache_init_gpu" {
+                let (compress_scheme, compress_window, compress_sinks) = self
+                    .features
+                    .kv_compress_policies
+                    .values()
+                    .next()
+                    .and_then(|policies| policies.first())
+                    .map(|p| (p.scheme as i64, p.window as i64, p.sinks as i64))
+                    .unwrap_or((0, 0, 0));
+                if compress_scheme > 0 {
+                    eprintln!(
+                        "[nsl] KV cache compression active: scheme={}, window={}, sinks={}",
+                        compress_scheme, compress_window, compress_sinks
+                    );
+                }
+                let scheme_val = builder.ins().iconst(cl_types::I64, compress_scheme);
+                let window_val = builder.ins().iconst(cl_types::I64, compress_window);
+                let sinks_val = builder.ins().iconst(cl_types::I64, compress_sinks);
+                arg_vals.push(scheme_val);
+                arg_vals.push(window_val);
+                arg_vals.push(sinks_val);
+            }
             let rt_name = format!("nsl_{func_name}");
             return self.compile_call_by_name(builder, &rt_name, &arg_vals);
         }

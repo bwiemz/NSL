@@ -367,6 +367,17 @@ impl<'a> Compiler<'a> {
         self.type_map.get(&id).unwrap_or(&Type::Unknown)
     }
 
+    /// M42: Look up the first KV compression policy for a specific model layer.
+    /// Key format: `"ModelName.layer_name"` (matches collection.rs insertion key).
+    /// Returns `None` when no `@kv_compress` decorator was found for that layer.
+    pub fn kv_compress_for_layer(&self, model_name: &str, layer_name: &str) -> Option<&KvCompressPolicy> {
+        let key = format!("{}.{}", model_name, layer_name);
+        self.features
+            .kv_compress_policies
+            .get(&key)
+            .and_then(|policies| policies.first())
+    }
+
     /// Allocate a unique function index for Cranelift.
     pub fn next_func_index(&mut self) -> u32 {
         let idx = self.func_index;
