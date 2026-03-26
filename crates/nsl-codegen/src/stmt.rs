@@ -2400,19 +2400,28 @@ impl Compiler<'_> {
         Ok((grads_list, loss_val))
     }
 
-    /// M43b: Emit pipeline-parallel training loop.
+    /// M43b: Emit pipeline-parallel training loop with gradient serialization.
     ///
     /// When a model carries `@pipeline(stages=N)`, the train block emits:
     ///   1. `nsl_pipeline_init(num_stages, schedule_type, num_micro_batches)`
-    ///   2. The step body (forward + loss + backward) — the runtime's
-    ///      pipeline schedule orchestrates which micro-batch each stage
-    ///      processes at each clock tick.
-    ///   3. `nsl_pipeline_barrier()` — synchronize all stages after the
-    ///      schedule completes.
-    ///   4. `nsl_pipeline_destroy()` — tear down pipeline state.
+    ///   2. Extract model param_list, optimizer config, and step body.
+    ///   3. Forward pass under tape recording — compile step body to produce
+    ///      activations and loss.
+    ///   4. Activation send — serialize the loss tensor to the next pipeline
+    ///      stage via `nsl_pipeline_send`.
+    ///   5. Backward pass — `nsl_tape_backward` computes per-parameter
+    ///      gradients from the recorded tape.
+    ///   6. Gradient send — serialize each parameter gradient to the previous
+    ///      pipeline stage via `nsl_pipeline_send_grad`.
+    ///   7. Optimizer step — apply optimizer update using the computed
+    ///      gradients (same dispatch as the non-pipelined path).
+    ///   8. `nsl_pipeline_barrier()` — synchronize all stages.
+    ///   9. Cleanup — free gradient tensors, param_list, optimizer buffers,
+    ///      and `nsl_pipeline_destroy()`.
     ///
     /// Model partitioning (which layers run on which stage) is deferred to
-    /// M43c; the initial implementation emits the full model on every stage.
+    /// M43c; the initial implementation runs the full model in a single
+    /// process with logical stage-to-stage communication.
     fn compile_train_block_pipelined(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2422,7 +2431,7 @@ impl Compiler<'_> {
         let config = self.features.pipeline_config.clone().unwrap();
         let num_stages = config.num_stages;
 
-        // Emit: nsl_pipeline_init(num_stages, schedule_type, num_micro_batches)
+        // ── 1. Pipeline init ────────────────────────────────────────────
         let v_stages = builder.ins().iconst(cl_types::I64, num_stages as i64);
         let v_schedule = builder.ins().iconst(
             cl_types::I64,
@@ -2434,28 +2443,391 @@ impl Compiler<'_> {
         let v_micro = builder.ins().iconst(cl_types::I64, 8); // default micro-batches
         self.compile_call_by_name(builder, "nsl_pipeline_init", &[v_stages, v_schedule, v_micro])?;
 
-        // Compile the step body (model forward + loss + backward).
-        // The pipeline schedule orchestration happens at the runtime level
-        // via the FFI calls; codegen emits the per-step work that each
-        // stage executes.
-        for section in &train.sections {
-            if let TrainSection::Step { param, body } = section {
-                // Declare step param (e.g. `batch`) as variable in scope
-                let pv = state.new_variable();
-                builder.declare_var(pv, cl_types::I64);
-                let null_ptr = builder.ins().iconst(cl_types::I64, 0);
-                builder.def_var(pv, null_ptr);
-                state.variables.insert(*param, (pv, cl_types::I64));
-                for stmt in &body.stmts {
-                    self.compile_stmt(builder, state, stmt)?;
+        // ── 2. Extract config from train(...) args ──────────────────────
+        let mut model_sym: Option<nsl_ast::Symbol> = None;
+        let mut optimizer_name = String::new();
+        let mut lr_value: f64 = 0.01;
+        let mut momentum_value: f64 = 0.0;
+        let mut dampening_value: f64 = 0.0;
+        let mut weight_decay_value: f64 = 0.0;
+        let mut nesterov_value: bool = false;
+        let mut beta1_value: f64 = 0.9;
+        let mut beta2_value: f64 = 0.999;
+        let mut eps_value: f64 = 1e-8;
+        let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
+
+        for arg in &train.config {
+            if let Some(name_sym) = arg.name {
+                let name = self.resolve_sym(name_sym).to_string();
+                if name == "model" {
+                    if let ExprKind::Ident(sym) = &arg.value.kind {
+                        model_sym = Some(*sym);
+                    }
                 }
             }
         }
 
-        // Emit: nsl_pipeline_barrier() — synchronize all stages
+        for section in &train.sections {
+            match section {
+                TrainSection::Optimizer(expr) => {
+                    if let ExprKind::Call { callee, args } = &expr.kind {
+                        if let ExprKind::Ident(sym) = &callee.kind {
+                            optimizer_name = self.resolve_sym(*sym).to_string().to_lowercase();
+                        }
+                        for arg in args {
+                            if let Some(name_sym) = arg.name {
+                                let name = self.resolve_sym(name_sym).to_string();
+                                match name.as_str() {
+                                    "lr" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            lr_value = *f;
+                                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                            lr_value = *n as f64;
+                                        }
+                                    }
+                                    "momentum" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            momentum_value = *f;
+                                        }
+                                    }
+                                    "dampening" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            dampening_value = *f;
+                                        }
+                                    }
+                                    "weight_decay" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            weight_decay_value = *f;
+                                        }
+                                    }
+                                    "nesterov" => {
+                                        if let ExprKind::BoolLiteral(b) = &arg.value.kind {
+                                            nesterov_value = *b;
+                                        }
+                                    }
+                                    "beta1" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            beta1_value = *f;
+                                        }
+                                    }
+                                    "beta2" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            beta2_value = *f;
+                                        }
+                                    }
+                                    "eps" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            eps_value = *f;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                TrainSection::Step { param, body } => {
+                    step_body = Some((body, *param));
+                }
+                TrainSection::Data(stmts) => {
+                    for stmt in stmts {
+                        self.compile_stmt(builder, state, stmt)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let model_sym = model_sym.ok_or_else(|| {
+            CodegenError::new("pipelined train block requires 'model=<ident>' config argument")
+        })?;
+
+        if optimizer_name.is_empty() {
+            return Err(CodegenError::new("pipelined train block requires an optimizer section"));
+        }
+
+        let (step_body, step_param_sym) = step_body.ok_or_else(|| {
+            CodegenError::new("pipelined train block requires a step section")
+        })?;
+
+        // ── 3. Resolve model and build param_list ───────────────────────
+        let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
+            CodegenError::new(format!(
+                "undefined model variable '{}' in pipelined train block",
+                self.resolve_sym(model_sym)
+            ))
+        })?;
+        let model_ptr = builder.use_var(model_var);
+
+        let model_var_name = self.resolve_sym(model_sym).to_string();
+        let model_type_name = {
+            let mut found_name = None;
+            for (_node_id, ty) in self.type_map.iter() {
+                match ty {
+                    nsl_semantic::types::Type::Model { name, .. } => {
+                        let n = self.resolve_sym(*name).to_string();
+                        if self.struct_layouts.contains_key(&n) {
+                            found_name = Some(n);
+                            break;
+                        }
+                    }
+                    nsl_semantic::types::Type::Struct { name, .. } => {
+                        let n = self.resolve_sym(*name).to_string();
+                        if self.struct_layouts.contains_key(&n) {
+                            found_name = Some(n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found_name.unwrap_or_else(|| model_var_name.clone())
+        };
+
+        let layout = self.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!(
+                "no struct layout found for model '{}' in pipelined train block",
+                model_type_name
+            ))
+        })?;
+
+        let num_params = layout.fields.len();
+
+        // Build param_list: NslList of tensor pointers (model fields)
+        let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for field in &layout.fields {
+            let field_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                model_ptr,
+                field.offset as i32,
+            );
+            self.compile_call_by_name(builder, "nsl_list_push", &[param_list, field_val])?;
+        }
+
+        // ── 4. Create optimizer state buffers ───────────────────────────
+        let num_state_buffers = match optimizer_name.as_str() {
+            "adam" | "adamw" | "soap" => 2,
+            _ => 1,
+        };
+
+        let mut state_buf_1: Vec<Value> = Vec::new();
+        let mut state_buf_2: Vec<Value> = Vec::new();
+        for field in &layout.fields {
+            let field_val = builder.ins().load(
+                field.cl_type,
+                MemFlags::trusted(),
+                model_ptr,
+                field.offset as i32,
+            );
+            let buf1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
+            state_buf_1.push(buf1);
+            if num_state_buffers >= 2 {
+                let buf2 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
+                state_buf_2.push(buf2);
+            }
+        }
+
+        // ── 5. Declare step parameter and step counter ──────────────────
+        let step_param_var = state.new_variable();
+        builder.declare_var(step_param_var, cl_types::I64);
+        let init_null = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(step_param_var, init_null);
+        state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
+
+        let step_count_var = state.new_variable();
+        builder.declare_var(step_count_var, cl_types::I64);
+        let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(step_count_var, zero_i64);
+
+        let lr_var = state.new_variable();
+        builder.declare_var(lr_var, cl_types::F64);
+        let lr_const = builder.ins().f64const(lr_value);
+        builder.def_var(lr_var, lr_const);
+
+        // ── 6. Forward pass under tape recording ────────────────────────
+        let true_val = builder.ins().iconst(cl_types::I8, 1);
+        self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
+        self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
+
+        state.in_tape_region = true;
+        for stmt in &step_body.stmts {
+            self.compile_stmt(builder, state, stmt)?;
+        }
+        state.in_tape_region = false;
+
+        // Find loss variable
+        let loss_val = {
+            let mut found = None;
+            for (sym, (var, _)) in &state.variables {
+                if self.resolve_sym(*sym) == "loss" {
+                    found = Some(builder.use_var(*var));
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                CodegenError::new("pipelined train step body must assign to a variable named 'loss'")
+            })?
+        };
+
+        // ── 7. Activation send — send loss to next stage ────────────────
+        // In single-process pipeline, stage 0 sends activations to logical
+        // stage 1. The runtime's shared-memory backend serializes the tensor
+        // into a mailbox keyed by (dst_rank, tag).
+        let zero_tag = builder.ins().iconst(cl_types::I64, 0);
+        let zero_stream = builder.ins().iconst(cl_types::I64, 0);
+        let next_stage = builder.ins().iconst(cl_types::I64, 1);
+        self.compile_call_by_name(
+            builder, "nsl_pipeline_send",
+            &[loss_val, next_stage, zero_tag, zero_stream],
+        )?;
+
+        // ── 8. Backward pass — tape backward + stop ─────────────────────
+        let grads_list = self.compile_call_by_name(
+            builder, "nsl_tape_backward",
+            &[loss_val, param_list],
+        )?;
+        self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
+
+        let false_val = builder.ins().iconst(cl_types::I8, 0);
+        self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
+
+        // ── 9. Gradient send — serialize each param gradient ────────────
+        // Send gradients to the previous stage (stage 0 receives gradients
+        // from stage 1 in the backward direction). Each gradient is tagged
+        // with its parameter index for correct matching.
+        let prev_stage = builder.ins().iconst(cl_types::I64, 0);
+        for i in 0..num_params {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+            let grad_val = self.compile_call_by_name(
+                builder, "nsl_list_get",
+                &[grads_list, idx],
+            )?;
+            let grad_tag = builder.ins().iconst(cl_types::I64, i as i64);
+            self.compile_call_by_name(
+                builder, "nsl_pipeline_send_grad",
+                &[grad_val, prev_stage, grad_tag, zero_stream],
+            )?;
+        }
+
+        // ── 10. Optimizer step ──────────────────────────────────────────
+        let optimizer_fn_name = match optimizer_name.as_str() {
+            "sgd" => "nsl__optim__sgd__sgd_step",
+            "adam" => "nsl__optim__adam__adam_step",
+            "adamw" => "nsl__optim__adamw__adamw_step",
+            "lion" => "nsl__optim__lion__lion_step",
+            "muon" => "nsl__optim__muon__muon_step",
+            "soap" => "nsl__optim__soap__soap_step",
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "unsupported optimizer '{}' in pipelined train block", optimizer_name
+                )));
+            }
+        };
+
+        let opt_fn = if self.functions.contains_key(optimizer_fn_name) {
+            optimizer_fn_name.to_string()
+        } else {
+            let simple = format!("{}_step", optimizer_name);
+            if self.functions.contains_key(&simple) {
+                simple
+            } else if self.runtime_fns.contains_key(optimizer_fn_name) {
+                optimizer_fn_name.to_string()
+            } else if self.runtime_fns.contains_key(&simple) {
+                simple
+            } else {
+                optimizer_fn_name.to_string()
+            }
+        };
+
+        let lr = builder.use_var(lr_var);
+        let momentum_const = builder.ins().f64const(momentum_value);
+        let dampening_const = builder.ins().f64const(dampening_value);
+        let weight_decay_const = builder.ins().f64const(weight_decay_value);
+        let nesterov_const = builder.ins().iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
+        let beta1_const = builder.ins().f64const(beta1_value);
+        let beta2_const = builder.ins().f64const(beta2_value);
+        let eps_const = builder.ins().f64const(eps_value);
+
+        for i in 0..num_params {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+            let param_val = self.compile_call_by_name(
+                builder, "nsl_list_get", &[param_list, idx],
+            )?;
+            let grad_val = self.compile_call_by_name(
+                builder, "nsl_list_get", &[grads_list, idx],
+            )?;
+
+            match optimizer_name.as_str() {
+                "sgd" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, dampening_const, weight_decay_const, nesterov_const],
+                    )?;
+                }
+                "adam" | "adamw" => {
+                    let t_val = builder.use_var(step_count_var);
+                    let one = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_one = builder.ins().iadd(t_val, one);
+                    let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const, weight_decay_const, t_float],
+                    )?;
+                }
+                "lion" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], lr, beta1_const, beta2_const, weight_decay_const],
+                    )?;
+                }
+                "muon" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, nesterov_const],
+                    )?;
+                }
+                "soap" => {
+                    self.compile_call_by_name(
+                        builder, &opt_fn,
+                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const],
+                    )?;
+                }
+                _ => {
+                    return Err(CodegenError::new(format!(
+                        "unsupported optimizer '{}' in pipelined train block", optimizer_name
+                    )));
+                }
+            }
+        }
+
+        // ── 11. Increment step count ────────────────────────────────────
+        let sc = builder.use_var(step_count_var);
+        let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+        let sc_next = builder.ins().iadd(sc, one_i64);
+        builder.def_var(step_count_var, sc_next);
+
+        // ── 12. Barrier — synchronize all pipeline stages ───────────────
         self.compile_call_by_name(builder, "nsl_pipeline_barrier", &[])?;
 
-        // Emit: nsl_pipeline_destroy()
+        // ── 13. Cleanup — free gradients, param_list, optimizer buffers ─
+        for i in 0..num_params {
+            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+            let grad_val = self.compile_call_by_name(
+                builder, "nsl_list_get", &[grads_list, idx],
+            )?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
+        }
+        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
+
+        for &buf in &state_buf_1 {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
+        }
+        for &buf in &state_buf_2 {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
+        }
+
+        // ── 14. Pipeline destroy ────────────────────────────────────────
         self.compile_call_by_name(builder, "nsl_pipeline_destroy", &[])?;
 
         Ok(())
