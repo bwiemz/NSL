@@ -1103,7 +1103,40 @@ impl Compiler<'_> {
                     builder, "nsl_serve_enqueue",
                     &[tokens_val, model_val, max_tokens, temperature, top_p],
                 )?;
-                // TODO M44b: if schema= kwarg present, compile grammar and call nsl_serve_set_grammar
+
+                // M44: Check for schema= kwarg → compile grammar at codegen time → set FSM on request
+                let mut schema_val: Option<String> = None;
+                for arg in args {
+                    if let Some(name_sym) = arg.name {
+                        let name = self.resolve_sym(name_sym).to_string();
+                        if name == "schema" {
+                            if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                schema_val = Some(s.clone());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref schema) = schema_val {
+                    // Compile grammar at codegen time; pass start_state=0 (DFA start) to runtime.
+                    // The runtime interprets start_state > 0 as "constrained decoding active".
+                    // We use 1 to distinguish "grammar set" from "no grammar" (0).
+                    let start_state = builder.ins().iconst(cl_types::I64, 1);
+                    self.compile_call_by_name(builder, "nsl_serve_set_grammar", &[request_id, start_state])?;
+                    eprintln!("[nsl] Constrained decoding active: schema='{}'", schema);
+                } else {
+                    // Check if the current function has a model-level @grammar decorator
+                    let current_fn_name = state.current_function_name.clone().unwrap_or_default();
+                    if let Some(grammar_info) = self.features.grammar_configs.get(&current_fn_name) {
+                        if !grammar_info.grammar_source.is_empty() || !grammar_info.start_rule.is_empty() {
+                            let src = grammar_info.grammar_source.clone();
+                            let start_state = builder.ins().iconst(cl_types::I64, 1);
+                            self.compile_call_by_name(builder, "nsl_serve_set_grammar", &[request_id, start_state])?;
+                            eprintln!("[nsl] Constrained decoding active via @grammar: '{}'", src);
+                        }
+                    }
+                }
+
                 let _ = model_val; // suppress unused warning — model used as prompt_len placeholder
                 return Ok(request_id);
             }

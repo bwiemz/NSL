@@ -74,6 +74,12 @@ pub struct FuncState {
     /// M36: Cranelift Variable holding the GPU slab base pointer (from nsl_gpu_slab_init).
     /// When Some, slab-planned tensors use offsets into this slab instead of alloc_managed.
     pub slab_ptr_var: Option<Variable>,
+    /// M52b: Maps Cranelift Value → weight name in WeightMap.
+    /// Set when compile_member_access loads a model weight field that exists in the WeightMap.
+    pub weight_values: HashMap<cranelift_codegen::ir::Value, String>,
+    /// M44: Name of the function currently being compiled.
+    /// Used by generate() to look up @grammar decorator configs.
+    pub current_function_name: Option<String>,
 }
 
 impl Default for FuncState {
@@ -103,6 +109,8 @@ impl FuncState {
             is_fp8_compute: false,
             use_counts: None,
             slab_ptr_var: None,
+            weight_values: HashMap::new(),
+            current_function_name: None,
         }
     }
 

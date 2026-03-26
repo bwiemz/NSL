@@ -123,6 +123,9 @@ impl Compiler<'_> {
                 state.is_fp8_compute = true;
             }
 
+            // M44: Record current function name for @grammar decorator lookup in generate() calls
+            state.current_function_name = Some(name.clone());
+
             // FBIP Phase 2: Pre-compute use counts for single-use optimizations
             // (clone elision, in-place op emission).
             state.use_counts = Some(crate::use_count::analyze_use_counts(&fn_def.body));

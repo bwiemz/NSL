@@ -67,6 +67,34 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // M44: Extract @grammar decorator for constrained decoding
+                for d in decos {
+                    if d.name.len() == 1 && self.resolve_sym(d.name[0]) == "grammar" {
+                        let mut start_rule = String::new();
+                        let mut grammar_source = String::new();
+                        if let Some(ref args) = d.args {
+                            for arg in args {
+                                if let Some(name_sym) = arg.name {
+                                    let arg_name = self.resolve_sym(name_sym).to_string();
+                                    if arg_name == "start_rule" {
+                                        if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                            start_rule = s.clone();
+                                        }
+                                    }
+                                } else {
+                                    // Positional arg = grammar source / schema kind string
+                                    if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                        grammar_source = s.clone();
+                                    }
+                                }
+                            }
+                        }
+                        self.features.grammar_configs.insert(
+                            raw_name.clone(),
+                            super::GrammarInfo { start_rule, grammar_source },
+                        );
+                    }
+                }
                 // M53: Extract @real_time and @wcet_budget constraints
                 if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
                     self.features.real_time_fns.insert(raw_name.clone(), rt);

@@ -347,6 +347,29 @@ impl Compiler<'_> {
                                 self.validate_fuse_body(fn_def)?;
                                 // TODO(M26): emit training branch + fused kernel launch for @fuse fn
                                 // For now, compile normally (unfused path is always correct).
+                            } else if dname == "grammar" {
+                                // M44: @grammar decorator on nested function
+                                let fname = self.resolve_sym(fn_def.name).to_string();
+                                let mut start_rule = String::new();
+                                let mut grammar_source = String::new();
+                                if let Some(ref dargs) = d.args {
+                                    for arg in dargs {
+                                        if let Some(name_sym) = arg.name {
+                                            let arg_name = self.resolve_sym(name_sym).to_string();
+                                            if arg_name == "start_rule" {
+                                                if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                                    start_rule = s.clone();
+                                                }
+                                            }
+                                        } else if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                            grammar_source = s.clone();
+                                        }
+                                    }
+                                }
+                                self.features.grammar_configs.insert(
+                                    fname,
+                                    crate::compiler::GrammarInfo { start_rule, grammar_source },
+                                );
                             }
                         }
                     }
