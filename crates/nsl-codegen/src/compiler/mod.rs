@@ -150,7 +150,7 @@ impl FeatureConfigs {
             decode_workers: 1,
             pipeline_config: None,
             parallelism_config: None,
-            zero_stage: None,
+            zero_stage: options.zero_stage,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
             kv_compress_policies: HashMap::new(),

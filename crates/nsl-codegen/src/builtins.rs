@@ -486,6 +486,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_zero_reduce_grads", &[types::I64, types::I64], Some(types::I64)),                // (grad_ptr, num_elems)
     ("nsl_zero_step", &[], Some(types::I64)),                                               // ()
     ("nsl_zero_destroy", &[], Some(types::I64)),
+    ("nsl_zero_owns_param", &[types::I64], Some(types::I64)),                               // (param_idx) -> 1 if owned
     // --- M43: Gradient accumulation (ABI-fixed) ---
     ("nsl_grad_accumulate_add", &[types::I64, types::I64, types::I64], Some(types::I64)),  // (dst, src, num_elems)
     ("nsl_grad_zero", &[types::I64, types::I64], Some(types::I64)),                         // (grad_ptr, num_elems)

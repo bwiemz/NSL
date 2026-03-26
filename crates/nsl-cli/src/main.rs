@@ -656,7 +656,7 @@ fn main() {
             debug_training,
             nan_analysis,
             distribute: _distribute,
-            zero_stage: _zero_stage,
+            zero_stage,
             deterministic: _deterministic,
             dead_weight_threshold,
             sparse_threshold,
@@ -765,6 +765,7 @@ fn main() {
                 zk_weights_path: zk_weights.clone(),
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
+                zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib,
             };
@@ -820,7 +821,7 @@ fn main() {
             trace_ops,
             deterministic,
             distribute: _distribute,
-            zero_stage: _zero_stage,
+            zero_stage,
             wcet,
             wcet_cert,
             gpu,
@@ -864,6 +865,7 @@ fn main() {
                 zk_weights_path: None,
                 linear_types_enabled: false, // run command doesn't expose --linear-types
                 ownership_info: std::collections::HashMap::new(),
+                zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib: false,
             };

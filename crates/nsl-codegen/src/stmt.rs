@@ -2066,8 +2066,31 @@ impl Compiler<'_> {
         let beta2_const = builder.ins().f64const(beta2_value);
         let eps_const = builder.ins().f64const(eps_value);
 
+        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step
+        let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
+        if zero_enabled {
+            let num_p = builder.ins().iconst(cl_types::I64, num_params as i64);
+            self.compile_call_by_name(builder, "nsl_zero_reduce_grads", &[grads_list, num_p])?;
+        }
+
         for i in 0..num_params {
             let idx = builder.ins().iconst(cl_types::I64, i as i64);
+
+            // M43b: ZeRO Stage 1+ — skip optimizer step for params not owned by this rank
+            let zero_merge_block = if zero_enabled {
+                let owns = self.compile_call_by_name(builder, "nsl_zero_owns_param", &[idx])?;
+                let one_val = builder.ins().iconst(cl_types::I64, 1);
+                let should_skip = builder.ins().icmp(IntCC::NotEqual, owns, one_val);
+                let skip_block = builder.create_block();
+                let step_block = builder.create_block();
+                builder.ins().brif(should_skip, skip_block, &[], step_block, &[]);
+
+                builder.switch_to_block(step_block);
+                builder.seal_block(step_block);
+                Some(skip_block)
+            } else {
+                None
+            };
 
             // Get param tensor from param_list
             let param_val = self.compile_call_by_name(
@@ -2121,6 +2144,18 @@ impl Compiler<'_> {
                     )));
                 }
             }
+
+            // M43b: ZeRO — merge the skip and step paths
+            if let Some(skip_block) = zero_merge_block {
+                builder.ins().jump(skip_block, &[]);
+                builder.switch_to_block(skip_block);
+                builder.seal_block(skip_block);
+            }
+        }
+
+        // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
+        if zero_enabled {
+            self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
         }
 
         // 7g. Free gradient tensors and the grads_list to prevent per-step memory leak
