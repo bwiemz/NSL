@@ -252,18 +252,15 @@ fn lower_single_op(
         // === Loss functions (3 ops) ===
         // Loss functions are composite: we lower them to sequences of existing FFI calls.
         PrimalOp::CrossEntropyLoss => {
-            // cross_entropy(logits, targets) = mean(-log(softmax(logits)) * one_hot(targets))
-            // Simplified: softmax(logits) -> log -> negate -> gather targets -> mean
+            // cross_entropy(logits, targets) = mean(-logsoftmax(logits)[targets])
+            // Uses numerically stable logsoftmax (log-sum-exp trick) instead of
+            // separate softmax → log (which loses precision for large logits).
             let neg_one = builder.ins().iconst(cl_types::I64, -1);
-            let softmax = call(compiler, builder, "nsl_tensor_softmax", &[inputs[0], neg_one])?;
-            let log_sm = call(compiler, builder, "nsl_tensor_log", &[softmax])?;
+            let log_sm = call(compiler, builder, "nsl_tensor_logsoftmax", &[inputs[0], neg_one])?;
             let neg_log = call(compiler, builder, "nsl_tensor_neg", &[log_sm])?;
-            // Gather target indices along last dim
-            let dim_val = neg_one;
-            let gathered = call(compiler, builder, "nsl_tensor_gather", &[neg_log, inputs[1], dim_val])?;
-            let mean_dim = builder.ins().iconst(cl_types::I64, -1);
+            let gathered = call(compiler, builder, "nsl_tensor_gather", &[neg_log, inputs[1], neg_one])?;
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_mean_dim", &[gathered, mean_dim, keepdim])
+            call(compiler, builder, "nsl_tensor_mean_dim", &[gathered, neg_one, keepdim])
         }
         PrimalOp::MSELoss => {
             // mse_loss(pred, target) = mean((pred - target)^2)
