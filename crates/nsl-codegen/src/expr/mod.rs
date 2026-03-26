@@ -234,10 +234,17 @@ impl Compiler<'_> {
             } else {
                 builder.ins().iconst(cl_types::I64, 0)
             };
-            self.compile_call_by_name(
+            let nan_flag = self.compile_call_by_name(
                 builder,
                 "nsl_trace_record_op",
                 &[op_id, in0, in1, result],
+            )?;
+
+            // M45: Pass NaN flag to warning function — it only prints when flag==1
+            self.compile_call_by_name(
+                builder,
+                "nsl_trace_nan_warning",
+                &[nan_flag, op_id],
             )?;
         }
 

@@ -202,6 +202,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_from_slab", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     // M52b: Create tensor from static .rodata data (compile-time constant folded)
     ("nsl_tensor_from_static", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    // M52c: CSR sparse matmul (row_ptrs, col_indices, values, B, nrows, ncols, nnz) -> C
+    ("nsl_sparse_matmul", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     // Checkpoint I/O (M14)
     ("nsl_model_save", &[types::I64, types::I64, types::I64, types::I64], None),
     ("nsl_model_load", &[types::I64, types::I64, types::I64], None),
@@ -521,6 +523,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_trace_breakpoint", &[], Some(types::I64)),
     ("nsl_trace_flush", &[], Some(types::I64)),
     ("nsl_trace_destroy", &[], Some(types::I64)),
+    ("nsl_trace_nan_warning", &[types::I64, types::I64], Some(types::I64)),
     // --- M62: Legacy Interop — DLPack bridge + C API ---
     ("nsl_dlpack_export", &[types::I64], Some(types::I64)),
     ("nsl_dlpack_import", &[types::I64], Some(types::I64)),

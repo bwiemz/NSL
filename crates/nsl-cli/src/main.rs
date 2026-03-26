@@ -536,17 +536,29 @@ fn main() {
             // is wired through the check pipeline.
 
             if nan_analysis {
-                // M45: Run compile-time NaN risk analysis.
-                // The NanAnalyzer needs function bodies + resolved types to detect
-                // log(x), sqrt(x), div-by-zero patterns by walking the typed AST
-                // and tracking value constraints through dataflow. Full integration
-                // requires a typed-AST walker pass — for now, instantiate to verify
-                // the module is importable and announce the pass is active.
-                let _analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
-                eprintln!(
-                    "note: --nan-analysis pass enabled \
-                     (pattern detection requires typed AST walker — in progress)"
-                );
+                // M45: Run compile-time NaN risk analysis via AST walker.
+                // Re-lex/parse the file to get a Module + Interner for the walker.
+                let source = std::fs::read_to_string(&file).unwrap_or_default();
+                let mut nan_interner = Interner::new();
+                let mut nan_source_map = SourceMap::new();
+                let nan_file_id = nan_source_map.add_file(file.display().to_string(), source.clone());
+                let (tokens, _) = nsl_lexer::tokenize(&source, nan_file_id, &mut nan_interner);
+                let parse_result = nsl_parser::parse(&tokens, &mut nan_interner);
+
+                let mut analyzer = nsl_semantic::nan_analysis::NanAnalyzer::new();
+                analyzer.analyze_module(&parse_result.module, &nan_interner);
+
+                if analyzer.diagnostics.is_empty() {
+                    eprintln!("note: --nan-analysis: no NaN/Inf risks detected");
+                } else {
+                    eprintln!(
+                        "note: --nan-analysis: {} warning(s) detected",
+                        analyzer.diagnostics.len()
+                    );
+                    for diag in &analyzer.diagnostics {
+                        nan_source_map.emit_diagnostic(diag);
+                    }
+                }
             }
 
             // M52: Weight analysis report

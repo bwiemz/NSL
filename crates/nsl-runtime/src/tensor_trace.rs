@@ -387,6 +387,33 @@ pub extern "C" fn nsl_trace_flush() -> i64 {
     })
 }
 
+/// Called after each traced op when trace_ops is enabled.
+/// Prints a warning to stderr if nan_flag == 1 (NaN/Inf detected in output).
+#[no_mangle]
+pub extern "C" fn nsl_trace_nan_warning(nan_flag: i64, op_type: i64) -> i64 {
+    if nan_flag == 1 {
+        let op_name = match op_type {
+            0 => "add",
+            1 => "sub",
+            2 => "mul",
+            3 => "div",
+            4 => "matmul",
+            5 => "relu",
+            6 => "sigmoid",
+            7 => "softmax",
+            8 => "sum",
+            9 => "mean",
+            _ => "unknown",
+        };
+        eprintln!(
+            "[nsl] WARNING: NaN/Inf detected in output of '{}' (op_type={})",
+            op_name, op_type
+        );
+        eprintln!("[nsl]   Run with: nsl debug <trace_file> --find-nan for details");
+    }
+    0
+}
+
 /// Destroy the trace recorder, freeing all buffered data.
 #[no_mangle]
 pub extern "C" fn nsl_trace_destroy() -> i64 {
@@ -569,5 +596,16 @@ mod tests {
 
         // Clean up the trace file if it was created.
         let _ = std::fs::remove_file("trace.nsltrace");
+    }
+
+    #[test]
+    fn nan_warning_returns_zero() {
+        // nsl_trace_nan_warning should always return 0 (no-op return).
+        // When nan_flag == 0, it should not print anything.
+        assert_eq!(nsl_trace_nan_warning(0, 0), 0);
+        assert_eq!(nsl_trace_nan_warning(0, 255), 0);
+        // When nan_flag == 1, it prints a warning but still returns 0.
+        assert_eq!(nsl_trace_nan_warning(1, 4), 0); // matmul
+        assert_eq!(nsl_trace_nan_warning(1, 255), 0); // unknown op
     }
 }
