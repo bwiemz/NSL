@@ -128,12 +128,22 @@ fn lower_single_op(
         PrimalOp::Sum { dim } => {
             let d = builder.ins().iconst(cl_types::I64, dim.unwrap_or(-1));
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_sum_dim", &[inputs[0], d, keepdim])
+            // M46b: Route to deterministic sort-based reduction when --deterministic is active.
+            if compiler.compile_options.deterministic {
+                call(compiler, builder, "nsl_tensor_reduce_sum_deterministic", &[inputs[0], d, keepdim])
+            } else {
+                call(compiler, builder, "nsl_tensor_sum_dim", &[inputs[0], d, keepdim])
+            }
         }
         PrimalOp::Mean { dim } => {
             let d = builder.ins().iconst(cl_types::I64, dim.unwrap_or(-1));
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_mean_dim", &[inputs[0], d, keepdim])
+            // M46b: Route to deterministic sort-based reduction when --deterministic is active.
+            if compiler.compile_options.deterministic {
+                call(compiler, builder, "nsl_tensor_reduce_mean_deterministic", &[inputs[0], d, keepdim])
+            } else {
+                call(compiler, builder, "nsl_tensor_mean_dim", &[inputs[0], d, keepdim])
+            }
         }
         PrimalOp::Softmax { dim } => {
             let d = builder.ins().iconst(cl_types::I64, *dim);
@@ -186,7 +196,13 @@ fn lower_single_op(
         }
         PrimalOp::ScatterAdd { dim } => {
             let d = builder.ins().iconst(cl_types::I64, *dim);
-            call(compiler, builder, "nsl_tensor_scatter_add", &[inputs[0], inputs[1], d])
+            // M46: Route to deterministic sort-accumulate variant when --deterministic is active.
+            // The deterministic FFI takes (input, indices, src) — dim is implicit (0).
+            if compiler.compile_options.deterministic {
+                call(compiler, builder, "nsl_tensor_scatter_add_deterministic", &[inputs[0], inputs[1], d])
+            } else {
+                call(compiler, builder, "nsl_tensor_scatter_add", &[inputs[0], inputs[1], d])
+            }
         }
         PrimalOp::Embedding => {
             call(compiler, builder, "nsl_tensor_embedding_lookup", &[inputs[0], inputs[1]])

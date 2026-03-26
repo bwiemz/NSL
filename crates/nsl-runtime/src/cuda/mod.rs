@@ -1758,6 +1758,138 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
     NslTensor::publish(out)
 }
 
+// ---------------------------------------------------------------------------
+// M46b: Deterministic GPU global sum — single-thread sequential accumulation
+// ---------------------------------------------------------------------------
+
+/// GPU deterministic global sum reduction. Uses a single-thread kernel that
+/// accumulates ALL elements in ascending order (no parallelism = bit-identical).
+/// This is slower than the multi-thread tree reduction but guarantees determinism.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::DET_GLOBAL_SUM_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let n = t.len as u64;
+
+    let out_data = inner::alloc_managed(4); // single f32
+
+    let out_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+    unsafe { *out_shape = 1 };
+    let out_strides = NslTensor::compute_strides(out_shape, 1);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut n_val = n;
+
+    let args: [*mut std::ffi::c_void; 3] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    // Single block, single thread — guarantees sequential deterministic accumulation
+    let result = inner::kernel_launch(
+        DET_GLOBAL_SUM_F32_PTX.as_ptr(), b"nsl_det_global_sum_f32\0".as_ptr(),
+        [1, 1, 1], [1, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU det_global_sum kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        1,
+        1,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
+// ---------------------------------------------------------------------------
+// M46b: Deterministic GPU per-dim sum — one thread per output, sequential
+// ---------------------------------------------------------------------------
+
+/// GPU deterministic per-dimension sum reduction. Uses one thread per output element,
+/// each sequentially accumulating its reduce_size inputs in ascending order.
+/// Slower than shared-memory tree reduction but guarantees bit-identical results.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::DET_SUM_DIM_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+
+    let reduce_size = shape_slice[dim] as u64;
+    let outer: u64 = shape_slice[..dim].iter().map(|&s| s as u64).product::<u64>().max(1);
+    let inner: u64 = shape_slice[dim + 1..].iter().map(|&s| s as u64).product::<u64>().max(1);
+
+    let out_total = (outer * inner) as usize;
+    let out_data = inner::alloc_managed(out_total * 4); // f32
+
+    // Build output shape
+    let out_shape_vec: Vec<i64> = if keepdim {
+        shape_slice.iter().enumerate()
+            .map(|(i, &s)| if i == dim { 1 } else { s })
+            .collect()
+    } else {
+        shape_slice.iter().enumerate()
+            .filter(|&(i, _)| i != dim)
+            .map(|(_, &s)| s)
+            .collect()
+    };
+
+    let out_ndim = out_shape_vec.len() as i64;
+    let out_shape = crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &v) in out_shape_vec.iter().enumerate() {
+        unsafe { *out_shape.add(i) = v };
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut outer_val = outer;
+    let mut reduce_val = reduce_size;
+    let mut inner_val = inner;
+
+    let args: [*mut std::ffi::c_void; 5] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut outer_val as *mut _ as *mut std::ffi::c_void,
+        &mut reduce_val as *mut _ as *mut std::ffi::c_void,
+        &mut inner_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    // One block per output element, single thread per block — sequential accumulation
+    let grid = out_total as i64;
+    let result = inner::kernel_launch(
+        DET_SUM_DIM_F32_PTX.as_ptr(), b"nsl_det_sum_dim_f32\0".as_ptr(),
+        [grid, 1, 1], [1, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU det_sum_dim kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        out_ndim,
+        out_total as i64,
+        t.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
 /// GPU per-dimension max reduction. Input must be on GPU (f32), contiguous.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
