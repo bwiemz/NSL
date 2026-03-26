@@ -834,3 +834,247 @@ fn e2e_m39_vmap_validation_error() {
         stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// NSLM ↔ Safetensors conversion tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal NSLM file in memory:
+///   magic(4) + version_u32_le(4) + header_size_u64_le(8) + JSON + padding + raw f32 data
+fn build_nslm_f32(tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Vec<u8> {
+    // Build tensor data blocks and metadata
+    let mut data_offset: u64 = 0;
+    let mut param_jsons: Vec<String> = Vec::new();
+    let mut raw_data: Vec<u8> = Vec::new();
+
+    for (name, shape, values) in tensors {
+        let nbytes = (values.len() * 4) as u64;
+        let shape_json: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        param_jsons.push(format!(
+            r#"{{"name":"{}","shape":[{}],"dtype":"f32","offset":{},"nbytes":{}}}"#,
+            name,
+            shape_json.join(","),
+            data_offset,
+            nbytes
+        ));
+        for &v in values {
+            raw_data.extend_from_slice(&v.to_le_bytes());
+        }
+        data_offset += nbytes;
+    }
+
+    let header = format!(r#"{{"params":[{}]}}"#, param_jsons.join(","));
+    let header_bytes = header.as_bytes();
+    let header_size = header_bytes.len() as u64;
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"NSLM");
+    out.extend_from_slice(&1u32.to_le_bytes());       // version
+    out.extend_from_slice(&header_size.to_le_bytes()); // header_size u64
+    out.extend_from_slice(header_bytes);
+
+    // Pad to 64-byte alignment from byte 0
+    let total_header = 4 + 4 + 8 + header_bytes.len();
+    let padding = (64 - (total_header % 64)) % 64;
+    out.extend(std::iter::repeat(0u8).take(padding));
+
+    out.extend_from_slice(&raw_data);
+    out
+}
+
+#[test]
+fn e2e_convert_nslm_to_safetensors() {
+    use safetensors::SafeTensors;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let nslm_path = tmp.path().join("model.nslm");
+    let st_path = tmp.path().join("model.safetensors");
+
+    // Build a NSLM file with two tensors
+    let nslm_bytes = build_nslm_f32(&[
+        ("weight", vec![2, 3], vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        ("bias", vec![3], vec![0.1f32, 0.2, 0.3]),
+    ]);
+    std::fs::write(&nslm_path, &nslm_bytes).unwrap();
+
+    // Run nsl convert
+    let root = workspace_root();
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .arg(&nslm_path)
+        .arg(&st_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to run nsl convert");
+
+    assert!(
+        output.status.success(),
+        "nsl convert (nslm→safetensors) failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(st_path.exists(), "output .safetensors not created");
+
+    // Verify the safetensors file contains the correct tensors
+    let st_bytes = std::fs::read(&st_path).unwrap();
+    let st = SafeTensors::deserialize(&st_bytes).expect("failed to parse safetensors");
+    let names: Vec<String> = {
+        let mut v: Vec<String> = st.tensors().into_iter().map(|(n, _)| n).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names, vec!["bias".to_string(), "weight".to_string()], "unexpected tensor names: {:?}", names);
+
+    // Check weight values (f32)
+    let weight_view = st.tensor("weight").unwrap();
+    assert_eq!(weight_view.shape(), &[2, 3]);
+    let weight_f32: Vec<f32> = weight_view
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(weight_f32.len(), 6);
+    assert!((weight_f32[0] - 1.0f32).abs() < 1e-5, "weight[0] = {}", weight_f32[0]);
+    assert!((weight_f32[5] - 6.0f32).abs() < 1e-5, "weight[5] = {}", weight_f32[5]);
+
+    // Check bias values
+    let bias_view = st.tensor("bias").unwrap();
+    assert_eq!(bias_view.shape(), &[3]);
+    let bias_f32: Vec<f32> = bias_view
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert!((bias_f32[0] - 0.1f32).abs() < 1e-4, "bias[0] = {}", bias_f32[0]);
+    assert!((bias_f32[2] - 0.3f32).abs() < 1e-4, "bias[2] = {}", bias_f32[2]);
+}
+
+#[test]
+fn e2e_convert_safetensors_to_nslm() {
+    use std::collections::HashMap;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let st_path = tmp.path().join("weights.safetensors");
+    let nslm_path = tmp.path().join("weights.nslm");
+
+    // Build a safetensors file with one tensor
+    let data: Vec<f32> = vec![10.0f32, 20.0, 30.0, 40.0];
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let view =
+        safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 2], &bytes).unwrap();
+    let mut map: HashMap<String, safetensors::tensor::TensorView<'_>> = HashMap::new();
+    map.insert("mat".to_string(), view);
+    let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+    std::fs::write(&st_path, &serialized).unwrap();
+
+    // Run nsl convert
+    let root = workspace_root();
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .arg(&st_path)
+        .arg(&nslm_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to run nsl convert");
+
+    assert!(
+        output.status.success(),
+        "nsl convert (safetensors→nslm) failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(nslm_path.exists(), "output .nslm not created");
+
+    // Parse NSLM manually and verify contents
+    let nslm_bytes = std::fs::read(&nslm_path).unwrap();
+    assert!(nslm_bytes.len() >= 16, "NSLM file too small");
+    assert_eq!(&nslm_bytes[0..4], b"NSLM", "bad magic");
+    let version = u32::from_le_bytes(nslm_bytes[4..8].try_into().unwrap());
+    assert_eq!(version, 1);
+    let header_size = u64::from_le_bytes(nslm_bytes[8..16].try_into().unwrap()) as usize;
+    let header_json: serde_json::Value =
+        serde_json::from_slice(&nslm_bytes[16..16 + header_size]).unwrap();
+    let params = header_json["params"].as_array().unwrap();
+    assert_eq!(params.len(), 1, "expected 1 param");
+    assert_eq!(params[0]["name"].as_str().unwrap(), "mat");
+    assert_eq!(params[0]["dtype"].as_str().unwrap(), "f32");
+
+    // Verify data
+    let total_header = 16 + header_size;
+    let padding = (64 - (total_header % 64)) % 64;
+    let data_start = total_header + padding;
+    let raw = &nslm_bytes[data_start..];
+    assert!(raw.len() >= 16, "not enough raw data bytes");
+    let v0 = f32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let v3 = f32::from_le_bytes(raw[12..16].try_into().unwrap());
+    assert!((v0 - 10.0f32).abs() < 1e-5, "data[0] = {}", v0);
+    assert!((v3 - 40.0f32).abs() < 1e-5, "data[3] = {}", v3);
+}
+
+#[test]
+fn e2e_convert_nslm_safetensors_round_trip() {
+    use safetensors::SafeTensors;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let nslm_orig = tmp.path().join("orig.nslm");
+    let st_mid = tmp.path().join("mid.safetensors");
+    let nslm_final = tmp.path().join("final.nslm");
+
+    // Build a NSLM file
+    let orig_values: Vec<f32> = (1..=9).map(|i| i as f32 * 0.5f32).collect();
+    let nslm_bytes = build_nslm_f32(&[("layer", vec![3, 3], orig_values.clone())]);
+    std::fs::write(&nslm_orig, &nslm_bytes).unwrap();
+
+    let root = workspace_root();
+
+    // Step 1: nslm → safetensors
+    let out1 = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .arg(&nslm_orig)
+        .arg(&st_mid)
+        .current_dir(&root)
+        .output()
+        .expect("step 1 failed");
+    assert!(
+        out1.status.success(),
+        "round-trip step 1 failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Step 2: safetensors → nslm
+    let out2 = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .arg(&st_mid)
+        .arg(&nslm_final)
+        .current_dir(&root)
+        .output()
+        .expect("step 2 failed");
+    assert!(
+        out2.status.success(),
+        "round-trip step 2 failed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // Verify final NSLM tensor values match originals (within f32 precision)
+    let final_bytes = std::fs::read(&nslm_final).unwrap();
+    let header_size = u64::from_le_bytes(final_bytes[8..16].try_into().unwrap()) as usize;
+    let total_header = 16 + header_size;
+    let padding = (64 - (total_header % 64)) % 64;
+    let data_start = total_header + padding;
+    let raw = &final_bytes[data_start..];
+
+    for (i, &expected) in orig_values.iter().enumerate() {
+        let got = f32::from_le_bytes(raw[i * 4..(i + 1) * 4].try_into().unwrap());
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "round-trip mismatch at [{}]: expected {}, got {}",
+            i, expected, got
+        );
+    }
+
+    // Also verify via safetensors intermediate
+    let st_bytes = std::fs::read(&st_mid).unwrap();
+    let st = SafeTensors::deserialize(&st_bytes).unwrap();
+    let layer = st.tensor("layer").unwrap();
+    assert_eq!(layer.shape(), &[3, 3]);
+}
