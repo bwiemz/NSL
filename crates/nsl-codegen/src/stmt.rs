@@ -157,6 +157,8 @@ impl Compiler<'_> {
 
                         // Free intermediate tensor temporaries (keep init_val which is now owned by the variable)
                         self.free_tensor_temporaries(builder, state, Some(init_val));
+                        // M38b: Free linear tensors consumed during this let-binding's RHS
+                        self.free_linear_consumes(builder, state, Some(init_val));
 
                         // If the value was a closure lambda, record capture count for indirect call dispatch
                         if let Some(count) = self.last_lambda_capture_count.take() {
@@ -202,6 +204,8 @@ impl Compiler<'_> {
                     let mut val = self.compile_expr(builder, state, e)?;
                     // Free intermediate tensor temporaries before returning (keep return value)
                     self.free_tensor_temporaries(builder, state, Some(val));
+                    // M38b: Free linear tensors consumed during the return expression
+                    self.free_linear_consumes(builder, state, Some(val));
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
@@ -231,6 +235,8 @@ impl Compiler<'_> {
                 let _ = self.compile_expr(builder, state, expr)?;
                 // Free all tensor temporaries from this expression (none are kept)
                 self.free_tensor_temporaries(builder, state, None);
+                // M38b: Free linear tensors consumed during this expression statement
+                self.free_linear_consumes(builder, state, None);
             }
 
             StmtKind::If { condition, then_block, elif_clauses, else_block } => {
@@ -434,6 +440,8 @@ impl Compiler<'_> {
                 builder.def_var(var, final_val);
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));
+                // M38b: Free linear tensors consumed during this assignment's RHS
+                self.free_linear_consumes(builder, state, Some(final_val));
             }
             nsl_ast::expr::ExprKind::Subscript { object, index } => {
                 let obj_val = self.compile_expr(builder, state, object)?;
@@ -619,6 +627,40 @@ impl Compiler<'_> {
                 }
             }
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
+        }
+    }
+
+    /// M38b: Free linear tensors that were consumed during the current statement.
+    /// Called after `free_tensor_temporaries` at each statement boundary.
+    /// `keep` is the value being assigned to a variable (should NOT be freed).
+    ///
+    /// Only active when `state.ownership_lowering.is_some()` — the pending list
+    /// is empty otherwise so the loop is a no-op.
+    fn free_linear_consumes(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        keep: Option<Value>,
+    ) {
+        if state.linear_consume_pending.is_empty() {
+            return;
+        }
+        // Don't free inside tape-recorded regions — backward needs the data alive.
+        if state.in_tape_region {
+            state.linear_consume_pending.clear();
+            return;
+        }
+        let pending = std::mem::take(&mut state.linear_consume_pending);
+        for val in &pending {
+            if Some(*val) == keep {
+                continue;
+            }
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*val]);
         }
     }
 

@@ -64,6 +64,10 @@ pub struct FuncState {
     /// M38b: Ownership lowering state for linear types free-at-consumption.
     /// `Some` when `--linear-types` is active and the function has ownership metadata.
     pub ownership_lowering: Option<crate::ownership::OwnershipLowering>,
+    /// M38b: Cranelift Values of linear tensors consumed in the current statement.
+    /// After statement-level cleanup, these are freed via `nsl_tensor_free` instead
+    /// of waiting for scope exit. Only populated when `ownership_lowering.is_some()`.
+    pub linear_consume_pending: Vec<ir::Value>,
     /// M35: True when compiling a function with @fp8_compute decorator.
     /// MatMul ops use nsl_fp8_matmul_training for E5M2 backward tape recording.
     pub is_fp8_compute: bool,
@@ -106,6 +110,7 @@ impl FuncState {
             in_tape_region: false,
             in_scoped_loop: false,
             ownership_lowering: None,
+            linear_consume_pending: Vec::new(),
             is_fp8_compute: false,
             use_counts: None,
             slab_ptr_var: None,

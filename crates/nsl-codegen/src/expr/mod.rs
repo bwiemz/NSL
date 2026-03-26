@@ -39,7 +39,17 @@ impl Compiler<'_> {
 
             ExprKind::Ident(sym) => {
                 if let Some((var, _)) = state.variables.get(sym) {
-                    Ok(builder.use_var(*var))
+                    let val = builder.use_var(*var);
+                    // M38b: If ownership lowering says this linear binding should be
+                    // freed at consumption, enqueue it for post-statement cleanup.
+                    // The actual nsl_tensor_free is emitted in free_linear_consumes()
+                    // after the statement finishes using the value.
+                    if let Some(ref lowering) = state.ownership_lowering {
+                        if lowering.should_free_at_consumption(sym) {
+                            state.linear_consume_pending.push(val);
+                        }
+                    }
+                    Ok(val)
                 } else {
                     let name = self.resolve_sym(*sym).to_string();
                     // Device constants for .to(device) calls
@@ -180,20 +190,53 @@ impl Compiler<'_> {
         }
     }
 
+    // ── M38b: Ownership-aware helpers ──────────────────────────────
+
+    /// Check if a tensor Ident expression should skip refcount ops (retain/release).
+    /// Returns true when the binding is linear under ownership lowering, meaning the
+    /// compiler has proven single-ownership — no refcount bumps needed.
+    pub(crate) fn should_elide_refcount_for_ident(
+        state: &FuncState,
+        expr: &nsl_ast::expr::Expr,
+    ) -> bool {
+        if let Some(ref lowering) = state.ownership_lowering {
+            if let nsl_ast::expr::ExprKind::Ident(sym) = &expr.kind {
+                return lowering.should_elide_refcount(sym);
+            }
+        }
+        false
+    }
+
     // ── Trace instrumentation (M45) ─────────────────────────────────
 
     /// FBIP Phase 2: Select inplace or normal variant for a unary tensor op.
     /// Returns `nsl_tensor_{op}_inplace` when the argument is a single-use Ident
     /// binding and we're not in a tape-recording region, otherwise `nsl_tensor_{op}`.
+    ///
+    /// M38b: Also selects inplace when ownership lowering proves the binding is
+    /// linear with no borrows or shared ownership — the compiler guarantees
+    /// exclusive access so the runtime refcount check can be bypassed entirely.
     pub(crate) fn fbip_select_variant(
         &self,
         state: &FuncState,
         arg_expr: &nsl_ast::expr::Expr,
         op_name: &str,
     ) -> String {
-        // Only optimize when use-count data is available and not recording autodiff
+        // Only optimize when not recording autodiff tape
         if !state.in_tape_region {
             if let nsl_ast::expr::ExprKind::Ident(sym) = &arg_expr.kind {
+                // M38b: Ownership lowering can prove exclusive access even when
+                // use-count heuristics cannot (e.g., multi-use linear binding
+                // where all but this use have already been consumed).
+                if let Some(ref lowering) = state.ownership_lowering {
+                    if lowering.should_use_inplace(sym) {
+                        let inplace = format!("nsl_tensor_{op_name}_inplace");
+                        if self.functions.contains_key(&inplace) {
+                            return inplace;
+                        }
+                    }
+                }
+                // Fall back to use-count heuristic for non-linear bindings
                 if let Some(ref uc) = state.use_counts {
                     if uc.is_single_use(sym) {
                         let inplace = format!("nsl_tensor_{op_name}_inplace");
