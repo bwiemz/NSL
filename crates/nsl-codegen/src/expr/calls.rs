@@ -1047,9 +1047,30 @@ impl Compiler<'_> {
             let verifier_logits = self.compile_expr(builder, state, &args[2].value)?;
             let vocab_size = self.compile_expr(builder, state, &args[3].value)?;
 
-            // Get temperature from @speculative config, default 0.0
-            let config = self.features.speculative_configs.values().next().cloned();
-            let temperature = config.map(|c| c.temperature).unwrap_or(0.0f32);
+            // Look up @speculative config using model name prefix from the mangled
+            // function name ("ModelName__method_name"), mirroring the MoE pattern (M32).
+            let config = state.current_function_name.as_ref()
+                .and_then(|fn_name| {
+                    let model_prefix = fn_name.split("__").next().unwrap_or("");
+                    self.features.speculative_configs.iter()
+                        .find(|(key, _)| key.starts_with(model_prefix))
+                        .map(|(_, info)| info.clone())
+                });
+
+            let (temperature, num_tokens, method_id, tree_width) = match &config {
+                Some(info) => (
+                    info.temperature,
+                    info.num_tokens as i64,
+                    match info.method {
+                        crate::speculative::SpeculativeMethod::Draft => 0i64,
+                        crate::speculative::SpeculativeMethod::Medusa => 1,
+                        crate::speculative::SpeculativeMethod::Eagle2 => 2,
+                        crate::speculative::SpeculativeMethod::Lookahead => 3,
+                    },
+                    info.tree_width as i64,
+                ),
+                None => (0.0f32, 5i64, 0i64, 4i64), // defaults
+            };
 
             // Get num_draft_tokens from draft_tokens tensor length
             let draft_len = builder.ins().load(
@@ -1062,11 +1083,15 @@ impl Compiler<'_> {
                 cranelift_codegen::ir::types::I64,
                 temperature.to_bits() as i64,
             );
+            let num_tokens_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, num_tokens);
+            let method_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, method_id);
+            let tree_width_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, tree_width);
 
             let result = self.compile_call_by_name(
                 builder,
                 "nsl_speculative_decode_step",
-                &[draft_tokens, draft_logits, verifier_logits, draft_len, vocab_size, temp_bits],
+                &[draft_tokens, draft_logits, verifier_logits, draft_len, vocab_size, temp_bits,
+                  num_tokens_val, method_val, tree_width_val],
             )?;
             return Ok(result);
         }

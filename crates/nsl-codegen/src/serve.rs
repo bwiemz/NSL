@@ -200,7 +200,17 @@ impl Compiler<'_> {
         self.compile_call_by_name(
             builder, "nsl_disagg_worker_init", &[role_decode, rank2, model_zero2],
         )?;
-        let config_zero2 = builder.ins().iconst(cl_types::I64, 0);
+        // M33: Check for speculative decoding config — if any @speculative decorator was
+        // collected during the compilation pass, log that speculative mode is active.
+        // The actual draft→verify loop replacement is deferred (needs draft model forward
+        // function wired); for now we pass a flag to the decode loop.
+        let speculative_flag: i64 = if self.features.speculative_configs.values().next().is_some() {
+            eprintln!("[nsl] Speculative decoding enabled for serve block");
+            1
+        } else {
+            0
+        };
+        let config_zero2 = builder.ins().iconst(cl_types::I64, speculative_flag);
         self.compile_call_by_name(builder, "nsl_disagg_decode_loop", &[config_zero2])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;
         builder.ins().jump(merge_block, &[]);

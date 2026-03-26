@@ -414,7 +414,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_page_cow_copy", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tree_attention", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_speculative_cleanup", &[types::I64, types::I64], Some(types::I64)),
-    ("nsl_speculative_decode_step", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_speculative_decode_step", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     // --- M34: Context parallelism (ring attention) ---
     ("nsl_cp_init", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_sequence_partition", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),

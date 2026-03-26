@@ -93,7 +93,9 @@ pub extern "C" fn nsl_speculative_verify(
     result_ptr: i64,
     _reserved: i64,
 ) -> i64 {
-    // Delegate to decode_step, then unpack into the result buffer
+    // Delegate to decode_step, then unpack into the result buffer.
+    // Pass zeros for the new config params (method/num_tokens/tree_width) since
+    // nsl_speculative_verify is called with pre-computed tensors and has no decorator context.
     let accepted_tensor_ptr = nsl_speculative_decode_step(
         draft_tokens_ptr,
         draft_logits_ptr,
@@ -101,6 +103,9 @@ pub extern "C" fn nsl_speculative_verify(
         num_draft_tokens,
         vocab_size,
         temperature_bits,
+        0, // num_tokens — not applicable in this path
+        0, // method — default (Draft)
+        0, // tree_width — not applicable in this path
     );
 
     if accepted_tensor_ptr == 0 || result_ptr == 0 {
@@ -151,6 +156,9 @@ pub extern "C" fn nsl_speculative_verify(
 ///   num_draft_tokens:     K (number of drafted tokens)
 ///   vocab_size:           vocabulary size
 ///   temperature_bits:     f32::to_bits() as i64
+///   num_tokens:           configured draft length from @speculative(num_tokens=K)
+///   method:               0=Draft, 1=Medusa, 2=Eagle2, 3=Lookahead
+///   tree_width:           branching factor for tree-based methods (Medusa/Eagle2)
 ///
 /// Returns: NslTensor* [num_accepted] i64 — accepted token IDs
 #[no_mangle]
@@ -161,6 +169,9 @@ pub extern "C" fn nsl_speculative_decode_step(
     num_draft_tokens: i64,
     vocab_size: i64,
     temperature_bits: i64,
+    _num_tokens: i64,   // configured K from @speculative decorator (reserved for future use)
+    _method: i64,       // 0=Draft, 1=Medusa, 2=Eagle2, 3=Lookahead (reserved for future use)
+    _tree_width: i64,   // branching factor for tree-based methods (reserved for future use)
 ) -> i64 {
     let k = num_draft_tokens as usize;
     let vocab = vocab_size as usize;
