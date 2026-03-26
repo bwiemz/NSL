@@ -146,6 +146,11 @@ pub struct ZkConfig {
     /// Controls the precision of [`ZkInstruction::FixedMul`] instructions:
     /// `out = (a * b) >> frac_bits`. Defaults to 8.
     pub frac_bits: u32,
+    /// Optional path to a `.safetensors` weight file used to populate the ZK witness.
+    ///
+    /// When set, weight values are loaded at compile time and embedded into the
+    /// circuit witness instead of using dummy zeros.
+    pub weights_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ZkConfig {
@@ -158,6 +163,7 @@ impl Default for ZkConfig {
             field: ZkField::Mersenne31,
             max_constraints: None,
             frac_bits: 8,
+            weights_path: None,
         }
     }
 }

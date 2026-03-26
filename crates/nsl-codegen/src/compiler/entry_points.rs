@@ -270,7 +270,24 @@ pub fn compile_with_zk_info(
                         crate::zk::backend::ZkBackendType::Folding
                     }
                 };
+                // Wire --zk-field flag to select finite field
+                cfg.field = match compiler.compile_options.zk_field.to_lowercase().as_str() {
+                    "bn254" | "bn256" => crate::zk::backend::ZkField::BN254,
+                    "mersenne31" | "m31" | "" => crate::zk::backend::ZkField::Mersenne31,
+                    other => {
+                        eprintln!("[nsl] warning: unknown ZK field '{}', using Mersenne31", other);
+                        crate::zk::backend::ZkField::Mersenne31
+                    }
+                };
                 cfg.emit_solidity = compiler.compile_options.zk_solidity;
+                // Wire --zk-weights flag to load weight file for witness generation
+                if let Some(ref weights_path) = compiler.compile_options.zk_weights_path {
+                    eprintln!(
+                        "[nsl] ZK: loading weights from {} for witness generation",
+                        weights_path.display()
+                    );
+                    cfg.weights_path = Some(weights_path.clone());
+                }
                 cfg
             };
             match crate::zk::compile_zk(fn_def, mode.clone(), &zk_config, type_map, interner) {

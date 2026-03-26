@@ -34,6 +34,8 @@ use nsl_ast::Symbol;
 pub struct ZkCompileResult {
     pub zkir: ir::ZkIR,
     pub stats: stats::CircuitStats,
+    /// The generated proof (if the folding prover ran successfully).
+    pub proof: Option<backend::ZkProof>,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,13 +151,61 @@ pub fn compile_zk(
     type_map: &nsl_semantic::checker::TypeMap,
     interner: &nsl_lexer::Interner,
 ) -> Result<ZkCompileResult, backend::ZkError> {
-    let dag = ast_to_zkdag(fn_def, type_map, interner)?;
-    let zkir = lower::lower_dag_to_zkir(&dag, config);
+    let mut dag = ast_to_zkdag(fn_def, type_map, interner)?;
+
+    // M55: If a weights file was provided, load weight values and patch the DAG.
+    // This populates ZkOp::Weight.values so the witness uses real weight data
+    // instead of dummy zeros, enabling meaningful proof generation.
+    if let Some(ref weights_path) = config.weights_path {
+        match crate::weight_aware::WeightMap::load(weights_path) {
+            Ok(mut wmap) => {
+                for op in &mut dag.ops {
+                    if let lower::ZkOp::Weight { name, values, dtype_bits, .. } = op {
+                        if let Some(entry) = wmap.get_mut(name) {
+                            let bw = entry.dtype.byte_width();
+                            let vals: Vec<i64> = (0..entry.num_elements)
+                                .map(|i| {
+                                    let offset = i * bw;
+                                    if offset + bw <= entry.data.len() {
+                                        entry.dtype.to_f64(&entry.data[offset..offset + bw]) as i64
+                                    } else {
+                                        0i64
+                                    }
+                                })
+                                .collect();
+                            *dtype_bits = (entry.dtype.byte_width() * 8) as u32;
+                            *values = Some(vals);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[nsl] ZK: warning: failed to load weights from '{}': {} — using zero witness", weights_path.display(), e);
+            }
+        }
+    }
+
+    // M55d: Auto-select M31 field for INT8 quantized models (10x faster proving)
+    let effective_config = if lower::is_int8_model(&dag) && config.field != backend::ZkField::BN254 {
+        eprintln!("[nsl] M55d: detected INT8 model — auto-selecting Mersenne-31 field for fast proving");
+        let mut cfg = config.clone();
+        cfg.field = backend::ZkField::Mersenne31;
+        cfg
+    } else {
+        config.clone()
+    };
+
+    let zkir = lower::lower_dag_to_zkir(&dag, &effective_config);
     let circuit_stats = stats::compute_stats(&zkir);
     let _ = mode; // privacy mode affects witness layout (applied in lowering)
+
+    // Try to produce a proof via the folding backend
+    let proof = compile_zk_from_dag(&dag, &effective_config).ok();
+
     Ok(ZkCompileResult {
         zkir,
         stats: circuit_stats,
+        proof,
     })
 }
 
