@@ -540,6 +540,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_logsoftmax", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_repeat", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_rope_inverse", &[types::I64, types::I64], Some(types::I64)),
+    // BatchNorm + AvgPool2d (proper implementations replacing approximations)
+    ("nsl_tensor_batchnorm", &[types::I64, types::I64, types::I64, types::F64, types::I64], Some(types::I64)),
+    ("nsl_tensor_avgpool2d", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

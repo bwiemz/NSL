@@ -542,6 +542,220 @@ pub fn check_vram_budget(plan: &SlabPlan, budget_bytes: u64) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// AST-level liveness analysis
+// ---------------------------------------------------------------------------
+
+/// Compute the byte size of a tensor type from its shape and dtype.
+/// Returns None if any dimension is non-concrete (symbolic, dynamic, etc.).
+pub fn compute_tensor_bytes(
+    shape: &nsl_semantic::types::Shape,
+    dtype: &nsl_semantic::types::DType,
+) -> Option<(u64, SizeKind)> {
+    let mut total_elems: u64 = 1;
+    for dim in &shape.dims {
+        match dim {
+            nsl_semantic::types::Dim::Concrete(n) => {
+                total_elems = total_elems.saturating_mul(*n as u64);
+            }
+            nsl_semantic::types::Dim::Bounded { upper_bound, .. } => {
+                // Use upper bound for slab planning
+                let ub = *upper_bound as u64;
+                total_elems = total_elems.saturating_mul(ub);
+                let bytes = total_elems * dtype_byte_size(dtype);
+                return Some((bytes, SizeKind::Bounded {
+                    upper: bytes,
+                    symbolic_expr: format!("{:?}", shape),
+                }));
+            }
+            _ => return None, // Dynamic / Wildcard / Symbolic — can't plan
+        }
+    }
+    let bytes = total_elems * dtype_byte_size(dtype);
+    Some((bytes, SizeKind::Static(bytes)))
+}
+
+/// Return the byte size of a DType.
+fn dtype_byte_size(dtype: &nsl_semantic::types::DType) -> u64 {
+    use nsl_semantic::types::DType;
+    match dtype {
+        DType::F64 | DType::Int64 => 8,
+        DType::F32 | DType::Int32 => 4,
+        DType::Fp16 | DType::Bf16 | DType::Int16 => 2,
+        DType::Int8 | DType::Uint8 | DType::Bool => 1,
+        DType::Fp8E4m3 | DType::Fp8E5m2 => 1,
+        DType::Int4 => 1, // rounded up
+        DType::Custom(_) | DType::Unknown => 4, // default to f32 size for unknown dtypes
+    }
+}
+
+/// Walk top-level statements to discover tensor allocations and their lifetimes.
+///
+/// Returns a list of TensorAlloc records that can be fed into `plan_slab()`.
+/// Only considers tensor bindings with statically-known shapes.
+pub fn analyze_ast_liveness(
+    stmts: &[nsl_ast::stmt::Stmt],
+    type_map: &nsl_semantic::checker::TypeMap,
+    interner: &nsl_lexer::Interner,
+) -> Vec<TensorAlloc> {
+    let mut analyzer = LivenessAnalyzer::new();
+    let mut name_to_id: HashMap<String, TensorAllocId> = HashMap::new();
+
+    walk_stmts(stmts, type_map, interner, &mut analyzer, &mut name_to_id);
+
+    analyzer.finish()
+}
+
+fn walk_stmts(
+    stmts: &[nsl_ast::stmt::Stmt],
+    type_map: &nsl_semantic::checker::TypeMap,
+    interner: &nsl_lexer::Interner,
+    analyzer: &mut LivenessAnalyzer,
+    name_to_id: &mut HashMap<String, TensorAllocId>,
+) {
+    for stmt in stmts {
+        walk_stmt(stmt, type_map, interner, analyzer, name_to_id);
+        analyzer.advance();
+    }
+}
+
+fn walk_stmt(
+    stmt: &nsl_ast::stmt::Stmt,
+    type_map: &nsl_semantic::checker::TypeMap,
+    interner: &nsl_lexer::Interner,
+    analyzer: &mut LivenessAnalyzer,
+    name_to_id: &mut HashMap<String, TensorAllocId>,
+) {
+    use nsl_ast::stmt::StmtKind;
+
+    match &stmt.kind {
+        StmtKind::VarDecl { pattern, value, .. } => {
+            // Record uses in the RHS expression
+            if let Some(expr) = value {
+                walk_expr_uses(expr, interner, analyzer, name_to_id);
+            }
+
+            // Check if this binding is a tensor with static shape
+            if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
+                if let Some(name_str) = interner.resolve(sym.0) {
+                    let name = name_str.to_string();
+                    // Type map stores types on expr IDs, not stmt IDs.
+                    // Check the RHS expression's type for tensor shape info.
+                    let expr_ty = value.as_ref().and_then(|v| type_map.get(&v.id));
+                    if let Some(ty) = expr_ty {
+                        if let Some((shape, dtype, _device)) = ty.as_tensor_parts() {
+                            if let Some((size_bytes, size_kind)) = compute_tensor_bytes(shape, dtype) {
+                                if size_bytes > 0 {
+                                    let loc = format!("byte {}", stmt.span.start.0);
+                                    analyzer.record_alloc(&name, size_bytes, size_kind, &loc);
+                                    let id = analyzer.current_pp();
+                                    name_to_id.insert(name, id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        StmtKind::Expr(expr) | StmtKind::Return(Some(expr)) => {
+            walk_expr_uses(expr, interner, analyzer, name_to_id);
+        }
+
+        StmtKind::Assign { target, value, .. } => {
+            walk_expr_uses(target, interner, analyzer, name_to_id);
+            walk_expr_uses(value, interner, analyzer, name_to_id);
+        }
+
+        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+            walk_expr_uses(condition, interner, analyzer, name_to_id);
+            walk_stmts(&then_block.stmts, type_map, interner, analyzer, name_to_id);
+            for (cond, block) in elif_clauses {
+                walk_expr_uses(cond, interner, analyzer, name_to_id);
+                walk_stmts(&block.stmts, type_map, interner, analyzer, name_to_id);
+            }
+            if let Some(block) = else_block {
+                walk_stmts(&block.stmts, type_map, interner, analyzer, name_to_id);
+            }
+        }
+
+        StmtKind::For { body, iterable, .. } => {
+            walk_expr_uses(iterable, interner, analyzer, name_to_id);
+            walk_stmts(&body.stmts, type_map, interner, analyzer, name_to_id);
+        }
+
+        StmtKind::While { condition, body } => {
+            walk_expr_uses(condition, interner, analyzer, name_to_id);
+            walk_stmts(&body.stmts, type_map, interner, analyzer, name_to_id);
+        }
+
+        _ => {} // FnDef, ModelDef, etc. handled separately
+    }
+}
+
+/// Walk an expression to record uses of tensor variables.
+fn walk_expr_uses(
+    expr: &nsl_ast::expr::Expr,
+    interner: &nsl_lexer::Interner,
+    analyzer: &mut LivenessAnalyzer,
+    name_to_id: &HashMap<String, TensorAllocId>,
+) {
+    use nsl_ast::expr::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Ident(sym) => {
+            if let Some(name) = interner.resolve(sym.0) {
+                if name_to_id.contains_key(name) {
+                    analyzer.record_use(name);
+                }
+            }
+        }
+
+        ExprKind::Call { callee, args, .. } => {
+            walk_expr_uses(callee, interner, analyzer, name_to_id);
+            for arg in args {
+                walk_expr_uses(&arg.value, interner, analyzer, name_to_id);
+            }
+        }
+
+        ExprKind::BinaryOp { left, right, .. } => {
+            walk_expr_uses(left, interner, analyzer, name_to_id);
+            walk_expr_uses(right, interner, analyzer, name_to_id);
+        }
+
+        ExprKind::UnaryOp { operand, .. } => {
+            walk_expr_uses(operand, interner, analyzer, name_to_id);
+        }
+
+        ExprKind::MemberAccess { object, .. } => {
+            walk_expr_uses(object, interner, analyzer, name_to_id);
+        }
+
+        ExprKind::Subscript { object, .. } => {
+            walk_expr_uses(object, interner, analyzer, name_to_id);
+        }
+
+        ExprKind::ListLiteral(items) | ExprKind::TupleLiteral(items) => {
+            for item in items {
+                walk_expr_uses(item, interner, analyzer, name_to_id);
+            }
+        }
+
+        ExprKind::Pipe { left, right, .. } => {
+            walk_expr_uses(left, interner, analyzer, name_to_id);
+            walk_expr_uses(right, interner, analyzer, name_to_id);
+        }
+
+        ExprKind::IfExpr { condition, then_expr, else_expr, .. } => {
+            walk_expr_uses(condition, interner, analyzer, name_to_id);
+            walk_expr_uses(then_expr, interner, analyzer, name_to_id);
+            walk_expr_uses(else_expr, interner, analyzer, name_to_id);
+        }
+
+        _ => {} // Literals, etc.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

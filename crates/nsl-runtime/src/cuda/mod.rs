@@ -134,11 +134,14 @@ pub(crate) mod inner {
 
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    /// Allocate unified memory (accessible from both CPU and GPU).
+    /// Allocate device memory (GPU-only, not accessible from CPU).
     /// Uses a size-bucketed pool to recycle recently freed allocations,
-    /// reducing cuMemAllocManaged syscall overhead and page table churn.
+    /// reducing cuMemAlloc syscall overhead.
+    ///
+    /// IMPORTANT: The returned pointer is a device pointer. CPU code must NOT
+    /// dereference it. Use `memcpy_htod` / `memcpy_dtoh` for data transfer.
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
-        // Try pool first — avoids expensive cuMemAllocManaged syscall
+        // Try pool first — avoids expensive cuMemAlloc syscall
         if let Some(ptr) = pool_try_alloc(size_bytes) {
             #[cfg(test)]
             crate::memory::stats::cuda_alloc(size_bytes);
@@ -155,22 +158,18 @@ pub(crate) mod inner {
         };
         unsafe {
             let mut ptr: CUdeviceptr = 0;
-            let result = cuMemAllocManaged(
-                &mut ptr,
-                actual_size,
-                CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL as u32,
-            );
+            let result = cuMemAlloc_v2(&mut ptr, actual_size);
             if result != CUresult::CUDA_SUCCESS {
                 let msg = if matches!(result, CUresult::CUDA_ERROR_ILLEGAL_ADDRESS) {
                     format!(
-                        "cuMemAllocManaged({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
+                        "cuMemAlloc({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
                          This is a DEFERRED error — a prior GPU kernel accessed invalid memory.\n\
                          To identify the failing kernel, re-run with: nsl run --cuda-sync <file>\n\
                          Allocation #{}", size_bytes, n
                     )
                 } else {
                     format!(
-                        "cuMemAllocManaged({} bytes) failed after {} allocs: {:?}",
+                        "cuMemAlloc({} bytes) failed after {} allocs: {:?}",
                         size_bytes, n, result
                     )
                 };
@@ -208,10 +207,8 @@ pub(crate) mod inner {
     }
 
     // ------------------------------------------------------------------
-    // Unified memory pool: caches freed allocations by size bucket to
-    // avoid repeated cuMemAllocManaged syscalls, which are expensive on
-    // Windows (page table operations) and cause OOM-like freezes when
-    // the OS can't reclaim pages fast enough.
+    // Device memory pool: caches freed allocations by size bucket to
+    // avoid repeated cuMemAlloc syscalls.
     //
     // Bucket strategy: round up to next power-of-2 so allocations of
     // similar sizes reuse the same pool entry. Pool is bounded per
@@ -285,7 +282,7 @@ pub(crate) mod inner {
         }
     }
 
-    /// Free unified memory allocated by alloc_managed.
+    /// Free device memory allocated by alloc_managed.
     /// Returns to pool if eligible, otherwise calls cuMemFree.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
@@ -383,7 +380,53 @@ pub(crate) mod inner {
         }
     }
 
+    /// Copy `size_bytes` bytes from device memory to host memory.
+    pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        ensure_context();
+        unsafe {
+            let result = cuMemcpyDtoH_v2(dst_host, src_device as CUdeviceptr, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyDtoH_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+        }
+    }
+
+    /// Copy `size_bytes` bytes from one device pointer to another.
+    pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        ensure_context();
+        unsafe {
+            let result = cuMemcpyDtoD_v2(dst_device as CUdeviceptr, src_device as CUdeviceptr, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyDtoD_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+        }
+    }
+
+    /// Zero-fill device memory.
+    pub(crate) fn memset_d8(device_ptr: *mut c_void, size_bytes: usize) {
+        ensure_context();
+        unsafe {
+            let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, 0, size_bytes);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemsetD8_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+        }
+    }
+
     /// Prefetch memory to device. Best-effort: silently ignores NOT_SUPPORTED.
+    /// NOTE: Only meaningful for unified memory. With device memory this is a no-op.
     pub(crate) fn prefetch_to_device(ptr: *mut c_void, size_bytes: usize, device_id: i32) {
         let state = state();
         let _guard = state.lock().unwrap();
@@ -524,8 +567,8 @@ pub(crate) mod inner {
             );
         }
 
-        // NOTE: cuCtxSynchronize removed — unified memory provides coherence,
-        // profiler flush performs single sync at program end
+        // NOTE: cuCtxSynchronize removed — same-stream kernels are implicitly
+        // ordered; profiler flush performs single sync at program end
         res
     }
 }
@@ -2250,24 +2293,25 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
     let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
 
-    // Upload shape, src_strides, and dst_strides to GPU-accessible memory
+    // Upload shape, src_strides, and dst_strides to device memory
     let arr_bytes = ndim * std::mem::size_of::<i64>();
 
-    let gpu_shape = inner::alloc_managed(arr_bytes) as *mut i64;
-    let gpu_src_strides = inner::alloc_managed(arr_bytes) as *mut i64;
-    let gpu_dst_strides = inner::alloc_managed(arr_bytes) as *mut i64;
+    let gpu_shape = inner::alloc_managed(arr_bytes);
+    let gpu_src_strides = inner::alloc_managed(arr_bytes);
+    let gpu_dst_strides = inner::alloc_managed(arr_bytes);
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(t.shape, gpu_shape, ndim);
-        std::ptr::copy_nonoverlapping(t.strides, gpu_src_strides, ndim);
-        std::ptr::copy_nonoverlapping(out_strides, gpu_dst_strides, ndim);
-    }
+    // Copy metadata from host to device via explicit memcpy
+    inner::memcpy_htod(gpu_shape, t.shape as *const c_void, arr_bytes);
+    inner::memcpy_htod(gpu_src_strides, t.strides as *const c_void, arr_bytes);
+    inner::memcpy_htod(gpu_dst_strides, out_strides as *const c_void, arr_bytes);
 
     let mut src_data = t.data as u64;
     let mut dst_data = out_data as u64;
     let mut shape_val = gpu_shape as u64;
     let mut src_str_val = gpu_src_strides as u64;
     let mut dst_str_val = gpu_dst_strides as u64;
+    #[allow(unused)]
+    let _ = (&shape_val, &src_str_val, &dst_str_val); // used as kernel args below
     let mut ndim_val = ndim as u64;
     let mut total_val = total;
 
@@ -2292,9 +2336,9 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
     // Free GPU metadata arrays
-    inner::free_managed(gpu_shape as *mut c_void);
-    inner::free_managed(gpu_src_strides as *mut c_void);
-    inner::free_managed(gpu_dst_strides as *mut c_void);
+    inner::free_managed(gpu_shape);
+    inner::free_managed(gpu_src_strides);
+    inner::free_managed(gpu_dst_strides);
 
     let out = Box::new(NslTensor::new(
         out_data, out_shape, out_strides,

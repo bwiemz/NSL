@@ -85,19 +85,43 @@ pub fn compile(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M36: Memory planner — compile-time slab allocation for GPU tensors.
+    // Run BEFORE compile_main so the slab plan is available during codegen.
+    {
+        use crate::memory_planner::*;
+        let allocs = analyze_ast_liveness(&ast.stmts, type_map, interner);
+        if !allocs.is_empty() {
+            let plannable: Vec<_> = allocs.iter().filter(|a| a.is_plannable()).cloned().collect();
+            if !plannable.is_empty() {
+                let graph = InterferenceGraph::build(&plannable);
+                let plan = plan_slab(&plannable, &graph);
+
+                if options.memory_report || plan.total_bytes > 0 {
+                    let report = format_memory_report(&allocs, &plan);
+                    eprintln!("[nsl] {}", report);
+                }
+
+                if let Some(budget) = options.vram_budget {
+                    if let Some(err_msg) = check_vram_budget(&plan, budget) {
+                        return Err(crate::error::CodegenError::new(err_msg));
+                    }
+                }
+
+                // Build name → offset map for codegen
+                for alloc in &plannable {
+                    if let Some(&(_slot_id, offset)) = plan.assignments.get(&alloc.id) {
+                        compiler.slab_name_offsets.insert(alloc.name.clone(), offset);
+                    }
+                }
+                compiler.slab_plan = Some(plan);
+            }
+        } else if options.memory_report {
+            eprintln!("[nsl] Memory plan: no static-shape tensor allocations found");
+        }
+    }
+
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
-
-    // M36: Memory planner integration
-    // The memory planner requires TensorAlloc records populated during codegen.
-    // TODO: Integrate planner.record_alloc() calls into tensor creation codegen,
-    // then invoke plan_slab() here. For now, report that the flags are recognized.
-    if let Some(budget) = options.vram_budget {
-        eprintln!("[nsl] --vram-budget set to {} bytes (planner integration in progress)", budget);
-    }
-    if options.memory_report {
-        eprintln!("[nsl] --memory-report requested (planner integration in progress)");
-    }
 
     // M53: Run WCET analysis for @real_time functions (after codegen, before finalize)
     if compiler.compile_options.wcet_enabled {

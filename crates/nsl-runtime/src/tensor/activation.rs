@@ -455,10 +455,10 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned
+    // FBIP: mutate in-place when uniquely owned (skip for i32 — needs dtype conversion)
     {
         let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
-        if t.can_mutate_inplace() {
+        if t.dtype != 4 && t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -481,7 +481,19 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let data: *mut c_void = if a.dtype == 1 {
+    // Output dtype: i32 inputs produce f32 output (clamp converts int→float)
+    let out_dtype = if a.dtype == 4 { 1u16 } else { a.dtype };
+    let data: *mut c_void = if a.dtype == 4 {
+        // i32 → f32 with clamping (used for token ID masking in cross_entropy)
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        let (mn, mx) = (min_val as f32, max_val as f32);
+        let src = a.data as *const i32;
+        for i in 0..len as usize {
+            let val = unsafe { *src.add(i) } as f32;
+            unsafe { *buf.add(i) = val.clamp(mn, mx) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == 1 {
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let (mn, mx) = (min_val as f32, max_val as f32);
         for i in 0..len as usize {
@@ -505,7 +517,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
         ndim,
         len,
         a.device,
-        a.dtype,
+        out_dtype,
         1,
         0,
     ));

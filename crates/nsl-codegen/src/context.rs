@@ -71,6 +71,9 @@ pub struct FuncState {
     /// When a binding is referenced exactly once, the codegen can emit in-place
     /// op variants and skip clones.
     pub use_counts: Option<crate::use_count::UseCountMap>,
+    /// M36: Cranelift Variable holding the GPU slab base pointer (from nsl_gpu_slab_init).
+    /// When Some, slab-planned tensors use offsets into this slab instead of alloc_managed.
+    pub slab_ptr_var: Option<Variable>,
 }
 
 impl Default for FuncState {
@@ -99,6 +102,7 @@ impl FuncState {
             ownership_lowering: None,
             is_fp8_compute: false,
             use_counts: None,
+            slab_ptr_var: None,
         }
     }
 

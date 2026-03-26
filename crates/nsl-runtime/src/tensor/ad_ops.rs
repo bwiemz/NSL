@@ -698,6 +698,230 @@ pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// 9. nsl_tensor_batchnorm — batch normalization (normalizes over dim 0)
+// ---------------------------------------------------------------------------
+
+/// BatchNorm: normalize over the batch dimension (dim=0).
+/// `input` shape [B, C, ...], `gamma` shape [C], `beta` shape [C].
+/// For each channel c: out[:, c, ...] = gamma[c] * (x[:, c, ...] - mean_c) / sqrt(var_c + eps) + beta[c]
+/// where mean_c and var_c are computed over the batch dimension.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_batchnorm(
+    input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, eps: f64, _training: i64,
+) -> i64 {
+    let t_c = nsl_tensor_contiguous(input_ptr);
+    let inp = NslTensor::from_ptr(t_c);
+    let g = NslTensor::from_ptr(gamma_ptr);
+    let b = NslTensor::from_ptr(beta_ptr);
+
+    let ndim = inp.ndim as usize;
+    let len = inp.len as usize;
+    let dtype = inp.dtype;
+    let shape_slice = unsafe { std::slice::from_raw_parts(inp.shape, ndim) };
+
+    // batch_size = shape[0], channels = shape[1], spatial = product of shape[2..]
+    let batch = if ndim > 0 { shape_slice[0] as usize } else { 1 };
+    let channels = if ndim > 1 { shape_slice[1] as usize } else { len / batch.max(1) };
+    let spatial: usize = shape_slice[2..].iter().map(|&d| d as usize).product::<usize>().max(1);
+
+    let elem_size = if dtype == 1 { 4 } else { 8 };
+    let out_data = checked_alloc(len * elem_size);
+
+    if dtype == 1 {
+        let src = inp.data as *const f32;
+        let dst = out_data as *mut f32;
+        let gamma_data = g.data as *const f32;
+        let beta_data = b.data as *const f32;
+        let eps_f = eps as f32;
+
+        for c in 0..channels {
+            // Compute mean and variance over batch and spatial dims
+            let mut sum = 0.0_f32;
+            let count = (batch * spatial) as f32;
+            for n in 0..batch {
+                for s in 0..spatial {
+                    let idx = n * channels * spatial + c * spatial + s;
+                    sum += unsafe { *src.add(idx) };
+                }
+            }
+            let mean = sum / count;
+
+            let mut var_sum = 0.0_f32;
+            for n in 0..batch {
+                for s in 0..spatial {
+                    let idx = n * channels * spatial + c * spatial + s;
+                    let diff = unsafe { *src.add(idx) } - mean;
+                    var_sum += diff * diff;
+                }
+            }
+            let var = var_sum / count;
+            let rstd = 1.0 / (var + eps_f).sqrt();
+
+            let gc = if c < g.len as usize { unsafe { *gamma_data.add(c) } } else { 1.0 };
+            let bc = if c < b.len as usize { unsafe { *beta_data.add(c) } } else { 0.0 };
+
+            for n in 0..batch {
+                for s in 0..spatial {
+                    let idx = n * channels * spatial + c * spatial + s;
+                    let x = unsafe { *src.add(idx) };
+                    unsafe { *dst.add(idx) = gc * (x - mean) * rstd + bc };
+                }
+            }
+        }
+    } else {
+        let src = inp.data as *const f64;
+        let dst = out_data as *mut f64;
+        let gamma_data = g.data as *const f64;
+        let beta_data = b.data as *const f64;
+
+        for c in 0..channels {
+            let mut sum = 0.0_f64;
+            let count = (batch * spatial) as f64;
+            for n in 0..batch {
+                for s in 0..spatial {
+                    let idx = n * channels * spatial + c * spatial + s;
+                    sum += unsafe { *src.add(idx) };
+                }
+            }
+            let mean = sum / count;
+
+            let mut var_sum = 0.0_f64;
+            for n in 0..batch {
+                for s in 0..spatial {
+                    let idx = n * channels * spatial + c * spatial + s;
+                    let diff = unsafe { *src.add(idx) } - mean;
+                    var_sum += diff * diff;
+                }
+            }
+            let var = var_sum / count;
+            let rstd = 1.0 / (var + eps).sqrt();
+
+            let gc = if c < g.len as usize { unsafe { *gamma_data.add(c) } } else { 1.0 };
+            let bc = if c < b.len as usize { unsafe { *beta_data.add(c) } } else { 0.0 };
+
+            for n in 0..batch {
+                for s in 0..spatial {
+                    let idx = n * channels * spatial + c * spatial + s;
+                    let x = unsafe { *src.add(idx) };
+                    unsafe { *dst.add(idx) = gc * (x - mean) * rstd + bc };
+                }
+            }
+        }
+    }
+
+    let shape = NslTensor::copy_shape(inp.shape, inp.ndim);
+    let strides = NslTensor::compute_strides(shape, inp.ndim);
+    let result = Box::new(NslTensor::new(
+        out_data as *mut c_void, shape, strides, inp.ndim, len as i64, 0, dtype, 1, 0,
+    ));
+    let out = NslTensor::publish(result);
+    nsl_tensor_free(t_c);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 10. nsl_tensor_avgpool2d — average pooling
+// ---------------------------------------------------------------------------
+
+/// AvgPool2d: average pooling over the last 2 spatial dimensions.
+/// Input shape: [B, C, H, W]. Output shape: [B, C, H/kernel, W/kernel].
+#[no_mangle]
+pub extern "C" fn nsl_tensor_avgpool2d(
+    input_ptr: i64, kernel_h: i64, kernel_w: i64, stride: i64, padding: i64,
+) -> i64 {
+    let t_c = nsl_tensor_contiguous(input_ptr);
+    let inp = NslTensor::from_ptr(t_c);
+    let ndim = inp.ndim as usize;
+    let dtype = inp.dtype;
+    let shape_slice = unsafe { std::slice::from_raw_parts(inp.shape, ndim) };
+
+    let kh = kernel_h as usize;
+    let kw = kernel_w as usize;
+    let s = stride as usize;
+    let p = padding as usize;
+
+    // Assume NCHW layout: [..., H, W]
+    let h_in = shape_slice[ndim - 2] as usize;
+    let w_in = shape_slice[ndim - 1] as usize;
+    let h_out = (h_in + 2 * p - kh) / s + 1;
+    let w_out = (w_in + 2 * p - kw) / s + 1;
+
+    // Outer dims = product of all dims except last 2
+    let outer: usize = shape_slice[..ndim - 2].iter().map(|&d| d as usize).product::<usize>().max(1);
+    let total_out = outer * h_out * w_out;
+
+    let elem_size = if dtype == 1 { 4 } else { 8 };
+    let out_data = checked_alloc(total_out * elem_size);
+
+    if dtype == 1 {
+        let src = inp.data as *const f32;
+        let dst = out_data as *mut f32;
+        let pool_area = (kh * kw) as f32;
+
+        for o in 0..outer {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut sum = 0.0_f32;
+                    for khr in 0..kh {
+                        for kwr in 0..kw {
+                            let ih = oh * s + khr;
+                            let iw = ow * s + kwr;
+                            if ih < h_in + 2 * p && iw < w_in + 2 * p {
+                                let ih_actual = ih.wrapping_sub(p);
+                                let iw_actual = iw.wrapping_sub(p);
+                                if ih_actual < h_in && iw_actual < w_in {
+                                    sum += unsafe { *src.add(o * h_in * w_in + ih_actual * w_in + iw_actual) };
+                                }
+                            }
+                        }
+                    }
+                    unsafe { *dst.add(o * h_out * w_out + oh * w_out + ow) = sum / pool_area };
+                }
+            }
+        }
+    } else {
+        let src = inp.data as *const f64;
+        let dst = out_data as *mut f64;
+        let pool_area = (kh * kw) as f64;
+
+        for o in 0..outer {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut sum = 0.0_f64;
+                    for khr in 0..kh {
+                        for kwr in 0..kw {
+                            let ih = oh * s + khr;
+                            let iw = ow * s + kwr;
+                            let ih_actual = ih.wrapping_sub(p);
+                            let iw_actual = iw.wrapping_sub(p);
+                            if ih_actual < h_in && iw_actual < w_in {
+                                sum += unsafe { *src.add(o * h_in * w_in + ih_actual * w_in + iw_actual) };
+                            }
+                        }
+                    }
+                    unsafe { *dst.add(o * h_out * w_out + oh * w_out + ow) = sum / pool_area };
+                }
+            }
+        }
+    }
+
+    // Build output shape: replace last 2 dims with h_out, w_out
+    let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim - 2 {
+        unsafe { *out_shape.add(i) = shape_slice[i] };
+    }
+    unsafe { *out_shape.add(ndim - 2) = h_out as i64 };
+    unsafe { *out_shape.add(ndim - 1) = w_out as i64 };
+    let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
+    let result = Box::new(NslTensor::new(
+        out_data as *mut c_void, out_shape, out_strides, ndim as i64, total_out as i64, 0, dtype, 1, 0,
+    ));
+    let out = NslTensor::publish(result);
+    nsl_tensor_free(t_c);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

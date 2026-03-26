@@ -15,6 +15,7 @@ use crate::tensor::{
     nsl_tensor_shape as tensor_shape,
     nsl_tensor_sign as tensor_sign,
     nsl_tensor_sum_dim as nsl_tensor_sum_dim,
+    nsl_tensor_to_device,
     nsl_tensor_transpose as tensor_transpose,
     nsl_tensor_zeros as tensor_zeros,
     NslTensor,
@@ -266,11 +267,19 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
 fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
     let out = NslTensor::from_ptr(out_ptr);
-    let on_gpu = grad.device > 0;
+    // Device memory: transfer to CPU, compute backward, transfer result back
     #[cfg(feature = "cuda")]
-    if on_gpu {
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    if grad.device > 0 {
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let out_cpu = nsl_tensor_to_device(out_ptr, 0);
+        let result_cpu = softmax_backward(grad_cpu, out_cpu, dim);
+        let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(out_cpu);
+        nsl_tensor_free(result_cpu);
+        return result_gpu;
     }
+
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
@@ -278,14 +287,7 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_size = len * elem_size;
-    let data_raw: *mut c_void = if on_gpu {
-        #[cfg(feature = "cuda")]
-        { crate::cuda::inner::alloc_managed(data_size) }
-        #[cfg(not(feature = "cuda"))]
-        { crate::memory::checked_alloc_zeroed(data_size) as *mut c_void }
-    } else {
-        crate::memory::checked_alloc_zeroed(data_size) as *mut c_void
-    };
+    let data_raw: *mut c_void = crate::memory::checked_alloc_zeroed(data_size) as *mut c_void;
 
     let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
     let o_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.shape.add(i) }).collect();
@@ -341,6 +343,18 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
 /// Slice backward: create zeros with input_shape, copy grad into the [start, start+slice_len) region along dim.
 fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+
+    // Device memory: transfer to CPU, compute, transfer back
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let result_cpu = slice_backward(grad_cpu, input_shape, dim, start);
+        let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(result_cpu);
+        return result_gpu;
+    }
+
     let ndim = input_shape.len();
 
     let grad_dtype = grad.dtype;
@@ -381,6 +395,22 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
 /// Cat backward: split the gradient along the cat dim into pieces matching the original input sizes.
 fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
     let grad = NslTensor::from_ptr(grad_ptr);
+
+    // Device memory: transfer to CPU, compute, transfer results back
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        let device = grad.device;
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let cpu_results = cat_backward(grad_cpu, dim, split_sizes);
+        let gpu_results: Vec<i64> = cpu_results.iter().map(|&r| {
+            let gpu_r = nsl_tensor_to_device(r, device as i64);
+            nsl_tensor_free(r);
+            gpu_r
+        }).collect();
+        nsl_tensor_free(grad_cpu);
+        return gpu_results;
+    }
+
     let ndim = grad.ndim as usize;
     let grad_dtype = grad.dtype;
 
@@ -447,7 +477,25 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
     let out_device = grad.device;
     #[cfg(feature = "cuda")]
     if out_device > 0 {
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        // Device memory: transfer all tensors to CPU, compute, transfer results back
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let input_cpu = nsl_tensor_to_device(input_ptr, 0);
+        let mean_cpu = nsl_tensor_to_device(mean_ptr, 0);
+        let inv_std_cpu = nsl_tensor_to_device(inv_std_ptr, 0);
+        let weight_cpu = nsl_tensor_to_device(weight_ptr, 0);
+        let (dx_cpu, dw_cpu, db_cpu) = layernorm_backward(grad_cpu, input_cpu, mean_cpu, inv_std_cpu, weight_cpu);
+        let dx_gpu = nsl_tensor_to_device(dx_cpu, out_device as i64);
+        let dw_gpu = nsl_tensor_to_device(dw_cpu, out_device as i64);
+        let db_gpu = nsl_tensor_to_device(db_cpu, out_device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(input_cpu);
+        nsl_tensor_free(mean_cpu);
+        nsl_tensor_free(inv_std_cpu);
+        nsl_tensor_free(weight_cpu);
+        nsl_tensor_free(dx_cpu);
+        nsl_tensor_free(dw_cpu);
+        nsl_tensor_free(db_cpu);
+        return (dx_gpu, dw_gpu, db_gpu);
     }
 
     let in_dtype = input.dtype;
@@ -541,7 +589,21 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
     let out_device = grad.device;
     #[cfg(feature = "cuda")]
     if out_device > 0 {
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        // Device memory: transfer all tensors to CPU, compute, transfer results back
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let input_cpu = nsl_tensor_to_device(input_ptr, 0);
+        let rms_cpu = nsl_tensor_to_device(rms_ptr, 0);
+        let weight_cpu = nsl_tensor_to_device(weight_ptr, 0);
+        let (dx_cpu, dw_cpu) = rmsnorm_backward(grad_cpu, input_cpu, rms_cpu, weight_cpu);
+        let dx_gpu = nsl_tensor_to_device(dx_cpu, out_device as i64);
+        let dw_gpu = nsl_tensor_to_device(dw_cpu, out_device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(input_cpu);
+        nsl_tensor_free(rms_cpu);
+        nsl_tensor_free(weight_cpu);
+        nsl_tensor_free(dx_cpu);
+        nsl_tensor_free(dw_cpu);
+        return (dx_gpu, dw_gpu);
     }
 
     let in_dtype = input.dtype;
@@ -612,6 +674,20 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
     let mask = NslTensor::from_ptr(mask_ptr); // always f64
+
+    // Device memory: transfer to CPU, compute, transfer back
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let mask_cpu = nsl_tensor_to_device(mask_ptr, 0);
+        let result_cpu = dropout_backward(grad_cpu, mask_cpu, scale);
+        let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(mask_cpu);
+        nsl_tensor_free(result_cpu);
+        return result_gpu;
+    }
+
     let len = grad.len as usize;
     let ndim = grad.ndim;
     let grad_dtype = grad.dtype;
@@ -661,6 +737,26 @@ fn conv2d_backward(
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let weight = NslTensor::from_ptr(weight_ptr);
+
+    // Device memory: transfer to CPU, compute, transfer back
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        let device = grad.device;
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let input_cpu = nsl_tensor_to_device(input_ptr, 0);
+        let weight_cpu = nsl_tensor_to_device(weight_ptr, 0);
+        let (dx_cpu, dw_cpu, db_cpu) = conv2d_backward(grad_cpu, input_cpu, weight_cpu, stride_h, stride_w, pad_h, pad_w);
+        let dx_gpu = nsl_tensor_to_device(dx_cpu, device as i64);
+        let dw_gpu = nsl_tensor_to_device(dw_cpu, device as i64);
+        let db_gpu = nsl_tensor_to_device(db_cpu, device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(input_cpu);
+        nsl_tensor_free(weight_cpu);
+        nsl_tensor_free(dx_cpu);
+        nsl_tensor_free(dw_cpu);
+        nsl_tensor_free(db_cpu);
+        return (dx_gpu, dw_gpu, db_gpu);
+    }
 
     let n = unsafe { *input.shape.add(0) } as usize;
     let c_in = unsafe { *input.shape.add(1) } as usize;
@@ -752,6 +848,18 @@ fn conv2d_backward(
 /// MaxPool2d backward: scatter gradient to argmax positions
 fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+
+    // Device memory: transfer to CPU, compute, transfer back
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let result_cpu = maxpool2d_backward(grad_cpu, input_shape, argmax);
+        let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
+        nsl_tensor_free(grad_cpu);
+        nsl_tensor_free(result_cpu);
+        return result_gpu;
+    }
+
     let grad_dtype = grad.dtype;
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
@@ -1081,8 +1189,17 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             TapeOp::EmbeddingLookup { weight, indices: _, out, saved_weight, saved_indices } => {
                 // Backward: scatter-add output gradient rows into weight gradient
                 if let Some(&g) = grad_map.get(out) {
+                    // Transfer to CPU for backward computation if on GPU
+                    let g_device = crate::tensor::NslTensor::from_ptr(g).device;
+                    let (g_cpu, g_needs_free) = if g_device > 0 {
+                        (nsl_tensor_to_device(g, 0), true)
+                    } else { (g, false) };
+                    let (idx_cpu, idx_needs_free) = if crate::tensor::NslTensor::from_ptr(*saved_indices).device > 0 {
+                        (nsl_tensor_to_device(*saved_indices, 0), true)
+                    } else { (*saved_indices, false) };
+
                     let w = crate::tensor::NslTensor::from_ptr(*saved_weight);
-                    let idx_t = crate::tensor::NslTensor::from_ptr(*saved_indices);
+                    let idx_t = crate::tensor::NslTensor::from_ptr(idx_cpu);
                     let vocab_size = unsafe { *w.shape.add(0) } as usize;
                     let embed_dim = unsafe { *w.shape.add(1) } as usize;
                     let total_indices = idx_t.len as usize;
@@ -1092,7 +1209,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     crate::list::nsl_list_free(w_shape_list);
 
                     let grad_w_t = crate::tensor::NslTensor::from_ptr(grad_w);
-                    let g_t = crate::tensor::NslTensor::from_ptr(g);
+                    let g_t = crate::tensor::NslTensor::from_ptr(g_cpu);
                     let grad_w_dtype = grad_w_t.dtype;
 
                     for i in 0..total_indices {
@@ -1111,13 +1228,22 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         }
                     }
 
+                    if g_needs_free { tensor_free(g_cpu); }
+                    if idx_needs_free { tensor_free(idx_cpu); }
+
                     // Eagerly free saved tensors
                     tensor_free(*saved_weight);
                     tensor_free(*saved_indices);
                     *saved_weight = 0;
                     *saved_indices = 0;
 
-                    accumulate_grad(&mut grad_map, *weight, grad_w);
+                    // Transfer grad_w to GPU if needed
+                    let final_grad_w = if g_device > 0 {
+                        let gpu_gw = nsl_tensor_to_device(grad_w, g_device as i64);
+                        tensor_free(grad_w);
+                        gpu_gw
+                    } else { grad_w };
+                    accumulate_grad(&mut grad_map, *weight, final_grad_w);
                 }
             }
             TapeOp::Cat { inputs, out, dim, split_sizes } => {
@@ -1288,7 +1414,13 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *tensor, grad_tensor);
 
                     // grad for bias = sum over batch dim (rows)
-                    let g_t = crate::tensor::NslTensor::from_ptr(g);
+                    let g_t_raw = crate::tensor::NslTensor::from_ptr(g);
+                    let g_device_bias = g_t_raw.device;
+                    // Transfer to CPU if on GPU
+                    let (g_bias_cpu, g_bias_free) = if g_device_bias > 0 {
+                        (nsl_tensor_to_device(g, 0), true)
+                    } else { (g, false) };
+                    let g_t = crate::tensor::NslTensor::from_ptr(g_bias_cpu);
                     if g_t.ndim < 2 {
                         eprintln!("nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
                         std::process::abort();
@@ -1310,8 +1442,15 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                             }
                         }
                     }
+                    if g_bias_free { tensor_free(g_bias_cpu); }
 
-                    accumulate_grad(&mut grad_map, *bias, grad_bias);
+                    // Transfer bias grad to GPU if needed
+                    let final_grad_bias = if g_device_bias > 0 {
+                        let gpu_gb = nsl_tensor_to_device(grad_bias, g_device_bias as i64);
+                        tensor_free(grad_bias);
+                        gpu_gb
+                    } else { grad_bias };
+                    accumulate_grad(&mut grad_map, *bias, final_grad_bias);
                 }
             }
             TapeOp::Fp8MatMul { a, b, out, saved_a, saved_b, scale_a, scale_b, k_dim, device } => {
@@ -1389,6 +1528,13 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
             continue;
         }
         let grad = NslTensor::from_ptr(grad_ptr);
+        // Device memory: transfer to CPU for reading
+        let (actual_ptr, needs_free) = if grad.device > 0 {
+            (nsl_tensor_to_device(grad_ptr, 0), true)
+        } else {
+            (grad_ptr, false)
+        };
+        let grad = NslTensor::from_ptr(actual_ptr);
         let len = grad.len as usize;
         let mut sum_abs: f64 = 0.0;
         let mut has_nan = false;
@@ -1423,5 +1569,6 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
             "ok"
         };
         eprintln!("  param[{}]: sum|grad|={:.6e}  len={}  [{}]", i, sum_abs, len, status);
+        if needs_free { tensor_free(actual_ptr); }
     }
 }

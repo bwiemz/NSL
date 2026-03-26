@@ -197,10 +197,10 @@ fn lower_single_op(
             let e = builder.ins().f64const(*eps);
             call(compiler, builder, "nsl_tensor_layernorm", &[inputs[0], inputs[1], inputs[2], e])
         }
-        PrimalOp::BatchNorm { eps, .. } => {
-            // BatchNorm uses the same runtime signature as LayerNorm (input, gamma, beta, eps)
+        PrimalOp::BatchNorm { eps, training } => {
             let e = builder.ins().f64const(*eps);
-            call(compiler, builder, "nsl_tensor_layernorm", &[inputs[0], inputs[1], inputs[2], e])
+            let t = builder.ins().iconst(cl_types::I64, if *training { 1 } else { 0 });
+            call(compiler, builder, "nsl_tensor_batchnorm", &[inputs[0], inputs[1], inputs[2], e, t])
         }
 
         // === Convolution (3 ops) ===
@@ -242,12 +242,11 @@ fn lower_single_op(
             call(compiler, builder, "nsl_tensor_maxpool2d", &[inputs[0], kh, kw, s, p])
         }
         PrimalOp::AvgPool2d { kernel, stride } => {
-            // Approximate: use maxpool2d runtime (AvgPool backward uses Repeat op instead)
             let kh = builder.ins().iconst(cl_types::I64, *kernel as i64);
             let kw = builder.ins().iconst(cl_types::I64, *kernel as i64);
             let s = builder.ins().iconst(cl_types::I64, *stride as i64);
             let p = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_maxpool2d", &[inputs[0], kh, kw, s, p])
+            call(compiler, builder, "nsl_tensor_avgpool2d", &[inputs[0], kh, kw, s, p])
         }
 
         // === Loss functions (3 ops) ===

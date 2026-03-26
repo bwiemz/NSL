@@ -220,6 +220,9 @@ pub struct Compiler<'a> {
 
     // ── Memory planning (M36) ────────────────────────────────────────
     pub slab_plan: Option<crate::memory_planner::SlabPlan>,
+    /// Maps tensor variable name → byte offset in the GPU slab.
+    /// Populated by the memory planner before compile_main.
+    pub slab_name_offsets: HashMap<String, u64>,
 
     // ── Feature configs (M30-M55 decorators) ─────────────────────────
     /// All feature-specific decorator state extracted into a single sub-struct.
@@ -341,6 +344,7 @@ impl<'a> Compiler<'a> {
             fusion_report_enabled: options.fusion_report,
             disable_fusion: options.disable_fusion || options.debug_training,
             slab_plan: None,
+            slab_name_offsets: HashMap::new(),
             features: FeatureConfigs::new(options),
         })
     }

@@ -122,12 +122,14 @@ pub(crate) fn allocate_f32_tensor(
         // GPU path (cuda feature)
         #[cfg(feature = "cuda")]
         {
-            let raw = crate::cuda::inner::alloc_managed((len as usize) * std::mem::size_of::<f32>());
-            // alloc_managed returns *mut c_void (unified memory); we can write from CPU
-            let f32_raw = raw as *mut f32;
-            unsafe {
-                std::ptr::copy_nonoverlapping(f32_data.as_ptr(), f32_raw, len as usize);
-            }
+            let data_size = (len as usize) * std::mem::size_of::<f32>();
+            let raw = crate::cuda::inner::alloc_managed(data_size);
+            // Device memory: copy from host via explicit memcpy
+            crate::cuda::inner::memcpy_htod(
+                raw,
+                f32_data.as_ptr() as *const std::ffi::c_void,
+                data_size,
+            );
             raw
         }
         #[cfg(not(feature = "cuda"))]

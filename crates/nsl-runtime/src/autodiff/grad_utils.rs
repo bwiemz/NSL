@@ -89,8 +89,8 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
     Box::into_raw(tensor) as i64
 }
 
-/// Like `create_tensor_with_shape_dtype` but allocates data in unified CUDA memory when device > 0.
-/// This allows CPU code to populate the tensor while the result is accessible on GPU.
+/// Like `create_tensor_with_shape_dtype` but allocates data in device memory when device > 0.
+/// Uses memcpy_htod for initialization since device memory is not CPU-accessible.
 pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u16, device: u8) -> i64 {
     use crate::memory::checked_alloc_zeroed;
 
@@ -116,22 +116,26 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
     let data_raw: *mut c_void = {
         #[cfg(feature = "cuda")]
         {
-            // Allocate in unified memory (zero-initialized via CUDA managed memory semantics).
-            // cuMemAllocManaged does not guarantee zero-init, so we zero it explicitly.
+            // Allocate device memory and initialize via explicit memcpy
             let ptr = crate::cuda::inner::alloc_managed(data_size);
-            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, data_size) };
-            if fill != 0.0 {
+            if fill == 0.0 {
+                crate::cuda::inner::memset_d8(ptr, data_size);
+            } else {
+                // Build fill data on CPU, then copy to device
+                let staging = crate::memory::checked_alloc(data_size);
                 if dtype == 1 {
-                    let fptr = ptr as *mut f32;
+                    let fptr = staging as *mut f32;
                     for i in 0..total as usize {
                         unsafe { *fptr.add(i) = fill as f32 };
                     }
                 } else {
-                    let fptr = ptr as *mut f64;
+                    let fptr = staging as *mut f64;
                     for i in 0..total as usize {
                         unsafe { *fptr.add(i) = fill };
                     }
                 }
+                crate::cuda::inner::memcpy_htod(ptr, staging as *const c_void, data_size);
+                crate::memory::checked_free(staging, data_size);
             }
             ptr
         }

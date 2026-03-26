@@ -523,14 +523,15 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
 
     // General N-D gather along dimension d:
     for o in 0..outer {
-        let idx = indices.read_index(o) as usize;
-        if idx >= gather_dim_size {
+        let raw_idx = indices.read_index(o);
+        if raw_idx < 0 || raw_idx as usize >= gather_dim_size {
             eprintln!(
                 "nsl: gather index {} out of bounds for dim {} with size {}",
-                idx, d, gather_dim_size
+                raw_idx, d, gather_dim_size
             );
             std::process::abort();
         }
+        let idx = raw_idx as usize;
         let in_base = o * gather_dim_size * inner + idx * inner;
         let out_base = o * inner;
         for k in 0..inner {

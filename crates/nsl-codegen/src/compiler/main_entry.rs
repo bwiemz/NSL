@@ -85,6 +85,20 @@ impl Compiler<'_> {
             // Register custom dtypes before user code runs
             self.emit_dtype_registration(&mut builder, stmts)?;
 
+            // M36: Initialize GPU memory slab if the planner computed a layout
+            let slab_ptr_var = if let Some(ref plan) = self.slab_plan {
+                if plan.total_bytes > 0 {
+                    let total = builder.ins().iconst(cl_types::I64, plan.total_bytes as i64);
+                    let slab_ptr = self.compile_call_by_name(&mut builder, "nsl_gpu_slab_init", &[total])?;
+                    // Store slab_ptr in a variable for slab_offset calls
+                    let var = state.new_variable();
+                    builder.declare_var(var, cl_types::I64);
+                    builder.def_var(var, slab_ptr);
+                    state.slab_ptr_var = Some(var);
+                    Some(var)
+                } else { None }
+            } else { None };
+
             for stmt in &top_level {
                 self.compile_stmt(&mut builder, &mut state, stmt)?;
             }
@@ -93,6 +107,10 @@ impl Compiler<'_> {
             if !crate::types::is_block_filled(&builder, current) {
                 // Stop and free any DataLoaders before implicit main() return
                 self.teardown_dataloaders(&mut builder, &mut state);
+                // M36: Destroy GPU memory slab before exit
+                if slab_ptr_var.is_some() {
+                    let _ = self.compile_call_by_name(&mut builder, "nsl_gpu_slab_destroy", &[]);
+                }
                 let zero = builder.ins().iconst(cl_types::I32, 0);
                 builder.ins().return_(&[zero]);
             }

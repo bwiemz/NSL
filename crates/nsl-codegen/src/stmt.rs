@@ -18,6 +18,96 @@ use crate::error::CodegenError;
 use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
 
 impl Compiler<'_> {
+    /// M36: Try to compile a tensor creation as a slab-managed allocation.
+    /// Returns Ok(Some(value)) if the variable is slab-planned and the RHS is a
+    /// tensor creation (zeros, ones, etc.). Returns Ok(None) to fall through to normal codegen.
+    fn try_compile_slab_tensor(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        sym: &nsl_ast::Symbol,
+        expr: &nsl_ast::expr::Expr,
+    ) -> Result<Option<Value>, CodegenError> {
+        // Check if slab is active and this variable is planned
+        let slab_var = match state.slab_ptr_var {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let var_name = match self.interner.resolve(sym.0) {
+            Some(n) => n.to_string(),
+            None => return Ok(None),
+        };
+        let offset = match self.slab_name_offsets.get(&var_name) {
+            Some(&o) => o,
+            None => return Ok(None),
+        };
+
+        // Check if the RHS is a tensor creation call (zeros, ones, rand, zeros_on)
+        let is_tensor_creation = match &expr.kind {
+            ExprKind::Call { callee, .. } => {
+                match &callee.kind {
+                    ExprKind::Ident(func_sym) => {
+                        let func_name = self.interner.resolve(func_sym.0).unwrap_or("");
+                        matches!(func_name, "zeros" | "ones" | "rand" | "randn" | "zeros_like")
+                    }
+                    _ => false,
+                }
+            }
+            // zeros_on is typically a method call: Tensor.zeros_on(shape, device)
+            _ => false,
+        };
+
+        if !is_tensor_creation {
+            return Ok(None);
+        }
+
+        // Extract the shape argument from the call
+        let shape_val = if let ExprKind::Call { args, .. } = &expr.kind {
+            if args.is_empty() {
+                return Ok(None);
+            }
+            self.compile_expr(builder, state, &args[0].value)?
+        } else {
+            return Ok(None);
+        };
+
+        // Compute data pointer: slab_base + offset
+        let slab_ptr = builder.use_var(slab_var);
+        let offset_val = builder.ins().iconst(cl_types::I64, offset as i64);
+        let data_ptr = self.compile_call_by_name(builder, "nsl_slab_offset", &[slab_ptr, offset_val])?;
+
+        // Determine device and dtype from the expression type
+        let (device, dtype) = if let Some(ty) = self.type_map.get(&expr.id) {
+            if let Some((_shape, dt, dev)) = ty.as_tensor_parts() {
+                let dev_val = match dev {
+                    nsl_semantic::types::Device::Cuda(_) => 1i64,
+                    nsl_semantic::types::Device::Cpu => 0i64,
+                    _ => 0i64,
+                };
+                let dt_val = match dt {
+                    nsl_semantic::types::DType::F32 => 1i64,
+                    nsl_semantic::types::DType::F64 => 0i64,
+                    _ => 1i64, // default GPU dtype
+                };
+                (dev_val, dt_val)
+            } else {
+                (0, 1) // fallback
+            }
+        } else {
+            (0, 1)
+        };
+
+        let device_val = builder.ins().iconst(cl_types::I64, device);
+        let dtype_val = builder.ins().iconst(cl_types::I64, dtype);
+
+        let tensor = self.compile_call_by_name(
+            builder, "nsl_tensor_from_slab",
+            &[data_ptr, shape_val, device_val, dtype_val],
+        )?;
+
+        Ok(Some(tensor))
+    }
+
     pub fn compile_stmt(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -40,7 +130,12 @@ impl Compiler<'_> {
                     PatternKind::Ident(sym) => {
                         let sym = *sym;
                         let init_val = if let Some(expr) = value {
-                            self.compile_expr(builder, state, expr)?
+                            // M36: Check if this variable is slab-planned for zero-alloc
+                            let slab_result = self.try_compile_slab_tensor(builder, state, &sym, expr);
+                            match slab_result {
+                                Ok(Some(val)) => val, // Slab allocation succeeded
+                                _ => self.compile_expr(builder, state, expr)?, // Normal path
+                            }
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
