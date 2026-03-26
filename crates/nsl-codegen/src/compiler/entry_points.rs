@@ -166,7 +166,7 @@ pub fn compile_with_zk_info(
     type_map: &TypeMap,
     dump_ir: bool,
     options: &crate::CompileOptions,
-) -> Result<(Vec<u8>, HashMap<String, crate::zk::backend::ZkMode>), CodegenError> {
+) -> Result<(Vec<u8>, HashMap<String, crate::zk::backend::ZkMode>, Vec<(String, crate::zk::ZkCompileResult)>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
 
     // M52: Load weights if --weights was provided
@@ -255,9 +255,24 @@ pub fn compile_with_zk_info(
     let zk_proof_fns = compiler.features.zk_proof_fns.clone();
 
     // M55: Compile @zk_proof functions to ZK circuits
+    let mut zk_results: Vec<(String, crate::zk::ZkCompileResult)> = Vec::new();
     for (fn_name, mode) in &zk_proof_fns {
         if let Some(fn_def) = compiler.features.zk_fn_defs.get(fn_name) {
-            let zk_config = crate::zk::backend::ZkConfig::default();
+            let zk_config = {
+                let mut cfg = crate::zk::backend::ZkConfig::default();
+                // Wire --zk-backend flag to select backend
+                cfg.backend = match compiler.compile_options.zk_backend.to_lowercase().as_str() {
+                    "plonky3" | "fri" => crate::zk::backend::ZkBackendType::Plonky3,
+                    "halo2" => crate::zk::backend::ZkBackendType::Halo2,
+                    "folding" | "nova" | "" => crate::zk::backend::ZkBackendType::Folding,
+                    other => {
+                        eprintln!("[nsl] warning: unknown ZK backend '{}', using folding", other);
+                        crate::zk::backend::ZkBackendType::Folding
+                    }
+                };
+                cfg.emit_solidity = compiler.compile_options.zk_solidity;
+                cfg
+            };
             match crate::zk::compile_zk(fn_def, mode.clone(), &zk_config, type_map, interner) {
                 Ok(result) => {
                     eprintln!(
@@ -266,6 +281,7 @@ pub fn compile_with_zk_info(
                         result.stats.num_constraints,
                         result.stats.estimated_proof_size_bytes / 1024,
                     );
+                    zk_results.push((fn_name.clone(), result));
                 }
                 Err(e) => {
                     eprintln!("[nsl] M55: ZK compilation warning for '{}': {}", fn_name, e);
@@ -275,7 +291,7 @@ pub fn compile_with_zk_info(
     }
 
     let bytes = compiler.finalize()?;
-    Ok((bytes, zk_proof_fns))
+    Ok((bytes, zk_proof_fns, zk_results))
 }
 
 /// Compile for standalone export: like `compile()` but uses `compile_standalone_main()`
