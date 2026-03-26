@@ -151,6 +151,14 @@ nsl check --deterministic file.nsl  # Determinism verification
 # GPU build
 nsl build file.nsl --features cuda  # Enable GPU support
 nsl run file.nsl --target cuda      # Run with CUDA backend
+
+# Unikernel deployment
+nsl build file.nsl --unikernel --listen 0.0.0.0:8080 --memory 16G
+
+# ZK proof generation
+nsl build --zk file.nsl             # Generate ZK proof
+nsl zk verify proof.zkp             # Verify a proof
+nsl zk stats proof.zkp              # Proof statistics
 ```
 
 ## Project Structure
@@ -226,7 +234,7 @@ $ nsl run examples/m14_sgd_basic.nsl
 2.8855583667755127     # epoch 5
 ```
 
-All 1,420 tests pass across 7 crates.
+All 1,558 tests pass across 7 crates.
 
 ### Recommended Training Config (RTX 5070 Ti, 16GB VRAM)
 
@@ -241,7 +249,7 @@ const PRETRAIN_GRAD_CLIP = 1.0
 ## Testing
 
 ```bash
-cargo test --workspace              # 1,420+ unit and integration tests
+cargo test --workspace              # 1,558+ unit and integration tests
 cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl  # Training demo
 cargo run -p nsl-cli -- test tests/m15_test.nsl          # NSL test suite
 

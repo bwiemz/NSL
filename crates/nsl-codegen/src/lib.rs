@@ -40,6 +40,7 @@ pub mod speculative;
 pub mod source_ad;
 pub mod standalone;
 pub mod unikernel;
+pub mod unikernel_boot;
 pub mod tensor_parallel;
 pub mod stmt;
 pub mod types;

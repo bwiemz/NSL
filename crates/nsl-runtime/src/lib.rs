@@ -80,6 +80,9 @@ pub mod deterministic_ops;
 pub mod multimodal;
 pub mod sparse;
 
+// M54: Unikernel runtime (bare-metal deployment)
+pub mod unikernel;
+
 // M62: Legacy Interop — DLPack bridge + C API
 pub mod dlpack;
 pub mod c_api;

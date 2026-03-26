@@ -4,6 +4,34 @@ All notable changes to NeuralScript will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.9.1] - 2026-03-26
+
+### M41b: NVLink/RDMA/TCP KV Transfer Backends
+- **TcpBackend**: TCP socket-based KV transfer for multi-node disaggregated inference (per-rank listener, retry logic, Nagle disabled)
+- **NvlinkBackend**: CUDA IPC GPU-direct transfer for same-node multi-GPU (cuIpcGetMemHandle/cuIpcOpenMemHandle, falls back to staged CPU transfer)
+- **RdmaBackend**: RDMA verbs-based zero-copy transport for HPC clusters (ibverbs memory registration, InfiniBand/RoCE hardware probe, TCP fallback)
+- **Auto-detection**: `auto_select_backend()` probes NVLink > RDMA > TCP > SharedMem based on available hardware
+- **Serve block wiring**: `kv_transfer` config string flows through codegen, workers emit `nsl_kv_transfer_init`/`destroy`
+
+### M35b: GPTQ Full OBQ Algorithm
+- **Optimal Brain Quantizer**: Column-wise quantization with Hessian-based error compensation (replaces RTN stub)
+- **Hessian computation**: `HessianAccumulator` for X^T X calibration data accumulation
+- **Cholesky factorization**: Damped Hessian inverse via Cholesky decomposition for numerical stability
+- **Act-order**: Columns quantized in descending Hessian diagonal order for better quality
+- **Blocked updates**: Lazy batch error propagation for memory efficiency on large matrices
+- **Calibration FFI**: `nsl_gptq_hessian_init`, `nsl_gptq_hessian_add_batch`, `nsl_gptq_hessian_finalize`
+
+### M54b: Bare-Metal Unikernel Boot Stub, Runtime & GPU Init
+- **x86_64 boot stub generator**: Multiboot2 header, GDT (64-bit code/data segments), PML4/PDPT page tables (identity-map 4GB), SSE/AVX enable, long mode transition
+- **Unikernel runtime**: Bump allocator (lock-free atomic), serial console (COM1 115200 8N1), boot config JSON parser
+- **GPU init framework**: PCI bus scan (CF8h/CFCh), NVIDIA device discovery, VFIO passthrough path (cuInit), direct register path (BAR0 MMIO)
+- **ELF image builder**: Combines boot stub + compiled code + weights + linker script into single binary
+
+### Documentation
+- Updated README.md with new CLI commands (unikernel, ZK), test count (1,558)
+- Updated implementation status: 34 production milestones (was 30), 131,800 LOC across 282 files
+- Updated CHANGELOG and SPECIFICATION
+
 ## [0.8.0] - 2026-03-18
 
 ### Consolidation & Code Quality

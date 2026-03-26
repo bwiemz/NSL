@@ -388,6 +388,20 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_serve_completed_count",  &[],                         Some(types::I64)),
     ("nsl_serve_preempt",          &[types::I64],                      Some(types::I64)),
     ("nsl_serve_destroy",          &[],                         Some(types::I64)),
+    // --- M41: Disaggregated inference ---
+    ("nsl_disagg_init",            &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_disagg_get_role",        &[],                         Some(types::I64)),
+    ("nsl_disagg_get_rank",        &[],                         Some(types::I64)),
+    ("nsl_disagg_destroy",         &[],                         Some(types::I64)),
+    ("nsl_disagg_worker_init",     &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_disagg_worker_destroy",  &[],                         Some(types::I64)),
+    ("nsl_disagg_prefill_loop",    &[types::I64],               Some(types::I64)),
+    ("nsl_disagg_decode_loop",     &[types::I64],               Some(types::I64)),
+    // --- M41b: KV transfer backends ---
+    ("nsl_kv_transfer_init",       &[types::I64, types::I64],   Some(types::I64)),
+    ("nsl_kv_transfer_send",       &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_transfer_recv",       &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_kv_transfer_destroy",    &[],                         Some(types::I64)),
     // --- M30: Tensor parallelism ---
     ("nsl_tp_init", &[], Some(types::I64)),
     ("nsl_tp_rank", &[], Some(types::I64)),
@@ -437,8 +451,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_awq_free", &[types::I64], None),
     // --- M35: GPTQ quantization ---
     ("nsl_gptq_quantize", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_gptq_quantize_ext", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_gptq_matmul", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_gptq_free", &[types::I64], None),
+    ("nsl_gptq_hessian_init", &[types::I64], Some(types::I64)),
+    ("nsl_gptq_hessian_add_batch", &[types::I64], Some(types::I64)),
+    ("nsl_gptq_hessian_finalize", &[], Some(types::I64)),
     // --- M36: Memory planning slab ---
     ("nsl_slab_alloc", &[types::I64], Some(types::I64)),
     ("nsl_slab_free", &[types::I64, types::I64], None),
@@ -557,6 +575,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // BatchNorm + AvgPool2d (proper implementations replacing approximations)
     ("nsl_tensor_batchnorm", &[types::I64, types::I64, types::I64, types::F64, types::I64], Some(types::I64)),
     ("nsl_tensor_avgpool2d", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    // --- M54b: Unikernel runtime ---
+    ("nsl_unikernel_init", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_unikernel_model_alloc", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_unikernel_kv_alloc", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_unikernel_model_pool_stats", &[], Some(types::I64)),
+    ("nsl_unikernel_shutdown", &[], Some(types::I64)),
+    ("nsl_unikernel_gpu_init", &[types::I64], Some(types::I64)),
+    ("nsl_unikernel_gpu_ready", &[], Some(types::I64)),
+    ("nsl_unikernel_gpu_device_id", &[], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

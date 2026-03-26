@@ -124,6 +124,43 @@ impl Mersenne31Field {
         let val = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         Self(reduce(val as u64))
     }
+
+    // ── INT8→M31 mapping (M55d) ─────────────────────────────────────
+
+    /// Map a signed INT8 value [-128, 127] into the M31 field.
+    /// Uses the canonical mapping: v → v + 128, so [-128, 127] → [0, 255] ⊂ F_{2^31-1}.
+    /// This ensures all values are non-negative in the field.
+    #[inline]
+    pub fn from_int8(val: i8) -> Self {
+        Self(reduce((val as i64 + 128) as u64))
+    }
+
+    /// Map a signed INT8 value directly (negative values use field negation).
+    /// This preserves the algebraic structure: from_int8_signed(-3) = -from_u64(3).
+    #[inline]
+    pub fn from_int8_signed(val: i8) -> Self {
+        if val >= 0 {
+            Self::from_u64(val as u64)
+        } else {
+            Self::from_u64(val.unsigned_abs() as u64).neg()
+        }
+    }
+
+    /// Map a fixed-point value into the M31 field.
+    /// The integer part is mapped directly; fractional bits are tracked externally.
+    pub fn from_fixed_point(val: i64, _frac_bits: u32) -> Self {
+        if val >= 0 {
+            Self::from_u64(val as u64)
+        } else {
+            Self::from_u64(val.unsigned_abs()).neg()
+        }
+    }
+
+    /// Convert a u8 quantized value [0, 255] into M31.
+    #[inline]
+    pub fn from_uint8(val: u8) -> Self {
+        Self(val as u32)
+    }
 }
 
 impl Field for Mersenne31Field {
@@ -137,6 +174,8 @@ impl Field for Mersenne31Field {
     #[inline] fn from_u64(val: u64) -> Self { Mersenne31Field::from_u64(val) }
     fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
     fn from_bytes(bytes: &[u8]) -> Self { Mersenne31Field::from_bytes(bytes) }
+    fn from_int8_signed(val: i8) -> Self { Mersenne31Field::from_int8_signed(val) }
+    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self { Mersenne31Field::from_fixed_point(val, frac_bits) }
     fn field_name() -> &'static str { "Mersenne31" }
 }
 

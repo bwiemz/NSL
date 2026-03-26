@@ -41,6 +41,10 @@ pub trait Field: Clone + std::fmt::Debug + PartialEq + Sized + Send + Sync {
     fn to_bytes_vec(&self) -> Vec<u8>;
     /// Deserialize from bytes.
     fn from_bytes(bytes: &[u8]) -> Self;
+    /// Map a signed INT8 value into the field (for quantized ZK circuits).
+    fn from_int8_signed(val: i8) -> Self;
+    /// Map a fixed-point integer into the field (fractional bits tracked externally).
+    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self;
     /// Name of this field (for diagnostics).
     fn field_name() -> &'static str;
 }
@@ -56,6 +60,8 @@ impl Field for FieldElement {
     #[inline] fn from_u64(val: u64) -> Self { FieldElement::from_u64(val) }
     fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
     fn from_bytes(bytes: &[u8]) -> Self { FieldElement::from_bytes(bytes) }
+    fn from_int8_signed(val: i8) -> Self { FieldElement::from_fixed_point(val as i64, 0) }
+    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self { FieldElement::from_fixed_point(val, frac_bits) }
     fn field_name() -> &'static str { "BN254" }
 }
 

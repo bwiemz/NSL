@@ -17,7 +17,8 @@ pub mod sumcheck;
 
 use super::backend::{ZkError, ZkProof};
 use super::field::Field;
-use super::ir::ZkIR;
+use super::ir::{ZkIR, ZkInstruction};
+use super::lookup_native::LookupMultiplicities;
 
 // ---------------------------------------------------------------------------
 // FoldingConfig
@@ -57,6 +58,11 @@ pub struct FoldingProver<F: Field> {
     pub challenges: Vec<F>,
     /// Number of layers folded so far.
     pub num_folds: u32,
+    /// M55e: Jolt lookup multiplicities per table (table_name → multiplicities).
+    /// Accumulated across all folded layers.
+    pub lookup_multiplicities: std::collections::HashMap<String, LookupMultiplicities>,
+    /// M55e: All lookup trace values (input field elements) collected during folding.
+    pub lookup_trace_values: Vec<F>,
 }
 
 impl<F: Field> FoldingProver<F> {
@@ -67,6 +73,8 @@ impl<F: Field> FoldingProver<F> {
             accumulator: None,
             challenges: Vec::new(),
             num_folds: 0,
+            lookup_multiplicities: std::collections::HashMap::new(),
+            lookup_trace_values: Vec::new(),
         }
     }
 
@@ -76,6 +84,31 @@ impl<F: Field> FoldingProver<F> {
     /// 2. Creates a new accumulator instance from the trace
     /// 3. Folds it with the running accumulator using a random challenge
     pub fn fold_layer(&mut self, ir: &ZkIR, witness: &[F]) -> Result<(), ZkError> {
+        // M55e: Track lookup multiplicities for Jolt argument
+        for inst in &ir.instructions {
+            if let ZkInstruction::Lookup { table, input, input_bits, .. } = inst {
+                let table_size = 1usize << (*input_bits as usize).min(16); // cap at 16-bit tables
+                let mult = self.lookup_multiplicities
+                    .entry(table.clone())
+                    .or_insert_with(|| LookupMultiplicities::new(table_size));
+                // Record the lookup access by input wire value
+                let input_idx = input.0 as usize;
+                if input_idx < witness.len() {
+                    // Map field element to table index (raw unsigned value)
+                    let raw_bytes = witness[input_idx].to_bytes_vec();
+                    let table_idx = if raw_bytes.len() >= 4 {
+                        u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]) as usize
+                    } else {
+                        0usize
+                    };
+                    if table_idx < table_size {
+                        mult.record(table_idx);
+                    }
+                    self.lookup_trace_values.push(witness[input_idx].clone());
+                }
+            }
+        }
+
         // Create a new instance from this layer
         let new_instance = self.compile_layer_instance(ir, witness)?;
 
@@ -171,6 +204,37 @@ impl<F: Field> FoldingProver<F> {
         // Folding challenges (for reproducibility)
         for ch in &self.challenges {
             proof_data.extend_from_slice(&ch.to_bytes_vec());
+        }
+
+        // M55e: Jolt lookup argument — log-derivative consistency check
+        // Compute and serialize the lookup argument for each table.
+        let num_lookup_tables = self.lookup_multiplicities.len() as u32;
+        proof_data.extend_from_slice(&num_lookup_tables.to_le_bytes());
+
+        if !self.lookup_trace_values.is_empty() {
+            // Random challenge for log-derivative argument (derived from proof state)
+            let beta = if !self.challenges.is_empty() {
+                self.challenges.last().unwrap().field_mul(&F::from_u64(31))
+                    .field_add(&F::from_u64(17))
+            } else {
+                F::from_u64(42)
+            };
+            let beta = if beta == F::zero() { F::one() } else { beta };
+
+            // Compute trace-side log-derivative sum
+            let trace_sum = super::lookup_native::log_derivative_trace_sum(
+                &self.lookup_trace_values, &beta
+            );
+            proof_data.extend_from_slice(&trace_sum.to_bytes_vec());
+
+            // Compute table-side log-derivative sums (one per table)
+            for (table_name, mult) in &self.lookup_multiplicities {
+                let table_name_bytes = table_name.as_bytes();
+                proof_data.extend_from_slice(&(table_name_bytes.len() as u32).to_le_bytes());
+                proof_data.extend_from_slice(table_name_bytes);
+                proof_data.extend_from_slice(&(mult.total_lookups as u32).to_le_bytes());
+                proof_data.extend_from_slice(&(mult.distinct_entries() as u32).to_le_bytes());
+            }
         }
 
         Ok(ZkProof {

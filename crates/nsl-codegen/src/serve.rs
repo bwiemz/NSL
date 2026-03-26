@@ -28,6 +28,7 @@ impl Compiler<'_> {
         let mut prefill_chunk: i64 = 512;
         let mut prefill_workers: i64 = 1;
         let mut decode_workers: i64 = 1;
+        let mut kv_transfer_backend: String = "auto".to_string();
 
         for entry in &serve.config {
             let key_name = self.resolve_sym(entry.key).to_string();
@@ -62,6 +63,11 @@ impl Compiler<'_> {
                         decode_workers = *v;
                     }
                 }
+                "kv_transfer" => {
+                    if let nsl_ast::expr::ExprKind::StringLiteral(s) = &entry.value.kind {
+                        kv_transfer_backend = s.clone();
+                    }
+                }
                 _ => {
                     self.compile_expr(builder, state, &entry.value)?;
                 }
@@ -82,7 +88,7 @@ impl Compiler<'_> {
             self.compile_disaggregated_serve(
                 builder, state, serve,
                 max_batch, max_seq_len, kv_blocks, prefill_chunk,
-                prefill_workers, decode_workers,
+                prefill_workers, decode_workers, &kv_transfer_backend,
             )?;
         } else {
             // Monolithic M29 path (unchanged)
@@ -135,7 +141,17 @@ impl Compiler<'_> {
         _prefill_chunk: i64,
         prefill_workers: i64,
         decode_workers: i64,
+        kv_transfer_backend: &str,
     ) -> Result<(), CodegenError> {
+        // M41b: Map kv_transfer backend name to ID for runtime init
+        let kv_backend_id: i64 = match kv_transfer_backend {
+            "shared_mem" => 0,
+            "nvlink" => 1,
+            "rdma" => 2,
+            "tcp" => 3,
+            "auto" | _ => -1, // auto-detect at runtime
+        };
+
         // Step 1: Get role from env var via FFI (returns 0=router, 1=prefill, 2=decode)
         let role = self.compile_call_by_name(builder, "nsl_disagg_get_role", &[])?;
 
@@ -186,8 +202,12 @@ impl Compiler<'_> {
         self.compile_call_by_name(
             builder, "nsl_disagg_worker_init", &[role_prefill, rank, model_zero],
         )?;
+        // M41b: Initialize KV transfer backend for this worker
+        let v_kv_backend = builder.ins().iconst(cl_types::I64, kv_backend_id);
+        self.compile_call_by_name(builder, "nsl_kv_transfer_init", &[v_kv_backend, rank])?;
         let config_zero = builder.ins().iconst(cl_types::I64, 0);
         self.compile_call_by_name(builder, "nsl_disagg_prefill_loop", &[config_zero])?;
+        self.compile_call_by_name(builder, "nsl_kv_transfer_destroy", &[])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;
         builder.ins().jump(merge_block, &[]);
 
@@ -200,6 +220,9 @@ impl Compiler<'_> {
         self.compile_call_by_name(
             builder, "nsl_disagg_worker_init", &[role_decode, rank2, model_zero2],
         )?;
+        // M41b: Initialize KV transfer backend for this worker
+        let v_kv_backend2 = builder.ins().iconst(cl_types::I64, kv_backend_id);
+        self.compile_call_by_name(builder, "nsl_kv_transfer_init", &[v_kv_backend2, rank2])?;
         // M33: Check for speculative decoding config — if any @speculative decorator was
         // collected during the compilation pass, log that speculative mode is active.
         // The actual draft→verify loop replacement is deferred (needs draft model forward
@@ -212,6 +235,7 @@ impl Compiler<'_> {
         };
         let config_zero2 = builder.ins().iconst(cl_types::I64, speculative_flag);
         self.compile_call_by_name(builder, "nsl_disagg_decode_loop", &[config_zero2])?;
+        self.compile_call_by_name(builder, "nsl_kv_transfer_destroy", &[])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;
         builder.ins().jump(merge_block, &[]);
 

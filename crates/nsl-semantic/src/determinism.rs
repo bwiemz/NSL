@@ -5,7 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 use nsl_ast::Symbol;
+use nsl_ast::expr::{Expr, ExprKind};
+use nsl_ast::stmt::{Block, StmtKind};
 use nsl_errors::Diagnostic;
+use nsl_lexer::Interner;
 
 /// How strictly determinism is enforced.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -145,6 +148,114 @@ impl DeterminismChecker {
             "reduce_mean" => Some("nsl_tensor_reduce_mean_deterministic"),
             "scatter_add" => Some("nsl_tensor_scatter_add_deterministic"),
             _ => None,
+        }
+    }
+
+    /// Walk a module's AST and emit diagnostics for all non-deterministic ops.
+    ///
+    /// Used by `nsl check --deterministic` to surface warnings/errors before codegen.
+    pub fn scan_module(&mut self, module: &nsl_ast::Module, interner: &Interner) {
+        for stmt in &module.stmts {
+            self.scan_stmt(stmt, interner);
+        }
+    }
+
+    fn scan_stmt(&mut self, stmt: &nsl_ast::stmt::Stmt, interner: &Interner) {
+        match &stmt.kind {
+            StmtKind::FnDef(fndef) => {
+                self.scan_block(&fndef.body, interner);
+            }
+            StmtKind::ModelDef(modeldef) => {
+                for member in &modeldef.members {
+                    if let nsl_ast::decl::ModelMember::Method(fndef, _) = member {
+                        self.scan_block(&fndef.body, interner);
+                    }
+                }
+            }
+            StmtKind::VarDecl { value: Some(expr), .. }
+            | StmtKind::Return(Some(expr))
+            | StmtKind::Expr(expr) => {
+                self.scan_expr(expr, interner);
+            }
+            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+                self.scan_expr(condition, interner);
+                self.scan_block(then_block, interner);
+                for (cond, block) in elif_clauses {
+                    self.scan_expr(cond, interner);
+                    self.scan_block(block, interner);
+                }
+                if let Some(eb) = else_block {
+                    self.scan_block(eb, interner);
+                }
+            }
+            StmtKind::For { iterable, body, .. } => {
+                self.scan_expr(iterable, interner);
+                self.scan_block(body, interner);
+            }
+            StmtKind::While { condition, body } => {
+                self.scan_expr(condition, interner);
+                self.scan_block(body, interner);
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_block(&mut self, block: &Block, interner: &Interner) {
+        for stmt in &block.stmts {
+            self.scan_stmt(stmt, interner);
+        }
+    }
+
+    fn scan_expr(&mut self, expr: &Expr, interner: &Interner) {
+        match &expr.kind {
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::Ident(sym) = &callee.kind {
+                    if let Some(name) = interner.resolve(sym.0) {
+                        // Check for explicit RNG keyword arg named "rng"
+                        let has_rng_arg = args.iter().any(|a| {
+                            a.name.as_ref().and_then(|sym| interner.resolve(sym.0))
+                                .map_or(false, |s| s == "rng")
+                        });
+                        if let Some(diag) = self.check_call(name, has_rng_arg, expr.span) {
+                            self.diagnostics.push(diag);
+                        }
+                    }
+                }
+                for arg in args {
+                    self.scan_expr(&arg.value, interner);
+                }
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                self.scan_expr(left, interner);
+                self.scan_expr(right, interner);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                self.scan_expr(operand, interner);
+            }
+            ExprKind::Pipe { left, right } => {
+                self.scan_expr(left, interner);
+                self.scan_expr(right, interner);
+            }
+            ExprKind::MemberAccess { object, .. } => {
+                self.scan_expr(object, interner);
+            }
+            ExprKind::ListLiteral(exprs) | ExprKind::TupleLiteral(exprs) => {
+                for e in exprs {
+                    self.scan_expr(e, interner);
+                }
+            }
+            ExprKind::Subscript { object, .. } => {
+                self.scan_expr(object, interner);
+            }
+            ExprKind::IfExpr { condition, then_expr, else_expr } => {
+                self.scan_expr(condition, interner);
+                self.scan_expr(then_expr, interner);
+                self.scan_expr(else_expr, interner);
+            }
+            ExprKind::Lambda { body, .. } => {
+                self.scan_expr(body, interner);
+            }
+            _ => {}
         }
     }
 }

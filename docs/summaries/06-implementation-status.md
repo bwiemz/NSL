@@ -1,19 +1,19 @@
 # NeuralScript: Implementation Status & Maturity Assessment
 
-**Last updated:** 2026-03-21
-**Audit method:** Full codebase scan (249 files, ~83,500 LOC), stub pattern analysis, NotebookLM cross-reference
+**Last updated:** 2026-03-26
+**Audit method:** Full codebase scan (282 files, ~131,800 LOC), stub pattern analysis, NotebookLM cross-reference
 
 ## Version History
 - **v0.1.0** (2026-03-12): Core language, tensors, autodiff, models, training DSL, GPU/CUDA
 - **v0.2.0** (2026-03-15): Production inference — PagedAttention, FlashAttention, continuous batching, tensor parallelism, graph fusion
-- **v0.9.0** (current): All M9-M62 compiler/runtime features implemented — FlashAttention-3 (Hopper wgmma), 50+ AD rules, EAGLE-2 dynamic draft trees + Lookahead decoding, MXFP8/NVFP4 Blackwell quantization, FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, cost-guided fusion, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, disaggregated worker loops
+- **v0.9.0** (current): All M9-M62 compiler/runtime features implemented — FlashAttention-3 (Hopper wgmma), 50+ AD rules, EAGLE-2 dynamic draft trees + Lookahead decoding, MXFP8/NVFP4 Blackwell quantization, FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, cost-guided fusion, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, disaggregated worker loops, NVLink/RDMA/TCP KV transfer, GPTQ OBQ algorithm, x86_64 unikernel boot stub
 
 ## Codebase Size
-- ~83,500 lines of Rust across 249 files in 8 crates
-- 109 runtime source files (~30,000 LOC)
-- 78 codegen source files (~35,000 LOC)
+- ~131,800 lines of Rust across 282 files in 8 crates
+- 120+ runtime source files (~48,000 LOC)
+- 85+ codegen source files (~52,000 LOC)
 - 31 semantic analysis files (~8,000 LOC)
-- 606+ tests passing (328 runtime, 196 semantic, 77 CLI, 5 parser)
+- 1,558 tests passing across all crates
 - Full stdlib in NSL
 
 ---
@@ -43,7 +43,7 @@ All complete and shipped in v0.1.0.
 | M15-M16 | Data pipeline, tokenization | Production | DataLoader, BPE tokenizer |
 | M17 | GPU/CUDA + kernel keyword | Production | 15 PTX kernels, cudarc 0.19 |
 | M18 | Interop (ONNX, SafeTensors, HuggingFace) | Production | SafeTensors I/O, ONNX export, HF model loading |
-| M21-M22 | INT4/INT8 quantization | Production | Per-tensor/channel/group, AWQ, GPTQ |
+| M21-M22 | INT4/INT8 quantization | Production | Per-tensor/channel/group, AWQ, GPTQ (full OBQ) |
 
 ### Production Inference (M23-M31) — PRODUCTION
 All complete, shipped in v0.2.0.
@@ -67,7 +67,7 @@ All complete, shipped in v0.2.0.
 | M32 | Mixture of Experts | Functional | @moe decorator, router, dispatch, aux loss, expert parallel FFI (all-to-all stub) |
 | M33 | Speculative Decoding | **Production** | DraftModelRunner (524 LOC), EAGLE-2 dynamic confidence-scored trees, Lookahead n-gram decoding, rejection sampling (greedy + stochastic), tree attention masks |
 | M34 | Ring Attention | Functional | @context_parallel extraction, ring comm basic |
-| M35 | FP8 Compute | Production | E4M3/E5M2, H100 MMA PTX, calibration, runtime dispatch |
+| M35 | FP8/AWQ/GPTQ Quantization | **Production** | E4M3/E5M2, H100 MMA PTX, calibration, AWQ 4-bit, **GPTQ full OBQ** (Hessian-based error compensation, Cholesky inverse, act-order, blocked updates) |
 
 ### Compiler Analysis (M36-M40) — FUNCTIONAL TO PRODUCTION
 
@@ -83,7 +83,7 @@ All complete, shipped in v0.2.0.
 
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
-| M41 | Disaggregated Inference | **Functional** | Router, KV transfer (KVXF format), **real prefill/decode worker loops** with message handling |
+| M41 | Disaggregated Inference | **Production** | Router, KV transfer (KVXF format), **real prefill/decode worker loops**, **NVLink/RDMA/TCP transport backends**, auto-detection, CUDA IPC GPU-direct, PCI bus scan |
 | M42 | KV Compression | Functional | INT8/INT4/FP8 quantization, H2O eviction, sliding window |
 | M43 | Pipeline Parallelism | **Functional** | Config parsed, 1F1B/GPipe schedules, SharedMemPipeline backend with mailbox pattern, condvar signaling |
 | M44 | Constrained Decoding | Functional | Thompson NFA → DFA → Hopcroft minimize, token alignment, logit masking |
@@ -106,8 +106,8 @@ All complete, shipped in v0.2.0.
 |-----------|---------|--------|-------|
 | M52 | Weight-Aware Compilation | Production | SafeTensors loading, constant folding, dead weight elimination, sparsity detection |
 | M53 | WCET Proofs | **Production** | Two-tier model: GPU statistical bounds + FPGA certified path (wcet_matmul_fpga_certified, wcet_elementwise_fpga_certified), DO-178C reporting |
-| M54 | Unikernels | Framework | Config, linker script, boot config — no actual boot stub or virtio drivers |
-| M55 | ZK Inference | Functional | Halo2 + Plonky3 backends, IR lowering, witness gen, **Jolt lookup-native gates**, folding accumulator structure, Mersenne-31 field |
+| M54 | Unikernels | **Functional** | Config, linker script, boot config, **x86_64 boot stub** (Multiboot2, GDT, page tables, SSE/AVX), **bump allocator**, serial console, **PCI GPU discovery** (VFIO + direct), ELF image builder |
+| M55 | ZK Inference | **Production** | **AST-to-ZkDag** compilation, Halo2 + Plonky3 backends, IR lowering, witness gen, **Jolt lookup-native gates**, **folding proofs** (sumcheck + Fiat-Shamir), Mersenne-31 field, **INT8→M31 mapping**, **CLI pipeline** (build/verify/stats) |
 
 ### Adoption & Scale (M56-M62)
 
@@ -124,9 +124,9 @@ All complete, shipped in v0.2.0.
 |----------|-------|-----------|------------|-----------|------|-------------|
 | Foundation (M9-M22) | 14 | 14 | 0 | 0 | 0 | 0 |
 | Inference (M23-M31) | 9 | 8 | 1 | 0 | 0 | 0 |
-| Scaling (M32-M55) | 24 | 7 | 12 | 3 | 1 | 1 |
+| Scaling (M32-M55) | 24 | 11 | 10 | 1 | 1 | 1 |
 | Frontier (M56-M62) | 7 | 1 | 0 | 0 | 0 | 6 |
-| **Total** | **54** | **30** | **13** | **3** | **1** | **7** |
+| **Total** | **54** | **34** | **11** | **1** | **1** | **7** |
 
 ---
 
@@ -139,13 +139,15 @@ All complete, shipped in v0.2.0.
 5. **Models**: model keyword, parameter management, serialization (.nslm), @shared weights
 6. **Training**: train block, 6 optimizers, 7 schedulers, loss functions, gradient checkpointing
 7. **GPU**: 15+ PTX kernels, .to(cuda), kernel keyword, FlashAttention-3 (Hopper wgmma)
-8. **Quantization**: INT4/8, FP8 E4M3/E5M2 (H100 MMA), AWQ, GPTQ
-9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding (basic)
-10. **Optimization**: Cost-guided fusion (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
-11. **Sparse tensors**: Format-agnostic @layout, TACO merge lattices, COO/CSR/CSC/BSR
-12. **Weight-aware compilation**: Constant folding, dead weight elimination, sparsity-aware codegen
-13. **Interop**: C API (real forward pass), DLPack, SafeTensors, ONNX export, HuggingFace loading
-14. **ZK circuits**: Halo2 + Plonky3, Jolt lookup-native, folding, Mersenne-31 field
+8. **Quantization**: INT4/8, FP8 E4M3/E5M2 (H100 MMA), AWQ, GPTQ (full OBQ with Hessian-based error compensation)
+9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding (EAGLE-2, Lookahead)
+10. **Disaggregated inference**: Prefill/decode worker separation, NVLink/RDMA/TCP KV transfer, auto-detection
+11. **Optimization**: Cost-guided fusion (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
+12. **Sparse tensors**: Format-agnostic @layout, TACO merge lattices, COO/CSR/CSC/BSR, GPU SpMM/SpMV
+13. **Weight-aware compilation**: Constant folding, dead weight elimination, sparsity-aware codegen, scaling fusion
+14. **Interop**: C API (real forward pass), DLPack, SafeTensors, ONNX export, HuggingFace loading
+15. **ZK circuits**: AST-to-ZkDag, Jolt lookup-native gates, folding proofs (sumcheck + Fiat-Shamir), Mersenne-31 field, CLI pipeline
+16. **Unikernels**: x86_64 boot stub (Multiboot2/Linux boot), PCI GPU discovery, bump allocator, ELF image builder
 
 ## Remaining Plans (1 active)
 

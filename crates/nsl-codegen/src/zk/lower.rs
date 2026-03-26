@@ -20,6 +20,37 @@ use super::ir::{Wire, ZkIR, ZkInstruction};
 use super::lookup::precompute_table;
 
 // ---------------------------------------------------------------------------
+// INT8 → Field Element mapping (M55d)
+// ---------------------------------------------------------------------------
+
+/// Map a signed INT8 value [-128, 127] into a BN254 field element.
+/// Uses signed representation: negative values become field negations.
+fn int8_to_field(val: i8) -> FieldElement {
+    if val >= 0 {
+        FieldElement::from_u64(val as u64)
+    } else {
+        let abs = val.unsigned_abs() as u64;
+        let fe = FieldElement::from_u64(abs);
+        FieldElement::zero().sub(&fe) // field negation
+    }
+}
+
+/// Check if a ZkDag uses only INT8 (8-bit) weights, making it eligible for M31 field.
+pub fn is_int8_model(dag: &ZkDag) -> bool {
+    dag.ops.iter().all(|op| match op {
+        ZkOp::Input { dtype_bits, .. } => *dtype_bits <= 8,
+        ZkOp::Weight { dtype_bits, .. } => *dtype_bits <= 8,
+        _ => true,
+    })
+}
+
+/// Maximum safe accumulation length for INT8 matmul in M31 field.
+/// M31 prime = 2^31 - 1. INT8 product max = 127 * 127 = 16129.
+/// Safe accumulation: floor((2^31 - 1) / 16129) = 133,143 terms.
+/// So matmul inner dimension K can be up to 133K without overflow.
+pub const M31_INT8_SAFE_K: usize = 133_000;
+
+// ---------------------------------------------------------------------------
 // ZkOp — Simplified DAG node
 // ---------------------------------------------------------------------------
 
@@ -678,8 +709,17 @@ fn lower_requantize(
         .expect("requantize input not lowered");
 
     let n = input_info.wires.len();
-    let scale_fe = FieldElement::from_fixed_point(scale as i64, 0);
-    let zp_fe = FieldElement::from_fixed_point(zero_point as i64, 0);
+    // INT8 requantize: map scale and zero_point into field elements
+    let scale_fe = if target_bits <= 8 {
+        int8_to_field((scale * 127.0).round() as i8) // scale as INT8 fraction
+    } else {
+        FieldElement::from_fixed_point(scale as i64, 0)
+    };
+    let zp_fe = if target_bits <= 8 {
+        int8_to_field(zero_point as i8)
+    } else {
+        FieldElement::from_fixed_point(zero_point as i64, 0)
+    };
 
     let mut out_wires = Vec::with_capacity(n);
     for i in 0..n {
@@ -741,7 +781,12 @@ pub fn lower_dag_to_zkir(dag: &ZkDag, config: &ZkConfig) -> ZkIR {
                 if let Some(vals) = values {
                     for (i, &v) in vals.iter().enumerate() {
                         let w = ir.alloc_wire(&format!("{name}_{i}"));
-                        let fe = FieldElement::from_fixed_point(v, config.frac_bits);
+                        // INT8 weights: use signed mapping to field element
+                        let fe = if *dtype_bits <= 8 {
+                            int8_to_field(v as i8)
+                        } else {
+                            FieldElement::from_fixed_point(v, config.frac_bits)
+                        };
                         ir.push(ZkInstruction::Const { out: w, value: fe });
                         wires.push(w);
                     }

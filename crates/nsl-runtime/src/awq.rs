@@ -78,7 +78,7 @@ pub fn dequantize_int4(quantized: u8, scale: f64, zero: f64) -> f64 {
 // Nibble read/write helpers
 // ---------------------------------------------------------------------------
 
-fn read_nibble(data: &[u8], flat_idx: usize) -> u8 {
+pub fn read_nibble(data: &[u8], flat_idx: usize) -> u8 {
     let byte_idx = flat_idx / 2;
     if flat_idx.is_multiple_of(2) {
         data[byte_idx] & 0x0F
@@ -87,7 +87,7 @@ fn read_nibble(data: &[u8], flat_idx: usize) -> u8 {
     }
 }
 
-fn write_nibble(data: &mut [u8], flat_idx: usize, val: u8) {
+pub fn write_nibble(data: &mut [u8], flat_idx: usize, val: u8) {
     let byte_idx = flat_idx / 2;
     if flat_idx.is_multiple_of(2) {
         data[byte_idx] = (data[byte_idx] & 0xF0) | (val & 0x0F);

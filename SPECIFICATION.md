@@ -1,6 +1,6 @@
 # NeuralScript (NSL) — Technical Specification
 
-Comprehensive feature reference, architecture details, and implementation status for NeuralScript v0.9.0.
+Comprehensive feature reference, architecture details, and implementation status for NeuralScript v0.9.1.
 
 For getting started, see [README.md](README.md).
 
