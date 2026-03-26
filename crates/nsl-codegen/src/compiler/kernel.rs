@@ -53,39 +53,101 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// Compile a single kernel definition: generate PTX and embed in .rodata.
+    /// Compile a single kernel definition: generate target-specific GPU code and embed in .rodata.
+    ///
+    /// Dispatches based on `--target` CLI flag:
+    /// - CUDA (default): direct AST->PTX via KernelCompiler
+    /// - ROCm/Metal/WebGPU: AST->KIR->backend lowerer
     fn compile_single_kernel(
         &mut self,
         kernel: &nsl_ast::block::KernelDef,
     ) -> Result<(), CodegenError> {
-        let ptx_bytes = crate::kernel::KernelCompiler::compile(kernel, self.interner);
+        use crate::gpu_target::GpuTarget;
+
+        let target = self.gpu_target();
         let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
 
-        // Embed PTX bytes in .rodata
-        let ptx_data_id = self.module
+        let kernel_bytes = match target {
+            GpuTarget::Cuda => {
+                // Original path: direct AST -> PTX
+                crate::kernel::KernelCompiler::compile(kernel, self.interner)
+            }
+            GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
+                // M47b: AST -> KIR -> backend-specific lowerer
+                let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target);
+
+                // Validate that the kernel's required features are supported by the target
+                let missing = target.features().missing(kir.required_features);
+                if !missing.is_empty() {
+                    return Err(CodegenError::new(format!(
+                        "kernel '{}' requires features not supported by {}: {}",
+                        kernel_name,
+                        target.name(),
+                        missing.names().join(", ")
+                    )));
+                }
+
+                let code = match target {
+                    GpuTarget::Rocm => {
+                        eprintln!(
+                            "[nsl] Generated AMDGPU ISA for kernel '{}' (runtime execution requires M47c)",
+                            kernel_name
+                        );
+                        crate::backend_amdgpu::lower_kir_to_amdgpu(&kir)
+                    }
+                    GpuTarget::Metal => {
+                        eprintln!(
+                            "[nsl] Generated MSL for kernel '{}' (runtime execution requires M47c)",
+                            kernel_name
+                        );
+                        crate::backend_metal::lower_kir_to_msl(&kir)
+                    }
+                    GpuTarget::WebGpu => {
+                        eprintln!(
+                            "[nsl] Generated WGSL for kernel '{}' (runtime execution requires M47c)",
+                            kernel_name
+                        );
+                        crate::backend_wgsl::lower_kir_to_wgsl(&kir)
+                    }
+                    GpuTarget::Cuda => unreachable!(),
+                };
+
+                // Null-terminate for consistency with PTX path
+                let mut bytes = code;
+                if bytes.last() != Some(&0) {
+                    bytes.push(0);
+                }
+                bytes
+            }
+        };
+
+        // Embed kernel code bytes in .rodata
+        let data_label = format!("__nsl_kernel_{}_{}", target.name(), kernel_name);
+        let kernel_data_id = self.module
             .declare_data(
-                &format!("__nsl_ptx_{}", kernel_name),
+                &data_label,
                 cranelift_module::Linkage::Local,
                 false,
                 false,
             )
             .map_err(|e| CodegenError::new(format!(
-                "failed to declare PTX data for kernel '{}': {e}", kernel_name
+                "failed to declare kernel data for '{}' ({}): {e}", kernel_name, target.name()
             )))?;
         let mut data_desc = cranelift_module::DataDescription::new();
-        data_desc.define(ptx_bytes.into_boxed_slice());
+        data_desc.define(kernel_bytes.into_boxed_slice());
         self.module
-            .define_data(ptx_data_id, &data_desc)
+            .define_data(kernel_data_id, &data_desc)
             .map_err(|e| CodegenError::new(format!(
-                "failed to define PTX data for kernel '{}': {e}", kernel_name
+                "failed to define kernel data for '{}' ({}): {e}", kernel_name, target.name()
             )))?;
 
         // Embed kernel name (null-terminated) in .rodata
         let mut name_bytes = kernel_name.as_bytes().to_vec();
         name_bytes.push(0);
+        let name_label = format!("__nsl_kernel_name_{}_{}", target.name(), kernel_name);
         let name_data_id = self.module
             .declare_data(
-                &format!("__nsl_ptx_name_{}", kernel_name),
+                &name_label,
                 cranelift_module::Linkage::Local,
                 false,
                 false,
@@ -101,7 +163,7 @@ impl Compiler<'_> {
                 "failed to define name data for kernel '{}': {e}", kernel_name
             )))?;
 
-        self.kernel_ptx_data.insert(kernel_name, (ptx_data_id, name_data_id));
+        self.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
         Ok(())
     }
 

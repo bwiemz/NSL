@@ -15,11 +15,19 @@ impl GpuTarget {
     pub fn parse_target(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "cuda" => Some(GpuTarget::Cuda),
-            "rocm" | "amd" => Some(GpuTarget::Rocm),
-            "metal" | "apple" => Some(GpuTarget::Metal),
+            "rocm" | "amd" | "hip" => Some(GpuTarget::Rocm),
+            "metal" | "apple" | "mps" => Some(GpuTarget::Metal),
             "webgpu" | "wgsl" => Some(GpuTarget::WebGpu),
             _ => None,
         }
+    }
+
+    /// Parse from CLI string, defaulting to Cuda when empty or unrecognized.
+    pub fn from_target_string(s: &str) -> Self {
+        if s.is_empty() {
+            return GpuTarget::Cuda;
+        }
+        Self::parse_target(s).unwrap_or(GpuTarget::Cuda)
     }
 
     /// Display name for error messages.
@@ -137,9 +145,20 @@ mod tests {
     fn target_parse() {
         assert_eq!(GpuTarget::parse_target("cuda"), Some(GpuTarget::Cuda));
         assert_eq!(GpuTarget::parse_target("ROCM"), Some(GpuTarget::Rocm));
+        assert_eq!(GpuTarget::parse_target("hip"), Some(GpuTarget::Rocm));
         assert_eq!(GpuTarget::parse_target("metal"), Some(GpuTarget::Metal));
+        assert_eq!(GpuTarget::parse_target("mps"), Some(GpuTarget::Metal));
         assert_eq!(GpuTarget::parse_target("webgpu"), Some(GpuTarget::WebGpu));
         assert_eq!(GpuTarget::parse_target("vulkan"), None);
+    }
+
+    #[test]
+    fn from_target_string_defaults_to_cuda() {
+        assert_eq!(GpuTarget::from_target_string(""), GpuTarget::Cuda);
+        assert_eq!(GpuTarget::from_target_string("unknown"), GpuTarget::Cuda);
+        assert_eq!(GpuTarget::from_target_string("rocm"), GpuTarget::Rocm);
+        assert_eq!(GpuTarget::from_target_string("metal"), GpuTarget::Metal);
+        assert_eq!(GpuTarget::from_target_string("webgpu"), GpuTarget::WebGpu);
     }
 
     #[test]

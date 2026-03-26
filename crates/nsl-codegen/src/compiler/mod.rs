@@ -133,6 +133,8 @@ pub struct FeatureConfigs {
     pub zk_proof_fns: HashMap<String, crate::zk::backend::ZkMode>,
     /// M55: Functions decorated with @zk_lookup — name -> (input_bits, output_bits)
     pub zk_lookup_fns: HashMap<String, (u32, u32)>,
+    /// M55: ASTs of @zk_proof functions — stored during declaration for ZK compilation
+    pub zk_fn_defs: HashMap<String, nsl_ast::decl::FnDef>,
 }
 
 impl FeatureConfigs {
@@ -167,6 +169,7 @@ impl FeatureConfigs {
             wcet_results: Vec::new(),
             zk_proof_fns: HashMap::new(),
             zk_lookup_fns: HashMap::new(),
+            zk_fn_defs: HashMap::new(),
         }
     }
 }
@@ -223,6 +226,9 @@ pub struct Compiler<'a> {
     /// Maps tensor variable name → byte offset in the GPU slab.
     /// Populated by the memory planner before compile_main.
     pub slab_name_offsets: HashMap<String, u64>,
+    /// M52d: Maps weight name → compile-time quantization scale (f32).
+    /// Populated during weight analysis for FP8/INT8 weights.
+    pub weight_scales: HashMap<String, f32>,
 
     // ── vmap batched function registry (M39) ─────────────────────────
     /// Maps original function name → batched variant name (e.g. "foo" → "foo_batched").
@@ -351,6 +357,7 @@ impl<'a> Compiler<'a> {
             disable_fusion: options.disable_fusion || options.debug_training,
             slab_plan: None,
             slab_name_offsets: HashMap::new(),
+            weight_scales: HashMap::new(),
             batched_fn_names: HashMap::new(),
             matmul_rewrites: HashMap::new(),
             features: FeatureConfigs::new(options),
@@ -365,6 +372,12 @@ impl<'a> Compiler<'a> {
     /// Get the inferred type of an AST node by NodeId.
     pub fn node_type(&self, id: NodeId) -> &Type {
         self.type_map.get(&id).unwrap_or(&Type::Unknown)
+    }
+
+    /// M47b: Resolve the GPU compilation target from `--target` CLI flag.
+    /// Defaults to CUDA when no target is specified.
+    pub fn gpu_target(&self) -> crate::gpu_target::GpuTarget {
+        crate::gpu_target::GpuTarget::from_target_string(&self.compile_options.target)
     }
 
     /// M42: Look up the first KV compression policy for a specific model layer.
