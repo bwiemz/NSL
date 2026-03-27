@@ -198,12 +198,12 @@ impl Compiler<'_> {
                     let tag = i as i64;
                     // Store qualified name (always unique)
                     let qualified = format!("{}.{}", enum_name, variant_name);
-                    self.enum_variants.insert(qualified, tag);
+                    self.types.enum_variants.insert(qualified, tag);
                     // Store bare name (may collide, last-write-wins for unqualified use)
-                    self.enum_variants.insert(variant_name.clone(), tag);
+                    self.types.enum_variants.insert(variant_name.clone(), tag);
                     variants.push((variant_name, tag));
                 }
-                self.enum_defs.insert(enum_name, variants);
+                self.types.enum_defs.insert(enum_name, variants);
             }
         }
         Ok(())
@@ -212,13 +212,13 @@ impl Compiler<'_> {
     /// Look up an enum variant by name and return its integer tag.
     /// Accepts both bare names ("Red") and qualified names ("Color.Red").
     pub fn lookup_enum_variant_tag(&self, name: &str) -> Option<i64> {
-        self.enum_variants.get(name).copied()
+        self.types.enum_variants.get(name).copied()
     }
 
     /// Look up with qualified enum name (EnumName.VariantName).
     pub fn lookup_qualified_variant(&self, enum_name: &str, variant_name: &str) -> Option<i64> {
         let qualified = format!("{}.{}", enum_name, variant_name);
-        self.enum_variants.get(&qualified).copied()
+        self.types.enum_variants.get(&qualified).copied()
     }
 
     // ── Pass 0.5b: Collect struct definitions ─────────────────────────
@@ -256,7 +256,7 @@ impl Compiler<'_> {
                     }
                 }
 
-                self.struct_layouts.insert(name.clone(), StructLayout { name, fields, total_size: offset });
+                self.types.struct_layouts.insert(name.clone(), StructLayout { name, fields, total_size: offset });
             }
         }
         Ok(())
@@ -348,7 +348,7 @@ impl Compiler<'_> {
                         // Check if this is a nested model field
                         if let nsl_ast::types::TypeExprKind::Named(type_sym) = &type_ann.kind {
                             let type_name = self.resolve_sym(*type_sym).to_string();
-                            if self.struct_layouts.contains_key(&type_name) {
+                            if self.types.struct_layouts.contains_key(&type_name) {
                                 field_type_map.insert(field_name, type_name);
                             }
                         }
@@ -522,7 +522,7 @@ impl Compiler<'_> {
                 if !field_type_map.is_empty() {
                     self.model_field_types.insert(name.clone(), field_type_map);
                 }
-                self.struct_layouts.insert(name.clone(), StructLayout { name, fields, total_size: offset });
+                self.types.struct_layouts.insert(name.clone(), StructLayout { name, fields, total_size: offset });
             }
         }
         Ok(())

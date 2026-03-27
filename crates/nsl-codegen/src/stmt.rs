@@ -638,7 +638,7 @@ impl Compiler<'_> {
                 let obj_type = self.node_type(object.id).clone();
                 if let nsl_semantic::types::Type::Struct { name, .. } = &obj_type {
                     let struct_name = self.resolve_sym(*name).to_string();
-                    if let Some(layout) = self.struct_layouts.get(&struct_name) {
+                    if let Some(layout) = self.types.struct_layouts.get(&struct_name) {
                         for field in &layout.fields {
                             if field.name == member_name {
                                 let final_val = if matches!(op, AssignOp::Assign) {
@@ -692,7 +692,7 @@ impl Compiler<'_> {
                 }
                 if let nsl_semantic::types::Type::Model { name, .. } = &obj_type {
                     let model_name = self.resolve_sym(*name).to_string();
-                    if let Some(layout) = self.struct_layouts.get(&model_name) {
+                    if let Some(layout) = self.types.struct_layouts.get(&model_name) {
                         for field in &layout.fields {
                             if field.name == member_name {
                                 let final_val = if matches!(op, AssignOp::Assign) {
@@ -1726,14 +1726,14 @@ impl Compiler<'_> {
                 match ty {
                     nsl_semantic::types::Type::Model { name, .. } => {
                         let n = self.resolve_sym(*name).to_string();
-                        if self.struct_layouts.contains_key(&n) {
+                        if self.types.struct_layouts.contains_key(&n) {
                             found_name = Some(n);
                             break;
                         }
                     }
                     nsl_semantic::types::Type::Struct { name, .. } => {
                         let n = self.resolve_sym(*name).to_string();
-                        if self.struct_layouts.contains_key(&n) {
+                        if self.types.struct_layouts.contains_key(&n) {
                             // Only use if it looks like a model (has tensor fields)
                             found_name = Some(n);
                         }
@@ -1749,7 +1749,7 @@ impl Compiler<'_> {
             })
         };
 
-        let layout = self.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
+        let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "no struct layout found for model '{}' in train block",
                 model_type_name
@@ -2687,14 +2687,14 @@ impl Compiler<'_> {
                 match ty {
                     nsl_semantic::types::Type::Model { name, .. } => {
                         let n = self.resolve_sym(*name).to_string();
-                        if self.struct_layouts.contains_key(&n) {
+                        if self.types.struct_layouts.contains_key(&n) {
                             found_name = Some(n);
                             break;
                         }
                     }
                     nsl_semantic::types::Type::Struct { name, .. } => {
                         let n = self.resolve_sym(*name).to_string();
-                        if self.struct_layouts.contains_key(&n) {
+                        if self.types.struct_layouts.contains_key(&n) {
                             found_name = Some(n);
                         }
                     }
@@ -2704,7 +2704,7 @@ impl Compiler<'_> {
             found_name.unwrap_or_else(|| model_var_name.clone())
         };
 
-        let layout = self.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
+        let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "no struct layout found for model '{}' in pipelined train block",
                 model_type_name
@@ -3092,14 +3092,14 @@ impl Compiler<'_> {
                 match ty {
                     nsl_semantic::types::Type::Model { name, .. } => {
                         let n = self.resolve_sym(*name).to_string();
-                        if self.struct_layouts.contains_key(&n) {
+                        if self.types.struct_layouts.contains_key(&n) {
                             found_name = Some(n);
                             break;
                         }
                     }
                     nsl_semantic::types::Type::Struct { name, .. } => {
                         let n = self.resolve_sym(*name).to_string();
-                        if self.struct_layouts.contains_key(&n) {
+                        if self.types.struct_layouts.contains_key(&n) {
                             found_name = Some(n);
                         }
                     }
@@ -3109,7 +3109,7 @@ impl Compiler<'_> {
             found_name.unwrap_or_else(|| self.resolve_sym(source_sym).to_string())
         };
 
-        let layout = self.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
+        let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "no struct layout found for model '{}' in quant block",
                 model_type_name
@@ -3172,8 +3172,8 @@ impl Compiler<'_> {
         // 6. Register the quantized model with the same struct layout and methods
         //    so that forward dispatch works identically to the source model.
         let quant_name = self.resolve_sym(quant.name).to_string();
-        if !self.struct_layouts.contains_key(&quant_name) {
-            self.struct_layouts.insert(quant_name.clone(), layout);
+        if !self.types.struct_layouts.contains_key(&quant_name) {
+            self.types.struct_layouts.insert(quant_name.clone(), layout);
         }
         if let Some(methods) = self.model_methods.get(&model_type_name).cloned() {
             self.model_methods.insert(quant_name, methods);

@@ -51,6 +51,25 @@ pub struct PendingLambda {
     pub captures: Vec<(Symbol, cl_types::Type)>,
 }
 
+/// Sub-struct grouping all type-system registration state out of the `Compiler` god-object.
+pub struct TypeRegistry {
+    pub struct_layouts: HashMap<String, StructLayout>,
+    pub enum_variants: HashMap<String, i64>,
+    pub enum_defs: HashMap<String, Vec<(String, i64)>>,
+    pub custom_dtype_ids: HashMap<String, u16>,
+}
+
+impl TypeRegistry {
+    fn new() -> Self {
+        Self {
+            struct_layouts: HashMap::new(),
+            enum_variants: HashMap::new(),
+            enum_defs: HashMap::new(),
+            custom_dtype_ids: HashMap::new(),
+        }
+    }
+}
+
 /// Sub-struct grouping all function/lambda registration state out of the `Compiler` god-object.
 pub struct FunctionRegistry {
     pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
@@ -213,10 +232,7 @@ pub struct Compiler<'a> {
     pub registry: FunctionRegistry,
 
     // ── Type system ──────────────────────────────────────────────────
-    pub struct_layouts: HashMap<String, StructLayout>,
-    pub enum_variants: HashMap<String, i64>,
-    pub enum_defs: HashMap<String, Vec<(String, i64)>>,
-    pub custom_dtype_ids: HashMap<String, u16>,
+    pub types: TypeRegistry,
 
     // ── Model metadata ───────────────────────────────────────────────
     pub model_methods: HashMap<String, HashMap<String, String>>,
@@ -357,10 +373,7 @@ impl<'a> Compiler<'a> {
             dump_ir: false,
             func_index: 0,
             registry: FunctionRegistry::new(),
-            struct_layouts: HashMap::new(),
-            enum_variants: HashMap::new(),
-            enum_defs: HashMap::new(),
-            custom_dtype_ids: HashMap::new(),
+            types: TypeRegistry::new(),
             model_methods: HashMap::new(),
             model_field_types: HashMap::new(),
             model_var_types: HashMap::new(),

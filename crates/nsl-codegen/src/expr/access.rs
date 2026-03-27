@@ -41,7 +41,7 @@ impl Compiler<'_> {
         // Check if this is an enum variant access: EnumName.VariantName
         if let ExprKind::Ident(obj_sym) = &object.kind {
             let obj_name = self.resolve_sym(*obj_sym).to_string();
-            if self.enum_defs.contains_key(&obj_name) {
+            if self.types.enum_defs.contains_key(&obj_name) {
                 if let Some(tag) = self.lookup_qualified_variant(&obj_name, &member_name) {
                     return Ok(builder.ins().iconst(cl_types::I64, tag));
                 }
@@ -56,7 +56,7 @@ impl Compiler<'_> {
 
         if let Type::Struct { name, .. } = &obj_type {
             let struct_name = self.resolve_sym(*name).to_string();
-            if let Some(layout) = self.struct_layouts.get(&struct_name) {
+            if let Some(layout) = self.types.struct_layouts.get(&struct_name) {
                 for field in &layout.fields {
                     if field.name == member_name {
                         let val = builder.ins().load(
@@ -80,7 +80,7 @@ impl Compiler<'_> {
             if let Some(field_type_map) = self.model_field_types.get(&model_name).cloned() {
                 if let Some(array_marker) = field_type_map.get(&member_name).cloned() {
                     if array_marker.starts_with('[') {
-                        if let Some(layout) = self.struct_layouts.get(&model_name).cloned() {
+                        if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
                             for field in &layout.fields {
                                 if field.name == member_name {
                                     let offset_val = builder.ins().iconst(cl_types::I64, field.offset as i64);
@@ -91,7 +91,7 @@ impl Compiler<'_> {
                     }
                 }
             }
-            if let Some(layout) = self.struct_layouts.get(&model_name).cloned() {
+            if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
                 for field in &layout.fields {
                     if field.name == member_name {
                         let val = builder.ins().load(

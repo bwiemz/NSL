@@ -398,7 +398,7 @@ impl Compiler<'_> {
         model_ptr: Value,
         device_val: Value,
     ) -> Result<(), CodegenError> {
-        let layout = self.struct_layouts.get(model_name).cloned().ok_or_else(|| {
+        let layout = self.types.struct_layouts.get(model_name).cloned().ok_or_else(|| {
             CodegenError::new(format!("no layout for model '{model_name}' in .to(device)"))
         })?;
         let num_fields = builder.ins().iconst(cl_types::I64, layout.fields.len() as i64);
@@ -959,7 +959,7 @@ impl Compiler<'_> {
     ) -> Vec<(String, usize, bool)> {
         let mut entries = Vec::new();
 
-        let layout = match self.struct_layouts.get(model_name) {
+        let layout = match self.types.struct_layouts.get(model_name) {
             Some(l) => l.clone(),
             None => return entries,
         };
@@ -986,7 +986,7 @@ impl Compiler<'_> {
                         let count: usize = count_str.trim().parse().unwrap_or(0);
                         // Determine element size from the element type's struct layout
                         let elem_size = self
-                            .struct_layouts
+                            .types.struct_layouts
                             .get(elem_type)
                             .map(|l| l.total_size)
                             .unwrap_or(8);
@@ -1168,7 +1168,7 @@ impl Compiler<'_> {
             .iconst(cl_types::I64, path_str.len() as i64);
 
         // Look up model struct layout
-        let layout = self.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
+        let layout = self.types.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "model_save(): no struct layout found for model '{}'",
                 model_name
@@ -1248,7 +1248,7 @@ impl Compiler<'_> {
             .iconst(cl_types::I64, path_str.len() as i64);
 
         // Look up model struct layout
-        let layout = self.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
+        let layout = self.types.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "model_load(): no struct layout found for model '{}'",
                 model_name

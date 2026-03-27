@@ -420,7 +420,7 @@ pub fn compile_module_with_imports(
 
     // Register imported structs/models from dependencies
     for (name, layout) in imported_struct_layouts {
-        compiler.struct_layouts.insert(name, layout);
+        compiler.types.struct_layouts.insert(name, layout);
     }
     for name in imported_model_names {
         compiler.imported_model_names.insert(name);
@@ -468,17 +468,17 @@ pub fn compile_entry(
 
     // Register imported structs/enums so the entry module can reference them
     for (name, layout) in imported_struct_layouts {
-        compiler.struct_layouts.insert(name, layout);
+        compiler.types.struct_layouts.insert(name, layout);
     }
     // Mark imported model names so we don't generate struct ctors for them
     for name in imported_model_names {
         compiler.imported_model_names.insert(name);
     }
     for (name, tag) in imported_enum_variants {
-        compiler.enum_variants.insert(name, tag);
+        compiler.types.enum_variants.insert(name, tag);
     }
     for (name, variants) in imported_enum_defs {
-        compiler.enum_defs.insert(name, variants);
+        compiler.types.enum_defs.insert(name, variants);
     }
 
     compiler.intern_string("")?;

@@ -131,12 +131,12 @@ impl Compiler<'_> {
             })
             .collect();
 
-        let struct_names: Vec<String> = self.struct_layouts.keys()
+        let struct_names: Vec<String> = self.types.struct_layouts.keys()
             .filter(|k| !model_name_set.contains(*k) && !self.imported_model_names.contains(*k))
             .cloned()
             .collect();
         for sname in struct_names {
-            let layout = &self.struct_layouts[&sname];
+            let layout = &self.types.struct_layouts[&sname];
             let mut sig = self.module.make_signature();
             sig.call_conv = self.call_conv;
             for field in &layout.fields {
@@ -403,8 +403,8 @@ impl Compiler<'_> {
         for stmt in stmts {
             if let StmtKind::DatatypeDef(def) = &stmt.kind {
                 let dtype_name = self.resolve_sym(def.name).to_string();
-                let id = 256u16 + self.custom_dtype_ids.len() as u16;
-                self.custom_dtype_ids.insert(dtype_name.clone(), id);
+                let id = 256u16 + self.types.custom_dtype_ids.len() as u16;
+                self.types.custom_dtype_ids.insert(dtype_name.clone(), id);
 
                 // Compile each method as a standalone Cranelift function
                 for method in &def.methods {
@@ -591,7 +591,7 @@ impl Compiler<'_> {
         for stmt in stmts {
             if let StmtKind::DatatypeDef(def) = &stmt.kind {
                 let dtype_name = self.resolve_sym(def.name).to_string();
-                let id = match self.custom_dtype_ids.get(&dtype_name) {
+                let id = match self.types.custom_dtype_ids.get(&dtype_name) {
                     Some(&id) => id,
                     None => continue,
                 };
@@ -641,7 +641,7 @@ impl Compiler<'_> {
         }
 
         // Call nsl_finalize_dtype_registry() after all registrations
-        if self.custom_dtype_ids.is_empty() {
+        if self.types.custom_dtype_ids.is_empty() {
             return Ok(());
         }
         let fin_id = self.registry.runtime_fns["nsl_finalize_dtype_registry"].0;

@@ -32,7 +32,7 @@ impl Compiler<'_> {
 
         #[allow(clippy::type_complexity)]
         let layouts: Vec<(String, Vec<(cl_types::Type, usize)>, usize)> = self
-            .struct_layouts.iter()
+            .types.struct_layouts.iter()
             .filter(|(name, _)| !self.model_methods.contains_key(*name) && !self.imported_model_names.contains(*name))
             .map(|(name, layout)| {
                 let fields: Vec<_> = layout.fields.iter().map(|f| (f.cl_type, f.offset)).collect();
@@ -208,7 +208,7 @@ impl Compiler<'_> {
             }
 
             // Allocate model memory
-            let layout = self.struct_layouts.get(&model_name).cloned();
+            let layout = self.types.struct_layouts.get(&model_name).cloned();
             let total_size = layout.as_ref().map(|l| l.total_size).unwrap_or(0);
             let alloc_size = total_size.max(8) as i64;
 

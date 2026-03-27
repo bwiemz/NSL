@@ -1465,7 +1465,7 @@ impl Compiler<'_> {
 
     /// Look up a custom dtype name in the registry and return its numeric id.
     pub(crate) fn resolve_custom_dtype(&self, name: &str) -> Option<u16> {
-        self.custom_dtype_ids.get(name).copied()
+        self.types.custom_dtype_ids.get(name).copied()
     }
 
     pub(crate) fn compile_print_call(
