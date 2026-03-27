@@ -26,11 +26,16 @@ impl<'a> TypeChecker<'a> {
                 }
                 TrainSection::Step { param, body } => {
                     has_step = true;
-                    // DataLoader yields Dict<String, Tensor> batches. Type the step
+                    // DataLoader yields Dict<Str, Tensor> batches. Type the step
                     // parameter concretely so field access (batch.input_ids) is validated.
+                    use crate::types::{Shape, DType, Device};
                     let batch_type = Type::Dict(
                         Box::new(Type::Str),
-                        Box::new(Type::Unknown),
+                        Box::new(Type::Tensor {
+                            shape: Shape::unknown(),
+                            dtype: DType::Unknown,
+                            device: Device::Unknown,
+                        }),
                     );
                     let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                     let prev = self.current_scope;
@@ -44,7 +49,11 @@ impl<'a> TypeChecker<'a> {
                 TrainSection::Eval { param, body } => {
                     let eval_type = Type::Dict(
                         Box::new(Type::Str),
-                        Box::new(Type::Unknown),
+                        Box::new(Type::Tensor {
+                            shape: Shape::unknown(),
+                            dtype: DType::Unknown,
+                            device: Device::Unknown,
+                        }),
                     );
                     let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                     let prev = self.current_scope;

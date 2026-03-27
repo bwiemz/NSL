@@ -60,6 +60,10 @@ impl Compiler<'_> {
                         return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
                     }
                 }
+                eprintln!(
+                    "[nsl-codegen] warning: method '.{member_name}()' called on Unknown-typed object \
+                     — defaulting to tensor dispatch. This may indicate a type inference gap."
+                );
                 return self.compile_tensor_method_call(builder, state, object, &member_name, args);
             }
         }

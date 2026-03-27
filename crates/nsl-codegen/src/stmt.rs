@@ -1071,8 +1071,17 @@ impl Compiler<'_> {
         // Detect DataLoader by checking if the iterable variable was assigned from a DataLoader() call.
         // The semantic type is List<Dict<Str, Tensor>> but the runtime handle is an opaque pointer,
         // not a real list — we must use the DataLoader-specific iteration protocol.
-        if self.is_dataloader_iterable(iterable) || matches!(iter_type, Type::Unknown) {
+        // Only route to DataLoader protocol when the type is positively known to be
+        // a DataLoader (List<Dict<...>>). Previously, Type::Unknown also fell through
+        // here, which could miscompile non-DataLoader iterables whose type inference failed.
+        if self.is_dataloader_iterable(iterable) {
             return self.compile_for_dataloader(builder, state, pattern, iterable, body);
+        }
+        if matches!(iter_type, Type::Unknown) {
+            eprintln!(
+                "[nsl-codegen] warning: for-loop iterable has Unknown type — compiling as list iteration. \
+                 If this is a DataLoader, ensure the variable type is inferred correctly."
+            );
         }
 
         let list_val = self.compile_expr(builder, state, iterable)?;

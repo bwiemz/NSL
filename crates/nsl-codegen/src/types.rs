@@ -32,13 +32,13 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
         Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } => types::I64,
         Type::Void => types::I8, // should not appear as value type
         Type::Unknown | Type::Error => {
-            #[cfg(debug_assertions)]
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static WARNED: AtomicBool = AtomicBool::new(false);
-                if !WARNED.swap(true, Ordering::Relaxed) {
-                    eprintln!("[nsl-codegen] warning: Type::Unknown reached codegen (defaulting to I64)");
-                }
+            // Warn in ALL builds (not just debug) — Unknown reaching codegen
+            // means type inference failed and the generated code is guessing.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[nsl-codegen] warning: Type::Unknown reached codegen (defaulting to I64). \
+                           This may indicate a type inference gap.");
             }
             types::I64
         }

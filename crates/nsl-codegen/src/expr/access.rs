@@ -133,7 +133,14 @@ impl Compiler<'_> {
         }
 
         // Dict-like member access: obj.field → nsl_dict_get_str(obj, "field")
-        // This supports train block batch access: batch.input_ids, batch.labels
+        // This is the correct path for Dict<String, Tensor> types (e.g., train block batches).
+        // Warn if the object type is Unknown — this means type inference failed upstream.
+        if matches!(obj_type, Type::Unknown) {
+            eprintln!(
+                "[nsl-codegen] warning: member access '.{member_name}' on Unknown-typed object — \
+                 falling through to dict access. This may be a type inference gap."
+            );
+        }
         {
             // Ensure the key string is in the string pool
             if !self.string_pool.contains_key(member_name.as_str()) {
@@ -170,7 +177,13 @@ impl Compiler<'_> {
                         Ok(builder.inst_results(call)[0])
                     }
                     _ => {
-                        // Default: list subscript
+                        // Default: list subscript. Warn if the type is Unknown.
+                        if matches!(obj_type, Type::Unknown) {
+                            eprintln!(
+                                "[nsl-codegen] warning: subscript on Unknown-typed object — \
+                                 defaulting to list access"
+                            );
+                        }
                         let fid = self.runtime_fns["nsl_list_get"].0;
                         let fref = self.module.declare_func_in_func(fid, builder.func);
                         let call = builder.ins().call(fref, &[obj_val, idx_val]);
