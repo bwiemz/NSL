@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
@@ -421,7 +423,7 @@ impl Compiler<'_> {
         // Look up mangled method name.
         // For locally defined models, use the model_methods map.
         // For imported models, fall back to the standard naming convention.
-        let mangled = if let Some(methods) = self.model_methods.get(model_name) {
+        let mangled = if let Some(methods) = self.models.model_methods.get(model_name) {
             methods.get(method_name).ok_or_else(|| {
                 CodegenError::new(format!("model '{model_name}' has no method '{method_name}'"))
             })?.clone()
@@ -630,6 +632,7 @@ impl Compiler<'_> {
         scale_val: Value,
     ) -> Result<Value, CodegenError> {
         let ctx = self
+            .kernels
             .flash_attention_context
             .as_ref()
             .ok_or_else(|| CodegenError::new("flash_attention_context not set"))?;
@@ -760,7 +763,7 @@ impl Compiler<'_> {
         )?;
 
         // 3. Call model's forward method
-        let mangled_forward = if let Some(methods) = self.model_methods.get(&model_name) {
+        let mangled_forward = if let Some(methods) = self.models.model_methods.get(&model_name) {
             methods
                 .get("forward")
                 .ok_or_else(|| {
@@ -963,7 +966,8 @@ impl Compiler<'_> {
             Some(l) => l.clone(),
             None => return entries,
         };
-        let field_types = self
+        let field_types: HashMap<String, String> = self
+            .models
             .model_field_types
             .get(model_name)
             .cloned()
@@ -1029,7 +1033,7 @@ impl Compiler<'_> {
         state: &mut FuncState,
         expr: &Expr,
     ) -> Result<Option<Value>, CodegenError> {
-        if state.in_fuse_bypass || self.disable_fusion {
+        if state.in_fuse_bypass || self.fusion.disabled {
             return Ok(None);
         }
         // Don't fuse during tape recording — autodiff needs individual op recordings
@@ -1734,7 +1738,7 @@ impl Compiler<'_> {
 
         // Check if the scalar comes from a known weight (e.g., scale tensor loaded from safetensors)
         if let Some(key) = state.weight_values.get(&scalar_val) {
-            if let Some(&scale) = self.weight_scales.get(key) {
+            if let Some(&scale) = self.memory.weight_scales.get(key) {
                 eprintln!(
                     "[nsl] M52d: fused scaling constant {:.6e} for weight '{}'",
                     scale, key

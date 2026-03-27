@@ -56,7 +56,7 @@ impl Compiler<'_> {
             // Fallback for model array loop variables (type is Unknown but var was bound from model array)
             if matches!(obj_type, Type::Unknown) {
                 if let ExprKind::Ident(obj_sym) = &object.kind {
-                    if let Some(model_name) = self.model_var_types.get(obj_sym).cloned() {
+                    if let Some(model_name) = self.models.model_var_types.get(obj_sym).cloned() {
                         return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
                     }
                 }
@@ -81,7 +81,7 @@ impl Compiler<'_> {
         // "batched_matmul_right" are logical names; both currently lower to
         // nsl_tensor_matmul which handles broadcast/batched shapes natively.
         // Future milestones (M39c+) will wire specialised batched kernels here.
-        if let Some(rewrite_target) = self.matmul_rewrites.get(&call_expr.id).cloned() {
+        if let Some(rewrite_target) = self.vmap.matmul_rewrites.get(&call_expr.id).cloned() {
             let rt_name = match rewrite_target.as_str() {
                 "batched_matmul" | "batched_matmul_right" => "nsl_tensor_matmul",
                 other => other, // forward any future named variants unchanged
@@ -95,7 +95,7 @@ impl Compiler<'_> {
         }
 
         // Check if this is a kernel call (compiled GPU kernel)
-        if let Some((ptx_data_id, name_data_id)) = self.kernel_ptx_data.get(&func_name).cloned() {
+        if let Some((ptx_data_id, name_data_id)) = self.kernels.kernel_ptx_data.get(&func_name).cloned() {
             return self.compile_kernel_call(builder, state, &func_name.clone(), args, ptx_data_id, name_data_id);
         }
 
@@ -762,7 +762,7 @@ impl Compiler<'_> {
             }
 
             // Check if the enclosing function has @flash_attention decorator
-            if self.flash_attention_context.is_some() {
+            if self.kernels.flash_attention_context.is_some() {
                 return self.compile_flash_attention_call(builder, q_val, k_val, v_val, scale_val);
             }
 
@@ -1434,7 +1434,7 @@ impl Compiler<'_> {
         // has already validated that the function body is batchable during the
         // transform pass.  If compilation of the batched variant failed (non-fatal),
         // the function won't be in self.registry.functions and we fall through to the original.
-        let effective_name: &str = if let Some(batched_name) = self.batched_fn_names.get(func_name) {
+        let effective_name: &str = if let Some(batched_name) = self.vmap.batched_fn_names.get(func_name) {
             if self.registry.functions.contains_key(batched_name.as_str()) {
                 // Batched variant exists and is compiled — dispatch to it.
                 batched_name.as_str()

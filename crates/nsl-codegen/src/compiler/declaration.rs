@@ -132,7 +132,7 @@ impl Compiler<'_> {
             .collect();
 
         let struct_names: Vec<String> = self.types.struct_layouts.keys()
-            .filter(|k| !model_name_set.contains(*k) && !self.imported_model_names.contains(*k))
+            .filter(|k| !model_name_set.contains(*k) && !self.models.imported_model_names.contains(*k))
             .cloned()
             .collect();
         for sname in struct_names {
@@ -245,7 +245,7 @@ impl Compiler<'_> {
                     method_map.insert(method_name, mangled);
                 }
             }
-            self.model_methods.insert(model_name, method_map);
+            self.models.model_methods.insert(model_name, method_map);
         }
 
         // M55: Handle @zk_proof on whole model blocks.

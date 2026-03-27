@@ -37,7 +37,7 @@ impl Compiler<'_> {
             Some(n) => n.to_string(),
             None => return Ok(None),
         };
-        let offset = match self.slab_name_offsets.get(&var_name) {
+        let offset = match self.memory.slab_name_offsets.get(&var_name) {
             Some(&o) => o,
             None => return Ok(None),
         };
@@ -1220,7 +1220,7 @@ impl Compiler<'_> {
 
         // Register the loop variable's model type for method dispatch
         let model_name = self.resolve_sym(element_model).to_string();
-        self.model_var_types.insert(loop_var_sym, model_name);
+        self.models.model_var_types.insert(loop_var_sym, model_name);
 
         // Counter variable
         let counter_var = state.new_variable();
@@ -3175,8 +3175,8 @@ impl Compiler<'_> {
         if !self.types.struct_layouts.contains_key(&quant_name) {
             self.types.struct_layouts.insert(quant_name.clone(), layout);
         }
-        if let Some(methods) = self.model_methods.get(&model_type_name).cloned() {
-            self.model_methods.insert(quant_name, methods);
+        if let Some(methods) = self.models.model_methods.get(&model_type_name).cloned() {
+            self.models.model_methods.insert(quant_name, methods);
         }
 
         // 7. Bind the new struct pointer as the output variable

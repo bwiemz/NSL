@@ -169,7 +169,7 @@ impl Compiler<'_> {
                 "failed to define name data for kernel '{}': {e}", kernel_name
             )))?;
 
-        self.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
+        self.kernels.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
         Ok(())
     }
 
@@ -289,7 +289,7 @@ impl Compiler<'_> {
                 "failed to define name data for kernel '{}': {e}", kernel_name
             )))?;
 
-        self.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
+        self.kernels.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
         Ok(())
     }
 
@@ -410,7 +410,7 @@ impl Compiler<'_> {
                     for member in &md.members {
                         if let ModelMember::LayerDecl { decorators, .. } = member {
                             if let Some(ctx) = self.try_build_flash_context(decorators)? {
-                                self.flash_attention_context = Some(ctx);
+                                self.kernels.flash_attention_context = Some(ctx);
                                 return Ok(());
                             }
                         }
@@ -421,7 +421,7 @@ impl Compiler<'_> {
             };
 
             if let Some(ctx) = self.try_build_flash_context(decorators)? {
-                self.flash_attention_context = Some(ctx);
+                self.kernels.flash_attention_context = Some(ctx);
                 return Ok(());
             }
         }
@@ -638,6 +638,7 @@ impl Compiler<'_> {
             // The primary variant's PTX was already embedded in the loop above.
             // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
             let (ptx_data_id, name_data_id) = self
+                .kernels
                 .kernel_ptx_data
                 .get(&format!("flash_{}", kernel_name))
                 .copied()
@@ -791,7 +792,7 @@ impl Compiler<'_> {
                 ))
             })?;
 
-        self.kernel_ptx_data
+        self.kernels.kernel_ptx_data
             .insert(format!("flash_{}", kernel_name), (ptx_data_id, name_data_id));
         Ok((ptx_data_id, name_data_id))
     }

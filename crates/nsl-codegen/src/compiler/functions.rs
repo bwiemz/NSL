@@ -33,7 +33,7 @@ impl Compiler<'_> {
         #[allow(clippy::type_complexity)]
         let layouts: Vec<(String, Vec<(cl_types::Type, usize)>, usize)> = self
             .types.struct_layouts.iter()
-            .filter(|(name, _)| !self.model_methods.contains_key(*name) && !self.imported_model_names.contains(*name))
+            .filter(|(name, _)| !self.models.model_methods.contains_key(*name) && !self.models.imported_model_names.contains(*name))
             .map(|(name, layout)| {
                 let fields: Vec<_> = layout.fields.iter().map(|f| (f.cl_type, f.offset)).collect();
                 (name.clone(), fields, layout.total_size)
@@ -299,7 +299,7 @@ impl Compiler<'_> {
             }
 
             // M25: Initialize paged KV cache if model has @paged_kv
-            if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) = self.paged_kv_configs.get(&model_name) {
+            if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) = self.models.paged_kv_configs.get(&model_name) {
                 let init_id = self.registry.runtime_fns["nsl_kv_cache_init"].0;
                 let init_ref = self.module.declare_func_in_func(init_id, builder.func);
                 let nb = builder.ins().iconst(cl_types::I64, num_blocks);

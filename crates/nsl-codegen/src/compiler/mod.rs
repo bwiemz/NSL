@@ -95,6 +95,93 @@ impl FunctionRegistry {
     }
 }
 
+/// Sub-struct grouping model metadata fields out of the `Compiler` god-object.
+pub struct ModelMetadata {
+    pub model_methods: HashMap<String, HashMap<String, String>>,
+    pub model_field_types: HashMap<String, HashMap<String, String>>,
+    pub model_var_types: HashMap<Symbol, String>,
+    pub imported_model_names: HashSet<String>,
+    pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
+}
+
+impl ModelMetadata {
+    fn new() -> Self {
+        Self {
+            model_methods: HashMap::new(),
+            model_field_types: HashMap::new(),
+            model_var_types: HashMap::new(),
+            imported_model_names: HashSet::new(),
+            paged_kv_configs: HashMap::new(),
+        }
+    }
+}
+
+/// Sub-struct grouping fusion reporting state out of the `Compiler` god-object.
+pub struct FusionState {
+    pub events: Vec<crate::fusion_report::FusionEvent>,
+    pub barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
+    pub report_enabled: bool,
+    pub disabled: bool,
+}
+
+impl FusionState {
+    fn new(options: &crate::CompileOptions) -> Self {
+        Self {
+            events: Vec::new(),
+            barriers: Vec::new(),
+            report_enabled: options.fusion_report,
+            disabled: options.disable_fusion || options.debug_training,
+        }
+    }
+}
+
+/// Sub-struct grouping memory planning state out of the `Compiler` god-object.
+pub struct MemoryPlanState {
+    pub slab_plan: Option<crate::memory_planner::SlabPlan>,
+    pub slab_name_offsets: HashMap<String, u64>,
+    pub weight_scales: HashMap<String, f32>,
+}
+
+impl MemoryPlanState {
+    fn new() -> Self {
+        Self {
+            slab_plan: None,
+            slab_name_offsets: HashMap::new(),
+            weight_scales: HashMap::new(),
+        }
+    }
+}
+
+/// Sub-struct grouping GPU kernel compilation state out of the `Compiler` god-object.
+pub struct GpuKernelState {
+    pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
+    pub flash_attention_context: Option<FlashAttentionCompileContext>,
+}
+
+impl GpuKernelState {
+    fn new() -> Self {
+        Self {
+            kernel_ptx_data: HashMap::new(),
+            flash_attention_context: None,
+        }
+    }
+}
+
+/// Sub-struct grouping vmap batched function state out of the `Compiler` god-object.
+pub struct VmapState {
+    pub batched_fn_names: HashMap<String, String>,
+    pub matmul_rewrites: HashMap<NodeId, String>,
+}
+
+impl VmapState {
+    fn new() -> Self {
+        Self {
+            batched_fn_names: HashMap::new(),
+            matmul_rewrites: HashMap::new(),
+        }
+    }
+}
+
 /// Configuration for standalone export codegen.
 pub struct StandaloneConfig {
     /// If true, weights are embedded in the binary via linker symbols.
@@ -235,11 +322,7 @@ pub struct Compiler<'a> {
     pub types: TypeRegistry,
 
     // ── Model metadata ───────────────────────────────────────────────
-    pub model_methods: HashMap<String, HashMap<String, String>>,
-    pub model_field_types: HashMap<String, HashMap<String, String>>,
-    pub model_var_types: HashMap<Symbol, String>,
-    pub imported_model_names: HashSet<String>,
-    pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
+    pub models: ModelMetadata,
 
     // ── Module & linking ─────────────────────────────────────────────
     pub module_prefix: String,
@@ -247,29 +330,16 @@ pub struct Compiler<'a> {
     pub(crate) standalone_config: Option<StandaloneConfig>,
 
     // ── GPU kernels ──────────────────────────────────────────────────
-    pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
-    pub flash_attention_context: Option<FlashAttentionCompileContext>,
+    pub kernels: GpuKernelState,
 
     // ── Fusion reporting (M31) ───────────────────────────────────────
-    pub fusion_events: Vec<crate::fusion_report::FusionEvent>,
-    pub fusion_barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
-    pub fusion_report_enabled: bool,
-    pub disable_fusion: bool,
+    pub fusion: FusionState,
 
     // ── Memory planning (M36) ────────────────────────────────────────
-    pub slab_plan: Option<crate::memory_planner::SlabPlan>,
-    /// Maps tensor variable name → byte offset in the GPU slab.
-    /// Populated by the memory planner before compile_main.
-    pub slab_name_offsets: HashMap<String, u64>,
-    /// M52d: Maps weight name → compile-time quantization scale (f32).
-    /// Populated during weight analysis for FP8/INT8 weights.
-    pub weight_scales: HashMap<String, f32>,
+    pub memory: MemoryPlanState,
 
     // ── vmap batched function registry (M39) ─────────────────────────
-    /// Maps original function name → batched variant name (e.g. "foo" → "foo_batched").
-    pub batched_fn_names: HashMap<String, String>,
-    /// Maps AST NodeId of matmul call sites → target batched callee name.
-    pub matmul_rewrites: HashMap<NodeId, String>,
+    pub vmap: VmapState,
 
     // ── Feature configs (M30-M55 decorators) ─────────────────────────
     /// All feature-specific decorator state extracted into a single sub-struct.
@@ -374,25 +444,14 @@ impl<'a> Compiler<'a> {
             func_index: 0,
             registry: FunctionRegistry::new(),
             types: TypeRegistry::new(),
-            model_methods: HashMap::new(),
-            model_field_types: HashMap::new(),
-            model_var_types: HashMap::new(),
-            imported_model_names: HashSet::new(),
-            paged_kv_configs: HashMap::new(),
+            models: ModelMetadata::new(),
             module_prefix: String::new(),
             string_pool: HashMap::new(),
             standalone_config: None,
-            kernel_ptx_data: HashMap::new(),
-            flash_attention_context: None,
-            fusion_events: Vec::new(),
-            fusion_barriers: Vec::new(),
-            fusion_report_enabled: options.fusion_report,
-            disable_fusion: options.disable_fusion || options.debug_training,
-            slab_plan: None,
-            slab_name_offsets: HashMap::new(),
-            weight_scales: HashMap::new(),
-            batched_fn_names: HashMap::new(),
-            matmul_rewrites: HashMap::new(),
+            kernels: GpuKernelState::new(),
+            fusion: FusionState::new(options),
+            memory: MemoryPlanState::new(),
+            vmap: VmapState::new(),
             features: FeatureConfigs::new(options),
         })
     }
@@ -436,7 +495,7 @@ impl<'a> Compiler<'a> {
 
     /// Enable fusion report collection (called when --fusion-report or @fuse_graph is present).
     pub fn enable_fusion_report(&mut self) {
-        self.fusion_report_enabled = true;
+        self.fusion.report_enabled = true;
     }
 
     /// Resolve a type name (from AST annotation) to a Cranelift type.
@@ -664,7 +723,7 @@ impl<'a> Compiler<'a> {
             let final_ms = total_ms * safety_margin;
             let bound_satisfied = final_ms <= constraint.max_latency_ms;
 
-            let no_heap = prove_no_heap(self.slab_plan.as_ref(), &fn_name);
+            let no_heap = prove_no_heap(self.memory.slab_plan.as_ref(), &fn_name);
             let static_cf = prove_static_cf(&target, &ops);
 
             let func_wcet = FunctionWcet {

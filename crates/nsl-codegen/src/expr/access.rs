@@ -77,7 +77,7 @@ impl Compiler<'_> {
         if let Type::Model { name, .. } = &obj_type {
             let model_name = self.resolve_sym(*name).to_string();
             // Check if this field is a FixedModelArray -- return the address, not a loaded value
-            if let Some(field_type_map) = self.model_field_types.get(&model_name).cloned() {
+            if let Some(field_type_map) = self.models.model_field_types.get(&model_name).cloned() {
                 if let Some(array_marker) = field_type_map.get(&member_name).cloned() {
                     if array_marker.starts_with('[') {
                         if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {

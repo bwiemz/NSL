@@ -58,14 +58,14 @@ pub fn compile(
                     for name in &names {
                         if let Some(entry) = wmap.get(name) {
                             if let Some(scale) = entry.compute_scale() {
-                                compiler.weight_scales.insert(name.clone(), scale);
+                                compiler.memory.weight_scales.insert(name.clone(), scale);
                             }
                         }
                     }
-                    if !compiler.weight_scales.is_empty() {
+                    if !compiler.memory.weight_scales.is_empty() {
                         eprintln!(
                             "[nsl] M52d: computed compile-time scales for {} quantized weights",
-                            compiler.weight_scales.len()
+                            compiler.memory.weight_scales.len()
                         );
                     }
                 }
@@ -130,10 +130,10 @@ pub fn compile(
                 // Build name → offset map for codegen
                 for alloc in &plannable {
                     if let Some(&(_slot_id, offset)) = plan.assignments.get(&alloc.id) {
-                        compiler.slab_name_offsets.insert(alloc.name.clone(), offset);
+                        compiler.memory.slab_name_offsets.insert(alloc.name.clone(), offset);
                     }
                 }
-                compiler.slab_plan = Some(plan);
+                compiler.memory.slab_plan = Some(plan);
             }
         } else if options.memory_report {
             eprintln!("[nsl] Memory plan: no static-shape tensor allocations found");
@@ -423,7 +423,7 @@ pub fn compile_module_with_imports(
         compiler.types.struct_layouts.insert(name, layout);
     }
     for name in imported_model_names {
-        compiler.imported_model_names.insert(name);
+        compiler.models.imported_model_names.insert(name);
     }
 
     compiler.intern_string("")?;
@@ -472,7 +472,7 @@ pub fn compile_entry(
     }
     // Mark imported model names so we don't generate struct ctors for them
     for name in imported_model_names {
-        compiler.imported_model_names.insert(name);
+        compiler.models.imported_model_names.insert(name);
     }
     for (name, tag) in imported_enum_variants {
         compiler.types.enum_variants.insert(name, tag);
@@ -505,8 +505,8 @@ pub fn compile_entry(
         compiler.run_wcet_analysis()?;
     }
     // M31: Print fusion report if enabled
-    if compiler.fusion_report_enabled {
-        crate::fusion_report::print_fusion_report(&compiler.fusion_events, &compiler.fusion_barriers);
+    if compiler.fusion.report_enabled {
+        crate::fusion_report::print_fusion_report(&compiler.fusion.events, &compiler.fusion.barriers);
     }
     compiler.finalize()
 }

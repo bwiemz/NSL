@@ -94,7 +94,7 @@ impl Compiler<'_> {
             self.emit_dtype_registration(&mut builder, stmts)?;
 
             // M36: Initialize GPU memory slab if the planner computed a layout
-            let slab_ptr_var = if let Some(ref plan) = self.slab_plan {
+            let slab_ptr_var = if let Some(ref plan) = self.memory.slab_plan {
                 if plan.total_bytes > 0 {
                     let total = builder.ins().iconst(cl_types::I64, plan.total_bytes as i64);
                     let slab_ptr = self.compile_call_by_name(&mut builder, "nsl_gpu_slab_init", &[total])?;
@@ -375,7 +375,7 @@ impl Compiler<'_> {
                 ) {
                     Ok(func_id) => {
                         self.registry.functions.insert(batched_name.clone(), (func_id, sig_clone));
-                        self.batched_fn_names.insert(original_name.to_string(), batched_name.clone());
+                        self.vmap.batched_fn_names.insert(original_name.to_string(), batched_name.clone());
                     }
                     Err(e) => {
                         eprintln!("[nsl] vmap: failed to declare '{}': {}", batched_name, e);
@@ -385,7 +385,7 @@ impl Compiler<'_> {
 
             // Store matmul rewrites for later use during call-site dispatch
             for (node_id, target) in &result.matmul_rewrites {
-                self.matmul_rewrites.insert(*node_id, target.clone());
+                self.vmap.matmul_rewrites.insert(*node_id, target.clone());
             }
         }
     }

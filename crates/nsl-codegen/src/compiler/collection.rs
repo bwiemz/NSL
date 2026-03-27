@@ -420,7 +420,7 @@ impl Compiler<'_> {
                                     }
                                 }
                                 let model_name = self.resolve_sym(md.name).to_string();
-                                self.paged_kv_configs.insert(model_name, (num_blocks, block_size, num_heads, head_dim, num_layers));
+                                self.models.paged_kv_configs.insert(model_name, (num_blocks, block_size, num_heads, head_dim, num_layers));
                             }
                             // M33: @speculative decorator extraction
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "speculative" {
@@ -520,7 +520,7 @@ impl Compiler<'_> {
                 }
 
                 if !field_type_map.is_empty() {
-                    self.model_field_types.insert(name.clone(), field_type_map);
+                    self.models.model_field_types.insert(name.clone(), field_type_map);
                 }
                 self.types.struct_layouts.insert(name.clone(), StructLayout { name, fields, total_size: offset });
             }
