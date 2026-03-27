@@ -1798,6 +1798,27 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
+        // These persist across batches within each accumulation window. Each buffer
+        // is zeros_like(param) and gets += each batch's grads, then zeroed after
+        // the optimizer step every N batches.
+        let accum_list = if grad_accumulation_steps > 1 {
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            for field in &layout.fields {
+                let field_val = builder.ins().load(
+                    field.cl_type,
+                    MemFlags::trusted(),
+                    model_ptr,
+                    field.offset as i32,
+                );
+                let zeros = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[field_val])?;
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, zeros])?;
+            }
+            Some(list)
+        } else {
+            None
+        };
+
         // ── 6. Emit epoch loop ──────────────────────────────────────────
         let epoch_counter_var = state.new_variable();
         builder.declare_var(epoch_counter_var, cl_types::I64);
@@ -1999,7 +2020,32 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
         }
 
-        // 7e3. Gradient accumulation gate: only step optimizer every N batches
+        // 7e3. Gradient accumulation: accumulate this batch's grads into
+        // persistent buffers, then free the per-batch grads immediately.
+        // When not accumulating (steps == 1), grads_list is used directly
+        // by the optimizer and freed after the step.
+        if let Some(accum) = accum_list {
+            // accum[i] += grads[i] for each parameter
+            for i in 0..num_params {
+                let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, idx])?;
+                let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, idx])?;
+                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                self.compile_call_by_name(builder, "nsl_grad_accumulate_add", &[accum_buf, grad, n_elems])?;
+            }
+
+            // Free this batch's gradient tensors (accumulated into buffers)
+            for i in 0..num_params {
+                let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                let grad_val = self.compile_call_by_name(
+                    builder, "nsl_list_get", &[grads_list, idx],
+                )?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
+            }
+            self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+        }
+
+        // 7e4. Gradient accumulation gate: only step optimizer every N batches
         let optimizer_block = builder.create_block();
         let post_optimizer_block = builder.create_block();
 
@@ -2025,6 +2071,9 @@ impl Compiler<'_> {
         }
 
         // 7f. Optimizer step: for each param, call optimizer step function
+        // When accumulating, use accum_list (accumulated grads); otherwise use grads_list directly.
+        let opt_grads = if let Some(accum) = accum_list { accum } else { grads_list };
+
         let optimizer_fn_name = match optimizer_name.as_str() {
             "sgd" => "nsl__optim__sgd__sgd_step",
             "adam" => "nsl__optim__adam__adam_step",
@@ -2070,7 +2119,7 @@ impl Compiler<'_> {
         let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
         if zero_enabled {
             let num_p = builder.ins().iconst(cl_types::I64, num_params as i64);
-            self.compile_call_by_name(builder, "nsl_zero_reduce_grads", &[grads_list, num_p])?;
+            self.compile_call_by_name(builder, "nsl_zero_reduce_grads", &[opt_grads, num_p])?;
         }
 
         for i in 0..num_params {
@@ -2097,9 +2146,9 @@ impl Compiler<'_> {
                 builder, "nsl_list_get", &[param_list, idx],
             )?;
 
-            // Get gradient from grads_list
+            // Get gradient from opt_grads (accumulated buffer or direct grads)
             let grad_val = self.compile_call_by_name(
-                builder, "nsl_list_get", &[grads_list, idx],
+                builder, "nsl_list_get", &[opt_grads, idx],
             )?;
 
             match optimizer_name.as_str() {
@@ -2158,15 +2207,27 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
         }
 
-        // 7g. Free gradient tensors and the grads_list to prevent per-step memory leak
-        for i in 0..num_params {
-            let idx = builder.ins().iconst(cl_types::I64, i as i64);
-            let grad_val = self.compile_call_by_name(
-                builder, "nsl_list_get", &[grads_list, idx],
-            )?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
+        // 7g. Post-optimizer cleanup: zero accum buffers or free direct grads
+        if let Some(accum) = accum_list {
+            // Zero the accumulation buffers after optimizer step so the next
+            // N batches start from a clean slate.
+            for i in 0..num_params {
+                let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                let buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, idx])?;
+                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[buf])?;
+                self.compile_call_by_name(builder, "nsl_grad_zero", &[buf, n_elems])?;
+            }
+        } else {
+            // No accumulation — free gradient tensors and grads_list every batch
+            for i in 0..num_params {
+                let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                let grad_val = self.compile_call_by_name(
+                    builder, "nsl_list_get", &[grads_list, idx],
+                )?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
+            }
+            self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
         }
-        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
 
         // Jump to post-optimizer block (merges optimizer and skip paths)
         builder.ins().jump(post_optimizer_block, &[]);
@@ -2379,6 +2440,16 @@ impl Compiler<'_> {
         }
         for &buf in &state_buf_2 {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
+        }
+
+        // Free gradient accumulation buffers (if allocated)
+        if let Some(accum) = accum_list {
+            for i in 0..num_params {
+                let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                let buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, idx])?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[buf])?;
+            }
+            self.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
         }
 
         Ok(())

@@ -99,6 +99,12 @@ pub extern "C" fn nsl_tensor_ndim(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).ndim
 }
 
+/// Returns the total number of elements in the tensor.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_len(tensor_ptr: i64) -> i64 {
+    NslTensor::from_ptr(tensor_ptr).len
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_get_dtype(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).dtype as i64
