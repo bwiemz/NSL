@@ -190,6 +190,15 @@ impl<'a> TypeChecker<'a> {
                 self.check_expr(condition);
                 let then_ty = self.check_expr(then_expr);
                 let else_ty = self.check_expr(else_expr);
+                // Warn if either branch is NoneLiteral — this means the parser
+                // inserted a placeholder for a missing branch or non-expression tail.
+                // In value position (let x = if ...), this is almost certainly a bug.
+                if matches!(else_expr.kind, ExprKind::NoneLiteral) {
+                    self.diagnostics.push(
+                        Diagnostic::warning("if-expression without else branch evaluates to None")
+                            .with_label(expr.span, "consider adding an else branch"),
+                    );
+                }
                 // Use the more specific type when one branch is Unknown
                 if matches!(then_ty, Type::Unknown) {
                     else_ty

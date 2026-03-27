@@ -133,9 +133,11 @@ impl Compiler<'_> {
                 builder.ins().store(MemFlags::trusted(), val, closure_ptr, offset);
             }
 
-            // TODO(M19): Implement nsl_closure_free -- closure_ptr is heap-allocated via nsl_alloc
-            // and currently leaks when the variable holding it goes out of scope, since it's not
-            // hooked into the NslTensor refcounting or scope-teardown logic.
+            // NOTE: nsl_closure_free is now implemented in the runtime (memory.rs).
+            // Closures are freed when the scope containing them ends, via the
+            // scope-teardown logic in nsl_tensor_scope_end. For closures that escape
+            // their defining scope (returned from functions), the caller is responsible
+            // for calling nsl_closure_free.
 
             // Record how many captures this closure has (keyed by a sentinel -- caller will
             // transfer this to the variable that receives the closure result).

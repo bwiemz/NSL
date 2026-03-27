@@ -19,6 +19,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Memory
     ("nsl_alloc", &[types::I64], Some(types::I64)),
     ("nsl_free", &[types::I64], None),
+    ("nsl_closure_free", &[types::I64], None),
     // List
     ("nsl_list_new", &[], Some(types::I64)),
     ("nsl_list_push", &[types::I64, types::I64], None),
