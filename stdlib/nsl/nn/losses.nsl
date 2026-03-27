@@ -12,7 +12,7 @@ fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     #   valid_mask = clamp(targets + 1, 0, 1)  →  -100 maps to 0, valid maps to 1
     # This avoids needing comparison ops. safe_targets clamps negatives to 0
     # so gather does not index out-of-bounds; the mask zeroes those losses out.
-    let safe_targets = clamp(targets, 0.0, 49151.0)
+    let safe_targets = clamp(targets, 0.0, 2147483647.0)
     let max_val = reduce_max(logits, 1, 1)
     let shifted = logits - max_val
     let exp_sum = sum(exp(shifted), 1, 1)

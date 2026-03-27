@@ -2178,13 +2178,17 @@ impl Compiler<'_> {
                 "muon" => {
                     self.compile_call_by_name(
                         builder, &opt_fn,
-                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, nesterov_const],
+                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, weight_decay_const, nesterov_const],
                     )?;
                 }
                 "soap" => {
+                    let t_val_s = builder.use_var(step_count_var);
+                    let one_s = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_s = builder.ins().iadd(t_val_s, one_s);
+                    let t_float_s = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_s);
                     self.compile_call_by_name(
                         builder, &opt_fn,
-                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const],
+                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const, t_float_s],
                     )?;
                 }
                 _ => {
@@ -2891,13 +2895,17 @@ impl Compiler<'_> {
                 "muon" => {
                     self.compile_call_by_name(
                         builder, &opt_fn,
-                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, nesterov_const],
+                        &[param_val, grad_val, state_buf_1[i], lr, momentum_const, weight_decay_const, nesterov_const],
                     )?;
                 }
                 "soap" => {
+                    let t_val_p = builder.use_var(step_count_var);
+                    let one_p = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_p = builder.ins().iadd(t_val_p, one_p);
+                    let t_float_p = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_p);
                     self.compile_call_by_name(
                         builder, &opt_fn,
-                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const],
+                        &[param_val, grad_val, state_buf_1[i], state_buf_2[i], lr, beta1_const, beta2_const, eps_const, t_float_p],
                     )?;
                 }
                 _ => {
