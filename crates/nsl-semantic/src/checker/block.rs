@@ -26,22 +26,30 @@ impl<'a> TypeChecker<'a> {
                 }
                 TrainSection::Step { param, body } => {
                     has_step = true;
-                    // Declare the step parameter (e.g. `batch`) as Unknown type
-                    // so that batch.input_ids / batch.labels resolve in scope.
+                    // DataLoader yields Dict<String, Tensor> batches. Type the step
+                    // parameter concretely so field access (batch.input_ids) is validated.
+                    let batch_type = Type::Dict(
+                        Box::new(Type::Str),
+                        Box::new(Type::Unknown),
+                    );
                     let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                     let prev = self.current_scope;
                     self.current_scope = scope;
-                    self.declare_symbol(*param, Type::Unknown, body.span, false, true);
+                    self.declare_symbol(*param, batch_type, body.span, false, true);
                     for s in &body.stmts {
                         self.check_stmt(s);
                     }
                     self.current_scope = prev;
                 }
                 TrainSection::Eval { param, body } => {
+                    let eval_type = Type::Dict(
+                        Box::new(Type::Str),
+                        Box::new(Type::Unknown),
+                    );
                     let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
                     let prev = self.current_scope;
                     self.current_scope = scope;
-                    self.declare_symbol(*param, Type::Unknown, body.span, false, true);
+                    self.declare_symbol(*param, eval_type, body.span, false, true);
                     for s in &body.stmts {
                         self.check_stmt(s);
                     }
