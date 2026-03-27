@@ -21,7 +21,7 @@ impl Compiler<'_> {
         } else {
             self.resolve_sym(fn_def.name).to_string()
         };
-        let (func_id, sig) = self.functions[&name].clone();
+        let (func_id, sig) = self.registry.functions[&name].clone();
 
         let mut ctx = Context::for_function(Function::with_name_signature(
             UserFuncName::user(0, self.next_func_index()),
@@ -113,7 +113,7 @@ impl Compiler<'_> {
             }
 
             // @no_grad: pause tape recording at function entry
-            let is_no_grad = self.no_grad_fns.contains(&name);
+            let is_no_grad = self.registry.no_grad_fns.contains(&name);
             if is_no_grad {
                 state.is_no_grad = true;
                 self.compile_call_by_name(&mut builder, "nsl_tape_pause", &[])?;

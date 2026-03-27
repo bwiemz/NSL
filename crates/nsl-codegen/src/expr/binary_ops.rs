@@ -36,7 +36,7 @@ impl Compiler<'_> {
             } else {
                 "nsl_list_contains"
             };
-            let fid = self.runtime_fns[fn_name].0;
+            let fid = self.registry.runtime_fns[fn_name].0;
             let fref = self.module.declare_func_in_func(fid, builder.func);
             let call = builder.ins().call(fref, &[rhs, lhs]);
             return Ok(builder.inst_results(call)[0]);
@@ -56,7 +56,7 @@ impl Compiler<'_> {
             if !matches!(right_type, Type::Str) {
                 rhs = self.value_to_string(builder, rhs, &right_type)?;
             }
-            let concat_id = self.runtime_fns["nsl_str_concat"].0;
+            let concat_id = self.registry.runtime_fns["nsl_str_concat"].0;
             let concat_ref = self.module.declare_func_in_func(concat_id, builder.func);
             let call = builder.ins().call(concat_ref, &[lhs, rhs]);
             return Ok(builder.inst_results(call)[0]);
@@ -69,7 +69,7 @@ impl Compiler<'_> {
             } else {
                 (rhs, lhs)
             };
-            let fid = self.runtime_fns["nsl_str_repeat"].0;
+            let fid = self.registry.runtime_fns["nsl_str_repeat"].0;
             let fref = self.module.declare_func_in_func(fid, builder.func);
             let call = builder.ins().call(fref, &[str_val, int_val]);
             return Ok(builder.inst_results(call)[0]);
@@ -223,7 +223,7 @@ impl Compiler<'_> {
 
             BinOp::Eq if is_float => Ok(builder.ins().fcmp(FloatCC::Equal, lhs, rhs)),
             BinOp::Eq if matches!(left_type, Type::Str) => {
-                let fid = self.runtime_fns["nsl_str_eq"].0;
+                let fid = self.registry.runtime_fns["nsl_str_eq"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[lhs, rhs]);
                 let result_i64 = builder.inst_results(call)[0];
@@ -233,7 +233,7 @@ impl Compiler<'_> {
             BinOp::Eq => Ok(builder.ins().icmp(IntCC::Equal, lhs, rhs)),
             BinOp::NotEq if is_float => Ok(builder.ins().fcmp(FloatCC::NotEqual, lhs, rhs)),
             BinOp::NotEq if matches!(left_type, Type::Str) => {
-                let fid = self.runtime_fns["nsl_str_eq"].0;
+                let fid = self.registry.runtime_fns["nsl_str_eq"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[lhs, rhs]);
                 let eq_i64 = builder.inst_results(call)[0];
@@ -327,7 +327,7 @@ impl Compiler<'_> {
         is_float: bool,
     ) -> Result<Value, CodegenError> {
         let rt_fn = if is_float { "nsl_pow_float" } else { "nsl_pow_int" };
-        let func_id = self.runtime_fns[rt_fn].0;
+        let func_id = self.registry.runtime_fns[rt_fn].0;
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         let call = builder.ins().call(func_ref, &[lhs, rhs]);
         Ok(builder.inst_results(call)[0])

@@ -119,7 +119,7 @@ impl Compiler<'_> {
         patterns: &[nsl_ast::pattern::Pattern],
         container_val: cranelift_codegen::ir::Value,
     ) -> Result<(), CodegenError> {
-        let get_id = self.runtime_fns["nsl_list_get"].0;
+        let get_id = self.registry.runtime_fns["nsl_list_get"].0;
         let get_ref = self.module.declare_func_in_func(get_id, builder.func);
 
         for (i, sub_pat) in patterns.iter().enumerate() {
@@ -233,7 +233,7 @@ impl Compiler<'_> {
 
         // Clear any stale lambda capture count from a previous statement
         // (only VarDecl should consume this; if it leaks past a statement boundary it's a bug)
-        self.last_lambda_capture_count = None;
+        self.registry.last_lambda_capture_count = None;
 
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value, .. } => {
@@ -287,8 +287,8 @@ impl Compiler<'_> {
                         self.free_linear_consumes(builder, state, Some(init_val));
 
                         // If the value was a closure lambda, record capture count for indirect call dispatch
-                        if let Some(count) = self.last_lambda_capture_count.take() {
-                            self.closure_info.insert(sym, count);
+                        if let Some(count) = self.registry.last_lambda_capture_count.take() {
+                            self.registry.closure_info.insert(sym, count);
                         }
                     }
                     PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
@@ -433,16 +433,16 @@ impl Compiler<'_> {
                     .declare_function(&unique_name, cranelift_module::Linkage::Local, &sig)
                     .map_err(|e| CodegenError::new(format!("failed to declare nested fn '{base_name}': {e}")))?;
                 // Temporarily insert under base_name for compile_fn_def lookup, then restore
-                let prev_entry = self.functions.remove(&base_name);
-                self.functions.insert(base_name.clone(), (func_id, sig.clone()));
+                let prev_entry = self.registry.functions.remove(&base_name);
+                self.registry.functions.insert(base_name.clone(), (func_id, sig.clone()));
 
                 // Compile the nested function body
                 self.compile_fn_def(fn_def)?;
 
                 // Remove temp entry and restore any previous function with the same name
-                self.functions.remove(&base_name);
+                self.registry.functions.remove(&base_name);
                 if let Some(prev) = prev_entry {
-                    self.functions.insert(base_name, prev);
+                    self.registry.functions.insert(base_name, prev);
                 }
 
                 // Bind function name as a variable holding the function pointer
@@ -495,7 +495,7 @@ impl Compiler<'_> {
                             let dname = self.resolve_sym(d.name[0]);
                             if dname == "no_grad" {
                                 let fname = self.resolve_sym(fn_def.name).to_string();
-                                self.no_grad_fns.insert(fname);
+                                self.registry.no_grad_fns.insert(fname);
                             } else if dname == "fp8_compute" {
                                 let fname = self.resolve_sym(fn_def.name).to_string();
                                 self.features.fp8_compute_fns.insert(fname);
@@ -607,7 +607,7 @@ impl Compiler<'_> {
                         } else {
                             // Read-modify-write: get old value, apply op, write back
                             let get_fn = if is_dict { "nsl_dict_get_str" } else { "nsl_list_get" };
-                            let get_id = self.runtime_fns[get_fn].0;
+                            let get_id = self.registry.runtime_fns[get_fn].0;
                             let get_ref = self.module.declare_func_in_func(get_id, builder.func);
                             let call = builder.ins().call(get_ref, &[obj_val, idx_val]);
                             let old_val = builder.inst_results(call)[0];
@@ -625,7 +625,7 @@ impl Compiler<'_> {
                         };
 
                         let set_fn = if is_dict { "nsl_dict_set_str" } else { "nsl_list_set" };
-                        let set_id = self.runtime_fns[set_fn].0;
+                        let set_id = self.registry.runtime_fns[set_fn].0;
                         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
                         builder.ins().call(set_ref, &[obj_val, idx_val, final_val]);
                     }
@@ -1086,7 +1086,7 @@ impl Compiler<'_> {
 
         let list_val = self.compile_expr(builder, state, iterable)?;
 
-        let len_id = self.runtime_fns["nsl_list_len"].0;
+        let len_id = self.registry.runtime_fns["nsl_list_len"].0;
         let len_ref = self.module.declare_func_in_func(len_id, builder.func);
         let call = builder.ins().call(len_ref, &[list_val]);
         let list_len = builder.inst_results(call)[0];
@@ -1134,7 +1134,7 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
-        let get_id = self.runtime_fns["nsl_list_get"].0;
+        let get_id = self.registry.runtime_fns["nsl_list_get"].0;
         let get_ref = self.module.declare_func_in_func(get_id, builder.func);
         let counter = builder.use_var(counter_var);
         let call = builder.ins().call(get_ref, &[list_val, counter]);
@@ -2098,16 +2098,16 @@ impl Compiler<'_> {
         };
 
         // Check if optimizer function exists, try fallback name patterns
-        let opt_fn = if self.functions.contains_key(optimizer_fn_name) {
+        let opt_fn = if self.registry.functions.contains_key(optimizer_fn_name) {
             optimizer_fn_name.to_string()
         } else {
             // Try simpler name: e.g. "sgd_step"
             let simple = format!("{}_step", optimizer_name);
-            if self.functions.contains_key(&simple) {
+            if self.registry.functions.contains_key(&simple) {
                 simple
-            } else if self.runtime_fns.contains_key(optimizer_fn_name) {
+            } else if self.registry.runtime_fns.contains_key(optimizer_fn_name) {
                 optimizer_fn_name.to_string()
-            } else if self.runtime_fns.contains_key(&simple) {
+            } else if self.registry.runtime_fns.contains_key(&simple) {
                 simple
             } else {
                 // Register as runtime function so it can be resolved at link time
@@ -2265,15 +2265,15 @@ impl Compiler<'_> {
             let mangled = format!("nsl__optim__schedulers__{}", sched_fn_name);
 
             // Find the actual function name (check functions/runtime_fns with fallback)
-            let sched_fn = if self.functions.contains_key(mangled.as_str()) {
+            let sched_fn = if self.registry.functions.contains_key(mangled.as_str()) {
                 mangled.clone()
             } else {
                 let simple = sched_fn_name.to_string();
-                if self.functions.contains_key(simple.as_str()) {
+                if self.registry.functions.contains_key(simple.as_str()) {
                     simple
-                } else if self.runtime_fns.contains_key(mangled.as_str()) {
+                } else if self.registry.runtime_fns.contains_key(mangled.as_str()) {
                     mangled.clone()
-                } else if self.runtime_fns.contains_key(simple.as_str()) {
+                } else if self.registry.runtime_fns.contains_key(simple.as_str()) {
                     simple
                 } else {
                     mangled.clone()
@@ -2845,15 +2845,15 @@ impl Compiler<'_> {
             }
         };
 
-        let opt_fn = if self.functions.contains_key(optimizer_fn_name) {
+        let opt_fn = if self.registry.functions.contains_key(optimizer_fn_name) {
             optimizer_fn_name.to_string()
         } else {
             let simple = format!("{}_step", optimizer_name);
-            if self.functions.contains_key(&simple) {
+            if self.registry.functions.contains_key(&simple) {
                 simple
-            } else if self.runtime_fns.contains_key(optimizer_fn_name) {
+            } else if self.registry.runtime_fns.contains_key(optimizer_fn_name) {
                 optimizer_fn_name.to_string()
-            } else if self.runtime_fns.contains_key(&simple) {
+            } else if self.registry.runtime_fns.contains_key(&simple) {
                 simple
             } else {
                 optimizer_fn_name.to_string()

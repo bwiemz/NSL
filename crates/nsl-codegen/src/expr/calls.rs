@@ -111,7 +111,7 @@ impl Compiler<'_> {
                 } else {
                     "nsl_list_len"
                 };
-                let fid = self.runtime_fns[fn_name].0;
+                let fid = self.registry.runtime_fns[fn_name].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[val]);
                 return Ok(builder.inst_results(call)[0]);
@@ -312,7 +312,7 @@ impl Compiler<'_> {
                 self.intern_string("assertion failed")?;
                 self.compile_string_literal(builder, "assertion failed")?
             };
-            let fid = self.runtime_fns["nsl_assert"].0;
+            let fid = self.registry.runtime_fns["nsl_assert"].0;
             let fref = self.module.declare_func_in_func(fid, builder.func);
             builder.ins().call(fref, &[cond_i8, msg]);
             return Ok(builder.ins().iconst(cl_types::I64, 0));
@@ -372,7 +372,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_exit", &[code_val]);
         }
         // Stdin I/O
-        if func_name == "read_line" && !self.functions.contains_key(&func_name) {
+        if func_name == "read_line" && !self.registry.functions.contains_key(&func_name) {
             if !args.is_empty() {
                 return Err(CodegenError::new("read_line() takes no arguments"));
             }
@@ -468,7 +468,7 @@ impl Compiler<'_> {
         // Element-wise tensor builtins (M14)
         // Skip if there's a user-defined function with the same name (e.g., nsl.math.sign)
         if matches!(func_name.as_str(), "exp" | "log" | "sqrt" | "abs" | "sign" | "neg")
-            && !self.functions.contains_key(&func_name)
+            && !self.registry.functions.contains_key(&func_name)
         {
             if args.len() != 1 {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
@@ -480,7 +480,7 @@ impl Compiler<'_> {
         }
         // Activation functions (M15): relu, gelu, silu, sigmoid -- single tensor arg
         if matches!(func_name.as_str(), "relu" | "gelu" | "silu" | "sigmoid")
-            && !self.functions.contains_key(&func_name)
+            && !self.registry.functions.contains_key(&func_name)
         {
             if args.len() != 1 {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
@@ -492,7 +492,7 @@ impl Compiler<'_> {
         }
         // Tensor trig: tensor_sin, tensor_cos (RoPE support)
         if matches!(func_name.as_str(), "tensor_sin" | "tensor_cos")
-            && !self.functions.contains_key(&func_name)
+            && !self.registry.functions.contains_key(&func_name)
         {
             if args.len() != 1 {
                 return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
@@ -502,7 +502,7 @@ impl Compiler<'_> {
             return self.compile_traced_call(builder, &rt_name, &[val]);
         }
         // Fused rotate_half for RoPE
-        if func_name == "rotate_half" && !self.functions.contains_key(&func_name) {
+        if func_name == "rotate_half" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("rotate_half() takes exactly 1 argument"));
             }
@@ -510,7 +510,7 @@ impl Compiler<'_> {
             return self.compile_traced_call(builder, "nsl_tensor_rotate_half", &[val]);
         }
         // tanh activation: maps NSL name "tanh" to runtime "nsl_tensor_tanh_act"
-        if func_name == "tanh" && !self.functions.contains_key(&func_name) {
+        if func_name == "tanh" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("tanh() takes exactly 1 argument"));
             }
@@ -518,7 +518,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_tanh_act", &[val]);
         }
         // softmax(tensor, dim) -- two args
-        if func_name == "softmax" && !self.functions.contains_key(&func_name) {
+        if func_name == "softmax" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new("softmax() takes exactly 2 arguments (tensor, dim)"));
             }
@@ -526,7 +526,7 @@ impl Compiler<'_> {
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_traced_call(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
         }
-        if func_name == "clamp" && !self.functions.contains_key(&func_name) {
+        if func_name == "clamp" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
                 return Err(CodegenError::new("clamp() takes exactly 3 arguments (tensor, min, max)"));
             }
@@ -592,7 +592,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_gather", &[t, dim, indices]);
         }
         // layernorm(input, weight, bias, eps) -> tensor
-        if func_name == "layernorm" && !self.functions.contains_key(&func_name) {
+        if func_name == "layernorm" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 4 {
                 return Err(CodegenError::new("layernorm() takes exactly 4 arguments (input, weight, bias, eps)"));
             }
@@ -606,7 +606,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_layernorm", &[input_val, weight_val, bias_val, eps_f]);
         }
         // rmsnorm(input, weight, eps) -> tensor
-        if func_name == "rmsnorm" && !self.functions.contains_key(&func_name) {
+        if func_name == "rmsnorm" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
                 return Err(CodegenError::new("rmsnorm() takes exactly 3 arguments (input, weight, eps)"));
             }
@@ -618,7 +618,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_rmsnorm", &[input_val, weight_val, eps_f]);
         }
         // dropout(tensor, p, training) -> tensor
-        if func_name == "dropout" && !self.functions.contains_key(&func_name) {
+        if func_name == "dropout" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
                 return Err(CodegenError::new("dropout() takes exactly 3 arguments (tensor, p, training)"));
             }
@@ -634,7 +634,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_dropout", &[tensor_val, p_f, training_i8]);
         }
         // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
-        if func_name == "conv2d" && !self.functions.contains_key(&func_name) {
+        if func_name == "conv2d" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 7 {
                 return Err(CodegenError::new("conv2d() takes exactly 7 arguments (input, weight, bias, stride_h, stride_w, pad_h, pad_w)"));
             }
@@ -648,7 +648,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_conv2d", &[input_val, weight_val, bias_val, stride_h, stride_w, pad_h, pad_w]);
         }
         // maxpool2d(input, kernel_h, kernel_w, stride, padding) -> tensor
-        if func_name == "maxpool2d" && !self.functions.contains_key(&func_name) {
+        if func_name == "maxpool2d" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 5 {
                 return Err(CodegenError::new("maxpool2d() takes exactly 5 arguments (input, kernel_h, kernel_w, stride, padding)"));
             }
@@ -660,7 +660,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_maxpool2d", &[input_val, kernel_h, kernel_w, stride_val, padding_val]);
         }
         // embedding_lookup(weight, indices) -> tensor
-        if func_name == "embedding_lookup" && !self.functions.contains_key(&func_name) {
+        if func_name == "embedding_lookup" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new("embedding_lookup() takes exactly 2 arguments (weight, indices)"));
             }
@@ -669,7 +669,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_embedding_lookup", &[weight_val, indices_val]);
         }
         // bias_add(tensor, bias) -> tensor -- broadcasts 1D bias over 2D tensor
-        if func_name == "bias_add" && !self.functions.contains_key(&func_name) {
+        if func_name == "bias_add" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new("bias_add() takes exactly 2 arguments (tensor, bias)"));
             }
@@ -698,7 +698,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_cat", &[list, dim]);
         }
         // M18a: unsqueeze(tensor, dim) -- free function form
-        if func_name == "unsqueeze" && !self.functions.contains_key(&func_name) {
+        if func_name == "unsqueeze" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new("unsqueeze() takes exactly 2 arguments (tensor, dim)"));
             }
@@ -707,7 +707,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_unsqueeze", &[tensor_val, dim_val]);
         }
         // M18a: stack(list_of_tensors, dim) -> tensor
-        if func_name == "stack" && !self.functions.contains_key(&func_name) {
+        if func_name == "stack" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new("stack() takes exactly 2 arguments (tensor_list, dim)"));
             }
@@ -716,7 +716,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_stack", &[list_val, dim_val]);
         }
         // contiguous(tensor) -> tensor — materialize non-contiguous views
-        if func_name == "contiguous" && !self.functions.contains_key(&func_name) {
+        if func_name == "contiguous" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("contiguous() takes exactly 1 argument (tensor)"));
             }
@@ -724,7 +724,7 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[tensor_val]);
         }
         // M18a: causal_mask(seq_len) -> tensor
-        if func_name == "causal_mask" && !self.functions.contains_key(&func_name) {
+        if func_name == "causal_mask" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("causal_mask() takes exactly 1 argument (seq_len)"));
             }
@@ -734,7 +734,7 @@ impl Compiler<'_> {
         // M27: scaled_dot_product_attention(Q, K, V, scale, causal=false)
         // Naive path: softmax((Q @ K.T) * scale [+ causal_mask]) @ V
         // Flash path: PTX dispatch via nsl_flash_attention when @flash_attention decorator is present
-        if func_name == "scaled_dot_product_attention" && !self.functions.contains_key(&func_name) {
+        if func_name == "scaled_dot_product_attention" && !self.registry.functions.contains_key(&func_name) {
             if args.len() < 4 {
                 return Err(CodegenError::new(
                     "scaled_dot_product_attention() requires at least 4 arguments (Q, K, V, scale)",
@@ -952,7 +952,7 @@ impl Compiler<'_> {
         }
 
         // Quantization functions (M16)
-        if func_name == "nsl_qtensor_quantize" && !self.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_quantize" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 5 {
                 return Err(CodegenError::new("nsl_qtensor_quantize() takes exactly 5 arguments (tensor, dtype, granularity, axis, group_size)"));
             }
@@ -963,14 +963,14 @@ impl Compiler<'_> {
             let group_val = self.compile_expr(builder, state, &args[4].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_quantize", &[tensor_val, dtype_val, gran_val, axis_val, group_val]);
         }
-        if func_name == "nsl_qtensor_dequantize" && !self.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_dequantize" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("nsl_qtensor_dequantize() takes exactly 1 argument (qtensor)"));
             }
             let qt_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt_val]);
         }
-        if func_name == "nsl_qtensor_matmul_mixed" && !self.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_matmul_mixed" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new("nsl_qtensor_matmul_mixed() takes exactly 2 arguments (tensor, qtensor)"));
             }
@@ -978,14 +978,14 @@ impl Compiler<'_> {
             let qw_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_matmul_mixed", &[x_val, qw_val]);
         }
-        if func_name == "nsl_qtensor_dtype" && !self.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_dtype" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("nsl_qtensor_dtype() takes exactly 1 argument (qtensor)"));
             }
             let qt_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_dtype", &[qt_val]);
         }
-        if func_name == "nsl_qtensor_shape" && !self.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_shape" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
                 return Err(CodegenError::new("nsl_qtensor_shape() takes exactly 1 argument (qtensor)"));
             }
@@ -1401,7 +1401,7 @@ impl Compiler<'_> {
         }
 
         // Check if it's a known function or variable holding a function pointer
-        if self.functions.contains_key(&func_name) || self.runtime_fns.contains_key(&func_name) {
+        if self.registry.functions.contains_key(&func_name) || self.registry.runtime_fns.contains_key(&func_name) {
             let mut arg_vals = Vec::new();
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -1433,9 +1433,9 @@ impl Compiler<'_> {
         // variant whenever it has been successfully compiled.  The VmapTransformer
         // has already validated that the function body is batchable during the
         // transform pass.  If compilation of the batched variant failed (non-fatal),
-        // the function won't be in self.functions and we fall through to the original.
+        // the function won't be in self.registry.functions and we fall through to the original.
         let effective_name: &str = if let Some(batched_name) = self.batched_fn_names.get(func_name) {
-            if self.functions.contains_key(batched_name.as_str()) {
+            if self.registry.functions.contains_key(batched_name.as_str()) {
                 // Batched variant exists and is compiled — dispatch to it.
                 batched_name.as_str()
             } else {
@@ -1446,9 +1446,9 @@ impl Compiler<'_> {
             func_name
         };
 
-        let (func_id, sig) = if let Some(e) = self.functions.get(effective_name) {
+        let (func_id, sig) = if let Some(e) = self.registry.functions.get(effective_name) {
             e.clone()
-        } else if let Some(e) = self.runtime_fns.get(effective_name) {
+        } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
             e.clone()
         } else {
             return Err(CodegenError::new(format!("undefined function '{effective_name}'")));
@@ -1476,7 +1476,7 @@ impl Compiler<'_> {
     ) -> Result<Value, CodegenError> {
         if args.is_empty() {
             let empty = self.compile_string_literal(builder, "")?;
-            let fid = self.runtime_fns["nsl_print_str"].0;
+            let fid = self.registry.runtime_fns["nsl_print_str"].0;
             let fref = self.module.declare_func_in_func(fid, builder.func);
             builder.ins().call(fref, &[empty]);
             return Ok(builder.ins().iconst(cl_types::I64, 0));
@@ -1524,7 +1524,7 @@ impl Compiler<'_> {
             }
             _ => val,
         };
-        let fid = self.runtime_fns[rt_fn].0;
+        let fid = self.registry.runtime_fns[rt_fn].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
         builder.ins().call(fref, &[print_val]);
         Ok(builder.ins().iconst(cl_types::I64, 0))
@@ -1557,7 +1557,7 @@ impl Compiler<'_> {
             }
             _ => return Err(CodegenError::new("range() takes 1-3 arguments")),
         };
-        let fid = self.runtime_fns["nsl_range"].0;
+        let fid = self.registry.runtime_fns["nsl_range"].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
         let call = builder.ins().call(fref, &[start, stop, step]);
         Ok(builder.inst_results(call)[0])
@@ -1574,7 +1574,7 @@ impl Compiler<'_> {
 
         // Check if callee is a closure variable (has captures)
         let closure_captures = if let ExprKind::Ident(sym) = &callee.kind {
-            self.closure_info.get(sym).copied()
+            self.registry.closure_info.get(sym).copied()
         } else {
             None
         };

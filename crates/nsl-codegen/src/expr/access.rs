@@ -28,7 +28,7 @@ impl Compiler<'_> {
             if matches!(obj_type, Type::Module { .. }) {
                 // Module member access in non-call context -- return function reference
                 // This is handled at call site; for now return a dummy value
-                if let Some((func_id, _sig)) = self.functions.get(&member_name) {
+                if let Some((func_id, _sig)) = self.registry.functions.get(&member_name) {
                     let fref = self.module.declare_func_in_func(*func_id, builder.func);
                     return Ok(builder.ins().func_addr(crate::types::pointer_type(), fref));
                 }
@@ -171,7 +171,7 @@ impl Compiler<'_> {
                 let obj_type = self.node_type(object.id).clone();
                 match &obj_type {
                     Type::Dict { .. } => {
-                        let fid = self.runtime_fns["nsl_dict_get_str"].0;
+                        let fid = self.registry.runtime_fns["nsl_dict_get_str"].0;
                         let fref = self.module.declare_func_in_func(fid, builder.func);
                         let call = builder.ins().call(fref, &[obj_val, idx_val]);
                         Ok(builder.inst_results(call)[0])
@@ -184,7 +184,7 @@ impl Compiler<'_> {
                                  defaulting to list access"
                             );
                         }
-                        let fid = self.runtime_fns["nsl_list_get"].0;
+                        let fid = self.registry.runtime_fns["nsl_list_get"].0;
                         let fref = self.module.declare_func_in_func(fid, builder.func);
                         let call = builder.ins().call(fref, &[obj_val, idx_val]);
                         Ok(builder.inst_results(call)[0])
@@ -215,7 +215,7 @@ impl Compiler<'_> {
                 } else {
                     "nsl_list_slice"
                 };
-                let fid = self.runtime_fns[fn_name].0;
+                let fid = self.registry.runtime_fns[fn_name].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[obj_val, lo, hi, st]);
                 Ok(builder.inst_results(call)[0])
@@ -252,7 +252,7 @@ impl Compiler<'_> {
                 }
                 Type::Bool => Ok(builder.ins().uextend(cl_types::I64, val)),
                 Type::Str => {
-                    let fid = self.runtime_fns["nsl_str_to_int"].0;
+                    let fid = self.registry.runtime_fns["nsl_str_to_int"].0;
                     let fref = self.module.declare_func_in_func(fid, builder.func);
                     let call = builder.ins().call(fref, &[val]);
                     Ok(builder.inst_results(call)[0])
@@ -274,7 +274,7 @@ impl Compiler<'_> {
                     Ok(builder.ins().fcvt_from_sint(cl_types::F64, ext))
                 }
                 Type::Str => {
-                    let fid = self.runtime_fns["nsl_str_to_float"].0;
+                    let fid = self.registry.runtime_fns["nsl_str_to_float"].0;
                     let fref = self.module.declare_func_in_func(fid, builder.func);
                     let call = builder.ins().call(fref, &[val]);
                     Ok(builder.inst_results(call)[0])

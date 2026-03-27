@@ -78,7 +78,7 @@ impl Compiler<'_> {
             // Initialize command-line args for args() support
             let argc_val = builder.block_params(entry)[0];
             let argv_val = builder.block_params(entry)[1];
-            let init_id = self.runtime_fns["nsl_args_init"].0;
+            let init_id = self.registry.runtime_fns["nsl_args_init"].0;
             let init_ref = self.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[argc_val, argv_val]);
 
@@ -138,7 +138,7 @@ impl Compiler<'_> {
     /// Compile a test-dispatch main() that reads `--run <name>` from argv and
     /// calls the corresponding @test function. Used by `nsl test`.
     pub fn compile_test_main(&mut self) -> Result<(), CodegenError> {
-        let test_fns = self.test_fns.clone();
+        let test_fns = self.registry.test_fns.clone();
         if test_fns.is_empty() {
             return Err(CodegenError::new("no @test functions found".to_string()));
         }
@@ -177,18 +177,18 @@ impl Compiler<'_> {
             // Initialize args
             let argc_val = builder.block_params(entry)[0];
             let argv_val = builder.block_params(entry)[1];
-            let init_id = self.runtime_fns["nsl_args_init"].0;
+            let init_id = self.registry.runtime_fns["nsl_args_init"].0;
             let init_ref = self.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[argc_val, argv_val]);
 
             // Get args list
-            let args_id = self.runtime_fns["nsl_args"].0;
+            let args_id = self.registry.runtime_fns["nsl_args"].0;
             let args_ref = self.module.declare_func_in_func(args_id, builder.func);
             let args_call = builder.ins().call(args_ref, &[]);
             let args_list = builder.inst_results(args_call)[0];
 
             // Get list length
-            let len_id = self.runtime_fns["nsl_list_len"].0;
+            let len_id = self.registry.runtime_fns["nsl_list_len"].0;
             let len_ref = self.module.declare_func_in_func(len_id, builder.func);
             let len_call = builder.ins().call(len_ref, &[args_list]);
             let args_len = builder.inst_results(len_call)[0];
@@ -212,9 +212,9 @@ impl Compiler<'_> {
             builder.switch_to_block(dispatch_block);
             builder.seal_block(dispatch_block);
 
-            let get_id = self.runtime_fns["nsl_list_get"].0;
+            let get_id = self.registry.runtime_fns["nsl_list_get"].0;
             let get_ref = self.module.declare_func_in_func(get_id, builder.func);
-            let eq_id = self.runtime_fns["nsl_str_eq"].0;
+            let eq_id = self.registry.runtime_fns["nsl_str_eq"].0;
             let eq_ref = self.module.declare_func_in_func(eq_id, builder.func);
 
             // argv[1]
@@ -277,7 +277,7 @@ impl Compiler<'_> {
                 builder.switch_to_block(match_block);
                 builder.seal_block(match_block);
 
-                let (func_id, _) = &self.functions[test_name];
+                let (func_id, _) = &self.registry.functions[test_name];
                 let fn_ref = self.module.declare_func_in_func(*func_id, builder.func);
                 builder.ins().call(fn_ref, &[]);
                 let zero_ret = builder.ins().iconst(cl_types::I32, 0);
@@ -365,7 +365,7 @@ impl Compiler<'_> {
             let batched_name = &result.batched_name;
             let original_name = batched_name.trim_end_matches("_batched");
 
-            if let Some((_, sig)) = self.functions.get(original_name) {
+            if let Some((_, sig)) = self.registry.functions.get(original_name) {
                 let sig_clone = sig.clone();
                 let mangled = super::mangle_name(&self.module_prefix, batched_name);
                 match self.module.declare_function(
@@ -374,7 +374,7 @@ impl Compiler<'_> {
                     &sig_clone,
                 ) {
                     Ok(func_id) => {
-                        self.functions.insert(batched_name.clone(), (func_id, sig_clone));
+                        self.registry.functions.insert(batched_name.clone(), (func_id, sig_clone));
                         self.batched_fn_names.insert(original_name.to_string(), batched_name.clone());
                     }
                     Err(e) => {
@@ -394,14 +394,14 @@ impl Compiler<'_> {
     /// the placeholder Symbol in fn_def.name.
     ///
     /// For each VmapResult whose batched function has been declared (present in
-    /// `self.functions`), compiles the batched FnDef body via
+    /// `self.registry.functions`), compiles the batched FnDef body via
     /// `compile_fn_def_named`. Failures are non-fatal — the original function
     /// still works via dispatch fallback.
     pub fn compile_batched_functions(&mut self, results: &[crate::vmap::VmapResult]) -> Result<(), CodegenError> {
         for result in results {
             let batched_name = &result.batched_name;
             // Only compile if the function was successfully declared during registration
-            if self.functions.contains_key(batched_name) {
+            if self.registry.functions.contains_key(batched_name) {
                 match self.compile_fn_def_named(&result.batched_fn, Some(batched_name)) {
                     Ok(()) => {}
                     Err(e) => {

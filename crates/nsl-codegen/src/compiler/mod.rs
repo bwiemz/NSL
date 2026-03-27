@@ -51,6 +51,31 @@ pub struct PendingLambda {
     pub captures: Vec<(Symbol, cl_types::Type)>,
 }
 
+/// Sub-struct grouping all function/lambda registration state out of the `Compiler` god-object.
+pub struct FunctionRegistry {
+    pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
+    pub runtime_fns: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
+    pub pending_lambdas: Vec<PendingLambda>,
+    pub closure_info: HashMap<Symbol, usize>,
+    pub last_lambda_capture_count: Option<usize>,
+    pub no_grad_fns: HashSet<String>,
+    pub test_fns: Vec<String>,
+}
+
+impl FunctionRegistry {
+    fn new() -> Self {
+        Self {
+            functions: HashMap::new(),
+            runtime_fns: HashMap::new(),
+            pending_lambdas: Vec::new(),
+            closure_info: HashMap::new(),
+            last_lambda_capture_count: None,
+            no_grad_fns: HashSet::new(),
+            test_fns: Vec::new(),
+        }
+    }
+}
+
 /// Configuration for standalone export codegen.
 pub struct StandaloneConfig {
     /// If true, weights are embedded in the binary via linker symbols.
@@ -185,13 +210,7 @@ pub struct Compiler<'a> {
     func_index: u32,
 
     // ── Function registry ────────────────────────────────────────────
-    pub functions: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
-    pub runtime_fns: HashMap<String, (FuncId, cranelift_codegen::ir::Signature)>,
-    pub pending_lambdas: Vec<PendingLambda>,
-    pub closure_info: HashMap<Symbol, usize>,
-    pub last_lambda_capture_count: Option<usize>,
-    pub no_grad_fns: HashSet<String>,
-    pub test_fns: Vec<String>,
+    pub registry: FunctionRegistry,
 
     // ── Type system ──────────────────────────────────────────────────
     pub struct_layouts: HashMap<String, StructLayout>,
@@ -337,13 +356,7 @@ impl<'a> Compiler<'a> {
             compile_options: options.clone(),
             dump_ir: false,
             func_index: 0,
-            functions: HashMap::new(),
-            runtime_fns: HashMap::new(),
-            pending_lambdas: Vec::new(),
-            closure_info: HashMap::new(),
-            last_lambda_capture_count: None,
-            no_grad_fns: HashSet::new(),
-            test_fns: Vec::new(),
+            registry: FunctionRegistry::new(),
             struct_layouts: HashMap::new(),
             enum_variants: HashMap::new(),
             enum_defs: HashMap::new(),

@@ -231,7 +231,7 @@ impl Compiler<'_> {
                 if let Some(ref lowering) = state.ownership_lowering {
                     if lowering.should_use_inplace(sym) {
                         let inplace = format!("nsl_tensor_{op_name}_inplace");
-                        if self.functions.contains_key(&inplace) {
+                        if self.registry.functions.contains_key(&inplace) {
                             return inplace;
                         }
                     }
@@ -241,7 +241,7 @@ impl Compiler<'_> {
                     if uc.is_single_use(sym) {
                         let inplace = format!("nsl_tensor_{op_name}_inplace");
                         // Verify the inplace variant is registered before using it
-                        if self.functions.contains_key(&inplace) {
+                        if self.registry.functions.contains_key(&inplace) {
                             return inplace;
                         }
                     }

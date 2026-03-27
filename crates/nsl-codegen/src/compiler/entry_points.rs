@@ -380,7 +380,7 @@ pub fn compile_test(
     // M39c: Compile batched function bodies
     compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_pending_lambdas()?;
-    let test_fns = compiler.test_fns.clone();
+    let test_fns = compiler.registry.test_fns.clone();
     if test_fns.is_empty() {
         return Err(CodegenError::new("no @test functions found".to_string()));
     }

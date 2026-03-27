@@ -35,12 +35,12 @@ impl Compiler<'_> {
         state: &mut FuncState,
         elements: &[Expr],
     ) -> Result<Value, CodegenError> {
-        let new_id = self.runtime_fns["nsl_list_new"].0;
+        let new_id = self.registry.runtime_fns["nsl_list_new"].0;
         let new_ref = self.module.declare_func_in_func(new_id, builder.func);
         let call = builder.ins().call(new_ref, &[]);
         let list_ptr = builder.inst_results(call)[0];
 
-        let push_id = self.runtime_fns["nsl_list_push"].0;
+        let push_id = self.registry.runtime_fns["nsl_list_push"].0;
         let push_ref = self.module.declare_func_in_func(push_id, builder.func);
         for elem in elements {
             let val = self.compile_expr(builder, state, elem)?;
@@ -63,12 +63,12 @@ impl Compiler<'_> {
         elements: &[Expr],
     ) -> Result<Value, CodegenError> {
         // Tuples reuse list representation (heap-allocated i64 array)
-        let new_id = self.runtime_fns["nsl_list_new"].0;
+        let new_id = self.registry.runtime_fns["nsl_list_new"].0;
         let new_ref = self.module.declare_func_in_func(new_id, builder.func);
         let call = builder.ins().call(new_ref, &[]);
         let tuple_ptr = builder.inst_results(call)[0];
 
-        let push_id = self.runtime_fns["nsl_list_push"].0;
+        let push_id = self.registry.runtime_fns["nsl_list_push"].0;
         let push_ref = self.module.declare_func_in_func(push_id, builder.func);
         for elem in elements {
             let val = self.compile_expr(builder, state, elem)?;
@@ -83,12 +83,12 @@ impl Compiler<'_> {
         state: &mut FuncState,
         pairs: &[(Expr, Expr)],
     ) -> Result<Value, CodegenError> {
-        let new_id = self.runtime_fns["nsl_dict_new"].0;
+        let new_id = self.registry.runtime_fns["nsl_dict_new"].0;
         let new_ref = self.module.declare_func_in_func(new_id, builder.func);
         let call = builder.ins().call(new_ref, &[]);
         let dict_ptr = builder.inst_results(call)[0];
 
-        let set_id = self.runtime_fns["nsl_dict_set_str"].0;
+        let set_id = self.registry.runtime_fns["nsl_dict_set_str"].0;
         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
         for (key_expr, val_expr) in pairs {
             // Bare ident keys are treated as string literals (matching checker behavior)
@@ -115,7 +115,7 @@ impl Compiler<'_> {
             return self.compile_string_literal(builder, "");
         }
 
-        let concat_id = self.runtime_fns["nsl_str_concat"].0;
+        let concat_id = self.registry.runtime_fns["nsl_str_concat"].0;
         let mut result: Option<Value> = None;
 
         for part in parts {
@@ -159,7 +159,7 @@ impl Compiler<'_> {
             Type::Str => return Ok(val),
             _ => ("nsl_int_to_str", val),
         };
-        let fid = self.runtime_fns[rt_fn].0;
+        let fid = self.registry.runtime_fns[rt_fn].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
         let call = builder.ins().call(fref, &[converted_val]);
         Ok(builder.inst_results(call)[0])
@@ -190,7 +190,7 @@ impl Compiler<'_> {
             return Err(CodegenError::new("open-ended range not supported"));
         };
         let step = builder.ins().iconst(cl_types::I64, 1);
-        let fid = self.runtime_fns["nsl_range"].0;
+        let fid = self.registry.runtime_fns["nsl_range"].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);
         let call = builder.ins().call(fref, &[start_val, end_val, step]);
         Ok(builder.inst_results(call)[0])
@@ -207,7 +207,7 @@ impl Compiler<'_> {
             return Err(CodegenError::new("list comprehension needs at least one generator"));
         }
         // Create a new list
-        let new_id = self.runtime_fns["nsl_list_new"].0;
+        let new_id = self.registry.runtime_fns["nsl_list_new"].0;
         let new_ref = self.module.declare_func_in_func(new_id, builder.func);
         let call = builder.ins().call(new_ref, &[]);
         let result_list = builder.inst_results(call)[0];
@@ -222,7 +222,7 @@ impl Compiler<'_> {
         let iter_val = self.compile_expr(builder, state, &gen.iterable)?;
 
         // Get list length
-        let len_id = self.runtime_fns["nsl_list_len"].0;
+        let len_id = self.registry.runtime_fns["nsl_list_len"].0;
         let len_ref = self.module.declare_func_in_func(len_id, builder.func);
         let call = builder.ins().call(len_ref, &[iter_val]);
         let list_len = builder.inst_results(call)[0];
@@ -258,7 +258,7 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
-        let get_id = self.runtime_fns["nsl_list_get"].0;
+        let get_id = self.registry.runtime_fns["nsl_list_get"].0;
         let get_ref = self.module.declare_func_in_func(get_id, builder.func);
         let counter = builder.use_var(counter_var);
         let call = builder.ins().call(get_ref, &[iter_val, counter]);
@@ -291,7 +291,7 @@ impl Compiler<'_> {
 
         // Evaluate element expression and push
         let elem_val = self.compile_expr(builder, state, element)?;
-        let push_id = self.runtime_fns["nsl_list_push"].0;
+        let push_id = self.registry.runtime_fns["nsl_list_push"].0;
         let push_ref = self.module.declare_func_in_func(push_id, builder.func);
         builder.ins().call(push_ref, &[result_list, elem_val]);
 

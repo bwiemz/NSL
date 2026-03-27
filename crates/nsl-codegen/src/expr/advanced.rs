@@ -89,8 +89,8 @@ impl Compiler<'_> {
             .map_err(|e| CodegenError::new(format!("failed to declare lambda '{lambda_name}': {e}")))?;
 
         // Store for compilation and in functions table
-        self.functions.insert(lambda_name.clone(), (func_id, sig.clone()));
-        self.pending_lambdas.push(crate::compiler::PendingLambda {
+        self.registry.functions.insert(lambda_name.clone(), (func_id, sig.clone()));
+        self.registry.pending_lambdas.push(crate::compiler::PendingLambda {
             name: lambda_name,
             func_id,
             sig,
@@ -109,7 +109,7 @@ impl Compiler<'_> {
         } else {
             // Allocate closure struct: { fn_ptr (8 bytes), num_captures (8 bytes), captures[] (8 bytes each) }
             let struct_size = 8 + 8 + captures.len() * 8;
-            let alloc_id = self.runtime_fns["nsl_alloc"].0;
+            let alloc_id = self.registry.runtime_fns["nsl_alloc"].0;
             let alloc_ref = self.module.declare_func_in_func(alloc_id, builder.func);
             let size_val = builder.ins().iconst(cl_types::I64, struct_size as i64);
             let call = builder.ins().call(alloc_ref, &[size_val]);
@@ -141,7 +141,7 @@ impl Compiler<'_> {
 
             // Record how many captures this closure has (keyed by a sentinel -- caller will
             // transfer this to the variable that receives the closure result).
-            self.last_lambda_capture_count = Some(captures.len());
+            self.registry.last_lambda_capture_count = Some(captures.len());
 
             Ok(closure_ptr)
         }
@@ -248,7 +248,7 @@ impl Compiler<'_> {
         }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
         if let ExprKind::Ident(sym) = &args[0].value.kind {
-            if self.closure_info.contains_key(sym) {
+            if self.registry.closure_info.contains_key(sym) {
                 let name = self.resolve_sym(*sym).to_string();
                 return Err(CodegenError::new(format!(
                     "cannot pass closure '{name}' to {func_name}() -- closures with captured variables \
@@ -258,7 +258,7 @@ impl Compiler<'_> {
         }
         let fn_val = self.compile_expr(builder, state, &args[0].value)?;
         // Also catch inline capturing lambdas (not just named variables)
-        if self.last_lambda_capture_count.take().is_some() {
+        if self.registry.last_lambda_capture_count.take().is_some() {
             return Err(CodegenError::new(format!(
                 "cannot pass capturing closure to {func_name}() -- closures with captured variables \
                  are not supported in higher-order functions yet. Use a non-capturing lambda instead."
@@ -579,7 +579,7 @@ impl Compiler<'_> {
         let obj_val = self.compile_expr(builder, state, object)?;
         let rt_name = format!("nsl_str_{method}");
 
-        if !self.runtime_fns.contains_key(&rt_name) {
+        if !self.registry.runtime_fns.contains_key(&rt_name) {
             return Err(CodegenError::new(format!("unknown string method '.{method}()'")));
         }
 
@@ -603,7 +603,7 @@ impl Compiler<'_> {
             "append" | "push" => {
                 if let Some(arg) = args.first() {
                     let val = self.compile_expr(builder, state, &arg.value)?;
-                    let fid = self.runtime_fns["nsl_list_push"].0;
+                    let fid = self.registry.runtime_fns["nsl_list_push"].0;
                     let fref = self.module.declare_func_in_func(fid, builder.func);
                     builder.ins().call(fref, &[obj_val, val]);
                     Ok(builder.ins().iconst(cl_types::I64, 0))
@@ -612,7 +612,7 @@ impl Compiler<'_> {
                 }
             }
             "len" => {
-                let fid = self.runtime_fns["nsl_list_len"].0;
+                let fid = self.registry.runtime_fns["nsl_list_len"].0;
                 let fref = self.module.declare_func_in_func(fid, builder.func);
                 let call = builder.ins().call(fref, &[obj_val]);
                 Ok(builder.inst_results(call)[0])

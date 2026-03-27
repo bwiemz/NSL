@@ -20,7 +20,7 @@ impl Compiler<'_> {
     // ── Pass 1: Declare functions ───────────────────────────────────
 
     pub fn declare_runtime_functions(&mut self) -> Result<(), CodegenError> {
-        self.runtime_fns = crate::builtins::declare_runtime_functions(&mut self.module, self.call_conv)?;
+        self.registry.runtime_fns = crate::builtins::declare_runtime_functions(&mut self.module, self.call_conv)?;
         Ok(())
     }
 
@@ -51,7 +51,7 @@ impl Compiler<'_> {
             let func_id = self.module
                 .declare_function(&cranelift_name, linkage, &sig)
                 .map_err(|e| CodegenError::new(format!("failed to declare fn '{raw_name}': {e}")))?;
-            self.functions.insert(raw_name.clone(), (func_id, sig));
+            self.registry.functions.insert(raw_name.clone(), (func_id, sig));
 
             // Track decorated functions
             if let Some(decos) = decorators {
@@ -59,9 +59,9 @@ impl Compiler<'_> {
                     if d.name.len() == 1 {
                         let dname = self.resolve_sym(d.name[0]);
                         if dname == "no_grad" {
-                            self.no_grad_fns.insert(raw_name.clone());
+                            self.registry.no_grad_fns.insert(raw_name.clone());
                         } else if dname == "test" {
-                            self.test_fns.push(raw_name.clone());
+                            self.registry.test_fns.push(raw_name.clone());
                         } else if dname == "fp8_compute" {
                             self.features.fp8_compute_fns.insert(raw_name.clone());
                         }
@@ -146,7 +146,7 @@ impl Compiler<'_> {
             let func_id = self.module
                 .declare_function(&format!("__nsl_struct_{sname}"), linkage, &sig)
                 .map_err(|e| CodegenError::new(format!("failed to declare struct ctor '{sname}': {e}")))?;
-            self.functions.insert(sname, (func_id, sig));
+            self.registry.functions.insert(sname, (func_id, sig));
         }
 
         // Declare model constructors and methods
@@ -179,7 +179,7 @@ impl Compiler<'_> {
             let ctor_id = self.module
                 .declare_function(&ctor_name, linkage, &ctor_sig)
                 .map_err(|e| CodegenError::new(format!("failed to declare model ctor '{model_name}': {e}")))?;
-            self.functions.insert(model_name.clone(), (ctor_id, ctor_sig));
+            self.registry.functions.insert(model_name.clone(), (ctor_id, ctor_sig));
 
             // Methods
             let mut method_map = HashMap::new();
@@ -226,7 +226,7 @@ impl Compiler<'_> {
                     let method_id = self.module
                         .declare_function(&mangled, linkage, &method_sig)
                         .map_err(|e| CodegenError::new(format!("failed to declare model method '{mangled}': {e}")))?;
-                    self.functions.insert(mangled.clone(), (method_id, method_sig));
+                    self.registry.functions.insert(mangled.clone(), (method_id, method_sig));
 
                     // M53: Extract @real_time and @wcet_budget from model method decorators
                     if !decos.is_empty() {
@@ -278,7 +278,7 @@ impl Compiler<'_> {
     /// Declare imported functions from other modules.
     /// Each entry is (raw_name, mangled_name, signature).
     /// The mangled name is used for the Cranelift symbol (must match the export),
-    /// while the raw name is used as the lookup key in self.functions.
+    /// while the raw name is used as the lookup key in self.registry.functions.
     pub fn declare_imported_functions(
         &mut self,
         imports: &[(String, String, Signature)],
@@ -287,7 +287,7 @@ impl Compiler<'_> {
             let func_id = self.module
                 .declare_function(mangled_name, Linkage::Import, sig)
                 .map_err(|e| CodegenError::new(format!("failed to declare imported fn '{raw_name}': {e}")))?;
-            self.functions.insert(raw_name.clone(), (func_id, sig.clone()));
+            self.registry.functions.insert(raw_name.clone(), (func_id, sig.clone()));
         }
         Ok(())
     }
@@ -486,7 +486,7 @@ impl Compiler<'_> {
                         .map_err(|e| CodegenError::new(format!(
                             "failed to declare dtype method '{fn_name}': {e}"
                         )))?;
-                    self.functions.insert(fn_name.clone(), (func_id, sig.clone()));
+                    self.registry.functions.insert(fn_name.clone(), (func_id, sig.clone()));
 
                     // Compile the method body
                     let mut ctx = Context::for_function(Function::with_name_signature(
@@ -609,13 +609,13 @@ impl Compiler<'_> {
                 let pack_fn_name = format!("__nsl_dtype_{}_pack", dtype_name);
                 let unpack_fn_name = format!("__nsl_dtype_{}_unpack", dtype_name);
 
-                let pack_addr = if let Some((fid, _)) = self.functions.get(&pack_fn_name) {
+                let pack_addr = if let Some((fid, _)) = self.registry.functions.get(&pack_fn_name) {
                     let fref = self.module.declare_func_in_func(*fid, builder.func);
                     builder.ins().func_addr(cl_types::I64, fref)
                 } else {
                     builder.ins().iconst(cl_types::I64, 0)
                 };
-                let unpack_addr = if let Some((fid, _)) = self.functions.get(&unpack_fn_name) {
+                let unpack_addr = if let Some((fid, _)) = self.registry.functions.get(&unpack_fn_name) {
                     let fref = self.module.declare_func_in_func(*fid, builder.func);
                     builder.ins().func_addr(cl_types::I64, fref)
                 } else {
@@ -634,7 +634,7 @@ impl Compiler<'_> {
                 let pbs_val = builder.ins().iconst(cl_types::I64, packed_block_size);
 
                 // Call nsl_register_custom_dtype(id, name_ptr, name_len, bit_width, block_size, packed_block_size, pack_fn, unpack_fn)
-                let reg_id = self.runtime_fns["nsl_register_custom_dtype"].0;
+                let reg_id = self.registry.runtime_fns["nsl_register_custom_dtype"].0;
                 let reg_ref = self.module.declare_func_in_func(reg_id, builder.func);
                 builder.ins().call(reg_ref, &[id_val, name_ptr, name_len, bw_val, bs_val, pbs_val, pack_addr, unpack_addr]);
             }
@@ -644,7 +644,7 @@ impl Compiler<'_> {
         if self.custom_dtype_ids.is_empty() {
             return Ok(());
         }
-        let fin_id = self.runtime_fns["nsl_finalize_dtype_registry"].0;
+        let fin_id = self.registry.runtime_fns["nsl_finalize_dtype_registry"].0;
         let fin_ref = self.module.declare_func_in_func(fin_id, builder.func);
         builder.ins().call(fin_ref, &[]);
 

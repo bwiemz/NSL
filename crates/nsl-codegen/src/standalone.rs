@@ -143,13 +143,13 @@ impl Compiler<'_> {
             let argv_val = builder.block_params(entry)[1]; // I64
 
             // 1. Initialise standard args: nsl_args_init(argc, argv)
-            let init_id = self.runtime_fns["nsl_args_init"].0;
+            let init_id = self.registry.runtime_fns["nsl_args_init"].0;
             let init_ref = self.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[argc_val, argv_val]);
 
             // 2. Initialise standalone arg parser: nsl_standalone_args_init(argc_i64, argv)
             let argc_i64 = builder.ins().sextend(cl_types::I64, argc_val);
-            let sa_init_id = self.runtime_fns["nsl_standalone_args_init"].0;
+            let sa_init_id = self.registry.runtime_fns["nsl_standalone_args_init"].0;
             let sa_init_ref = self.module.declare_func_in_func(sa_init_id, builder.func);
             builder.ins().call(sa_init_ref, &[argc_i64, argv_val]);
 
@@ -192,7 +192,7 @@ impl Compiler<'_> {
                         .ins()
                         .load(cl_types::I64, MemFlags::trusted(), size_ptr, 0);
 
-                let embed_init_id = self.runtime_fns["nsl_standalone_init_embedded"].0;
+                let embed_init_id = self.registry.runtime_fns["nsl_standalone_init_embedded"].0;
                 let embed_init_ref =
                     self.module.declare_func_in_func(embed_init_id, builder.func);
                 builder
@@ -209,7 +209,7 @@ impl Compiler<'_> {
                 let path_ptr = builder.ins().symbol_value(cl_types::I64, path_gv);
                 let path_len_val = builder.ins().iconst(cl_types::I64, path_len);
 
-                let sidecar_init_id = self.runtime_fns["nsl_standalone_init_sidecar"].0;
+                let sidecar_init_id = self.registry.runtime_fns["nsl_standalone_init_sidecar"].0;
                 let sidecar_init_ref =
                     self.module
                         .declare_func_in_func(sidecar_init_id, builder.func);
@@ -230,7 +230,7 @@ impl Compiler<'_> {
             let current = state.current_block.unwrap_or(entry);
             if !crate::types::is_block_filled(&builder, current) {
                 // Finish standalone arg parser
-                let finish_id = self.runtime_fns["nsl_standalone_args_finish"].0;
+                let finish_id = self.registry.runtime_fns["nsl_standalone_args_finish"].0;
                 let finish_ref =
                     self.module.declare_func_in_func(finish_id, builder.func);
                 builder.ins().call(finish_ref, &[]);

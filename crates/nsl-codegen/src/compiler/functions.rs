@@ -62,8 +62,8 @@ impl Compiler<'_> {
 
     /// Compile all pending lambda bodies. Drains in a loop to handle nested lambdas.
     pub fn compile_pending_lambdas(&mut self) -> Result<(), CodegenError> {
-        while !self.pending_lambdas.is_empty() {
-            let lambdas: Vec<PendingLambda> = self.pending_lambdas.drain(..).collect();
+        while !self.registry.pending_lambdas.is_empty() {
+            let lambdas: Vec<PendingLambda> = self.registry.pending_lambdas.drain(..).collect();
             for lambda in lambdas {
                 self.compile_lambda_body(&lambda)?;
             }
@@ -132,7 +132,7 @@ impl Compiler<'_> {
         fields: &[(cl_types::Type, usize)],
         total_size: usize,
     ) -> Result<(), CodegenError> {
-        let (func_id, sig) = self.functions[name].clone();
+        let (func_id, sig) = self.registry.functions[name].clone();
         let mut ctx = Context::for_function(Function::with_name_signature(
             UserFuncName::user(0, self.next_func_index()),
             sig.clone(),
@@ -146,7 +146,7 @@ impl Compiler<'_> {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
 
-            let alloc_id = self.runtime_fns["nsl_alloc"].0;
+            let alloc_id = self.registry.runtime_fns["nsl_alloc"].0;
             let alloc_ref = self.module.declare_func_in_func(alloc_id, builder.func);
             let size_val = builder.ins().iconst(cl_types::I64, total_size as i64);
             let call = builder.ins().call(alloc_ref, &[size_val]);
@@ -175,7 +175,7 @@ impl Compiler<'_> {
         md: &nsl_ast::decl::ModelDef,
     ) -> Result<(), CodegenError> {
         let model_name = self.resolve_sym(md.name).to_string();
-        let (func_id, sig) = self.functions[&model_name].clone();
+        let (func_id, sig) = self.registry.functions[&model_name].clone();
 
         let mut ctx = Context::for_function(Function::with_name_signature(
             UserFuncName::user(0, self.next_func_index()),
@@ -212,7 +212,7 @@ impl Compiler<'_> {
             let total_size = layout.as_ref().map(|l| l.total_size).unwrap_or(0);
             let alloc_size = total_size.max(8) as i64;
 
-            let alloc_id = self.runtime_fns["nsl_alloc"].0;
+            let alloc_id = self.registry.runtime_fns["nsl_alloc"].0;
             let alloc_ref = self.module.declare_func_in_func(alloc_id, builder.func);
             let size_val = builder.ins().iconst(cl_types::I64, alloc_size);
             let call = builder.ins().call(alloc_ref, &[size_val]);
@@ -300,7 +300,7 @@ impl Compiler<'_> {
 
             // M25: Initialize paged KV cache if model has @paged_kv
             if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) = self.paged_kv_configs.get(&model_name) {
-                let init_id = self.runtime_fns["nsl_kv_cache_init"].0;
+                let init_id = self.registry.runtime_fns["nsl_kv_cache_init"].0;
                 let init_ref = self.module.declare_func_in_func(init_id, builder.func);
                 let nb = builder.ins().iconst(cl_types::I64, num_blocks);
                 let bs = builder.ins().iconst(cl_types::I64, block_size);
@@ -358,7 +358,7 @@ impl Compiler<'_> {
                 if let ModelMember::Method(fn_def, decos) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
-                    let (func_id, sig) = self.functions.get(&mangled)
+                    let (func_id, sig) = self.registry.functions.get(&mangled)
                         .ok_or_else(|| CodegenError::new(format!("model method '{}' not registered", mangled)))?
                         .clone();
 
