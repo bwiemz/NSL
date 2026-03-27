@@ -23,6 +23,7 @@ struct WorkerContext {
     role: WorkerRole,
     rank: i32,
     model_ptr: i64,  // opaque model handle from codegen
+    kv_cache_handle: i64, // opaque KvCacheManager handle (0 = not set)
 }
 
 /// Configuration for worker loops, passed from the router.
@@ -144,8 +145,32 @@ pub extern "C" fn nsl_disagg_worker_init(role: i64, rank: i64, model_ptr: i64) -
         role: worker_role,
         rank: rank as i32,
         model_ptr,
+        kv_cache_handle: 0,
     });
     0
+}
+
+/// Set the KV cache handle on the current worker context.
+///
+/// Must be called after `nsl_disagg_worker_init`. The handle is an opaque
+/// pointer returned by `nsl_kv_cache_init` / `nsl_kv_cache_init_gpu`.
+/// The prefill worker uses this handle to serialize KV data via
+/// `nsl_kv_serialize` before transferring to the decode worker.
+///
+/// Returns 0 on success, -1 if the worker is not initialized.
+#[no_mangle]
+pub extern "C" fn nsl_disagg_worker_set_kv_cache(kv_cache_handle: i64) -> i64 {
+    let mut guard = match WORKER_CTX.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    match guard.as_mut() {
+        Some(ctx) => {
+            ctx.kv_cache_handle = kv_cache_handle;
+            0
+        }
+        None => -1,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,8 +359,8 @@ fn sample_argmax(logits_ptr: i64) -> i64 {
 /// Returns 0 on clean shutdown, negative on error.
 #[no_mangle]
 pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
-    // Verify role
-    let (rank, model_ptr) = {
+    // Verify role and extract context
+    let (rank, model_ptr, kv_cache_handle) = {
         let guard = match WORKER_CTX.lock() {
             Ok(g) => g,
             Err(_) => return -1,
@@ -347,7 +372,7 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
         if ctx.role != WorkerRole::Prefill {
             return -3;
         }
-        (ctx.rank, ctx.model_ptr)
+        (ctx.rank, ctx.model_ptr, ctx.kv_cache_handle)
     };
 
     let config = if config_ptr != 0 {
@@ -418,17 +443,52 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
                 }
 
                 // Step 3: Transfer KV cache to decode worker.
-                // When model_ptr != 0 the forward pass has populated KV cache
-                // memory. For now we still send the header + entries (the
-                // SharedMemBackend will copy any non-null K/V data). A future
-                // change will wire nsl_kv_serialize to extract actual block
-                // data from the BlockAllocator.
+                // Allocate buffers and serialize KV data from the block allocator
+                // when a KV cache handle is available. Falls back to empty buffers
+                // (header-only transfer) when the handle is not set.
+                let total_bytes = header.total_bytes as usize;
+                let (k_data_ptr, v_data_ptr): (*const std::ffi::c_void, *const std::ffi::c_void) =
+                    if total_bytes > 0 && kv_cache_handle != 0 {
+                        let mut k_buf: Vec<u8> = vec![0u8; total_bytes];
+                        let mut v_buf: Vec<u8> = vec![0u8; total_bytes];
+
+                        // Serialize KV cache data from the model's block allocator
+                        // into contiguous transfer buffers via nsl_kv_serialize.
+                        let _rc = super::kv_transfer::nsl_kv_serialize(
+                            kv_cache_handle,
+                            request_id as i64,
+                            request_id as i64,
+                            &mut header as *mut KvTransferHeader as i64,
+                            k_buf.as_mut_ptr() as i64,
+                            v_buf.as_mut_ptr() as i64,
+                        );
+
+                        let k_ptr = k_buf.as_ptr() as *const std::ffi::c_void;
+                        let v_ptr = v_buf.as_ptr() as *const std::ffi::c_void;
+                        // Keep buffers alive through the send_kv call
+                        std::mem::forget(k_buf);
+                        std::mem::forget(v_buf);
+                        (k_ptr, v_ptr)
+                    } else if total_bytes > 0 {
+                        // No KV cache handle — send zeroed buffers so the backend
+                        // copies the right amount of data (better than null).
+                        let k_buf: Vec<u8> = vec![0u8; total_bytes];
+                        let v_buf: Vec<u8> = vec![0u8; total_bytes];
+                        let k_ptr = k_buf.as_ptr() as *const std::ffi::c_void;
+                        let v_ptr = v_buf.as_ptr() as *const std::ffi::c_void;
+                        std::mem::forget(k_buf);
+                        std::mem::forget(v_buf);
+                        (k_ptr, v_ptr)
+                    } else {
+                        (std::ptr::null(), std::ptr::null())
+                    };
+
                 let _rc = kv_backend.send_kv(
                     target_decode_rank,
                     &header,
                     &entries,
-                    std::ptr::null(), // TODO: wire to BlockAllocator K data
-                    std::ptr::null(), // TODO: wire to BlockAllocator V data
+                    k_data_ptr,
+                    v_data_ptr,
                 );
 
                 // Step 4: Notify router that prefill is complete

@@ -21,6 +21,12 @@ pub struct KvCacheManager {
     page_tables: HashMap<SeqId, PageTable>,
     num_layers: usize,
     next_seq_id: SeqId,
+    /// M42: KV compression scheme (0=none, 1=int8_head, 2=int8_token, 3=int4_group, 4=fp8).
+    compress_scheme: u8,
+    /// M42: Attention sink window size for compression-aware eviction.
+    compress_window: usize,
+    /// M42: Number of attention sink tokens to preserve uncompressed.
+    compress_sinks: usize,
 }
 
 impl KvCacheManager {
@@ -44,6 +50,9 @@ impl KvCacheManager {
             page_tables: HashMap::new(),
             num_layers,
             next_seq_id: 0,
+            compress_scheme: 0,
+            compress_window: 0,
+            compress_sinks: 0,
         }
     }
 
@@ -61,6 +70,9 @@ impl KvCacheManager {
             page_tables: HashMap::new(),
             num_layers,
             next_seq_id: 0,
+            compress_scheme: 0,
+            compress_window: 0,
+            compress_sinks: 0,
         }
     }
 
@@ -171,6 +183,31 @@ impl KvCacheManager {
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
+
+    /// Set M42 KV compression configuration.
+    ///
+    /// Called during `nsl_kv_cache_init` when `compress_scheme > 0`.
+    /// The compression config is used by eviction logic to quantize old KV blocks.
+    pub fn set_compression(&mut self, scheme: u8, window: usize, sinks: usize) {
+        self.compress_scheme = scheme;
+        self.compress_window = window;
+        self.compress_sinks = sinks;
+    }
+
+    /// Returns the active compression scheme (0 = none).
+    pub fn compress_scheme(&self) -> u8 {
+        self.compress_scheme
+    }
+
+    /// Returns the attention sink window size for compression-aware eviction.
+    pub fn compress_window(&self) -> usize {
+        self.compress_window
+    }
+
+    /// Returns the number of attention sink tokens preserved uncompressed.
+    pub fn compress_sinks(&self) -> usize {
+        self.compress_sinks
+    }
 }
 
 // ── FFI exports ─────────────────────────────────────────────────────────────
@@ -201,7 +238,7 @@ pub extern "C" fn nsl_kv_cache_init(
     compress_window: i64,
     compress_sinks: i64,
 ) -> i64 {
-    let mgr = KvCacheManager::new(
+    let mut mgr = KvCacheManager::new(
         num_blocks as usize,
         block_size as usize,
         num_heads as usize,
@@ -213,10 +250,12 @@ pub extern "C" fn nsl_kv_cache_init(
             "[nsl-runtime] KV cache compression: scheme={}, window={}, sinks={}",
             compress_scheme, compress_window, compress_sinks
         );
-        // TODO(M42): plumb compress_scheme/window/sinks into KvCacheManager fields
-        // when the compression eviction path is implemented.
+        mgr.set_compression(
+            compress_scheme as u8,
+            compress_window as usize,
+            compress_sinks as usize,
+        );
     }
-    let _ = (compress_scheme, compress_window, compress_sinks);
     let boxed = Box::new(Mutex::new(mgr));
     Box::into_raw(boxed) as i64
 }
@@ -238,7 +277,7 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
-        let mgr = KvCacheManager::new_gpu(
+        let mut mgr = KvCacheManager::new_gpu(
             num_blocks as usize,
             block_size as usize,
             num_heads as usize,
@@ -250,8 +289,12 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
                 "[nsl-runtime] KV cache compression (GPU): scheme={}, window={}, sinks={}",
                 compress_scheme, compress_window, compress_sinks
             );
+            mgr.set_compression(
+                compress_scheme as u8,
+                compress_window as usize,
+                compress_sinks as usize,
+            );
         }
-        let _ = (compress_scheme, compress_window, compress_sinks);
         let boxed = Box::new(Mutex::new(mgr));
         Box::into_raw(boxed) as i64
     }

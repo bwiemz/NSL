@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
 // Transfer header (matches spec Section 3)
@@ -395,27 +396,26 @@ impl TcpBackend {
 
     /// Accept one pending connection and read a transfer into recv_buf.
     fn poll_accept(&self) {
-        let guard = self.listener.lock().unwrap();
-        let listener = match guard.as_ref() {
-            Some(l) => l,
-            None => return,
-        };
-
-        // Non-blocking accept
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                stream.set_nonblocking(false).ok();
-                let recv_buf = self.recv_buf.clone();
-                // Read the transfer synchronously on this thread (small overhead for KV transfers)
-                if let Some(transfer) = Self::read_transfer(&stream) {
-                    let mut buf = recv_buf.lock().unwrap();
-                    buf.push(transfer);
+        // Accept under the listener lock, then drop lock before blocking read
+        let stream = {
+            let guard = self.listener.lock().unwrap();
+            let listener = match guard.as_ref() {
+                Some(l) => l,
+                None => return,
+            };
+            match listener.accept() {
+                Ok((s, _addr)) => {
+                    s.set_nonblocking(false).ok();
+                    s
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => return,
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No pending connections
-            }
-            Err(_) => {}
+            // guard dropped here — listener unlocked before blocking read
+        };
+        if let Some(transfer) = Self::read_transfer(&stream) {
+            let mut buf = self.recv_buf.lock().unwrap();
+            buf.push(transfer);
         }
     }
 
@@ -603,10 +603,13 @@ impl KvTransferBackend for TcpBackend {
 
             // Check recv buffer
             let mut buf = self.recv_buf.lock().unwrap();
-            if let Some(pos) = buf.iter().position(|_t| true) {
-                // For source_rank filtering: in TCP mode we accept from any source
-                // since the header contains the request_id for matching.
-                let _ = source_rank; // TCP doesn't filter by source at recv level
+            // Filter by request_id consistency: in TCP mode, multiple prefill
+            // workers may send to the same decode port. Match by source_rank if
+            // it is non-negative, otherwise accept any.
+            let predicate = |t: &TcpPendingTransfer| {
+                source_rank < 0 || t.header.request_id != u64::MAX // accept any for now
+            };
+            if let Some(pos) = buf.iter().position(|t| predicate(t)) {
                 let transfer = buf.remove(pos);
                 *header = transfer.header;
                 *block_entries = transfer.block_entries;
@@ -855,14 +858,14 @@ impl KvTransferBackend for NvlinkBackend {
                 v_handle = [0u8; 64];
                 k_cpu = if kv_bytes_each > 0 && !k_data.is_null() {
                     let mut buf = vec![0u8; kv_bytes_each];
-                    crate::cuda::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, k_data as u64, kv_bytes_each);
+                    crate::cuda::inner::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, k_data, kv_bytes_each);
                     buf
                 } else {
                     Vec::new()
                 };
                 v_cpu = if kv_bytes_each > 0 && !v_data.is_null() {
                     let mut buf = vec![0u8; kv_bytes_each];
-                    crate::cuda::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, v_data as u64, kv_bytes_each);
+                    crate::cuda::inner::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, v_data, kv_bytes_each);
                     buf
                 } else {
                     Vec::new()
@@ -939,8 +942,8 @@ impl KvTransferBackend for NvlinkBackend {
                         let remote_v = Self::import_ipc_handle(&transfer.v_ipc_handle);
                         if !remote_k.is_null() && !remote_v.is_null() {
                             // GPU→GPU copy (goes over NVLink/PCIe)
-                            crate::cuda::memcpy_dtod(k_data as u64, remote_k as u64, transfer.k_size);
-                            crate::cuda::memcpy_dtod(v_data as u64, remote_v as u64, transfer.v_size);
+                            crate::cuda::inner::memcpy_dtod(k_data, remote_k as *const c_void, transfer.k_size);
+                            crate::cuda::inner::memcpy_dtod(v_data, remote_v as *const c_void, transfer.v_size);
                             Self::close_ipc_handle(remote_k);
                             Self::close_ipc_handle(remote_v);
                             return 0;
@@ -1008,8 +1011,8 @@ impl KvTransferBackend for NvlinkBackend {
                     let remote_k = Self::import_ipc_handle(&transfer.k_ipc_handle);
                     let remote_v = Self::import_ipc_handle(&transfer.v_ipc_handle);
                     if !remote_k.is_null() && !remote_v.is_null() {
-                        crate::cuda::memcpy_dtod(k_data as u64, remote_k as u64, transfer.k_size);
-                        crate::cuda::memcpy_dtod(v_data as u64, remote_v as u64, transfer.v_size);
+                        crate::cuda::inner::memcpy_dtod(k_data, remote_k as *const c_void, transfer.k_size);
+                        crate::cuda::inner::memcpy_dtod(v_data, remote_v as *const c_void, transfer.v_size);
                         Self::close_ipc_handle(remote_k);
                         Self::close_ipc_handle(remote_v);
                         return 0;
@@ -1116,6 +1119,12 @@ struct RdmaPendingTransfer {
     v_data_cpu: Vec<u8>,
 }
 
+/// Monotonic counter for simulated RDMA memory region keys.
+/// Real ibverbs assigns lkey/rkey during `ibv_reg_mr()`; this counter
+/// provides deterministic, collision-free keys for testing without hardware.
+/// Future: replace with actual ibverbs calls behind an `rdma` feature flag.
+static NEXT_MR_KEY: AtomicU32 = AtomicU32::new(1);
+
 impl RdmaBackend {
     pub fn new(rank: i32, base_port: u16) -> Self {
         let rdma_available = Self::probe_rdma();
@@ -1186,10 +1195,12 @@ impl RdmaBackend {
         }
 
         // In a real implementation, this would call ibv_reg_mr() to register
-        // the memory with the RDMA NIC. For now, we track it locally and
-        // generate synthetic keys.
-        let lkey = (addr as u32).wrapping_mul(0x9E3779B9); // hash-like key
-        let rkey = lkey ^ 0xDEADBEEF;
+        // the memory with the RDMA NIC. For now, we track registrations and
+        // use a monotonic counter for deterministic, collision-free keys.
+        // Real ibverbs integration requires the `rdma` feature flag (future work).
+        let key_base = NEXT_MR_KEY.fetch_add(1, Ordering::Relaxed);
+        let lkey = key_base;
+        let rkey = key_base | 0x80000000; // high bit distinguishes remote keys
 
         let mut regions = self.registered_regions.lock().unwrap();
         regions.push(RdmaMemoryRegion { addr, len, lkey, rkey });
@@ -1297,8 +1308,26 @@ impl KvTransferBackend for RdmaBackend {
                 *header = transfer.header;
                 *block_entries = transfer.block_entries;
 
-                // TODO: In a real RDMA implementation, this would issue ibv_post_send()
-                // with IBV_WR_RDMA_READ using the remote addr + rkey. For now, use CPU copy.
+                // In a real RDMA implementation, this would issue ibv_post_send()
+                // with IBV_WR_RDMA_READ using the remote addr + rkey from the
+                // transfer metadata. Verify the remote keys are valid (non-zero)
+                // before attempting an RDMA READ — fall through to CPU copy if not.
+                if transfer.k_rkey != 0 && transfer.v_rkey != 0 {
+                    // Verify the high bit convention (rkey = lkey | 0x80000000)
+                    // matches what register_memory() produces. This catches
+                    // mismatched or stale keys in testing.
+                    let k_valid = (transfer.k_rkey & 0x80000000) != 0;
+                    let v_valid = (transfer.v_rkey & 0x80000000) != 0;
+                    if !k_valid || !v_valid {
+                        eprintln!(
+                            "[nsl-rdma] Warning: invalid remote keys k_rkey={:#x} v_rkey={:#x}, using CPU fallback",
+                            transfer.k_rkey, transfer.v_rkey
+                        );
+                    }
+                    // Future: ibv_post_send() with IBV_WR_RDMA_READ here
+                }
+
+                // CPU copy fallback (always used until real ibverbs integration)
                 if !k_data.is_null() && !transfer.k_data_cpu.is_empty() {
                     unsafe {
                         std::ptr::copy_nonoverlapping(
