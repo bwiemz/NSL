@@ -498,7 +498,7 @@ impl Compiler<'_> {
                     {
                         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
                         let mut state = crate::context::FuncState::new();
-                        state.in_dtype_method = true;
+                        state.flags.in_dtype_method = true;
 
                         let entry = builder.create_block();
                         builder.append_block_params_for_function_params(entry);
@@ -533,7 +533,7 @@ impl Compiler<'_> {
 
                         // Mark unpack methods so return statements bitcast f64→i64
                         let is_elem_unpack = !is_block_mode && method.kind == DatatypeMethodKind::Unpack;
-                        state.dtype_unpack_ret_bitcast = is_elem_unpack;
+                        state.flags.dtype_unpack_ret_bitcast = is_elem_unpack;
 
                         // Compile body statements
                         for body_stmt in &method.body {

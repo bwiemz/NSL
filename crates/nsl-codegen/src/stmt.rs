@@ -277,7 +277,7 @@ impl Compiler<'_> {
                                 } else { false }
                             } else { false };
                             if is_sparse_type || is_sparse_call {
-                                state.sparse_vars.insert(sym);
+                                state.ownership.sparse_vars.insert(sym);
                             }
                         }
 
@@ -360,11 +360,11 @@ impl Compiler<'_> {
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
-                    if state.is_no_grad {
+                    if state.flags.is_no_grad {
                         self.compile_call_by_name(builder, "nsl_tape_resume", &[])?;
                     }
                     // In element-wise unpack methods, bitcast f64→i64 for the return value
-                    if state.dtype_unpack_ret_bitcast {
+                    if state.flags.dtype_unpack_ret_bitcast {
                         let vt = builder.func.dfg.value_type(val);
                         if vt == cranelift_codegen::ir::types::F64 {
                             val = builder.ins().bitcast(cranelift_codegen::ir::types::I64, cranelift_codegen::ir::MemFlags::new(), val);
@@ -375,7 +375,7 @@ impl Compiler<'_> {
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
-                    if state.is_no_grad {
+                    if state.flags.is_no_grad {
                         self.compile_call_by_name(builder, "nsl_tape_resume", &[])?;
                     }
                     builder.ins().return_(&[]);
@@ -760,11 +760,11 @@ impl Compiler<'_> {
         state: &mut FuncState,
         keep: Option<Value>,
     ) {
-        let temps = std::mem::take(&mut state.tensor_temporaries);
+        let temps = std::mem::take(&mut state.cleanup.tensor_temporaries);
         // When inside a tape-recorded region (train step body), the autodiff tape
         // holds raw pointers to intermediate tensors (TapeOp `a`/`out` fields).
         // Freeing them here causes use-after-free during backward.
-        if state.in_tape_region {
+        if state.flags.in_tape_region {
             return;
         }
         for temp in &temps {
@@ -785,7 +785,7 @@ impl Compiler<'_> {
     /// Called after `free_tensor_temporaries` at each statement boundary.
     /// `keep` is the value being assigned to a variable (should NOT be freed).
     ///
-    /// Only active when `state.ownership_lowering.is_some()` — the pending list
+    /// Only active when `state.ownership.lowering.is_some()` — the pending list
     /// is empty otherwise so the loop is a no-op.
     fn free_linear_consumes(
         &mut self,
@@ -793,15 +793,15 @@ impl Compiler<'_> {
         state: &mut FuncState,
         keep: Option<Value>,
     ) {
-        if state.linear_consume_pending.is_empty() {
+        if state.ownership.linear_consume_pending.is_empty() {
             return;
         }
         // Don't free inside tape-recorded regions — backward needs the data alive.
-        if state.in_tape_region {
-            state.linear_consume_pending.clear();
+        if state.flags.in_tape_region {
+            state.ownership.linear_consume_pending.clear();
             return;
         }
-        let pending = std::mem::take(&mut state.linear_consume_pending);
+        let pending = std::mem::take(&mut state.ownership.linear_consume_pending);
         for val in &pending {
             if Some(*val) == keep {
                 continue;
@@ -823,8 +823,8 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
     ) {
-        if let Some(&scope_start) = state.temp_scope_stack.last() {
-            for &temp in &state.tensor_temporaries[scope_start..] {
+        if let Some(&scope_start) = state.cleanup.temp_scope_stack.last() {
+            for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
                     if is_block_filled(builder, block) {
                         break;
@@ -841,8 +841,8 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
     ) {
-        if let Some(scope_start) = state.temp_scope_stack.pop() {
-            for &temp in &state.tensor_temporaries[scope_start..] {
+        if let Some(scope_start) = state.cleanup.temp_scope_stack.pop() {
+            for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
                     if is_block_filled(builder, block) {
                         break;
@@ -850,7 +850,7 @@ impl Compiler<'_> {
                 }
                 let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
             }
-            state.tensor_temporaries.truncate(scope_start);
+            state.cleanup.tensor_temporaries.truncate(scope_start);
         }
     }
 
@@ -862,7 +862,7 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
     ) {
-        let loaders = std::mem::take(&mut state.dataloader_vars);
+        let loaders = std::mem::take(&mut state.cleanup.dataloader_vars);
         for dl in &loaders {
             if let Some(block) = state.current_block {
                 if is_block_filled(builder, block) {
@@ -968,7 +968,7 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
-        state.temp_scope_stack.push(state.tensor_temporaries.len());
+        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: header_block, exit_block });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
@@ -978,7 +978,7 @@ impl Compiler<'_> {
             self.cleanup_loop_scope(builder, state);
             builder.ins().jump(header_block, &[]);
         } else {
-            state.temp_scope_stack.pop();
+            state.cleanup.temp_scope_stack.pop();
         }
 
         builder.seal_block(header_block);
@@ -1033,7 +1033,7 @@ impl Compiler<'_> {
             builder.def_var(var, val);
         }
 
-        state.temp_scope_stack.push(state.tensor_temporaries.len());
+        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: header_block, exit_block });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
@@ -1043,7 +1043,7 @@ impl Compiler<'_> {
             self.cleanup_loop_scope(builder, state);
             builder.ins().jump(header_block, &[]);
         } else {
-            state.temp_scope_stack.pop();
+            state.cleanup.temp_scope_stack.pop();
         }
 
         builder.seal_block(header_block);
@@ -1163,7 +1163,7 @@ impl Compiler<'_> {
         }
 
         // continue jumps to increment_block (not header) so counter is incremented
-        state.temp_scope_stack.push(state.tensor_temporaries.len());
+        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
@@ -1173,7 +1173,7 @@ impl Compiler<'_> {
             self.cleanup_loop_scope(builder, state);
             builder.ins().jump(increment_block, &[]);
         } else {
-            state.temp_scope_stack.pop();
+            state.cleanup.temp_scope_stack.pop();
         }
 
         // Increment block: counter++ then jump to header
@@ -1254,7 +1254,7 @@ impl Compiler<'_> {
         builder.def_var(elem_var, elem_ptr);
 
         // Compile body statements
-        state.temp_scope_stack.push(state.tensor_temporaries.len());
+        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
@@ -1266,7 +1266,7 @@ impl Compiler<'_> {
             self.cleanup_loop_scope(builder, state);
             builder.ins().jump(increment_block, &[]);
         } else {
-            state.temp_scope_stack.pop();
+            state.cleanup.temp_scope_stack.pop();
         }
 
         // Increment: counter++ then jump to header
@@ -1344,7 +1344,7 @@ impl Compiler<'_> {
         // Rely on codegen-level tensor_temporaries for per-statement cleanup.
         // Do NOT use scope_begin/scope_end — it double-frees tensors that are
         // already freed by free_tensor_temporaries in called functions.
-        state.temp_scope_stack.push(state.tensor_temporaries.len());
+        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
         state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
@@ -1356,7 +1356,7 @@ impl Compiler<'_> {
             self.cleanup_loop_scope(builder, state);
             builder.ins().jump(cleanup_block, &[]);
         } else {
-            state.temp_scope_stack.pop();
+            state.cleanup.temp_scope_stack.pop();
         }
 
         // Cleanup: free batch dict, loop back
@@ -1855,7 +1855,7 @@ impl Compiler<'_> {
 
         // ── 7. Inner batch loop (when DataLoader exists) or single-step (backward compat) ──
 
-        let has_dataloader = state.dataloader_vars.last().copied();
+        let has_dataloader = state.cleanup.dataloader_vars.last().copied();
 
         // Declare step parameter variable
         let step_param_var = state.new_variable();
@@ -1940,7 +1940,7 @@ impl Compiler<'_> {
                 self.compile_tape_backward(builder, state, step_body, param_list)?
             } else {
                 // 3. Compile forward pass normally (no tape wrapping)
-                state.in_tape_region = false;
+                state.flags.in_tape_region = false;
                 for stmt in &step_body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
@@ -2486,11 +2486,11 @@ impl Compiler<'_> {
 
         // Compile step body stmts
         // Suppress tensor temporary cleanup — tape holds raw pointers to intermediates.
-        state.in_tape_region = true;
+        state.flags.in_tape_region = true;
         for stmt in &step_body.stmts {
             self.compile_stmt(builder, state, stmt)?;
         }
-        state.in_tape_region = false;
+        state.flags.in_tape_region = false;
 
         // Find loss variable — look for "loss" in state.variables by name
         let loss_val = {
@@ -2770,11 +2770,11 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
         self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
 
-        state.in_tape_region = true;
+        state.flags.in_tape_region = true;
         for stmt in &step_body.stmts {
             self.compile_stmt(builder, state, stmt)?;
         }
-        state.in_tape_region = false;
+        state.flags.in_tape_region = false;
 
         // Find loss variable
         let loss_val = {

@@ -115,13 +115,13 @@ impl Compiler<'_> {
             // @no_grad: pause tape recording at function entry
             let is_no_grad = self.registry.no_grad_fns.contains(&name);
             if is_no_grad {
-                state.is_no_grad = true;
+                state.flags.is_no_grad = true;
                 self.compile_call_by_name(&mut builder, "nsl_tape_pause", &[])?;
             }
 
             // @fp8_compute: use FP8 training matmul for E5M2 backward
             if self.features.fp8_compute_fns.contains(&name) {
-                state.is_fp8_compute = true;
+                state.flags.is_fp8_compute = true;
             }
 
             // M44: Record current function name for @grammar decorator lookup in generate() calls
@@ -135,7 +135,7 @@ impl Compiler<'_> {
             // When --linear-types is active and the semantic pass produced ownership
             // metadata for this function, create an OwnershipLowering tracker and
             // install it in the function state. During expr codegen, variable use
-            // compilation can consult `state.ownership_lowering` to decide whether
+            // compilation can consult `state.ownership.lowering` to decide whether
             // to emit `nsl_tensor_free` at consumption point (linear bindings) or
             // skip refcount ops entirely.
             if self.features.linear_types_enabled {
@@ -147,7 +147,7 @@ impl Compiler<'_> {
                     for sym in &fn_ownership.shared_params {
                         lowering.mark_shared(*sym);
                     }
-                    state.ownership_lowering = Some(lowering);
+                    state.ownership.lowering = Some(lowering);
                 }
             }
 

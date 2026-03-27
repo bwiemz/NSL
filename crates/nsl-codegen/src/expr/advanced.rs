@@ -293,7 +293,7 @@ impl Compiler<'_> {
 
             // M52b: Try constant folding if both operands are known weights
             if let Some(folded) = self.try_weight_fold(builder, state, lhs, rhs, op)? {
-                state.tensor_temporaries.push(folded);
+                state.cleanup.tensor_temporaries.push(folded);
                 return Ok(folded);
             }
 
@@ -305,9 +305,9 @@ impl Compiler<'_> {
             }
 
             // M52c: Try sparse matmul if RHS weight is >50% sparse
-            if op == BinOp::MatMul && !state.is_fp8_compute {
+            if op == BinOp::MatMul && !state.flags.is_fp8_compute {
                 if let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)? {
-                    state.tensor_temporaries.push(sparse_result);
+                    state.cleanup.tensor_temporaries.push(sparse_result);
                     return Ok(sparse_result);
                 }
             }
@@ -318,7 +318,7 @@ impl Compiler<'_> {
                 BinOp::Sub => "nsl_tensor_sub",
                 BinOp::Mul => "nsl_tensor_mul",
                 BinOp::Div => "nsl_tensor_div",
-                BinOp::MatMul => if state.is_fp8_compute {
+                BinOp::MatMul => if state.flags.is_fp8_compute {
                     "nsl_fp8_matmul_training"
                 } else {
                     "nsl_tensor_matmul"
@@ -330,7 +330,7 @@ impl Compiler<'_> {
             self.annotate_sparsity_hints(state, lhs, rhs, op);
 
             let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs])?;
-            state.tensor_temporaries.push(result);
+            state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else if left_is_tensor {
             // M52d: Scaling constant fusion — if this is `tensor * scalar` where
@@ -366,7 +366,7 @@ impl Compiler<'_> {
                 }
                 _ => return Err(CodegenError::new(format!("unsupported tensor-scalar op: {op:?}"))),
             };
-            state.tensor_temporaries.push(result);
+            state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else {
             // Scalar-tensor: ensure scalar is f64
@@ -385,7 +385,7 @@ impl Compiler<'_> {
                 }
                 _ => return Err(CodegenError::new(format!("unsupported scalar-tensor op: {op:?}"))),
             };
-            state.tensor_temporaries.push(result);
+            state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         }
     }
@@ -474,9 +474,9 @@ impl Compiler<'_> {
                 // M38b: Ownership lowering can prove clone is unnecessary when
                 // the source is linear, consumed once, with no borrows or sharing.
                 if let ExprKind::Ident(sym) = &object.kind {
-                    if let Some(ref lowering) = state.ownership_lowering {
+                    if let Some(ref lowering) = state.ownership.lowering {
                         if lowering.decide_clone(sym) == crate::ownership::CloneDecision::Eliminate
-                            && !state.in_tape_region
+                            && !state.flags.in_tape_region
                         {
                             return Ok(obj_val); // elide clone — linear single-owner
                         }
@@ -486,7 +486,7 @@ impl Compiler<'_> {
                 // (the binding won't be referenced again, so cloning is unnecessary)
                 if let ExprKind::Ident(sym) = &object.kind {
                     if let Some(ref uc) = state.use_counts {
-                        if uc.is_single_use(sym) && !state.in_tape_region {
+                        if uc.is_single_use(sym) && !state.flags.in_tape_region {
                             return Ok(obj_val); // elide clone
                         }
                     }
@@ -1033,11 +1033,11 @@ impl Compiler<'_> {
         state: &mut FuncState,
         expr: &Expr,
     ) -> Result<Option<Value>, CodegenError> {
-        if state.in_fuse_bypass || self.fusion.disabled {
+        if state.flags.in_fuse_bypass || self.fusion.disabled {
             return Ok(None);
         }
         // Don't fuse during tape recording — autodiff needs individual op recordings
-        if state.in_tape_region {
+        if state.flags.in_tape_region {
             return Ok(None);
         }
 
@@ -1089,11 +1089,11 @@ impl Compiler<'_> {
                 }
 
                 // Compile inputs (bypass fusion to avoid infinite recursion)
-                state.in_fuse_bypass = true;
+                state.flags.in_fuse_bypass = true;
                 let compiled_inputs: Vec<Value> = inputs.iter()
                     .map(|inp| self.compile_expr(builder, state, inp))
                     .collect::<Result<Vec<_>, _>>()?;
-                state.in_fuse_bypass = false;
+                state.flags.in_fuse_bypass = false;
 
                 // Build op-codes list
                 let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -1371,7 +1371,7 @@ impl Compiler<'_> {
                 result
             }
         };
-        state.tensor_temporaries.push(result);
+        state.cleanup.tensor_temporaries.push(result);
         Ok(result)
     }
 
@@ -1486,7 +1486,7 @@ impl Compiler<'_> {
             &[data_ptr, shape_list, dtype_val],
         )?;
 
-        state.tensor_temporaries.push(tensor);
+        state.cleanup.tensor_temporaries.push(tensor);
         Ok(tensor)
     }
 

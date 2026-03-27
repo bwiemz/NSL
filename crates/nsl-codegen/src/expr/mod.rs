@@ -44,9 +44,9 @@ impl Compiler<'_> {
                     // freed at consumption, enqueue it for post-statement cleanup.
                     // The actual nsl_tensor_free is emitted in free_linear_consumes()
                     // after the statement finishes using the value.
-                    if let Some(ref lowering) = state.ownership_lowering {
+                    if let Some(ref lowering) = state.ownership.lowering {
                         if lowering.should_free_at_consumption(sym) {
-                            state.linear_consume_pending.push(val);
+                            state.ownership.linear_consume_pending.push(val);
                         }
                     }
                     Ok(val)
@@ -172,7 +172,7 @@ impl Compiler<'_> {
         let val = self.compile_expr(builder, state, operand)?;
         let ty = self.node_type(operand.id).clone();
         match op {
-            UnaryOp::Neg if ty.is_tensor() || (ty.is_indeterminate() && !state.in_dtype_method) => {
+            UnaryOp::Neg if ty.is_tensor() || (ty.is_indeterminate() && !state.flags.in_dtype_method) => {
                 self.compile_call_by_name(builder, "nsl_tensor_neg", &[val])
             }
             UnaryOp::Neg if is_float_type(&ty) || builder.func.dfg.value_type(val).is_float() => {
@@ -199,7 +199,7 @@ impl Compiler<'_> {
         state: &FuncState,
         expr: &nsl_ast::expr::Expr,
     ) -> bool {
-        if let Some(ref lowering) = state.ownership_lowering {
+        if let Some(ref lowering) = state.ownership.lowering {
             if let nsl_ast::expr::ExprKind::Ident(sym) = &expr.kind {
                 return lowering.should_elide_refcount(sym);
             }
@@ -223,12 +223,12 @@ impl Compiler<'_> {
         op_name: &str,
     ) -> String {
         // Only optimize when not recording autodiff tape
-        if !state.in_tape_region {
+        if !state.flags.in_tape_region {
             if let nsl_ast::expr::ExprKind::Ident(sym) = &arg_expr.kind {
                 // M38b: Ownership lowering can prove exclusive access even when
                 // use-count heuristics cannot (e.g., multi-use linear binding
                 // where all but this use have already been consumed).
-                if let Some(ref lowering) = state.ownership_lowering {
+                if let Some(ref lowering) = state.ownership.lowering {
                     if lowering.should_use_inplace(sym) {
                         let inplace = format!("nsl_tensor_{op_name}_inplace");
                         if self.registry.functions.contains_key(&inplace) {

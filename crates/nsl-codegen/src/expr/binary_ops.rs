@@ -83,12 +83,12 @@ impl Compiler<'_> {
         // Exception: inside datatype method bodies, indeterminate types are always scalars
         //   (the semantic checker does not descend into method bodies).
         let both_indeterminate = left_type.is_indeterminate() && right_type.is_indeterminate()
-            && !state.in_dtype_method;
+            && !state.flags.in_dtype_method;
         let left_is_tensor = left_type.is_tensor()
-            || (left_type.is_indeterminate() && !state.in_dtype_method
+            || (left_type.is_indeterminate() && !state.flags.in_dtype_method
                 && (matches!(op, BinOp::MatMul) || right_type.is_tensor() || both_indeterminate));
         let right_is_tensor = right_type.is_tensor()
-            || (right_type.is_indeterminate() && !state.in_dtype_method
+            || (right_type.is_indeterminate() && !state.flags.in_dtype_method
                 && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
             // M50: Extract sparse flags for sparse operation dispatch.
@@ -96,9 +96,9 @@ impl Compiler<'_> {
             // created by sparse_from_dense where the type checker doesn't
             // assign Type::Sparse).
             let left_is_sparse = matches!(left_type, Type::Sparse { .. })
-                || matches!(&left.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.sparse_vars.contains(sym));
+                || matches!(&left.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.ownership.sparse_vars.contains(sym));
             let right_is_sparse = matches!(right_type, Type::Sparse { .. })
-                || matches!(&right.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.sparse_vars.contains(sym));
+                || matches!(&right.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.ownership.sparse_vars.contains(sym));
 
             // FBIP safety: protect tensor operands from runtime in-place mutation
             // when they come from named variables (Ident). The runtime FBIP check

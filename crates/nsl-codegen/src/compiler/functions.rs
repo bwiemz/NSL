@@ -383,7 +383,7 @@ impl Compiler<'_> {
                             || self.features.fp8_compute_fns.contains(&method_name)
                             || self.features.fp8_compute_fns.contains(&mangled)
                         {
-                            state.is_fp8_compute = true;
+                            state.flags.is_fp8_compute = true;
                         }
 
                         // M35: @quantize on the model — log active quantization config for
