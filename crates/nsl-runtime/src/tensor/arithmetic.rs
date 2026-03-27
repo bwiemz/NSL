@@ -562,11 +562,11 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
 /// Returns a new dense tensor C[nrows, N] where N is B's last dim.
 #[no_mangle]
 pub extern "C" fn nsl_sparse_matmul(
-    _row_ptrs_ptr: i64,
-    _col_indices_ptr: i64,
+    row_ptrs_ptr: i64,
+    col_indices_ptr: i64,
     values_ptr: i64,
     b_ptr: i64,
-    _nrows: i64,
+    nrows: i64,
     _ncols: i64,
     _nnz: i64,
 ) -> i64 {
