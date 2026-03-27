@@ -85,7 +85,11 @@ for batch in loader:
 
         step_start = clock()
 
-    # TODO: checkpoint saving (model_save needs CPU tensors, model is on GPU)
+    # Checkpoint saving — model_save handles GPU→CPU transfer internally
+    if step > 0 and step % checkpoint_interval == 0:
+        print("Saving checkpoint at step:")
+        print(step)
+        model_save(m, "checkpoints/coder50m_step_" + str(step) + ".nslm")
 
     step = step + 1
     if step >= max_steps:
@@ -109,6 +113,7 @@ if total_time > 0.0:
 print("Final running loss:")
 print(running_loss)
 
-# TODO: Save final checkpoint (needs model.to(cpu) first)
+# Save final checkpoint — model_save handles GPU→CPU transfer internally
+model_save(m, "checkpoints/coder50m_final.nslm")
 print("Final checkpoint saved.")
 print("================================================================")

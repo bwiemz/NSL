@@ -86,15 +86,28 @@ pub extern "C" fn nsl_model_save(
     let pad_buf = [0u8; 64];
     write_or_abort(&mut file, &pad_buf[..padding], "write padding");
 
-    // Raw tensor data (little-endian, dtype-aware)
+    // Raw tensor data (little-endian, dtype-aware).
+    // GPU tensors are transferred to CPU before reading data.
     for i in 0..tensors.len as usize {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
         let byte_count = (tensor.len as usize) * tensor.element_size();
-        let data_slice = unsafe {
-            std::slice::from_raw_parts(tensor.data as *const u8, byte_count)
-        };
-        write_or_abort(&mut file, data_slice, "write tensor data");
+
+        if tensor.device > 0 {
+            // GPU tensor: copy to CPU staging buffer before writing
+            let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_ptr, 0);
+            let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
+            let data_slice = unsafe {
+                std::slice::from_raw_parts(cpu_tensor.data as *const u8, byte_count)
+            };
+            write_or_abort(&mut file, data_slice, "write tensor data (GPU→CPU)");
+            crate::tensor::nsl_tensor_free(cpu_ptr);
+        } else {
+            let data_slice = unsafe {
+                std::slice::from_raw_parts(tensor.data as *const u8, byte_count)
+            };
+            write_or_abort(&mut file, data_slice, "write tensor data");
+        }
     }
 }
 
@@ -182,37 +195,63 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
             std::process::abort();
         }
 
-        #[cfg(target_endian = "little")]
-        {
-            // Fast path: bulk copy on little-endian hardware (x86, ARM, etc.)
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data[offset..].as_ptr(),
-                    tensor.data as *mut u8,
+        if tensor.device > 0 {
+            // GPU tensor: load data into CPU staging buffer, then memcpy to device
+            #[cfg(feature = "cuda")]
+            {
+                let staging = crate::memory::checked_alloc(byte_count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data[offset..].as_ptr(),
+                        staging,
+                        byte_count,
+                    );
+                }
+                crate::cuda::inner::memcpy_htod(
+                    tensor.data,
+                    staging as *const std::ffi::c_void,
                     byte_count,
                 );
+                unsafe { crate::memory::checked_free(staging, byte_count); }
             }
-        }
+            #[cfg(not(feature = "cuda"))]
+            {
+                eprintln!("nsl: model_load: tensor {} is on GPU but CUDA not compiled", i);
+                std::process::abort();
+            }
+        } else {
+            #[cfg(target_endian = "little")]
+            {
+                // Fast path: bulk copy on little-endian hardware (x86, ARM, etc.)
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data[offset..].as_ptr(),
+                        tensor.data as *mut u8,
+                        byte_count,
+                    );
+                }
+            }
 
-        #[cfg(not(target_endian = "little"))]
-        {
-            let elem_size = tensor.element_size();
-            for j in 0..tensor.len as usize {
-                let start = offset + j * elem_size;
-                if tensor.dtype == 1 {
-                    let val = f32::from_le_bytes(
-                        data[start..start + 4]
-                            .try_into()
-                            .unwrap_or_else(|_| std::process::abort()),
-                    );
-                    unsafe { *tensor.data_f32().add(j) = val; }
-                } else {
-                    let val = f64::from_le_bytes(
-                        data[start..start + 8]
-                            .try_into()
-                            .unwrap_or_else(|_| std::process::abort()),
-                    );
-                    unsafe { *tensor.data_f64().add(j) = val; }
+            #[cfg(not(target_endian = "little"))]
+            {
+                let elem_size = tensor.element_size();
+                for j in 0..tensor.len as usize {
+                    let start = offset + j * elem_size;
+                    if tensor.dtype == 1 {
+                        let val = f32::from_le_bytes(
+                            data[start..start + 4]
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        );
+                        unsafe { *tensor.data_f32().add(j) = val; }
+                    } else {
+                        let val = f64::from_le_bytes(
+                            data[start..start + 8]
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        );
+                        unsafe { *tensor.data_f64().add(j) = val; }
+                    }
                 }
             }
         }
