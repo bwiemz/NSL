@@ -1138,15 +1138,19 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
         let result = nsl_tensor_zeros_on(shape_list, t.device as i64);
         crate::list::nsl_list_free(shape_list);
         let result_t = NslTensor::from_ptr(result);
-        let data = result_t.data_f32();
-        for i in 0..result_t.len as usize {
-            unsafe { *data.add(i) = 1.0f32; }
+        let len = result_t.len as usize;
+        let byte_size = len * std::mem::size_of::<f32>();
+        // Fill via CPU staging buffer then memcpy to device (can't write device ptr from CPU)
+        let staging = crate::memory::checked_alloc(byte_size) as *mut f32;
+        for i in 0..len {
+            unsafe { *staging.add(i) = 1.0f32; }
         }
-        crate::cuda::inner::prefetch_to_device(
+        crate::cuda::inner::memcpy_htod(
             result_t.data,
-            (result_t.len as usize) * std::mem::size_of::<f32>(),
-            (t.device - 1) as i32,
+            staging as *const std::ffi::c_void,
+            byte_size,
         );
+        unsafe { crate::memory::checked_free(staging as *mut u8, byte_size); }
         result
     }
     #[cfg(not(feature = "cuda"))]
@@ -1162,11 +1166,28 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     let list = NslList::from_ptr(grad_list_ptr);
     let num_grads = list.len as usize;
 
-    let mut sum_sq: f64 = 0.0;
+    // Collect grad pointers, transferring GPU tensors to CPU for computation
+    let mut cpu_grads: Vec<(i64, bool)> = Vec::with_capacity(num_grads); // (ptr, was_gpu)
     for g in 0..num_grads {
         let tensor_ptr = unsafe { *list.data.add(g) };
-        if tensor_ptr == 0 { continue; }
+        if tensor_ptr == 0 {
+            cpu_grads.push((0, false));
+            continue;
+        }
         let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            // Transfer to CPU for norm computation
+            let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
+            cpu_grads.push((cpu_ptr, true));
+        } else {
+            cpu_grads.push((tensor_ptr, false));
+        }
+    }
+
+    let mut sum_sq: f64 = 0.0;
+    for &(ptr, _) in &cpu_grads {
+        if ptr == 0 { continue; }
+        let tensor = NslTensor::from_ptr(ptr);
         if tensor.dtype == 1 {
             for i in 0..tensor.len as usize {
                 let val = unsafe { *tensor.data_f32().add(i) } as f64;
@@ -1182,25 +1203,56 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     let norm = sum_sq.sqrt();
 
     if norm <= max_norm {
+        // Free temporary CPU copies
+        for &(ptr, was_gpu) in &cpu_grads {
+            if was_gpu && ptr != 0 { nsl_tensor_free(ptr); }
+        }
         return;
     }
 
-    {
-        let scale = max_norm / (norm + 1e-6);
-        for g in 0..num_grads {
-            let tensor_ptr = unsafe { *list.data.add(g) };
-            let tensor = NslTensor::from_ptr(tensor_ptr);
-            if tensor.dtype == 1 {
-                let scale_f32 = scale as f32;
-                for i in 0..tensor.len as usize {
-                    unsafe { *tensor.data_f32().add(i) *= scale_f32; }
+    let scale = max_norm / (norm + 1e-8);
+
+    // Scale the original tensors (GPU or CPU)
+    for (g, &(cpu_ptr, was_gpu)) in cpu_grads.iter().enumerate() {
+        let tensor_ptr = unsafe { *list.data.add(g) };
+        if tensor_ptr == 0 || cpu_ptr == 0 { continue; }
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if was_gpu {
+            // Scale the CPU copy, then copy back to GPU
+            let cpu_t = NslTensor::from_ptr(cpu_ptr);
+            if cpu_t.dtype == 1 {
+                let s = scale as f32;
+                for i in 0..cpu_t.len as usize {
+                    unsafe { *cpu_t.data_f32().add(i) *= s; }
                 }
             } else {
-                for i in 0..tensor.len as usize {
-                    unsafe { *tensor.data_f64().add(i) *= scale; }
+                for i in 0..cpu_t.len as usize {
+                    unsafe { *cpu_t.data_f64().add(i) *= scale; }
                 }
             }
+            // Copy scaled data back to GPU
+            let byte_size = if cpu_t.dtype == 1 {
+                cpu_t.len as usize * std::mem::size_of::<f32>()
+            } else {
+                cpu_t.len as usize * std::mem::size_of::<f64>()
+            };
+            #[cfg(feature = "cuda")]
+            crate::cuda::inner::memcpy_htod(tensor.data, cpu_t.data, byte_size);
+        } else if tensor.dtype == 1 {
+            let scale_f32 = scale as f32;
+            for i in 0..tensor.len as usize {
+                unsafe { *tensor.data_f32().add(i) *= scale_f32; }
+            }
+        } else {
+            for i in 0..tensor.len as usize {
+                unsafe { *tensor.data_f64().add(i) *= scale; }
+            }
         }
+    }
+
+    // Free temporary CPU copies
+    for &(ptr, was_gpu) in &cpu_grads {
+        if was_gpu && ptr != 0 { nsl_tensor_free(ptr); }
     }
 }
 

@@ -2235,13 +2235,9 @@ impl Compiler<'_> {
         builder.seal_block(post_optimizer_block);
         state.current_block = Some(post_optimizer_block);
 
-        // 7h. Increment step count
-        let sc = builder.use_var(step_count_var);
-        let one_i64 = builder.ins().iconst(cl_types::I64, 1);
-        let sc_next = builder.ins().iadd(sc, one_i64);
-        builder.def_var(step_count_var, sc_next);
-
         // 7g2. Scheduler: update learning rate if scheduler is configured
+        // NOTE: step_count is incremented AFTER the scheduler call so that
+        // step 0 produces the step-0 learning rate (e.g. warmup starts correctly).
         if !scheduler_name.is_empty() {
             let sched_fn_name = match scheduler_name.to_lowercase().as_str() {
                 "constant_lr" | "constantlr" => "constant_lr",
@@ -2329,7 +2325,13 @@ impl Compiler<'_> {
             builder.def_var(lr_var, new_lr);
         }
 
-        // 7h. Callbacks: compile on_step body with step_count and loss bound
+        // 7h. Increment step count (after scheduler so step 0 uses the initial LR)
+        let sc = builder.use_var(step_count_var);
+        let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+        let sc_next = builder.ins().iadd(sc, one_i64);
+        builder.def_var(step_count_var, sc_next);
+
+        // 7i. Callbacks: compile on_step body with step_count and loss bound
         for cb in &callbacks {
             let cb_name = self.resolve_sym(cb.name).to_string();
             if cb_name == "on_step" {

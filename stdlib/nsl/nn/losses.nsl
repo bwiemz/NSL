@@ -8,18 +8,20 @@ fn l1_loss(pred: Tensor, target: Tensor) -> Tensor:
 fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     # Expects 2D logits [N, vocab] and 1D targets [N]
     # Caller must flatten 3D logits before calling.
-    # Clamp targets to valid range [0, vocab-1] — negative values like -100
-    # (ignore_index) are clamped to 0 and contribute a small noise term.
-    # For pretraining with seq_len=512+, ~1 boundary token per sequence
-    # is negligible (<0.2% of tokens). A proper ignore_index mask requires
-    # comparison ops not yet available in NSL stdlib.
+    # Padding tokens use ignore_index = -100. We use a clamp-based mask:
+    #   valid_mask = clamp(targets + 1, 0, 1)  →  -100 maps to 0, valid maps to 1
+    # This avoids needing comparison ops. safe_targets clamps negatives to 0
+    # so gather does not index out-of-bounds; the mask zeroes those losses out.
     let safe_targets = clamp(targets, 0.0, 49151.0)
     let max_val = reduce_max(logits, 1, 1)
     let shifted = logits - max_val
     let exp_sum = sum(exp(shifted), 1, 1)
     let log_probs = shifted - log(exp_sum)
     let nll = neg(gather(log_probs, 1, safe_targets))
-    return mean(nll)
+    let valid_mask = clamp(targets + 1.0, 0.0, 1.0)
+    let masked_nll = nll * valid_mask
+    let num_valid = sum(valid_mask) + 0.00000001
+    return sum(masked_nll) / num_valid
 
 fn bce_loss(pred: Tensor, target: Tensor) -> Tensor:
     let clamped = clamp(pred, 0.0000001, 0.9999999)

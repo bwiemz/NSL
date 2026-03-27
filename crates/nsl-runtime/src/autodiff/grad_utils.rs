@@ -135,7 +135,7 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
                     }
                 }
                 crate::cuda::inner::memcpy_htod(ptr, staging as *const c_void, data_size);
-                crate::memory::checked_free(staging, data_size);
+                unsafe { crate::memory::checked_free(staging, data_size); }
             }
             ptr
         }
@@ -425,20 +425,59 @@ pub(crate) fn scatter_gather_grad(
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
-    let out_strides: Vec<usize> = (0..input_shape.len())
+    let ndim = input_shape.len();
+    let out_strides: Vec<usize> = (0..ndim)
         .map(|i| unsafe { *out.strides.add(i) } as usize)
         .collect();
-    // For cross_entropy: input=[batch, classes], dim=1, indices=[batch]
-    // grad=[batch], output[b, indices[b]] += grad[b]
+
+    // General N-dimensional scatter-add for gather backward.
+    // For each element b in the batch (all dims except `dim`):
+    //   output[..., indices[b], ...] += grad[b]
+    // where `dim` is the axis along which gather selected elements.
     let batch = indices.len as usize;
+    let dim_usize = if dim < 0 { (ndim as i64 + dim as i64) as usize } else { dim as usize };
+
+    // Compute the shape of the indices tensor (all dims except `dim`)
+    let mut idx_shape: Vec<usize> = Vec::new();
+    for d in 0..ndim {
+        if d != dim_usize {
+            idx_shape.push(input_shape[d] as usize);
+        }
+    }
+
     for b in 0..batch {
         let idx = indices.read_index(b) as usize;
+
+        // Decompose flat index `b` into multi-index over non-dim axes
         let mut out_offset = 0usize;
-        if input_shape.len() == 2 && dim == 1 {
+        let mut remaining = b;
+
+        if ndim == 1 {
+            // 1D case: output[indices[b]] += grad[b]
+            out_offset = idx * out_strides[0];
+        } else if ndim == 2 && dim_usize == 1 {
+            // Common 2D case: output[b, indices[b]] += grad[b]
             out_offset = b * out_strides[0] + idx * out_strides[1];
-        } else if dim == 0 {
+        } else if ndim == 2 && dim_usize == 0 {
             out_offset = idx * out_strides[0] + b * out_strides[1];
+        } else {
+            // General N-dim: decompose `b` into coordinates for non-dim axes
+            let mut coords = vec![0usize; ndim];
+            coords[dim_usize] = idx;
+            let mut flat = remaining;
+            for d in (0..ndim).rev() {
+                if d == dim_usize { continue; }
+                let dim_size = input_shape[d] as usize;
+                if dim_size > 0 {
+                    coords[d] = flat % dim_size;
+                    flat /= dim_size;
+                }
+            }
+            for d in 0..ndim {
+                out_offset += coords[d] * out_strides[d];
+            }
         }
+
         if grad_dtype == 1 {
             let g_val = unsafe { *grad.data_f32().add(b) };
             unsafe { *out.data_f32().add(out_offset) += g_val };

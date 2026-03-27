@@ -151,6 +151,24 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
     let padding = (64 - (total_header % 64)) % 64;
     let data_start = total_header + padding;
 
+    // Count saved params by counting "name": occurrences in the JSON header.
+    // This is a lightweight check that avoids pulling in a full JSON parser.
+    {
+        let header_bytes = &data[16..16 + header_size];
+        let needle = b"\"name\":";
+        let saved_param_count = header_bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        if saved_param_count != tensors.len as usize {
+            eprintln!(
+                "[nsl] WARNING: checkpoint has {} params but model expects {} params; \
+                 weights may be mismatched",
+                saved_param_count, tensors.len
+            );
+        }
+    }
+
     let mut offset = data_start;
     for i in 0..tensors.len as usize {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
