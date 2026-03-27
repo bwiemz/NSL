@@ -435,22 +435,14 @@ pub(crate) fn scatter_gather_grad(
     //   output[..., indices[b], ...] += grad[b]
     // where `dim` is the axis along which gather selected elements.
     let batch = indices.len as usize;
-    let dim_usize = if dim < 0 { (ndim as i64 + dim as i64) as usize } else { dim as usize };
-
-    // Compute the shape of the indices tensor (all dims except `dim`)
-    let mut idx_shape: Vec<usize> = Vec::new();
-    for d in 0..ndim {
-        if d != dim_usize {
-            idx_shape.push(input_shape[d] as usize);
-        }
-    }
+    let dim_usize = dim; // already usize; caller handles negative dim normalization
 
     for b in 0..batch {
         let idx = indices.read_index(b) as usize;
 
         // Decompose flat index `b` into multi-index over non-dim axes
         let mut out_offset = 0usize;
-        let mut remaining = b;
+        let remaining = b;
 
         if ndim == 1 {
             // 1D case: output[indices[b]] += grad[b]
