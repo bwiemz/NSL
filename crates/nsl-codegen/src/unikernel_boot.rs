@@ -222,7 +222,7 @@ impl BootStub {
 
     fn emit_gdt64(&mut self) {
         // Align to 16 bytes
-        while self.code.len() % 16 != 0 {
+        while !self.code.len().is_multiple_of(16) {
             self.emit_u8(0);
         }
 
@@ -256,7 +256,7 @@ impl BootStub {
 
     fn emit_page_tables(&mut self) {
         // Align to 4KB page boundary
-        while self.code.len() % 4096 != 0 {
+        while !self.code.len().is_multiple_of(4096) {
             self.emit_u8(0);
         }
 
@@ -301,7 +301,7 @@ impl BootStub {
 
     fn emit_entry_64(&mut self) {
         // Align to 16 bytes
-        while self.code.len() % 16 != 0 {
+        while !self.code.len().is_multiple_of(16) {
             self.emit_u8(0);
         }
 

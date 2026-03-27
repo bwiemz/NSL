@@ -78,6 +78,7 @@ pub fn elementwise_binary_cost(
 ///   3. exp (1 transcendental)
 ///   4. sum reduction (1 add)
 ///   5. divide by sum (1 div)
+///
 ///   6-7. log-sum-exp stability: 2 extra ops for safe max tracking
 pub fn softmax_cost(b: u64, s: u64, dtype_bytes: u64) -> (u64, u64, u64) {
     let flops = 7 * b * s;

@@ -160,6 +160,7 @@ pub fn compile(
 ///
 /// Returns `(object_bytes, zk_proof_fns)` where `zk_proof_fns` maps mangled
 /// function names to their [`crate::zk::backend::ZkMode`].
+#[allow(clippy::type_complexity, clippy::field_reassign_with_default)]
 pub fn compile_with_zk_info(
     ast: &nsl_ast::Module,
     interner: &Interner,
@@ -290,7 +291,7 @@ pub fn compile_with_zk_info(
                 }
                 cfg
             };
-            match crate::zk::compile_zk(fn_def, mode.clone(), &zk_config, type_map, interner) {
+            match crate::zk::compile_zk(fn_def, *mode, &zk_config, type_map, interner) {
                 Ok(result) => {
                     eprintln!(
                         "[nsl] M55: compiled ZK circuit for '{}' — {} constraints, proof ~{} KB",

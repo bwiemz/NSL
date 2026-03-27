@@ -372,7 +372,7 @@ impl<'a> ZkDagBuilder<'a> {
                 }
             }
 
-            ExprKind::MemberAccess { object, member } => {
+            ExprKind::MemberAccess { object: _, member } => {
                 // self.weight → emit Weight op
                 let field_name = self.resolve_sym(*member).to_string();
                 let shape = self.extract_shape(expr.id);
@@ -406,7 +406,7 @@ impl<'a> ZkDagBuilder<'a> {
             _ => {
                 // Unsupported expression — return error with context
                 Err(backend::ZkError::CompilationError(
-                    format!("ZK: unsupported expression kind in @zk_proof function")
+                    "ZK: unsupported expression kind in @zk_proof function".to_string()
                 ))
             }
         }

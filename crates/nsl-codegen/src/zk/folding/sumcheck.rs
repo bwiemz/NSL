@@ -207,7 +207,7 @@ pub fn sumcheck_verify<F: Field>(
 /// using a simple hash-based Fiat-Shamir transform.
 pub fn sumcheck_prove_interactive<F: Field>(
     polynomial: &[F],
-    claim: &F,
+    _claim: &F,
 ) -> SumcheckProof<F> {
     let n = polynomial.len();
     if n == 0 {

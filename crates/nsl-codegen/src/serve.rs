@@ -149,7 +149,7 @@ impl Compiler<'_> {
             "nvlink" => 1,
             "rdma" => 2,
             "tcp" => 3,
-            "auto" | _ => -1, // auto-detect at runtime
+            _ => -1, // auto-detect at runtime (includes "auto")
         };
 
         // Step 1: Get role from env var via FFI (returns 0=router, 1=prefill, 2=decode)

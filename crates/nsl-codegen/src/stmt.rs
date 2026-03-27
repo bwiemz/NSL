@@ -298,7 +298,7 @@ impl Compiler<'_> {
                             return Err(CodegenError::new("tuple/list destructuring requires a value"));
                         };
 
-                        self.compile_destructure_patterns(builder, state, &sub_patterns, tuple_val)?;
+                        self.compile_destructure_patterns(builder, state, sub_patterns, tuple_val)?;
                     }
                     PatternKind::Struct { fields, .. } => {
                         // Top-level struct destructuring: let { x, y } = expr

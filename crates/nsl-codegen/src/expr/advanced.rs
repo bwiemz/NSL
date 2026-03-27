@@ -1043,7 +1043,7 @@ impl Compiler<'_> {
         };
 
         if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve) {
-            if ops.len() >= 2 && inputs.len() >= 1 && inputs.len() <= 2 {
+            if ops.len() >= 2 && !inputs.is_empty() && inputs.len() <= 2 {
                 // Convert op names to runtime op codes
                 let op_codes: Vec<i64> = ops.iter().filter_map(|op| match op.as_str() {
                     "add" => Some(0), // FUSED_OP_ADD
@@ -1279,6 +1279,7 @@ impl Compiler<'_> {
 
     /// Compile a binary op where at least one operand is a sparse tensor.
     /// Dispatches to sparse-specific runtime functions.
+    #[allow(clippy::too_many_arguments)]
     fn compile_sparse_binary_op(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1659,7 +1660,7 @@ impl Compiler<'_> {
         // Check RHS weight for sparsity
         if let Some(key) = state.weight_values.get(&rhs) {
             if let Some(entry) = wmap.get(key) {
-                let hint = if let Some(ref info) = entry.sparsity() {
+                let hint = if let Some(info) = entry.sparsity() {
                     if info.use_sparse_kernel {
                         if let Some(ref csr) = info.csr {
                             eprintln!(
@@ -1691,7 +1692,7 @@ impl Compiler<'_> {
         // Check LHS weight for sparsity
         if let Some(key) = state.weight_values.get(&lhs) {
             if let Some(entry) = wmap.get(key) {
-                let hint = if let Some(ref info) = entry.sparsity() {
+                let hint = if let Some(info) = entry.sparsity() {
                     if info.use_sparse_kernel {
                         if let Some(ref csr) = info.csr {
                             eprintln!(

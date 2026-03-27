@@ -426,7 +426,7 @@ pub enum TensorExpr {
 /// the optimal iteration structure.
 pub fn build_iteration_graph_from_expr(expr: &TensorExpr) -> IterationGraph {
     match expr {
-        TensorExpr::Matmul { left, right, .. } => {
+        TensorExpr::Matmul { left, right: _, .. } => {
             // C[i,j] = A[i,k] * B[k,j]
             // Outer loop: iterate A's row dimension (level 0)
             // Inner loop: iterate A's column dimension (level 1), merge with B's row dimension

@@ -250,7 +250,7 @@ fn merkle_path(tree: &[[u8; 32]], n: usize, leaf_index: usize) -> Vec<[u8; 32]> 
     let mut level_len = n;
 
     while level_len > 1 {
-        let sibling = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
         path.push(tree[level_start + sibling]);
         idx /= 2;
         level_start += level_len;
@@ -264,7 +264,7 @@ fn merkle_verify(root: &[u8; 32], leaf_hash: &[u8; 32], index: usize, path: &[[u
     let mut current = *leaf_hash;
     let mut idx = index;
     for sibling in path {
-        current = if idx % 2 == 0 {
+        current = if idx.is_multiple_of(2) {
             sha256_hash_pair(&current, sibling)
         } else {
             sha256_hash_pair(sibling, &current)
@@ -299,6 +299,7 @@ fn poly_eval(coeffs: &[Mersenne31Field], x: &Mersenne31Field) -> Mersenne31Field
 ///
 /// This is O(n^2) — acceptable for the trace sizes we handle (hundreds to
 /// low thousands of rows). A production implementation would use NTT.
+#[allow(clippy::needless_range_loop)]
 fn interpolate(domain: &[Mersenne31Field], evals: &[Mersenne31Field]) -> Vec<Mersenne31Field> {
     let n = domain.len();
     assert_eq!(n, evals.len());
@@ -408,7 +409,7 @@ fn multiplicative_subgroup(n: usize) -> Vec<Mersenne31Field> {
 /// Split a polynomial into even and odd parts: f(x) = f_even(x^2) + x * f_odd(x^2)
 fn split_even_odd(coeffs: &[Mersenne31Field]) -> (Vec<Mersenne31Field>, Vec<Mersenne31Field>) {
     let n = coeffs.len();
-    let half = (n + 1) / 2;
+    let half = n.div_ceil(2);
     let mut even = Vec::with_capacity(half);
     let mut odd = Vec::with_capacity(half);
     for (i, c) in coeffs.iter().enumerate() {
