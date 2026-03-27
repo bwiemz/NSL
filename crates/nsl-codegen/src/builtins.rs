@@ -458,10 +458,6 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_gptq_hessian_init", &[types::I64], Some(types::I64)),
     ("nsl_gptq_hessian_add_batch", &[types::I64], Some(types::I64)),
     ("nsl_gptq_hessian_finalize", &[], Some(types::I64)),
-    // --- M36: Memory planning slab ---
-    ("nsl_slab_alloc", &[types::I64], Some(types::I64)),
-    ("nsl_slab_free", &[types::I64, types::I64], None),
-    ("nsl_slab_offset", &[types::I64, types::I64], Some(types::I64)),
     // --- M42: KV-cache compression ---
     ("nsl_kv_quantize_and_store", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_kv_sliding_window_init", &[types::I64, types::I64, types::I64], Some(types::I64)),

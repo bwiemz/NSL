@@ -274,9 +274,9 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         let out_cpu = nsl_tensor_to_device(out_ptr, 0);
         let result_cpu = softmax_backward(grad_cpu, out_cpu, dim);
         let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(out_cpu);
-        nsl_tensor_free(result_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(out_cpu);
+        tensor_free(result_cpu);
         return result_gpu;
     }
 
@@ -350,8 +350,8 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
         let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
         let result_cpu = slice_backward(grad_cpu, input_shape, dim, start);
         let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(result_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(result_cpu);
         return result_gpu;
     }
 
@@ -404,10 +404,10 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
         let cpu_results = cat_backward(grad_cpu, dim, split_sizes);
         let gpu_results: Vec<i64> = cpu_results.iter().map(|&r| {
             let gpu_r = nsl_tensor_to_device(r, device as i64);
-            nsl_tensor_free(r);
+            tensor_free(r);
             gpu_r
         }).collect();
-        nsl_tensor_free(grad_cpu);
+        tensor_free(grad_cpu);
         return gpu_results;
     }
 
@@ -487,14 +487,14 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
         let dx_gpu = nsl_tensor_to_device(dx_cpu, out_device as i64);
         let dw_gpu = nsl_tensor_to_device(dw_cpu, out_device as i64);
         let db_gpu = nsl_tensor_to_device(db_cpu, out_device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(input_cpu);
-        nsl_tensor_free(mean_cpu);
-        nsl_tensor_free(inv_std_cpu);
-        nsl_tensor_free(weight_cpu);
-        nsl_tensor_free(dx_cpu);
-        nsl_tensor_free(dw_cpu);
-        nsl_tensor_free(db_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(input_cpu);
+        tensor_free(mean_cpu);
+        tensor_free(inv_std_cpu);
+        tensor_free(weight_cpu);
+        tensor_free(dx_cpu);
+        tensor_free(dw_cpu);
+        tensor_free(db_cpu);
         return (dx_gpu, dw_gpu, db_gpu);
     }
 
@@ -597,12 +597,12 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
         let (dx_cpu, dw_cpu) = rmsnorm_backward(grad_cpu, input_cpu, rms_cpu, weight_cpu);
         let dx_gpu = nsl_tensor_to_device(dx_cpu, out_device as i64);
         let dw_gpu = nsl_tensor_to_device(dw_cpu, out_device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(input_cpu);
-        nsl_tensor_free(rms_cpu);
-        nsl_tensor_free(weight_cpu);
-        nsl_tensor_free(dx_cpu);
-        nsl_tensor_free(dw_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(input_cpu);
+        tensor_free(rms_cpu);
+        tensor_free(weight_cpu);
+        tensor_free(dx_cpu);
+        tensor_free(dw_cpu);
         return (dx_gpu, dw_gpu);
     }
 
@@ -661,7 +661,9 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
             let w = read_weight(j);
             let x = read_input(base + j);
 
-            let d_x = w * (g / rms_val - x * sum_dout_x / (nf * rms_cubed));
+            // RMSNorm: y_j = w_j * x_j / rms
+            // dx_j = w_j * g_j / rms - x_j * Σ(g_k * w_k * x_k) / (N * rms³)
+            let d_x = w * g / rms_val - x * sum_dout_x / (nf * rms_cubed);
             write_dx(base + j, d_x);
             write_dw(j, g * (x / rms_val));
         }
@@ -682,9 +684,9 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
         let mask_cpu = nsl_tensor_to_device(mask_ptr, 0);
         let result_cpu = dropout_backward(grad_cpu, mask_cpu, scale);
         let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(mask_cpu);
-        nsl_tensor_free(result_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(mask_cpu);
+        tensor_free(result_cpu);
         return result_gpu;
     }
 
@@ -749,12 +751,12 @@ fn conv2d_backward(
         let dx_gpu = nsl_tensor_to_device(dx_cpu, device as i64);
         let dw_gpu = nsl_tensor_to_device(dw_cpu, device as i64);
         let db_gpu = nsl_tensor_to_device(db_cpu, device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(input_cpu);
-        nsl_tensor_free(weight_cpu);
-        nsl_tensor_free(dx_cpu);
-        nsl_tensor_free(dw_cpu);
-        nsl_tensor_free(db_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(input_cpu);
+        tensor_free(weight_cpu);
+        tensor_free(dx_cpu);
+        tensor_free(dw_cpu);
+        tensor_free(db_cpu);
         return (dx_gpu, dw_gpu, db_gpu);
     }
 
@@ -855,8 +857,8 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
         let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
         let result_cpu = maxpool2d_backward(grad_cpu, input_shape, argmax);
         let result_gpu = nsl_tensor_to_device(result_cpu, grad.device as i64);
-        nsl_tensor_free(grad_cpu);
-        nsl_tensor_free(result_cpu);
+        tensor_free(grad_cpu);
+        tensor_free(result_cpu);
         return result_gpu;
     }
 
@@ -973,7 +975,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let neg_g = tensor_neg(g_clone2);
                     tensor_free(g_clone2);
                     let neg_ga = tensor_mul(neg_g, *saved_a);
-                    let b_sq = tensor_mul(*saved_b, *saved_b);
+                    // Clone one operand to avoid aliasing: tensor_mul(b, b)
+                    // with FBIP would mutate b in-place while reading it,
+                    // causing a data race on GPU.
+                    let b_clone = tensor_clone(*saved_b);
+                    let b_sq = tensor_mul(b_clone, *saved_b);
                     // Eagerly free saved tensors after last use
                     tensor_free(*saved_a);
                     tensor_free(*saved_b);

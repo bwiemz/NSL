@@ -236,6 +236,7 @@ pub extern "C" fn nsl_awq_quantize(
     group_size: i64,
     _calibration_ptr: i64,
 ) -> i64 {
+    if weight_ptr == 0 { eprintln!("nsl_awq_quantize: null weight tensor"); return 0; }
     let t = unsafe { &*(weight_ptr as *const NslTensor) };
     assert!(t.ndim >= 2, "nsl_awq_quantize requires 2D weight tensor (got {}D)", t.ndim);
     let len = t.len as usize;
@@ -262,6 +263,7 @@ pub extern "C" fn nsl_awq_matmul(
     packed_ptr: i64,
     _group_size: i64,
 ) -> i64 {
+    if input_ptr == 0 || packed_ptr == 0 { eprintln!("nsl_awq_matmul: null pointer"); return 0; }
     let input_t = unsafe { &*(input_ptr as *const NslTensor) };
     let packed = unsafe { &*(packed_ptr as *const AwqPackedWeight) };
 

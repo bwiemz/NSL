@@ -115,7 +115,10 @@ pub fn select_longest_accepted_path(tree: &SpeculativeTree) -> Vec<i64> {
         best_path
     }
 
-    if !tree.nodes[0].accepted {
+    // Root node (index 0) is a sentinel with token_id=-1.
+    // Always traverse from root regardless of its accepted flag —
+    // the root is not a real token, only its children carry tokens.
+    if tree.nodes.is_empty() {
         return vec![];
     }
     dfs_longest(tree, 0)

@@ -846,13 +846,11 @@ impl KvTransferBackend for NvlinkBackend {
 
         #[cfg(feature = "cuda")]
         {
-            if self.cuda_ipc_available && !k_data.is_null() && !v_data.is_null() && kv_bytes_each > 0 {
-                // GPU-direct path: export IPC handles
-                k_handle = Self::export_ipc_handle(k_data).unwrap_or([0u8; 64]);
-                v_handle = Self::export_ipc_handle(v_data).unwrap_or([0u8; 64]);
-                k_cpu = Vec::new();
-                v_cpu = Vec::new();
-            } else {
+            // NOTE: CUDA IPC (cuIpcGetMemHandle) requires the exact base pointer
+            // returned by cuMemAlloc. KV block pointers are interior offsets into
+            // a pool allocation, so IPC export will fail. Always use the staged
+            // CPU copy path until the pool allocator exports base+offset pairs.
+            {
                 // Staged path: copy GPU→CPU then transfer via shared memory
                 k_handle = [0u8; 64];
                 v_handle = [0u8; 64];
@@ -1127,9 +1125,11 @@ static NEXT_MR_KEY: AtomicU32 = AtomicU32::new(1);
 
 impl RdmaBackend {
     pub fn new(rank: i32, base_port: u16) -> Self {
-        let rdma_available = Self::probe_rdma();
-        if rdma_available {
-            eprintln!("[nsl-rdma] RDMA NIC detected, using zero-copy transfer");
+        // RDMA hardware may be detected but ibverbs is not yet wired —
+        // always fall back to TCP until real ibv_reg_mr/ibv_post_send is implemented.
+        let rdma_available = false;
+        if Self::probe_rdma() {
+            eprintln!("[nsl-rdma] RDMA NIC detected but ibverbs not yet wired — using TCP fallback");
         } else {
             eprintln!("[nsl-rdma] No RDMA NIC detected, falling back to TCP");
         }

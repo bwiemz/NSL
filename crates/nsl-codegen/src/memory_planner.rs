@@ -124,6 +124,18 @@ impl LivenessAnalyzer {
         self.current_pp
     }
 
+    /// Extend the death of any tensor whose birth < loop_entry to at least loop_exit.
+    /// This prevents the slab planner from reusing slots for tensors that are
+    /// live across loop iterations (conservative: any tensor alive before the loop
+    /// must survive the full loop body).
+    pub fn extend_loop_live(&mut self, loop_entry: ProgramPoint, loop_exit: ProgramPoint) {
+        for alloc in &mut self.allocs {
+            if alloc.birth < loop_entry && alloc.death >= loop_entry && alloc.death < loop_exit {
+                alloc.death = loop_exit;
+            }
+        }
+    }
+
     /// Consume the analyzer and return all discovered allocations.
     pub fn finish(self) -> Vec<TensorAlloc> {
         self.allocs
@@ -684,12 +696,20 @@ fn walk_stmt(
 
         StmtKind::For { body, iterable, .. } => {
             walk_expr_uses(iterable, interner, analyzer, name_to_id);
+            let loop_entry = analyzer.current_pp();
             walk_stmts(&body.stmts, type_map, interner, analyzer, name_to_id);
+            let loop_exit = analyzer.current_pp();
+            // Extend death of any tensor live at loop entry to loop exit
+            // (conservative: loop-carried values must survive the full loop)
+            analyzer.extend_loop_live(loop_entry, loop_exit);
         }
 
         StmtKind::While { condition, body } => {
             walk_expr_uses(condition, interner, analyzer, name_to_id);
+            let loop_entry = analyzer.current_pp();
             walk_stmts(&body.stmts, type_map, interner, analyzer, name_to_id);
+            let loop_exit = analyzer.current_pp();
+            analyzer.extend_loop_live(loop_entry, loop_exit);
         }
 
         _ => {} // FnDef, ModelDef, etc. handled separately

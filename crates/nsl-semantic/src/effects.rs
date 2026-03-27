@@ -113,10 +113,12 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
         | "nsl_tensor_softmax" | "nsl_tensor_gather"
         => EffectSet::PURE,
 
-        // Unknown/unclassified: conservatively assume ALL effects.
-        // This is the safe default — an unrecognized builtin in a @pure
-        // function will cause a compile error, forcing explicit classification.
-        _ => EffectSet::IO | EffectSet::RANDOM | EffectSet::MUTATION | EffectSet::COMMUNICATION,
+        // Unknown/unclassified: conservatively assume MUTATION only.
+        // Most unrecognized builtins are tensor ops that mutate state but
+        // don't perform IO, randomness, or communication. Using all 4 effects
+        // caused false positives for @pure functions calling user-defined
+        // functions not yet in the known list.
+        _ => EffectSet::MUTATION,
     }
 }
 
@@ -361,12 +363,14 @@ mod tests {
 
     #[test]
     fn classify_unknown_is_conservative() {
-        // Unknown builtins conservatively assumed to have all effects
-        let all = classify_builtin_effects("some_unknown_function");
-        assert!(all.contains(EffectSet::IO));
-        assert!(all.contains(EffectSet::RANDOM));
-        assert!(all.contains(EffectSet::MUTATION));
-        assert!(all.contains(EffectSet::COMMUNICATION));
+        // Unknown builtins conservatively assumed to have MUTATION effect.
+        // We don't assume IO/RANDOM/COMMUNICATION because most unrecognized
+        // builtins are tensor ops, and over-approximating with all 4 effects
+        // causes false @pure violations for user-defined functions.
+        let effects = classify_builtin_effects("some_unknown_function");
+        assert!(effects.contains(EffectSet::MUTATION));
+        assert!(!effects.contains(EffectSet::IO));
+        assert!(!effects.contains(EffectSet::RANDOM));
     }
 
     // --- EffectChecker tests ---

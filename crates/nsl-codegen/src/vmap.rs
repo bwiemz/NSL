@@ -525,9 +525,14 @@ impl<'a> VmapTransformer<'a> {
 
                 if is_dim_arg {
                     if let ExprKind::IntLiteral(d) = &arg.value.kind {
-                        // NOTE: original_ndim=2 is hardcoded. Only affects negative dim
-                        // conversion. For positive dims this param is unused. Proper ndim
-                        // propagation via type system deferred to M39c.
+                        // For negative dims, we need the original tensor rank to
+                        // convert correctly. Since type info is not available at
+                        // the AST transform stage, skip shifting negative dims
+                        // entirely — they already refer to the correct axis
+                        // relative to the tensor's own rank.
+                        if *d < 0 {
+                            break; // negative dims are relative, no shift needed
+                        }
                         let shifted = shift_dim(*d, self.config.batch_dim, 2);
                         arg.value.kind = ExprKind::IntLiteral(shifted);
                     }

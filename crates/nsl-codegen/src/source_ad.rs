@@ -390,7 +390,15 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::ConvTranspose2d { stride, padding }, vec![y_bar, weight])
             }
             AdjointExpr::ConvTransposeWeight(input, y_bar) => {
-                self.emit_op(PrimalOp::Matmul, vec![input, y_bar])
+                // Conv weight gradient requires im2col + matmul (cross-correlation),
+                // not a plain matmul on 4D tensors. The tape-based backward in
+                // backward.rs implements the correct nested loop. For source-AD,
+                // we transpose the input and compute the correlation via matmul
+                // on the flattened spatial dimensions.
+                // TODO(M40c): implement proper im2col + matmul for 4D conv grad.
+                // For now, transpose input and matmul (correct for 2D FC-like convs).
+                let input_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![input]);
+                self.emit_op(PrimalOp::Matmul, vec![input_t, y_bar])
             }
             AdjointExpr::MaxPoolBackward(y_bar, indices) => {
                 // MaxPool backward: scatter grad to argmax positions
@@ -404,13 +412,13 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![repeated, scale])
             }
 
-            // --- CrossEntropy backward: softmax(logits) - one_hot(targets) ---
-            AdjointExpr::CrossEntropyBackward(logits, targets) => {
+            // --- CrossEntropy backward: y_bar * (softmax(logits) - one_hot(targets)) ---
+            // The first field is the upstream gradient (y_bar), which must be
+            // multiplied in for chain rule correctness.
+            AdjointExpr::CrossEntropyBackward(y_bar, logits, targets) => {
                 let softmax_out = self.emit_op(PrimalOp::Softmax { dim: -1 }, vec![logits]);
-                // one_hot is approximated by Gather from identity matrix; for the
-                // combined cross-entropy-softmax backward, the runtime FFI handles
-                // the subtraction directly. Emit as Sub(softmax, targets_one_hot).
-                self.emit_op(PrimalOp::Sub, vec![softmax_out, targets])
+                let diff = self.emit_op(PrimalOp::Sub, vec![softmax_out, targets]);
+                self.emit_op(PrimalOp::Mul, vec![y_bar, diff])
             }
 
             // --- MSE backward for reduction='sum': d/d(pred) = 2*(pred - target) * grad_output ---

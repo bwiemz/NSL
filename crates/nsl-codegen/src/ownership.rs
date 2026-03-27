@@ -1,8 +1,11 @@
 //! M38b: Ownership-aware codegen — tracks linear/shared bindings for
 //! consumption-point free emission and refcount elision.
 //!
-//! NOTE: The compiler reference (`&mut Compiler`) will be added when actual
-//! Cranelift IR emission is wired in a follow-up. Currently infrastructure-only.
+//! **STATUS: INFRASTRUCTURE ONLY** — `OwnershipLowering::decide()` returns
+//! correct `OwnershipDecision` values, but no code in the compiler calls it.
+//! All tensors remain refcount-managed via the runtime's `nsl_tensor_free`.
+//! The optimization has zero runtime effect until wired into `stmt.rs`/`func.rs`.
+//! Tracked for M38c.
 
 use std::collections::{HashMap, HashSet};
 use nsl_ast::Symbol;

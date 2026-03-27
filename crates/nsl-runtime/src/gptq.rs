@@ -248,23 +248,18 @@ pub fn gptq_quantize_obq(
     let h_inv = hessian_inverse_from_cholesky(&h, k);
 
     // Step 2: Determine column order
+    // Act-order: quantize columns with largest *original* Hessian diagonal first.
+    // H[i,i] measures how much input feature i is activated — larger = more important.
+    // We must capture the diagonal BEFORE Cholesky overwrites `hessian`.
     let col_order: Vec<usize> = if config.act_order {
-        // Act-order: quantize columns with largest Hessian diagonal first
-        // (these are the most "important" / most activated columns)
         let mut order: Vec<usize> = (0..k).collect();
         order.sort_by(|&a, &b| {
-            h_inv[b * k + b].partial_cmp(&h_inv[a * k + a]).unwrap_or(std::cmp::Ordering::Equal)
+            hessian[b * k + b].partial_cmp(&hessian[a * k + a]).unwrap_or(std::cmp::Ordering::Equal)
         });
         order
     } else {
         (0..k).collect()
     };
-
-    // Inverse permutation: perm_inv[col_order[i]] = i
-    let mut perm_inv = vec![0usize; k];
-    for (new_pos, &orig_col) in col_order.iter().enumerate() {
-        perm_inv[orig_col] = new_pos;
-    }
 
     // Step 3: Make a mutable copy of weights for error compensation
     // We work in the permuted order for act-order, but store results in original order
@@ -353,8 +348,11 @@ pub fn gptq_quantize_obq(
                         col * n + row,
                     );
                     let q_val = (q as f64) * scale + zero;
-                    let original_w = weights[col * n + row]; // use original weight for cross-block error
-                    let error = (original_w - q_val) / h_inv[col * k + col].max(1e-15);
+                    // Use the weight value as it was when this column was quantized
+                    // (already includes within-block error compensation from earlier columns).
+                    // Using `weights[...]` (original) would double-count within-block corrections.
+                    let w_at_quant = w[col * n + row];
+                    let error = (w_at_quant - q_val) / h_inv[col * k + col].max(1e-15);
 
                     for jdx in block_end..k {
                         let j = col_order[jdx];
@@ -549,6 +547,7 @@ pub extern "C" fn nsl_gptq_quantize(
     group_size: i64,
     bits: i64,
 ) -> i64 {
+    if weight_ptr == 0 { eprintln!("nsl_gptq_quantize: null weight tensor"); return 0; }
     let t = unsafe { &*(weight_ptr as *const NslTensor) };
     assert!(t.ndim >= 2, "nsl_gptq_quantize requires 2D weight tensor (got {}D)", t.ndim);
     let len = t.len as usize;

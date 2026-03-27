@@ -1,8 +1,22 @@
 //! Folding-based ZK proof backend (Nova/HyperNova-style).
 //!
-//! Processes the model layer-by-layer, folding each layer's AIR constraints
-//! into a running accumulator. This produces constant-size proofs regardless
-//! of model depth — critical for scaling to 7B+ parameter models.
+//! **SOUNDNESS WARNING**: This module is a structural prototype. The proofs it
+//! generates are NOT cryptographically sound due to three known limitations:
+//!
+//! 1. **Fiat-Shamir transcript** uses a trivially invertible linear hash
+//!    (`sum_0 * 7 + sum_1 * 13 + round + 1`) instead of a collision-resistant
+//!    hash (Poseidon/SHA-256). A malicious prover can forge challenges.
+//!
+//! 2. **Folding cross-term** approximates the R1CS cross-term as
+//!    `dot(instance, new_instance)` instead of the actual constraint polynomial
+//!    product `sum(A_i * z * new_z_i)`. The accumulated error term is meaningless.
+//!
+//! 3. **Sumcheck prover** (`sumcheck_prove`) binds all variables to 0,
+//!    producing a `final_eval` that doesn't match the claimed sum.
+//!    Only `sumcheck_prove_interactive` (used by `finalize()`) is correct.
+//!
+//! These limitations are tracked for M55c (crypto hash integration). Do not
+//! rely on verification results for security-critical applications.
 //!
 //! Architecture:
 //!   1. Each layer becomes an AIR trace (from `lower.rs` per-layer emission)

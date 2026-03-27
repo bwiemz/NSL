@@ -88,11 +88,15 @@ fn link_gcc_multi(
         cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
     }
 
-    // Link CUDA driver library if available
+    // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
+        let cuda_lib_win = PathBuf::from(&cuda_path).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
+            cmd.arg("-lcuda");
+        } else if cuda_lib_win.is_dir() {
+            cmd.arg(format!("-L{}", cuda_lib_win.display()));
             cmd.arg("-lcuda");
         }
     }
@@ -307,11 +311,15 @@ fn link_shared_gcc(
         cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
     }
 
-    // Link CUDA driver library if available
+    // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
+        let cuda_lib_win = PathBuf::from(&cuda_path).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
+            cmd.arg("-lcuda");
+        } else if cuda_lib_win.is_dir() {
+            cmd.arg(format!("-L{}", cuda_lib_win.display()));
             cmd.arg("-lcuda");
         }
     }

@@ -130,8 +130,12 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
         let mut remaining = flat_in;
         let mut indices = vec![0usize; ndim];
         for dd in 0..ndim {
-            indices[dd] = remaining / in_strides[dd];
-            remaining %= in_strides[dd];
+            if in_strides[dd] == 0 {
+                indices[dd] = 0; // broadcast dimension (stride=0)
+            } else {
+                indices[dd] = remaining / in_strides[dd];
+                remaining %= in_strides[dd];
+            }
         }
 
         // Compute output flat index (skip or collapse the reduced dim)
@@ -405,8 +409,12 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
         let mut remaining = flat_in;
         let mut indices = vec![0usize; ndim];
         for dd in 0..ndim {
-            indices[dd] = remaining / in_strides[dd];
-            remaining %= in_strides[dd];
+            if in_strides[dd] == 0 {
+                indices[dd] = 0; // broadcast dimension (stride=0)
+            } else {
+                indices[dd] = remaining / in_strides[dd];
+                remaining %= in_strides[dd];
+            }
         }
 
         // Compute output flat index

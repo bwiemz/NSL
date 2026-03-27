@@ -4,6 +4,10 @@
 //! of univariate polynomial evaluations. This is used in the folding backend
 //! to efficiently verify that the accumulator constraints are satisfied.
 //!
+//! **NOTE**: `sumcheck_prove` (non-interactive) binds all variables to 0 and
+//! produces a meaningless `final_eval`. Use `sumcheck_prove_interactive` instead,
+//! which is the version called by `FoldingProver::finalize()`.
+//!
 //! The protocol runs in `num_variables` rounds:
 //!   1. Prover sends a univariate polynomial g_i(X) = sum_{rest} f(x_1,...,X,...,x_n)
 //!   2. Verifier checks g_i(0) + g_i(1) == claim

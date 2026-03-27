@@ -151,7 +151,7 @@ pub fn deserialize_message(buf: &[u8]) -> Option<RouterMessage> {
     let payload = &buf[4..];
 
     match tag {
-        0 if payload.len() >= 22 => {
+        0 if payload.len() >= 24 => {
             let request_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
             let token_ids_ptr = i64::from_le_bytes(payload[8..16].try_into().ok()?);
             let num_tokens = u32::from_le_bytes(payload[16..20].try_into().ok()?);

@@ -83,8 +83,8 @@ pub enum AdjointExpr {
     AvgPoolBackward(VarId, usize),
 
     // Loss backward
-    /// CrossEntropy backward: softmax(logits) - one_hot(target). args: (logits, targets)
-    CrossEntropyBackward(VarId, VarId),
+    /// CrossEntropy backward: y_bar * (softmax(logits) - one_hot(target)). args: (y_bar, logits, targets)
+    CrossEntropyBackward(VarId, VarId, VarId),
     /// MSE backward: 2*(pred - target)/n. args: (grad, pred, target)
     MSEBackward(VarId, VarId, VarId),
     /// L1 backward: sign(pred - target)/n. args: (grad, pred, target)
@@ -366,7 +366,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // --- Loss functions ---
         PrimalOp::CrossEntropyLoss => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::CrossEntropyBackward(op.inputs[0], op.inputs[1]),
+            expr: AdjointExpr::CrossEntropyBackward(output_bar, op.inputs[0], op.inputs[1]),
         }],
         PrimalOp::MSELoss => {
             let pred = op.inputs[0];
@@ -782,7 +782,7 @@ mod tests {
         let op = make_op(2, PrimalOp::CrossEntropyLoss, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::CrossEntropyBackward(0, 1)));
+        assert!(matches!(adj[0].expr, AdjointExpr::CrossEntropyBackward(100, 0, 1)));
         assert_eq!(saved_for_backward(&PrimalOp::CrossEntropyLoss), SavedRequirement::Inputs);
     }
 

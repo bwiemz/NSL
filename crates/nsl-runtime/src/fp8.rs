@@ -1,6 +1,5 @@
 //! M35: FP8 scale management, cast operations, and matmul FFI.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -24,24 +23,26 @@ pub const FP8_FORMAT_E5M2: i64 = 1;
 // Thread-local scale table
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// Per-tensor scale factors, keyed by tensor pointer (as i64).
-    static FP8_SCALES: RefCell<HashMap<i64, f32>> = RefCell::new(HashMap::new());
-}
+/// Global per-tensor scale factors, keyed by tensor pointer (as i64).
+/// Uses a Mutex-protected HashMap instead of thread_local to ensure scales
+/// set on one thread (e.g., a worker) are visible on another (e.g., main thread
+/// running backward pass).
+static FP8_SCALES: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, f32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Register scale for an FP8 tensor.
 pub fn set_fp8_scale(tensor_ptr: i64, scale: f32) {
-    FP8_SCALES.with(|s| s.borrow_mut().insert(tensor_ptr, scale));
+    FP8_SCALES.lock().unwrap().insert(tensor_ptr, scale);
 }
 
 /// Retrieve scale (returns 1.0 if unregistered — safe default).
 pub fn get_fp8_scale(tensor_ptr: i64) -> f32 {
-    FP8_SCALES.with(|s| *s.borrow().get(&tensor_ptr).unwrap_or(&1.0))
+    *FP8_SCALES.lock().unwrap().get(&tensor_ptr).unwrap_or(&1.0)
 }
 
 /// Remove scale entry (on tensor free).
 pub fn remove_fp8_scale(tensor_ptr: i64) {
-    FP8_SCALES.with(|s| s.borrow_mut().remove(&tensor_ptr));
+    FP8_SCALES.lock().unwrap().remove(&tensor_ptr);
 }
 
 // ---------------------------------------------------------------------------

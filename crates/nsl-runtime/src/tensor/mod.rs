@@ -116,7 +116,9 @@ pub extern "C" fn nsl_tensor_scope_end(keep: i64) {
             kept += 1;
         }
     }
-    eprintln!("[scope] tracked={total}, freed={freed}, kept={kept} (refcount>1)");
+    if std::env::var("NSL_SCOPE_TRACE").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("[scope] tracked={total}, freed={freed}, kept={kept} (refcount>1)");
+    }
 }
 
 // ---------------------------------------------------------------------------

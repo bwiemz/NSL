@@ -258,19 +258,26 @@ pub(crate) mod inner {
     }
 
     /// Try to get a cached allocation from the pool.
+    /// Lock ordering: MANAGED_POOL first, then POOL_SIZE_MAP (consistent with pool_try_return).
     fn pool_try_alloc(size_bytes: usize) -> Option<*mut c_void> {
         if size_bytes == 0 || size_bytes > POOL_MAX_ALLOC { return None; }
         let bsize = bucket_size(size_bytes);
-        let mut pool = MANAGED_POOL.lock().unwrap();
-        if let Some(deque) = pool.buckets.get_mut(&bsize) {
-            if let Some(ptr) = deque.pop_front() {
-                // Track for return-to-pool on free
-                POOL_SIZE_MAP.lock().unwrap().insert(ptr as usize, bsize);
-                register_cuda_alloc(ptr);
-                return Some(ptr);
+        let ptr = {
+            let mut pool = MANAGED_POOL.lock().unwrap();
+            if let Some(deque) = pool.buckets.get_mut(&bsize) {
+                deque.pop_front()
+            } else {
+                None
             }
+            // MANAGED_POOL lock dropped here before acquiring POOL_SIZE_MAP
+        };
+        if let Some(ptr) = ptr {
+            POOL_SIZE_MAP.lock().unwrap().insert(ptr as usize, bsize);
+            register_cuda_alloc(ptr);
+            Some(ptr)
+        } else {
+            None
         }
-        None
     }
 
     /// Return an allocation to the pool instead of calling cuMemFree.
@@ -340,7 +347,12 @@ pub(crate) mod inner {
     pub(crate) fn staging_alloc(size_bytes: usize) -> *mut c_void {
         if size_bytes == 0 { return std::ptr::null_mut(); }
         if size_bytes > PINNED_POOL_MAX_ALLOC {
-            return alloc_pinned(size_bytes);
+            // Large allocations: use regular heap memory instead of pinned.
+            // cuMemcpyHtoD/DtoH work with any host pointer; pinned memory
+            // only helps with concurrent stream overlap which we don't use.
+            // This avoids exhausting CUDA's pinned memory limit during training
+            // when transferring large tensors (e.g., logits [B, S, V]).
+            return crate::memory::checked_alloc(size_bytes) as *mut c_void;
         }
         let bsize = bucket_size(size_bytes);
         {
@@ -358,7 +370,8 @@ pub(crate) mod inner {
     pub(crate) fn staging_free(ptr: *mut c_void, size_bytes: usize) {
         if ptr.is_null() { return; }
         if size_bytes > PINNED_POOL_MAX_ALLOC {
-            free_pinned(ptr);
+            // Large allocations were heap-allocated, not pinned
+            unsafe { crate::memory::checked_free(ptr as *mut u8, size_bytes); }
             return;
         }
         let bsize = bucket_size(size_bytes);
@@ -378,36 +391,33 @@ pub(crate) mod inner {
     // pool to avoid device-wide synchronization on allocation.
     // ------------------------------------------------------------------
 
-    static ASYNC_ALLOC_ENABLED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    static ASYNC_ALLOC_CHECKED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static ASYNC_ALLOC_RESULT: OnceLock<bool> = OnceLock::new();
 
     /// Check if async allocation is enabled and supported.
+    /// Uses OnceLock to avoid TOCTOU race on initialization.
     fn async_alloc_enabled() -> bool {
-        if !ASYNC_ALLOC_CHECKED.load(std::sync::atomic::Ordering::Relaxed) {
+        *ASYNC_ALLOC_RESULT.get_or_init(|| {
             let env_enabled = std::env::var("NSL_ASYNC_ALLOC")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            if env_enabled {
-                // Probe: try to query the default memory pool
-                let s = state();
-                let guard = s.lock().unwrap();
-                let supported = unsafe {
-                    let mut pool: CUmemoryPool = std::ptr::null_mut();
-                    let r = cuDeviceGetDefaultMemPool(&mut pool, guard.device);
-                    r == CUresult::CUDA_SUCCESS && !pool.is_null()
-                };
-                if supported {
-                    ASYNC_ALLOC_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("[nsl] Async GPU allocation ENABLED (cuMemAllocAsync)");
-                } else {
-                    eprintln!("[nsl] NSL_ASYNC_ALLOC=1 but driver does not support memory pools — using sync alloc");
-                }
+            if !env_enabled {
+                return false;
             }
-            ASYNC_ALLOC_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        ASYNC_ALLOC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            // Probe: try to query the default memory pool
+            let s = state();
+            let guard = s.lock().unwrap();
+            let supported = unsafe {
+                let mut pool: CUmemoryPool = std::ptr::null_mut();
+                let r = cuDeviceGetDefaultMemPool(&mut pool, guard.device);
+                r == CUresult::CUDA_SUCCESS && !pool.is_null()
+            };
+            if supported {
+                eprintln!("[nsl] Async GPU allocation ENABLED (cuMemAllocAsync)");
+            } else {
+                eprintln!("[nsl] NSL_ASYNC_ALLOC=1 but driver does not support memory pools — using sync alloc");
+            }
+            supported
+        })
     }
 
     /// Track async-allocated pointers (freed via cuMemFreeAsync, not cuMemFree)
@@ -791,7 +801,13 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
         ptx.as_ptr(), kernel_name.as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
-    assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    if result as u32 != 0 {
+        // Free the allocated tensor+data to avoid leak on kernel failure
+        eprintln!("GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+        unsafe { let _ = Box::from_raw(out_ptr); }
+        inner::free_managed(out_data);
+        return 0;
+    }
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
     out_ptr as i64
 }
@@ -2800,21 +2816,21 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
     let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
     for i in 0..m + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
     inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
-    crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+    unsafe { crate::memory::checked_free(staging_rp as *mut u8, rp_bytes); }
 
     // col_indices: i64 → u32
     let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
     let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
     for i in 0..nnz { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
     inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
-    crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+    unsafe { crate::memory::checked_free(staging_ci as *mut u8, ci_bytes); }
 
     // values: f64 → f32
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
 
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
@@ -2885,7 +2901,7 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let src_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     for i in 0..nnz { unsafe { *staging.add(i) = src_vals[i] as f32; } }
     inner::memcpy_htod(gpu_v, staging as *const std::ffi::c_void, v_bytes);
-    crate::memory::checked_free(staging as *mut u8, v_bytes);
+    unsafe { crate::memory::checked_free(staging as *mut u8, v_bytes); }
 
     let mut ri_val = gpu_ri as u64;
     let mut ci_val = gpu_ci as u64;
@@ -2950,19 +2966,19 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
     for i in 0..m + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
     inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
-    crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+    unsafe { crate::memory::checked_free(staging_rp as *mut u8, rp_bytes); }
 
     let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
     let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
     for i in 0..nnz { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
     inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
-    crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+    unsafe { crate::memory::checked_free(staging_ci as *mut u8, ci_bytes); }
 
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
 
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
@@ -3032,21 +3048,21 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
     for i in 0..nblk_rows + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
     inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
-    crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+    unsafe { crate::memory::checked_free(staging_rp as *mut u8, rp_bytes); }
 
     // Convert i64 → u32 for col_indices
     let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
     let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
     for i in 0..num_blocks { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
     inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
-    crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+    unsafe { crate::memory::checked_free(staging_ci as *mut u8, ci_bytes); }
 
     // Convert f64 → f32 for values
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
     for i in 0..num_blocks * block_size { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
 
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
@@ -3116,7 +3132,7 @@ pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
 
     let mut ri = gpu_ri as u64;
     let mut ci = gpu_ci as u64;

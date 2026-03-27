@@ -226,8 +226,8 @@ fn compute_scale_zp(values: &[f64], qmin: f64, qmax: f64) -> (f32, u8) {
         return (1.0, 0);
     }
 
-    let mut min_val = f64::MAX;
-    let mut max_val = f64::MIN;
+    let mut min_val = f64::INFINITY;
+    let mut max_val = f64::NEG_INFINITY;
     for &v in values {
         if v < min_val { min_val = v; }
         if v > max_val { max_val = v; }

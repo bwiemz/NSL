@@ -130,6 +130,10 @@ impl BlockAllocator {
     pub fn free(&mut self, id: BlockId) {
         debug_assert!((id as usize) < self.num_blocks, "BlockId out of range");
         let idx = id as usize;
+        if self.refcounts[idx] == 0 {
+            // Already free — no-op to prevent double-free corruption
+            return;
+        }
         if self.refcounts[idx] > 1 {
             self.refcounts[idx] -= 1;
             return; // shared block — just decrement, don't return to pool
