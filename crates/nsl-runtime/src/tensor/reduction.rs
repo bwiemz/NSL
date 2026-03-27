@@ -470,6 +470,7 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if tensor.device > 0 {
             let ndim = tensor.ndim;
+            #[allow(unused_variables)]
             let d = if dim < 0 { ndim + dim } else { dim };
             #[cfg(feature = "cuda")]
             if d == 0 {

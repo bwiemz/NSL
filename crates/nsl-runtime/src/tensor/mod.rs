@@ -330,6 +330,7 @@ impl NslTensor {
         self.data as *mut f32
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_i32(&self) -> *mut i32 {
         assert_eq!(self.dtype, 4, "data_i32() called on non-i32 tensor (dtype={})", self.dtype);
@@ -1233,6 +1234,7 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
                 }
             }
             // Copy scaled data back to GPU
+            #[allow(unused_variables)]
             let byte_size = if cpu_t.dtype == 1 {
                 cpu_t.len as usize * std::mem::size_of::<f32>()
             } else {
@@ -2377,6 +2379,7 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
         // Probe: read the NslTensor header fields carefully
         let ptr = field_val as *const NslTensor;
         // Safety check: ensure the pointer is reasonably aligned (8-byte)
+        #[allow(clippy::manual_is_multiple_of)]
         if (field_val as usize) % 8 != 0 { continue; }
 
         let t = unsafe { &*ptr };

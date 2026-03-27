@@ -152,8 +152,8 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
     if fmt == SparseFmtId::Bsr {
         let br = 16usize; // block_rows
         let bc = 16usize; // block_cols
-        let nblk_rows = (rows + br - 1) / br;
-        let nblk_cols = (cols + bc - 1) / bc;
+        let nblk_rows = rows.div_ceil(br);
+        let nblk_cols = cols.div_ceil(bc);
 
         // Scan blocks: a block is nonzero if any element in it exceeds threshold
         let mut block_row_ptrs = vec![0i64; nblk_rows + 1];
@@ -301,7 +301,7 @@ pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
             let br = sparse.block_rows as usize;
             let bc = sparse.block_cols as usize;
             if br == 0 || bc == 0 { return 0; }
-            let nblk_rows = (rows + br - 1) / br;
+            let nblk_rows = rows.div_ceil(br);
             let num_blocks = sparse.nnz as usize;
             let block_size = br * bc;
             let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
@@ -311,8 +311,8 @@ pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
             for blk_r in 0..nblk_rows {
                 let start = block_row_ptrs[blk_r] as usize;
                 let end = block_row_ptrs[blk_r + 1] as usize;
-                for blk_idx in start..end {
-                    let blk_c = block_col_indices[blk_idx] as usize;
+                for (blk_idx, &blk_c_raw) in block_col_indices.iter().enumerate().take(end).skip(start) {
+                    let blk_c = blk_c_raw as usize;
                     let val_base = blk_idx * block_size;
                     for r in 0..br {
                         for c in 0..bc {
@@ -428,7 +428,7 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
             let br = sparse.block_rows as usize;
             let bc = sparse.block_cols as usize;
             if br == 0 || bc == 0 { return 0; }
-            let nblk_rows = (m + br - 1) / br;
+            let nblk_rows = m.div_ceil(br);
             let num_blocks = nnz; // nnz = number of nonzero blocks
             let block_size = br * bc;
             let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
@@ -438,8 +438,8 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
             for blk_r in 0..nblk_rows {
                 let start = block_row_ptrs[blk_r] as usize;
                 let end = block_row_ptrs[blk_r + 1] as usize;
-                for blk_idx in start..end {
-                    let blk_c = block_col_indices[blk_idx] as usize;
+                for (blk_idx, &blk_c_raw) in block_col_indices.iter().enumerate().take(end).skip(start) {
+                    let blk_c = blk_c_raw as usize;
                     let val_base = blk_idx * block_size;
                     for r in 0..br {
                         let gr = blk_r * br + r;
@@ -480,7 +480,7 @@ pub extern "C" fn nsl_sparse_free(sparse_ptr: i64) -> i64 {
         let (idx0_len, idx1_len, data_bytes) = if sparse.format == SparseFmtId::Bsr as u8 {
             let br = sparse.block_rows as usize;
             let bc = sparse.block_cols as usize;
-            let nblk_rows = if br > 0 { (sparse.rows as usize + br - 1) / br } else { 0 };
+            let nblk_rows = if br > 0 { (sparse.rows as usize).div_ceil(br) } else { 0 };
             (nblk_rows + 1, n, n * br * bc * 8)
         } else if sparse.format == SparseFmtId::Csr as u8 {
             (sparse.rows as usize + 1, n, n * 8)
@@ -804,8 +804,8 @@ pub extern "C" fn nsl_sparse_csr_to_coo(csr_ptr: i64) -> i64 {
     for r in 0..rows {
         let start = row_ptr[r] as usize;
         let end = row_ptr[r + 1] as usize;
-        for idx in start..end {
-            row_indices[idx] = r as i64;
+        for slot in row_indices.iter_mut().take(end).skip(start) {
+            *slot = r as i64;
         }
     }
 
@@ -840,8 +840,8 @@ pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
     for c in 0..cols {
         let start = col_ptr[c] as usize;
         let end = col_ptr[c + 1] as usize;
-        for idx in start..end {
-            col_indices[idx] = c as i64;
+        for slot in col_indices.iter_mut().take(end).skip(start) {
+            *slot = c as i64;
         }
     }
 
@@ -925,7 +925,7 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
             let br = sparse.block_rows as usize;
             let bc = sparse.block_cols as usize;
             if br == 0 || bc == 0 { return 0; }
-            let nblk_rows = (m + br - 1) / br;
+            let nblk_rows = m.div_ceil(br);
             let num_blocks = nnz;
             let block_size = br * bc;
             let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
@@ -935,8 +935,8 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
             for blk_r in 0..nblk_rows {
                 let start = block_row_ptrs[blk_r] as usize;
                 let end = block_row_ptrs[blk_r + 1] as usize;
-                for blk_idx in start..end {
-                    let blk_c = block_col_indices[blk_idx] as usize;
+                for (blk_idx, &blk_c_raw) in block_col_indices.iter().enumerate().take(end).skip(start) {
+                    let blk_c = blk_c_raw as usize;
                     let val_base = blk_idx * block_size;
                     for r in 0..br {
                         let gr = blk_r * br + r;

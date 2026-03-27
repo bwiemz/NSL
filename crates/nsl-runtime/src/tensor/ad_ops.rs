@@ -643,6 +643,7 @@ pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
     }
 
     let last_dim = unsafe { *tensor.shape.add(ndim - 1) } as usize;
+    #[allow(clippy::manual_is_multiple_of)]
     if last_dim % 2 != 0 {
         eprintln!("nsl: rope_inverse requires even last dimension, got {}", last_dim);
         std::process::abort();
@@ -907,6 +908,7 @@ pub extern "C" fn nsl_tensor_avgpool2d(
 
     // Build output shape: replace last 2 dims with h_out, w_out
     let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..ndim - 2 {
         unsafe { *out_shape.add(i) = shape_slice[i] };
     }

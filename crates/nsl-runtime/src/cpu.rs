@@ -296,7 +296,7 @@ fn apply_fused_op_f32(op: i64, val: f32, rhs: f32) -> f32 {
         FUSED_OP_ABS => val.abs(),
         FUSED_OP_GELU => {
             // GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-            let c = 0.7978845608_f32; // sqrt(2/pi)
+            let c = 0.797_884_6_f32; // sqrt(2/pi)
             val * 0.5 * (1.0 + (c * (val + 0.044715 * val * val * val)).tanh())
         }
         FUSED_OP_SILU => val * (1.0 / (1.0 + (-val).exp())),

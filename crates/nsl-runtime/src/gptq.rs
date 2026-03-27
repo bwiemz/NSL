@@ -325,8 +325,7 @@ pub fn gptq_quantize_obq(
                 let error = (w_val - q_val) / h_inv_diag;
 
                 // Compensate remaining columns in this block
-                for jdx in (idx + 1)..block_end {
-                    let j = col_order[jdx];
+                for &j in col_order.iter().take(block_end).skip(idx + 1) {
                     // W[j, row] -= error * H^{-1}[col, j]
                     w[j * n + row] -= error * h_inv[col * k + j];
                 }
@@ -354,8 +353,7 @@ pub fn gptq_quantize_obq(
                     let w_at_quant = w[col * n + row];
                     let error = (w_at_quant - q_val) / h_inv[col * k + col].max(1e-15);
 
-                    for jdx in block_end..k {
-                        let j = col_order[jdx];
+                    for &j in col_order.iter().skip(block_end) {
                         w[j * n + row] -= error * h_inv[col * k + j];
                     }
                 }
@@ -460,7 +458,7 @@ pub extern "C" fn nsl_gptq_hessian_add_batch(input_ptr: i64) -> i64 {
     assert!(t.ndim >= 2, "calibration input must be 2D");
 
     let batch_size = unsafe { *t.shape } as usize;
-    let k = unsafe { *t.shape.add(1) } as usize;
+    let _k = unsafe { *t.shape.add(1) } as usize;
     let len = t.len as usize;
 
     let data: Vec<f64> = if t.dtype == 1 {

@@ -49,6 +49,7 @@ static ZERO_CTX: Mutex<Option<ZeROContext>> = Mutex::new(None);
 
 #[derive(Clone)]
 struct ZeROContext {
+    #[allow(dead_code)]
     stage: ZeROStage,
     rank: usize,
     world_size: usize,
@@ -323,7 +324,7 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
         0 => 8usize, // f64
         1 => 4,      // f32
         2 | 3 => 2,  // f16/bf16
-        4 | 5 | 6 => 1, // i8/fp8
+        4..=6 => 1, // i8/fp8
         _ => 8,      // default to f64 width
     };
 

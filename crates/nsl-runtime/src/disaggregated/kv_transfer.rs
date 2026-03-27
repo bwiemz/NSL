@@ -440,10 +440,8 @@ impl TcpBackend {
         // Read block entries
         let entries_size = header.entries_bytes();
         let mut entries_bytes = vec![0u8; entries_size];
-        if entries_size > 0 {
-            if stream.read_exact(&mut entries_bytes).is_err() {
-                return None;
-            }
+        if entries_size > 0 && stream.read_exact(&mut entries_bytes).is_err() {
+            return None;
         }
         let block_entries: Vec<KvBlockTransferEntry> = (0..header.num_blocks as usize)
             .map(|i| unsafe {
@@ -499,7 +497,7 @@ impl TcpBackend {
             let entries_bytes = unsafe {
                 std::slice::from_raw_parts(
                     block_entries.as_ptr() as *const u8,
-                    block_entries.len() * std::mem::size_of::<KvBlockTransferEntry>(),
+                    std::mem::size_of_val(block_entries),
                 )
             };
             stream.write_all(entries_bytes)?;
@@ -609,7 +607,7 @@ impl KvTransferBackend for TcpBackend {
             let predicate = |t: &TcpPendingTransfer| {
                 source_rank < 0 || t.header.request_id != u64::MAX // accept any for now
             };
-            if let Some(pos) = buf.iter().position(|t| predicate(t)) {
+            if let Some(pos) = buf.iter().position(predicate) {
                 let transfer = buf.remove(pos);
                 *header = transfer.header;
                 *block_entries = transfer.block_entries;
@@ -1208,6 +1206,7 @@ impl RdmaBackend {
     }
 
     /// Deregister a memory region.
+    #[allow(dead_code)]
     fn deregister_memory(&self, addr: u64) {
         let mut regions = self.registered_regions.lock().unwrap();
         regions.retain(|r| r.addr != addr);
