@@ -1,0 +1,78 @@
+# models/coder-rl/reward.nsl
+# ============================================================================
+# GRPO Reward Function — Compiler-as-Reward-Model
+# ============================================================================
+# Scores generated NSL code through the 5-stage compilation pipeline.
+# Returns a scalar reward in [0.0, 1.0] plus the error string for retry.
+#
+# Stage 1: Parse          → 0.0 (fail) / 0.2 (pass)
+# Stage 2: Semantic check  → 0.4
+# Stage 3: Shape check    → 0.6
+# Stage 4: Full compile   → 0.8
+# Stage 5: Execute + test → 1.0
+#
+# This module is called from the GRPO training loop.
+# It shells out to `nsl check` and `nsl run` as subprocesses.
+
+# ─── Reward computation ───
+# In a real implementation, these would call the NSL CLI as subprocesses.
+# For now, we define the reward structure and scoring logic.
+
+const REWARD_PARSE_FAIL = 0.0
+const REWARD_PARSE_OK = 0.2
+const REWARD_SEMANTIC_OK = 0.4
+const REWARD_SHAPE_OK = 0.6
+const REWARD_COMPILE_OK = 0.8
+const REWARD_RUN_OK = 0.85
+const REWARD_TEST_PASS = 1.0
+
+# Partial credit for near-misses
+const PARTIAL_PER_VALID_STMT = 0.02
+const PARTIAL_MAX = 0.15
+
+# ─── Task definition ───
+# Each training task has:
+#   - prompt: English description of what to write
+#   - test_code: optional NSL code that tests the output
+#   - difficulty: 1-4 (controls curriculum scheduling)
+#   - category: "function" | "model" | "bugfix" | "shape" | "train" | "rust"
+
+# ─── Example tasks (hardcoded for bootstrap) ───
+# These would be loaded from a task bank in the full implementation.
+
+# Task 1: Simple function
+# prompt: "Write an NSL function named add_tensors that takes two Tensor arguments
+#          and returns their element-wise sum."
+# expected:
+#   fn add_tensors(a: Tensor, b: Tensor) -> Tensor:
+#       return a + b
+
+# Task 2: Model definition
+# prompt: "Define an NSL model named SimpleMLP with a weight tensor of shape [64, 32]
+#          and a forward method that computes x @ self.w with relu activation."
+# expected:
+#   model SimpleMLP:
+#       w: Tensor = randn([64, 32])
+#       fn forward(self, x: Tensor) -> Tensor:
+#           return relu(x @ self.w)
+
+# Task 3: Bug fix
+# prompt: "Fix this code:\n  fn matmul_shapes(x: Tensor) -> Tensor:\n    let w = randn([512, 256])\n    return x @ w @ w\nError: Shape mismatch at dim 1: [batch, 256] @ [512, 256]"
+# expected: add transpose or fix dimensions
+
+# Task 4: Shape reasoning
+# prompt: "If x has shape [32, 512] and w has shape [1024, 512], what is the shape of x @ w.transpose(0, 1)?"
+# expected: "[32, 1024]"
+
+# Task 5: Train block
+# prompt: "Write a train block that trains model m for 10 epochs with AdamW optimizer
+#          at learning rate 0.001, using mse_loss."
+# expected:
+#   train(model=m, epochs=10):
+#       optimizer: AdamW(lr=0.001)
+#       step(batch):
+#           let pred = m.forward(x)
+#           let loss = mse_loss(pred, y)
+#       callbacks:
+#           on_epoch(epoch, loss):
+#               print(loss)

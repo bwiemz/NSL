@@ -1,0 +1,83 @@
+# models/coder-rl/tasks.nsl
+# ============================================================================
+# RL Task Generator — Curriculum-Based Training Prompts
+# ============================================================================
+# Generates training tasks for GRPO at 4 difficulty levels.
+# Each task has: prompt, optional test code, difficulty, category.
+
+# ─── Difficulty 1: Single expressions and simple functions ───
+
+# 1.1 Tensor creation
+# "Create a tensor of zeros with shape [32, 512]"
+# "Create a random normal tensor with shape [batch, d_model] where batch=16, d_model=256"
+# "Create a tensor filled with 0.02 of shape [vocab_size, hidden] where vocab_size=4096, hidden=384"
+
+# 1.2 Simple operations
+# "Write a function that adds two tensors element-wise"
+# "Write a function that computes the dot product of two vectors"
+# "Write a function that applies relu activation to a tensor"
+# "Write a function that computes the mean of a tensor along dimension 1"
+
+# 1.3 Type annotations
+# "Add type annotations: fn scale(x, factor) -> ?"
+# "What is the return type of: fn matmul(a: Tensor, b: Tensor) -> ?"
+
+# ─── Difficulty 2: Multi-line functions and model definitions ───
+
+# 2.1 Functions with multiple steps
+# "Write a function that normalizes a tensor to zero mean and unit variance"
+# "Write a function that implements scaled dot-product attention"
+# "Write a function that computes the softmax cross-entropy loss"
+
+# 2.2 Simple model definitions
+# "Define a Linear layer model with weight [in_features, out_features] and bias [out_features]"
+# "Define an MLP model with two linear layers and relu activation"
+# "Define an Embedding model that looks up token embeddings from a weight matrix"
+
+# 2.3 Import and use stdlib
+# "Import RMSNorm from nsl.nn.norms and use it in a model"
+# "Import cross_entropy from nsl.nn.losses and use it to compute loss"
+
+# ─── Difficulty 3: Bug fixing, shape reasoning, train blocks ───
+
+# 3.1 Bug fixing (given broken code + compiler error)
+# "Fix: fn bad(x: Tensor) -> Tensor:\n  return x @ randn([512, 256]) @ randn([512, 128])\nError: shape mismatch"
+# "Fix: model M:\n  w: Tensor = randn([64, 32])\n  fn forward(self, x):\n    return x @ self.w\nError: missing return type"
+# "Fix: let loss = cross_entropy(logits, labels)\nError: logits must be 2D [N, classes], got 3D [batch, seq, vocab]"
+
+# 3.2 Shape reasoning
+# "x: [32, 512], w: [512, 1024]. What is (x @ w).shape?"
+# "After reshape([32, 1024], [32, 8, 128]), what is the shape?"
+# "If softmax(x, dim=-1) where x: [4, 8, 64, 64], what is the output shape?"
+
+# 3.3 Train blocks
+# "Write a train block for model m using SGD with lr=0.01 for 5 epochs with mse_loss"
+# "Write a train block with AdamW, warmup cosine schedule, and gradient clipping at 1.0"
+# "Write a training script that loads data from a mmap file, creates a DataLoader, and trains"
+
+# ─── Difficulty 4: Full programs, multi-module, Rust reading ───
+
+# 4.1 Full programs
+# "Write a complete NSL program that defines a 2-layer transformer, loads tokenized data, trains for 100 steps, and saves a checkpoint"
+# "Write an NSL inference script that loads a model checkpoint and generates text with top-k sampling"
+
+# 4.2 Rust reading
+# "Explain what this Rust function does: pub extern 'C' fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 { ... }"
+# "Read the NslTensor struct definition and explain each field"
+
+# 4.3 Advanced patterns
+# "Implement a GroupedQueryAttention module with RoPE positional encoding"
+# "Write a custom GPU kernel for element-wise fused multiply-add"
+# "Implement a SwiGLU feedforward network with residual connection and dropout"
+
+# ─── Task format for the reward server ───
+# Each task is serialized as JSON:
+# {
+#   "id": "task_001",
+#   "prompt": "Write an NSL function...",
+#   "difficulty": 1,
+#   "category": "function",
+#   "test_code": "let result = add_tensors(ones([2,3]), ones([2,3]))\nassert(result.shape[0] == 2)\nassert(result.shape[1] == 3)",
+#   "max_tokens": 256,
+#   "reference_solution": "fn add_tensors(a: Tensor, b: Tensor) -> Tensor:\n    return a + b"
+# }

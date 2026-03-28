@@ -1,0 +1,68 @@
+# models/coder-rl/collect_sft_data.nsl
+# ============================================================================
+# SFT Data Collection — Gather all NSL code for supervised pretraining
+# ============================================================================
+# Collects NSL source code from:
+#   1. stdlib/ — canonical patterns (25 files, ~800 LOC)
+#   2. examples/ — diverse usage (89 files, ~1500 LOC)
+#   3. models/ — real architectures (15 files, ~500 LOC)
+#   4. spec/ — language reference (13 chapters, ~4200 LOC)
+#
+# Formats each file as a training sample with metadata.
+# Output: JSONL file with {prompt, completion, source, category} fields.
+
+# Note: This script describes the data collection process.
+# The actual collection is done by a Rust tool that reads the filesystem.
+
+# ─── Data format ───
+# Each training sample is a JSON object:
+# {
+#   "prompt": "<|task|>Write the NSL standard library function for RMSNorm<|code|>",
+#   "completion": "model RMSNorm(dim: int):\n    w: Tensor = ones([dim])\n    ...",
+#   "source": "stdlib/nsl/nn/norms.nsl",
+#   "category": "stdlib",
+#   "tokens": 142
+# }
+
+# ─── Synthetic task-code pairs ───
+# For each stdlib function, generate an English description and pair it with the code.
+# This teaches the model to translate task descriptions into NSL code.
+
+# Example pairs:
+
+# Pair 1:
+# task: "Implement the AdamW optimizer step function in NSL. It should take a parameter
+#        tensor, its gradient, first moment (m), second moment (v), learning rate, and
+#        standard hyperparameters (beta1, beta2, eps, weight_decay). Update the moments
+#        with EMA and apply the weight decay + bias-corrected update."
+# code: [contents of stdlib/nsl/optim/adamw.nsl]
+
+# Pair 2:
+# task: "Write a cross-entropy loss function in NSL that takes logits [N, vocab_size]
+#        and integer targets [N], computes log-softmax with max-subtraction for numerical
+#        stability, gathers the correct class log-probabilities, and returns the mean
+#        negative log-likelihood."
+# code: [contents of stdlib/nsl/nn/losses.nsl cross_entropy function]
+
+# Pair 3:
+# task: "Define a GroupedQueryAttention model in NSL with separate Q, K, V projection
+#        weights, KV head replication for GQA, scaled dot-product attention with causal
+#        masking, RoPE positional encoding, and output projection with dropout."
+# code: [contents of stdlib/nsl/nn/gqa.nsl]
+
+# ─── Augmentation strategies ───
+# 1. Variable renaming: replace `x` with `input`, `h` with `hidden`, etc.
+# 2. Dimension shuffling: change [512, 1024] to [256, 768]
+# 3. Optimizer swapping: replace AdamW with SGD or Lion
+# 4. Comment variation: add/remove/modify comments
+# 5. Style variation: one-liner vs multi-line for simple expressions
+
+# ─── Data statistics (estimated) ───
+# Raw NSL code: ~2,800 lines → ~28K tokens (at ~10 tokens/line)
+# Spec text: ~4,200 lines → ~40K tokens
+# Synthetic pairs: ~500 pairs → ~100K tokens
+# Augmented copies: 3x → ~70K tokens
+# Total SFT corpus: ~238K tokens
+# At 4096 token sequences: ~58 training sequences
+# At 10 epochs: ~580 forward+backward passes
+# Estimated SFT time: <30 minutes on RTX 5070 Ti

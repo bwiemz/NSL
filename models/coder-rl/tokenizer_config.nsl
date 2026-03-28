@@ -1,0 +1,106 @@
+# models/coder-rl/tokenizer_config.nsl
+# ============================================================================
+# NSL-Coder-RL Tokenizer Configuration
+# ============================================================================
+# NSL-aware tokenizer with 4096 vocab. Every NSL keyword is a single token.
+# Builds on NSL's existing byte_tokenizer/BPE infrastructure.
+
+# ─── Special tokens ───
+const PAD_TOKEN = 0
+const BOS_TOKEN = 1
+const EOS_TOKEN = 2
+const CODE_START = 3
+const CODE_END = 4
+const ERROR_START = 5
+const ERROR_END = 6
+const FIX_START = 7
+const TASK_START = 8
+const TASK_END = 9
+
+# ─── NSL keywords (tokens 10-59) ───
+# Each is exactly 1 token — the model never has to assemble sub-word pieces
+# for language constructs
+const NSL_KEYWORDS = [
+    "fn", "let", "const", "model", "train", "return", "if", "else", "elif",
+    "for", "while", "break", "continue", "in", "from", "import", "as",
+    "true", "false", "and", "or", "not", "none", "pass",
+    "grad", "kernel", "quant", "serve", "match", "case",
+    "Tensor", "int", "float", "bool", "str", "list", "dict", "tuple",
+    "self", "super", "class", "def", "with", "try", "except", "raise",
+    "pub", "struct", "impl", "use", "mut", "unsafe"
+]
+
+# ─── NSL builtins (tokens 60-139) ───
+const NSL_BUILTINS = [
+    "randn", "zeros", "ones", "full", "arange", "linspace",
+    "matmul", "softmax", "relu", "gelu", "silu", "sigmoid", "tanh",
+    "exp", "log", "sqrt", "abs", "neg", "sign", "clamp",
+    "sum", "mean", "reduce_max", "argmax",
+    "reshape", "transpose", "squeeze", "unsqueeze", "contiguous", "expand",
+    "embedding_lookup", "layernorm", "rmsnorm", "batchnorm",
+    "cross_entropy", "mse_loss", "l1_loss", "bce_loss",
+    "dropout", "bias_add", "gather", "scatter_add",
+    "conv2d", "maxpool2d", "avgpool2d",
+    "to", "cuda", "cpu", "shape", "ndim", "item",
+    "print", "clock", "str", "float", "int",
+    "model_save", "model_load",
+    "load_mmap", "DataLoader",
+    "AdamW", "Adam", "SGD", "Lion",
+    "warmup_cosine", "cosine_anneal", "linear_decay",
+    "RMSNorm", "LayerNorm", "Linear", "Embedding",
+    "GroupedQueryAttention", "SwiGLUFFN", "TransformerBlock",
+    "byte_tokenizer_new", "tokenizer_encode", "tokenizer_decode",
+    "tensor_slice", "causal_mask"
+]
+
+# ─── Operators (tokens 140-169) ───
+const NSL_OPERATORS = [
+    "@", "|>", "**", "+=", "-=", "*=", "/=",
+    "->", ":", "=", "==", "!=", "<", ">", "<=", ">=",
+    "+", "-", "*", "/", "%", ".", ",", ";",
+    "(", ")", "[", "]", "{", "}"
+]
+
+# ─── Structure tokens (tokens 170-179) ───
+const INDENT_TOKEN = 170
+const DEDENT_TOKEN = 171
+const NEWLINE_TOKEN = 172
+
+# ─── Number tokens (tokens 180-211) ───
+# 0-9 digits + common numeric patterns
+const DIGIT_TOKENS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+const COMMON_NUMBERS = [
+    "0.0", "1.0", "0.1", "0.01", "0.001", "0.0001",
+    "0.5", "2.0", "0.02", "0.9", "0.95", "0.99",
+    "32", "64", "128", "256", "512", "1024", "2048", "4096",
+    "49152", "384"
+]
+
+# ─── Common identifiers (tokens 212-399) ───
+const COMMON_IDENTS = [
+    "x", "y", "z", "h", "w", "b", "m", "n", "k", "v", "q",
+    "loss", "logits", "pred", "target", "labels", "input_ids",
+    "hidden", "output", "result", "out",
+    "batch", "seq", "dim", "size", "len", "num",
+    "batch_size", "seq_len", "d_model", "d_ff", "n_heads", "n_kv_heads",
+    "head_dim", "vocab_size", "num_layers", "dropout_p",
+    "weight", "bias", "scale", "gamma", "beta", "eps",
+    "lr", "epoch", "step", "grad", "param",
+    "gate", "up", "down", "proj", "norm",
+    "embed", "blocks", "attn", "ffn",
+    "w_gate", "w_up", "w_down", "w_q", "w_k", "w_v", "w_o",
+    "attn_norm", "ffn_norm", "final_norm",
+    "training", "forward", "forward_train",
+    "tokens", "loader", "batch",
+    "running_loss", "total_tokens",
+    "optimizer", "scheduler",
+    "data", "callbacks",
+    "on_step", "on_epoch"
+]
+
+# ─── Remaining 3696 tokens (400-4095): learned BPE ───
+# These cover:
+#   - English words for task descriptions and comments
+#   - Uncommon variable names and identifiers
+#   - String literals and documentation text
+#   - Rust-specific tokens (lifetime annotations, macros, etc.)

@@ -1,0 +1,96 @@
+# models/coder-rl/train_grpo.nsl
+# ============================================================================
+# GRPO Training Loop — Group Relative Policy Optimization
+# ============================================================================
+# The three-phase training pipeline:
+#   Phase 1: SFT on existing NSL code (warm up the model)
+#   Phase 2: Rejection sampling (filter by compiler, retrain on winners)
+#   Phase 3: GRPO with compiler-as-reward-model
+#
+# This file defines the GRPO phase. Phases 1-2 use the standard train block.
+
+from model import NSLCoderRL
+from nsl.nn.losses import cross_entropy
+
+# ─── Phase 1: Supervised Fine-Tuning ───
+# Uses the standard train block with pre-collected SFT data.
+# This bootstraps the model to generate parseable NSL code >50% of the time.
+
+print("================================================================")
+print("  NSL-Coder-RL — Phase 1: Supervised Fine-Tuning")
+print("  10.1M parameters | 6 layers | D=384 | GQA 6Q/3KV")
+print("================================================================")
+
+let m = NSLCoderRL()
+print("Model created")
+
+# SFT data: pre-tokenized NSL corpus + synthetic task-code pairs
+let sft_tokens = load_mmap("data/sft_tokens.bin", 3)
+let sft_loader = DataLoader(sft_tokens, batch_size=8, seq_len=2048, shuffle=true, drop_last=true)
+
+train(model=m, epochs=10):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.01)
+    scheduler: warmup_cosine(warmup_steps=100, total_steps=1000, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 50 == 0:
+                print(step)
+                print(loss)
+        on_epoch(epoch, loss):
+            print("SFT Epoch complete:")
+            print(epoch)
+            print(loss)
+            model_save(m, "checkpoints/coder_rl_sft.nslm")
+
+print("SFT complete!")
+model_save(m, "checkpoints/coder_rl_sft_final.nslm")
+
+# ─── Phase 3: GRPO ───
+# Note: Phase 2 (rejection sampling) runs as a separate script that
+# generates completions, filters by compiler, and prepares a new dataset.
+# Phase 3 is the main RL loop.
+#
+# The GRPO loop cannot be expressed as a standard train block because:
+# 1. It generates K candidates per prompt (requires sampling, not teacher forcing)
+# 2. The reward comes from the compiler, not from a loss function
+# 3. The policy gradient update uses advantages, not cross-entropy
+#
+# Instead, GRPO is implemented as a custom training loop in the
+# reward server (Rust), which calls the model's forward pass via FFI
+# and computes the GRPO gradient update externally.
+#
+# See: docs/plans/2026-03-28-nsl-coder-rl-design.md Section 5 for details.
+#
+# The reward server architecture:
+#   1. Load the SFT checkpoint
+#   2. For each training step:
+#      a. Sample a task from the task generator
+#      b. Generate K=8 completions via autoregressive sampling
+#      c. Score each through the NSL compiler (parallel workers)
+#      d. Compute GRPO advantages (within-group normalization)
+#      e. Compute policy gradient loss
+#      f. Backward + optimizer step
+#   3. Save checkpoint every 100 steps
+#
+# This requires the NSL model to support:
+#   - Autoregressive generation (token-by-token sampling)
+#   - Per-token log-probability computation (for policy gradient)
+#   - KL divergence against a frozen reference model
+#
+# These are already available via:
+#   - nsl.inference.generate (M19)
+#   - cross_entropy per-token (no reduction)
+#   - A frozen copy of the SFT model for KL reference
+
+print("================================================================")
+print("  Training pipeline defined.")
+print("  Phase 1: SFT (this script)")
+print("  Phase 2: Rejection sampling (run collect_rejections.nsl)")
+print("  Phase 3: GRPO (run grpo_server)")
+print("================================================================")
