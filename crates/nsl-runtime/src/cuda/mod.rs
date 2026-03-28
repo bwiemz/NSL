@@ -608,8 +608,12 @@ pub(crate) mod inner {
             if result != CUresult::CUDA_SUCCESS
                 && result != CUresult::CUDA_ERROR_NOT_SUPPORTED
                 && result != CUresult::CUDA_ERROR_INVALID_DEVICE
+                && result != CUresult::CUDA_ERROR_INVALID_VALUE
             {
-                panic!("cuMemPrefetchAsync failed: {:?}", result);
+                // Don't panic on prefetch failures — device memory (cuMemAlloc_v2)
+                // doesn't support prefetch (that's a unified memory API).
+                // Log and continue.
+                eprintln!("[nsl] cuMemPrefetchAsync warning: {:?} (non-fatal)", result);
             }
         }
     }
