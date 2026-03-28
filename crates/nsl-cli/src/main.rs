@@ -1428,7 +1428,7 @@ fn run_build_shared_multi(
                     }
                 }
 
-                for (name, layout) in temp_compiler.struct_layouts.drain() {
+                for (name, layout) in temp_compiler.types.struct_layouts.drain() {
                     imported_struct_layouts.insert(name, layout);
                 }
 
@@ -1985,7 +1985,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                     }
                 }
 
-                for (name, layout) in temp_compiler.struct_layouts.drain() {
+                for (name, layout) in temp_compiler.types.struct_layouts.drain() {
                     imported_struct_layouts.insert(name, layout);
                 }
 
@@ -2075,7 +2075,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                         }
                     }
 
-                    for (name, layout) in temp_compiler.struct_layouts.drain() {
+                    for (name, layout) in temp_compiler.types.struct_layouts.drain() {
                         lib_struct_layouts.insert(name, layout);
                     }
                 }

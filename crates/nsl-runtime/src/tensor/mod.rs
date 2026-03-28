@@ -2415,6 +2415,77 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
     }
 }
 
+/// Recursively collect all tensor parameter pointers from a model struct.
+/// Walks the struct fields by probing the magic number on each i64 field.
+/// Tensor fields (magic == TENSOR_MAGIC) are added to the result list.
+/// Sub-model fields are recursed into using the same probing strategy.
+/// FixedArray sub-model elements are walked contiguously.
+///
+/// `model_ptr`: pointer to the model struct (on CPU heap)
+/// `num_fields`: number of i64-sized slots in the struct (total_size / 8)
+///
+/// Returns an NslList of tensor pointers (only actual Param/Tensor fields).
+#[no_mangle]
+pub extern "C" fn nsl_collect_model_params(model_ptr: i64, num_fields: i64) -> i64 {
+    let result = crate::list::nsl_list_new();
+    if model_ptr == 0 || num_fields <= 0 { return result; }
+    collect_params_recursive(model_ptr as usize, num_fields as usize, result);
+    result
+}
+
+fn collect_params_recursive(base: usize, num_slots: usize, result: i64) {
+    for i in 0..num_slots {
+        let field_addr = (base + i * 8) as *const i64;
+        let field_val = unsafe { *field_addr };
+        if field_val == 0 { continue; }
+        // Skip values that look like small integers (not heap pointers)
+        if (field_val as u64) < 0x10000 { continue; }
+        // Alignment check
+        #[allow(clippy::manual_is_multiple_of)]
+        if (field_val as usize) % 8 != 0 { continue; }
+
+        let ptr = field_val as *const NslTensor;
+        let t = unsafe { &*ptr };
+
+        if t.magic == TENSOR_MAGIC {
+            // This is a tensor — add it to the param list
+            crate::list::nsl_list_push(result, field_val);
+        } else {
+            // This might be a sub-model struct pointer — probe its first few
+            // slots to see if any contain tensors. If the first word is a valid
+            // heap pointer that itself contains tensor magic at depth 1, treat
+            // the whole struct as a sub-model and recurse.
+            //
+            // Heuristic: probe up to 128 i64 slots (1KB) from this pointer.
+            // Most model structs are < 1KB. This is safe because model structs
+            // are always allocated via nsl_alloc on the CPU heap.
+            let probe_ptr = field_val as *const i64;
+            let mut found_tensor = false;
+            // Quick probe: check if first field is a tensor
+            let first_val = unsafe { *probe_ptr };
+            if first_val != 0 && (first_val as u64) >= 0x10000 && (first_val as usize) % 8 == 0 {
+                let inner = first_val as *const NslTensor;
+                if unsafe { (*inner).magic } == TENSOR_MAGIC {
+                    found_tensor = true;
+                }
+            }
+            if found_tensor {
+                // Recurse into sub-model — estimate slot count from a reasonable upper bound.
+                // We walk until we hit a null or invalid pointer.
+                let mut sub_slots = 0usize;
+                for j in 0..128 {
+                    let sv = unsafe { *probe_ptr.add(j) };
+                    if sv == 0 { sub_slots = j; break; }
+                    sub_slots = j + 1;
+                }
+                if sub_slots > 0 {
+                    collect_params_recursive(field_val as usize, sub_slots, result);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slice assignment primitives (M19 data pipeline)
 // ---------------------------------------------------------------------------
