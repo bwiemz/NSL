@@ -414,10 +414,11 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned (CPU)
+    // FBIP: mutate in-place when uniquely owned (CPU).
+    // Skip for dtype=4 (i32) — needs type conversion to float, can't mutate in-place.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if t.can_mutate_inplace() {
+        if t.dtype != 4 && t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -440,7 +441,18 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
     let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let data: *mut c_void = if a.dtype == 1 {
+    // Output dtype: i32 inputs produce f32 (used for label arithmetic in cross_entropy)
+    let out_dtype: u16 = if a.dtype == 4 { 1 } else { a.dtype };
+    let data: *mut c_void = if a.dtype == 4 {
+        // i32 → f32 with scalar add
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        let src = a.data as *const i32;
+        let sf = s as f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = (*src.add(i) as f32) + sf };
+        }
+        buf as *mut c_void
+    } else if a.dtype == 1 {
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len as usize {
             unsafe { *buf.add(i) = *a.data_f32().add(i) + (s as f32) };
@@ -461,7 +473,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
         ndim,
         len,
         a.device,
-        a.dtype,
+        out_dtype,
         1,
         0,
     ));
