@@ -156,6 +156,9 @@ fn link_msvc_multi(
         "shell32.lib",
         "ole32.lib",
         "/NODEFAULTLIB:LIBCMT",
+        // Disable Control Flow Guard — Cranelift object files don't have CFG
+        // metadata, so the linker's guard checks trigger false positives.
+        "/GUARD:NO",
     ]);
 
     // Link CUDA driver library if available (needed when runtime has cuda feature)
