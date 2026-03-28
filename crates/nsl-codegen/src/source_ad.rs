@@ -110,8 +110,16 @@ impl AdjointGenerator {
             // --- Simple pass-through ops (single instruction, mathematically correct) ---
             AdjointExpr::Negate(v) => self.emit_op(PrimalOp::Neg, vec![v]),
             AdjointExpr::MulElementwise(a, b) => self.emit_op(PrimalOp::Mul, vec![a, b]),
-            AdjointExpr::MatmulTransposeLeft(a, b) => self.emit_op(PrimalOp::Matmul, vec![a, b]),
-            AdjointExpr::MatmulTransposeRight(a, b) => self.emit_op(PrimalOp::Matmul, vec![a, b]),
+            AdjointExpr::MatmulTransposeLeft(grad, b) => {
+                // d_loss/d_A = grad @ B^T
+                let b_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![b]);
+                self.emit_op(PrimalOp::Matmul, vec![grad, b_t])
+            }
+            AdjointExpr::MatmulTransposeRight(a, grad) => {
+                // d_loss/d_B = A^T @ grad
+                let a_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![a]);
+                self.emit_op(PrimalOp::Matmul, vec![a_t, grad])
+            }
             AdjointExpr::Scale(v, s) => {
                 let scale = self.emit_constant(s);
                 self.emit_op(PrimalOp::Mul, vec![v, scale])
@@ -704,6 +712,38 @@ impl<'a> WengertExtractor<'a> {
                 self.symbol_to_var.get(sym).copied()
             }
 
+            // Field access: m.w → treat as a parameter reference
+            ExprKind::MemberAccess { object, member } => {
+                // Try to resolve as "object.member" compound name
+                if let ExprKind::Ident(obj_sym) = &object.kind {
+                    let obj_name = self.interner.resolve(obj_sym.0).unwrap_or("?");
+                    let field_name = self.interner.resolve(member.0).unwrap_or("?");
+                    let compound = format!("{}.{}", obj_name, field_name);
+
+                    // Check if we already registered this compound name
+                    if let Some(&var) = self.symbol_to_var.get(member) {
+                        return Some(var);
+                    }
+
+                    // Register as a new parameter input
+                    let var = self.alloc_var();
+                    self.symbol_to_var.insert(*member, var);
+                    self.param_symbols.insert(*member);
+                    self.list.var_names.insert(var, compound.clone());
+                    self.list.ops.push(WengertOp {
+                        id: self.list.ops.len() as u32,
+                        result: var,
+                        op: PrimalOp::Param(compound),
+                        inputs: vec![],
+                        saved_for_backward: false,
+                        checkpointed: false,
+                    });
+                    Some(var)
+                } else {
+                    None // Complex object expression
+                }
+            }
+
             ExprKind::BinaryOp { left, op, right } => {
                 let l = self.extract_expr(left)?;
                 let r = self.extract_expr(right)?;
@@ -720,6 +760,7 @@ impl<'a> WengertExtractor<'a> {
                     BinOp::LtEq => PrimalOp::Condition(CompareKind::LtEq),
                     BinOp::Eq => PrimalOp::Condition(CompareKind::Eq),
                     BinOp::NotEq => PrimalOp::Condition(CompareKind::NotEq),
+                    BinOp::MatMul => PrimalOp::Matmul,
                     _ => return None, // Unsupported op for AD
                 };
                 self.list.ops.push(WengertOp {
@@ -793,6 +834,9 @@ impl<'a> WengertExtractor<'a> {
                     "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
                     "mse_loss" => PrimalOp::MSELoss,
                     "l1_loss" => PrimalOp::L1Loss,
+                    // Reductions
+                    "sum" => PrimalOp::Sum { dim: None },
+                    "mean" => PrimalOp::Mean { dim: None },
                     // Regularization
                     "dropout" => PrimalOp::Dropout { p: 0.1 },
                     // Indexing
@@ -1038,6 +1082,13 @@ impl<'a> WengertExtractor<'a> {
     /// Access the extracted WengertList.
     pub fn wengert_list(&self) -> &WengertList {
         &self.list
+    }
+
+    /// Set the output VarId of the extracted WengertList.
+    /// This is needed when the step body uses `let loss = ...` (VarDecl) rather
+    /// than `return loss`, since VarDecl extraction does not set list.output.
+    pub fn set_output(&mut self, var: VarId) {
+        self.list.output = var;
     }
 }
 

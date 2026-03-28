@@ -1,0 +1,19 @@
+# Source AD flat test — no model method calls, only inline ops
+# The WengertExtractor can handle: @, +, -, *, relu, mean, sum
+# but cannot handle m.forward() method dispatch.
+
+model Linear:
+    w: Tensor = randn([4, 1])
+
+let m = Linear()
+let x = randn([8, 4])
+let y = randn([8, 1])
+
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = x @ m.w
+        let diff = pred - y
+        let loss = mean(diff * diff)
+
+print("source_ad_flat: PASS")

@@ -1927,6 +1927,12 @@ impl Compiler<'_> {
 
             // 2. Try to extract Wengert list from step body
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+
+            // Pre-register outer variables visible in the step body as inputs
+            for &sym in state.variables.keys() {
+                extractor.register_input(sym);
+            }
+
             let extraction_ok = extractor.extract_stmts(&step_body.stmts);
 
             if !extraction_ok {
@@ -1939,32 +1945,8 @@ impl Compiler<'_> {
 
                 self.compile_tape_backward(builder, state, step_body, param_list)?
             } else {
-                // 3. Compile forward pass normally (no tape wrapping)
-                state.flags.in_tape_region = false;
-                for stmt in &step_body.stmts {
-                    self.compile_stmt(builder, state, stmt)?;
-                }
-
-                // 4. Find loss variable
-                let loss_val = {
-                    let mut found = None;
-                    for (sym, (var, _)) in &state.variables {
-                        if self.resolve_sym(*sym) == "loss" {
-                            found = Some(builder.use_var(*var));
-                            break;
-                        }
-                    }
-                    found.ok_or_else(|| {
-                        CodegenError::new("train step body must assign to a variable named 'loss'")
-                    })?
-                };
-
-                // 5. Generate adjoint backward graph
-                let start_var = extractor.next_var_id();
-                let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
-                let adjoint = gen.generate(extractor.wengert_list());
-
-                // 6. Build VarMap: map symbolic VarIds to Cranelift Values
+                // 3. Build initial VarMap: map named input/param VarIds to
+                //    Cranelift Values already present in state.variables.
                 let mut primal_vars = crate::wengert_lower::VarMap::new();
                 for (sym, vid) in extractor.symbol_var_map() {
                     if let Some(&(cvar, _)) = state.variables.get(sym) {
@@ -1972,19 +1954,75 @@ impl Compiler<'_> {
                     }
                 }
 
-                // 7. Lower adjoint to Cranelift IR
-                // If lowering fails (e.g. unsupported op), fall back to tape AD.
-                // Note: at this point the forward pass is already emitted, so we
-                // cannot cleanly re-run through tape. Instead we propagate the error
-                // with a clear diagnostic so the user can disable --source-ad.
+                // Also populate model parameter VarIds from param_list.
+                // MemberAccess expressions (e.g., m.w) are registered in the extractor
+                // under the member symbol, but those aren't in state.variables — they're
+                // loaded from the model struct. Map them to nsl_list_get(param_list, i).
+                for (i, field) in layout.fields.iter().enumerate() {
+                    let field_sym = "";
+                    // Try to find this field in the extractor's param VarIds
+                    for (sym, vid) in extractor.param_var_ids() {
+                        let sym_name = self.interner.resolve(sym.0).unwrap_or("");
+                        if sym_name == field.name {
+                            if !primal_vars.contains_key(&vid) {
+                                let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                                let param_val = self.compile_call_by_name(
+                                    builder, "nsl_list_get", &[param_list, idx],
+                                )?;
+                                primal_vars.insert(vid, param_val);
+                            }
+                        }
+                    }
+                    let _ = field_sym; // suppress unused
+                }
+
+                // 4. Find the loss symbol's VarId and set it as the Wengert
+                //    list output. VarDecl extraction does not set list.output
+                //    (only Return does), so we resolve "loss" by name.
+                let loss_var_id = {
+                    let mut found = None;
+                    for (sym, vid) in extractor.symbol_var_map() {
+                        if self.resolve_sym(*sym) == "loss" {
+                            found = Some(*vid);
+                            break;
+                        }
+                    }
+                    found.ok_or_else(|| {
+                        CodegenError::new("train step body must assign to a variable named 'loss'")
+                    })?
+                };
+                extractor.set_output(loss_var_id);
+
+                // 5. Lower PRIMAL Wengert list to Cranelift IR.
+                //    This IS the forward pass — each WengertOp is compiled to
+                //    its runtime FFI call, and ALL intermediate VarId → Value
+                //    mappings are recorded in full_vars.
+                state.flags.in_tape_region = false;
+                let full_vars = crate::wengert_lower::compile_wengert_ops(
+                    self, builder, state, extractor.wengert_list(), &primal_vars,
+                )?;
+
+                let loss_val = *full_vars.get(&loss_var_id)
+                    .ok_or_else(|| CodegenError::new("source AD: loss VarId not found in compiled forward graph"))?;
+
+                // 6. Generate adjoint backward graph from the primal list.
+                let start_var = extractor.next_var_id();
+                let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+                let adjoint = gen.generate(extractor.wengert_list());
+
+                // 7. Lower ADJOINT Wengert list using full_vars, which now
+                //    contains all intermediate VarId → Value mappings from
+                //    the forward pass. This is the key fix: the old code only
+                //    had named variables in primal_vars, so intermediate
+                //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
                 let grad_vars = match crate::wengert_lower::compile_wengert_ops(
-                    self, builder, state, &adjoint, &primal_vars,
+                    self, builder, state, &adjoint, &full_vars,
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
                         eprintln!(
                             "[nsl] source AD lowering failed ({}), \
-                             falling back to tape AD is not possible after forward emit; \
+                             cannot fall back to tape AD after forward emit; \
                              rerun without --source-ad",
                             e
                         );
