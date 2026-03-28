@@ -386,6 +386,18 @@ impl<'a> Compiler<'a> {
             .set("opt_level", "speed")
             .map_err(|e| CodegenError::new(e.to_string()))?;
 
+        // Enable stack probing for large stack frames (>4KB).
+        // On Windows x64, stack pages are committed lazily via guard pages.
+        // Without probing, functions with large stack frames (e.g., train steps
+        // with many tensor temporaries) skip past the guard page and trigger
+        // STATUS_STACK_BUFFER_OVERRUN instead of growing the stack.
+        flag_builder
+            .enable("enable_probestack")
+            .map_err(|e| CodegenError::new(format!("failed to enable probestack: {e}")))?;
+        flag_builder
+            .set("probestack_strategy", "inline")
+            .map_err(|e| CodegenError::new(format!("failed to set probestack strategy: {e}")))?;
+
         // M62a: Enable position-independent code for shared library emission.
         if options.shared_lib {
             flag_builder

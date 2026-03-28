@@ -1934,8 +1934,8 @@ impl Compiler<'_> {
             builder.ins().jump(batch_header_block, &[]);
 
             // Batch header: get next batch, check for null (exhausted)
+            // Don't seal yet — back-edge from batch body will be added later
             builder.switch_to_block(batch_header_block);
-            builder.seal_block(batch_header_block);
             let batch_ptr = self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_handle])?;
             let null_check = builder.ins().iconst(cl_types::I64, 0);
             let is_done = builder.ins().icmp(IntCC::Equal, batch_ptr, null_check);
@@ -2559,6 +2559,8 @@ impl Compiler<'_> {
             if !is_block_filled(builder, current) {
                 builder.ins().jump(batch_header_block, &[]);
             }
+            // Now seal batch_header — both predecessors connected (entry + back-edge)
+            builder.seal_block(batch_header_block);
             // batch_exit: all batches done → jump to epoch increment
             builder.switch_to_block(batch_exit_block);
             builder.seal_block(batch_exit_block);
