@@ -72,6 +72,10 @@ fn link_gcc_multi(
 
     let mut cmd = Command::new(&cc);
     cmd.arg("-o").arg(output_path);
+    // 64MB stack for deep model training (tape AD on 8+ transformer blocks)
+    if cfg!(target_os = "windows") {
+        cmd.arg("-Wl,--stack,67108864");
+    }
     for obj_path in obj_paths {
         cmd.arg(obj_path);
     }
@@ -124,7 +128,10 @@ fn link_msvc_multi(
 
     let mut cmd = Command::new(&msvc.link);
     cmd.arg("/nologo")
-        .arg(format!("/OUT:{}", output_path.display()));
+        .arg(format!("/OUT:{}", output_path.display()))
+        // 64MB stack — tape-based AD on deep models (8+ transformer blocks)
+        // creates deep call chains that overflow the default 1MB stack.
+        .arg("/STACK:67108864");
     for obj_path in obj_paths {
         cmd.arg(obj_path);
     }
