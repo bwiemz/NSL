@@ -1802,7 +1802,7 @@ impl Compiler<'_> {
 
             builder.ins().jump(init_header, &[]);
             builder.switch_to_block(init_header);
-            builder.seal_block(init_header);
+            // Do NOT seal init_header here — the back-edge from init_body hasn't been added yet
             state.current_block = Some(init_header);
 
             let idx = builder.use_var(init_counter_var);
@@ -1825,6 +1825,8 @@ impl Compiler<'_> {
             let next_idx = builder.ins().iadd(idx, one_init);
             builder.def_var(init_counter_var, next_idx);
             builder.ins().jump(init_header, &[]);
+            // Now seal init_header — both predecessors (entry jump + back-edge) are connected
+            builder.seal_block(init_header);
 
             builder.switch_to_block(init_exit);
             builder.seal_block(init_exit);
@@ -1858,7 +1860,7 @@ impl Compiler<'_> {
             let accum_exit = builder.create_block();
             builder.ins().jump(accum_hdr, &[]);
             builder.switch_to_block(accum_hdr);
-            builder.seal_block(accum_hdr);
+            // Don't seal accum_hdr yet — back-edge not added
             let ai = builder.use_var(accum_i_var);
             let ac = builder.ins().icmp(IntCC::SignedLessThan, ai, num_params_val);
             builder.ins().brif(ac, accum_body, &[], accum_exit, &[]);
@@ -1871,6 +1873,7 @@ impl Compiler<'_> {
             let a_next = builder.ins().iadd(ai, a_one);
             builder.def_var(accum_i_var, a_next);
             builder.ins().jump(accum_hdr, &[]);
+            builder.seal_block(accum_hdr);
             builder.switch_to_block(accum_exit);
             builder.seal_block(accum_exit);
             state.current_block = Some(accum_exit);
@@ -2132,7 +2135,6 @@ impl Compiler<'_> {
             let ga_exit = builder.create_block();
             builder.ins().jump(ga_hdr, &[]);
             builder.switch_to_block(ga_hdr);
-            builder.seal_block(ga_hdr);
             let gai = builder.use_var(ga_i_var);
             let gac = builder.ins().icmp(IntCC::SignedLessThan, gai, num_params_val);
             builder.ins().brif(gac, ga_body, &[], ga_exit, &[]);
@@ -2147,6 +2149,7 @@ impl Compiler<'_> {
             let ga_next = builder.ins().iadd(gai, ga_one);
             builder.def_var(ga_i_var, ga_next);
             builder.ins().jump(ga_hdr, &[]);
+            builder.seal_block(ga_hdr);
             builder.switch_to_block(ga_exit);
             builder.seal_block(ga_exit);
             state.current_block = Some(ga_exit);
@@ -2242,7 +2245,6 @@ impl Compiler<'_> {
 
             builder.ins().jump(opt_header, &[]);
             builder.switch_to_block(opt_header);
-            builder.seal_block(opt_header);
             state.current_block = Some(opt_header);
 
             let idx = builder.use_var(opt_i_var);
@@ -2310,6 +2312,7 @@ impl Compiler<'_> {
             let next_opt = builder.ins().iadd(idx, one_opt);
             builder.def_var(opt_i_var, next_opt);
             builder.ins().jump(opt_header, &[]);
+            builder.seal_block(opt_header);
 
             builder.switch_to_block(opt_exit);
             builder.seal_block(opt_exit);
@@ -2333,7 +2336,6 @@ impl Compiler<'_> {
             let c_exit = builder.create_block();
             builder.ins().jump(c_header, &[]);
             builder.switch_to_block(c_header);
-            builder.seal_block(c_header);
             let ci = builder.use_var(cleanup_i_var);
             let cc = builder.ins().icmp(IntCC::SignedLessThan, ci, num_params_val);
             builder.ins().brif(cc, c_body, &[], c_exit, &[]);
@@ -2346,6 +2348,7 @@ impl Compiler<'_> {
             let c_next = builder.ins().iadd(ci, c_one);
             builder.def_var(cleanup_i_var, c_next);
             builder.ins().jump(c_header, &[]);
+            builder.seal_block(c_header);
             builder.switch_to_block(c_exit);
             builder.seal_block(c_exit);
             state.current_block = Some(c_exit);
@@ -2360,7 +2363,6 @@ impl Compiler<'_> {
             let c_exit = builder.create_block();
             builder.ins().jump(c_header, &[]);
             builder.switch_to_block(c_header);
-            builder.seal_block(c_header);
             let ci = builder.use_var(cleanup_i_var);
             let cc = builder.ins().icmp(IntCC::SignedLessThan, ci, num_params_val);
             builder.ins().brif(cc, c_body, &[], c_exit, &[]);
@@ -2372,6 +2374,7 @@ impl Compiler<'_> {
             let c_next = builder.ins().iadd(ci, c_one);
             builder.def_var(cleanup_i_var, c_next);
             builder.ins().jump(c_header, &[]);
+            builder.seal_block(c_header);
             builder.switch_to_block(c_exit);
             builder.seal_block(c_exit);
             state.current_block = Some(c_exit);
@@ -2597,7 +2600,6 @@ impl Compiler<'_> {
             let f_exit = builder.create_block();
             builder.ins().jump(f_header, &[]);
             builder.switch_to_block(f_header);
-            builder.seal_block(f_header);
             let fi = builder.use_var(free_i_var);
             let fc = builder.ins().icmp(IntCC::SignedLessThan, fi, num_params_val);
             builder.ins().brif(fc, f_body, &[], f_exit, &[]);
@@ -2613,6 +2615,7 @@ impl Compiler<'_> {
             let f_next = builder.ins().iadd(fi, f_one);
             builder.def_var(free_i_var, f_next);
             builder.ins().jump(f_header, &[]);
+            builder.seal_block(f_header);
             builder.switch_to_block(f_exit);
             builder.seal_block(f_exit);
             state.current_block = Some(f_exit);
@@ -2633,7 +2636,6 @@ impl Compiler<'_> {
             let fa_exit = builder.create_block();
             builder.ins().jump(fa_hdr, &[]);
             builder.switch_to_block(fa_hdr);
-            builder.seal_block(fa_hdr);
             let fai = builder.use_var(fa_i_var);
             let fac = builder.ins().icmp(IntCC::SignedLessThan, fai, num_params_val);
             builder.ins().brif(fac, fa_body, &[], fa_exit, &[]);
@@ -2645,6 +2647,7 @@ impl Compiler<'_> {
             let fa_next = builder.ins().iadd(fai, fa_one);
             builder.def_var(fa_i_var, fa_next);
             builder.ins().jump(fa_hdr, &[]);
+            builder.seal_block(fa_hdr);
             builder.switch_to_block(fa_exit);
             builder.seal_block(fa_exit);
             state.current_block = Some(fa_exit);
