@@ -2429,11 +2429,16 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
 pub extern "C" fn nsl_collect_model_params(model_ptr: i64, num_fields: i64) -> i64 {
     let result = crate::list::nsl_list_new();
     if model_ptr == 0 || num_fields <= 0 { return result; }
-    collect_params_recursive(model_ptr as usize, num_fields as usize, result);
+    collect_params_recursive(model_ptr as usize, num_fields as usize, result, 0);
     result
 }
 
-fn collect_params_recursive(base: usize, num_slots: usize, result: i64) {
+/// Maximum recursion depth for sub-model traversal.
+/// Real models rarely exceed depth 4 (Model → Block → Attention → Norm).
+const MAX_COLLECT_DEPTH: usize = 16;
+
+fn collect_params_recursive(base: usize, num_slots: usize, result: i64, depth: usize) {
+    if depth >= MAX_COLLECT_DEPTH { return; }
     for i in 0..num_slots {
         let field_addr = (base + i * 8) as *const i64;
         let field_val = unsafe { *field_addr };
@@ -2479,7 +2484,7 @@ fn collect_params_recursive(base: usize, num_slots: usize, result: i64) {
                     sub_slots = j + 1;
                 }
                 if sub_slots > 0 {
-                    collect_params_recursive(field_val as usize, sub_slots, result);
+                    collect_params_recursive(field_val as usize, sub_slots, result, depth + 1);
                 }
             }
         }
