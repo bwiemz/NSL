@@ -26,7 +26,10 @@ train(model=m, epochs=1, grad_clip=1.0):
     scheduler: warmup_cosine(warmup_steps=3000, total_steps=10000, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
-        let loss = cross_entropy(logits, batch.labels)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
     callbacks:
         on_step(step, loss):
             if step % 10 == 0:

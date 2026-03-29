@@ -6,8 +6,8 @@ fn l1_loss(pred: Tensor, target: Tensor) -> Tensor:
     return mean(abs(pred - target))
 
 fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
-    # Expects 2D logits [N, vocab] and 1D targets [N]
-    # Caller must flatten 3D logits before calling.
+    # Accepts 2D [N, vocab] or 3D [batch, seq, vocab] logits.
+    # 3D logits and 2D targets are auto-flattened.
     # Padding tokens use ignore_index = -100. We use a clamp-based mask:
     #   valid_mask = clamp(targets + 1, 0, 1)  →  -100 maps to 0, valid maps to 1
     # This avoids needing comparison ops. safe_targets clamps negatives to 0

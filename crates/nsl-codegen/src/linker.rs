@@ -55,8 +55,12 @@ pub fn link_multi(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), Codeg
     let runtime_lib = find_runtime_lib()?;
 
     if cfg!(target_os = "windows") {
-        link_msvc_multi(obj_paths, output_path, &runtime_lib)
-            .or_else(|_| link_gcc_multi(obj_paths, output_path, &runtime_lib))
+        // Prefer GCC (MinGW/MSYS2) over MSVC on Windows when available.
+        // MSVC's /GS security cookies cause false STATUS_STACK_BUFFER_OVERRUN
+        // when Cranelift-generated code calls into the Rust runtime.
+        // GCC doesn't have this issue.
+        link_gcc_multi(obj_paths, output_path, &runtime_lib)
+            .or_else(|_| link_msvc_multi(obj_paths, output_path, &runtime_lib))
     } else {
         link_gcc_multi(obj_paths, output_path, &runtime_lib)
     }
@@ -80,6 +84,12 @@ fn link_gcc_multi(
         cmd.arg(obj_path);
     }
     cmd.arg(runtime_lib);
+
+    // Windows system libraries AFTER runtime lib (GCC link order: libs after objects)
+    if cfg!(target_os = "windows") {
+        cmd.args(["-lws2_32", "-lntdll", "-lbcrypt", "-ladvapi32", "-luserenv",
+                  "-lkernel32", "-lsynchronization", "-lshell32", "-lole32"]);
+    }
 
     if cfg!(target_os = "linux") {
         cmd.arg("-lm");
