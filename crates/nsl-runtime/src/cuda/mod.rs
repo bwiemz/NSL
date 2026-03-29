@@ -10,6 +10,9 @@ pub(crate) mod fused_kernels;
 pub(crate) mod kernels_hopper;
 
 #[cfg(feature = "cuda")]
+pub(crate) mod caching_allocator;
+
+#[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
     use std::collections::HashMap;
@@ -101,6 +104,16 @@ pub(crate) mod inner {
                     CUDA_SYNC_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
                 }
+                // Register atexit handler for memory stats if NSL_MEMSTATS=1
+                if super::caching_allocator::memstats_enabled() {
+                    extern "C" {
+                        fn atexit(callback: extern "C" fn()) -> i32;
+                    }
+                    extern "C" fn memstats_atexit() {
+                        super::caching_allocator::print_memory_summary();
+                    }
+                    atexit(memstats_atexit);
+                }
                 Mutex::new(CudaState {
                     device,
                     context,
@@ -134,71 +147,235 @@ pub(crate) mod inner {
 
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    // ------------------------------------------------------------------
+    // OOM recovery infrastructure
+    // ------------------------------------------------------------------
+
+    /// Query free and total device memory in bytes.
+    pub(crate) fn query_vram() -> (usize, usize) {
+        ensure_context();
+        unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            cuMemGetInfo_v2(&mut free, &mut total);
+            (free, total)
+        }
+    }
+
+    /// Drain all cached allocations from the device memory pool.
+    /// Releases fully-free segments back to the CUDA driver.
+    /// Returns total bytes freed.
+    fn pool_drain() -> usize {
+        ensure_context();
+        let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        alloc.drain_all()
+    }
+
+    /// Drain all cached allocations from the pinned host memory pool.
+    fn pinned_pool_drain() -> usize {
+        let mut pool = PINNED_POOL.lock().unwrap();
+        let mut freed = 0usize;
+        ensure_context();
+        for (bucket_size, deque) in pool.buckets.iter_mut() {
+            while let Some(ptr) = deque.pop_front() {
+                unsafe { cuMemFreeHost(ptr); }
+                freed += bucket_size;
+            }
+        }
+        pool.buckets.clear();
+        freed
+    }
+
+    /// Thread-local context string describing the current GPU operation.
+    /// Set before allocations so OOM messages identify which op failed.
+    ///
+    /// NOTE: This is thread-local, so in multi-threaded GPU dispatch the
+    /// context reflects the calling thread only. For single-threaded
+    /// inference/training (the common case) this is correct.
+    thread_local! {
+        static OOM_CONTEXT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    pub(crate) fn set_oom_context(ctx: &str) {
+        OOM_CONTEXT.with(|c| {
+            let mut s = c.borrow_mut();
+            s.clear();
+            s.push_str(ctx);
+        });
+    }
+
+    fn get_oom_context() -> String {
+        OOM_CONTEXT.with(|c| c.borrow().clone())
+    }
+
+    fn format_bytes(bytes: usize) -> String {
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    fn oom_diagnostic(requested: usize, alloc_num: u64, pool_freed: usize) -> String {
+        let (free_vram, total_vram) = query_vram();
+        let ctx = get_oom_context();
+        let op_line = if ctx.is_empty() {
+            String::new()
+        } else {
+            format!("\n  Operation: {}", ctx)
+        };
+        format!(
+            "[nsl] GPU out of memory\n\
+             \n\
+               Requested:    {} ({})\n\
+               VRAM free:    {} / {}\n\
+               Pool drained: {}\n\
+               Allocation #: {}{}\n\
+             \n\
+             Suggestions:\n\
+               - Reduce batch size or sequence length\n\
+               - Enable gradient checkpointing (@checkpoint)\n\
+               - Use lower precision (fp16, fp8, int8)\n\
+               - Set NSL_ASYNC_ALLOC=1 for stream-ordered allocation",
+            requested, format_bytes(requested),
+            format_bytes(free_vram), format_bytes(total_vram),
+            format_bytes(pool_freed),
+            alloc_num, op_line,
+        )
+    }
+
+    /// Helper: try to alloc from caching allocator (cache hit or grow).
+    /// Handles registration and test stats. Returns None on failure.
+    fn caching_alloc(size_bytes: usize) -> Option<*mut c_void> {
+        let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        let ptr = alloc.alloc_from_cache(size_bytes)
+            .or_else(|| alloc.alloc_with_grow(size_bytes))?;
+        drop(alloc);
+        register_cuda_alloc(ptr);
+        #[cfg(test)]
+        crate::memory::stats::cuda_alloc(size_bytes);
+        #[cfg(test)]
+        cuda_size_registry().lock().unwrap().insert(ptr as usize, size_bytes);
+        Some(ptr)
+    }
+
+    /// Try async allocation. Returns null on failure (no fallback/recursion).
+    fn alloc_async_inner(size_bytes: usize) -> *mut c_void {
+        ensure_context();
+        unsafe {
+            let mut ptr: CUdeviceptr = 0;
+            let result = cuMemAllocAsync(&mut ptr, size_bytes, std::ptr::null_mut());
+            if result != CUresult::CUDA_SUCCESS || ptr == 0 {
+                return std::ptr::null_mut();
+            }
+            let cptr = ptr as *mut c_void;
+            register_cuda_alloc(cptr);
+            ASYNC_ALLOC_SET.lock().unwrap().insert(cptr as usize);
+            cptr
+        }
+    }
+
+    /// Try to allocate GPU memory with OOM recovery. Returns None after all
+    /// recovery attempts fail. Use this for ops that can fall back to CPU.
+    pub(crate) fn try_alloc_managed(size_bytes: usize) -> Option<*mut c_void> {
+        if size_bytes == 0 { return Some(std::ptr::null_mut()); }
+
+        // Async alloc path (opt-in, bypasses caching allocator)
+        if async_alloc_enabled() {
+            let ptr = alloc_async_inner(size_bytes);
+            if !ptr.is_null() {
+                #[cfg(test)]
+                crate::memory::stats::cuda_alloc(size_bytes);
+                return Some(ptr);
+            }
+        }
+
+        ensure_context();
+
+        // Attempt 1: caching allocator (cache hit or grow)
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return Some(ptr);
+        }
+
+        // Attempt 2: synchronize device (flushes pending async frees) and retry
+        unsafe { cuCtxSynchronize(); }
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return Some(ptr);
+        }
+
+        // Attempt 3: drain caching allocator (free idle segments) and retry
+        let _drained = pool_drain();
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return Some(ptr);
+        }
+
+        // Attempt 4: drain pinned pool (reduces system memory pressure) and retry
+        let _pinned_drained = pinned_pool_drain();
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return Some(ptr);
+        }
+
+        None
+    }
+
     /// Allocate device memory (GPU-only, not accessible from CPU).
-    /// Uses a size-bucketed pool to recycle recently freed allocations,
-    /// reducing cuMemAlloc syscall overhead.
+    /// Uses a caching allocator with block splitting and coalescing to
+    /// recycle freed allocations, reducing cuMemAlloc syscall overhead.
+    ///
+    /// On OOM, attempts recovery (sync + pool drain) before panicking
+    /// with detailed VRAM diagnostics.
     ///
     /// IMPORTANT: The returned pointer is a device pointer. CPU code must NOT
     /// dereference it. Use `memcpy_htod` / `memcpy_dtoh` for data transfer.
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
-        // Try pool first — avoids expensive cuMemAlloc syscall
-        if let Some(ptr) = pool_try_alloc(size_bytes) {
-            #[cfg(test)]
-            crate::memory::stats::cuda_alloc(size_bytes);
-            return ptr;
-        }
+        if size_bytes == 0 { return std::ptr::null_mut(); }
 
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Async alloc path: use cuMemAllocAsync when enabled (avoids device-wide sync)
         if async_alloc_enabled() {
-            let ptr = alloc_async(size_bytes);
+            let ptr = alloc_async_inner(size_bytes);
             if !ptr.is_null() {
                 #[cfg(test)]
                 crate::memory::stats::cuda_alloc(size_bytes);
                 return ptr;
             }
-            // Fallback: async alloc failed, use sync path below
         }
 
         ensure_context();
-        // Pool miss — allocate the bucket size so it's reusable later
-        let actual_size = if size_bytes <= POOL_MAX_ALLOC && size_bytes > 0 {
-            bucket_size(size_bytes)
-        } else {
-            size_bytes
-        };
-        unsafe {
-            let mut ptr: CUdeviceptr = 0;
-            let result = cuMemAlloc_v2(&mut ptr, actual_size);
-            if result != CUresult::CUDA_SUCCESS {
-                let msg = if matches!(result, CUresult::CUDA_ERROR_ILLEGAL_ADDRESS) {
-                    format!(
-                        "cuMemAlloc({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
-                         This is a DEFERRED error — a prior GPU kernel accessed invalid memory.\n\
-                         To identify the failing kernel, re-run with: nsl run --cuda-sync <file>\n\
-                         Allocation #{}", size_bytes, n
-                    )
-                } else {
-                    format!(
-                        "cuMemAlloc({} bytes) failed after {} allocs: {:?}",
-                        size_bytes, n, result
-                    )
-                };
-                panic!("{}", msg);
-            }
-            let cptr = ptr as *mut c_void;
-            register_cuda_alloc(cptr);
-            // Track bucket size for pool return
-            if actual_size <= POOL_MAX_ALLOC && actual_size > 0 {
-                POOL_SIZE_MAP.lock().unwrap().insert(cptr as usize, actual_size);
-            }
-            #[cfg(test)]
-            crate::memory::stats::cuda_alloc(size_bytes);
-            #[cfg(test)]
-            cuda_size_registry().lock().unwrap().insert(ptr as usize, size_bytes);
-            cptr
+
+        // Attempt 1: caching allocator (cache hit or grow new segment)
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return ptr;
         }
+
+        // === OOM Recovery ===
+        // Step 1: synchronize device — flushes pending async frees
+        unsafe { cuCtxSynchronize(); }
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return ptr;
+        }
+
+        // Step 2: drain caching allocator — release idle segments to driver
+        let pool_freed = pool_drain();
+        if pool_freed > 0 {
+            if let Some(ptr) = caching_alloc(size_bytes) {
+                return ptr;
+            }
+        }
+
+        // Step 3: drain pinned pool (reduces system memory pressure) and retry
+        let _pinned_freed = pinned_pool_drain();
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return ptr;
+        }
+
+        // All recovery failed
+        panic!("{}", oom_diagnostic(size_bytes, n, pool_freed));
     }
 
     // Track all CUDA allocations so we can validate frees
@@ -219,90 +396,12 @@ pub(crate) mod inner {
     }
 
     // ------------------------------------------------------------------
-    // Device memory pool: caches freed allocations by size bucket to
-    // avoid repeated cuMemAlloc syscalls.
-    //
-    // Bucket strategy: round up to next power-of-2 so allocations of
-    // similar sizes reuse the same pool entry. Pool is bounded per
-    // bucket (max 8 cached blocks) to prevent unbounded memory growth.
+    // Device memory pool: PyTorch-style caching allocator with block
+    // splitting, coalescing, and best-fit search. See caching_allocator.rs.
     // ------------------------------------------------------------------
 
-    use std::collections::VecDeque;
-
-    const POOL_MAX_PER_BUCKET: usize = 8;
-    /// Maximum individual allocation size to pool (256 MB). Larger allocations
-    /// bypass the pool and go directly to cuMemAllocManaged/cuMemFree.
-    const POOL_MAX_ALLOC: usize = 256 * 1024 * 1024;
-
-    struct ManagedPool {
-        /// Map from bucket_size -> list of (ptr, actual_alloc_size) free blocks
-        buckets: HashMap<usize, VecDeque<*mut c_void>>,
-    }
-    unsafe impl Send for ManagedPool {}
-
-    static MANAGED_POOL: std::sync::LazyLock<std::sync::Mutex<ManagedPool>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(ManagedPool {
-            buckets: HashMap::new(),
-        }));
-
-    /// Map from ptr -> bucket_size for returning to pool on free.
-    static POOL_SIZE_MAP: std::sync::LazyLock<std::sync::Mutex<HashMap<usize, usize>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-    fn bucket_size(requested: usize) -> usize {
-        if requested == 0 { return 0; }
-        // Round up to next power of 2, minimum 4096
-        let min = 4096usize;
-        let s = requested.max(min);
-        s.next_power_of_two()
-    }
-
-    /// Try to get a cached allocation from the pool.
-    /// Lock ordering: MANAGED_POOL first, then POOL_SIZE_MAP (consistent with pool_try_return).
-    fn pool_try_alloc(size_bytes: usize) -> Option<*mut c_void> {
-        if size_bytes == 0 || size_bytes > POOL_MAX_ALLOC { return None; }
-        let bsize = bucket_size(size_bytes);
-        let ptr = {
-            let mut pool = MANAGED_POOL.lock().unwrap();
-            if let Some(deque) = pool.buckets.get_mut(&bsize) {
-                deque.pop_front()
-            } else {
-                None
-            }
-            // MANAGED_POOL lock dropped here before acquiring POOL_SIZE_MAP
-        };
-        if let Some(ptr) = ptr {
-            POOL_SIZE_MAP.lock().unwrap().insert(ptr as usize, bsize);
-            register_cuda_alloc(ptr);
-            Some(ptr)
-        } else {
-            None
-        }
-    }
-
-    /// Return an allocation to the pool instead of calling cuMemFree.
-    fn pool_try_return(ptr: *mut c_void) -> bool {
-        let bsize = {
-            let mut map = POOL_SIZE_MAP.lock().unwrap();
-            match map.remove(&(ptr as usize)) {
-                Some(s) => s,
-                None => return false,
-            }
-        };
-        if bsize > POOL_MAX_ALLOC { return false; }
-        let mut pool = MANAGED_POOL.lock().unwrap();
-        let deque = pool.buckets.entry(bsize).or_insert_with(VecDeque::new);
-        if deque.len() < POOL_MAX_PER_BUCKET {
-            deque.push_back(ptr);
-            true
-        } else {
-            // Pool full for this bucket — actually free
-            false
-        }
-    }
-
     /// Free device memory allocated by alloc_managed.
-    /// Returns to pool if eligible, otherwise calls cuMemFree.
+    /// Returns to caching allocator's free-list (with coalescing).
     /// Routes async-allocated pointers to cuMemFreeAsync.
     pub(crate) fn free_managed(ptr: *mut c_void) {
         if ptr.is_null() { return; }
@@ -313,13 +412,17 @@ pub(crate) mod inner {
         }
         let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         if !was_cuda { return; }
-        // Try returning to pool first
-        if pool_try_return(ptr) { return; }
-        ensure_context();
-        unsafe {
-            let result = cuMemFree_v2(ptr as CUdeviceptr);
-            if result != CUresult::CUDA_SUCCESS {
-                eprintln!("nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
+        // Return to caching allocator (coalesces with neighbors)
+        let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        if !alloc.free_block(ptr) {
+            // Not tracked by caching allocator — direct free (legacy/fallback)
+            drop(alloc);
+            ensure_context();
+            unsafe {
+                let result = cuMemFree_v2(ptr as CUdeviceptr);
+                if result != CUresult::CUDA_SUCCESS {
+                    eprintln!("nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
+                }
             }
         }
     }
@@ -330,11 +433,18 @@ pub(crate) mod inner {
     // syscalls during training loops (~50+ transfers per step).
     // ------------------------------------------------------------------
 
+    /// Round up to next power-of-2 for pinned pool bucket sizing.
+    fn pinned_bucket_size(requested: usize) -> usize {
+        if requested == 0 { return 0; }
+        let s = requested.max(4096);
+        s.next_power_of_two()
+    }
+
     const PINNED_POOL_MAX_PER_BUCKET: usize = 4;
     const PINNED_POOL_MAX_ALLOC: usize = 64 * 1024 * 1024; // 64 MB
 
     struct PinnedPool {
-        buckets: HashMap<usize, VecDeque<*mut c_void>>,
+        buckets: HashMap<usize, std::collections::VecDeque<*mut c_void>>,
     }
     unsafe impl Send for PinnedPool {}
 
@@ -354,7 +464,7 @@ pub(crate) mod inner {
             // when transferring large tensors (e.g., logits [B, S, V]).
             return crate::memory::checked_alloc(size_bytes) as *mut c_void;
         }
-        let bsize = bucket_size(size_bytes);
+        let bsize = pinned_bucket_size(size_bytes);
         {
             let mut pool = PINNED_POOL.lock().unwrap();
             if let Some(deque) = pool.buckets.get_mut(&bsize) {
@@ -374,9 +484,9 @@ pub(crate) mod inner {
             unsafe { crate::memory::checked_free(ptr as *mut u8, size_bytes); }
             return;
         }
-        let bsize = bucket_size(size_bytes);
+        let bsize = pinned_bucket_size(size_bytes);
         let mut pool = PINNED_POOL.lock().unwrap();
-        let deque = pool.buckets.entry(bsize).or_insert_with(VecDeque::new);
+        let deque = pool.buckets.entry(bsize).or_insert_with(std::collections::VecDeque::new);
         if deque.len() < PINNED_POOL_MAX_PER_BUCKET {
             deque.push_back(ptr);
         } else {
@@ -425,20 +535,14 @@ pub(crate) mod inner {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
     /// Allocate device memory asynchronously on the default stream.
+    /// Falls back to synchronous allocation (with OOM recovery) on failure.
     pub(crate) fn alloc_async(size_bytes: usize) -> *mut c_void {
-        ensure_context();
-        unsafe {
-            let mut ptr: CUdeviceptr = 0;
-            let result = cuMemAllocAsync(&mut ptr, size_bytes, std::ptr::null_mut());
-            if result != CUresult::CUDA_SUCCESS {
-                // Fallback to synchronous allocation
-                return alloc_managed(size_bytes);
-            }
-            let cptr = ptr as *mut c_void;
-            register_cuda_alloc(cptr);
-            ASYNC_ALLOC_SET.lock().unwrap().insert(cptr as usize);
-            cptr
+        let ptr = alloc_async_inner(size_bytes);
+        if !ptr.is_null() {
+            return ptr;
         }
+        // Fallback to synchronous allocation (with OOM recovery)
+        alloc_managed(size_bytes)
     }
 
     /// Free device memory that was allocated via cuMemAllocAsync.
@@ -463,12 +567,20 @@ pub(crate) mod inner {
     }
 
     /// Allocate device-only memory (not accessible from host without explicit copy).
+    /// On OOM, attempts sync + pool drain recovery before panicking.
     pub(crate) fn alloc_device(size_bytes: usize) -> *mut c_void {
         ensure_context();
         unsafe {
             let mut ptr: CUdeviceptr = 0;
             let result = cuMemAlloc_v2(&mut ptr, size_bytes);
-            if result != CUresult::CUDA_SUCCESS {
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return ptr as *mut c_void;
+            }
+
+            // Non-OOM errors: panic immediately
+            if result != CUresult::CUDA_SUCCESS
+                && !matches!(result, CUresult::CUDA_ERROR_OUT_OF_MEMORY)
+            {
                 if matches!(result, CUresult::CUDA_ERROR_ILLEGAL_ADDRESS) {
                     panic!(
                         "cuMemAlloc({} bytes) failed with CUDA_ERROR_ILLEGAL_ADDRESS.\n\
@@ -479,7 +591,27 @@ pub(crate) mod inner {
                 }
                 panic!("cuMemAlloc({} bytes) failed: {:?}", size_bytes, result);
             }
-            ptr as *mut c_void
+
+            // OOM recovery: sync and retry
+            cuCtxSynchronize();
+            ptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return ptr as *mut c_void;
+            }
+
+            // Drain pool and retry
+            let pool_freed = pool_drain();
+            if pool_freed > 0 {
+                ptr = 0;
+                let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+                if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                    return ptr as *mut c_void;
+                }
+            }
+
+            let n = ALLOC_COUNT_DBG.load(std::sync::atomic::Ordering::Relaxed);
+            panic!("{}", oom_diagnostic(size_bytes, n, pool_freed));
         }
     }
 
@@ -745,34 +877,54 @@ pub(crate) use inner::{cu_event_create, cu_event_record, cu_event_elapsed_time, 
 
 // === GPU op helpers ===
 
+/// CPU fallback for a binary elementwise op when GPU allocation fails.
+#[cfg(feature = "cuda")]
+fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
+    let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
+    let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
+    let b_cpu = if unsafe { &*(b_ptr as *const crate::tensor::NslTensor) }.device > 0 {
+        crate::tensor::nsl_tensor_to_device(b_ptr, 0)
+    } else {
+        b_ptr
+    };
+    let op_fn: fn(f64, f64) -> f64 = match kernel_name.trim_end_matches('\0') {
+        "nsl_add_f32" => |x, y| x + y,
+        "nsl_sub_f32" => |x, y| x - y,
+        "nsl_mul_f32" => |x, y| x * y,
+        "nsl_div_f32" => |x, y| x / y,
+        _ => |x, y| x + y,
+    };
+    let result_cpu = crate::cpu::tensor_elementwise_op(a_cpu, b_cpu, op_fn);
+    // Transfer back to GPU — alloc_managed will retry/drain internally
+    let result_gpu = crate::tensor::nsl_tensor_to_device(result_cpu, a.device as i64);
+    if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
+    if b_cpu != b_ptr { crate::tensor::nsl_tensor_free(b_cpu); }
+    crate::tensor::nsl_tensor_free(result_cpu);
+    result_gpu
+}
+
 /// GPU elementwise binary op.
+/// Falls back to CPU on GPU OOM (transfers to CPU, computes, transfers back).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
+    inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
     // Fall back to CPU broadcast path when shapes differ
     if a.len != b.len {
-        // Transfer both to CPU, do broadcast op, transfer result back
-        let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
-        let b_cpu = if b.device > 0 { crate::tensor::nsl_tensor_to_device(b_ptr, 0) } else { b_ptr };
-        let op_fn: fn(f64, f64) -> f64 = match kernel_name.trim_end_matches('\0') {
-            "nsl_add_f32" => |x, y| x + y,
-            "nsl_sub_f32" => |x, y| x - y,
-            "nsl_mul_f32" => |x, y| x * y,
-            "nsl_div_f32" => |x, y| x / y,
-            _ => |x, y| x + y,
-        };
-        let result_cpu = crate::cpu::tensor_elementwise_op(a_cpu, b_cpu, op_fn);
-        let result_gpu = crate::tensor::nsl_tensor_to_device(result_cpu, a.device as i64);
-        if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
-        if b_cpu != b_ptr { crate::tensor::nsl_tensor_free(b_cpu); }
-        crate::tensor::nsl_tensor_free(result_cpu);
-        return result_gpu;
+        return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
     }
 
     let n = a.len as usize;
-    let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
+    // Try GPU allocation — fall back to CPU on OOM
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            eprintln!("[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
+            return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
+        }
+    };
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
@@ -816,13 +968,53 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     out_ptr as i64
 }
 
+/// CPU fallback for a unary elementwise op when GPU allocation fails.
+#[cfg(feature = "cuda")]
+fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
+    let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
+    let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
+    let op_fn: fn(f64) -> f64 = match kernel_name.trim_end_matches('\0') {
+        "nsl_neg_f32" => |x| -x,
+        "nsl_relu_f32" => |x| if x > 0.0 { x } else { 0.0 },
+        "nsl_exp_f32" => |x| x.exp(),
+        "nsl_log_f32" => |x| x.ln(),
+        "nsl_sqrt_f32" => |x| x.sqrt(),
+        "nsl_abs_f32" => |x| x.abs(),
+        "nsl_sign_f32" => |x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 },
+        "nsl_sigmoid_f32" => |x| 1.0 / (1.0 + (-x).exp()),
+        "nsl_tanh_f32" => |x| x.tanh(),
+        _ => |x| x,
+    };
+    let a_t = unsafe { &*(a_cpu as *const crate::tensor::NslTensor) };
+    let n = a_t.len as usize;
+    let src = a_t.data as *const f64;
+    let result_ptr = crate::tensor::nsl_tensor_zeros(a_t.ndim as i64, a_t.shape, a_t.len);
+    let result_t = unsafe { &*(result_ptr as *const crate::tensor::NslTensor) };
+    let dst = result_t.data as *mut f64;
+    for i in 0..n {
+        unsafe { *dst.add(i) = op_fn(*src.add(i)); }
+    }
+    let result_gpu = crate::tensor::nsl_tensor_to_device(result_ptr, a.device as i64);
+    if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
+    crate::tensor::nsl_tensor_free(result_ptr);
+    result_gpu
+}
+
 /// GPU elementwise unary op.
+/// Falls back to CPU on GPU OOM.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
+    inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let n = a.len as usize;
-    let out_data = inner::alloc_managed(n * 4);
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            eprintln!("[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
+            return cpu_fallback_unary(a_ptr, kernel_name);
+        }
+    };
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
@@ -945,6 +1137,7 @@ pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_n
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
+    inner::set_oom_context("matmul_f32");
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
 
@@ -1097,6 +1290,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
+    inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);
@@ -1143,6 +1337,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
+    inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
     assert_eq!(a.len, b.len, "GPU backward: length mismatch between grad and saved tensors");
@@ -1236,6 +1431,7 @@ pub(crate) fn gpu_silu_backward(grad: i64, input: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     use crate::tensor::NslTensor;
+    inner::set_oom_context("clamp_f32");
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);
@@ -1436,6 +1632,7 @@ pub extern "C" fn nsl_kernel_launch(
 /// Returns a GPU tensor (device = weight.device).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
+    inner::set_oom_context("embedding_lookup");
     use crate::tensor::NslTensor;
 
     let weight = unsafe { &*(weight_ptr as *const NslTensor) };
@@ -1525,6 +1722,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 /// Both tensor and bias must be on GPU (f32). Allocates output via alloc_managed.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
+    inner::set_oom_context("bias_add");
     use crate::tensor::NslTensor;
     use fused_kernels::BIAS_ADD_F32_PTX;
 
@@ -1598,6 +1796,7 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 /// Input must be on GPU (f32). Output allocated via alloc_managed.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
+    inner::set_oom_context("softmax_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::SOFTMAX_F32_PTX;
 
@@ -1655,6 +1854,7 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
 /// Returns a new GPU tensor with the reduced dimension removed (or kept as 1 if keepdim).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
+    inner::set_oom_context("sum_dim_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::SUM_DIM_F32_PTX;
 
@@ -1732,6 +1932,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
 /// GPU global sum reduction (all elements to a single scalar). Input must be on GPU (f32), contiguous.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
+    inner::set_oom_context("global_sum_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::GLOBAL_SUM_F32_PTX;
 
@@ -2011,6 +2212,7 @@ pub(crate) fn gpu_det_scatter_add_f32(
 /// GPU per-dimension max reduction. Input must be on GPU (f32), contiguous.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
+    inner::set_oom_context("max_dim_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::MAX_DIM_F32_PTX;
 
@@ -2086,6 +2288,7 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
 /// Normalizes along the last dimension.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, eps: f32) -> i64 {
+    inner::set_oom_context("layernorm_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::LAYERNORM_F32_PTX;
 
@@ -2151,6 +2354,7 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
 /// Normalizes along the last dimension.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
+    inner::set_oom_context("rmsnorm_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::RMSNORM_F32_PTX;
 
@@ -2309,6 +2513,7 @@ pub(crate) fn gpu_scatter_add_f32(
 /// Both input and indices must be on GPU (f32).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
+    inner::set_oom_context("gather_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::GATHER_F32_PTX;
 
@@ -2410,6 +2615,7 @@ pub(crate) fn gpu_conv2d_f32(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64,
     stride_h: u64, stride_w: u64, pad_h: u64, pad_w: u64,
 ) -> i64 {
+    inner::set_oom_context("conv2d_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::CONV2D_F32_PTX;
 
@@ -2609,6 +2815,7 @@ pub(crate) fn gpu_maxpool2d_f32(
 /// Returns (output_ptr, mask_ptr) — mask is f32 on GPU for backward pass.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
+    inner::set_oom_context("dropout_f32");
     use crate::tensor::NslTensor;
     use fused_kernels::DROPOUT_F32_PTX;
     use std::sync::atomic::{AtomicU64, Ordering};
