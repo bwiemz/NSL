@@ -372,7 +372,15 @@ fn lower_single_op(
                     let dim = if inputs.len() > 1 { inputs[1] } else { builder.ins().iconst(cl_types::I64, 0) };
                     call(compiler, builder, "nsl_tensor_unsqueeze", &[inputs[0], dim])
                 }
-                "item" => call(compiler, builder, "nsl_tensor_item", &[inputs[0]]),
+                "item" => {
+                    // .item() extracts a scalar from a tensor. In source AD context,
+                    // we keep it as a scalar tensor (not raw f64) so it stays in the
+                    // tensor domain and can be used with tensor ops like mul/add.
+                    // Extract f64, then wrap back into 0-dim tensor.
+                    let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
+                    let dt = builder.ins().iconst(cl_types::I64, 1); // f32
+                    call(compiler, builder, "nsl_tensor_scalar", &[f64_val, dt])
+                }
                 // Trigonometric (forward pass — backward handled by tape)
                 "cos" => call(compiler, builder, "nsl_tensor_cos", &[inputs[0]]),
                 "sin" => call(compiler, builder, "nsl_tensor_sin", &[inputs[0]]),
@@ -394,17 +402,32 @@ fn lower_single_op(
                     let rt_name = format!("nsl_tensor_{}", name);
                     call(compiler, builder, &rt_name, &inputs)
                 }
-                // Scalar type conversion (non-differentiable)
-                "int" | "float" => {
-                    // Pass through the input — type conversion is semantic-only in the Wengert graph
+                // Scalar type conversion
+                "int" => {
+                    // In source AD, int() receives a scalar tensor (from .item()).
+                    // Extract the f64 value, convert to i64.
+                    let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
+                    Ok(builder.ins().fcvt_to_sint(cl_types::I64, f64_val))
+                }
+                "float" => {
+                    // float() on a scalar tensor → extract f64 value, wrap back to scalar tensor
+                    // (keeps it in tensor domain for compatibility with other tensor ops)
                     Ok(inputs[0])
                 }
                 "subscript" => {
-                    // inputs[0] = list/tensor, inputs[1] = index
-                    call(compiler, builder, "nsl_list_get", &[inputs[0], inputs[1]])
+                    // inputs[0] = list/shape, inputs[1] = index (scalar tensor from Constant)
+                    // Extract index as raw i64 from scalar tensor, then get list element.
+                    let idx = {
+                        let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[1]])?;
+                        builder.ins().fcvt_to_sint(cl_types::I64, f64_val)
+                    };
+                    // nsl_list_get returns raw i64 (dimension value, NOT tensor pointer).
+                    // This is a non-tensor value in the Wengert graph.
+                    call(compiler, builder, "nsl_list_get", &[inputs[0], idx])
                 }
                 "list" => {
-                    // Build a list from input elements
+                    // Build a list from input elements.
+                    // Elements are raw i64 values (dim sizes from subscript, or i64 from int()).
                     let list = call(compiler, builder, "nsl_list_new", &[])?;
                     for &inp in &inputs {
                         call(compiler, builder, "nsl_list_push", &[list, inp])?;

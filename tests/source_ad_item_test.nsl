@@ -1,0 +1,20 @@
+# Minimal test: source AD with .item() only (no reshape)
+
+model ScalarModel:
+    w: Tensor = randn([4, 1])
+    _scale: Tensor = full([1], 2.0)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let s = self._scale.item()
+        let out = x @ self.w
+        return mean(out * out) * s
+
+let m = ScalarModel()
+let x = randn([2, 4])
+
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let loss = m.forward(x)
+
+print("source_ad_item_test: PASS")
