@@ -355,7 +355,39 @@ fn lower_single_op(
                     call(compiler, builder, "nsl_tensor_transpose", &[inputs[0], inputs[1], inputs[2]])
                 }
                 "contiguous" => call(compiler, builder, "nsl_tensor_contiguous", &[inputs[0]]),
+                "expand" => call(compiler, builder, "nsl_tensor_expand", &[inputs[0], inputs[1]]),
+                "squeeze" => call(compiler, builder, "nsl_tensor_squeeze", &[inputs[0]]),
+                "unsqueeze" => {
+                    let dim = if inputs.len() > 1 { inputs[1] } else { builder.ins().iconst(cl_types::I64, 0) };
+                    call(compiler, builder, "nsl_tensor_unsqueeze", &[inputs[0], dim])
+                }
                 "item" => call(compiler, builder, "nsl_tensor_item", &[inputs[0]]),
+                // Trigonometric (forward pass — backward handled by tape)
+                "cos" => call(compiler, builder, "nsl_tensor_cos", &[inputs[0]]),
+                "sin" => call(compiler, builder, "nsl_tensor_sin", &[inputs[0]]),
+                "rotate_half" => call(compiler, builder, "nsl_tensor_rotate_half", &[inputs[0]]),
+                // Tensor construction (non-differentiable, used for shape/position computation)
+                "arange" => {
+                    if inputs.len() >= 2 {
+                        call(compiler, builder, "nsl_arange", &[inputs[0], inputs[1]])
+                    } else if inputs.len() == 1 {
+                        let zero = builder.ins().f64const(0.0);
+                        let dt = builder.ins().iconst(cl_types::I64, 1);
+                        let zero_t = call(compiler, builder, "nsl_tensor_scalar", &[zero, dt])?;
+                        call(compiler, builder, "nsl_arange", &[zero_t, inputs[0]])
+                    } else {
+                        Err(CodegenError::new("arange requires at least 1 argument".to_string()))
+                    }
+                }
+                "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
+                    let rt_name = format!("nsl_tensor_{}", name);
+                    call(compiler, builder, &rt_name, &inputs)
+                }
+                // Scalar type conversion (non-differentiable)
+                "int" | "float" => {
+                    // Pass through the input — type conversion is semantic-only in the Wengert graph
+                    Ok(inputs[0])
+                }
                 "subscript" => {
                     // inputs[0] = list/tensor, inputs[1] = index
                     call(compiler, builder, "nsl_list_get", &[inputs[0], inputs[1]])

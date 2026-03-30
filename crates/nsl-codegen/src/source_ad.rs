@@ -703,6 +703,9 @@ impl<'a> WengertExtractor<'a> {
     fn extract_stmt(&mut self, stmt: &nsl_ast::stmt::Stmt) -> bool {
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value: Some(val), .. } => {
+                let var_name = if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
+                    self.interner.resolve(sym.0).unwrap_or("?").to_string()
+                } else { "?".to_string() };
                 if let Some(var) = self.extract_expr(val) {
                     if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
                         self.symbol_to_var.insert(*sym, var);
@@ -711,6 +714,7 @@ impl<'a> WengertExtractor<'a> {
                     }
                     true
                 } else {
+                    eprintln!("[source-ad] VarDecl '{}' extraction failed", var_name);
                     false
                 }
             }
@@ -774,6 +778,21 @@ impl<'a> WengertExtractor<'a> {
 
             // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
+                // Early check: .shape and .ndim are always non-differentiable metadata
+                let member_name = self.interner.resolve(member.0).unwrap_or("?");
+                if member_name == "shape" || member_name == "ndim" {
+                    if let Some(obj_var) = self.extract_expr(object) {
+                        let result = self.alloc_var();
+                        self.list.ops.push(WengertOp {
+                            id: self.list.ops.len() as u32, result,
+                            op: PrimalOp::Passthrough(member_name.to_string()),
+                            inputs: vec![obj_var],
+                            saved_for_backward: false, checkpointed: false,
+                        });
+                        return Some(result);
+                    }
+                }
+
                 // Resolve the object prefix to a string
                 let obj_prefix = match &object.kind {
                     ExprKind::SelfRef => self.self_context.clone(),
@@ -790,40 +809,10 @@ impl<'a> WengertExtractor<'a> {
                     _ => None,
                 };
 
-                // If object is a known variable (not a model/context), treat .shape/.ndim as passthrough
-                if obj_prefix.is_none() {
-                    let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
-                    if field_name == "shape" || field_name == "ndim" {
-                        if let Some(obj_var) = self.extract_expr(object) {
-                            let result = self.alloc_var();
-                            self.list.ops.push(WengertOp {
-                                id: self.list.ops.len() as u32, result,
-                                op: PrimalOp::Passthrough(field_name),
-                                inputs: vec![obj_var],
-                                saved_for_backward: false, checkpointed: false,
-                            });
-                            return Some(result);
-                        }
-                    }
-                }
+                // shape/ndim already handled by early check above
 
                 if let Some(prefix) = obj_prefix {
                     let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
-
-                    // .shape/.ndim on a variable with known context — still a passthrough
-                    if field_name == "shape" || field_name == "ndim" {
-                        if let Some(obj_var) = self.extract_expr(object) {
-                            let result = self.alloc_var();
-                            self.list.ops.push(WengertOp {
-                                id: self.list.ops.len() as u32, result,
-                                op: PrimalOp::Passthrough(field_name.clone()),
-                                inputs: vec![obj_var],
-                                saved_for_backward: false, checkpointed: false,
-                            });
-                            return Some(result);
-                        }
-                    }
-
                     let compound = format!("{}.{}", prefix, field_name);
 
                     // Check if we already have this compound name registered
@@ -1003,7 +992,7 @@ impl<'a> WengertExtractor<'a> {
                 if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let method_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
                     match method_name.as_str() {
-                        "reshape" | "contiguous" | "transpose" | "item" => {
+                        "reshape" | "contiguous" | "transpose" | "item" | "expand" | "squeeze" | "unsqueeze" => {
                             let obj = self.extract_expr(object)?;
                             let mut inputs = vec![obj];
                             for arg in args {
@@ -1069,8 +1058,9 @@ impl<'a> WengertExtractor<'a> {
                     "softmax" => PrimalOp::Softmax { dim: -1 },
                     "log_softmax" => PrimalOp::LogSoftmax { dim: -1 },
                     // Normalization
-                    "layer_norm" => PrimalOp::LayerNorm { eps: 1e-5 },
-                    "batch_norm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
+                    "layer_norm" | "layernorm" => PrimalOp::LayerNorm { eps: 1e-5 },
+                    "batch_norm" | "batchnorm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
+                    "rmsnorm" | "rms_norm" => PrimalOp::LayerNorm { eps: 1e-5 },
                     // Loss functions
                     "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
                     "mse_loss" => PrimalOp::MSELoss,
@@ -1083,8 +1073,30 @@ impl<'a> WengertExtractor<'a> {
                     // Indexing
                     "embedding" | "embedding_lookup" => PrimalOp::Embedding,
                     "gather" => PrimalOp::Gather { dim: 0 },
-                    // Transpose requires dim args -- proper arg extraction in M40c
-                    "transpose" => return None,
+                    // Attention
+                    "scaled_dot_product_attention" => PrimalOp::ScaledDotProductAttention { causal: true },
+                    // Transpose (default: swap last two dims)
+                    "transpose" => PrimalOp::Transpose { dim0: 0, dim1: 1 },
+                    // Shape ops (non-differentiable passthrough for AD)
+                    "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze" => {
+                        PrimalOp::Passthrough(func_name.clone())
+                    }
+                    // Trigonometric (for RoPE)
+                    "tensor_cos" | "cos" => PrimalOp::Passthrough("cos".into()),
+                    "tensor_sin" | "sin" => PrimalOp::Passthrough("sin".into()),
+                    "rotate_half" => PrimalOp::Passthrough("rotate_half".into()),
+                    // Tensor construction (non-differentiable)
+                    "arange" | "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
+                        PrimalOp::Passthrough(func_name.clone())
+                    }
+                    // Concatenation
+                    "tensor_cat" | "cat" => PrimalOp::Concat { dim: -1 },
+                    // Negative
+                    "neg" => PrimalOp::Neg,
+                    // Clamp
+                    "clamp" => PrimalOp::Clamp { min: f64::NEG_INFINITY, max: f64::INFINITY },
+                    // Scalar extraction (non-differentiable)
+                    "int" | "float" => PrimalOp::Passthrough(func_name.clone()),
                     _ => return None, // Unknown function -- can't differentiate
                 };
 
@@ -1469,6 +1481,7 @@ impl<'a> WengertExtractor<'a> {
 
         // Extract the method body
         if !self.extract_stmts(&fn_def.body.stmts) {
+            eprintln!("[source-ad] inline method body extraction failed (self_context={:?})", self.self_context);
             return None;
         }
 

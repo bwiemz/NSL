@@ -29,7 +29,11 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
     let b = NslTensor::from_ptr(b_c);
     let len = a.len as usize;
     let b_len = b.len as usize;
-    assert!(b_len >= len, "nsl_tensor_compare: b tensor too short ({} < {})", b_len, len);
+    let b_is_scalar = b_len == 1;
+    // Allow scalar broadcasting: if b has 1 element, broadcast it to match a's length
+    if !b_is_scalar && b_len < len {
+        panic!("nsl_tensor_compare: b tensor too short ({} < {})", b_len, len);
+    }
     let ndim = a.ndim;
     let dtype = a.dtype;
     let shape = NslTensor::copy_shape(a.shape, ndim);
@@ -39,7 +43,7 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
         let buf = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len {
             let av = unsafe { *a.data_f32().add(i) };
-            let bv = unsafe { *b.data_f32().add(i) };
+            let bv = unsafe { *b.data_f32().add(if b_is_scalar { 0 } else { i }) };
             let result = compare_f32(av, bv, cmp_kind);
             unsafe { *buf.add(i) = if result { 1.0_f32 } else { 0.0_f32 } };
         }
@@ -48,7 +52,7 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
         let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
         for i in 0..len {
             let av = unsafe { *a.data_f64().add(i) };
-            let bv = unsafe { *b.data_f64().add(i) };
+            let bv = unsafe { *b.data_f64().add(if b_is_scalar { 0 } else { i }) };
             let result = compare_f64(av, bv, cmp_kind);
             unsafe { *buf.add(i) = if result { 1.0_f64 } else { 0.0_f64 } };
         }
@@ -107,8 +111,12 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     let fv = NslTensor::from_ptr(false_c);
 
     let len = tv.len as usize;
-    assert!(cond.len as usize >= len, "nsl_tensor_where: cond tensor too short ({} < {})", cond.len, len);
-    assert!(fv.len as usize >= len, "nsl_tensor_where: false tensor too short ({} < {})", fv.len, len);
+    let cond_scalar = cond.len == 1;
+    let fv_scalar = fv.len == 1;
+    let tv_scalar = tv.len == 1;
+    // Determine output length: max of all inputs (broadcast scalars)
+    let out_len = len.max(cond.len as usize).max(fv.len as usize);
+    let len = out_len;
     let ndim = tv.ndim;
     let dtype = tv.dtype;
     let shape = NslTensor::copy_shape(tv.shape, ndim);
@@ -117,16 +125,16 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     let data: *mut c_void = if dtype == 1 {
         let buf = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len {
-            // cond may be any dtype; we use the same dtype to read it as tv
+            let ci = if cond_scalar { 0 } else { i };
             let c_val = if cond.dtype == 1 {
-                unsafe { *cond.data_f32().add(i) != 0.0_f32 }
+                unsafe { *cond.data_f32().add(ci) != 0.0_f32 }
             } else {
-                unsafe { *cond.data_f64().add(i) != 0.0_f64 }
+                unsafe { *cond.data_f64().add(ci) != 0.0_f64 }
             };
             let val = if c_val {
-                unsafe { *tv.data_f32().add(i) }
+                unsafe { *tv.data_f32().add(if tv_scalar { 0 } else { i }) }
             } else {
-                unsafe { *fv.data_f32().add(i) }
+                unsafe { *fv.data_f32().add(if fv_scalar { 0 } else { i }) }
             };
             unsafe { *buf.add(i) = val };
         }
@@ -134,22 +142,23 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     } else {
         let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
         for i in 0..len {
+            let ci = if cond_scalar { 0 } else { i };
             let c_val = if cond.dtype == 1 {
-                unsafe { *cond.data_f32().add(i) != 0.0_f32 }
+                unsafe { *cond.data_f32().add(ci) != 0.0_f32 }
             } else {
-                unsafe { *cond.data_f64().add(i) != 0.0_f64 }
+                unsafe { *cond.data_f64().add(ci) != 0.0_f64 }
             };
             let val = if c_val {
-                unsafe { *tv.data_f64().add(i) }
+                unsafe { *tv.data_f64().add(if tv_scalar { 0 } else { i }) }
             } else {
-                unsafe { *fv.data_f64().add(i) }
+                unsafe { *fv.data_f64().add(if fv_scalar { 0 } else { i }) }
             };
             unsafe { *buf.add(i) = val };
         }
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor::new(data, shape, strides, ndim, tv.len, tv.device, dtype, 1, 0));
+    let result = Box::new(NslTensor::new(data, shape, strides, ndim, len as i64, tv.device, dtype, 1, 0));
     let out = NslTensor::publish(result);
     nsl_tensor_free(cond_c);
     nsl_tensor_free(true_c);
