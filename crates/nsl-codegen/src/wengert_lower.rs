@@ -5,7 +5,7 @@
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
-use crate::wengert::{CompareKind, PrimalOp, VarId, WengertList, WengertOp};
+use crate::wengert::{CompareKind, PrimalOp, VarId, WengertList, WengertOp, WengertType, type_for_op};
 use crate::CodegenError;
 use cranelift_codegen::ir::{types as cl_types, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
@@ -25,9 +25,13 @@ pub fn compile_wengert_ops(
     primal_vars: &VarMap,
 ) -> Result<VarMap, CodegenError> {
     let mut var_map = primal_vars.clone();
+    // Clone var_types so the lowerer can look up types for any VarId and
+    // also tag newly-created adjoint VarIds.
+    let mut var_types = wengert.var_types.clone();
     for op in &wengert.ops {
-        let result_val = lower_single_op(compiler, builder, op, &var_map)?;
+        let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
         var_map.insert(op.result, result_val);
+        var_types.insert(op.result, type_for_op(&op.op));
     }
     Ok(var_map)
 }
@@ -69,6 +73,7 @@ fn lower_single_op(
     builder: &mut FunctionBuilder,
     op: &WengertOp,
     var_map: &VarMap,
+    var_types: &HashMap<VarId, WengertType>,
 ) -> Result<Value, CodegenError> {
     // Marker ops (leaf nodes) — should be in primal_vars
     match &op.op {
@@ -83,9 +88,23 @@ fn lower_single_op(
             return Ok(builder.ins().iconst(cl_types::I64, 0));
         }
         PrimalOp::Constant(val) => {
-            let v = builder.ins().f64const(*val);
-            let dt = builder.ins().iconst(cl_types::I64, 1); // f32 default
-            return call(compiler, builder, "nsl_tensor_scalar", &[v, dt]);
+            let ty = var_types.get(&op.result).copied().unwrap_or(WengertType::Tensor);
+            match ty {
+                WengertType::Scalar => {
+                    // Raw f64 constant — used as scalar value (e.g., index 0.0 for subscript)
+                    return Ok(builder.ins().f64const(*val));
+                }
+                WengertType::Integer => {
+                    // Raw i64 constant — used as integer (e.g., dimension size)
+                    return Ok(builder.ins().iconst(cl_types::I64, *val as i64));
+                }
+                WengertType::Tensor | WengertType::List => {
+                    // Scalar tensor for use in tensor ops (default)
+                    let v = builder.ins().f64const(*val);
+                    let dt = builder.ins().iconst(cl_types::I64, 1); // f32 default
+                    return call(compiler, builder, "nsl_tensor_scalar", &[v, dt]);
+                }
+            }
         }
         _ => {}
     }
@@ -373,10 +392,9 @@ fn lower_single_op(
                     call(compiler, builder, "nsl_tensor_unsqueeze", &[inputs[0], dim])
                 }
                 "item" => {
-                    // .item() extracts a scalar from a tensor. In source AD context,
-                    // we keep it as a scalar tensor (not raw f64) so it stays in the
-                    // tensor domain and can be used with tensor ops like mul/add.
-                    // Extract f64, then wrap back into 0-dim tensor.
+                    // .item() extracts a scalar from a tensor and wraps back into a
+                    // 0-dim scalar tensor so it stays in the tensor domain for
+                    // arithmetic ops (Mul, Add, etc.).
                     let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
                     let dt = builder.ins().iconst(cl_types::I64, 1); // f32
                     call(compiler, builder, "nsl_tensor_scalar", &[f64_val, dt])
@@ -404,33 +422,80 @@ fn lower_single_op(
                 }
                 // Scalar type conversion
                 "int" => {
-                    // In source AD, int() receives a scalar tensor (from .item()).
-                    // Extract the f64 value, convert to i64.
-                    let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
-                    Ok(builder.ins().fcvt_to_sint(cl_types::I64, f64_val))
+                    // Convert to i64. Input may be:
+                    //   - Scalar (f64): convert with fcvt_to_sint
+                    //   - Tensor: extract f64 via nsl_tensor_item, then convert
+                    //   - Integer (i64): already an integer, pass through
+                    let input_ty = op.inputs.first()
+                        .and_then(|vid| var_types.get(vid).copied())
+                        .unwrap_or(WengertType::Tensor);
+                    match input_ty {
+                        WengertType::Integer => Ok(inputs[0]),
+                        WengertType::Scalar => {
+                            Ok(builder.ins().fcvt_to_sint(cl_types::I64, inputs[0]))
+                        }
+                        _ => {
+                            // Tensor or List — extract f64 first
+                            let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
+                            Ok(builder.ins().fcvt_to_sint(cl_types::I64, f64_val))
+                        }
+                    }
                 }
                 "float" => {
-                    // float() on a scalar tensor → extract f64 value, wrap back to scalar tensor
-                    // (keeps it in tensor domain for compatibility with other tensor ops)
-                    Ok(inputs[0])
+                    // float() converts to f64 scalar. Input may be:
+                    //   - Integer (i64): convert with fcvt_from_sint
+                    //   - Scalar (f64): pass through
+                    //   - Tensor: extract f64 via nsl_tensor_item
+                    let input_ty = op.inputs.first()
+                        .and_then(|vid| var_types.get(vid).copied())
+                        .unwrap_or(WengertType::Tensor);
+                    match input_ty {
+                        WengertType::Scalar => Ok(inputs[0]),
+                        WengertType::Integer => {
+                            Ok(builder.ins().fcvt_from_sint(cl_types::F64, inputs[0]))
+                        }
+                        _ => {
+                            // Tensor — extract f64
+                            call(compiler, builder, "nsl_tensor_item", &[inputs[0]])
+                        }
+                    }
                 }
                 "subscript" => {
-                    // inputs[0] = list/shape, inputs[1] = index (scalar tensor from Constant)
-                    // Extract index as raw i64 from scalar tensor, then get list element.
-                    let idx = {
-                        let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[1]])?;
-                        builder.ins().fcvt_to_sint(cl_types::I64, f64_val)
+                    // inputs[0] = list/shape, inputs[1] = index
+                    // Index may be Scalar (f64 from Constant), Integer (i64), or Tensor.
+                    let idx_ty = op.inputs.get(1)
+                        .and_then(|vid| var_types.get(vid).copied())
+                        .unwrap_or(WengertType::Tensor);
+                    let idx = match idx_ty {
+                        WengertType::Integer => inputs[1],
+                        WengertType::Scalar => {
+                            builder.ins().fcvt_to_sint(cl_types::I64, inputs[1])
+                        }
+                        _ => {
+                            // Tensor — extract f64 then convert to i64
+                            let f64_val = call(compiler, builder, "nsl_tensor_item", &[inputs[1]])?;
+                            builder.ins().fcvt_to_sint(cl_types::I64, f64_val)
+                        }
                     };
                     // nsl_list_get returns raw i64 (dimension value, NOT tensor pointer).
-                    // This is a non-tensor value in the Wengert graph.
                     call(compiler, builder, "nsl_list_get", &[inputs[0], idx])
                 }
                 "list" => {
                     // Build a list from input elements.
-                    // Elements are raw i64 values (dim sizes from subscript, or i64 from int()).
+                    // Elements may be i64 (from subscript/int), f64 (from Constant/Scalar),
+                    // or tensor pointers. nsl_list_push expects i64.
                     let list = call(compiler, builder, "nsl_list_new", &[])?;
-                    for &inp in &inputs {
-                        call(compiler, builder, "nsl_list_push", &[list, inp])?;
+                    for (i, &inp) in inputs.iter().enumerate() {
+                        let val_ty = op.inputs.get(i)
+                            .and_then(|vid| var_types.get(vid).copied())
+                            .unwrap_or(WengertType::Integer);
+                        let val = match val_ty {
+                            WengertType::Scalar => {
+                                builder.ins().fcvt_to_sint(cl_types::I64, inp)
+                            }
+                            _ => inp, // Integer, List, Tensor — already i64
+                        };
+                        call(compiler, builder, "nsl_list_push", &[list, val])?;
                     }
                     Ok(list)
                 }

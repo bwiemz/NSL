@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
-use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp};
+use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, type_for_op};
 
 // M40b: Wengert extraction from typed AST
 use nsl_ast::expr::ExprKind;
@@ -75,10 +75,16 @@ impl AdjointGenerator {
             }
         }
 
+        // Build var_types for the adjoint graph from its ops.
+        let mut adjoint_var_types = HashMap::new();
+        for op in &self.adjoint_ops {
+            adjoint_var_types.insert(op.result, type_for_op(&op.op));
+        }
         WengertList {
             ops: self.adjoint_ops.clone(),
             output: loss_bar,
             var_names: HashMap::new(),
+            var_types: adjoint_var_types,
         }
     }
 
@@ -610,6 +616,7 @@ impl<'a> WengertExtractor<'a> {
                 ops: Vec::new(),
                 output: 0,
                 var_names: HashMap::new(),
+                var_types: HashMap::new(),
             },
             symbol_to_var: HashMap::new(),
             next_var: 0,
@@ -631,6 +638,13 @@ impl<'a> WengertExtractor<'a> {
         id
     }
 
+    /// Push a WengertOp and auto-tag its result VarId with the correct WengertType.
+    fn push_op(&mut self, op: WengertOp) {
+        let ty = type_for_op(&op.op);
+        self.list.var_types.insert(op.result, ty);
+        self.list.ops.push(op);
+    }
+
     /// Register a parameter symbol (needs gradient).
     pub fn register_param(&mut self, sym: nsl_ast::Symbol) {
         let var = self.alloc_var();
@@ -639,7 +653,7 @@ impl<'a> WengertExtractor<'a> {
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
         self.list.var_names.insert(var, name.clone());
-        self.list.ops.push(WengertOp {
+        self.push_op(WengertOp {
             id: self.list.ops.len() as u32,
             result: var,
             op: PrimalOp::Param(name),
@@ -656,7 +670,7 @@ impl<'a> WengertExtractor<'a> {
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
         self.list.var_names.insert(var, name.clone());
-        self.list.ops.push(WengertOp {
+        self.push_op(WengertOp {
             id: self.list.ops.len() as u32,
             result: var,
             op: PrimalOp::Input(name),
@@ -786,7 +800,7 @@ impl<'a> WengertExtractor<'a> {
                 if member_name == "shape" || member_name == "ndim" {
                     if let Some(obj_var) = self.extract_expr(object) {
                         let result = self.alloc_var();
-                        self.list.ops.push(WengertOp {
+                        self.push_op(WengertOp {
                             id: self.list.ops.len() as u32, result,
                             op: PrimalOp::Passthrough(member_name.to_string()),
                             inputs: vec![obj_var],
@@ -837,7 +851,7 @@ impl<'a> WengertExtractor<'a> {
                     if is_model_param {
                         self.param_symbols.insert(*member);
                         self.named_param_vars.push((compound.clone(), var));
-                        self.list.ops.push(WengertOp {
+                        self.push_op(WengertOp {
                             id: self.list.ops.len() as u32,
                             result: var,
                             op: PrimalOp::Param(compound),
@@ -847,7 +861,7 @@ impl<'a> WengertExtractor<'a> {
                         });
                     } else {
                         // Data input — no gradient needed
-                        self.list.ops.push(WengertOp {
+                        self.push_op(WengertOp {
                             id: self.list.ops.len() as u32,
                             result: var,
                             op: PrimalOp::Input(compound),
@@ -881,7 +895,7 @@ impl<'a> WengertExtractor<'a> {
                     BinOp::MatMul => PrimalOp::Matmul,
                     _ => return None, // Unsupported op for AD
                 };
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: primal_op,
@@ -899,7 +913,7 @@ impl<'a> WengertExtractor<'a> {
                     AstUnaryOp::Neg => PrimalOp::Neg,
                     _ => return None,
                 };
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: primal_op,
@@ -1002,7 +1016,7 @@ impl<'a> WengertExtractor<'a> {
                                 inputs.push(self.extract_expr(&arg.value)?);
                             }
                             let result = self.alloc_var();
-                            self.list.ops.push(WengertOp {
+                            self.push_op(WengertOp {
                                 id: self.list.ops.len() as u32, result,
                                 op: PrimalOp::Passthrough(method_name),
                                 inputs,
@@ -1014,7 +1028,7 @@ impl<'a> WengertExtractor<'a> {
                             // Property access compiled as method — non-diff metadata
                             let obj = self.extract_expr(object)?;
                             let result = self.alloc_var();
-                            self.list.ops.push(WengertOp {
+                            self.push_op(WengertOp {
                                 id: self.list.ops.len() as u32, result,
                                 op: PrimalOp::Passthrough(method_name),
                                 inputs: vec![obj],
@@ -1103,7 +1117,7 @@ impl<'a> WengertExtractor<'a> {
                     _ => return None, // Unknown function -- can't differentiate
                 };
 
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: primal_op,
@@ -1116,7 +1130,7 @@ impl<'a> WengertExtractor<'a> {
 
             ExprKind::IntLiteral(v) => {
                 let result = self.alloc_var();
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: PrimalOp::Constant(*v as f64),
@@ -1129,7 +1143,7 @@ impl<'a> WengertExtractor<'a> {
 
             ExprKind::FloatLiteral(v) => {
                 let result = self.alloc_var();
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: PrimalOp::Constant(*v),
@@ -1142,7 +1156,7 @@ impl<'a> WengertExtractor<'a> {
 
             ExprKind::BoolLiteral(v) => {
                 let result = self.alloc_var();
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: PrimalOp::Constant(if *v { 1.0 } else { 0.0 }),
@@ -1161,7 +1175,7 @@ impl<'a> WengertExtractor<'a> {
                 if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
                     let idx = self.extract_expr(idx_expr)?;
                     let result = self.alloc_var();
-                    self.list.ops.push(WengertOp {
+                    self.push_op(WengertOp {
                         id: self.list.ops.len() as u32, result,
                         op: PrimalOp::Passthrough("subscript".into()),
                         inputs: vec![obj, idx],
@@ -1176,7 +1190,7 @@ impl<'a> WengertExtractor<'a> {
                 let mut inputs = Vec::new();
                 for elem in elements { inputs.push(self.extract_expr(elem)?); }
                 let result = self.alloc_var();
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32, result,
                     op: PrimalOp::Passthrough("list".into()),
                     inputs,
@@ -1295,7 +1309,7 @@ impl<'a> WengertExtractor<'a> {
                 if t != e {
                     // Different values in each branch — emit Select
                     let result = self.alloc_var();
-                    self.list.ops.push(WengertOp {
+                    self.push_op(WengertOp {
                         id: self.list.ops.len() as u32,
                         result,
                         op: PrimalOp::Select,
@@ -1323,7 +1337,7 @@ impl<'a> WengertExtractor<'a> {
             let e_out = if else_output != output_before { else_output } else { output_before };
             if t_out != e_out {
                 let result = self.alloc_var();
-                self.list.ops.push(WengertOp {
+                self.push_op(WengertOp {
                     id: self.list.ops.len() as u32,
                     result,
                     op: PrimalOp::Select,
@@ -1589,7 +1603,7 @@ mod tests {
                 make_op(1, 1, PrimalOp::Input("b".into()), vec![]),
                 make_op(2, 2, PrimalOp::Add, vec![0, 1]),
             ],
-            output: 2, var_names: HashMap::new(),
+            output: 2, var_names: HashMap::new(), var_types: HashMap::new(),
         };
         let mut gen = AdjointGenerator::new(10);
         let adjoint = gen.generate(&primal);
@@ -1606,7 +1620,7 @@ mod tests {
                 make_op(1, 1, PrimalOp::Input("B".into()), vec![]),
                 make_op(2, 2, PrimalOp::Matmul, vec![0, 1]),
             ],
-            output: 2, var_names: HashMap::new(),
+            output: 2, var_names: HashMap::new(), var_types: HashMap::new(),
         };
         let mut gen = AdjointGenerator::new(10);
         let _adjoint = gen.generate(&primal);
@@ -1643,14 +1657,14 @@ mod tests {
                 make_op(0, 0, PrimalOp::Input("x".into()), vec![]),
                 make_op(1, 1, PrimalOp::Relu, vec![0]),
             ],
-            output: 1, var_names: HashMap::new(),
+            output: 1, var_names: HashMap::new(), var_types: HashMap::new(),
         };
         let adjoint = WengertList {
             ops: vec![
                 make_op(0, 10, PrimalOp::Constant(1.0), vec![]),
                 make_op(1, 11, PrimalOp::Mul, vec![10, 0]),
             ],
-            output: 10, var_names: HashMap::new(),
+            output: 10, var_names: HashMap::new(), var_types: HashMap::new(),
         };
         let saved = analyze_saved_tensors(&primal, &adjoint);
         assert_eq!(saved.len(), 1);
@@ -1661,11 +1675,11 @@ mod tests {
     fn test_saved_tensor_no_cross_reference() {
         let primal = WengertList {
             ops: vec![make_op(0, 0, PrimalOp::Input("x".into()), vec![])],
-            output: 0, var_names: HashMap::new(),
+            output: 0, var_names: HashMap::new(), var_types: HashMap::new(),
         };
         let adjoint = WengertList {
             ops: vec![make_op(0, 10, PrimalOp::Constant(1.0), vec![])],
-            output: 10, var_names: HashMap::new(),
+            output: 10, var_names: HashMap::new(), var_types: HashMap::new(),
         };
         assert!(analyze_saved_tensors(&primal, &adjoint).is_empty());
     }
@@ -2064,6 +2078,7 @@ mod tests {
             ],
             output: 3,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(10);
@@ -2096,6 +2111,7 @@ mod tests {
             ],
             output: 3,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(10);
@@ -2126,6 +2142,7 @@ mod tests {
             ],
             output: 5,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(10);
@@ -2239,6 +2256,7 @@ mod tests {
             ],
             output: 7,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(20);
@@ -2331,6 +2349,7 @@ mod tests {
             ],
             output: 5,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(20);
@@ -2621,6 +2640,7 @@ mod tests {
             ],
             output: 6,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let max_var = 6;
@@ -2686,6 +2706,7 @@ mod tests {
             ],
             output: 7,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let max_var = 7;
@@ -2739,6 +2760,7 @@ mod tests {
             ],
             output: 5,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(20);
@@ -2784,6 +2806,7 @@ mod tests {
             ],
             output: 7,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(20);
@@ -2824,6 +2847,7 @@ mod tests {
             ],
             output: 5,
             var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
 
         let mut gen = AdjointGenerator::new(20);
