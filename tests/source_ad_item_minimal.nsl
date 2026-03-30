@@ -1,0 +1,18 @@
+# Absolute minimal .item() test
+model M:
+    w: Tensor = randn([2, 1])
+    _s: Tensor = full([1], 3.0)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let out = x @ self.w
+        return mean(out * out)
+
+let m = M()
+let x = randn([4, 2])
+
+train(model = m, epochs = 2):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let loss = m.forward(x)
+
+print("PASS")

@@ -2059,14 +2059,17 @@ impl Compiler<'_> {
                     if primal_vars.contains_key(vid) { continue; }
                     // Extract the field name (last component after '.')
                     let field_name = compound_name.rsplit('.').next().unwrap_or("");
-                    // Find this field in the layout
-                    for (i, field) in layout.fields.iter().enumerate() {
+                    // Load directly from model struct via field offset (not param_list index,
+                    // because param_list order may differ from layout.fields order)
+                    for field in layout.fields.iter() {
                         if field.name == field_name {
-                            let idx = builder.ins().iconst(cl_types::I64, i as i64);
-                            let param_val = self.compile_call_by_name(
-                                builder, "nsl_list_get", &[param_list, idx],
-                            )?;
-                            primal_vars.insert(*vid, param_val);
+                            let field_val = builder.ins().load(
+                                field.cl_type,
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                model_ptr,
+                                field.offset as i32,
+                            );
+                            primal_vars.insert(*vid, field_val);
                             break;
                         }
                     }
@@ -2135,12 +2138,34 @@ impl Compiler<'_> {
                 let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let named_params = extractor.named_param_var_ids();
                 if !named_params.is_empty() {
-                    // Inlined path: iterate over compound-named parameters
+                    // Inlined path: iterate over compound-named parameters.
+                    // Only push gradients up to num_params_val (runtime param count)
+                    // to match param_list length. Config fields collected after
+                    // optimizable params are skipped.
+                    let num_p = self.compile_call_by_name(builder, "nsl_list_len", &[param_list])?;
+                    let mut pushed = 0usize;
                     for (_name, vid) in named_params {
+                        // Only push first N gradients matching param_list
+                        let push_check = builder.ins().iconst(cl_types::I64, pushed as i64);
+                        let should_push = builder.ins().icmp(
+                            IntCC::SignedLessThan, push_check, num_p
+                        );
+                        let push_block = builder.create_block();
+                        let skip_block = builder.create_block();
+                        builder.ins().brif(should_push, push_block, &[], skip_block, &[]);
+
+                        builder.switch_to_block(push_block);
+                        builder.seal_block(push_block);
                         let grad_val = gen.adjoint_of(*vid)
                             .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
                             .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
                         self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
+                        builder.ins().jump(skip_block, &[]);
+
+                        builder.switch_to_block(skip_block);
+                        builder.seal_block(skip_block);
+                        state.current_block = Some(skip_block);
+                        pushed += 1;
                     }
                 } else {
                     // Legacy flat path: match by field name
