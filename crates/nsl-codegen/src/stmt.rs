@@ -2138,34 +2138,37 @@ impl Compiler<'_> {
                 let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let named_params = extractor.named_param_var_ids();
                 if !named_params.is_empty() {
-                    // Inlined path: iterate over compound-named parameters.
-                    // Only push gradients up to num_params_val (runtime param count)
-                    // to match param_list length. Config fields collected after
-                    // optimizable params are skipped.
-                    let num_p = self.compile_call_by_name(builder, "nsl_list_len", &[param_list])?;
-                    let mut pushed = 0usize;
-                    for (_name, vid) in named_params {
-                        // Only push first N gradients matching param_list
-                        let push_check = builder.ins().iconst(cl_types::I64, pushed as i64);
-                        let should_push = builder.ins().icmp(
-                            IntCC::SignedLessThan, push_check, num_p
-                        );
-                        let push_block = builder.create_block();
-                        let skip_block = builder.create_block();
-                        builder.ins().brif(should_push, push_block, &[], skip_block, &[]);
+                    // Build gradients aligned to param_list order.
+                    // param_list is collected at runtime via nsl_collect_model_params
+                    // which scans struct memory slots in order. named_param_var_ids
+                    // only contains params actually accessed in the forward method.
+                    //
+                    // Strategy: iterate layout fields (compile-time order matches
+                    // struct memory order). For each field, check if the extractor
+                    // has a gradient for it. Push gradient or zero accordingly.
+                    for (i, field) in layout.fields.iter().enumerate() {
+                        // Find matching named param by field name suffix
+                        let has_grad = named_params.iter()
+                            .find(|(name, _)| {
+                                name.rsplit('.').next().unwrap_or("") == field.name
+                            })
+                            .and_then(|(_, vid)| gen.adjoint_of(*vid))
+                            .and_then(|adj_vid| grad_vars.get(&adj_vid).copied());
 
-                        builder.switch_to_block(push_block);
-                        builder.seal_block(push_block);
-                        let grad_val = gen.adjoint_of(*vid)
-                            .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
-                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        let grad_val = if let Some(gv) = has_grad {
+                            gv
+                        } else {
+                            // No gradient for this param (unused in forward).
+                            // Create a zeros_like tensor so the optimizer doesn't get null.
+                            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                            let param_ptr = self.compile_call_by_name(
+                                builder, "nsl_list_get", &[param_list, idx],
+                            )?;
+                            self.compile_call_by_name(
+                                builder, "nsl_tensor_zeros_like", &[param_ptr],
+                            )?
+                        };
                         self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
-                        builder.ins().jump(skip_block, &[]);
-
-                        builder.switch_to_block(skip_block);
-                        builder.seal_block(skip_block);
-                        state.current_block = Some(skip_block);
-                        pushed += 1;
                     }
                 } else {
                     // Legacy flat path: match by field name
