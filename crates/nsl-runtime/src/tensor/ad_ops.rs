@@ -6,10 +6,12 @@
 //! repeat (avgpool backward), and inverse RoPE rotation.
 
 use std::ffi::c_void;
+use std::sync::atomic::Ordering;
 
+use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
-use super::{nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
+use super::{nsl_tensor_contiguous, nsl_tensor_free, nsl_tensor_to_device, NslTensor};
 
 // ---------------------------------------------------------------------------
 // 1. nsl_tensor_compare — elementwise comparison → 0.0 / 1.0 tensor
@@ -405,6 +407,45 @@ pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i6
 /// `result[i] = x[i] - logsumexp(x, dim)`
 #[no_mangle]
 pub extern "C" fn nsl_tensor_logsoftmax(tensor_ptr: i64, dim: i64) -> i64 {
+    // GPU dispatch: native GPU log_softmax kernel (last dim) or CPU-redirect (other dims)
+    {
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.device > 0 {
+            let ndim = tensor.ndim;
+            let d = if dim < 0 { ndim + dim } else { dim };
+            // Native GPU kernel for last-dim log_softmax (the common case)
+            if d == ndim - 1 {
+                #[cfg(feature = "cuda")]
+                {
+                    let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+                    let result = crate::cuda::gpu_log_softmax_f32(c_ptr);
+                    if c_ptr != tensor_ptr {
+                        nsl_tensor_free(c_ptr);
+                    }
+                    if autodiff::is_recording() {
+                        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+                        autodiff::maybe_record(autodiff::TapeOp::LogSoftmax {
+                            a: tensor_ptr, out: result, saved_out: result, dim,
+                        });
+                    }
+                    return result;
+                }
+            }
+            // Non-last-dim: CPU redirect
+            let cpu_t = nsl_tensor_to_device(tensor_ptr, 0);
+            let result = nsl_tensor_logsoftmax(cpu_t, dim);
+            let gpu_result = nsl_tensor_to_device(result, tensor.device as i64);
+            nsl_tensor_free(cpu_t);
+            nsl_tensor_free(result);
+            if autodiff::is_recording() {
+                NslTensor::from_ptr(gpu_result).refcount.fetch_add(1, Ordering::SeqCst);
+                autodiff::maybe_record(autodiff::TapeOp::LogSoftmax {
+                    a: tensor_ptr, out: gpu_result, saved_out: gpu_result, dim,
+                });
+            }
+            return gpu_result;
+        }
+    }
     let a_c = nsl_tensor_contiguous(tensor_ptr);
     let a = NslTensor::from_ptr(a_c);
     let len = a.len as usize;
@@ -478,6 +519,12 @@ pub extern "C" fn nsl_tensor_logsoftmax(tensor_ptr: i64, dim: i64) -> i64 {
     let result = Box::new(NslTensor::new(data, shape, strides, a.ndim, a.len, a.device, dtype, 1, 0));
     let out = NslTensor::publish(result);
     nsl_tensor_free(a_c);
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(out).refcount.fetch_add(1, Ordering::SeqCst);
+        autodiff::maybe_record(autodiff::TapeOp::LogSoftmax {
+            a: tensor_ptr, out, saved_out: out, dim,
+        });
+    }
     out
 }
 

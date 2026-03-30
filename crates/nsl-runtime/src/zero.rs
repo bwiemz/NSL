@@ -451,6 +451,7 @@ mod tests {
             owns_data: 0, // borrowed
             data_owner: 0,
             slab_managed: 0,
+            tape_id: 0,
         };
 
         let tensor_ptr = &tensor as *const NslTensor as i64;
@@ -478,6 +479,7 @@ mod tests {
             owns_data: 0,
             data_owner: 0,
             slab_managed: 0,
+            tape_id: 0,
         };
 
         let src_tensor = NslTensor {
@@ -493,6 +495,7 @@ mod tests {
             owns_data: 0,
             data_owner: 0,
             slab_managed: 0,
+            tape_id: 0,
         };
 
         let dst_ptr = &dst_tensor as *const NslTensor as i64;

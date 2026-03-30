@@ -1,0 +1,24 @@
+from nsl.nn.losses import mse_loss
+
+model Tiny:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+
+let x = full([2, 2], 2.0)
+let y = zeros([2, 2])
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "test_checkpoint.nslm")
+
+let m2 = Tiny()
+model_load(m2, "test_checkpoint.nslm")
+
+print("checkpoint_roundtrip: PASS")

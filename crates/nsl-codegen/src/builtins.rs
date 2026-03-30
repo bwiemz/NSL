@@ -141,6 +141,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor memory
     ("nsl_tensor_clone", &[types::I64], Some(types::I64)),
     ("nsl_tensor_free", &[types::I64], None),
+    ("nsl_tensor_free_if_valid", &[types::I64], None),
     ("nsl_tensor_retain", &[types::I64], None),
     ("nsl_tensor_release", &[types::I64], None),
     ("nsl_tensor_scope_begin", &[], None),
@@ -173,6 +174,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tape_backward", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tape_pause", &[], None),
     ("nsl_tape_resume", &[], None),
+    // Gradient checkpointing
+    ("nsl_checkpoint_record", &[types::I64, types::I64, types::I64, types::I64], None),
     // Element-wise tensor ops (M14)
     ("nsl_tensor_exp", &[types::I64], Some(types::I64)),
     ("nsl_tensor_log", &[types::I64], Some(types::I64)),

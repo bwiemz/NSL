@@ -102,6 +102,8 @@ pub struct ModelMetadata {
     pub model_var_types: HashMap<Symbol, String>,
     pub imported_model_names: HashSet<String>,
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
+    /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
+    pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
 }
 
 impl ModelMetadata {
@@ -112,6 +114,7 @@ impl ModelMetadata {
             model_var_types: HashMap::new(),
             imported_model_names: HashSet::new(),
             paged_kv_configs: HashMap::new(),
+            model_method_bodies: HashMap::new(),
         }
     }
 }

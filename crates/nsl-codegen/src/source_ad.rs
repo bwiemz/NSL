@@ -581,6 +581,21 @@ pub struct WengertExtractor<'a> {
     is_static: bool,
     /// Symbols that are model parameters (need gradients).
     param_symbols: HashSet<nsl_ast::Symbol>,
+    /// Current "self" context prefix for model method inlining (e.g., "m", "m.blocks.0").
+    self_context: Option<String>,
+    /// Model method bodies: model_type_name -> method_name -> FnDef
+    model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    /// Model field type info: model_type -> field_name -> type_string
+    model_field_types: HashMap<String, HashMap<String, String>>,
+    /// Context prefix -> model type name mapping (e.g., "m" -> "NSLCoder", "m.blocks.0" -> "TransformerBlock")
+    context_to_model_type: HashMap<String, String>,
+    /// Override resolved names for symbols (loop var -> "m.blocks.0")
+    symbol_name_overrides: HashMap<nsl_ast::Symbol, String>,
+    /// Model instance type for symbols (loop var -> "TransformerBlock")
+    model_instance_types: HashMap<nsl_ast::Symbol, String>,
+    /// Named parameter VarIds with their compound names (e.g., "m.blocks.0.attn.w_q" -> VarId).
+    /// Used for gradient collection since compound params don't have unique AST Symbols.
+    named_param_vars: Vec<(String, VarId)>,
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -596,6 +611,13 @@ impl<'a> WengertExtractor<'a> {
             next_var: 0,
             is_static: true,
             param_symbols: HashSet::new(),
+            self_context: None,
+            model_method_bodies: HashMap::new(),
+            model_field_types: HashMap::new(),
+            context_to_model_type: HashMap::new(),
+            symbol_name_overrides: HashMap::new(),
+            model_instance_types: HashMap::new(),
+            named_param_vars: Vec::new(),
         }
     }
 
@@ -638,6 +660,32 @@ impl<'a> WengertExtractor<'a> {
             saved_for_backward: false,
             checkpointed: false,
         });
+    }
+
+    /// Set model method bodies for inline expansion during extraction.
+    /// Maps model_type_name -> method_name -> FnDef.
+    pub fn set_model_method_bodies(&mut self, bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>) {
+        self.model_method_bodies = bodies;
+    }
+
+    /// Set model field type info for for-loop unrolling.
+    /// Maps model_type -> field_name -> type_string (e.g., "[TransformerBlock;8]").
+    pub fn set_model_field_types(&mut self, types: HashMap<String, HashMap<String, String>>) {
+        self.model_field_types = types;
+    }
+
+    /// Register a model instance: maps a variable symbol to a model type name
+    /// and sets up the context-to-type mapping for method inlining.
+    pub fn register_model_instance(&mut self, sym: nsl_ast::Symbol, model_type: &str) {
+        let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+        self.model_instance_types.insert(sym, model_type.to_string());
+        self.context_to_model_type.insert(name, model_type.to_string());
+    }
+
+    /// Get named parameter VarIds with their compound names.
+    /// Returns (compound_name, VarId) pairs for gradient collection.
+    pub fn named_param_var_ids(&self) -> &[(String, VarId)] {
+        &self.named_param_vars
     }
 
     /// Extract statements into the Wengert list.
@@ -686,11 +734,9 @@ impl<'a> WengertExtractor<'a> {
                 false
             }
 
-            // For loops: could be static if range is compile-time known,
-            // but conservatively mark as dynamic for M40b
-            StmtKind::For { .. } => {
-                self.is_static = false;
-                false
+            // For loops: try to unroll if iterating over a model's FixedArray field
+            StmtKind::For { pattern, iterable, body } => {
+                self.try_unroll_for(pattern, iterable, body)
             }
 
             // If/else: extract both branches, emit Select ops for variables
@@ -699,7 +745,21 @@ impl<'a> WengertExtractor<'a> {
                 self.extract_if(condition, then_block, elif_clauses, else_block.as_ref())
             }
 
-            // Other statements pass through (assign, decorated, etc.)
+            // Assignment: x = expr (rebind variable to new value)
+            StmtKind::Assign { target, op, value } => {
+                if let nsl_ast::operator::AssignOp::Assign = op {
+                    if let nsl_ast::expr::ExprKind::Ident(sym) = &target.kind {
+                        if let Some(var) = self.extract_expr(value) {
+                            self.symbol_to_var.insert(*sym, var);
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+                true
+            }
+
+            // Other statements pass through (decorated, etc.)
             _ => true,
         }
     }
@@ -712,35 +772,101 @@ impl<'a> WengertExtractor<'a> {
                 self.symbol_to_var.get(sym).copied()
             }
 
-            // Field access: m.w → treat as a parameter reference
+            // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
-                // Try to resolve as "object.member" compound name
-                if let ExprKind::Ident(obj_sym) = &object.kind {
-                    let obj_name = self.interner.resolve(obj_sym.0).unwrap_or("?");
-                    let field_name = self.interner.resolve(member.0).unwrap_or("?");
-                    let compound = format!("{}.{}", obj_name, field_name);
+                // Resolve the object prefix to a string
+                let obj_prefix = match &object.kind {
+                    ExprKind::SelfRef => self.self_context.clone(),
+                    ExprKind::Ident(obj_sym) => {
+                        self.symbol_name_overrides.get(obj_sym).cloned()
+                            .or_else(|| Some(self.interner.resolve(obj_sym.0).unwrap_or("?").to_string()))
+                    }
+                    // Nested member access: self.attn.w_q -> resolve recursively
+                    ExprKind::MemberAccess { .. } => {
+                        // Try to extract the inner object as a compound name
+                        // by recursively resolving the member access chain
+                        self.resolve_member_access_prefix(object)
+                    }
+                    _ => None,
+                };
 
-                    // Check if we already registered this compound name
-                    if let Some(&var) = self.symbol_to_var.get(member) {
-                        return Some(var);
+                // If object is a known variable (not a model/context), treat .shape/.ndim as passthrough
+                if obj_prefix.is_none() {
+                    let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                    if field_name == "shape" || field_name == "ndim" {
+                        if let Some(obj_var) = self.extract_expr(object) {
+                            let result = self.alloc_var();
+                            self.list.ops.push(WengertOp {
+                                id: self.list.ops.len() as u32, result,
+                                op: PrimalOp::Passthrough(field_name),
+                                inputs: vec![obj_var],
+                                saved_for_backward: false, checkpointed: false,
+                            });
+                            return Some(result);
+                        }
+                    }
+                }
+
+                if let Some(prefix) = obj_prefix {
+                    let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+
+                    // .shape/.ndim on a variable with known context — still a passthrough
+                    if field_name == "shape" || field_name == "ndim" {
+                        if let Some(obj_var) = self.extract_expr(object) {
+                            let result = self.alloc_var();
+                            self.list.ops.push(WengertOp {
+                                id: self.list.ops.len() as u32, result,
+                                op: PrimalOp::Passthrough(field_name.clone()),
+                                inputs: vec![obj_var],
+                                saved_for_backward: false, checkpointed: false,
+                            });
+                            return Some(result);
+                        }
                     }
 
-                    // Register as a new parameter input
+                    let compound = format!("{}.{}", prefix, field_name);
+
+                    // Check if we already have this compound name registered
+                    // (search by name in var_names to handle cross-iteration reuse)
+                    for (vid, name) in &self.list.var_names {
+                        if name == &compound {
+                            return Some(*vid);
+                        }
+                    }
+
+                    // Determine if this is a model parameter (prefix is a known model context)
+                    // or a data access (e.g., batch.input_ids). Only model params get gradients.
+                    let is_model_param = self.context_to_model_type.contains_key(&prefix);
+
                     let var = self.alloc_var();
                     self.symbol_to_var.insert(*member, var);
-                    self.param_symbols.insert(*member);
                     self.list.var_names.insert(var, compound.clone());
-                    self.list.ops.push(WengertOp {
-                        id: self.list.ops.len() as u32,
-                        result: var,
-                        op: PrimalOp::Param(compound),
-                        inputs: vec![],
-                        saved_for_backward: false,
-                        checkpointed: false,
-                    });
+
+                    if is_model_param {
+                        self.param_symbols.insert(*member);
+                        self.named_param_vars.push((compound.clone(), var));
+                        self.list.ops.push(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: var,
+                            op: PrimalOp::Param(compound),
+                            inputs: vec![],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                    } else {
+                        // Data input — no gradient needed
+                        self.list.ops.push(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: var,
+                            op: PrimalOp::Input(compound),
+                            inputs: vec![],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                    }
                     Some(var)
                 } else {
-                    None // Complex object expression
+                    None // Can't resolve object prefix
                 }
             }
 
@@ -793,7 +919,122 @@ impl<'a> WengertExtractor<'a> {
             }
 
             ExprKind::Call { callee, args } => {
-                // Extract function name
+                // Check for model method calls: obj.method(args) → inline the method body
+                if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                    let method_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+
+                    // Case 1: obj.method(args) where obj is an Ident (e.g., m.forward_train(...))
+                    if let ExprKind::Ident(obj_sym) = &object.kind {
+                        let obj_type = self.model_instance_types.get(obj_sym).cloned();
+                        if let Some(model_type) = obj_type {
+                            let fn_def = self.model_method_bodies
+                                .get(&model_type)
+                                .and_then(|methods| methods.get(&method_name))
+                                .cloned();
+                            if let Some(fn_def) = fn_def {
+                                return self.inline_method_call(*obj_sym, &fn_def, args);
+                            }
+                        }
+                    }
+
+                    // Case 2: self.sub_model.method(args) — nested model field
+                    if let ExprKind::MemberAccess { object: inner_obj, member: field_sym } = &object.kind {
+                        let obj_prefix = match &inner_obj.kind {
+                            ExprKind::SelfRef => self.self_context.clone(),
+                            ExprKind::Ident(sym) => {
+                                self.symbol_name_overrides.get(sym).cloned()
+                                    .or_else(|| Some(self.interner.resolve(sym.0).unwrap_or("?").to_string()))
+                            }
+                            _ => None,
+                        };
+                        if let Some(prefix) = obj_prefix {
+                            let sub_field_name = self.interner.resolve(field_sym.0).unwrap_or("?").to_string();
+                            let compound_prefix = format!("{}.{}", prefix, sub_field_name);
+
+                            // Find the sub-model's type
+                            let parent_type = self.context_to_model_type.get(&prefix).cloned();
+                            let sub_type = parent_type.as_ref()
+                                .and_then(|pt| self.model_field_types.get(pt))
+                                .and_then(|fields| fields.get(&sub_field_name))
+                                .cloned();
+
+                            if let Some(ref sub_type) = sub_type {
+                                // Don't try to inline array types
+                                if !sub_type.starts_with('[') {
+                                    self.context_to_model_type.insert(compound_prefix.clone(), sub_type.clone());
+                                    let fn_def = self.model_method_bodies
+                                        .get(sub_type)
+                                        .and_then(|methods| methods.get(&method_name))
+                                        .cloned();
+                                    if let Some(fn_def) = fn_def {
+                                        let saved_self = self.self_context.clone();
+                                        self.self_context = Some(compound_prefix);
+                                        let result = self.inline_method_call_inner(&fn_def, args);
+                                        self.self_context = saved_self;
+                                        return result;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Case 3: self.method(args) — method call on self
+                    if let ExprKind::SelfRef = &object.kind {
+                        if let Some(ctx) = self.self_context.clone() {
+                            let model_type = self.context_to_model_type.get(&ctx).cloned();
+                            if let Some(model_type) = model_type {
+                                let fn_def = self.model_method_bodies
+                                    .get(&model_type)
+                                    .and_then(|methods| methods.get(&method_name))
+                                    .cloned();
+                                if let Some(fn_def) = fn_def {
+                                    let saved_self = self.self_context.clone();
+                                    self.self_context = Some(ctx);
+                                    let result = self.inline_method_call_inner(&fn_def, args);
+                                    self.self_context = saved_self;
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Tensor method calls: tensor.reshape(arg), tensor.transpose(d0, d1), etc.
+                if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                    let method_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                    match method_name.as_str() {
+                        "reshape" | "contiguous" | "transpose" | "item" => {
+                            let obj = self.extract_expr(object)?;
+                            let mut inputs = vec![obj];
+                            for arg in args {
+                                inputs.push(self.extract_expr(&arg.value)?);
+                            }
+                            let result = self.alloc_var();
+                            self.list.ops.push(WengertOp {
+                                id: self.list.ops.len() as u32, result,
+                                op: PrimalOp::Passthrough(method_name),
+                                inputs,
+                                saved_for_backward: false, checkpointed: false,
+                            });
+                            return Some(result);
+                        }
+                        "shape" | "ndim" => {
+                            // Property access compiled as method — non-diff metadata
+                            let obj = self.extract_expr(object)?;
+                            let result = self.alloc_var();
+                            self.list.ops.push(WengertOp {
+                                id: self.list.ops.len() as u32, result,
+                                op: PrimalOp::Passthrough(method_name),
+                                inputs: vec![obj],
+                                saved_for_backward: false, checkpointed: false,
+                            });
+                            return Some(result);
+                        }
+                        _ => {} // fall through to model method handling
+                    }
+                }
+
+                // Regular function call: extract function name
                 let func_name = if let ExprKind::Ident(sym) = &callee.kind {
                     self.interner.resolve(sym.0).unwrap_or("").to_string()
                 } else {
@@ -840,7 +1081,7 @@ impl<'a> WengertExtractor<'a> {
                     // Regularization
                     "dropout" => PrimalOp::Dropout { p: 0.1 },
                     // Indexing
-                    "embedding" => PrimalOp::Embedding,
+                    "embedding" | "embedding_lookup" => PrimalOp::Embedding,
                     "gather" => PrimalOp::Gather { dim: 0 },
                     // Transpose requires dim args -- proper arg extraction in M40c
                     "transpose" => return None,
@@ -884,7 +1125,50 @@ impl<'a> WengertExtractor<'a> {
                 Some(result)
             }
 
+            ExprKind::BoolLiteral(v) => {
+                let result = self.alloc_var();
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: PrimalOp::Constant(if *v { 1.0 } else { 0.0 }),
+                    inputs: vec![],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
             ExprKind::Paren(inner) => self.extract_expr(inner),
+
+            // Subscript: list[index] — non-differentiable metadata access
+            ExprKind::Subscript { object, index } => {
+                let obj = self.extract_expr(object)?;
+                if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
+                    let idx = self.extract_expr(idx_expr)?;
+                    let result = self.alloc_var();
+                    self.list.ops.push(WengertOp {
+                        id: self.list.ops.len() as u32, result,
+                        op: PrimalOp::Passthrough("subscript".into()),
+                        inputs: vec![obj, idx],
+                        saved_for_backward: false, checkpointed: false,
+                    });
+                    Some(result)
+                } else { None }
+            }
+
+            // List literal: [a, b, c] — non-differentiable
+            ExprKind::ListLiteral(elements) => {
+                let mut inputs = Vec::new();
+                for elem in elements { inputs.push(self.extract_expr(elem)?); }
+                let result = self.alloc_var();
+                self.list.ops.push(WengertOp {
+                    id: self.list.ops.len() as u32, result,
+                    op: PrimalOp::Passthrough("list".into()),
+                    inputs,
+                    saved_for_backward: false, checkpointed: false,
+                });
+                Some(result)
+            }
 
             // Anything else we can't extract -> fallback
             _ => None,
@@ -1039,6 +1323,187 @@ impl<'a> WengertExtractor<'a> {
         }
 
         true
+    }
+
+    /// Try to unroll a for-loop over a model's FixedArray field.
+    ///
+    /// Handles patterns like `for block in self.blocks: x = block.forward(x, training)`
+    /// by resolving the iterable to a model field with a known array type (e.g.,
+    /// `[TransformerBlock; 8]`), then expanding the loop body N times with the loop
+    /// variable bound to each element's context prefix (e.g., "m.blocks.0", "m.blocks.1", ...).
+    fn try_unroll_for(
+        &mut self,
+        pattern: &nsl_ast::pattern::Pattern,
+        iterable: &nsl_ast::expr::Expr,
+        body: &nsl_ast::stmt::Block,
+    ) -> bool {
+        // 1. Get the loop variable symbol
+        let loop_var_sym = match &pattern.kind {
+            nsl_ast::pattern::PatternKind::Ident(sym) => *sym,
+            _ => { self.is_static = false; return false; }
+        };
+
+        // 2. Resolve the iterable to get the context prefix and field name.
+        // The iterable is `self.blocks` (MemberAccess { SelfRef, "blocks" })
+        // or `m.blocks` (MemberAccess { Ident(m), "blocks" }).
+        let (context_prefix, field_name) = match &iterable.kind {
+            ExprKind::MemberAccess { object, member } => {
+                let ctx = match &object.kind {
+                    ExprKind::SelfRef => self.self_context.clone(),
+                    ExprKind::Ident(sym) => {
+                        self.symbol_name_overrides.get(sym).cloned()
+                            .or_else(|| Some(self.interner.resolve(sym.0).unwrap_or("?").to_string()))
+                    }
+                    _ => None,
+                };
+                let fname = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                match ctx {
+                    Some(c) => (c, fname),
+                    None => { self.is_static = false; return false; }
+                }
+            }
+            _ => { self.is_static = false; return false; }
+        };
+
+        // 3. Look up the model type for this context, then the field type
+        let model_type = self.context_to_model_type.get(&context_prefix).cloned();
+        let field_info = model_type.as_ref()
+            .and_then(|mt| self.model_field_types.get(mt))
+            .and_then(|fields| fields.get(&field_name))
+            .cloned();
+
+        // Parse field type — look for "[ModelType;N]" pattern
+        let (element_type, size) = match field_info {
+            Some(ref ft) if ft.starts_with('[') && ft.contains(';') => {
+                // Parse "[TransformerBlock;8]"
+                let inner = ft.trim_start_matches('[').trim_end_matches(']');
+                let parts: Vec<&str> = inner.split(';').collect();
+                if parts.len() == 2 {
+                    let elem = parts[0].trim().to_string();
+                    let n = parts[1].trim().parse::<usize>().unwrap_or(0);
+                    if n > 0 { (elem, n) } else { self.is_static = false; return false; }
+                } else { self.is_static = false; return false; }
+            }
+            _ => { self.is_static = false; return false; }
+        };
+
+        // 4. Unroll: for i in 0..size, expand loop body with adjusted context
+        for i in 0..size {
+            let iter_prefix = format!("{}.{}.{}", context_prefix, field_name, i);
+
+            // Register this iteration's context -> model type
+            self.context_to_model_type.insert(iter_prefix.clone(), element_type.clone());
+
+            // Map loop variable to this iteration's context
+            self.symbol_name_overrides.insert(loop_var_sym, iter_prefix.clone());
+            self.model_instance_types.insert(loop_var_sym, element_type.clone());
+
+            // Save and set self_context for nested self.field resolution
+            let saved_self = self.self_context.clone();
+
+            // Extract loop body
+            if !self.extract_stmts(&body.stmts) {
+                self.self_context = saved_self;
+                self.is_static = false;
+                return false;
+            }
+
+            self.self_context = saved_self;
+        }
+
+        // Clean up overrides
+        self.symbol_name_overrides.remove(&loop_var_sym);
+        true
+    }
+
+    /// Inline a model method call, given the model instance symbol and FnDef.
+    /// Sets up self_context from the symbol name (or override) and delegates
+    /// to `inline_method_call_inner`.
+    fn inline_method_call(
+        &mut self,
+        model_sym: nsl_ast::Symbol,
+        fn_def: &nsl_ast::decl::FnDef,
+        call_args: &[nsl_ast::expr::Arg],
+    ) -> Option<VarId> {
+        let name = self.symbol_name_overrides.get(&model_sym).cloned()
+            .unwrap_or_else(|| self.interner.resolve(model_sym.0).unwrap_or("?").to_string());
+        let saved_self = self.self_context.clone();
+        self.self_context = Some(name);
+        let result = self.inline_method_call_inner(fn_def, call_args);
+        self.self_context = saved_self;
+        result
+    }
+
+    /// Inline a model method call's body into the current Wengert list.
+    /// Assumes `self.self_context` is already set to the correct prefix.
+    ///
+    /// Binds call arguments to the method's parameter names (skipping `self`),
+    /// then extracts the method body statements. The return value of the method
+    /// becomes the result of this expression.
+    fn inline_method_call_inner(
+        &mut self,
+        fn_def: &nsl_ast::decl::FnDef,
+        call_args: &[nsl_ast::expr::Arg],
+    ) -> Option<VarId> {
+        // Bind call arguments to parameter names (skip `self` param)
+        let mut arg_idx = 0;
+        for param in &fn_def.params {
+            let param_name = self.interner.resolve(param.name.0).unwrap_or("?").to_string();
+            if param_name == "self" {
+                continue;
+            }
+            if arg_idx < call_args.len() {
+                // Extract the argument expression and bind it to the parameter symbol
+                if let Some(var) = self.extract_expr(&call_args[arg_idx].value) {
+                    self.symbol_to_var.insert(param.name, var);
+                    self.list.var_names.insert(var, param_name);
+                } else {
+                    return None;
+                }
+                arg_idx += 1;
+            }
+        }
+
+        // Save the output before extraction
+        let saved_output = self.list.output;
+
+        // Extract the method body
+        if !self.extract_stmts(&fn_def.body.stmts) {
+            return None;
+        }
+
+        // The method's return value is the list output (set by Return stmt extraction)
+        let result = self.list.output;
+
+        // If the method didn't set output (no return statement), check if a variable
+        // was assigned that should be the result
+        if result == saved_output {
+            // No return found — method might use implicit return via last expression
+            return None;
+        }
+
+        Some(result)
+    }
+
+    /// Resolve a nested MemberAccess chain to a compound prefix string.
+    /// E.g., `self.attn` -> "m.blocks.0.attn", `block.ffn` -> "m.blocks.0.ffn"
+    fn resolve_member_access_prefix(&self, expr: &nsl_ast::expr::Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::MemberAccess { object, member } => {
+                let obj_prefix = match &object.kind {
+                    ExprKind::SelfRef => self.self_context.clone(),
+                    ExprKind::Ident(sym) => {
+                        self.symbol_name_overrides.get(sym).cloned()
+                            .or_else(|| Some(self.interner.resolve(sym.0).unwrap_or("?").to_string()))
+                    }
+                    ExprKind::MemberAccess { .. } => self.resolve_member_access_prefix(object),
+                    _ => None,
+                };
+                let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                obj_prefix.map(|p| format!("{}.{}", p, field_name))
+            }
+            _ => None,
+        }
     }
 
     /// Finalize extraction. Returns the WengertList if the graph is static.

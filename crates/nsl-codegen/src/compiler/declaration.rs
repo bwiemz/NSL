@@ -248,6 +248,21 @@ impl Compiler<'_> {
             self.models.model_methods.insert(model_name, method_map);
         }
 
+        // Store model method FnDef bodies for source AD inlining
+        for md in &model_defs {
+            let model_name = self.resolve_sym(md.name).to_string();
+            let mut body_map = HashMap::new();
+            for member in &md.members {
+                if let ModelMember::Method(fn_def, _decos) = member {
+                    let method_name = self.resolve_sym(fn_def.name).to_string();
+                    body_map.insert(method_name, fn_def.clone());
+                }
+            }
+            if !body_map.is_empty() {
+                self.models.model_method_bodies.insert(model_name, body_map);
+            }
+        }
+
         // M55: Handle @zk_proof on whole model blocks.
         // When a `model` statement is wrapped in `@zk_proof(...)`, register all
         // its methods in `zk_proof_fns` using the same mangled names used above.

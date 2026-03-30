@@ -443,23 +443,30 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         if !next.is_null() {
             let next_block = unsafe { &*next };
             if !next_block.allocated {
+                // Copy fields from next_block into locals BEFORE reborrowing
+                // block mutably. This avoids UB from aliasing &*next while
+                // mutating &mut *block_ptr (MIRI-clean).
+                let next_size = next_block.size;
+                let next_next = next_block.next;
+                let next_ptr_addr = next_block.ptr as usize;
+
                 // Remove next from free-list (use next's size to find correct pool)
-                let next_small = Self::is_small(next_block.size);
+                let next_small = Self::is_small(next_size);
                 self.free_set_mut(next_small).remove(&FreeBlockKey {
-                    size: next_block.size,
-                    ptr: next_block.ptr as usize,
+                    size: next_size,
+                    ptr: next_ptr_addr,
                 });
                 self.stats.num_free_blocks -= 1;
 
                 let block = unsafe { &mut *block_ptr };
-                block.size += next_block.size;
-                block.next = next_block.next;
-                if !next_block.next.is_null() {
-                    unsafe { (*next_block.next).prev = block_ptr; }
+                block.size += next_size;
+                block.next = next_next;
+                if !next_next.is_null() {
+                    unsafe { (*next_next).prev = block_ptr; }
                 }
 
                 // Remove next from tracking and deallocate
-                self.all_blocks.remove(&(next_block.ptr as usize));
+                self.all_blocks.remove(&next_ptr_addr);
                 unsafe { drop(Box::from_raw(next)); }
                 self.stats.num_coalesces += 1;
             }
@@ -531,25 +538,32 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             }
         }
 
-        // Process in reverse order to maintain valid indices during removal
-        to_remove.reverse();
+        // Process in reverse order so swap_remove doesn't invalidate
+        // indices we haven't visited yet.
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
         for idx in to_remove {
-            let seg = &self.segments[idx];
+            // Copy segment fields into locals to avoid borrowing self.segments
+            // while we need &mut self for free_set_mut / all_blocks / driver.
+            let seg_blocks_head = self.segments[idx].blocks_head;
+            let seg_base_ptr = self.segments[idx].base_ptr;
+            let seg_total_size = self.segments[idx].total_size;
 
             // Walk the block list and remove all blocks from free-set + all_blocks
-            let mut bptr = seg.blocks_head;
+            let mut bptr = seg_blocks_head;
             while !bptr.is_null() {
                 let block = unsafe { &*bptr };
                 let next = block.next;
+                let blk_size = block.size;
+                let blk_ptr = block.ptr as usize;
 
                 // Remove from free-list (all blocks in a fully-free segment must be free)
-                let blk_small = Self::is_small(block.size);
+                let blk_small = Self::is_small(blk_size);
                 self.free_set_mut(blk_small).remove(&FreeBlockKey {
-                    size: block.size,
-                    ptr: block.ptr as usize,
+                    size: blk_size,
+                    ptr: blk_ptr,
                 });
                 self.stats.num_free_blocks = self.stats.num_free_blocks.saturating_sub(1);
-                self.all_blocks.remove(&(block.ptr as usize));
+                self.all_blocks.remove(&blk_ptr);
 
                 // Deallocate the Block node
                 unsafe { drop(Box::from_raw(bptr)); }
@@ -557,23 +571,24 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             }
 
             // Free the GPU memory
-            self.driver.free(seg.base_ptr);
-            freed += seg.total_size;
-            self.total_reserved -= seg.total_size;
+            self.driver.free(seg_base_ptr);
+            freed += seg_total_size;
+            self.total_reserved -= seg_total_size;
             self.stats.num_driver_frees += 1;
 
             // Remove segment (swap_remove to avoid O(n) shift)
             self.segments.swap_remove(idx);
+        }
 
-            // Fix segment_idx for the segment that was swapped in
-            if idx < self.segments.len() {
-                let swapped_seg = &self.segments[idx];
-                let mut bptr = swapped_seg.blocks_head;
-                while !bptr.is_null() {
-                    let block = unsafe { &mut *bptr };
-                    block.segment_idx = idx;
-                    bptr = block.next;
-                }
+        // After all removals, do a single O(blocks) sweep to rewrite
+        // segment_idx on every block.  Consecutive swap_removes can
+        // leave stale indices that the per-removal fixup missed.
+        for (idx, seg) in self.segments.iter().enumerate() {
+            let mut bptr = seg.blocks_head;
+            while !bptr.is_null() {
+                let block = unsafe { &mut *bptr };
+                block.segment_idx = idx;
+                bptr = block.next;
             }
         }
 
@@ -668,6 +683,8 @@ pub(crate) fn print_memory_summary() {
         s.num_driver_frees,
         s.num_cache_hits,
         s.num_cache_misses,
+        s.num_splits,
+        s.num_coalesces,
         fmt(s.internal_fragmentation_bytes),
     );
 }

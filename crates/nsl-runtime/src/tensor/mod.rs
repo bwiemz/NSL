@@ -162,6 +162,9 @@ pub struct NslTensor {
     /// 1 = data is an offset into a GPU memory slab (do NOT free individually).
     /// The slab is freed once at program exit via nsl_slab_destroy.
     pub(crate) slab_managed: u8,
+    /// Monotonic ID assigned during tape recording (0 = unassigned).
+    /// Decouples tensor identity from memory address for safe intermediate cleanup.
+    pub(crate) tape_id: i64,
 }
 
 // Built-in dtype IDs (match existing u8 values)
@@ -287,6 +290,7 @@ impl NslTensor {
             owns_data,
             data_owner,
             slab_managed: 0,
+            tape_id: 0,
         }
     }
 
@@ -945,6 +949,19 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
             (*(tensor_ptr as *mut NslTensor)).magic = TENSOR_FREED;
             drop(Box::from_raw(tensor_ptr as *mut NslTensor));
         }
+    }
+}
+
+/// Safe version of nsl_tensor_free that probes the magic field before freeing.
+/// Used for Type::Unknown variables where we can't be sure the i64 is a tensor pointer.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
+    if ptr == 0 { return; }
+    if (ptr as u64) < 0x10000 { return; }
+    if (ptr as usize) % 8 != 0 { return; }
+    let magic = unsafe { *(ptr as *const u32) };
+    if magic == TENSOR_MAGIC {
+        nsl_tensor_free(ptr);
     }
 }
 
@@ -1727,7 +1744,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
                 if c_ptr != tensor_ptr { nsl_tensor_free(c_ptr); }
                 // Record tape op for backward
                 if autodiff::is_recording() {
-                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    // No refcount bump on a — identity-only (tape_id)
                     autodiff::maybe_record(autodiff::TapeOp::Dropout {
                         a: tensor_ptr, out: result_ptr, saved_mask: mask_ptr,
                         scale: 1.0 / (1.0 - p),
@@ -1806,7 +1823,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
     let mask_ptr = NslTensor::publish(mask_tensor);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        // No refcount bump on a — identity-only. Mask still bumped (saved data).
         NslTensor::from_ptr(mask_ptr).refcount.fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Dropout {
             a: tensor_ptr, out: result_ptr, saved_mask: mask_ptr, scale,
@@ -2159,8 +2176,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(bias_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        // No refcount bumps — identity-only fields (tape_ids after assign_ids)
         autodiff::maybe_record(autodiff::TapeOp::BiasAdd { tensor: tensor_ptr, bias: bias_ptr, out: out_ptr });
     }
 

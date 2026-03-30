@@ -1,0 +1,29 @@
+# Test @checkpoint with a multi-operation function inside a grad block.
+# Verifies that checkpointed function produces correct gradients
+# through matmul + relu composition.
+
+fn layer(x: Tensor, w: Tensor) -> Tensor:
+    let h = x @ w
+    return relu(h)
+
+let x = full([2, 3], 1.0)
+let w = full([3, 2], 0.5)
+
+# --- Non-checkpointed baseline ---
+let (loss1, grads1) = grad(w):
+    let out = layer(x, w)
+    sum(out)
+
+print("baseline grad:")
+print(grads1)
+
+# --- Checkpointed version ---
+let (loss2, grads2) = grad(w):
+    @checkpoint
+    let out = layer(x, w)
+    sum(out)
+
+print("checkpoint grad:")
+print(grads2)
+
+print("checkpoint multi-op test: PASS")

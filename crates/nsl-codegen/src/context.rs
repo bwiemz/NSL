@@ -162,6 +162,8 @@ pub struct FuncState {
     /// M44: Name of the function currently being compiled.
     /// Used by generate() to look up @grammar decorator configs.
     pub current_function_name: Option<String>,
+    /// Semantic types for variables, used by step-variable cleanup to identify tensors.
+    pub variable_types: HashMap<Symbol, nsl_semantic::types::Type>,
 }
 
 impl Default for FuncState {
@@ -185,6 +187,7 @@ impl FuncState {
             slab_ptr_var: None,
             weight_values: HashMap::new(),
             current_function_name: None,
+            variable_types: HashMap::new(),
         }
     }
 

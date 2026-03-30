@@ -141,7 +141,7 @@ pub(crate) const DIV_F32_PTX: &str = "\
     ld.global.f32 %fs1, [%rd7];\n\
     add.u64 %rd7, %rd2, %rd6;\n\
     ld.global.f32 %fs2, [%rd7];\n\
-    div.f32 %fs3, %fs1, %fs2;\n\
+    div.approx.f32 %fs3, %fs1, %fs2;\n\
     add.u64 %rd7, %rd3, %rd6;\n\
     st.global.f32 [%rd7], %fs3;\n\
 DONE: ret;\n\

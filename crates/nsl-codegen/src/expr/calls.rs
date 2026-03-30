@@ -526,6 +526,15 @@ impl Compiler<'_> {
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_traced_call(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
         }
+        // log_softmax(tensor, dim) -- two args
+        if func_name == "log_softmax" && !self.registry.functions.contains_key(&func_name) {
+            if args.len() != 2 {
+                return Err(CodegenError::new("log_softmax() takes exactly 2 arguments (tensor, dim)"));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let dim_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_traced_call(builder, "nsl_tensor_logsoftmax", &[tensor_val, dim_val]);
+        }
         if func_name == "clamp" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
                 return Err(CodegenError::new("clamp() takes exactly 3 arguments (tensor, min, max)"));

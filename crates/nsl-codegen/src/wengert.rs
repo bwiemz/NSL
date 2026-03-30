@@ -80,6 +80,10 @@ pub enum PrimalOp {
     Input(String),
     Param(String),
     Constant(f64),
+    /// Non-differentiable passthrough: compiled via the regular codegen path.
+    /// The string identifies the operation for the lowering to dispatch.
+    /// Zero gradient — these are shape/metadata ops that don't affect gradients.
+    Passthrough(String),
 }
 
 /// Comparison operators for branch conditions.

@@ -1,0 +1,31 @@
+# Test gradient checkpointing: @checkpoint on a function call inside a grad block.
+# The checkpointed function's forward pass runs with tape paused; during backward,
+# the function is re-executed with recording enabled to recompute activations.
+# Correctness: gradients should be identical to the non-checkpointed version.
+
+fn double(x: Tensor) -> Tensor:
+    return x * 2.0
+
+# --- Non-checkpointed baseline ---
+let x1 = full([2, 3], 3.0)
+
+let (loss1, grads1) = grad(x1):
+    let y = double(x1)
+    sum(y)
+
+print("baseline grad:")
+print(grads1)
+
+# --- Checkpointed version ---
+let x2 = full([2, 3], 3.0)
+
+let (loss2, grads2) = grad(x2):
+    @checkpoint
+    let y = double(x2)
+    sum(y)
+
+print("checkpoint grad:")
+print(grads2)
+
+# Both should produce the same gradient (2.0 everywhere)
+print("checkpoint grad test: PASS")

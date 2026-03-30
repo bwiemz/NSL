@@ -340,6 +340,37 @@ fn lower_single_op(
             });
             call(compiler, builder, "nsl_tensor_compare", &[inputs[0], inputs[1], cmp_val])
         }
+
+        // === Non-differentiable passthroughs ===
+        PrimalOp::Passthrough(ref name) => {
+            match name.as_str() {
+                "shape" => call(compiler, builder, "nsl_tensor_shape", &[inputs[0]]),
+                "ndim" => call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]]),
+                "reshape" => {
+                    // inputs[0] = tensor, inputs[1] = shape_list
+                    call(compiler, builder, "nsl_tensor_reshape", &[inputs[0], inputs[1]])
+                }
+                "transpose" => {
+                    // inputs[0] = tensor, inputs[1] = dim0, inputs[2] = dim1
+                    call(compiler, builder, "nsl_tensor_transpose", &[inputs[0], inputs[1], inputs[2]])
+                }
+                "contiguous" => call(compiler, builder, "nsl_tensor_contiguous", &[inputs[0]]),
+                "item" => call(compiler, builder, "nsl_tensor_item", &[inputs[0]]),
+                "subscript" => {
+                    // inputs[0] = list/tensor, inputs[1] = index
+                    call(compiler, builder, "nsl_list_get", &[inputs[0], inputs[1]])
+                }
+                "list" => {
+                    // Build a list from input elements
+                    let list = call(compiler, builder, "nsl_list_new", &[])?;
+                    for &inp in &inputs {
+                        call(compiler, builder, "nsl_list_push", &[list, inp])?;
+                    }
+                    Ok(list)
+                }
+                other => Err(CodegenError::new(format!("unsupported passthrough op: {}", other))),
+            }
+        }
     }
 }
 

@@ -282,7 +282,7 @@ pub(crate) mod inner {
     /// Try to allocate GPU memory with OOM recovery. Returns None after all
     /// recovery attempts fail. Use this for ops that can fall back to CPU.
     pub(crate) fn try_alloc_managed(size_bytes: usize) -> Option<*mut c_void> {
-        if size_bytes == 0 { return Some(std::ptr::null_mut()); }
+        if size_bytes == 0 { return None; }
 
         // Async alloc path (opt-in, bypasses caching allocator)
         if async_alloc_enabled() {
@@ -360,12 +360,12 @@ pub(crate) mod inner {
             return ptr;
         }
 
-        // Step 2: drain caching allocator — release idle segments to driver
+        // Step 2: drain caching allocator — release idle segments to driver.
+        // Retry unconditionally: even if drain freed 0 bytes, cuCtxSynchronize
+        // above may have completed async frees the caching allocator can now use.
         let pool_freed = pool_drain();
-        if pool_freed > 0 {
-            if let Some(ptr) = caching_alloc(size_bytes) {
-                return ptr;
-            }
+        if let Some(ptr) = caching_alloc(size_bytes) {
+            return ptr;
         }
 
         // Step 3: drain pinned pool (reduces system memory pressure) and retry
@@ -412,12 +412,15 @@ pub(crate) mod inner {
         }
         let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         if !was_cuda { return; }
+        // Ensure CUDA context BEFORE acquiring CACHING_ALLOCATOR lock.
+        // Lock ordering: CUDA_STATE first, then CACHING_ALLOCATOR.
+        // Reversing this order causes ABBA deadlock with alloc_managed.
+        ensure_context();
         // Return to caching allocator (coalesces with neighbors)
         let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
         if !alloc.free_block(ptr) {
             // Not tracked by caching allocator — direct free (legacy/fallback)
             drop(alloc);
-            ensure_context();
             unsafe {
                 let result = cuMemFree_v2(ptr as CUdeviceptr);
                 if result != CUresult::CUDA_SUCCESS {
@@ -600,14 +603,14 @@ pub(crate) mod inner {
                 return ptr as *mut c_void;
             }
 
-            // Drain pool and retry
+            // Drain pool and retry unconditionally: even if drain freed 0 bytes,
+            // cuCtxSynchronize above may have completed async frees the caching
+            // allocator can now use.
             let pool_freed = pool_drain();
-            if pool_freed > 0 {
-                ptr = 0;
-                let result = cuMemAlloc_v2(&mut ptr, size_bytes);
-                if result == CUresult::CUDA_SUCCESS && ptr != 0 {
-                    return ptr as *mut c_void;
-                }
+            ptr = 0;
+            let result = cuMemAlloc_v2(&mut ptr, size_bytes);
+            if result == CUresult::CUDA_SUCCESS && ptr != 0 {
+                return ptr as *mut c_void;
             }
 
             let n = ALLOC_COUNT_DBG.load(std::sync::atomic::Ordering::Relaxed);
@@ -988,7 +991,7 @@ fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
     let a_t = unsafe { &*(a_cpu as *const crate::tensor::NslTensor) };
     let n = a_t.len as usize;
     let src = a_t.data as *const f64;
-    let result_ptr = crate::tensor::nsl_tensor_zeros(a_t.ndim as i64, a_t.shape, a_t.len);
+    let result_ptr = crate::tensor::nsl_tensor_zeros_like(a_cpu);
     let result_t = unsafe { &*(result_ptr as *const crate::tensor::NslTensor) };
     let dst = result_t.data as *mut f64;
     for i in 0..n {
@@ -1558,6 +1561,44 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
 }
 
 // === FFI exports ===
+
+/// GPU fused log-softmax: (x - max) - log(sum(exp(x - max))) in a single kernel.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::LOG_SOFTMAX_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let ndim = t.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (t.len as u64) / cols;
+    let total = t.len as usize;
+    let out_data = inner::alloc_managed(total * 4);
+    let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let args: [*mut c_void; 4] = [
+        &mut in_data as *mut _ as *mut c_void,
+        &mut out_data_u64 as *mut _ as *mut c_void,
+        &mut rows_val as *mut _ as *mut c_void,
+        &mut cols_val as *mut _ as *mut c_void,
+    ];
+    let block = 256i64;
+    let grid = rows as i64;
+    let result = inner::kernel_launch(
+        LOG_SOFTMAX_F32_PTX.as_ptr(), b"nsl_log_softmax_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2,
+    );
+    assert_eq!(result as u32, 0, "GPU log_softmax kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, t.ndim, t.len, t.device, 1, 1, 0));
+    NslTensor::publish(out)
+}
 
 /// Initialize the CUDA runtime (device 0, primary context).
 /// Returns 0 on success. Aborts if CUDA feature is not compiled.

@@ -258,12 +258,27 @@ impl Compiler<'_> {
                         };
 
                         if let Some((var, _)) = state.variables.get(&sym) {
+                            // Free old tensor value before reassignment to prevent memory leak
+                            if state.current_block.map(|b| !is_block_filled(builder, b)).unwrap_or(true) {
+                                let old_val = builder.use_var(*var);
+                                let sem_ty = state.variable_types.get(&sym);
+                                if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
+                                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
+                                } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
+                                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[old_val]);
+                                }
+                            }
                             builder.def_var(*var, init_val);
                         } else {
                             let var = state.new_variable();
                             builder.declare_var(var, cl_type);
                             builder.def_var(var, init_val);
                             state.variables.insert(sym, (var, cl_type));
+                        }
+
+                        // Record semantic type for step-variable cleanup
+                        if let Some(expr) = value {
+                            state.variable_types.insert(sym, self.node_type(expr.id).clone());
                         }
 
                         // M50: Track sparse tensor variables for end-to-end dispatch.
@@ -588,6 +603,18 @@ impl Compiler<'_> {
                         }
                     }
                 };
+                // Free old tensor value before reassignment to prevent memory leak
+                if matches!(op, AssignOp::Assign) {
+                    if state.current_block.map(|b| !is_block_filled(builder, b)).unwrap_or(true) {
+                        let old_val = builder.use_var(var);
+                        let sem_ty = state.variable_types.get(sym);
+                        if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
+                            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
+                        } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
+                            let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[old_val]);
+                        }
+                    }
+                }
                 builder.def_var(var, final_val);
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));
@@ -761,12 +788,8 @@ impl Compiler<'_> {
         keep: Option<Value>,
     ) {
         let temps = std::mem::take(&mut state.cleanup.tensor_temporaries);
-        // When inside a tape-recorded region (train step body), the autodiff tape
-        // holds raw pointers to intermediate tensors (TapeOp `a`/`out` fields).
-        // Freeing them here causes use-after-free during backward.
-        if state.flags.in_tape_region {
-            return;
-        }
+        // Tape ID identity: intermediates can now be safely freed during tape recording
+        // because TapeOps use monotonic tape_ids as identity keys (not raw pointers).
         for temp in &temps {
             if Some(*temp) == keep {
                 continue;
@@ -797,10 +820,7 @@ impl Compiler<'_> {
             return;
         }
         // Don't free inside tape-recorded regions — backward needs the data alive.
-        if state.flags.in_tape_region {
-            state.ownership.linear_consume_pending.clear();
-            return;
-        }
+        // Tape ID identity: linear consumes can now be freed during tape recording.
         let pending = std::mem::take(&mut state.ownership.linear_consume_pending);
         for val in &pending {
             if Some(*val) == keep {
@@ -1967,6 +1987,10 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
         }
 
+        // Snapshot variables before step body for cleanup
+        let vars_before_step: std::collections::HashSet<nsl_ast::Symbol> =
+            state.variables.keys().copied().collect();
+
         // ── 7b. Forward pass + backward pass ─────────────────────────
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
@@ -1981,6 +2005,13 @@ impl Compiler<'_> {
 
             // 2. Try to extract Wengert list from step body
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+
+            // Wire model method bodies and field types for inline expansion
+            extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
+            extractor.set_model_field_types(self.models.model_field_types.clone());
+
+            // Register the model variable as a model instance so method calls get inlined
+            extractor.register_model_instance(model_sym, &model_type_name);
 
             // Pre-register outer variables visible in the step body as inputs
             for &sym in state.variables.keys() {
@@ -2085,17 +2116,33 @@ impl Compiler<'_> {
                 };
 
                 // 8. Collect parameter gradients into grads_list (NslList)
+                //
+                // When model methods are inlined (nested models, for-loop unrolling),
+                // parameters have compound names like "m.blocks.0.attn.w_q". Use the
+                // named_param_var_ids list which preserves DFS registration order matching
+                // the runtime's nsl_collect_model_params traversal.
                 let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-                for field in &layout.fields {
-                    // Find the param's symbol -> VarId -> adjoint VarId -> Cranelift Value
-                    let grad_val = extractor
-                        .param_var_ids()
-                        .iter()
-                        .find(|(sym, _)| self.resolve_sym(*sym) == field.name)
-                        .and_then(|(_, vid)| gen.adjoint_of(*vid))
-                        .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
-                        .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
-                    self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
+                let named_params = extractor.named_param_var_ids();
+                if !named_params.is_empty() {
+                    // Inlined path: iterate over compound-named parameters
+                    for (_name, vid) in named_params {
+                        let grad_val = gen.adjoint_of(*vid)
+                            .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
+                    }
+                } else {
+                    // Legacy flat path: match by field name
+                    for field in &layout.fields {
+                        let grad_val = extractor
+                            .param_var_ids()
+                            .iter()
+                            .find(|(sym, _)| self.resolve_sym(*sym) == field.name)
+                            .and_then(|(_, vid)| gen.adjoint_of(*vid))
+                            .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
+                    }
                 }
 
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
@@ -2548,6 +2595,32 @@ impl Compiler<'_> {
                 }
                 for stmt in &cb.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
+                }
+            }
+        }
+
+        // Free step-body tensor variables to prevent GPU memory accumulation
+        {
+            let current_blk = state.current_block.unwrap_or(batch_body_block);
+            if !is_block_filled(builder, current_blk) {
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                let step_tensor_vars: Vec<_> = state.variables.iter()
+                    .filter(|(sym, _)| !vars_before_step.contains(sym))
+                    .filter_map(|(sym, (var, _))| {
+                        let sem_ty = state.variable_types.get(sym);
+                        let is_tensor = sem_ty.map(|t| t.is_tensor()).unwrap_or(false);
+                        let is_unknown = sem_ty.map(|t| t.is_indeterminate()).unwrap_or(true);
+                        if is_tensor || is_unknown { Some((*var, is_tensor)) } else { None }
+                    })
+                    .collect();
+                for (var, is_tensor) in step_tensor_vars {
+                    let val = builder.use_var(var);
+                    if is_tensor {
+                        let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[val]);
+                    } else {
+                        let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[val]);
+                    }
+                    builder.def_var(var, zero);
                 }
             }
         }
