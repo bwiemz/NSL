@@ -545,13 +545,10 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     }
 
     if autodiff::is_recording() {
+        // No refcount bumps — identity-only (tape_ids after assign_ids)
         let ptrs: Vec<i64> = (0..num_tensors)
             .map(|i| unsafe { *list.data.add(i) })
             .collect();
-        for &tp in &ptrs {
-            let t = unsafe { &mut *(tp as *mut NslTensor) };
-            t.refcount.fetch_add(1, Ordering::SeqCst);
-        }
         autodiff::maybe_record(autodiff::TapeOp::Stack {
             inputs: ptrs,
             out: out_ptr,
@@ -977,12 +974,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         .map(|i| unsafe { *list.data.add(i) })
         .collect();
 
-    if autodiff::is_recording() {
-        for &tp in &input_ptrs {
-            let t = unsafe { &mut *(tp as *mut NslTensor) };
-            t.refcount.fetch_add(1, Ordering::SeqCst);
-        }
-    }
+    // No refcount bumps on inputs — identity-only (tape_ids after assign_ids)
 
     #[cfg(feature = "interop")]
     let trace_input_ptrs = input_ptrs.clone();
@@ -1088,6 +1080,11 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
+    if crate::autodiff::is_recording() {
+        crate::autodiff::maybe_record(crate::autodiff::TapeOp::RotateHalf {
+            a: tensor_ptr, out: result,
+        });
+    }
     result
 }
 

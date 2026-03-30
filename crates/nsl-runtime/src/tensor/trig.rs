@@ -2,7 +2,9 @@
 //! Used for RoPE (Rotary Position Embeddings) precomputation.
 
 use std::ffi::c_void;
+use std::sync::atomic::Ordering;
 
+use crate::autodiff;
 use crate::memory::checked_alloc;
 
 use super::{NslTensor, nsl_tensor_contiguous, nsl_tensor_free};
@@ -52,8 +54,15 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
         1,
         0,
     ));
+    let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
-    NslTensor::publish(result)
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        autodiff::maybe_record(autodiff::TapeOp::Sin {
+            a: tensor_ptr, out: result, saved_a: tensor_ptr,
+        });
+    }
+    result
 }
 
 #[no_mangle]
@@ -101,6 +110,13 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
         1,
         0,
     ));
+    let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
-    NslTensor::publish(result)
+    if autodiff::is_recording() {
+        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        autodiff::maybe_record(autodiff::TapeOp::Cos {
+            a: tensor_ptr, out: result, saved_a: tensor_ptr,
+        });
+    }
+    result
 }

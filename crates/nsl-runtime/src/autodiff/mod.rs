@@ -1,9 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 
 use crate::list::NslList;
 use crate::tensor::{
     nsl_tensor_free as tensor_free,
+    NslTensor,
 };
 
 pub mod backward;
@@ -63,9 +65,12 @@ pub enum TapeOp {
     ReLU { a: i64, out: i64, saved_a: i64 },
     GELU { a: i64, out: i64, saved_a: i64 },
     SiLU { a: i64, out: i64, saved_a: i64 },
+    Sin { a: i64, out: i64, saved_a: i64 },
+    Cos { a: i64, out: i64, saved_a: i64 },
     Sigmoid { a: i64, out: i64, saved_out: i64 },
     Tanh { a: i64, out: i64, saved_out: i64 },
     Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
+    LogSoftmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
     Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
     EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
@@ -74,6 +79,7 @@ pub enum TapeOp {
     Dropout { a: i64, out: i64, saved_mask: i64, scale: f64 },
     Conv2d { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_weight: i64, stride_h: usize, stride_w: usize, pad_h: usize, pad_w: usize },
     MaxPool2d { a: i64, out: i64, saved_argmax: Vec<usize>, input_shape: Vec<i64> },
+    RotateHalf { a: i64, out: i64 },
     BiasAdd { tensor: i64, bias: i64, out: i64 },
     Unsqueeze { input: i64, out: i64, input_shape: Vec<i64> },
     Expand { input: i64, out: i64, original_shape: Vec<i64> },
@@ -89,6 +95,18 @@ pub enum TapeOp {
         saved_k: i64,
         saved_v: i64,
     },
+    /// Gradient checkpointing: re-run the forward function during backward
+    /// instead of saving intermediate activations.
+    Checkpoint {
+        /// Function pointer to re-execute: extern "C" fn(i64, ...) -> i64
+        fn_ptr: usize,
+        /// All arguments to the function (tensor ptrs + non-tensor ptrs)
+        all_args: Vec<i64>,
+        /// Indices into `all_args` that are tensor pointers (need refcount management)
+        tensor_arg_indices: Vec<usize>,
+        /// Output tensor pointer (key for grad_map lookup in backward)
+        output: i64,
+    },
 }
 
 pub(crate) struct Tape {
@@ -96,15 +114,66 @@ pub(crate) struct Tape {
     pub(crate) param_set: HashSet<i64>,
     pub(crate) recording: bool,
     pub(crate) pause_depth: i32,
+    pub(crate) next_id: i64,
 }
 
 impl Tape {
     fn new() -> Self {
-        Tape {
-            ops: Vec::new(),
-            param_set: HashSet::new(),
-            recording: false,
-            pause_depth: 0,
+        Tape { ops: Vec::new(), param_set: HashSet::new(), recording: false, pause_depth: 0, next_id: 1 }
+    }
+    fn get_or_assign_id(&mut self, ptr: i64) -> i64 {
+        if ptr == 0 { return 0; }
+        let t = crate::tensor::NslTensor::from_ptr(ptr);
+        if t.tape_id == 0 { t.tape_id = self.next_id; self.next_id += 1; }
+        t.tape_id
+    }
+}
+
+impl TapeOp {
+    fn assign_ids(&mut self, tape: &mut Tape) {
+        match self {
+            TapeOp::Add { a, b, out, .. } | TapeOp::Sub { a, b, out, .. }
+            | TapeOp::Mul { a, b, out, .. } | TapeOp::Div { a, b, out, .. }
+            | TapeOp::MatMul { a, b, out, .. } | TapeOp::Fp8MatMul { a, b, out, .. } => {
+                *a = tape.get_or_assign_id(*a); *b = tape.get_or_assign_id(*b); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::Neg { a, out } | TapeOp::MulScalar { a, out, .. } | TapeOp::AddScalar { a, out }
+            | TapeOp::Transpose { a, out, .. } | TapeOp::SumReduce { a, out, .. }
+            | TapeOp::MeanReduce { a, out, .. } | TapeOp::ReduceMax { a, out, .. }
+            | TapeOp::Gather { a, out, .. } | TapeOp::Exp { a, out, .. } | TapeOp::Log { a, out, .. }
+            | TapeOp::Sqrt { a, out, .. } | TapeOp::Abs { a, out, .. } | TapeOp::Clamp { a, out, .. }
+            | TapeOp::ReLU { a, out, .. } | TapeOp::GELU { a, out, .. } | TapeOp::SiLU { a, out, .. }
+            | TapeOp::Sin { a, out, .. } | TapeOp::Cos { a, out, .. }
+            | TapeOp::Sigmoid { a, out, .. } | TapeOp::Tanh { a, out, .. } | TapeOp::Softmax { a, out, .. }
+            | TapeOp::LogSoftmax { a, out, .. } | TapeOp::Slice { a, out, .. } | TapeOp::Dropout { a, out, .. }
+            | TapeOp::RotateHalf { a, out, .. } | TapeOp::MaxPool2d { a, out, .. } => {
+                *a = tape.get_or_assign_id(*a); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::EmbeddingLookup { weight, indices, out, .. } => {
+                *weight = tape.get_or_assign_id(*weight); *indices = tape.get_or_assign_id(*indices); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::LayerNorm { input, weight, bias, out, .. } | TapeOp::Conv2d { input, weight, bias, out, .. } => {
+                *input = tape.get_or_assign_id(*input); *weight = tape.get_or_assign_id(*weight);
+                *bias = tape.get_or_assign_id(*bias); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::RMSNorm { input, weight, out, .. } => {
+                *input = tape.get_or_assign_id(*input); *weight = tape.get_or_assign_id(*weight); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::BiasAdd { tensor, bias, out } => {
+                *tensor = tape.get_or_assign_id(*tensor); *bias = tape.get_or_assign_id(*bias); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::Unsqueeze { input, out, .. } | TapeOp::Expand { input, out, .. } => {
+                *input = tape.get_or_assign_id(*input); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::Cat { inputs, out, .. } | TapeOp::Stack { inputs, out, .. } => {
+                for inp in inputs.iter_mut() { *inp = tape.get_or_assign_id(*inp); }
+                *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::FlashAttention { q, k, v, .. } => {
+                *q = tape.get_or_assign_id(*q); *k = tape.get_or_assign_id(*k); *v = tape.get_or_assign_id(*v);
+                // out stays raw pointer — backward reads tape_id from tensor
+            }
+            TapeOp::Checkpoint { output, .. } => { *output = tape.get_or_assign_id(*output); }
         }
     }
 }
@@ -113,29 +182,19 @@ thread_local! {
     pub(crate) static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
 }
 
-/// Returns true if the tape is actively recording (started and not paused).
 pub fn is_recording() -> bool {
-    TAPE.with(|t| {
-        let tape = t.borrow();
-        tape.recording && tape.pause_depth == 0
-    })
+    TAPE.with(|t| { let tape = t.borrow(); tape.recording && tape.pause_depth == 0 })
 }
 
-/// Remove the last recorded op from the tape (used when a compound op replaces a sub-op).
 pub fn pop_last_op() {
-    TAPE.with(|t| {
-        t.borrow_mut().ops.pop();
-    });
+    TAPE.with(|t| { t.borrow_mut().ops.pop(); });
 }
 
 /// Records an operation on the tape if recording is active.
-pub fn maybe_record(op: TapeOp) {
-    if !is_recording() {
-        return;
-    }
-    TAPE.with(|t| {
-        t.borrow_mut().ops.push(op);
-    });
+/// Converts identity fields from raw pointers to tape_ids via assign_ids.
+pub fn maybe_record(mut op: TapeOp) {
+    if !is_recording() { return; }
+    TAPE.with(|t| { let mut tape = t.borrow_mut(); op.assign_ids(&mut tape); tape.ops.push(op); });
 }
 
 /// Start recording operations on the tape.
@@ -166,11 +225,15 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
         tape.param_set.clear();
         tape.recording = true;
         tape.pause_depth = 0;
+        // Do NOT reset next_id — parameters retain their tape_ids across steps.
+        // Resetting would cause new intermediates to collide with parameter IDs.
 
         let list = NslList::from_ptr(param_list);
         for i in 0..list.len as usize {
             let tensor_ptr = unsafe { *list.data.add(i) };
             tape.param_set.insert(tensor_ptr);
+            // Assign tape_ids to parameters (reuses existing if already set)
+            let _id = tape.get_or_assign_id(tensor_ptr);
         }
     });
 }
@@ -191,7 +254,8 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
             | TapeOp::Sqrt { saved_out, .. }
             | TapeOp::Sigmoid { saved_out, .. }
             | TapeOp::Tanh { saved_out, .. }
-            | TapeOp::Softmax { saved_out, .. } => {
+            | TapeOp::Softmax { saved_out, .. }
+            | TapeOp::LogSoftmax { saved_out, .. } => {
                 tensor_free(*saved_out);
             }
             TapeOp::Log { saved_a, .. }
@@ -199,7 +263,9 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
             | TapeOp::Clamp { saved_a, .. }
             | TapeOp::ReLU { saved_a, .. }
             | TapeOp::GELU { saved_a, .. }
-            | TapeOp::SiLU { saved_a, .. } => {
+            | TapeOp::SiLU { saved_a, .. }
+            | TapeOp::Sin { saved_a, .. }
+            | TapeOp::Cos { saved_a, .. } => {
                 tensor_free(*saved_a);
             }
             TapeOp::Gather { indices_ptr, .. } => {
@@ -227,16 +293,13 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
                 tensor_free(*saved_input);
                 tensor_free(*saved_weight);
             }
-            TapeOp::BiasAdd { tensor, bias, .. } => {
-                tensor_free(*tensor);
-                tensor_free(*bias);
+            TapeOp::BiasAdd { .. } => {
+                // tensor/bias are tape_ids after assign_ids — nothing to free
             }
             TapeOp::Unsqueeze { .. } => {}
             TapeOp::Expand { .. } => {}
-            TapeOp::Stack { inputs, .. } | TapeOp::Cat { inputs, .. } => {
-                for &inp in inputs {
-                    tensor_free(inp);
-                }
+            TapeOp::Stack { .. } | TapeOp::Cat { .. } => {
+                // inputs are tape_ids after assign_ids — nothing to free
             }
             TapeOp::FlashAttention { saved_q, saved_k, saved_v, out, logsumexp, .. } => {
                 tensor_free(*saved_q);
@@ -244,6 +307,13 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
                 tensor_free(*saved_v);
                 tensor_free(*out);
                 tensor_free(*logsumexp);
+            }
+            TapeOp::Checkpoint { all_args, tensor_arg_indices, .. } => {
+                for &idx in tensor_arg_indices {
+                    if idx < all_args.len() {
+                        tensor_free(all_args[idx]);
+                    }
+                }
             }
             _ => {}
         }
@@ -263,6 +333,7 @@ pub extern "C" fn nsl_tape_stop() {
 
         tape.ops.clear();
         tape.param_set.clear();
+        // Do NOT reset next_id — monotonic across steps to avoid collisions
     });
 }
 
@@ -282,5 +353,73 @@ pub extern "C" fn nsl_tape_resume() {
         if tape.pause_depth > 0 {
             tape.pause_depth -= 1;
         }
+    });
+}
+
+/// Call a function pointer with a variable number of i64 arguments (up to 8).
+/// Used by gradient checkpointing to re-execute the forward function during backward.
+pub(crate) fn call_with_args(fn_ptr: usize, args: &[i64]) -> i64 {
+    debug_assert_eq!(std::mem::size_of::<usize>(), 8, "gradient checkpointing requires 64-bit target");
+    type Fn0 = extern "C" fn() -> i64;
+    type Fn1 = extern "C" fn(i64) -> i64;
+    type Fn2 = extern "C" fn(i64, i64) -> i64;
+    type Fn3 = extern "C" fn(i64, i64, i64) -> i64;
+    type Fn4 = extern "C" fn(i64, i64, i64, i64) -> i64;
+    type Fn5 = extern "C" fn(i64, i64, i64, i64, i64) -> i64;
+    type Fn6 = extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
+    type Fn7 = extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64;
+    type Fn8 = extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64;
+    unsafe {
+        match args.len() {
+            0 => std::mem::transmute::<usize, Fn0>(fn_ptr)(),
+            1 => std::mem::transmute::<usize, Fn1>(fn_ptr)(args[0]),
+            2 => std::mem::transmute::<usize, Fn2>(fn_ptr)(args[0], args[1]),
+            3 => std::mem::transmute::<usize, Fn3>(fn_ptr)(args[0], args[1], args[2]),
+            4 => std::mem::transmute::<usize, Fn4>(fn_ptr)(args[0], args[1], args[2], args[3]),
+            5 => std::mem::transmute::<usize, Fn5>(fn_ptr)(args[0], args[1], args[2], args[3], args[4]),
+            6 => std::mem::transmute::<usize, Fn6>(fn_ptr)(args[0], args[1], args[2], args[3], args[4], args[5]),
+            7 => std::mem::transmute::<usize, Fn7>(fn_ptr)(args[0], args[1], args[2], args[3], args[4], args[5], args[6]),
+            8 => std::mem::transmute::<usize, Fn8>(fn_ptr)(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]),
+            n => panic!("@checkpoint: function has {n} arguments (max supported: 8)"),
+        }
+    }
+}
+
+/// Record a gradient checkpoint on the tape.
+/// Instead of saving intermediate activations, we save the function pointer and args
+/// so the forward can be re-executed during backward.
+///
+/// `fn_ptr`: raw function pointer (as i64)
+/// `args_list`: NslList of all arguments (tensor ptrs and non-tensor i64 values)
+/// `tensor_mask`: bitmask where bit i indicates args_list[i] is a tensor pointer
+/// `output`: the output tensor pointer from the forward call
+#[no_mangle]
+pub extern "C" fn nsl_checkpoint_record(fn_ptr: i64, args_list: i64, tensor_mask: i64, output: i64) {
+    if !is_recording() { return; }
+
+    let list = NslList::from_ptr(args_list);
+    let num_args = list.len as usize;
+
+    let mut all_args = Vec::with_capacity(num_args);
+    let mut tensor_arg_indices = Vec::new();
+
+    for i in 0..num_args {
+        let arg = unsafe { *list.data.add(i) };
+        all_args.push(arg);
+        // Check bitmask to see if this arg is a tensor
+        if (tensor_mask >> i) & 1 == 1 {
+            tensor_arg_indices.push(i);
+            // Bump refcount on tensor args so they survive until backward
+            if arg != 0 {
+                NslTensor::from_ptr(arg).refcount.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    maybe_record(TapeOp::Checkpoint {
+        fn_ptr: fn_ptr as usize,
+        all_args,
+        tensor_arg_indices,
+        output,
     });
 }
