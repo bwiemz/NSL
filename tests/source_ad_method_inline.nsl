@@ -1,0 +1,26 @@
+# Test: source AD with method inlining + .item() + reshape
+# This reproduces the coder50m pattern of:
+#   let dim_val = int(self._config.item())
+#   let reshaped = tensor.reshape([batch, dim_val])
+
+model ConfigModel:
+    w: Tensor = randn([8, 4])
+    _hidden: Tensor = full([1], 4.0)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = int(self._hidden.item())
+        let s = x.shape
+        let batch = s[0]
+        let out = x @ self.w
+        let reshaped = out.reshape([batch, h])
+        return mean(reshaped * reshaped)
+
+let m = ConfigModel()
+let x = randn([2, 8])
+
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let loss = m.forward(x)
+
+print("source_ad_method_inline: PASS")

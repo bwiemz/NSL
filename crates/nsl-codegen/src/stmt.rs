@@ -2043,22 +2043,33 @@ impl Compiler<'_> {
                 // MemberAccess expressions (e.g., m.w) are registered in the extractor
                 // under the member symbol, but those aren't in state.variables — they're
                 // loaded from the model struct. Map them to nsl_list_get(param_list, i).
-                for (i, field) in layout.fields.iter().enumerate() {
-                    let field_sym = "";
-                    // Try to find this field in the extractor's param VarIds
-                    for (sym, vid) in extractor.param_var_ids() {
-                        let sym_name = self.interner.resolve(sym.0).unwrap_or("");
-                        if sym_name == field.name {
-                            if !primal_vars.contains_key(&vid) {
-                                let idx = builder.ins().iconst(cl_types::I64, i as i64);
-                                let param_val = self.compile_call_by_name(
-                                    builder, "nsl_list_get", &[param_list, idx],
-                                )?;
-                                primal_vars.insert(vid, param_val);
-                            }
+                //
+                // Also add the step parameter (batch) which is stored separately
+                if let Some(&step_vid) = extractor.symbol_var_map().get(&step_param_sym) {
+                    if !primal_vars.contains_key(&step_vid) {
+                        let batch_val = builder.use_var(step_param_var);
+                        primal_vars.insert(step_vid, batch_val);
+                    }
+                }
+                // Resolve model parameter VarIds from param_list.
+                // Match by compound name (e.g., "m.w" → layout field "w").
+                // The extractor's named_param_var_ids() has (compound_name, VarId) pairs
+                // like ("m.w", 9), ("m._hidden", 3). Match the field name suffix.
+                for (compound_name, vid) in extractor.named_param_var_ids() {
+                    if primal_vars.contains_key(vid) { continue; }
+                    // Extract the field name (last component after '.')
+                    let field_name = compound_name.rsplit('.').next().unwrap_or("");
+                    // Find this field in the layout
+                    for (i, field) in layout.fields.iter().enumerate() {
+                        if field.name == field_name {
+                            let idx = builder.ins().iconst(cl_types::I64, i as i64);
+                            let param_val = self.compile_call_by_name(
+                                builder, "nsl_list_get", &[param_list, idx],
+                            )?;
+                            primal_vars.insert(*vid, param_val);
+                            break;
                         }
                     }
-                    let _ = field_sym; // suppress unused
                 }
 
                 // 4. Find the loss symbol's VarId and set it as the Wengert

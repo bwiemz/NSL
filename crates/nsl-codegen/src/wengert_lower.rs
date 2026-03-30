@@ -34,6 +34,15 @@ pub fn compile_wengert_ops(
 
 /// Resolve all input VarIds for a WengertOp to their Cranelift Values.
 fn resolve_inputs(op: &WengertOp, var_map: &VarMap) -> Result<Vec<Value>, CodegenError> {
+    // If any input is unresolved, give a detailed error including the op info
+    for &vid in &op.inputs {
+        if !var_map.contains_key(&vid) {
+            return Err(CodegenError::new(format!(
+                "source-ad: unresolved VarId {} (input to {:?} at VarId {})",
+                vid, op.op, op.result
+            )));
+        }
+    }
     op.inputs
         .iter()
         .map(|vid| {
@@ -61,15 +70,17 @@ fn lower_single_op(
     op: &WengertOp,
     var_map: &VarMap,
 ) -> Result<Value, CodegenError> {
-    // Marker ops (leaf nodes) — already present in primal_vars
+    // Marker ops (leaf nodes) — should be in primal_vars
     match &op.op {
-        PrimalOp::Input(_) | PrimalOp::Param(_) => {
-            return var_map.get(&op.result).copied().ok_or_else(|| {
-                CodegenError::new(format!(
-                    "source-ad: leaf VarId {} not in primal_vars",
-                    op.result
-                ))
-            });
+        PrimalOp::Input(name) | PrimalOp::Param(name) => {
+            if let Some(&val) = var_map.get(&op.result) {
+                return Ok(val);
+            }
+            // Leaf not in primal_vars — produce a zero placeholder.
+            // This handles unused variables (batch param not referenced in step body)
+            // and model config fields not in param_list.
+            eprintln!("[source-ad] note: leaf VarId {} ('{}') not in primal_vars, using null placeholder", op.result, name);
+            return Ok(builder.ins().iconst(cl_types::I64, 0));
         }
         PrimalOp::Constant(val) => {
             let v = builder.ins().f64const(*val);

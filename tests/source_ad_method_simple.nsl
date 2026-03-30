@@ -1,0 +1,21 @@
+# Source AD test: method inlining without .item()/.shape
+# Just matmul + elementwise ops inside a model method
+
+model SimpleModel:
+    w1: Tensor = randn([4, 8])
+    w2: Tensor = randn([8, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = relu(x @ self.w1)
+        let out = h @ self.w2
+        return mean(out * out)
+
+let m = SimpleModel()
+let x = randn([2, 4])
+
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let loss = m.forward(x)
+
+print("source_ad_method_simple: PASS")

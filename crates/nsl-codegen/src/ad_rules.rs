@@ -404,6 +404,26 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
 
         // Condition is non-differentiable — no adjoints to propagate
         PrimalOp::Condition(_) => vec![],
+        // Passthrough ops: only shape-preserving ones propagate gradients.
+        // Non-differentiable metadata ops (shape, ndim, item, int, subscript, list, arange, etc.)
+        // do NOT propagate gradients — they produce non-tensor values.
+        PrimalOp::Passthrough(name) => {
+            match name.as_str() {
+                // Shape-preserving: gradient flows through to tensor input
+                "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze"
+                | "cos" | "sin" | "rotate_half" => {
+                    if op.inputs.is_empty() { vec![] }
+                    else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::Identity(output_bar),
+                        }]
+                    }
+                }
+                // Non-differentiable: no gradient propagation
+                _ => vec![],
+            }
+        }
         _ => vec![],
     }
 }
@@ -426,7 +446,8 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. } | PrimalOp::Split { .. } | PrimalOp::Slice { .. }
         | PrimalOp::RoPE { .. } | PrimalOp::RoPEInverse { .. }
-        | PrimalOp::AvgPool2d { .. } => SavedRequirement::Nothing,
+        | PrimalOp::AvgPool2d { .. }
+        | PrimalOp::Passthrough(_) => SavedRequirement::Nothing,
 
         // Save inputs — gradient depends on forward input values
         PrimalOp::Mul | PrimalOp::Div | PrimalOp::Matmul

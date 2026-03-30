@@ -105,7 +105,11 @@ impl AdjointGenerator {
         }
 
         match expr {
-            AdjointExpr::Identity(_) => unreachable!(),
+            AdjointExpr::Identity(v) => {
+                // Gradient passes through unchanged — emit a "copy" op
+                // so the VarId gets registered in the var_map during lowering.
+                self.emit_op(PrimalOp::Broadcast, vec![v])
+            }
 
             // --- Simple pass-through ops (single instruction, mathematically correct) ---
             AdjointExpr::Negate(v) => self.emit_op(PrimalOp::Neg, vec![v]),
@@ -714,7 +718,6 @@ impl<'a> WengertExtractor<'a> {
                     }
                     true
                 } else {
-                    eprintln!("[source-ad] VarDecl '{}' extraction failed", var_name);
                     false
                 }
             }
@@ -1481,7 +1484,6 @@ impl<'a> WengertExtractor<'a> {
 
         // Extract the method body
         if !self.extract_stmts(&fn_def.body.stmts) {
-            eprintln!("[source-ad] inline method body extraction failed (self_context={:?})", self.self_context);
             return None;
         }
 

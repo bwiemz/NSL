@@ -163,6 +163,15 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // log_softmax(tensor, dim) -> tensor
+    def(
+        "log_softmax",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
 
     // NN layer constructors
     for name in &[
