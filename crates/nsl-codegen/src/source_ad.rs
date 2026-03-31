@@ -49,22 +49,11 @@ impl AdjointGenerator {
         if let Some(&adj) = self.adjoint_vars.get(&primal_var) {
             adj
         } else {
-            // Allocate a new adjoint VarId initialized to zero.
-            // This ensures the VarId has a definition in the ops list even if
-            // no gradient ever flows to this variable (e.g., dead paths through
-            // non-differentiable Passthrough ops like shape/subscript/list).
-            // If a gradient DOES arrive via accumulate_adjoint, the zero gets
-            // replaced by Add(zero, gradient) or overwritten directly.
+            // Allocate a new adjoint VarId. No op is emitted yet —
+            // the VarId is a "ghost" that gets populated by accumulate_adjoint
+            // when a gradient arrives. If no gradient arrives, the VarId
+            // stays unmapped and the lowerer should produce zeros_like(primal).
             let adj = self.next_var();
-            let op_id = self.next_op();
-            self.adjoint_ops.push(WengertOp {
-                id: op_id,
-                result: adj,
-                op: PrimalOp::Constant(0.0),
-                inputs: vec![],
-                saved_for_backward: false,
-                checkpointed: false,
-            });
             self.adjoint_vars.insert(primal_var, adj);
             adj
         }

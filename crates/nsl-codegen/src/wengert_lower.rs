@@ -29,6 +29,15 @@ pub fn compile_wengert_ops(
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
     for op in &wengert.ops {
+        // Skip ops whose inputs can't be resolved (ghost VarIds from
+        // get_or_create_adjoint that never received a gradient).
+        // These produce dead adjoint paths for non-differentiable ops.
+        let all_inputs_resolved = op.inputs.iter().all(|vid| var_map.contains_key(vid));
+        if !all_inputs_resolved {
+            // Ghost VarId — skip this op. Its result stays unmapped,
+            // which propagates the "no gradient" signal downstream.
+            continue;
+        }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
         var_map.insert(op.result, result_val);
         var_types.insert(op.result, type_for_op(&op.op));
@@ -38,20 +47,14 @@ pub fn compile_wengert_ops(
 
 /// Resolve all input VarIds for a WengertOp to their Cranelift Values.
 fn resolve_inputs(op: &WengertOp, var_map: &VarMap) -> Result<Vec<Value>, CodegenError> {
-    // If any input is unresolved, give a detailed error including the op info
-    for &vid in &op.inputs {
-        if !var_map.contains_key(&vid) {
-            return Err(CodegenError::new(format!(
-                "source-ad: unresolved VarId {} (input to {:?} at VarId {})",
-                vid, op.op, op.result
-            )));
-        }
-    }
     op.inputs
         .iter()
         .map(|vid| {
             var_map.get(vid).copied().ok_or_else(|| {
-                CodegenError::new(format!("source-ad: unresolved VarId {}", vid))
+                CodegenError::new(format!(
+                    "source-ad: unresolved VarId {} (input to {:?} at VarId {})",
+                    vid, op.op, op.result
+                ))
             })
         })
         .collect()
