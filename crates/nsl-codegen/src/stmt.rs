@@ -2107,7 +2107,23 @@ impl Compiler<'_> {
                 // 6. Generate adjoint backward graph from the primal list.
                 let start_var = extractor.next_var_id();
                 let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
-                let adjoint = gen.generate(extractor.wengert_list());
+                let mut adjoint = gen.generate(extractor.wengert_list());
+
+                // 6b. Dead gradient elimination: prune adjoint ops not needed
+                // by any parameter gradient. This removes ghost VarId chains
+                // from non-differentiable ops (shape, subscript, list) that
+                // would cascade skip in the lowerer.
+                {
+                    let named_params = extractor.named_param_var_ids();
+                    let needed: std::collections::HashSet<crate::wengert::VarId> = named_params.iter()
+                        .filter_map(|(_, vid)| gen.adjoint_of(*vid))
+                        .collect();
+                    if !needed.is_empty() {
+                        adjoint.ops = crate::source_ad::eliminate_dead_gradients(
+                            &adjoint.ops, &needed,
+                        );
+                    }
+                }
 
                 // 7. Lower ADJOINT Wengert list using full_vars, which now
                 //    contains all intermediate VarId → Value mappings from

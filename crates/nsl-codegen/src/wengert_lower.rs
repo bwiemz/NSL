@@ -40,7 +40,20 @@ pub fn compile_wengert_ops(
         }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
         var_map.insert(op.result, result_val);
-        var_types.insert(op.result, type_for_op(&op.op));
+        // Infer result type: for binary ops, if both inputs are Integer, result is Integer
+        let result_type = match &op.op {
+            PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+                let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
+                let b_ty = var_types.get(&op.inputs[1]).copied().unwrap_or(WengertType::Tensor);
+                if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
+                    WengertType::Integer
+                } else {
+                    WengertType::Tensor
+                }
+            }
+            _ => type_for_op(&op.op),
+        };
+        var_types.insert(op.result, result_type);
     }
     Ok(var_map)
 }
@@ -136,10 +149,44 @@ fn lower_single_op(
         }
 
         // === Elementwise binary (4 ops) ===
-        PrimalOp::Add => call(compiler, builder, "nsl_tensor_add", &[inputs[0], inputs[1]]),
-        PrimalOp::Sub => call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1]]),
-        PrimalOp::Mul => call(compiler, builder, "nsl_tensor_mul", &[inputs[0], inputs[1]]),
-        PrimalOp::Div => call(compiler, builder, "nsl_tensor_div", &[inputs[0], inputs[1]]),
+        // Check if both inputs are Integer-typed (e.g., shape[0] * shape[1]).
+        // If so, use Cranelift integer arithmetic instead of tensor ops.
+        PrimalOp::Add => {
+            let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
+            let b_ty = var_types.get(&op.inputs[1]).copied().unwrap_or(WengertType::Tensor);
+            if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
+                Ok(builder.ins().iadd(inputs[0], inputs[1]))
+            } else {
+                call(compiler, builder, "nsl_tensor_add", &[inputs[0], inputs[1]])
+            }
+        }
+        PrimalOp::Sub => {
+            let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
+            let b_ty = var_types.get(&op.inputs[1]).copied().unwrap_or(WengertType::Tensor);
+            if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
+                Ok(builder.ins().isub(inputs[0], inputs[1]))
+            } else {
+                call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1]])
+            }
+        }
+        PrimalOp::Mul => {
+            let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
+            let b_ty = var_types.get(&op.inputs[1]).copied().unwrap_or(WengertType::Tensor);
+            if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
+                Ok(builder.ins().imul(inputs[0], inputs[1]))
+            } else {
+                call(compiler, builder, "nsl_tensor_mul", &[inputs[0], inputs[1]])
+            }
+        }
+        PrimalOp::Div => {
+            let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
+            let b_ty = var_types.get(&op.inputs[1]).copied().unwrap_or(WengertType::Tensor);
+            if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
+                Ok(builder.ins().sdiv(inputs[0], inputs[1]))
+            } else {
+                call(compiler, builder, "nsl_tensor_div", &[inputs[0], inputs[1]])
+            }
+        }
 
         // === Linear algebra (4 ops) ===
         PrimalOp::Matmul => call(compiler, builder, "nsl_tensor_matmul", &[inputs[0], inputs[1]]),

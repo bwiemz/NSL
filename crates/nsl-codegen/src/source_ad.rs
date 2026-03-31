@@ -1178,6 +1178,8 @@ impl<'a> WengertExtractor<'a> {
                 let obj = self.extract_expr(object)?;
                 if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
                     let idx = self.extract_expr(idx_expr)?;
+                    // Note: idx type is NOT overridden here — the subscript lowerer
+                    // handles type conversion (extracts i64 from tensor/scalar).
                     let result = self.alloc_var();
                     self.push_op(WengertOp {
                         id: self.list.ops.len() as u32, result,
