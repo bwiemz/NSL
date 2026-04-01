@@ -676,9 +676,10 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
 pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.len != 1 {
+        let shape: Vec<i64> = (0..tensor.ndim as usize).map(|i| unsafe { *tensor.shape.add(i) }).collect();
         eprintln!(
-            "nsl: .item() requires a scalar tensor (got {} elements)",
-            tensor.len
+            "nsl: .item() requires a scalar tensor (got {} elements, shape={:?}, ndim={})",
+            tensor.len, shape, tensor.ndim
         );
         std::process::abort();
     }

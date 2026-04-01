@@ -2082,7 +2082,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
             // Library module: export all functions.
             // If this module has dependencies (imports from other modules), inject their symbols.
             let mut lib_imported_fns = Vec::new();
-            let mut lib_struct_layouts = HashMap::new();
+            let mut lib_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
             let mut lib_model_names = std::collections::HashSet::new();
 
             // Check if this module has any imports
@@ -2120,6 +2120,11 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                             let sig = temp_compiler.build_fn_signature(fn_def);
                             lib_imported_fns.push((raw_name, mangled_name, sig));
                         }
+                    }
+
+                    // Inject previously-collected struct layouts from earlier deps
+                    for (name, layout) in &lib_struct_layouts {
+                        temp_compiler.types.struct_layouts.insert(name.clone(), layout.clone());
                     }
 
                     if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
