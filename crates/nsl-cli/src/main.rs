@@ -1377,10 +1377,12 @@ fn run_build_shared_multi(
 
         let obj_bytes = if is_entry {
             let mut imported_fns = Vec::new();
-            let mut imported_struct_layouts = HashMap::new();
+            let mut imported_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
             let mut imported_model_names = std::collections::HashSet::new();
             let mut imported_enum_variants = HashMap::new();
             let mut imported_enum_defs = HashMap::new();
+            let mut imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>> = HashMap::new();
+            let mut imported_model_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
             for dep_path in &graph.dep_order {
                 if dep_path == &graph.entry {
@@ -1409,6 +1411,11 @@ fn run_build_shared_multi(
                     }
                 }
 
+                // Inject previously-collected struct layouts from earlier deps
+                for (name, layout) in &imported_struct_layouts {
+                    temp_compiler.types.struct_layouts.insert(name.clone(), layout.clone());
+                }
+
                 if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
                     eprintln!("codegen error: {e}");
                     process::exit(1);
@@ -1432,6 +1439,28 @@ fn run_build_shared_multi(
                     imported_struct_layouts.insert(name, layout);
                 }
 
+                // Propagate model field types from temp compiler (populated by collect_models)
+                for (name, fields) in temp_compiler.models.model_field_types.drain() {
+                    imported_model_field_types.entry(name).or_insert(fields);
+                }
+
+                // Extract model method bodies directly from AST
+                for stmt in &dep_data.ast.stmts {
+                    if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
+                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        let mut body_map = HashMap::new();
+                        for member in &md.members {
+                            if let nsl_ast::decl::ModelMember::Method(fn_def, _) = member {
+                                let method_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                                body_map.insert(method_name, fn_def.clone());
+                            }
+                        }
+                        if !body_map.is_empty() {
+                            imported_model_method_bodies.entry(model_name).or_insert(body_map);
+                        }
+                    }
+                }
+
                 imported_enum_variants.extend(dep_data.enum_variants.clone());
                 imported_enum_defs.extend(dep_data.enum_defs.clone());
             }
@@ -1445,6 +1474,8 @@ fn run_build_shared_multi(
                 imported_model_names,
                 imported_enum_variants,
                 imported_enum_defs,
+                imported_model_method_bodies,
+                imported_model_field_types,
                 dump_ir,
                 options,
             ) {
@@ -1933,10 +1964,12 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
         let obj_bytes = if is_entry {
             // Entry module: import functions from all dependencies
             let mut imported_fns = Vec::new();
-            let mut imported_struct_layouts = HashMap::new();
+            let mut imported_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
             let mut imported_model_names = std::collections::HashSet::new();
             let mut imported_enum_variants = HashMap::new();
             let mut imported_enum_defs = HashMap::new();
+            let mut imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>> = HashMap::new();
+            let mut imported_model_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
             // Collect imports from ALL dependency modules (not just direct deps)
             for dep_path in &graph.dep_order {
@@ -1961,6 +1994,13 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                         let sig = temp_compiler.build_fn_signature(fn_def);
                         imported_fns.push((raw_name, mangled_name, sig));
                     }
+                }
+
+                // Inject previously-collected struct layouts from earlier deps so that
+                // collect_models can resolve sub-model field types (e.g., GQA referencing
+                // RotaryEmbedding which was collected from the rope module earlier).
+                for (name, layout) in &imported_struct_layouts {
+                    temp_compiler.types.struct_layouts.insert(name.clone(), layout.clone());
                 }
 
                 // Extract struct layouts from dependency (structs first, then models which may reference structs)
@@ -1989,6 +2029,30 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                     imported_struct_layouts.insert(name, layout);
                 }
 
+                // Propagate model field types from temp compiler (populated by collect_models)
+                for (name, fields) in temp_compiler.models.model_field_types.drain() {
+                    imported_model_field_types.entry(name).or_insert(fields);
+                }
+
+                // Extract model method bodies directly from AST (not from temp compiler,
+                // because model_method_bodies is only populated by declare_user_functions
+                // which is not called on temp compilers).
+                for stmt in &dep_data.ast.stmts {
+                    if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
+                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        let mut body_map = HashMap::new();
+                        for member in &md.members {
+                            if let nsl_ast::decl::ModelMember::Method(fn_def, _) = member {
+                                let method_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                                body_map.insert(method_name, fn_def.clone());
+                            }
+                        }
+                        if !body_map.is_empty() {
+                            imported_model_method_bodies.entry(model_name).or_insert(body_map);
+                        }
+                    }
+                }
+
                 // Import enum variants/defs
                 imported_enum_variants.extend(dep_data.enum_variants.clone());
                 imported_enum_defs.extend(dep_data.enum_defs.clone());
@@ -2003,6 +2067,8 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
                 imported_model_names,
                 imported_enum_variants,
                 imported_enum_defs,
+                imported_model_method_bodies,
+                imported_model_field_types,
                 dump_ir,
                 options,
             ) {

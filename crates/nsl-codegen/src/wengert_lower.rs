@@ -486,13 +486,17 @@ fn lower_single_op(
                 "rotate_half" => call(compiler, builder, "nsl_tensor_rotate_half", &[inputs[0]]),
                 // Tensor construction (non-differentiable, used for shape/position computation)
                 "arange" => {
+                    // arange(start, stop) or arange(stop) — extract f64 from tensor inputs
+                    // and call nsl_tensor_arange(start, stop, step=1.0)
+                    let step = builder.ins().f64const(1.0);
                     if inputs.len() >= 2 {
-                        call(compiler, builder, "nsl_arange", &[inputs[0], inputs[1]])
+                        let start = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
+                        let stop = call(compiler, builder, "nsl_tensor_item", &[inputs[1]])?;
+                        call(compiler, builder, "nsl_tensor_arange", &[start, stop, step])
                     } else if inputs.len() == 1 {
                         let zero = builder.ins().f64const(0.0);
-                        let dt = builder.ins().iconst(cl_types::I64, 1);
-                        let zero_t = call(compiler, builder, "nsl_tensor_scalar", &[zero, dt])?;
-                        call(compiler, builder, "nsl_arange", &[zero_t, inputs[0]])
+                        let stop = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
+                        call(compiler, builder, "nsl_tensor_arange", &[zero, stop, step])
                     } else {
                         Err(CodegenError::new("arange requires at least 1 argument".to_string()))
                     }

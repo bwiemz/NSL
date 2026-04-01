@@ -4,29 +4,31 @@
 from nsl.nn.norms import RMSNorm
 from nsl.nn.gqa import GroupedQueryAttention
 
-model SwiGLUFFN(d_model: int, d_ff: int):
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
     w_up: Tensor = randn([d_model, d_ff])
     w_down: Tensor = randn([d_ff, d_model])
+    _dropout_p: Tensor = full([1], dropout_p)
 
-    fn forward(self, x: Tensor) -> Tensor:
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
         let gate = silu(x @ self.w_gate)
         let up = x @ self.w_up
-        return (gate * up) @ self.w_down
+        let out = (gate * up) @ self.w_down
+        return dropout(out, self._dropout_p.item(), training)
 
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
     ffn_norm: RMSNorm = RMSNorm(d_model)
-    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
 
-    fn forward(self, x: Tensor) -> Tensor:
-        let h = x + self.attn.forward(self.attn_norm.forward(x))
-        return h + self.ffn.forward(self.ffn_norm.forward(h))
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x), training)
+        return h + self.ffn.forward(self.ffn_norm.forward(h), training)
 
 model TinyCoder:
     embed: Tensor = randn([256, 64])
-    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 176)
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 176, 0.0)
     norm: RMSNorm = RMSNorm(64)
 
     fn forward(self, input_ids: Tensor) -> Tensor:
@@ -36,7 +38,7 @@ model TinyCoder:
         let es = emb.shape
         let x = emb.reshape([1, es[0], es[1]])
         for block in self.blocks:
-            x = block.forward(x)
+            x = block.forward(x, false)
         x = self.norm.forward(x)
         return x @ self.embed.transpose(0, 1)
 

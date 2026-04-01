@@ -1736,38 +1736,28 @@ impl Compiler<'_> {
         })?;
         let model_ptr = builder.use_var(model_var);
 
-        // Resolve model type name — search type_map for any entry with Model/Struct type
-        // that matches what we know about this variable, or fall back to the variable name
+        // Resolve model type name from the variable's semantic type.
+        // First try model_var_types (set for for-loop model vars), then
+        // state.variable_types (set for let-bound vars), then fall back to
+        // scanning the type_map (unreliable — picks the first model type).
         let model_var_name = self.resolve_sym(model_sym).to_string();
-        let model_type_name = {
-            // Try to find the model type by checking all type_map entries
-            let mut found_name = None;
-            for (_node_id, ty) in self.type_map.iter() {
-                match ty {
-                    nsl_semantic::types::Type::Model { name, .. } => {
-                        let n = self.resolve_sym(*name).to_string();
-                        if self.types.struct_layouts.contains_key(&n) {
-                            found_name = Some(n);
-                            break;
+        let model_type_name = self.models.model_var_types.get(&model_sym)
+            .cloned()
+            .or_else(|| {
+                // Check semantic type from variable_types
+                state.variable_types.get(&model_sym).and_then(|ty| {
+                    match ty {
+                        nsl_semantic::types::Type::Model { name, .. } => {
+                            Some(self.resolve_sym(*name).to_string())
                         }
-                    }
-                    nsl_semantic::types::Type::Struct { name, .. } => {
-                        let n = self.resolve_sym(*name).to_string();
-                        if self.types.struct_layouts.contains_key(&n) {
-                            // Only use if it looks like a model (has tensor fields)
-                            found_name = Some(n);
+                        nsl_semantic::types::Type::Struct { name, .. } => {
+                            Some(self.resolve_sym(*name).to_string())
                         }
+                        _ => None,
                     }
-                    _ => {}
-                }
-            }
-            // Fallback: try variable name directly, or capitalize it
-            found_name.unwrap_or_else(|| {
-                // Try capitalized form (common: variable 'm' → type 'M' not useful)
-                // Just use the variable name and hope struct_layouts has it
-                model_var_name.clone()
+                })
             })
-        };
+            .unwrap_or_else(|| model_var_name.clone());
 
         let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(

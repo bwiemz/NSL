@@ -992,9 +992,16 @@ impl<'a> WengertExtractor<'a> {
                                         .and_then(|methods| methods.get(&method_name))
                                         .cloned();
                                     if let Some(fn_def) = fn_def {
+                                        // Pre-extract args in CALLER's context before switching to callee's context.
+                                        // This is critical: args like `self.attn_norm.forward(x)` use `self` referring
+                                        // to the caller's model (TransformerBlock), not the callee (GQA).
+                                        let extracted = match self.pre_extract_args(&fn_def, args) {
+                                            Some(e) => e,
+                                            None => return None,
+                                        };
                                         let saved_self = self.self_context.clone();
                                         self.self_context = Some(compound_prefix);
-                                        let result = self.inline_method_call_inner(&fn_def, args);
+                                        let result = self.inline_method_body(&fn_def, extracted);
                                         self.self_context = saved_self;
                                         return result;
                                     }
@@ -1013,9 +1020,14 @@ impl<'a> WengertExtractor<'a> {
                                     .and_then(|methods| methods.get(&method_name))
                                     .cloned();
                                 if let Some(fn_def) = fn_def {
+                                    // Pre-extract args in caller's context
+                                    let extracted = match self.pre_extract_args(&fn_def, args) {
+                                        Some(e) => e,
+                                        None => return None,
+                                    };
                                     let saved_self = self.self_context.clone();
                                     self.self_context = Some(ctx);
-                                    let result = self.inline_method_call_inner(&fn_def, args);
+                                    let result = self.inline_method_body(&fn_def, extracted);
                                     self.self_context = saved_self;
                                     return result;
                                 }
@@ -1062,6 +1074,23 @@ impl<'a> WengertExtractor<'a> {
                 // Regular function call: extract function name
                 let func_name = if let ExprKind::Ident(sym) = &callee.kind {
                     self.interner.resolve(sym.0).unwrap_or("").to_string()
+                } else if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                    let method = self.interner.resolve(member.0).unwrap_or("?");
+                    let obj_desc = match &object.kind {
+                        ExprKind::Ident(s) => format!("Ident({})", self.interner.resolve(s.0).unwrap_or("?")),
+                        ExprKind::SelfRef => "self".to_string(),
+                        ExprKind::MemberAccess { object: inner, member: m } => {
+                            let m_name = self.interner.resolve(m.0).unwrap_or("?");
+                            match &inner.kind {
+                                ExprKind::SelfRef => format!("self.{}", m_name),
+                                ExprKind::Ident(s) => format!("{}.{}", self.interner.resolve(s.0).unwrap_or("?"), m_name),
+                                _ => format!("?.{}", m_name),
+                            }
+                        }
+                        _ => format!("{:?}", std::mem::discriminant(&object.kind)),
+                    };
+                    eprintln!("[source-ad] unresolved method call: {}.{}() — model type not found in method bodies", obj_desc, method);
+                    return None;
                 } else {
                     eprintln!("[source-ad] unsupported callee expression: {:?}", std::mem::discriminant(&callee.kind));
                     return None; // Complex callee -- can't extract
@@ -1483,11 +1512,13 @@ impl<'a> WengertExtractor<'a> {
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
     ) -> Option<VarId> {
+        // Pre-extract args in caller's context before switching to callee's
+        let extracted = self.pre_extract_args(fn_def, call_args)?;
         let name = self.symbol_name_overrides.get(&model_sym).cloned()
             .unwrap_or_else(|| self.interner.resolve(model_sym.0).unwrap_or("?").to_string());
         let saved_self = self.self_context.clone();
         self.self_context = Some(name);
-        let result = self.inline_method_call_inner(fn_def, call_args);
+        let result = self.inline_method_body(fn_def, extracted);
         self.self_context = saved_self;
         result
     }
@@ -1498,12 +1529,14 @@ impl<'a> WengertExtractor<'a> {
     /// Binds call arguments to the method's parameter names (skipping `self`),
     /// then extracts the method body statements. The return value of the method
     /// becomes the result of this expression.
-    fn inline_method_call_inner(
+    /// Pre-extract call arguments in the current (caller's) context.
+    /// Returns (param_symbol, param_name, VarId) triples for binding.
+    fn pre_extract_args(
         &mut self,
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
-    ) -> Option<VarId> {
-        // Bind call arguments to parameter names (skip `self` param)
+    ) -> Option<Vec<(nsl_ast::Symbol, String, VarId)>> {
+        let mut result = Vec::new();
         let mut arg_idx = 0;
         for param in &fn_def.params {
             let param_name = self.interner.resolve(param.name.0).unwrap_or("?").to_string();
@@ -1511,15 +1544,37 @@ impl<'a> WengertExtractor<'a> {
                 continue;
             }
             if arg_idx < call_args.len() {
-                // Extract the argument expression and bind it to the parameter symbol
                 if let Some(var) = self.extract_expr(&call_args[arg_idx].value) {
-                    self.symbol_to_var.insert(param.name, var);
-                    self.list.var_names.insert(var, param_name);
+                    result.push((param.name, param_name, var));
                 } else {
                     return None;
                 }
                 arg_idx += 1;
             }
+        }
+        Some(result)
+    }
+
+    fn inline_method_call_inner(
+        &mut self,
+        fn_def: &nsl_ast::decl::FnDef,
+        call_args: &[nsl_ast::expr::Arg],
+    ) -> Option<VarId> {
+        // Extract args in current context, then bind
+        let extracted = self.pre_extract_args(fn_def, call_args)?;
+        self.inline_method_body(fn_def, extracted)
+    }
+
+    /// Inline a method body with pre-extracted argument bindings.
+    fn inline_method_body(
+        &mut self,
+        fn_def: &nsl_ast::decl::FnDef,
+        extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,
+    ) -> Option<VarId> {
+        // Bind the pre-extracted argument VarIds to parameter symbols
+        for (sym, name, var) in extracted_args {
+            self.symbol_to_var.insert(sym, var);
+            self.list.var_names.insert(var, name);
         }
 
         // Save the output before extraction
