@@ -13,11 +13,11 @@ m.to(cuda)
 print("Model on GPU")
 print("================================================================")
 print("  NSL-Coder-50M Pretraining (GPU)")
-print("  48.8M parameters | batch=4, seq=1024, AdamW")
+print("  48.8M parameters | batch=1, seq=1024, AdamW")
 print("================================================================")
 
 let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=4, seq_len=1024, shuffle=false, drop_last=true)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
 
 print("Starting train block...")
 

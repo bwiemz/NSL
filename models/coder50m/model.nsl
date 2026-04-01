@@ -69,17 +69,22 @@ model NSLCoder:
             return self.forward_train(ids_2d, false)
         return self.forward_train(input_ids, false)
 
-    fn forward_train(self, input_ids: Tensor, training: bool) -> Tensor:
-        # DataLoader produces [batch, seq] — flatten to 1D for embedding_lookup
-        let ids_shape = input_ids.shape
-        let batch_size = ids_shape[0]
-        let seq_len = ids_shape[1]
-        let flat_ids = input_ids.reshape([batch_size * seq_len])
-        let emb = embedding_lookup(self.embed, flat_ids)
-        # emb is [batch*seq, d_model] — reshape to [batch, seq, d_model]
-        let x = emb.reshape([batch_size, seq_len, 512])
+    fn forward_core(self, emb_3d: Tensor, training: bool) -> Tensor:
+        # Differentiable core: blocks → norm → LM head
+        # All ops here are extractable by source AD
+        let x = emb_3d
         for block in self.blocks:
             x = block.forward(x, training)
         x = self.norm.forward(x)
         # Weight-tied LM head: reuse embedding matrix
         return x @ self.embed.transpose(0, 1)
+
+    fn forward_train(self, input_ids: Tensor, training: bool) -> Tensor:
+        # Shape manipulation (non-differentiable) then differentiable core
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let emb_3d = emb.reshape([batch_size, seq_len, 512])
+        return self.forward_core(emb_3d, training)

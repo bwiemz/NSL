@@ -40,7 +40,9 @@ pub fn compile_wengert_ops(
         }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
         var_map.insert(op.result, result_val);
-        // Infer result type: for binary ops, if both inputs are Integer, result is Integer
+        // Infer result type: for binary ops, if both inputs are Integer, result is Integer.
+        // For Constants, preserve the extractor's type (it may have overridden
+        // the default Tensor to Integer for IntLiteral).
         let result_type = match &op.op {
             PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
                 let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
@@ -50,6 +52,11 @@ pub fn compile_wengert_ops(
                 } else {
                     WengertType::Tensor
                 }
+            }
+            PrimalOp::Constant(_) => {
+                // Preserve the extractor's type annotation (Integer for IntLiteral,
+                // Tensor for adjoint seeds, Scalar for float literals).
+                var_types.get(&op.result).copied().unwrap_or(type_for_op(&op.op))
             }
             _ => type_for_op(&op.op),
         };
@@ -81,6 +88,22 @@ fn call(
     args: &[Value],
 ) -> Result<Value, CodegenError> {
     compiler.compile_call_by_name(builder, name, args)
+}
+
+/// Promote an Integer (i64) to a scalar Tensor if needed for mixed-type arithmetic.
+fn promote_to_tensor(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    val: Value,
+    ty: WengertType,
+) -> Result<Value, CodegenError> {
+    if ty == WengertType::Integer {
+        let f = builder.ins().fcvt_from_sint(cl_types::F64, val);
+        let dt = builder.ins().iconst(cl_types::I64, 0); // f64 — matches CPU working dtype
+        call(compiler, builder, "nsl_tensor_scalar", &[f, dt])
+    } else {
+        Ok(val)
+    }
 }
 
 /// Lower one WengertOp to Cranelift IR.
@@ -157,7 +180,9 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().iadd(inputs[0], inputs[1]))
             } else {
-                call(compiler, builder, "nsl_tensor_add", &[inputs[0], inputs[1]])
+                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                call(compiler, builder, "nsl_tensor_add", &[a, b])
             }
         }
         PrimalOp::Sub => {
@@ -166,7 +191,9 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().isub(inputs[0], inputs[1]))
             } else {
-                call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1]])
+                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                call(compiler, builder, "nsl_tensor_sub", &[a, b])
             }
         }
         PrimalOp::Mul => {
@@ -175,7 +202,9 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().imul(inputs[0], inputs[1]))
             } else {
-                call(compiler, builder, "nsl_tensor_mul", &[inputs[0], inputs[1]])
+                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                call(compiler, builder, "nsl_tensor_mul", &[a, b])
             }
         }
         PrimalOp::Div => {
@@ -184,7 +213,9 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().sdiv(inputs[0], inputs[1]))
             } else {
-                call(compiler, builder, "nsl_tensor_div", &[inputs[0], inputs[1]])
+                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                call(compiler, builder, "nsl_tensor_div", &[a, b])
             }
         }
 
@@ -272,7 +303,7 @@ fn lower_single_op(
         // === Indexing (3 ops) ===
         PrimalOp::Gather { dim } => {
             let d = builder.ins().iconst(cl_types::I64, *dim);
-            call(compiler, builder, "nsl_tensor_gather", &[inputs[0], inputs[1], d])
+            call(compiler, builder, "nsl_tensor_gather", &[inputs[0], d, inputs[1]])
         }
         PrimalOp::ScatterAdd { dim } => {
             let d = builder.ins().iconst(cl_types::I64, *dim);
@@ -354,7 +385,7 @@ fn lower_single_op(
             let neg_one = builder.ins().iconst(cl_types::I64, -1);
             let log_sm = call(compiler, builder, "nsl_tensor_logsoftmax", &[inputs[0], neg_one])?;
             let neg_log = call(compiler, builder, "nsl_tensor_neg", &[log_sm])?;
-            let gathered = call(compiler, builder, "nsl_tensor_gather", &[neg_log, inputs[1], neg_one])?;
+            let gathered = call(compiler, builder, "nsl_tensor_gather", &[neg_log, neg_one, inputs[1]])?;
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             call(compiler, builder, "nsl_tensor_mean_dim", &[gathered, neg_one, keepdim])
         }
@@ -466,6 +497,15 @@ fn lower_single_op(
                         Err(CodegenError::new("arange requires at least 1 argument".to_string()))
                     }
                 }
+                "embedding_backward" => {
+                    // inputs = [grad, indices, weight]
+                    // Creates zeros_like(weight) then scatter-adds grad rows
+                    call(compiler, builder, "nsl_embedding_backward", &[inputs[0], inputs[1], inputs[2]])
+                }
+                "cross_entropy_backward" => {
+                    // inputs = [grad_output, logits, targets]
+                    call(compiler, builder, "nsl_cross_entropy_backward", &[inputs[0], inputs[1], inputs[2]])
+                }
                 "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
                     let rt_name = format!("nsl_tensor_{}", name);
                     call(compiler, builder, &rt_name, &inputs)
@@ -533,7 +573,7 @@ fn lower_single_op(
                 "list" => {
                     // Build a list from input elements.
                     // Elements may be i64 (from subscript/int), f64 (from Constant/Scalar),
-                    // or tensor pointers. nsl_list_push expects i64.
+                    // or tensor pointers. nsl_list_push expects raw i64 dimension values.
                     let list = call(compiler, builder, "nsl_list_new", &[])?;
                     for (i, &inp) in inputs.iter().enumerate() {
                         let val_ty = op.inputs.get(i)
@@ -543,7 +583,14 @@ fn lower_single_op(
                             WengertType::Scalar => {
                                 builder.ins().fcvt_to_sint(cl_types::I64, inp)
                             }
-                            _ => inp, // Integer, List, Tensor — already i64
+                            WengertType::Tensor => {
+                                // Safety net: if a Tensor value ends up in a list
+                                // (e.g., Constant not tagged as Integer), extract
+                                // the scalar and convert to i64 dimension.
+                                let f64_val = call(compiler, builder, "nsl_tensor_item", &[inp])?;
+                                builder.ins().fcvt_to_sint(cl_types::I64, f64_val)
+                            }
+                            _ => inp, // Integer, List — already i64
                         };
                         call(compiler, builder, "nsl_list_push", &[list, val])?;
                     }

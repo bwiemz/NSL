@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
-use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, type_for_op};
+use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, WengertType, type_for_op};
 
 // M40b: Wengert extraction from typed AST
 use nsl_ast::expr::ExprKind;
@@ -375,10 +375,14 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![masked, inv_keep])
             }
 
-            // --- Embedding backward: scatter_add(grad, indices) into weight gradient ---
-            // Lowered as ScatterAdd — the runtime FFI handles the actual scatter
-            AdjointExpr::EmbeddingBackward(y_bar, indices, _vocab) => {
-                self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices])
+            // --- Embedding backward: scatter_add(grad, indices) into weight-shaped gradient ---
+            // Uses dedicated runtime function that creates a zeros tensor matching
+            // the weight's shape and scatter-adds gradient rows at index positions.
+            AdjointExpr::EmbeddingBackward(y_bar, indices, weight) => {
+                self.emit_op(
+                    PrimalOp::Passthrough("embedding_backward".into()),
+                    vec![y_bar, indices, weight],
+                )
             }
 
             // --- Gather backward: scatter_add(grad, indices, dim) ---
@@ -434,13 +438,14 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![repeated, scale])
             }
 
-            // --- CrossEntropy backward: y_bar * (softmax(logits) - one_hot(targets)) ---
-            // The first field is the upstream gradient (y_bar), which must be
-            // multiplied in for chain rule correctness.
+            // --- CrossEntropy backward: (softmax(logits) - one_hot(targets)) * y_bar / N ---
+            // Uses dedicated runtime function that handles class-index targets
+            // (not one-hot), computes softmax internally, and fuses the /N scaling.
             AdjointExpr::CrossEntropyBackward(y_bar, logits, targets) => {
-                let softmax_out = self.emit_op(PrimalOp::Softmax { dim: -1 }, vec![logits]);
-                let diff = self.emit_op(PrimalOp::Sub, vec![softmax_out, targets]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, diff])
+                self.emit_op(
+                    PrimalOp::Passthrough("cross_entropy_backward".into()),
+                    vec![y_bar, logits, targets],
+                )
             }
 
             // --- MSE backward for reduction='sum': d/d(pred) = 2*(pred - target) * grad_output ---
@@ -716,6 +721,8 @@ impl<'a> WengertExtractor<'a> {
         for stmt in stmts {
             if !self.extract_stmt(stmt) {
                 self.is_static = false;
+                eprintln!("[source-ad] extraction failed at {:?} (line {:?})",
+                    std::mem::discriminant(&stmt.kind), stmt.span);
                 return false;
             }
         }
@@ -725,7 +732,7 @@ impl<'a> WengertExtractor<'a> {
     fn extract_stmt(&mut self, stmt: &nsl_ast::stmt::Stmt) -> bool {
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value: Some(val), .. } => {
-                let var_name = if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
+                let _var_name = if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
                     self.interner.resolve(sym.0).unwrap_or("?").to_string()
                 } else { "?".to_string() };
                 if let Some(var) = self.extract_expr(val) {
@@ -736,6 +743,8 @@ impl<'a> WengertExtractor<'a> {
                     }
                     true
                 } else {
+                    eprintln!("[source-ad] VarDecl '{}' extraction failed at expr {:?}",
+                        _var_name, std::mem::discriminant(&val.kind));
                     false
                 }
             }
@@ -943,6 +952,12 @@ impl<'a> WengertExtractor<'a> {
                                 .cloned();
                             if let Some(fn_def) = fn_def {
                                 return self.inline_method_call(*obj_sym, &fn_def, args);
+                            } else {
+                                eprintln!("[source-ad] method '{}' not found in model type '{}' (available: {:?})",
+                                    method_name, model_type,
+                                    self.model_method_bodies.get(&model_type)
+                                        .map(|m| m.keys().collect::<Vec<_>>())
+                                        .unwrap_or_default());
                             }
                         }
                     }
@@ -1048,6 +1063,7 @@ impl<'a> WengertExtractor<'a> {
                 let func_name = if let ExprKind::Ident(sym) = &callee.kind {
                     self.interner.resolve(sym.0).unwrap_or("").to_string()
                 } else {
+                    eprintln!("[source-ad] unsupported callee expression: {:?}", std::mem::discriminant(&callee.kind));
                     return None; // Complex callee -- can't extract
                 };
 
@@ -1118,7 +1134,10 @@ impl<'a> WengertExtractor<'a> {
                     "clamp" => PrimalOp::Clamp { min: f64::NEG_INFINITY, max: f64::INFINITY },
                     // Scalar extraction (non-differentiable)
                     "int" | "float" => PrimalOp::Passthrough(func_name.clone()),
-                    _ => return None, // Unknown function -- can't differentiate
+                    _ => {
+                        eprintln!("[source-ad] unsupported function: '{}'", func_name);
+                        return None;
+                    }
                 };
 
                 self.push_op(WengertOp {
@@ -1142,6 +1161,10 @@ impl<'a> WengertExtractor<'a> {
                     saved_for_backward: false,
                     checkpointed: false,
                 });
+                // Override type: integer literals are raw i64, not tensor pointers.
+                // push_op defaults to Tensor (for adjoint seed constants), but
+                // IntLiterals are used for subscript indices and shape dimensions.
+                self.list.var_types.insert(result, WengertType::Integer);
                 Some(result)
             }
 

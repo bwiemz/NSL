@@ -572,6 +572,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_scalar", &[types::F64, types::I64], Some(types::I64)),
     ("nsl_tensor_pad_zero", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_scatter_add", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_embedding_backward", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_cross_entropy_backward", &[types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_logsoftmax", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_repeat", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_rope_inverse", &[types::I64, types::I64], Some(types::I64)),

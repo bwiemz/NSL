@@ -56,8 +56,8 @@ pub enum AdjointExpr {
     DropoutBackward(VarId, VarId, f64),
 
     // Indexing backward
-    /// Embedding backward: scatter_add(grad, indices). args: (grad, indices, vocab_size)
-    EmbeddingBackward(VarId, VarId, usize),
+    /// Embedding backward: scatter_add(grad, indices, weight). args: (grad, indices, weight_var)
+    EmbeddingBackward(VarId, VarId, VarId),
     /// Gather backward: scatter_add(grad, indices, dim). args: (grad, indices, dim)
     GatherBackward(VarId, VarId, i64),
     /// ScatterAdd backward for src: gather(grad, indices). args: (grad, indices, dim)
@@ -291,7 +291,8 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // --- Indexing ---
         PrimalOp::Embedding => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::EmbeddingBackward(output_bar, op.inputs[1], 0),
+            // Pass weight (inputs[0]) so backward can size the output to match
+            expr: AdjointExpr::EmbeddingBackward(output_bar, op.inputs[1], op.inputs[0]),
         }],
         PrimalOp::Gather { dim } => vec![InputAdjoint {
             input_var: op.inputs[0],

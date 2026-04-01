@@ -408,6 +408,217 @@ pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i6
 }
 
 // ---------------------------------------------------------------------------
+// 5b. nsl_embedding_backward — scatter-add grad rows into weight-shaped zeros
+// ---------------------------------------------------------------------------
+
+/// Embedding backward: creates a zeros tensor matching the weight shape, then
+/// scatter-adds gradient rows at the given index positions.
+///
+/// `grad` shape: `[seq_len, embed_dim]`
+/// `indices` shape: `[seq_len]` (integer token indices)
+/// `weight` shape: `[vocab_size, embed_dim]` (used only for sizing the output)
+///
+/// Returns: gradient w.r.t. weight, shape `[vocab_size, embed_dim]`
+#[no_mangle]
+pub extern "C" fn nsl_embedding_backward(
+    grad_ptr: i64,
+    indices_ptr: i64,
+    weight_ptr: i64,
+) -> i64 {
+    let grad_c = nsl_tensor_contiguous(grad_ptr);
+    let grad = NslTensor::from_ptr(grad_c);
+    let idx_c = nsl_tensor_contiguous(indices_ptr);
+    let idx = NslTensor::from_ptr(idx_c);
+    let weight_c = nsl_tensor_contiguous(weight_ptr);
+    let weight = NslTensor::from_ptr(weight_c);
+
+    if weight.ndim < 2 {
+        eprintln!("nsl: embedding_backward requires 2D weight, got {}D", weight.ndim);
+        std::process::abort();
+    }
+
+    let vocab_size = unsafe { *weight.shape } as usize;
+    let embed_dim = unsafe { *weight.shape.add(1) } as usize;
+    let seq_len = idx.len as usize;
+    let dtype = grad.dtype;
+
+    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let out_len = vocab_size * embed_dim;
+    let out_data = checked_alloc_zeroed(out_len * elem_size);
+
+    if dtype == 1 {
+        let src = grad.data_f32();
+        let dst = out_data as *mut f32;
+        for i in 0..seq_len {
+            let tok = idx.read_index(i) as usize;
+            if tok < vocab_size {
+                for e in 0..embed_dim {
+                    unsafe { *dst.add(tok * embed_dim + e) += *src.add(i * embed_dim + e); }
+                }
+            }
+        }
+    } else {
+        let src = grad.data_f64();
+        let dst = out_data as *mut f64;
+        for i in 0..seq_len {
+            let tok = idx.read_index(i) as usize;
+            if tok < vocab_size {
+                for e in 0..embed_dim {
+                    unsafe { *dst.add(tok * embed_dim + e) += *src.add(i * embed_dim + e); }
+                }
+            }
+        }
+    }
+
+    let shape_ptr = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape_ptr = vocab_size as i64;
+        *shape_ptr.add(1) = embed_dim as i64;
+    }
+    let strides_ptr = NslTensor::compute_strides(shape_ptr, 2);
+    let result = Box::new(NslTensor::new(
+        out_data as *mut c_void,
+        shape_ptr,
+        strides_ptr,
+        2,
+        out_len as i64,
+        grad.device,
+        dtype,
+        1,
+        0,
+    ));
+    let out = NslTensor::publish(result);
+    nsl_tensor_free(grad_c);
+    nsl_tensor_free(idx_c);
+    nsl_tensor_free(weight_c);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 5c. nsl_cross_entropy_backward — CE gradient: (softmax(logits) - one_hot(targets)) / N
+// ---------------------------------------------------------------------------
+
+/// Compute the cross-entropy loss backward gradient w.r.t. logits.
+///
+/// `logits` shape: `[N, C]`
+/// `targets` shape: `[N]` (integer class indices)
+/// `grad_output` shape: scalar or `[1]`
+///
+/// Returns: `grad_output * (softmax(logits) - one_hot(targets)) / N`
+#[no_mangle]
+pub extern "C" fn nsl_cross_entropy_backward(
+    grad_output_ptr: i64,
+    logits_ptr: i64,
+    targets_ptr: i64,
+) -> i64 {
+    let logits_c = nsl_tensor_contiguous(logits_ptr);
+    let logits = NslTensor::from_ptr(logits_c);
+    let targets_c = nsl_tensor_contiguous(targets_ptr);
+    let targets = NslTensor::from_ptr(targets_c);
+    let grad_out_c = nsl_tensor_contiguous(grad_output_ptr);
+    let grad_out = NslTensor::from_ptr(grad_out_c);
+
+    if logits.ndim < 2 {
+        eprintln!("nsl: cross_entropy_backward requires 2D logits, got {}D", logits.ndim);
+        std::process::abort();
+    }
+
+    let n = unsafe { *logits.shape } as usize; // batch size
+    let c = unsafe { *logits.shape.add(1) } as usize; // num classes
+    let dtype = logits.dtype;
+
+    // Compute softmax along last dim, then subtract 1.0 at target positions
+    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let out_data = checked_alloc(n * c * elem_size);
+
+    // Get grad_output scalar
+    let go = if grad_out.len == 1 {
+        if dtype == 1 {
+            (unsafe { *grad_out.data_f32() }) as f64
+        } else {
+            unsafe { *grad_out.data_f64() }
+        }
+    } else {
+        1.0
+    };
+
+    if dtype == 1 {
+        let src = logits.data_f32();
+        let dst = out_data as *mut f32;
+        for i in 0..n {
+            // Find max for numerical stability
+            let mut max_val = f32::NEG_INFINITY;
+            for j in 0..c {
+                let v = unsafe { *src.add(i * c + j) };
+                if v > max_val { max_val = v; }
+            }
+            // Compute softmax
+            let mut sum_exp = 0.0f32;
+            for j in 0..c {
+                let v = unsafe { *src.add(i * c + j) };
+                let e = (v - max_val).exp();
+                unsafe { *dst.add(i * c + j) = e; }
+                sum_exp += e;
+            }
+            let target_idx = targets.read_index(i) as usize;
+            let scale = (go / n as f64) as f32;
+            for j in 0..c {
+                let sm = unsafe { *dst.add(i * c + j) } / sum_exp;
+                let one_hot = if j == target_idx { 1.0f32 } else { 0.0f32 };
+                unsafe { *dst.add(i * c + j) = (sm - one_hot) * scale; }
+            }
+        }
+    } else {
+        let src = logits.data_f64();
+        let dst = out_data as *mut f64;
+        for i in 0..n {
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..c {
+                let v = unsafe { *src.add(i * c + j) };
+                if v > max_val { max_val = v; }
+            }
+            let mut sum_exp = 0.0f64;
+            for j in 0..c {
+                let v = unsafe { *src.add(i * c + j) };
+                let e = (v - max_val).exp();
+                unsafe { *dst.add(i * c + j) = e; }
+                sum_exp += e;
+            }
+            let target_idx = targets.read_index(i) as usize;
+            let scale = go / n as f64;
+            for j in 0..c {
+                let sm = unsafe { *dst.add(i * c + j) } / sum_exp;
+                let one_hot = if j == target_idx { 1.0 } else { 0.0 };
+                unsafe { *dst.add(i * c + j) = (sm - one_hot) * scale; }
+            }
+        }
+    }
+
+    let shape_ptr = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape_ptr = n as i64;
+        *shape_ptr.add(1) = c as i64;
+    }
+    let strides_ptr = NslTensor::compute_strides(shape_ptr, 2);
+    let result = Box::new(NslTensor::new(
+        out_data as *mut c_void,
+        shape_ptr,
+        strides_ptr,
+        2,
+        (n * c) as i64,
+        logits.device,
+        dtype,
+        1,
+        0,
+    ));
+    let out = NslTensor::publish(result);
+    nsl_tensor_free(logits_c);
+    nsl_tensor_free(targets_c);
+    nsl_tensor_free(grad_out_c);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // 6. nsl_tensor_logsoftmax — numerically-stable log-softmax along `dim`
 // ---------------------------------------------------------------------------
 
