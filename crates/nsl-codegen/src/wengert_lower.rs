@@ -126,14 +126,29 @@ fn lower_single_op(
 ) -> Result<Value, CodegenError> {
     // Marker ops (leaf nodes) — should be in primal_vars
     match &op.op {
-        PrimalOp::Input(name) | PrimalOp::Param(name) => {
+        PrimalOp::Input(name) => {
             if let Some(&val) = var_map.get(&op.result) {
                 return Ok(val);
             }
-            // Leaf not in primal_vars — produce a zero placeholder.
-            // This handles unused variables (batch param not referenced in step body)
-            // and model config fields not in param_list.
-            eprintln!("[source-ad] note: leaf VarId {} ('{}') not in primal_vars, using null placeholder", op.result, name);
+            // Unresolved Input leaf — this is a real error. Data accesses like
+            // batch.input_ids should be dict_get ops (with the batch as input),
+            // not disconnected Input leaves. Fail with a diagnostic instead of
+            // silently producing a null pointer that crashes at runtime.
+            return Err(CodegenError::new(format!(
+                "[source-ad] unresolved Input VarId {} ('{}') — no Cranelift Value in primal_vars. \
+                 If this is a struct field access (e.g., batch.field), it should be a dict_get op, \
+                 not a leaf Input.",
+                op.result, name
+            )));
+        }
+        PrimalOp::Param(name) => {
+            if let Some(&val) = var_map.get(&op.result) {
+                return Ok(val);
+            }
+            // Unresolved Param — may be a scalar config field (eps, _d_model)
+            // used only in non-differentiable contexts. Safe to use null for
+            // Passthrough ops that don't need the actual tensor value.
+            eprintln!("[source-ad] note: unresolved Param VarId {} ('{}'), using null placeholder", op.result, name);
             return Ok(builder.ins().iconst(cl_types::I64, 0));
         }
         PrimalOp::Constant(val) => {
@@ -583,6 +598,13 @@ fn lower_single_op(
                     // inputs = [grad, target_param]
                     // Reduce grad by summing over leading batch dims to match target shape
                     call(compiler, builder, "nsl_tensor_reduce_to_shape", &[inputs[0], inputs[1]])
+                }
+                _ if name.starts_with("dict_get:") => {
+                    // inputs = [dict_ptr]
+                    // Dict field access: batch.input_ids -> nsl_dict_get_str(batch, "input_ids")
+                    let field = &name["dict_get:".len()..];
+                    let key = compiler.compile_string_literal(builder, field)?;
+                    call(compiler, builder, "nsl_dict_get_str", &[inputs[0], key])
                 }
                 "embedding_backward" => {
                     // inputs = [grad, indices, weight]

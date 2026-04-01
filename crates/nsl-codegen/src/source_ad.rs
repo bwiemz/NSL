@@ -884,12 +884,15 @@ impl<'a> WengertExtractor<'a> {
                             checkpointed: false,
                         });
                     } else {
-                        // Data input — no gradient needed
+                        // Data access (e.g., batch.input_ids) — emit a dict_get op
+                        // that depends on the object value, not a disconnected leaf.
+                        // This preserves the computation edge: batch -> dict_get -> tensor.
+                        let obj_var = self.extract_expr(object)?;
                         self.push_op(WengertOp {
                             id: self.list.ops.len() as u32,
                             result: var,
-                            op: PrimalOp::Input(compound),
-                            inputs: vec![],
+                            op: PrimalOp::Passthrough(format!("dict_get:{}", field_name)),
+                            inputs: vec![obj_var],
                             saved_for_backward: false,
                             checkpointed: false,
                         });
