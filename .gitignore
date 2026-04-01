@@ -11,3 +11,8 @@ desktop.ini
 docs/superpowers/specs/
 docs/superpowers/plans/
 docs/plans/
+
+# Coder-RL generated data (rebuild with build_tokenizer.py + prepare_sft.py)
+models/coder-rl/data/sft_tokens.bin
+models/coder-rl/data/sft_labels.bin
+models/coder-rl/data/tokenizer/
