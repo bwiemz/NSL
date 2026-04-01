@@ -2023,9 +2023,23 @@ impl Compiler<'_> {
                 // 3. Build initial VarMap: map named input/param VarIds to
                 //    Cranelift Values already present in state.variables.
                 let mut primal_vars = crate::wengert_lower::VarMap::new();
-                for (sym, vid) in extractor.symbol_var_map() {
-                    if let Some(&(cvar, _)) = state.variables.get(sym) {
-                        primal_vars.insert(*vid, builder.use_var(cvar));
+                // Build a name→Cranelift value map from state.variables.
+                // We match by resolved name (not Symbol) because the step body AST
+                // and outer scope may use different Symbol IDs for the same variable
+                // (different interning order across modules/parse phases).
+                let state_vars_by_name: std::collections::HashMap<String, Value> = state.variables.iter()
+                    .map(|(sym, (cvar, _))| (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar)))
+                    .collect();
+
+                // Map ALL Input/Param ops in the Wengert list to Cranelift values
+                for op in &extractor.wengert_list().ops {
+                    match &op.op {
+                        crate::wengert::PrimalOp::Input(name) => {
+                            if let Some(&val) = state_vars_by_name.get(name) {
+                                primal_vars.insert(op.result, val);
+                            }
+                        }
+                        _ => {}
                     }
                 }
 
@@ -2052,6 +2066,8 @@ impl Compiler<'_> {
                         builder, model_ptr, &layout, &model_type_name, compound_name,
                     ) {
                         primal_vars.insert(*vid, val);
+                    } else {
+                        eprintln!("[source-ad] warning: could not resolve param '{}' via nested field loading", compound_name);
                     }
                 }
 
@@ -2859,7 +2875,7 @@ impl Compiler<'_> {
     /// that `nsl_collect_model_params` uses at runtime.
     ///
     /// For a model with structure:
-    /// ```
+    /// ```text
     /// model NSLCoder:
     ///     embed: Tensor
     ///     blocks: [TransformerBlock; 2]  # each has attn_norm, attn, ffn_norm, ffn
