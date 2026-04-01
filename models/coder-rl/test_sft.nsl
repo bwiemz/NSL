@@ -1,0 +1,34 @@
+# models/coder-rl/test_sft.nsl
+# Quick validation: 1 epoch SFT on the Phase A corpus
+# Verifies: tokenizer -> corpus -> DataLoader -> model -> loss -> backward
+
+from model import NSLCoderRL
+from nsl.nn.losses import cross_entropy
+
+print("================================================================")
+print("  NSL-Coder-RL — SFT Pipeline Validation")
+print("  10.1M parameters | 6 layers | D=384 | GQA 6Q/3KV")
+print("================================================================")
+
+let m = NSLCoderRL()
+print("Model created")
+
+let tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=2048, shuffle=false, drop_last=true)
+
+print("Starting 1-epoch SFT validation...")
+
+train(model=m, epochs=1, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.01)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("SFT validation complete.")
