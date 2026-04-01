@@ -460,6 +460,8 @@ pub fn compile_entry(
     imported_model_names: HashSet<String>,
     imported_enum_variants: HashMap<String, i64>,
     imported_enum_defs: HashMap<String, Vec<(String, i64)>>,
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    imported_model_field_types: HashMap<String, HashMap<String, String>>,
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
@@ -486,6 +488,17 @@ pub fn compile_entry(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+
+    // Merge imported model method bodies and field types from dependency modules.
+    // This enables source AD to inline method calls on imported model types
+    // (e.g., RMSNorm.forward, GroupedQueryAttention.forward from stdlib).
+    // Local models (from collect_models above) take precedence over imports.
+    for (model_name, methods) in imported_model_method_bodies {
+        compiler.models.model_method_bodies.entry(model_name).or_insert(methods);
+    }
+    for (model_name, fields) in imported_model_field_types {
+        compiler.models.model_field_types.entry(model_name).or_insert(fields);
+    }
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;

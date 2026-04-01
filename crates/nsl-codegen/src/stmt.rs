@@ -1736,38 +1736,28 @@ impl Compiler<'_> {
         })?;
         let model_ptr = builder.use_var(model_var);
 
-        // Resolve model type name — search type_map for any entry with Model/Struct type
-        // that matches what we know about this variable, or fall back to the variable name
+        // Resolve model type name from the variable's semantic type.
+        // First try model_var_types (set for for-loop model vars), then
+        // state.variable_types (set for let-bound vars), then fall back to
+        // scanning the type_map (unreliable — picks the first model type).
         let model_var_name = self.resolve_sym(model_sym).to_string();
-        let model_type_name = {
-            // Try to find the model type by checking all type_map entries
-            let mut found_name = None;
-            for (_node_id, ty) in self.type_map.iter() {
-                match ty {
-                    nsl_semantic::types::Type::Model { name, .. } => {
-                        let n = self.resolve_sym(*name).to_string();
-                        if self.types.struct_layouts.contains_key(&n) {
-                            found_name = Some(n);
-                            break;
+        let model_type_name = self.models.model_var_types.get(&model_sym)
+            .cloned()
+            .or_else(|| {
+                // Check semantic type from variable_types
+                state.variable_types.get(&model_sym).and_then(|ty| {
+                    match ty {
+                        nsl_semantic::types::Type::Model { name, .. } => {
+                            Some(self.resolve_sym(*name).to_string())
                         }
-                    }
-                    nsl_semantic::types::Type::Struct { name, .. } => {
-                        let n = self.resolve_sym(*name).to_string();
-                        if self.types.struct_layouts.contains_key(&n) {
-                            // Only use if it looks like a model (has tensor fields)
-                            found_name = Some(n);
+                        nsl_semantic::types::Type::Struct { name, .. } => {
+                            Some(self.resolve_sym(*name).to_string())
                         }
+                        _ => None,
                     }
-                    _ => {}
-                }
-            }
-            // Fallback: try variable name directly, or capitalize it
-            found_name.unwrap_or_else(|| {
-                // Try capitalized form (common: variable 'm' → type 'M' not useful)
-                // Just use the variable name and hope struct_layouts has it
-                model_var_name.clone()
+                })
             })
-        };
+            .unwrap_or_else(|| model_var_name.clone());
 
         let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
@@ -2033,9 +2023,32 @@ impl Compiler<'_> {
                 // 3. Build initial VarMap: map named input/param VarIds to
                 //    Cranelift Values already present in state.variables.
                 let mut primal_vars = crate::wengert_lower::VarMap::new();
+                // Build primal_vars from state.variables using both Symbol-based
+                // and name-based matching to handle cross-module Symbol mismatches.
+                let state_vars_by_name: std::collections::HashMap<String, Value> = state.variables.iter()
+                    .map(|(sym, (cvar, _))| (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar)))
+                    .collect();
+
+                // First pass: map symbol_var_map entries via Symbol match or name fallback
                 for (sym, vid) in extractor.symbol_var_map() {
+                    if primal_vars.contains_key(vid) { continue; }
                     if let Some(&(cvar, _)) = state.variables.get(sym) {
                         primal_vars.insert(*vid, builder.use_var(cvar));
+                    } else {
+                        let name = self.resolve_sym(*sym).to_string();
+                        if let Some(&val) = state_vars_by_name.get(&name) {
+                            primal_vars.insert(*vid, val);
+                        }
+                    }
+                }
+                // Second pass: map Input ops by name (catches inputs not in symbol_var_map)
+                for op in &extractor.wengert_list().ops {
+                    if let crate::wengert::PrimalOp::Input(name) = &op.op {
+                        if !primal_vars.contains_key(&op.result) {
+                            if let Some(&val) = state_vars_by_name.get(name) {
+                                primal_vars.insert(op.result, val);
+                            }
+                        }
                     }
                 }
 
@@ -2051,27 +2064,23 @@ impl Compiler<'_> {
                         primal_vars.insert(step_vid, batch_val);
                     }
                 }
-                // Resolve model parameter VarIds from param_list.
-                // Match by compound name (e.g., "m.w" → layout field "w").
-                // The extractor's named_param_var_ids() has (compound_name, VarId) pairs
-                // like ("m.w", 9), ("m._hidden", 3). Match the field name suffix.
+                // Resolve model parameter VarIds by traversing nested struct layouts.
+                // Compound names like "m.blocks.0.attn.wq" are split into path
+                // components and walked through struct layouts + array indices,
+                // emitting a chain of Cranelift loads at each level.
                 for (compound_name, vid) in extractor.named_param_var_ids() {
                     if primal_vars.contains_key(vid) { continue; }
-                    // Extract the field name (last component after '.')
-                    let field_name = compound_name.rsplit('.').next().unwrap_or("");
-                    // Load directly from model struct via field offset (not param_list index,
-                    // because param_list order may differ from layout.fields order)
-                    for field in layout.fields.iter() {
-                        if field.name == field_name {
-                            let field_val = builder.ins().load(
-                                field.cl_type,
-                                cranelift_codegen::ir::MemFlags::trusted(),
-                                model_ptr,
-                                field.offset as i32,
-                            );
-                            primal_vars.insert(*vid, field_val);
-                            break;
-                        }
+
+                    if let Some(val) = self.load_nested_field(
+                        builder, model_ptr, &layout, &model_type_name, compound_name,
+                    ) {
+                        primal_vars.insert(*vid, val);
+                    } else {
+                        // Param not resolvable through struct layouts — this is expected
+                        // for scalar config fields (eps, _d_model, etc.) that are used
+                        // in non-differentiable contexts (int(), item()). The wengert
+                        // lowerer will use the null placeholder, which is acceptable
+                        // for Passthrough ops that don't need the actual tensor value.
                     }
                 }
 
@@ -2097,6 +2106,16 @@ impl Compiler<'_> {
                 //    its runtime FFI call, and ALL intermediate VarId → Value
                 //    mappings are recorded in full_vars.
                 state.flags.in_tape_region = false;
+                // Debug: dump primal Wengert ops
+                if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
+                    eprintln!("[wengert] primal_vars: {:?}", primal_vars.keys().collect::<Vec<_>>());
+                    for op in &extractor.wengert_list().ops {
+                        let name = extractor.wengert_list().var_names.get(&op.result).cloned().unwrap_or_default();
+                        eprintln!("[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
+                            op.result, name, op.op, op.inputs,
+                            primal_vars.contains_key(&op.result));
+                    }
+                }
                 let full_vars = crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, extractor.wengert_list(), &primal_vars,
                 )?;
@@ -2147,57 +2166,75 @@ impl Compiler<'_> {
 
                 // 8. Collect parameter gradients into grads_list (NslList)
                 //
-                // When model methods are inlined (nested models, for-loop unrolling),
-                // parameters have compound names like "m.blocks.0.attn.w_q". Use the
-                // named_param_var_ids list which preserves DFS registration order matching
-                // the runtime's nsl_collect_model_params traversal.
+                // Collect gradients aligned with param_list (runtime DFS order).
+                //
+                // param_list is built at runtime by nsl_collect_model_params which
+                // does a DFS through nested structs, collecting all tensor fields.
+                // We replicate that DFS at compile time using struct layouts and
+                // model_field_types to enumerate ALL tensor paths in the same order.
+                // For each, we look up the source AD gradient or emit zeros_like.
                 let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let named_params = extractor.named_param_var_ids();
-                if !named_params.is_empty() {
-                    // Build gradients aligned to param_list order.
-                    // param_list is collected at runtime via nsl_collect_model_params
-                    // which scans struct memory slots in order. named_param_var_ids
-                    // only contains params actually accessed in the forward method.
-                    //
-                    // Strategy: iterate layout fields (compile-time order matches
-                    // struct memory order). For each field, check if the extractor
-                    // has a gradient for it. Push gradient or zero accordingly.
-                    for (i, field) in layout.fields.iter().enumerate() {
-                        // Find matching named param by field name suffix
-                        let has_grad = named_params.iter()
-                            .find(|(name, _)| {
-                                name.rsplit('.').next().unwrap_or("") == field.name
-                            })
-                            .and_then(|(_, vid)| gen.adjoint_of(*vid))
-                            .and_then(|adj_vid| grad_vars.get(&adj_vid).copied());
 
-                        let grad_val = if let Some(gv) = has_grad {
-                            gv
-                        } else {
-                            // No gradient for this param (unused in forward).
-                            // Create a zeros_like tensor so the optimizer doesn't get null.
-                            let idx = builder.ins().iconst(cl_types::I64, i as i64);
-                            let param_ptr = self.compile_call_by_name(
-                                builder, "nsl_list_get", &[param_list, idx],
-                            )?;
-                            self.compile_call_by_name(
-                                builder, "nsl_tensor_zeros_like", &[param_ptr],
-                            )?
-                        };
-                        self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
-                    }
-                } else {
-                    // Legacy flat path: match by field name
-                    for field in &layout.fields {
-                        let grad_val = extractor
-                            .param_var_ids()
-                            .iter()
-                            .find(|(sym, _)| self.resolve_sym(*sym) == field.name)
-                            .and_then(|(_, vid)| gen.adjoint_of(*vid))
-                            .and_then(|adj_vid| grad_vars.get(&adj_vid).copied())
-                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
-                        self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
-                    }
+                // Build a compile-time DFS enumeration of all tensor field paths
+                let all_param_paths = self.enumerate_model_tensor_paths(
+                    &model_var_name, &model_type_name,
+                );
+
+                let mut param_idx: usize = 0;
+                for path in &all_param_paths {
+                    // Find matching named param from source AD extraction
+                    let has_grad = named_params.iter()
+                        .find(|(name, _)| name == path)
+                        .and_then(|(_, vid)| gen.adjoint_of(*vid))
+                        .and_then(|adj_vid| grad_vars.get(&adj_vid).copied());
+
+                    let grad_val = if let Some(gv) = has_grad {
+                        gv
+                    } else {
+                        // No gradient for this param (unused in forward or non-differentiable).
+                        let idx = builder.ins().iconst(cl_types::I64, param_idx as i64);
+                        let param_ptr = self.compile_call_by_name(
+                            builder, "nsl_list_get", &[param_list, idx],
+                        )?;
+                        self.compile_call_by_name(
+                            builder, "nsl_tensor_zeros_like", &[param_ptr],
+                        )?
+                    };
+                    self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
+                    param_idx += 1;
+                }
+
+                // If compile-time enumeration found fewer params than runtime
+                // (shouldn't happen if layouts are consistent), fill remaining
+                // slots with zeros_like at runtime.
+                if all_param_paths.is_empty() {
+                    // Fallback: runtime loop for all params
+                    let fill_i_var = state.new_variable();
+                    builder.declare_var(fill_i_var, cl_types::I64);
+                    let fill_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(fill_i_var, fill_zero);
+                    let fill_hdr = builder.create_block();
+                    let fill_body = builder.create_block();
+                    let fill_exit = builder.create_block();
+                    builder.ins().jump(fill_hdr, &[]);
+                    builder.switch_to_block(fill_hdr);
+                    let fi = builder.use_var(fill_i_var);
+                    let fc = builder.ins().icmp(IntCC::SignedLessThan, fi, num_params_val);
+                    builder.ins().brif(fc, fill_body, &[], fill_exit, &[]);
+                    builder.switch_to_block(fill_body);
+                    builder.seal_block(fill_body);
+                    let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
+                    let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
+                    self.compile_call_by_name(builder, "nsl_list_push", &[grads, z])?;
+                    let fill_one = builder.ins().iconst(cl_types::I64, 1);
+                    let fill_next = builder.ins().iadd(fi, fill_one);
+                    builder.def_var(fill_i_var, fill_next);
+                    builder.ins().jump(fill_hdr, &[]);
+                    builder.seal_block(fill_hdr);
+                    builder.switch_to_block(fill_exit);
+                    builder.seal_block(fill_exit);
+                    state.current_block = Some(fill_exit);
                 }
 
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
@@ -2857,6 +2894,191 @@ impl Compiler<'_> {
     ///   9. Cleanup — free gradient tensors, param_list, optimizer buffers,
     ///      and `nsl_pipeline_destroy()`.
     ///
+    /// Enumerate all tensor field paths in a model struct via DFS, matching the order
+    /// that `nsl_collect_model_params` uses at runtime.
+    ///
+    /// For a model with structure:
+    /// ```text
+    /// model NSLCoder:
+    ///     embed: Tensor
+    ///     blocks: [TransformerBlock; 2]  # each has attn_norm, attn, ffn_norm, ffn
+    ///     norm: RMSNorm
+    /// ```
+    /// Returns paths like:
+    /// `["m.embed", "m.blocks.0.attn_norm.weight", "m.blocks.0.attn_norm.eps", ...]`
+    fn enumerate_model_tensor_paths(
+        &self,
+        var_name: &str,
+        type_name: &str,
+    ) -> Vec<String> {
+        let mut paths = Vec::new();
+        self.enumerate_tensor_paths_recursive(var_name, type_name, &mut paths, 0);
+        paths
+    }
+
+    fn enumerate_tensor_paths_recursive(
+        &self,
+        prefix: &str,
+        type_name: &str,
+        paths: &mut Vec<String>,
+        depth: usize,
+    ) {
+        if depth > 16 { return; } // prevent infinite recursion
+        let layout = match self.types.struct_layouts.get(type_name) {
+            Some(l) => l.clone(),
+            None => return,
+        };
+        let field_types = self.models.model_field_types.get(type_name).cloned();
+
+        for field in &layout.fields {
+            let field_path = format!("{}.{}", prefix, field.name);
+
+            // Check if this field has a sub-model type
+            let ft = field_types.as_ref().and_then(|m| m.get(&field.name));
+
+            if let Some(ft) = ft {
+                if ft.starts_with('[') && ft.contains(';') {
+                    // FixedArray: "[TransformerBlock;8]" — expand for each element
+                    let inner = ft.trim_start_matches('[').trim_end_matches(']');
+                    let parts: Vec<&str> = inner.split(';').collect();
+                    if parts.len() == 2 {
+                        let elem_type = parts[0].trim();
+                        let count: usize = parts[1].trim().parse().unwrap_or(0);
+                        for i in 0..count {
+                            let elem_path = format!("{}.{}", field_path, i);
+                            self.enumerate_tensor_paths_recursive(
+                                &elem_path, elem_type, paths, depth + 1,
+                            );
+                        }
+                    }
+                } else {
+                    // Sub-model struct: recurse into it
+                    self.enumerate_tensor_paths_recursive(
+                        &field_path, ft, paths, depth + 1,
+                    );
+                }
+            } else {
+                // Leaf field — only include if it's a tensor (i64 pointer type).
+                // Skip scalar fields like eps: float (F64) or count: int (I64 but
+                // model_field_types would have it as a sub-model if it were a struct).
+                // Tensors are stored as i64 pointers; scalar floats are F64.
+                if field.cl_type == cl_types::I64 {
+                    paths.push(field_path);
+                }
+            }
+        }
+    }
+
+    /// Load a nested model field by traversing struct layouts along a compound name path.
+    ///
+    /// For a compound name like `m.blocks.0.attn.wq`, emits Cranelift IR to:
+    /// 1. Start at `base_ptr` (pointer to top-level model struct)
+    /// 2. Load `blocks` field from the top-level layout (FixedArray base)
+    /// 3. Index element `0` from the array (load pointer at offset 0*8)
+    /// 4. Load `attn` field from the TransformerBlock layout (sub-model pointer)
+    /// 5. Load `wq` field from the GroupedQueryAttention layout (tensor pointer)
+    ///
+    /// Returns None if the path cannot be resolved through the struct layouts.
+    fn load_nested_field(
+        &self,
+        builder: &mut FunctionBuilder,
+        base_ptr: Value,
+        top_layout: &crate::context::StructLayout,
+        top_type_name: &str,
+        compound_name: &str,
+    ) -> Option<Value> {
+        let parts: Vec<&str> = compound_name.split('.').collect();
+        if parts.len() < 2 { return None; }
+
+        // State: current struct pointer and current type name (for layout/field_type lookup)
+        let mut current_ptr = base_ptr;
+        let mut current_type_name = top_type_name.to_string();
+        let mut current_layout = top_layout.clone();
+
+        // Skip first component (model variable name like "m")
+        let path = &parts[1..];
+
+        let mut i = 0;
+        while i < path.len() {
+            let part = path[i];
+            let is_last = i == path.len() - 1;
+
+            // Check if this is a numeric array index (from FixedArray unrolling)
+            if let Ok(array_idx) = part.parse::<usize>() {
+                // current_ptr is already pointing to the base of the inline array
+                // region (set by the preceding FixedArray field handler).
+                // Each element is an i64 pointer at offset array_idx * 8.
+                let elem_ptr = builder.ins().load(
+                    cl_types::I64,
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    current_ptr,
+                    (array_idx * 8) as i32,
+                );
+                if is_last {
+                    return Some(elem_ptr);
+                }
+                current_ptr = elem_ptr;
+                // current_layout and current_type_name were already set to the
+                // element type by the preceding array field handler.
+                i += 1;
+                continue;
+            }
+
+            // Named field: look up in current struct layout
+            let field = current_layout.fields.iter().find(|f| f.name == part)?;
+
+            // Check if this field is a FixedArray type
+            let field_type = self.models.model_field_types
+                .get(&current_type_name)
+                .and_then(|ft| ft.get(part))
+                .cloned();
+
+            if let Some(ref ft) = field_type {
+                if ft.starts_with('[') && ft.contains(';') {
+                    // FixedArray field: slots are stored inline in the parent struct.
+                    // DON'T load the field value — instead compute the address of the
+                    // array base region within the parent struct.
+                    let inner = ft.trim_start_matches('[').trim_end_matches(']');
+                    let elem_type = inner.split(';').next().unwrap_or("").trim();
+
+                    // Set current_ptr to address of array base in parent struct
+                    current_ptr = builder.ins().iadd_imm(current_ptr, field.offset as i64);
+                    current_type_name = elem_type.to_string();
+                    current_layout = self.types.struct_layouts.get(elem_type)?.clone();
+                    // Next component should be a numeric index
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Regular field: load the value
+            let field_val = builder.ins().load(
+                field.cl_type,
+                cranelift_codegen::ir::MemFlags::trusted(),
+                current_ptr,
+                field.offset as i32,
+            );
+
+            if is_last {
+                return Some(field_val);
+            }
+
+            // Navigate into sub-model struct
+            current_ptr = field_val;
+            if let Some(ref ft) = field_type {
+                current_type_name = ft.clone();
+                current_layout = self.types.struct_layouts.get(ft)?.clone();
+            } else {
+                // No type info — can't continue traversal
+                return None;
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
     /// Model partitioning (which layers run on which stage) is deferred to
     /// M43c; the initial implementation runs the full model in a single
     /// process with logical stage-to-stage communication.

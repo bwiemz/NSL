@@ -236,6 +236,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // LayerNorm & RMSNorm (M15)
     ("nsl_tensor_layernorm", &[types::I64, types::I64, types::I64, types::F64], Some(types::I64)),
     ("nsl_tensor_rmsnorm", &[types::I64, types::I64, types::F64], Some(types::I64)),
+    // Source AD: reduce gradient to match parameter shape (matmul broadcast backward)
+    ("nsl_tensor_reduce_to_shape", &[types::I64, types::I64], Some(types::I64)),
     // Dropout, Conv2d, MaxPool2d (M15)
     ("nsl_tensor_dropout", &[types::I64, types::F64, types::I8], Some(types::I64)),
     ("nsl_tensor_conv2d", &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),

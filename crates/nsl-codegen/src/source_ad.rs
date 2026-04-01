@@ -125,14 +125,19 @@ impl AdjointGenerator {
             AdjointExpr::Negate(v) => self.emit_op(PrimalOp::Neg, vec![v]),
             AdjointExpr::MulElementwise(a, b) => self.emit_op(PrimalOp::Mul, vec![a, b]),
             AdjointExpr::MatmulTransposeLeft(grad, b) => {
-                // d_loss/d_A = grad @ B^T
-                let b_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![b]);
+                // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support)
+                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b]);
                 self.emit_op(PrimalOp::Matmul, vec![grad, b_t])
             }
-            AdjointExpr::MatmulTransposeRight(a, grad) => {
-                // d_loss/d_B = A^T @ grad
-                let a_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![a]);
-                self.emit_op(PrimalOp::Matmul, vec![a_t, grad])
+            AdjointExpr::MatmulTransposeRight(a, grad, b) => {
+                // d_loss/d_B = A^T @ grad (transpose last two dims for N-D support)
+                // When the forward matmul broadcasts (A has more dims than B),
+                // the gradient must be summed over the extra batch dimensions
+                // so it matches B's shape.
+                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
+                let raw_grad = self.emit_op(PrimalOp::Matmul, vec![a_t, grad]);
+                // Reduce to match B's shape: nsl_tensor_reduce_to_shape(raw_grad, B)
+                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![raw_grad, b])
             }
             AdjointExpr::Scale(v, s) => {
                 let scale = self.emit_constant(s);
@@ -350,7 +355,7 @@ impl AdjointGenerator {
             // --- Normalization gamma backward: grad * x_hat ---
             // Recomputes x_hat = (x - mean) / std from input to get the correct
             // normalized values (NOT the output, which is gamma * x_hat + beta).
-            AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim) => {
+            AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim, weight) => {
                 let mean = self.emit_op(PrimalOp::Mean { dim: Some(dim) }, vec![x]);
                 let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
@@ -363,9 +368,11 @@ impl AdjointGenerator {
                 let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
                 let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
                 let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
-                // dgamma = sum(grad * x_hat, dim=reduction_dim)
+                // dgamma = reduce_to_shape(grad * x_hat, weight)
+                // The weight has shape [last_dim], so we sum over all dims except the last.
+                // Using reduce_to_shape handles arbitrary input ndim.
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                self.emit_op(PrimalOp::Sum { dim: Some(dim) }, vec![grad_x_hat])
+                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![grad_x_hat, weight])
             }
 
             // --- Dropout backward: grad * mask * (1/(1-p)) ---
@@ -992,9 +999,16 @@ impl<'a> WengertExtractor<'a> {
                                         .and_then(|methods| methods.get(&method_name))
                                         .cloned();
                                     if let Some(fn_def) = fn_def {
+                                        // Pre-extract args in CALLER's context before switching to callee's context.
+                                        // This is critical: args like `self.attn_norm.forward(x)` use `self` referring
+                                        // to the caller's model (TransformerBlock), not the callee (GQA).
+                                        let extracted = match self.pre_extract_args(&fn_def, args) {
+                                            Some(e) => e,
+                                            None => return None,
+                                        };
                                         let saved_self = self.self_context.clone();
                                         self.self_context = Some(compound_prefix);
-                                        let result = self.inline_method_call_inner(&fn_def, args);
+                                        let result = self.inline_method_body(&fn_def, extracted);
                                         self.self_context = saved_self;
                                         return result;
                                     }
@@ -1013,9 +1027,14 @@ impl<'a> WengertExtractor<'a> {
                                     .and_then(|methods| methods.get(&method_name))
                                     .cloned();
                                 if let Some(fn_def) = fn_def {
+                                    // Pre-extract args in caller's context
+                                    let extracted = match self.pre_extract_args(&fn_def, args) {
+                                        Some(e) => e,
+                                        None => return None,
+                                    };
                                     let saved_self = self.self_context.clone();
                                     self.self_context = Some(ctx);
-                                    let result = self.inline_method_call_inner(&fn_def, args);
+                                    let result = self.inline_method_body(&fn_def, extracted);
                                     self.self_context = saved_self;
                                     return result;
                                 }
@@ -1062,6 +1081,23 @@ impl<'a> WengertExtractor<'a> {
                 // Regular function call: extract function name
                 let func_name = if let ExprKind::Ident(sym) = &callee.kind {
                     self.interner.resolve(sym.0).unwrap_or("").to_string()
+                } else if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                    let method = self.interner.resolve(member.0).unwrap_or("?");
+                    let obj_desc = match &object.kind {
+                        ExprKind::Ident(s) => format!("Ident({})", self.interner.resolve(s.0).unwrap_or("?")),
+                        ExprKind::SelfRef => "self".to_string(),
+                        ExprKind::MemberAccess { object: inner, member: m } => {
+                            let m_name = self.interner.resolve(m.0).unwrap_or("?");
+                            match &inner.kind {
+                                ExprKind::SelfRef => format!("self.{}", m_name),
+                                ExprKind::Ident(s) => format!("{}.{}", self.interner.resolve(s.0).unwrap_or("?"), m_name),
+                                _ => format!("?.{}", m_name),
+                            }
+                        }
+                        _ => format!("{:?}", std::mem::discriminant(&object.kind)),
+                    };
+                    eprintln!("[source-ad] unresolved method call: {}.{}() — model type not found in method bodies", obj_desc, method);
+                    return None;
                 } else {
                     eprintln!("[source-ad] unsupported callee expression: {:?}", std::mem::discriminant(&callee.kind));
                     return None; // Complex callee -- can't extract
@@ -1097,7 +1133,7 @@ impl<'a> WengertExtractor<'a> {
                     // Normalization
                     "layer_norm" | "layernorm" => PrimalOp::LayerNorm { eps: 1e-5 },
                     "batch_norm" | "batchnorm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
-                    "rmsnorm" | "rms_norm" => PrimalOp::LayerNorm { eps: 1e-5 },
+                    "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm { eps: 1e-5 },
                     // Loss functions
                     "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
                     "mse_loss" => PrimalOp::MSELoss,
@@ -1475,19 +1511,21 @@ impl<'a> WengertExtractor<'a> {
     }
 
     /// Inline a model method call, given the model instance symbol and FnDef.
-    /// Sets up self_context from the symbol name (or override) and delegates
-    /// to `inline_method_call_inner`.
+    /// Sets up self_context from the symbol name (or override), pre-extracts
+    /// args in the caller's context, then inlines the method body.
     fn inline_method_call(
         &mut self,
         model_sym: nsl_ast::Symbol,
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
     ) -> Option<VarId> {
+        // Pre-extract args in caller's context before switching to callee's
+        let extracted = self.pre_extract_args(fn_def, call_args)?;
         let name = self.symbol_name_overrides.get(&model_sym).cloned()
             .unwrap_or_else(|| self.interner.resolve(model_sym.0).unwrap_or("?").to_string());
         let saved_self = self.self_context.clone();
         self.self_context = Some(name);
-        let result = self.inline_method_call_inner(fn_def, call_args);
+        let result = self.inline_method_body(fn_def, extracted);
         self.self_context = saved_self;
         result
     }
@@ -1498,12 +1536,14 @@ impl<'a> WengertExtractor<'a> {
     /// Binds call arguments to the method's parameter names (skipping `self`),
     /// then extracts the method body statements. The return value of the method
     /// becomes the result of this expression.
-    fn inline_method_call_inner(
+    /// Pre-extract call arguments in the current (caller's) context.
+    /// Returns (param_symbol, param_name, VarId) triples for binding.
+    fn pre_extract_args(
         &mut self,
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
-    ) -> Option<VarId> {
-        // Bind call arguments to parameter names (skip `self` param)
+    ) -> Option<Vec<(nsl_ast::Symbol, String, VarId)>> {
+        let mut result = Vec::new();
         let mut arg_idx = 0;
         for param in &fn_def.params {
             let param_name = self.interner.resolve(param.name.0).unwrap_or("?").to_string();
@@ -1511,15 +1551,27 @@ impl<'a> WengertExtractor<'a> {
                 continue;
             }
             if arg_idx < call_args.len() {
-                // Extract the argument expression and bind it to the parameter symbol
                 if let Some(var) = self.extract_expr(&call_args[arg_idx].value) {
-                    self.symbol_to_var.insert(param.name, var);
-                    self.list.var_names.insert(var, param_name);
+                    result.push((param.name, param_name, var));
                 } else {
                     return None;
                 }
                 arg_idx += 1;
             }
+        }
+        Some(result)
+    }
+
+    /// Inline a method body with pre-extracted argument bindings.
+    fn inline_method_body(
+        &mut self,
+        fn_def: &nsl_ast::decl::FnDef,
+        extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,
+    ) -> Option<VarId> {
+        // Bind the pre-extracted argument VarIds to parameter symbols
+        for (sym, name, var) in extracted_args {
+            self.symbol_to_var.insert(sym, var);
+            self.list.var_names.insert(var, name);
         }
 
         // Save the output before extraction
