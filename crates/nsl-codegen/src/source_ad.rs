@@ -1126,7 +1126,7 @@ impl<'a> WengertExtractor<'a> {
                     // Normalization
                     "layer_norm" | "layernorm" => PrimalOp::LayerNorm { eps: 1e-5 },
                     "batch_norm" | "batchnorm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
-                    "rmsnorm" | "rms_norm" => PrimalOp::LayerNorm { eps: 1e-5 },
+                    "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm { eps: 1e-5 },
                     // Loss functions
                     "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
                     "mse_loss" => PrimalOp::MSELoss,
@@ -1504,8 +1504,8 @@ impl<'a> WengertExtractor<'a> {
     }
 
     /// Inline a model method call, given the model instance symbol and FnDef.
-    /// Sets up self_context from the symbol name (or override) and delegates
-    /// to `inline_method_call_inner`.
+    /// Sets up self_context from the symbol name (or override), pre-extracts
+    /// args in the caller's context, then inlines the method body.
     fn inline_method_call(
         &mut self,
         model_sym: nsl_ast::Symbol,
@@ -1553,16 +1553,6 @@ impl<'a> WengertExtractor<'a> {
             }
         }
         Some(result)
-    }
-
-    fn inline_method_call_inner(
-        &mut self,
-        fn_def: &nsl_ast::decl::FnDef,
-        call_args: &[nsl_ast::expr::Arg],
-    ) -> Option<VarId> {
-        // Extract args in current context, then bind
-        let extracted = self.pre_extract_args(fn_def, call_args)?;
-        self.inline_method_body(fn_def, extracted)
     }
 
     /// Inline a method body with pre-extracted argument bindings.

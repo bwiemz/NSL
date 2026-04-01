@@ -97,12 +97,18 @@ fn promote_to_tensor(
     val: Value,
     ty: WengertType,
 ) -> Result<Value, CodegenError> {
-    if ty == WengertType::Integer {
-        let f = builder.ins().fcvt_from_sint(cl_types::F64, val);
-        let dt = builder.ins().iconst(cl_types::I64, 0); // f64 — matches CPU working dtype
-        call(compiler, builder, "nsl_tensor_scalar", &[f, dt])
-    } else {
-        Ok(val)
+    match ty {
+        WengertType::Integer => {
+            let f = builder.ins().fcvt_from_sint(cl_types::F64, val);
+            let dt = builder.ins().iconst(cl_types::I64, 0); // f64
+            call(compiler, builder, "nsl_tensor_scalar", &[f, dt])
+        }
+        WengertType::Scalar => {
+            // f64 scalar → wrap in a scalar tensor for tensor arithmetic
+            let dt = builder.ins().iconst(cl_types::I64, 0); // f64
+            call(compiler, builder, "nsl_tensor_scalar", &[val, dt])
+        }
+        _ => Ok(val), // Already a tensor pointer (i64)
     }
 }
 
@@ -155,16 +161,27 @@ fn lower_single_op(
         PrimalOp::Input(_) | PrimalOp::Param(_) | PrimalOp::Constant(_) => unreachable!(),
 
         // === Elementwise unary (11 ops) ===
-        PrimalOp::Relu => call(compiler, builder, "nsl_tensor_relu", &[inputs[0]]),
-        PrimalOp::Sigmoid => call(compiler, builder, "nsl_tensor_sigmoid", &[inputs[0]]),
-        PrimalOp::Tanh => call(compiler, builder, "nsl_tensor_tanh_act", &[inputs[0]]),
-        PrimalOp::Gelu => call(compiler, builder, "nsl_tensor_gelu", &[inputs[0]]),
-        PrimalOp::Silu => call(compiler, builder, "nsl_tensor_silu", &[inputs[0]]),
-        PrimalOp::Exp => call(compiler, builder, "nsl_tensor_exp", &[inputs[0]]),
-        PrimalOp::Log => call(compiler, builder, "nsl_tensor_log", &[inputs[0]]),
-        PrimalOp::Sqrt => call(compiler, builder, "nsl_tensor_sqrt", &[inputs[0]]),
-        PrimalOp::Abs => call(compiler, builder, "nsl_tensor_abs", &[inputs[0]]),
-        PrimalOp::Neg => call(compiler, builder, "nsl_tensor_neg", &[inputs[0]]),
+        // Promote scalar/integer inputs to tensor before calling tensor ops.
+        PrimalOp::Relu | PrimalOp::Sigmoid | PrimalOp::Tanh
+        | PrimalOp::Gelu | PrimalOp::Silu | PrimalOp::Exp
+        | PrimalOp::Log | PrimalOp::Sqrt | PrimalOp::Abs | PrimalOp::Neg => {
+            let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
+            let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+            let rt_name = match &op.op {
+                PrimalOp::Relu => "nsl_tensor_relu",
+                PrimalOp::Sigmoid => "nsl_tensor_sigmoid",
+                PrimalOp::Tanh => "nsl_tensor_tanh_act",
+                PrimalOp::Gelu => "nsl_tensor_gelu",
+                PrimalOp::Silu => "nsl_tensor_silu",
+                PrimalOp::Exp => "nsl_tensor_exp",
+                PrimalOp::Log => "nsl_tensor_log",
+                PrimalOp::Sqrt => "nsl_tensor_sqrt",
+                PrimalOp::Abs => "nsl_tensor_abs",
+                PrimalOp::Neg => "nsl_tensor_neg",
+                _ => unreachable!(),
+            };
+            call(compiler, builder, rt_name, &[a])
+        }
         PrimalOp::Clamp { min, max } => {
             let min_v = builder.ins().f64const(*min);
             let max_v = builder.ins().f64const(*max);
@@ -324,6 +341,13 @@ fn lower_single_op(
             let e = builder.ins().f64const(*eps);
             call(compiler, builder, "nsl_tensor_layernorm", &[inputs[0], inputs[1], inputs[2], e])
         }
+        PrimalOp::RMSNorm { eps } => {
+            // RMSNorm takes (input, weight, eps) — the eps argument from the Wengert
+            // inputs is a float field loaded from the model struct. Use the hardcoded
+            // eps from the PrimalOp to avoid type mismatches (input eps may be f64).
+            let e = builder.ins().f64const(*eps);
+            call(compiler, builder, "nsl_tensor_rmsnorm", &[inputs[0], inputs[1], e])
+        }
         PrimalOp::BatchNorm { eps, training } => {
             let e = builder.ins().f64const(*eps);
             let t = builder.ins().iconst(cl_types::I64, if *training { 1 } else { 0 });
@@ -407,10 +431,49 @@ fn lower_single_op(
         }
 
         // === Attention (4 ops) ===
-        PrimalOp::ScaledDotProductAttention { .. } => {
-            // Forward attention op should not normally appear in the adjoint graph,
-            // but handle for safety by cloning the first input (approximate).
-            call(compiler, builder, "nsl_tensor_clone", &[inputs[0]])
+        PrimalOp::ScaledDotProductAttention { causal } => {
+            // Decompose into primitive ops: softmax((Q @ K.T) * scale [+ mask]) @ V
+            // inputs: [q, k, v, scale, causal_flag]
+            let q = inputs[0];
+            let k = inputs[1];
+            let v = inputs[2];
+            // Scale may be f64 scalar or tensor — promote to tensor if needed
+            let scale_ty = op.inputs.get(3)
+                .and_then(|vid| var_types.get(vid).copied())
+                .unwrap_or(WengertType::Tensor);
+            let scale = if inputs.len() > 3 {
+                promote_to_tensor(compiler, builder, inputs[3], scale_ty)?
+            } else {
+                // Default scale: 1.0
+                let one = builder.ins().f64const(1.0);
+                let dt = builder.ins().iconst(cl_types::I64, 1);
+                call(compiler, builder, "nsl_tensor_scalar", &[one, dt])?
+            };
+
+            // K_T = transpose(K, -2, -1)
+            let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
+            let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
+            let k_t = call(compiler, builder, "nsl_tensor_transpose", &[k, dim_m2, dim_m1])?;
+            // scores = Q @ K_T
+            let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t])?;
+            // scaled = scores * scale
+            let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
+            let scaled = call(compiler, builder, "nsl_tensor_mul_scalar", &[scores, scale_item])?;
+
+            // Apply causal mask if needed
+            let masked = if *causal {
+                let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
+                let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim_neg2])?;
+                let mask = call(compiler, builder, "nsl_tensor_causal_mask", &[seq_len])?;
+                call(compiler, builder, "nsl_tensor_add", &[scaled, mask])?
+            } else {
+                scaled
+            };
+
+            // attn_weights = softmax(masked, -1)
+            let attn_weights = call(compiler, builder, "nsl_tensor_softmax", &[masked, dim_m1])?;
+            // output = attn_weights @ V
+            call(compiler, builder, "nsl_tensor_matmul", &[attn_weights, v])
         }
         PrimalOp::FlashAttentionBackwardExtract { .. } => {
             // Fused attention backward component extraction.
@@ -486,16 +549,27 @@ fn lower_single_op(
                 "rotate_half" => call(compiler, builder, "nsl_tensor_rotate_half", &[inputs[0]]),
                 // Tensor construction (non-differentiable, used for shape/position computation)
                 "arange" => {
-                    // arange(start, stop) or arange(stop) — extract f64 from tensor inputs
-                    // and call nsl_tensor_arange(start, stop, step=1.0)
+                    // arange(start, stop) or arange(stop) — extract f64 from inputs
+                    // and call nsl_tensor_arange(start, stop, step=1.0).
+                    // Inputs may be Tensor (i64 ptr), Scalar (f64), or Integer (i64).
+                    let mut to_f64 = |builder: &mut FunctionBuilder, val: Value, idx: usize| -> Result<Value, CodegenError> {
+                        let vty = op.inputs.get(idx)
+                            .and_then(|vid| var_types.get(vid).copied())
+                            .unwrap_or(WengertType::Tensor);
+                        match vty {
+                            WengertType::Scalar => Ok(val),
+                            WengertType::Integer => Ok(builder.ins().fcvt_from_sint(cl_types::F64, val)),
+                            _ => call(compiler, builder, "nsl_tensor_item", &[val]),
+                        }
+                    };
                     let step = builder.ins().f64const(1.0);
                     if inputs.len() >= 2 {
-                        let start = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
-                        let stop = call(compiler, builder, "nsl_tensor_item", &[inputs[1]])?;
+                        let start = to_f64(builder, inputs[0], 0)?;
+                        let stop = to_f64(builder, inputs[1], 1)?;
                         call(compiler, builder, "nsl_tensor_arange", &[start, stop, step])
                     } else if inputs.len() == 1 {
                         let zero = builder.ins().f64const(0.0);
-                        let stop = call(compiler, builder, "nsl_tensor_item", &[inputs[0]])?;
+                        let stop = to_f64(builder, inputs[0], 0)?;
                         call(compiler, builder, "nsl_tensor_arange", &[zero, stop, step])
                     } else {
                         Err(CodegenError::new("arange requires at least 1 argument".to_string()))
@@ -714,6 +788,7 @@ mod tests {
             PrimalOp::ScatterAdd { dim: 0 },
             PrimalOp::Embedding,
             PrimalOp::LayerNorm { eps: 1e-5 },
+            PrimalOp::RMSNorm { eps: 1e-5 },
             PrimalOp::BatchNorm { eps: 1e-5, training: true },
             PrimalOp::MaxPool2d { kernel: 2, stride: 2 },
             PrimalOp::AvgPool2d { kernel: 2, stride: 2 },
@@ -734,7 +809,7 @@ mod tests {
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 50 variants total (including markers)
-        assert_eq!(ops.len(), 50);
+        // 51 variants total (including markers)
+        assert_eq!(ops.len(), 51);
     }
 }

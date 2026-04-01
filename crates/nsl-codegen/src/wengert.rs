@@ -86,6 +86,7 @@ pub enum PrimalOp {
     Embedding,
     // Normalization
     LayerNorm { eps: f64 },
+    RMSNorm { eps: f64 },
     BatchNorm { eps: f64, training: bool },
     // Pooling
     MaxPool2d { kernel: usize, stride: usize },

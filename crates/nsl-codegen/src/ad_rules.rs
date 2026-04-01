@@ -255,6 +255,22 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             }
             adjoints
         }
+        // RMSNorm(input, weight) -> output  (no bias, eps is compile-time constant)
+        PrimalOp::RMSNorm { eps } => {
+            let input = op.inputs[0];
+            let mut adjoints = vec![InputAdjoint {
+                input_var: input,
+                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result, *eps),
+            }];
+            // weight gradient: grad * x_hat
+            if op.inputs.len() > 1 {
+                adjoints.push(InputAdjoint {
+                    input_var: op.inputs[1],
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1),
+                });
+            }
+            adjoints
+        }
         PrimalOp::BatchNorm { eps, .. } => {
             let input = op.inputs[0];
             let mut adjoints = vec![InputAdjoint {
@@ -454,7 +470,7 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         PrimalOp::Mul | PrimalOp::Div | PrimalOp::Matmul
         | PrimalOp::Relu | PrimalOp::Log | PrimalOp::Abs
         | PrimalOp::Gelu | PrimalOp::Silu | PrimalOp::Clamp { .. }
-        | PrimalOp::LayerNorm { .. } | PrimalOp::BatchNorm { .. }
+        | PrimalOp::LayerNorm { .. } | PrimalOp::RMSNorm { .. } | PrimalOp::BatchNorm { .. }
         | PrimalOp::Dropout { .. }
         | PrimalOp::Embedding | PrimalOp::Gather { .. } | PrimalOp::ScatterAdd { .. }
         | PrimalOp::Conv2d { .. }
