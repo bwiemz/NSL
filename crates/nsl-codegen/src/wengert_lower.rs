@@ -304,14 +304,30 @@ fn lower_single_op(
         // === Shape ops (5 ops) ===
         PrimalOp::Concat { dim } => {
             // Runtime nsl_tensor_cat takes (tensor_list_ptr, dim).
-            // Construct an NslList from all inputs, then pass to cat.
-            let list = call(compiler, builder, "nsl_list_new", &[])?;
-            for &inp in &inputs {
-                call(compiler, builder, "nsl_list_push", &[list, inp])?;
-            }
+            // In source AD, tensor_cat(tensors, dim) passes the list VarId from a
+            // Passthrough("list") op as inputs[0]. Detect this by checking if the
+            // first input is typed as List, and use it directly instead of building
+            // a new list.
+            let first_is_list = op.inputs.first()
+                .and_then(|vid| var_types.get(vid).copied())
+                .map(|t| t == WengertType::List)
+                .unwrap_or(false);
+            let list = if first_is_list {
+                // inputs[0] is already a tensor list pointer (from Passthrough("list"))
+                inputs[0]
+            } else {
+                // Individual tensor inputs — build a list from them
+                let l = call(compiler, builder, "nsl_list_new", &[])?;
+                for &inp in &inputs {
+                    call(compiler, builder, "nsl_list_push", &[l, inp])?;
+                }
+                l
+            };
             let d = builder.ins().iconst(cl_types::I64, *dim);
             let result = call(compiler, builder, "nsl_tensor_cat", &[list, d])?;
-            call(compiler, builder, "nsl_list_free", &[list])?;
+            if !first_is_list {
+                call(compiler, builder, "nsl_list_free", &[list])?;
+            }
             Ok(result)
         }
         PrimalOp::Split { .. } => {
@@ -681,25 +697,28 @@ fn lower_single_op(
                 }
                 "list" => {
                     // Build a list from input elements.
-                    // Elements may be i64 (from subscript/int), f64 (from Constant/Scalar),
-                    // or tensor pointers. nsl_list_push expects raw i64 dimension values.
+                    // Determine list kind from element types:
+                    //   - If ANY element is a Tensor, treat as tensor list (push raw pointers)
+                    //   - Otherwise, treat as dimension list (scalarize to i64)
+                    let has_tensor = op.inputs.iter().any(|vid|
+                        var_types.get(vid).copied().unwrap_or(WengertType::Integer) == WengertType::Tensor
+                    );
                     let list = call(compiler, builder, "nsl_list_new", &[])?;
                     for (i, &inp) in inputs.iter().enumerate() {
                         let val_ty = op.inputs.get(i)
                             .and_then(|vid| var_types.get(vid).copied())
                             .unwrap_or(WengertType::Integer);
-                        let val = match val_ty {
-                            WengertType::Scalar => {
-                                builder.ins().fcvt_to_sint(cl_types::I64, inp)
+                        let val = if has_tensor {
+                            // Tensor list: push raw i64 pointers (no scalarization)
+                            inp
+                        } else {
+                            // Dimension list: convert to i64
+                            match val_ty {
+                                WengertType::Scalar => {
+                                    builder.ins().fcvt_to_sint(cl_types::I64, inp)
+                                }
+                                _ => inp, // Integer, List — already i64
                             }
-                            WengertType::Tensor => {
-                                // Safety net: if a Tensor value ends up in a list
-                                // (e.g., Constant not tagged as Integer), extract
-                                // the scalar and convert to i64 dimension.
-                                let f64_val = call(compiler, builder, "nsl_tensor_item", &[inp])?;
-                                builder.ins().fcvt_to_sint(cl_types::I64, f64_val)
-                            }
-                            _ => inp, // Integer, List — already i64
                         };
                         call(compiler, builder, "nsl_list_push", &[list, val])?;
                     }
