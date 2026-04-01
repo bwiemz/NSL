@@ -1,5 +1,6 @@
 /.serena
 /target/
+.nsl-cache/
 /.VSCodeCounter/
 *.exe
 *.o
