@@ -155,6 +155,10 @@ impl AdjointGenerator {
             AdjointExpr::Reshape(v) => {
                 self.emit_op(PrimalOp::Reshape { target_ndim: 0 }, vec![v])
             }
+            // --- Expand backward: sum-reduce gradient over broadcast-expanded dims ---
+            AdjointExpr::ReduceToShape(grad, target) => {
+                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![grad, target])
+            }
 
             // --- Exp backward: d(exp(x))/dx = exp(x) = y. grad * y (correct as-is) ---
             AdjointExpr::ExpBackward(y_bar, y) => self.emit_op(PrimalOp::Mul, vec![y_bar, y]),
@@ -1127,9 +1131,29 @@ impl<'a> WengertExtractor<'a> {
                     "abs" => PrimalOp::Abs,
                     // Linear algebra
                     "matmul" => PrimalOp::Matmul,
-                    // Reductions (dim args extracted as default -1 for now)
-                    "softmax" => PrimalOp::Softmax { dim: -1 },
-                    "log_softmax" => PrimalOp::LogSoftmax { dim: -1 },
+                    // Reductions — extract dim from second arg if present
+                    "softmax" => {
+                        let dim = args.get(1).and_then(|a| match &a.value.kind {
+                            ExprKind::IntLiteral(v) => Some(*v as i64),
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                _ => None,
+                            },
+                            _ => None,
+                        }).unwrap_or(-1);
+                        PrimalOp::Softmax { dim }
+                    }
+                    "log_softmax" => {
+                        let dim = args.get(1).and_then(|a| match &a.value.kind {
+                            ExprKind::IntLiteral(v) => Some(*v as i64),
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                _ => None,
+                            },
+                            _ => None,
+                        }).unwrap_or(-1);
+                        PrimalOp::LogSoftmax { dim }
+                    }
                     // Normalization
                     "layer_norm" | "layernorm" => PrimalOp::LayerNorm { eps: 1e-5 },
                     "batch_norm" | "batchnorm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
@@ -1141,11 +1165,28 @@ impl<'a> WengertExtractor<'a> {
                     // Reductions
                     "sum" => PrimalOp::Sum { dim: None },
                     "mean" => PrimalOp::Mean { dim: None },
-                    // Regularization
-                    "dropout" => PrimalOp::Dropout { p: 0.1 },
+                    // Regularization — extract p from second arg if literal
+                    "dropout" => {
+                        let p = args.get(1).and_then(|a| match &a.value.kind {
+                            ExprKind::FloatLiteral(v) => Some(*v),
+                            _ => None,
+                        }).unwrap_or(0.1);
+                        PrimalOp::Dropout { p }
+                    }
                     // Indexing
                     "embedding" | "embedding_lookup" => PrimalOp::Embedding,
-                    "gather" => PrimalOp::Gather { dim: 0 },
+                    "gather" => {
+                        // gather(tensor, dim, indices) — extract dim from second arg
+                        let dim = args.get(1).and_then(|a| match &a.value.kind {
+                            ExprKind::IntLiteral(v) => Some(*v as i64),
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                _ => None,
+                            },
+                            _ => None,
+                        }).unwrap_or(0);
+                        PrimalOp::Gather { dim }
+                    }
                     // Attention
                     "scaled_dot_product_attention" => PrimalOp::ScaledDotProductAttention { causal: true },
                     // Transpose (default: swap last two dims)
@@ -1163,7 +1204,18 @@ impl<'a> WengertExtractor<'a> {
                         PrimalOp::Passthrough(func_name.clone())
                     }
                     // Concatenation
-                    "tensor_cat" | "cat" => PrimalOp::Concat { dim: -1 },
+                    "tensor_cat" | "cat" => {
+                        // tensor_cat(tensors, dim) — extract dim from last arg
+                        let dim = args.last().and_then(|a| match &a.value.kind {
+                            ExprKind::IntLiteral(v) => Some(*v as i64),
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                _ => None,
+                            },
+                            _ => None,
+                        }).unwrap_or(-1);
+                        PrimalOp::Concat { dim }
+                    }
                     // Negative
                     "neg" => PrimalOp::Neg,
                     // Clamp

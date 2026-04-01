@@ -102,6 +102,11 @@ pub enum AdjointExpr {
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
 
+    // Shape backward (broadcast reduction)
+    /// Expand backward: sum-reduce gradient over expanded dims to match original shape.
+    /// args: (grad, original_input) — original_input provides the target shape.
+    ReduceToShape(VarId, VarId),
+
     // Control flow backward rules
     /// SelectTrue: adj_true = cond ? adj_out : 0.  inputs: (adj_out, cond_var)
     SelectTrue(VarId, VarId),
@@ -428,14 +433,24 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // do NOT propagate gradients — they produce non-tensor values.
         PrimalOp::Passthrough(name) => {
             match name.as_str() {
-                // Shape-preserving: gradient flows through to tensor input
-                "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze"
+                // Shape-preserving identity: gradient flows through unchanged
+                "reshape" | "contiguous" | "squeeze" | "unsqueeze"
                 | "cos" | "sin" | "rotate_half" => {
                     if op.inputs.is_empty() { vec![] }
                     else {
                         vec![InputAdjoint {
                             input_var: op.inputs[0],
                             expr: AdjointExpr::Identity(output_bar),
+                        }]
+                    }
+                }
+                // Expand backward: sum-reduce gradient over broadcast-expanded dims
+                "expand" => {
+                    if op.inputs.is_empty() { vec![] }
+                    else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::ReduceToShape(output_bar, op.inputs[0]),
                         }]
                     }
                 }
@@ -908,5 +923,24 @@ mod tests {
         assert_eq!(saved_for_backward(&PrimalOp::Softmax { dim: -1 }), SavedRequirement::Output);
         assert_eq!(saved_for_backward(&PrimalOp::LogSoftmax { dim: -1 }), SavedRequirement::Output);
         assert_eq!(saved_for_backward(&PrimalOp::MaxPool2d { kernel: 2, stride: 2 }), SavedRequirement::Output);
+    }
+
+    #[test]
+    fn test_expand_backward_reduce_to_shape() {
+        // expand backward should produce ReduceToShape, NOT Identity
+        let op = make_op(2, PrimalOp::Passthrough("expand".into()), vec![0, 1]);
+        let adj = apply_ad_rule(&op, 100);
+        assert_eq!(adj.len(), 1);
+        assert_eq!(adj[0].input_var, 0);
+        assert!(matches!(adj[0].expr, AdjointExpr::ReduceToShape(100, 0)));
+    }
+
+    #[test]
+    fn test_reshape_backward_identity() {
+        // reshape backward should still be Identity (not ReduceToShape)
+        let op = make_op(1, PrimalOp::Passthrough("reshape".into()), vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert_eq!(adj.len(), 1);
+        assert!(matches!(adj[0].expr, AdjointExpr::Identity(100)));
     }
 }
