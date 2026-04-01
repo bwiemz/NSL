@@ -7,7 +7,9 @@ use crate::wengert::{PrimalOp, VarId, WengertOp};
 pub enum AdjointExpr {
     MulElementwise(VarId, VarId),
     MatmulTransposeLeft(VarId, VarId),
-    MatmulTransposeRight(VarId, VarId),
+    /// MatmulTransposeRight(a, grad, b) — grad_b = reduce_to_shape(a.T @ grad, b)
+    /// The third field `b` is the original weight for shape reduction.
+    MatmulTransposeRight(VarId, VarId, VarId),
     Scale(VarId, f64),
     Negate(VarId),
     Broadcast(VarId),
@@ -48,8 +50,8 @@ pub enum AdjointExpr {
     /// args: (grad, input, mean_unused, rstd_unused, eps)
     BatchNormBackward(VarId, VarId, VarId, VarId, f64),
     /// Gamma gradient for normalization: grad * x_hat where x_hat = (x - mean) / std
-    /// args: (grad, input, eps, dim) — recomputes x_hat from input
-    NormGammaBackward(VarId, VarId, f64, i64),
+    /// args: (grad, input, eps, dim, weight) — recomputes x_hat from input, reduces to weight shape
+    NormGammaBackward(VarId, VarId, f64, i64, VarId),
 
     // Regularization
     /// Dropout backward: grad * mask / (1-p).  args: (grad, mask)
@@ -162,7 +164,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }],
         PrimalOp::Matmul => vec![
             InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::MatmulTransposeLeft(output_bar, op.inputs[1]) },
-            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::MatmulTransposeRight(op.inputs[0], output_bar) },
+            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::MatmulTransposeRight(op.inputs[0], output_bar, op.inputs[1]) },
         ],
         PrimalOp::Transpose { dim0, dim1 } => vec![InputAdjoint {
             input_var: op.inputs[0],
@@ -243,7 +245,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1),
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1, op.inputs[1]),
                 });
             }
             // beta gradient: identity (grad flows through)
@@ -266,7 +268,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1),
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1, op.inputs[1]),
                 });
             }
             adjoints
@@ -281,7 +283,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, 0),
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, 0, op.inputs[1]),
                 });
             }
             if op.inputs.len() > 2 {
@@ -528,7 +530,7 @@ mod tests {
         let op = make_op(2, PrimalOp::Matmul, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert!(matches!(adj[0].expr, AdjointExpr::MatmulTransposeLeft(100, 1)));
-        assert!(matches!(adj[1].expr, AdjointExpr::MatmulTransposeRight(0, 100)));
+        assert!(matches!(adj[1].expr, AdjointExpr::MatmulTransposeRight(0, 100, 1)));
     }
 
     #[test]
@@ -730,7 +732,7 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 3, "LayerNorm should produce 3 adjoints (input, gamma, beta)");
         assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 3, 3, _)));
-        assert!(matches!(adj[1].expr, AdjointExpr::NormGammaBackward(100, 0, _, -1))); // gamma grad
+        assert!(matches!(adj[1].expr, AdjointExpr::NormGammaBackward(100, 0, _, -1, 1))); // gamma grad
         assert!(matches!(adj[2].expr, AdjointExpr::Identity(100))); // beta grad
         assert_eq!(saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }), SavedRequirement::Inputs);
     }

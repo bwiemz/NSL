@@ -36,6 +36,10 @@ pub fn compile_wengert_ops(
         if !all_inputs_resolved {
             // Ghost VarId — skip this op. Its result stays unmapped,
             // which propagates the "no gradient" signal downstream.
+            if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
+                let missing: Vec<_> = op.inputs.iter().filter(|vid| !var_map.contains_key(vid)).collect();
+                eprintln!("[wengert-skip] VarId {} ({:?}) — missing inputs: {:?}", op.result, op.op, missing);
+            }
             continue;
         }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
@@ -574,6 +578,11 @@ fn lower_single_op(
                     } else {
                         Err(CodegenError::new("arange requires at least 1 argument".to_string()))
                     }
+                }
+                "reduce_to_shape" => {
+                    // inputs = [grad, target_param]
+                    // Reduce grad by summing over leading batch dims to match target shape
+                    call(compiler, builder, "nsl_tensor_reduce_to_shape", &[inputs[0], inputs[1]])
                 }
                 "embedding_backward" => {
                     // inputs = [grad, indices, weight]

@@ -125,14 +125,19 @@ impl AdjointGenerator {
             AdjointExpr::Negate(v) => self.emit_op(PrimalOp::Neg, vec![v]),
             AdjointExpr::MulElementwise(a, b) => self.emit_op(PrimalOp::Mul, vec![a, b]),
             AdjointExpr::MatmulTransposeLeft(grad, b) => {
-                // d_loss/d_A = grad @ B^T
-                let b_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![b]);
+                // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support)
+                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b]);
                 self.emit_op(PrimalOp::Matmul, vec![grad, b_t])
             }
-            AdjointExpr::MatmulTransposeRight(a, grad) => {
-                // d_loss/d_B = A^T @ grad
-                let a_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![a]);
-                self.emit_op(PrimalOp::Matmul, vec![a_t, grad])
+            AdjointExpr::MatmulTransposeRight(a, grad, b) => {
+                // d_loss/d_B = A^T @ grad (transpose last two dims for N-D support)
+                // When the forward matmul broadcasts (A has more dims than B),
+                // the gradient must be summed over the extra batch dimensions
+                // so it matches B's shape.
+                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
+                let raw_grad = self.emit_op(PrimalOp::Matmul, vec![a_t, grad]);
+                // Reduce to match B's shape: nsl_tensor_reduce_to_shape(raw_grad, B)
+                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![raw_grad, b])
             }
             AdjointExpr::Scale(v, s) => {
                 let scale = self.emit_constant(s);
@@ -350,7 +355,7 @@ impl AdjointGenerator {
             // --- Normalization gamma backward: grad * x_hat ---
             // Recomputes x_hat = (x - mean) / std from input to get the correct
             // normalized values (NOT the output, which is gamma * x_hat + beta).
-            AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim) => {
+            AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim, weight) => {
                 let mean = self.emit_op(PrimalOp::Mean { dim: Some(dim) }, vec![x]);
                 let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
@@ -363,9 +368,11 @@ impl AdjointGenerator {
                 let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
                 let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
                 let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
-                // dgamma = sum(grad * x_hat, dim=reduction_dim)
+                // dgamma = reduce_to_shape(grad * x_hat, weight)
+                // The weight has shape [last_dim], so we sum over all dims except the last.
+                // Using reduce_to_shape handles arbitrary input ndim.
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                self.emit_op(PrimalOp::Sum { dim: Some(dim) }, vec![grad_x_hat])
+                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![grad_x_hat, weight])
             }
 
             // --- Dropout backward: grad * mask * (1/(1-p)) ---

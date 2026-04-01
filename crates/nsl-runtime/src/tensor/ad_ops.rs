@@ -1312,3 +1312,53 @@ mod tests {
         nsl_tensor_free(out);
     }
 }
+
+// ---------------------------------------------------------------------------
+// nsl_tensor_reduce_to_shape — reduce gradient to match parameter shape
+// ---------------------------------------------------------------------------
+
+/// Reduce a gradient tensor to match a target parameter's shape by summing
+/// over leading batch dimensions. Used in matmul backward when the input
+/// has more dimensions than the weight (broadcasting).
+///
+/// If grad and target already have the same shape, returns a clone of grad.
+/// Otherwise sums over leading dimensions until ndims match, then reshapes.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> i64 {
+    if grad_ptr == 0 || target_ptr == 0 {
+        eprintln!("nsl_tensor_reduce_to_shape: null pointer (grad={}, target={})", grad_ptr, target_ptr);
+        return grad_ptr;
+    }
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let target = NslTensor::from_ptr(target_ptr);
+
+    let g_ndim = grad.ndim as usize;
+    let t_ndim = target.ndim as usize;
+
+    // If same ndim and same shape, just clone
+    if g_ndim == t_ndim {
+        let same = (0..g_ndim).all(|i| unsafe { *grad.shape.add(i) == *target.shape.add(i) });
+        if same {
+            return super::nsl_tensor_clone(grad_ptr);
+        }
+    }
+
+    // If grad has more dims, sum over the leading dims
+    if g_ndim > t_ndim {
+        let extra = g_ndim - t_ndim;
+        let mut result = super::nsl_tensor_clone(grad_ptr);
+        // Sum over dim 0, `extra` times (each sum reduces ndim by 1 if keepdim=0)
+        for _ in 0..extra {
+            let old = result;
+            result = super::reduction::nsl_tensor_sum_dim(result, 0, 0); // keepdim=0
+            if old != grad_ptr {
+                super::nsl_tensor_free(old);
+            }
+        }
+        return result;
+    }
+
+    // Same ndim but different shape — sum over broadcast dims
+    let target_shape: Vec<i64> = (0..t_ndim).map(|i| unsafe { *target.shape.add(i) }).collect();
+    crate::autodiff::grad_utils::reduce_grad_for_broadcast(grad_ptr, &target_shape)
+}

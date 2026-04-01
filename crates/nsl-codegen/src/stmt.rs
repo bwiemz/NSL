@@ -2023,23 +2023,32 @@ impl Compiler<'_> {
                 // 3. Build initial VarMap: map named input/param VarIds to
                 //    Cranelift Values already present in state.variables.
                 let mut primal_vars = crate::wengert_lower::VarMap::new();
-                // Build a name→Cranelift value map from state.variables.
-                // We match by resolved name (not Symbol) because the step body AST
-                // and outer scope may use different Symbol IDs for the same variable
-                // (different interning order across modules/parse phases).
+                // Build primal_vars from state.variables using both Symbol-based
+                // and name-based matching to handle cross-module Symbol mismatches.
                 let state_vars_by_name: std::collections::HashMap<String, Value> = state.variables.iter()
                     .map(|(sym, (cvar, _))| (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar)))
                     .collect();
 
-                // Map ALL Input/Param ops in the Wengert list to Cranelift values
+                // First pass: map symbol_var_map entries via Symbol match or name fallback
+                for (sym, vid) in extractor.symbol_var_map() {
+                    if primal_vars.contains_key(vid) { continue; }
+                    if let Some(&(cvar, _)) = state.variables.get(sym) {
+                        primal_vars.insert(*vid, builder.use_var(cvar));
+                    } else {
+                        let name = self.resolve_sym(*sym).to_string();
+                        if let Some(&val) = state_vars_by_name.get(&name) {
+                            primal_vars.insert(*vid, val);
+                        }
+                    }
+                }
+                // Second pass: map Input ops by name (catches inputs not in symbol_var_map)
                 for op in &extractor.wengert_list().ops {
-                    match &op.op {
-                        crate::wengert::PrimalOp::Input(name) => {
+                    if let crate::wengert::PrimalOp::Input(name) = &op.op {
+                        if !primal_vars.contains_key(&op.result) {
                             if let Some(&val) = state_vars_by_name.get(name) {
                                 primal_vars.insert(op.result, val);
                             }
                         }
-                        _ => {}
                     }
                 }
 
@@ -2067,7 +2076,11 @@ impl Compiler<'_> {
                     ) {
                         primal_vars.insert(*vid, val);
                     } else {
-                        eprintln!("[source-ad] warning: could not resolve param '{}' via nested field loading", compound_name);
+                        // Param not resolvable through struct layouts — this is expected
+                        // for scalar config fields (eps, _d_model, etc.) that are used
+                        // in non-differentiable contexts (int(), item()). The wengert
+                        // lowerer will use the null placeholder, which is acceptable
+                        // for Passthrough ops that don't need the actual tensor value.
                     }
                 }
 
@@ -2093,6 +2106,16 @@ impl Compiler<'_> {
                 //    its runtime FFI call, and ALL intermediate VarId → Value
                 //    mappings are recorded in full_vars.
                 state.flags.in_tape_region = false;
+                // Debug: dump primal Wengert ops
+                if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
+                    eprintln!("[wengert] primal_vars: {:?}", primal_vars.keys().collect::<Vec<_>>());
+                    for op in &extractor.wengert_list().ops {
+                        let name = extractor.wengert_list().var_names.get(&op.result).cloned().unwrap_or_default();
+                        eprintln!("[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
+                            op.result, name, op.op, op.inputs,
+                            primal_vars.contains_key(&op.result));
+                    }
+                }
                 let full_vars = crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, extractor.wengert_list(), &primal_vars,
                 )?;
@@ -2935,8 +2958,13 @@ impl Compiler<'_> {
                     );
                 }
             } else {
-                // Leaf field (Tensor or scalar) — this is a parameter
-                paths.push(field_path);
+                // Leaf field — only include if it's a tensor (i64 pointer type).
+                // Skip scalar fields like eps: float (F64) or count: int (I64 but
+                // model_field_types would have it as a sub-model if it were a struct).
+                // Tensors are stored as i64 pointers; scalar floats are F64.
+                if field.cl_type == cl_types::I64 {
+                    paths.push(field_path);
+                }
             }
         }
     }
