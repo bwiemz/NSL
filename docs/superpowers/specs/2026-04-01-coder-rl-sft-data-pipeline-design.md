@@ -125,16 +125,39 @@ At ~40-48K tokens across ~130 files, with seq_len=2048, padding waste is negligi
 
 **Phase B (future, when corpus grows to 238K+ tokens)**: Output `sft_offsets.bin` alongside `sft_tokens.bin` — a u32 array marking the token index where each document starts. Pass this offset array into NSL's FlashAttention kernel (M27) to isolate documents in SRAM with zero padding and zero attention leakage. This becomes important when packing many short documents into long sequences.
 
-### 3.4 Binary Format
+### 3.4 Padding Loss Isolation (Critical)
+
+When padding documents to `seq_len` boundaries, the model must **not** compute gradients for padding positions. Without this, the model wastes capacity learning that "the most likely token after PAD is another PAD", diluting the gradients from actual NSL syntax.
+
+**Solution**: `prepare_sft.py` outputs **two** parallel arrays of equal length:
+
+- **`sft_tokens.bin`** (inputs): Token IDs with PAD_ID=0 in padding positions.
+- **`sft_labels.bin`** (targets): Token IDs shifted by 1, with **-100** in padding positions (not 0).
+
+Using -100 as the ignore label matches PyTorch convention and works with NSL's existing `cross_entropy` implementation in `losses.nsl`, which already masks targets via `valid_mask = clamp(targets + 1.0, 0.0, 1.0)` — this produces 0.0 for targets of -100, zeroing out their loss and gradient contribution.
+
+Example for a 10-token document with seq_len=16:
+
+```text
+inputs: [BOS  t1  t2  t3  t4  t5  t6  t7  t8  EOS  PAD  PAD  PAD  PAD  PAD  PAD]
+labels: [ t1  t2  t3  t4  t5  t6  t7  t8  EOS -100 -100 -100 -100 -100 -100 -100]
+```
+
+Note: u16 cannot represent -100, so `sft_labels.bin` is stored as **i16** (signed). NSL's `load_mmap` with dtype=2 (i32) or a new i16 dtype handles this. Alternatively, store labels as i32 for simplicity and use dtype=2.
+
+### 3.5 Binary Format
 
 **File**: `sft_tokens.bin`
-**Format**: Flat array of u16 token IDs. Each document encoded as:
-```
-[BOS] token_1 token_2 ... token_n [EOS] [PAD] [PAD] ... [PAD]
-```
-Padded to next `seq_len` (2048) boundary. Total file = `num_sequences * seq_len * 2` bytes.
+**Format**: Flat array of u16 token IDs (inputs). Each document padded to `seq_len` boundary with PAD_ID=0. Total file = `num_sequences * seq_len * 2` bytes.
 
-**Loaded in NSL as**: `load_mmap("data/sft_tokens.bin", 3)` (dtype=3 = u16).
+**File**: `sft_labels.bin`
+**Format**: Flat array of i32 token IDs (labels). Each document's labels are the input shifted by 1, with -100 in padding positions. Total file = `num_sequences * seq_len * 4` bytes.
+
+**Loaded in NSL as**:
+```
+let inputs = load_mmap("data/sft_tokens.bin", 3)   # dtype=3 = u16
+let labels = load_mmap("data/sft_labels.bin", 2)    # dtype=2 = i32
+```
 
 ### 3.5 Implementation
 
@@ -157,22 +180,33 @@ tok = Tokenizer.from_file("tokenizer/nsl_coder_4k.json")
 nsl_files = collect_nsl_files(["stdlib/", "examples/", "models/"])
 spec_code = extract_spec_code_blocks("spec/")
 
-# 3. Encode each document, pad to seq_len
-sequences = []
+# 3. Encode each document, build input/label pairs with padding
+all_inputs = []
+all_labels = []
+LABEL_IGNORE = -100
+
 for text in all_documents:
     ids = [BOS_ID] + tok.encode(text).ids + [EOS_ID]
+    # Labels are inputs shifted by 1
+    inp = ids[:-1]
+    lbl = ids[1:]
     # Pad to next seq_len boundary
-    padded_len = ((len(ids) + SEQ_LEN - 1) // SEQ_LEN) * SEQ_LEN
-    ids += [PAD_ID] * (padded_len - len(ids))
-    sequences.extend(ids)
+    padded_len = ((len(inp) + SEQ_LEN - 1) // SEQ_LEN) * SEQ_LEN
+    pad_count = padded_len - len(inp)
+    inp += [PAD_ID] * pad_count
+    lbl += [LABEL_IGNORE] * pad_count
+    all_inputs.extend(inp)
+    all_labels.extend(lbl)
 
-# 4. Write as u16 binary
-arr = np.array(sequences, dtype=np.uint16)
-arr.tofile("sft_tokens.bin")
+# 4. Write as binary
+np.array(all_inputs, dtype=np.uint16).tofile("sft_tokens.bin")
+np.array(all_labels, dtype=np.int32).tofile("sft_labels.bin")
 
-print(f"Total tokens: {len(sequences)}")
-print(f"Sequences: {len(sequences) // SEQ_LEN}")
-print(f"File size: {len(sequences) * 2} bytes")
+n_seq = len(all_inputs) // SEQ_LEN
+print(f"Documents: {len(all_documents)}")
+print(f"Total tokens: {len(all_inputs)} ({n_seq} sequences of {SEQ_LEN})")
+print(f"sft_tokens.bin: {len(all_inputs) * 2} bytes")
+print(f"sft_labels.bin: {len(all_labels) * 4} bytes")
 ```
 
 ### 3.6 Validation
@@ -192,7 +226,8 @@ models/coder-rl/
 │   ├── prepare_sft.py          # Step 2: Build SFT corpus
 │   ├── tokenizer/
 │   │   └── nsl_coder_4k.json   # Trained tokenizer (generated)
-│   ├── sft_tokens.bin          # Pre-tokenized SFT data (generated)
+│   ├── sft_tokens.bin          # Pre-tokenized SFT inputs, u16 (generated)
+│   ├── sft_labels.bin          # Shifted labels with -100 padding, i32 (generated)
 │   └── sft_offsets.bin         # Document boundaries (Phase B, future)
 ├── model.nsl                   # NSLCoderRL (VOCAB_SIZE=4096, unchanged)
 ├── train_grpo.nsl              # Training script (update data path)
