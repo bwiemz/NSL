@@ -1,0 +1,69 @@
+# models/coder-rl/train_sft.nsl
+# ============================================================================
+# NSL-Coder-RL — Phase 1: Supervised Fine-Tuning (Production)
+# ============================================================================
+# Hardware: RTX 5070 Ti (16GB VRAM)
+# Corpus: 172 sequences of 2048 tokens (106K real tokens, Phase A)
+# Estimated time: ~5-15 minutes on GPU
+#
+# Run with:
+#   cargo run --release -- run --source-ad models/coder-rl/train_sft.nsl
+
+from model import NSLCoderRL
+from nsl.nn.losses import cross_entropy
+
+print("================================================================")
+print("  NSL-Coder-RL — Phase 1: Supervised Fine-Tuning")
+print("  10.1M parameters | 6 layers | D=384 | GQA 6Q/3KV")
+print("  GPU: RTX 5070 Ti | Source AD")
+print("================================================================")
+
+# ─── Model ───
+let m = NSLCoderRL()
+m.to(cuda)
+print("Model created and transferred to GPU")
+
+# ─── Data ───
+# 172 sequences of 2048 tokens from stdlib + examples + models + spec code
+# batch_size=4: 43 steps/epoch, 430 total steps over 10 epochs
+# batch_size=4 balances GPU utilization with gradient noise for this tiny corpus
+let tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=4, seq_len=2048, shuffle=true, drop_last=true)
+
+print("Data loaded: 172 sequences, batch_size=4, 43 steps/epoch")
+print("Starting SFT training (10 epochs, 430 steps)...")
+
+# ─── Training ───
+# - AdamW with moderate LR (3e-4) and weight decay (0.01)
+# - Warmup cosine: 20 steps warmup (5% of training), cosine decay to 3e-5
+# - Grad clip at 1.0 to prevent explosion on small corpus
+# - 10 epochs is aggressive for 172 sequences but the model needs to memorize
+#   NSL syntax patterns, not generalize to unseen data (that's Phase B's job)
+
+train(model=m, epochs=10, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.01, beta1=0.9, beta2=0.95)
+    scheduler: warmup_cosine(warmup_steps=20, total_steps=430, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 10 == 0:
+                print(step)
+                print(loss)
+        on_epoch(epoch, loss):
+            print("================================================================")
+            print("Epoch complete:")
+            print(epoch)
+            print(loss)
+            model_save(m, "models/coder-rl/checkpoints/coder_rl_sft.nslm")
+            print("Checkpoint saved")
+
+print("================================================================")
+print("SFT Phase 1 complete!")
+model_save(m, "models/coder-rl/checkpoints/coder_rl_sft_final.nslm")
+print("Final checkpoint: models/coder-rl/checkpoints/coder_rl_sft_final.nslm")
+print("================================================================")
