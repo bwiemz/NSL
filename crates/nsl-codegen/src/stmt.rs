@@ -112,12 +112,31 @@ impl Compiler<'_> {
     /// Each `PatternKind::Ident` binds a variable, `Wildcard` is skipped,
     /// `Tuple`/`List` recurse into nested `nsl_list_get` calls, and
     /// `Struct` destructures by field name via `nsl_dict_get`.
+    fn destructure_element_type(&self, container_ty: Option<&Type>, index: usize) -> Option<Type> {
+        match container_ty? {
+            Type::Tuple(items) => items.get(index).cloned(),
+            Type::List(elem_ty) => Some((**elem_ty).clone()),
+            _ => None,
+        }
+    }
+
+    fn destructure_field_type(&self, container_ty: Option<&Type>, field: nsl_ast::Symbol) -> Option<Type> {
+        match container_ty? {
+            Type::Dict(_, value_ty) => Some((**value_ty).clone()),
+            Type::Struct { fields, .. } | Type::Model { fields, .. } => {
+                fields.iter().find_map(|(name, ty)| (*name == field).then(|| ty.clone()))
+            }
+            _ => None,
+        }
+    }
+
     fn compile_destructure_patterns(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
         patterns: &[nsl_ast::pattern::Pattern],
         container_val: cranelift_codegen::ir::Value,
+        container_ty: Option<&Type>,
     ) -> Result<(), CodegenError> {
         let get_id = self.registry.runtime_fns["nsl_list_get"].0;
         let get_ref = self.module.declare_func_in_func(get_id, builder.func);
@@ -132,6 +151,9 @@ impl Compiler<'_> {
                     builder.declare_var(var, cl_types::I64);
                     builder.def_var(var, elem);
                     state.variables.insert(*sym, (var, cl_types::I64));
+                    if let Some(elem_ty) = self.destructure_element_type(container_ty, i) {
+                        state.variable_types.insert(*sym, elem_ty);
+                    }
                 }
                 PatternKind::Wildcard => {}
                 PatternKind::Tuple(nested) | PatternKind::List(nested) => {
@@ -139,13 +161,15 @@ impl Compiler<'_> {
                     let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let nested_val = builder.inst_results(call)[0];
-                    self.compile_destructure_patterns(builder, state, nested, nested_val)?;
+                    let nested_ty = self.destructure_element_type(container_ty, i);
+                    self.compile_destructure_patterns(builder, state, nested, nested_val, nested_ty.as_ref())?;
                 }
                 PatternKind::Struct { fields, .. } => {
                     // Extract the i-th element (the struct/dict), then destructure fields
                     let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let struct_val = builder.inst_results(call)[0];
+                    let struct_ty = self.destructure_element_type(container_ty, i);
                     for field in fields {
                         let field_name = self.resolve_sym(field.name).to_string();
                         // Ensure string is in pool, then get pointer for dict lookup
@@ -153,9 +177,13 @@ impl Compiler<'_> {
                             self.intern_string(&field_name)?;
                         }
                         let key_str = self.compile_string_literal(builder, &field_name)?;
-                        let field_val = self.compile_call_by_name(
+                        let field_ty = self.destructure_field_type(struct_ty.as_ref(), field.name);
+                        let mut field_val = self.compile_call_by_name(
                             builder, "nsl_dict_get_str", &[struct_val, key_str],
                         )?;
+                        if field_ty.as_ref().map(|ty| ty.is_tensor()).unwrap_or(false) {
+                            field_val = self.compile_call_by_name(builder, "nsl_tensor_clone", &[field_val])?;
+                        }
                         if let Some(ref pat) = field.pattern {
                             // Nested pattern: { x: (a, b) } → destructure the field value
                             match &pat.kind {
@@ -164,9 +192,12 @@ impl Compiler<'_> {
                                     builder.declare_var(var, cl_types::I64);
                                     builder.def_var(var, field_val);
                                     state.variables.insert(*sym, (var, cl_types::I64));
+                                    if let Some(field_ty) = field_ty.clone() {
+                                        state.variable_types.insert(*sym, field_ty);
+                                    }
                                 }
                                 PatternKind::Tuple(nested) | PatternKind::List(nested) => {
-                                    self.compile_destructure_patterns(builder, state, nested, field_val)?;
+                                    self.compile_destructure_patterns(builder, state, nested, field_val, field_ty.as_ref())?;
                                 }
                                 PatternKind::Wildcard => {}
                                 _ => {
@@ -181,6 +212,9 @@ impl Compiler<'_> {
                             builder.declare_var(var, cl_types::I64);
                             builder.def_var(var, field_val);
                             state.variables.insert(field.name, (var, cl_types::I64));
+                            if let Some(field_ty) = field_ty {
+                                state.variable_types.insert(field.name, field_ty);
+                            }
                         }
                     }
                 }
@@ -189,15 +223,19 @@ impl Compiler<'_> {
                     let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let elem = builder.inst_results(call)[0];
+                    let elem_ty = self.destructure_element_type(container_ty, i);
                     match &pattern.kind {
                         PatternKind::Ident(sym) => {
                             let var = state.new_variable();
                             builder.declare_var(var, cl_types::I64);
                             builder.def_var(var, elem);
                             state.variables.insert(*sym, (var, cl_types::I64));
+                            if let Some(elem_ty) = elem_ty {
+                                state.variable_types.insert(*sym, elem_ty);
+                            }
                         }
                         PatternKind::Tuple(nested) | PatternKind::List(nested) => {
-                            self.compile_destructure_patterns(builder, state, nested, elem)?;
+                            self.compile_destructure_patterns(builder, state, nested, elem, elem_ty.as_ref())?;
                         }
                         PatternKind::Wildcard => {}
                         _ => {
@@ -240,6 +278,14 @@ impl Compiler<'_> {
                 match &pattern.kind {
                     PatternKind::Ident(sym) => {
                         let sym = *sym;
+                        if let Some(expr) = value {
+                            if self.expr_is_borrowed_batch_handle(state, expr) {
+                                return Err(CodegenError::new(format!(
+                                    "cannot bind DataLoader batch handle '{}' directly; access batch fields instead",
+                                    self.resolve_sym(sym)
+                                )));
+                            }
+                        }
                         let init_val = if let Some(expr) = value {
                             // M36: Check if this variable is slab-planned for zero-alloc
                             let slab_result = self.try_compile_slab_tensor(builder, state, &sym, expr);
@@ -258,6 +304,12 @@ impl Compiler<'_> {
                         };
 
                         if let Some((var, _)) = state.variables.get(&sym) {
+                            if state.dataloader_symbols.contains(&sym) {
+                                return Err(CodegenError::new(format!(
+                                    "redeclaring DataLoader handle '{}' is unsupported; use a fresh symbol instead",
+                                    self.resolve_sym(sym)
+                                )));
+                            }
                             // Free old tensor value before reassignment to prevent memory leak
                             if state.current_block.map(|b| !is_block_filled(builder, b)).unwrap_or(true) {
                                 let old_val = builder.use_var(*var);
@@ -279,6 +331,13 @@ impl Compiler<'_> {
                         // Record semantic type for step-variable cleanup
                         if let Some(expr) = value {
                             state.variable_types.insert(sym, self.node_type(expr.id).clone());
+                            if self.expr_is_dataloader_handle(state, expr) {
+                                state.dataloader_symbols.insert(sym);
+                            } else {
+                                state.dataloader_symbols.remove(&sym);
+                            }
+                        } else {
+                            state.dataloader_symbols.remove(&sym);
                         }
 
                         // M50: Track sparse tensor variables for end-to-end dispatch.
@@ -312,8 +371,9 @@ impl Compiler<'_> {
                         } else {
                             return Err(CodegenError::new("tuple/list destructuring requires a value"));
                         };
+                        let tuple_ty = value.as_ref().map(|expr| self.node_type(expr.id).clone());
 
-                        self.compile_destructure_patterns(builder, state, sub_patterns, tuple_val)?;
+                        self.compile_destructure_patterns(builder, state, sub_patterns, tuple_val, tuple_ty.as_ref())?;
                     }
                     PatternKind::Struct { fields, .. } => {
                         // Top-level struct destructuring: let { x, y } = expr
@@ -322,15 +382,20 @@ impl Compiler<'_> {
                         } else {
                             return Err(CodegenError::new("struct destructuring requires a value"));
                         };
+                        let struct_ty = value.as_ref().map(|expr| self.node_type(expr.id).clone());
                         for field in fields {
                             let field_name = self.resolve_sym(field.name).to_string();
                             if !self.string_pool.contains_key(field_name.as_str()) {
                                 self.intern_string(&field_name)?;
                             }
                             let key_str = self.compile_string_literal(builder, &field_name)?;
-                            let field_val = self.compile_call_by_name(
+                            let field_ty = self.destructure_field_type(struct_ty.as_ref(), field.name);
+                            let mut field_val = self.compile_call_by_name(
                                 builder, "nsl_dict_get_str", &[struct_val, key_str],
                             )?;
+                            if field_ty.as_ref().map(|ty| ty.is_tensor()).unwrap_or(false) {
+                                field_val = self.compile_call_by_name(builder, "nsl_tensor_clone", &[field_val])?;
+                            }
                             if let Some(ref pat) = field.pattern {
                                 match &pat.kind {
                                     PatternKind::Ident(sym) => {
@@ -338,9 +403,12 @@ impl Compiler<'_> {
                                         builder.declare_var(var, cl_types::I64);
                                         builder.def_var(var, field_val);
                                         state.variables.insert(*sym, (var, cl_types::I64));
+                                        if let Some(field_ty) = field_ty.clone() {
+                                            state.variable_types.insert(*sym, field_ty);
+                                        }
                                     }
                                     PatternKind::Tuple(nested) | PatternKind::List(nested) => {
-                                        self.compile_destructure_patterns(builder, state, nested, field_val)?;
+                                        self.compile_destructure_patterns(builder, state, nested, field_val, field_ty.as_ref())?;
                                     }
                                     PatternKind::Wildcard => {}
                                     _ => {
@@ -354,6 +422,9 @@ impl Compiler<'_> {
                                 builder.declare_var(var, cl_types::I64);
                                 builder.def_var(var, field_val);
                                 state.variables.insert(field.name, (var, cl_types::I64));
+                                if let Some(field_ty) = field_ty {
+                                    state.variable_types.insert(field.name, field_ty);
+                                }
                             }
                         }
                     }
@@ -367,11 +438,22 @@ impl Compiler<'_> {
 
             StmtKind::Return(expr) => {
                 if let Some(e) = expr {
+                    if self.expr_is_dataloader_handle(state, e) {
+                        return Err(CodegenError::new(
+                            "cannot return a DataLoader handle directly; create and consume loaders within the same function",
+                        ));
+                    }
+                    if self.expr_is_borrowed_batch_handle(state, e) {
+                        return Err(CodegenError::new(
+                            "cannot return a DataLoader batch handle directly; return batch fields instead",
+                        ));
+                    }
                     let mut val = self.compile_expr(builder, state, e)?;
                     // Free intermediate tensor temporaries before returning (keep return value)
                     self.free_tensor_temporaries(builder, state, Some(val));
                     // M38b: Free linear tensors consumed during the return expression
                     self.free_linear_consumes(builder, state, Some(val));
+                    self.cleanup_active_loop_batches(builder, state);
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
@@ -387,6 +469,7 @@ impl Compiler<'_> {
                     }
                     builder.ins().return_(&[val]);
                 } else {
+                    self.cleanup_active_loop_batches(builder, state);
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
                     // @no_grad: resume tape before explicit return
@@ -566,6 +649,11 @@ impl Compiler<'_> {
         op: AssignOp,
         value: &nsl_ast::expr::Expr,
     ) -> Result<(), CodegenError> {
+        if self.expr_is_borrowed_batch_handle(state, value) {
+            return Err(CodegenError::new(
+                "cannot assign a DataLoader batch handle directly; access batch fields instead",
+            ));
+        }
         let new_val = self.compile_expr(builder, state, value)?;
         match &target.kind {
             nsl_ast::expr::ExprKind::Ident(sym) => {
@@ -578,6 +666,13 @@ impl Compiler<'_> {
 
                 let target_type = self.node_type(target.id).clone();
                 let is_float = is_float_type(&target_type);
+
+                if matches!(op, AssignOp::Assign) && state.dataloader_symbols.contains(sym) {
+                    return Err(CodegenError::new(format!(
+                        "reassigning DataLoader handle '{}' is unsupported; create a new loader symbol instead",
+                        self.resolve_sym(*sym)
+                    )));
+                }
 
                 let final_val = match op {
                     AssignOp::Assign => new_val,
@@ -616,12 +711,24 @@ impl Compiler<'_> {
                     }
                 }
                 builder.def_var(var, final_val);
+                if matches!(op, AssignOp::Assign) {
+                    if self.expr_is_dataloader_handle(state, value) {
+                        state.dataloader_symbols.insert(*sym);
+                    } else {
+                        state.dataloader_symbols.remove(sym);
+                    }
+                }
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));
                 // M38b: Free linear tensors consumed during this assignment's RHS
                 self.free_linear_consumes(builder, state, Some(final_val));
             }
             nsl_ast::expr::ExprKind::Subscript { object, index } => {
+                if self.expr_is_borrowed_batch_handle(state, object) {
+                    return Err(CodegenError::new(
+                        "cannot mutate a DataLoader batch dict directly; bind or replace batch fields instead",
+                    ));
+                }
                 let obj_val = self.compile_expr(builder, state, object)?;
                 let obj_type = self.node_type(object.id).clone();
                 match index.as_ref() {
@@ -874,6 +981,34 @@ impl Compiler<'_> {
         }
     }
 
+    fn cleanup_active_loop_batches(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+    ) {
+        for &batch_var in state.cleanup.active_batch_vars.iter().rev() {
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let batch_ptr = builder.use_var(batch_var);
+            let _ = self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_ptr]);
+        }
+        for loop_ctx in state.loop_stack.iter().rev() {
+            let Some(batch_var) = loop_ctx.batch_var else {
+                continue;
+            };
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let batch_ptr = builder.use_var(batch_var);
+            let _ = self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_ptr]);
+        }
+    }
+
     /// Emit nsl_dataloader_stop + nsl_dataloader_free for all DataLoaders
     /// created in this scope. Called before function returns to prevent
     /// thread leaks and resource leaks.
@@ -905,6 +1040,10 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let merge_block = builder.create_block();
         let cond_val = self.compile_expr(builder, state, condition)?;
+        let incoming_loader_symbols = state.dataloader_symbols.clone();
+        let mut reaching_loader_sets: Vec<std::collections::HashSet<nsl_ast::Symbol>> = Vec::new();
+        let incoming_loader_vars = state.cleanup.dataloader_vars.clone();
+        let mut reaching_loader_var_sets: Vec<Vec<Value>> = Vec::new();
 
         let then_bb = builder.create_block();
         let next_bb = if !elif_clauses.is_empty() || else_block.is_some() {
@@ -917,9 +1056,17 @@ impl Compiler<'_> {
         builder.switch_to_block(then_bb);
         builder.seal_block(then_bb);
         state.current_block = Some(then_bb);
+        state.dataloader_symbols = incoming_loader_symbols.clone();
+        state.cleanup.dataloader_vars = incoming_loader_vars.clone();
+        state.flags.conditional_depth += 1;
         for s in &then_block.stmts { self.compile_stmt(builder, state, s)?; }
+        state.flags.conditional_depth -= 1;
         let current = state.current_block.unwrap_or(then_bb);
-        if !is_block_filled(builder, current) { builder.ins().jump(merge_block, &[]); }
+        if !is_block_filled(builder, current) {
+            reaching_loader_sets.push(state.dataloader_symbols.clone());
+            reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
+            builder.ins().jump(merge_block, &[]);
+        }
 
         let mut current_else = next_bb;
         for (i, (elif_cond, elif_body)) in elif_clauses.iter().enumerate() {
@@ -939,9 +1086,17 @@ impl Compiler<'_> {
             builder.switch_to_block(elif_then);
             builder.seal_block(elif_then);
             state.current_block = Some(elif_then);
+            state.dataloader_symbols = incoming_loader_symbols.clone();
+            state.cleanup.dataloader_vars = incoming_loader_vars.clone();
+            state.flags.conditional_depth += 1;
             for s in &elif_body.stmts { self.compile_stmt(builder, state, s)?; }
+            state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(elif_then);
-            if !is_block_filled(builder, current) { builder.ins().jump(merge_block, &[]); }
+            if !is_block_filled(builder, current) {
+                reaching_loader_sets.push(state.dataloader_symbols.clone());
+                reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
+                builder.ins().jump(merge_block, &[]);
+            }
 
             current_else = elif_next;
         }
@@ -950,15 +1105,40 @@ impl Compiler<'_> {
             builder.switch_to_block(current_else);
             builder.seal_block(current_else);
             state.current_block = Some(current_else);
+            state.dataloader_symbols = incoming_loader_symbols.clone();
+            state.cleanup.dataloader_vars = incoming_loader_vars.clone();
+            state.flags.conditional_depth += 1;
             for s in &else_body.stmts { self.compile_stmt(builder, state, s)?; }
+            state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(current_else);
-            if !is_block_filled(builder, current) { builder.ins().jump(merge_block, &[]); }
+            if !is_block_filled(builder, current) {
+                reaching_loader_sets.push(state.dataloader_symbols.clone());
+                reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
+                builder.ins().jump(merge_block, &[]);
+            }
         } else if current_else != merge_block {
             builder.switch_to_block(current_else);
             builder.seal_block(current_else);
             state.current_block = Some(current_else);
+            reaching_loader_sets.push(incoming_loader_symbols.clone());
+            reaching_loader_var_sets.push(incoming_loader_vars.clone());
             builder.ins().jump(merge_block, &[]);
         }
+
+        state.dataloader_symbols = if let Some(first) = reaching_loader_sets.first().cloned() {
+            reaching_loader_sets.into_iter().skip(1).fold(first, |acc, branch_set| {
+                acc.into_iter().filter(|sym| branch_set.contains(sym)).collect()
+            })
+        } else {
+            incoming_loader_symbols
+        };
+        state.cleanup.dataloader_vars = if let Some(first) = reaching_loader_var_sets.first().cloned() {
+            reaching_loader_var_sets.into_iter().skip(1).fold(first, |acc, branch_vec| {
+                acc.into_iter().filter(|value| branch_vec.contains(value)).collect()
+            })
+        } else {
+            incoming_loader_vars
+        };
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
@@ -989,7 +1169,7 @@ impl Compiler<'_> {
         state.current_block = Some(body_block);
 
         state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: header_block, exit_block });
+        state.loop_stack.push(LoopContext { continue_block: header_block, exit_block, batch_var: None });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
@@ -1054,7 +1234,7 @@ impl Compiler<'_> {
         }
 
         state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: header_block, exit_block });
+        state.loop_stack.push(LoopContext { continue_block: header_block, exit_block, batch_var: None });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
@@ -1087,14 +1267,9 @@ impl Compiler<'_> {
             return self.compile_for_model_array(builder, state, pattern, iterable, body, *element_model, *size);
         }
 
-        // DataLoader iteration: `for batch in loader:`
-        // Detect DataLoader by checking if the iterable variable was assigned from a DataLoader() call.
-        // The semantic type is List<Dict<Str, Tensor>> but the runtime handle is an opaque pointer,
-        // not a real list — we must use the DataLoader-specific iteration protocol.
-        // Only route to DataLoader protocol when the type is positively known to be
-        // a DataLoader (List<Dict<...>>). Previously, Type::Unknown also fell through
-        // here, which could miscompile non-DataLoader iterables whose type inference failed.
-        if self.is_dataloader_iterable(iterable) {
+        // DataLoader iteration uses an opaque runtime handle, not a real list.
+        // Route to the loader protocol only for expressions proven to come from DataLoader(...).
+        if self.is_dataloader_iterable(state, iterable) {
             return self.compile_for_dataloader(builder, state, pattern, iterable, body);
         }
         if matches!(iter_type, Type::Unknown) {
@@ -1184,7 +1359,7 @@ impl Compiler<'_> {
 
         // continue jumps to increment_block (not header) so counter is incremented
         state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
+        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block, batch_var: None });
         for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
         state.loop_stack.pop();
 
@@ -1275,7 +1450,7 @@ impl Compiler<'_> {
 
         // Compile body statements
         state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block });
+        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block, batch_var: None });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
@@ -1306,10 +1481,27 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// Check if an iterable expression is a DataLoader (typed as List<Dict<Str, Tensor>>).
-    fn is_dataloader_iterable(&self, iterable: &nsl_ast::expr::Expr) -> bool {
-        let ty = self.node_type(iterable.id).clone();
-        matches!(ty, Type::List(ref elem) if matches!(**elem, Type::Dict(_, _)))
+    fn expr_is_dataloader_handle(&self, state: &FuncState, expr: &nsl_ast::expr::Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(fn_sym) = &callee.kind {
+                    self.resolve_sym(*fn_sym) == "DataLoader"
+                } else {
+                    false
+                }
+            }
+            ExprKind::Ident(sym) => state.dataloader_symbols.contains(sym),
+            _ => false,
+        }
+    }
+
+    fn expr_is_borrowed_batch_handle(&self, state: &FuncState, expr: &nsl_ast::expr::Expr) -> bool {
+        matches!(&expr.kind, ExprKind::Ident(sym) if state.borrowed_batch_symbols.contains(sym))
+    }
+
+    /// Check if an iterable expression is a real DataLoader handle.
+    fn is_dataloader_iterable(&self, state: &FuncState, iterable: &nsl_ast::expr::Expr) -> bool {
+        self.expr_is_dataloader_handle(state, iterable)
     }
 
     // ── DataLoader for-loop ──────────────────────────────────────────
@@ -1335,13 +1527,17 @@ impl Compiler<'_> {
         builder.declare_var(batch_var, cl_types::I64);
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(batch_var, zero);
-        state.variables.insert(loop_var_sym, (batch_var, cl_types::I64));
+        let prev_binding = state.variables.insert(loop_var_sym, (batch_var, cl_types::I64));
+        let prev_var_type = state.variable_types.get(&loop_var_sym).cloned();
+        let prev_loader_symbol = state.dataloader_symbols.contains(&loop_var_sym);
+        let prev_borrowed_symbol = state.borrowed_batch_symbols.contains(&loop_var_sym);
 
-        // Create blocks: header, body, cleanup, break_exit, exit
+        // Create blocks: header, body, cleanup, break_exit, exhausted_exit, exit
         let header_block = builder.create_block();
         let body_block = builder.create_block();
         let cleanup_block = builder.create_block();
         let break_exit_block = builder.create_block();
+        let exhausted_exit_block = builder.create_block();
         let exit_block = builder.create_block();
 
         builder.ins().jump(header_block, &[]);
@@ -1352,7 +1548,7 @@ impl Compiler<'_> {
         let batch_ptr = self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_val])?;
         builder.def_var(batch_var, batch_ptr);
         let is_null = builder.ins().icmp_imm(IntCC::Equal, batch_ptr, 0);
-        builder.ins().brif(is_null, exit_block, &[], body_block, &[]);
+        builder.ins().brif(is_null, exhausted_exit_block, &[], body_block, &[]);
 
         // Body: compile loop body statements
         // break → break_exit_block (frees batch, then stops DL)
@@ -1365,11 +1561,13 @@ impl Compiler<'_> {
         // Do NOT use scope_begin/scope_end — it double-frees tensors that are
         // already freed by free_tensor_temporaries in called functions.
         state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block });
+        state.borrowed_batch_symbols.insert(loop_var_sym);
+        state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block, batch_var: Some(batch_var) });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
         state.loop_stack.pop();
+        state.borrowed_batch_symbols.remove(&loop_var_sym);
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
@@ -1384,7 +1582,7 @@ impl Compiler<'_> {
         builder.seal_block(cleanup_block);
         state.current_block = Some(cleanup_block);
         let batch_to_free = builder.use_var(batch_var);
-        self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
+        self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_to_free])?;
         builder.ins().jump(header_block, &[]);
 
         // Break exit: end tensor scope, free the current batch dict, then stop the DataLoader
@@ -1392,16 +1590,42 @@ impl Compiler<'_> {
         builder.seal_block(break_exit_block);
         state.current_block = Some(break_exit_block);
         let batch_to_free = builder.use_var(batch_var);
-        self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
-        self.compile_call_by_name(builder, "nsl_dataloader_stop", &[dl_val])?;
+        self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_to_free])?;
+        self.compile_call_by_name(builder, "nsl_dataloader_reset", &[dl_val])?;
         builder.ins().jump(exit_block, &[]);
 
-        // Exit (normal exhaustion): reset the dataloader for potential next epoch
+        // Exit on natural exhaustion: reset the dataloader for potential next epoch
         builder.seal_block(header_block);
-        builder.switch_to_block(exit_block);
+        builder.switch_to_block(exhausted_exit_block);
+        builder.seal_block(exhausted_exit_block);
+        state.current_block = Some(exhausted_exit_block);
         builder.seal_block(exit_block);
-        state.current_block = Some(exit_block);
         self.compile_call_by_name(builder, "nsl_dataloader_reset", &[dl_val])?;
+        builder.ins().jump(exit_block, &[]);
+
+        builder.switch_to_block(exit_block);
+        state.current_block = Some(exit_block);
+
+        if let Some(prev_binding) = prev_binding {
+            state.variables.insert(loop_var_sym, prev_binding);
+        } else {
+            state.variables.remove(&loop_var_sym);
+        }
+        if let Some(prev_var_type) = prev_var_type {
+            state.variable_types.insert(loop_var_sym, prev_var_type);
+        } else {
+            state.variable_types.remove(&loop_var_sym);
+        }
+        if prev_loader_symbol {
+            state.dataloader_symbols.insert(loop_var_sym);
+        } else {
+            state.dataloader_symbols.remove(&loop_var_sym);
+        }
+        if prev_borrowed_symbol {
+            state.borrowed_batch_symbols.insert(loop_var_sym);
+        } else {
+            state.borrowed_batch_symbols.remove(&loop_var_sym);
+        }
 
         Ok(())
     }
@@ -1426,9 +1650,11 @@ impl Compiler<'_> {
             match &arm.pattern.kind {
                 PatternKind::Wildcard => {
                     // Default arm — always taken
+                    state.flags.conditional_depth += 1;
                     for s in &arm.body.stmts {
                         self.compile_stmt(builder, state, s)?;
                     }
+                    state.flags.conditional_depth -= 1;
                     if let Some(block) = state.current_block {
                         if !is_block_filled(builder, block) {
                             builder.ins().jump(merge_block, &[]);
@@ -1450,7 +1676,9 @@ impl Compiler<'_> {
                         builder.switch_to_block(arm_block);
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
+                        state.flags.conditional_depth += 1;
                         for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                        state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
                             builder.ins().jump(merge_block, &[]);
@@ -1467,7 +1695,9 @@ impl Compiler<'_> {
                         builder.declare_var(var, cl_types::I64);
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
+                        state.flags.conditional_depth += 1;
                         for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                        state.flags.conditional_depth -= 1;
                         if let Some(block) = state.current_block {
                             if !is_block_filled(builder, block) {
                                 builder.ins().jump(merge_block, &[]);
@@ -1491,7 +1721,9 @@ impl Compiler<'_> {
                     builder.switch_to_block(arm_block);
                     builder.seal_block(arm_block);
                     state.current_block = Some(arm_block);
+                    state.flags.conditional_depth += 1;
                     for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                    state.flags.conditional_depth -= 1;
                     let current = state.current_block.unwrap_or(arm_block);
                     if !is_block_filled(builder, current) {
                         builder.ins().jump(merge_block, &[]);
@@ -1520,7 +1752,9 @@ impl Compiler<'_> {
                         builder.switch_to_block(arm_block);
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
+                        state.flags.conditional_depth += 1;
                         for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                        state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
                             builder.ins().jump(merge_block, &[]);
@@ -1564,6 +1798,11 @@ impl Compiler<'_> {
         if self.features.pipeline_config.is_some() {
             return self.compile_train_block_pipelined(builder, state, train);
         }
+
+        let saved_variables = state.variables.clone();
+        let saved_variable_types = state.variable_types.clone();
+        let saved_dataloader_symbols = state.dataloader_symbols.clone();
+        let saved_borrowed_batch_symbols = state.borrowed_batch_symbols.clone();
 
         // ── 1. Extract config from train(...) args ──────────────────────
         let mut model_sym: Option<nsl_ast::Symbol> = None;
@@ -1968,6 +2207,8 @@ impl Compiler<'_> {
             builder.seal_block(batch_body_block);
             state.current_block = Some(batch_body_block);
             builder.def_var(step_param_var, batch_ptr);
+            state.cleanup.active_batch_vars.push(step_param_var);
+            state.borrowed_batch_symbols.insert(step_param_sym);
         } else {
             // No DataLoader — step body runs once per epoch (backward compat)
             batch_header_block = body_block; // unused, just needs a value
@@ -1987,6 +2228,11 @@ impl Compiler<'_> {
             let device_1 = builder.ins().iconst(cl_types::I64, 1);
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[ids_tensor, device_1])?;
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
+        }
+
+        let prev_batch_scope = state.flags.in_dataloader_batch_scope;
+        if has_dataloader.is_some() {
+            state.flags.in_dataloader_batch_scope = true;
         }
 
         // Snapshot variables before step body for cleanup
@@ -2776,6 +3022,8 @@ impl Compiler<'_> {
             }
         }
 
+        state.flags.in_dataloader_batch_scope = prev_batch_scope;
+
         if on_epoch_binds_loss {
             let saved_loss = builder.use_var(epoch_loss_var);
             self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[saved_loss])?;
@@ -2817,10 +3065,12 @@ impl Compiler<'_> {
             let current_blk = state.current_block.unwrap_or(batch_body_block);
             if !is_block_filled(builder, current_blk) {
                 let batch_to_free = builder.use_var(step_param_var);
-                self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
+                self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_to_free])?;
                 let zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(step_param_var, zero);
             }
+            state.cleanup.active_batch_vars.pop();
+            state.borrowed_batch_symbols.remove(&step_param_sym);
         }
 
         // ── 8. Close batch loop (if DataLoader) and increment epoch ──────
@@ -2970,6 +3220,11 @@ impl Compiler<'_> {
             state.current_block = Some(fa_exit);
             self.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
         }
+
+        state.variables = saved_variables;
+        state.variable_types = saved_variable_types;
+        state.dataloader_symbols = saved_dataloader_symbols;
+        state.borrowed_batch_symbols = saved_borrowed_batch_symbols;
 
         Ok(())
     }
@@ -3261,6 +3516,11 @@ impl Compiler<'_> {
         state: &mut FuncState,
         train: &nsl_ast::block::TrainBlock,
     ) -> Result<(), CodegenError> {
+        let saved_variables = state.variables.clone();
+        let saved_variable_types = state.variable_types.clone();
+        let saved_dataloader_symbols = state.dataloader_symbols.clone();
+        let saved_borrowed_batch_symbols = state.borrowed_batch_symbols.clone();
+
         let config = self.features.pipeline_config.clone().unwrap();
         let num_stages = config.num_stages;
 
@@ -3741,6 +4001,11 @@ impl Compiler<'_> {
 
         // ── 14. Pipeline destroy ────────────────────────────────────────
         self.compile_call_by_name(builder, "nsl_pipeline_destroy", &[])?;
+
+        state.variables = saved_variables;
+        state.variable_types = saved_variable_types;
+        state.dataloader_symbols = saved_dataloader_symbols;
+        state.borrowed_batch_symbols = saved_borrowed_batch_symbols;
 
         Ok(())
     }

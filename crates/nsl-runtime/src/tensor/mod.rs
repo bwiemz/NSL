@@ -966,6 +966,27 @@ pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
     }
 }
 
+/// Safe version of nsl_tensor_clone that returns the original i64 when the input
+/// is not a valid tensor pointer.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_clone_if_valid(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    if (ptr as u64) < 0x10000 {
+        return ptr;
+    }
+    if (ptr as usize) % 8 != 0 {
+        return ptr;
+    }
+    let magic = unsafe { *(ptr as *const u32) };
+    if magic == TENSOR_MAGIC {
+        nsl_tensor_clone(ptr)
+    } else {
+        ptr
+    }
+}
+
 // === In-place mutation ops (NOT taped -- used outside grad blocks) ===
 
 #[no_mangle]

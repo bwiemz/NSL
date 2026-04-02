@@ -70,6 +70,32 @@ impl NslDict {
     }
 }
 
+fn free_dict_impl(dict_ptr: i64, free_tensor_values: bool) {
+    if dict_ptr == 0 {
+        return;
+    }
+
+    let dict = unsafe { &mut *(dict_ptr as *mut NslDict) };
+    for i in 0..dict.num_buckets as usize {
+        let mut entry = unsafe { *dict.buckets.add(i) };
+        while !entry.is_null() {
+            let e = unsafe { &*entry };
+            let next = e.next;
+            let key_bytes = unsafe { CStr::from_ptr(e.key as *const c_char) }.to_bytes_with_nul();
+            unsafe { crate::memory::checked_free(e.key, key_bytes.len()) };
+            if free_tensor_values {
+                crate::tensor::nsl_tensor_free(e.value);
+            }
+            unsafe { drop(Box::from_raw(entry)) };
+            entry = next;
+        }
+    }
+
+    let bucket_size = (dict.num_buckets as usize) * std::mem::size_of::<*mut NslDictEntry>();
+    unsafe { crate::memory::checked_free(dict.buckets as *mut u8, bucket_size) };
+    unsafe { drop(Box::from_raw(dict as *mut NslDict)) };
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_dict_new() -> i64 {
     let num_buckets: i64 = 16;
@@ -187,26 +213,12 @@ pub extern "C" fn nsl_dict_keys(dict_ptr: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn nsl_dict_free(dict_ptr: i64) {
-    if dict_ptr == 0 { return; }
-    let dict = unsafe { &mut *(dict_ptr as *mut NslDict) };
-    for i in 0..dict.num_buckets as usize {
-        let mut entry = unsafe { *dict.buckets.add(i) };
-        while !entry.is_null() {
-            let e = unsafe { &*entry };
-            let next = e.next;
-            // Free the key string allocated by copy_cstr
-            let key_bytes = unsafe { CStr::from_ptr(e.key as *const c_char) }.to_bytes_with_nul();
-            unsafe { crate::memory::checked_free(e.key, key_bytes.len()) };
-            // Values are owned by the caller — dict only frees its own structure.
-            // This matches nsl_list_free which also does not free elements.
-            // Free the entry struct itself
-            unsafe { drop(Box::from_raw(entry)) };
-            entry = next;
-        }
-    }
-    // Free bucket array
-    let bucket_size = (dict.num_buckets as usize) * std::mem::size_of::<*mut NslDictEntry>();
-    unsafe { crate::memory::checked_free(dict.buckets as *mut u8, bucket_size) };
-    // Free dict struct
-    unsafe { drop(Box::from_raw(dict as *mut NslDict)) };
+    // Values are owned by the caller — dict only frees its own structure.
+    // This matches nsl_list_free which also does not free elements.
+    free_dict_impl(dict_ptr, false);
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_dict_free_tensor_values(dict_ptr: i64) {
+    free_dict_impl(dict_ptr, true);
 }

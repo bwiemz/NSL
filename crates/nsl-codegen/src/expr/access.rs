@@ -18,7 +18,7 @@ impl Compiler<'_> {
         state: &mut FuncState,
         object: &Expr,
         member: nsl_ast::Symbol,
-        _expr: &Expr,
+        expr: &Expr,
     ) -> Result<Value, CodegenError> {
         let member_name = self.resolve_sym(member).to_string();
 
@@ -26,8 +26,6 @@ impl Compiler<'_> {
         {
             let obj_type = self.node_type(object.id).clone();
             if matches!(obj_type, Type::Module { .. }) {
-                // Module member access in non-call context -- return function reference
-                // This is handled at call site; for now return a dummy value
                 if let Some((func_id, _sig)) = self.registry.functions.get(&member_name) {
                     let fref = self.module.declare_func_in_func(*func_id, builder.func);
                     return Ok(builder.ins().func_addr(crate::types::pointer_type(), fref));
@@ -76,7 +74,6 @@ impl Compiler<'_> {
 
         if let Type::Model { name, .. } = &obj_type {
             let model_name = self.resolve_sym(*name).to_string();
-            // Check if this field is a FixedModelArray -- return the address, not a loaded value
             if let Some(field_type_map) = self.models.model_field_types.get(&model_name).cloned() {
                 if let Some(array_marker) = field_type_map.get(&member_name).cloned() {
                     if array_marker.starts_with('[') {
@@ -100,8 +97,6 @@ impl Compiler<'_> {
                             obj_val,
                             field.offset as i32,
                         );
-                        // M52b: Tag this value as a known weight if it exists in the WeightMap.
-                        // Try common naming conventions: "model.field", "field", etc.
                         if let Some(ref wmap) = self.features.weight_map {
                             let candidates = [
                                 format!("{}.{}", model_name, member_name),
@@ -148,8 +143,13 @@ impl Compiler<'_> {
             }
             if let Ok(key_str) = self.compile_string_literal(builder, &member_name) {
                 let result = self.compile_call_by_name(builder, "nsl_dict_get_str", &[obj_val, key_str]);
-                if result.is_ok() {
-                    return result;
+                if let Ok(value) = result {
+                    if self.node_type(expr.id).is_tensor() {
+                        let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
+                        state.cleanup.tensor_temporaries.push(cloned);
+                        return Ok(cloned);
+                    }
+                    return Ok(value);
                 }
             }
         }
@@ -170,11 +170,17 @@ impl Compiler<'_> {
                 let idx_val = self.compile_expr(builder, state, idx_expr)?;
                 let obj_type = self.node_type(object.id).clone();
                 match &obj_type {
-                    Type::Dict { .. } => {
+                    Type::Dict(_, value_ty) => {
                         let fid = self.registry.runtime_fns["nsl_dict_get_str"].0;
                         let fref = self.module.declare_func_in_func(fid, builder.func);
                         let call = builder.ins().call(fref, &[obj_val, idx_val]);
-                        Ok(builder.inst_results(call)[0])
+                        let value = builder.inst_results(call)[0];
+                        if value_ty.is_tensor() {
+                            let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
+                            state.cleanup.tensor_temporaries.push(cloned);
+                            return Ok(cloned);
+                        }
+                        Ok(value)
                     }
                     _ => {
                         // Default: list subscript. Warn if the type is Unknown.

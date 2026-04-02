@@ -28,7 +28,8 @@ print("Model created and transferred to GPU")
 # batch_size=4: 43 steps/epoch, 430 total steps over 10 epochs
 # batch_size=4 balances GPU utilization with gradient noise for this tiny corpus
 let tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=4, seq_len=2048, shuffle=true, drop_last=true)
+let labels = load_mmap("models/coder-rl/data/sft_labels.bin", 2)
+let loader = DataLoader(tokens, labels=labels, batch_size=4, seq_len=2048, shuffle=true, drop_last=true)
 
 print("Data loaded: 172 sequences, batch_size=4, 43 steps/epoch")
 print("Starting SFT training (10 epochs, 430 steps)...")

@@ -47,6 +47,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_dict_contains", &[types::I64, types::I64], Some(types::I8)),
     ("nsl_dict_keys", &[types::I64], Some(types::I64)),
     ("nsl_dict_free", &[types::I64], None),
+    ("nsl_dict_free_tensor_values", &[types::I64], None),
     // String comparison
     ("nsl_str_eq", &[types::I64, types::I64], Some(types::I64)),
     // String repeat & slice
@@ -140,6 +141,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_print", &[types::I64], None),
     // Tensor memory
     ("nsl_tensor_clone", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_clone_if_valid", &[types::I64], Some(types::I64)),
     ("nsl_tensor_free", &[types::I64], None),
     ("nsl_tensor_free_if_valid", &[types::I64], None),
     ("nsl_tensor_retain", &[types::I64], None),
@@ -309,7 +311,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_load_csv", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_load_mmap", &[types::I64, types::I64, types::I64], Some(types::I64)),
     // DataLoader (M19)
-    ("nsl_dataloader_create", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+    ("nsl_dataloader_create", &[types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
     ("nsl_dataloader_start", &[types::I64], None),
     ("nsl_dataloader_next_batch", &[types::I64], Some(types::I64)),
     ("nsl_dataloader_reset", &[types::I64], None),

@@ -14,7 +14,8 @@ let m = NSLCoderRL()
 print("Model created")
 
 let tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
-let loader = DataLoader(tokens, batch_size=1, seq_len=2048, shuffle=false, drop_last=true)
+let labels = load_mmap("models/coder-rl/data/sft_labels.bin", 2)
+let loader = DataLoader(tokens, labels=labels, batch_size=1, seq_len=2048, shuffle=false, drop_last=true)
 
 print("Starting 1-epoch SFT validation...")
 

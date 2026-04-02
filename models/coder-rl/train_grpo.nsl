@@ -26,7 +26,8 @@ print("Model created")
 
 # SFT data: pre-tokenized NSL corpus + synthetic task-code pairs
 let sft_tokens = load_mmap("data/sft_tokens.bin", 3)
-let sft_loader = DataLoader(sft_tokens, batch_size=8, seq_len=2048, shuffle=true, drop_last=true)
+let sft_labels = load_mmap("data/sft_labels.bin", 2)
+let sft_loader = DataLoader(sft_tokens, labels=sft_labels, batch_size=8, seq_len=2048, shuffle=true, drop_last=true)
 
 train(model=m, epochs=10):
     optimizer: AdamW(lr=0.0003, weight_decay=0.01)

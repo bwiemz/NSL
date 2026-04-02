@@ -9,6 +9,8 @@ pub struct LoopContext {
     /// For for-loops this is the increment block (so counter gets incremented before rechecking).
     pub continue_block: ir::Block,
     pub exit_block: ir::Block,
+    /// Active DataLoader batch dict for this loop, when applicable.
+    pub batch_var: Option<Variable>,
 }
 
 /// Struct field layout info.
@@ -39,6 +41,8 @@ pub struct TensorCleanupState {
     /// Stack of scope markers into tensor_temporaries, pushed on loop entry, popped on exit.
     /// Used to emit cleanup at break/continue without corrupting compiler state.
     pub temp_scope_stack: Vec<usize>,
+    /// Non-loop batch dict variables that must be freed on explicit return.
+    pub active_batch_vars: Vec<Variable>,
     /// True when inside a DataLoader for-loop with runtime scope tracking.
     /// Suppresses codegen-level tensor_temporaries cleanup to avoid double-free
     /// with scope_end (which handles all cleanup at end of each iteration).
@@ -51,6 +55,7 @@ impl TensorCleanupState {
             tensor_temporaries: Vec::new(),
             dataloader_vars: Vec::new(),
             temp_scope_stack: Vec::new(),
+            active_batch_vars: Vec::new(),
             in_scoped_loop: false,
         }
     }
@@ -111,6 +116,10 @@ pub struct CodegenFlags {
     /// True when compiling a train block step body (inside tape recording).
     /// Suppresses freeing tensor temporaries since backward needs them alive.
     pub in_tape_region: bool,
+    /// Nesting depth inside branch-only control flow bodies such as if/elif/else and match arms.
+    pub conditional_depth: usize,
+    /// True while compiling code that executes once per yielded DataLoader batch inside train blocks.
+    pub in_dataloader_batch_scope: bool,
     /// M35: True when compiling a function with @fp8_compute decorator.
     /// MatMul ops use nsl_fp8_matmul_training for E5M2 backward tape recording.
     pub is_fp8_compute: bool,
@@ -124,6 +133,8 @@ impl CodegenFlags {
             dtype_unpack_ret_bitcast: false,
             in_fuse_bypass: false,
             in_tape_region: false,
+            conditional_depth: 0,
+            in_dataloader_batch_scope: false,
             is_fp8_compute: false,
         }
     }
@@ -138,6 +149,8 @@ impl Default for CodegenFlags {
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {
     pub variables: HashMap<Symbol, (Variable, cl_types::Type)>,
+    pub dataloader_symbols: HashSet<Symbol>,
+    pub borrowed_batch_symbols: HashSet<Symbol>,
     pub var_counter: usize,
     pub loop_stack: Vec<LoopContext>,
     pub current_block: Option<ir::Block>,
@@ -176,6 +189,8 @@ impl FuncState {
     pub fn new() -> Self {
         FuncState {
             variables: HashMap::new(),
+            dataloader_symbols: HashSet::new(),
+            borrowed_batch_symbols: HashSet::new(),
             var_counter: 0,
             loop_stack: Vec::new(),
             current_block: None,

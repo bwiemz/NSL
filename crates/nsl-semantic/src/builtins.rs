@@ -782,7 +782,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "DataLoader",
         Type::Function {
-            params: vec![Type::Unknown],
+            params: vec![Type::Unknown, Type::Unknown],
             ret: Box::new(Type::List(Box::new(batch_dict))),
             effect: Effect::Inferred,
         },

@@ -12,6 +12,30 @@ use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::types::{is_float_type, is_int_type, nsl_type_to_cl, pointer_type};
 
+fn static_dim_value(dim: &nsl_semantic::types::Dim) -> Option<i64> {
+    match dim {
+        nsl_semantic::types::Dim::Concrete(value) => Some(*value),
+        nsl_semantic::types::Dim::Named { size, .. } => static_dim_value(size),
+        nsl_semantic::types::Dim::Computed(expr) => expr.as_lit(),
+        nsl_semantic::types::Dim::Symbolic(_)
+        | nsl_semantic::types::Dim::Bounded { .. }
+        | nsl_semantic::types::Dim::Wildcard => None,
+    }
+}
+
+fn static_tensor_numel(ty: &Type) -> Option<i64> {
+    let (shape, _, _) = ty.as_tensor_parts()?;
+    if shape.dims.is_empty() {
+        return Some(1);
+    }
+
+    let mut total = 1_i64;
+    for dim in &shape.dims {
+        total = total.checked_mul(static_dim_value(dim)?)?;
+    }
+    Some(total)
+}
+
 impl Compiler<'_> {
     pub(crate) fn compile_call(
         &mut self,
@@ -1346,13 +1370,38 @@ impl Compiler<'_> {
 
         // DataLoader(data, batch_size=32, seq_len=128, ...)
         if func_name == "DataLoader" {
-            let data_val = self.compile_expr(builder, state, &args[0].value)?;
+            if state.flags.conditional_depth > 0
+                || state.flags.in_dataloader_batch_scope
+                || !state.loop_stack.is_empty()
+            {
+                return Err(CodegenError::new(
+                    "DataLoader creation is only supported in straight-line function scope; move it out of conditionals and loops",
+                ));
+            }
+            let data_expr = &args[0].value;
+            let data_ty = self.node_type(data_expr.id).clone();
+            if !data_ty.is_tensor() && !data_ty.is_indeterminate() {
+                return Err(CodegenError::new(format!(
+                    "DataLoader(): data must be a tensor, got {}",
+                    nsl_semantic::types::display_type(&data_ty)
+                )));
+            }
+
+            let data_val = self.compile_expr(builder, state, data_expr)?;
+            let mut labels_arg: Option<&nsl_ast::expr::Expr> = None;
 
             // Build JSON config from keyword args at compile time
             let mut config = serde_json::Map::new();
             for arg in args.iter().skip(1) {
                 if let Some(name_sym) = arg.name {
                     let key = self.resolve_sym(name_sym).to_string();
+                    if key == "labels" {
+                        if labels_arg.is_some() {
+                            return Err(CodegenError::new("DataLoader(): labels provided more than once"));
+                        }
+                        labels_arg = Some(&arg.value);
+                        continue;
+                    }
                     match &arg.value.kind {
                         ExprKind::IntLiteral(v) => {
                             config.insert(key, serde_json::Value::Number(serde_json::Number::from(*v)));
@@ -1371,8 +1420,71 @@ impl Compiler<'_> {
                             )));
                         }
                     }
+                } else if labels_arg.is_none() {
+                    labels_arg = Some(&arg.value);
+                } else {
+                    return Err(CodegenError::new(
+                        "DataLoader(): only one optional labels tensor is allowed after data",
+                    ));
                 }
             }
+
+            if config
+                .get("pin_memory")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return Err(CodegenError::new(
+                    "DataLoader(): pin_memory=true is currently unsupported",
+                ));
+            }
+
+            match config.get("drop_last").and_then(|value| value.as_bool()) {
+                Some(false) => {
+                    return Err(CodegenError::new(
+                        "DataLoader(): drop_last=false is currently unsupported because partial tail batches are not implemented",
+                    ));
+                }
+                Some(true) => {}
+                None => {
+                    config.insert("drop_last".to_string(), serde_json::Value::Bool(true));
+                }
+            }
+
+            if config
+                .get("packing")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return Err(CodegenError::new(
+                    "DataLoader(): packing=true is currently unsupported because attention_mask is not propagated into model attention",
+                ));
+            }
+
+            if let Some(labels_expr) = labels_arg {
+                let labels_ty = self.node_type(labels_expr.id).clone();
+                if matches!(labels_ty.strip_borrow(), Type::NoneType) {
+                    labels_arg = None;
+                } else if !labels_ty.is_tensor() && !labels_ty.is_indeterminate() {
+                    return Err(CodegenError::new(format!(
+                        "DataLoader(): labels must be a tensor, got {}",
+                        nsl_semantic::types::display_type(&labels_ty)
+                    )));
+                } else {
+                    if let (Some(data_numel), Some(labels_numel)) = (
+                        static_tensor_numel(&data_ty),
+                        static_tensor_numel(&labels_ty),
+                    ) {
+                        if data_numel != labels_numel {
+                            return Err(CodegenError::new(format!(
+                                "DataLoader(): data and labels must have the same number of elements ({} vs {})",
+                                data_numel, labels_numel
+                            )));
+                        }
+                    }
+                }
+            }
+
             let config_json = serde_json::Value::Object(config).to_string();
 
             // Intern the config string as data
@@ -1381,29 +1493,28 @@ impl Compiler<'_> {
             let config_ptr = builder.ins().symbol_value(pointer_type(), config_gv);
             let config_len = builder.ins().iconst(cl_types::I64, config_json.len() as i64);
 
-            // Ensure tensor is on CPU (DataLoader reads raw f64 data pointer)
+            // Normalize loader inputs to CPU-contiguous tensors and let the runtime keep them alive.
             let cpu_device = builder.ins().iconst(cl_types::I64, 0);
-            let data_val = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[data_val, cpu_device])?;
+            let data_cpu = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[data_val, cpu_device])?;
+            let data_tensor = self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[data_cpu])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[data_cpu])?;
 
-            // Read tensor .len field (offset 32: data:8 + shape:8 + strides:8 + ndim:8)
-            let tensor_len = builder.ins().load(
-                cl_types::I64,
-                MemFlags::trusted(),
-                data_val,
-                cranelift_codegen::ir::immediates::Offset32::new(40), // NslTensor.len offset (magic+pad shifts +8)
-            );
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            let labels_tensor = if let Some(labels_expr) = labels_arg {
+                let labels_val = self.compile_expr(builder, state, labels_expr)?;
+                let labels_cpu = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[labels_val, cpu_device])?;
+                let labels_tensor = self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[labels_cpu])?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[labels_cpu])?;
+                labels_tensor
+            } else {
+                zero
+            };
 
-            // Read tensor .data field (offset 8, after magic:u32 + 4-byte pad)
-            let tensor_data = builder.ins().load(
-                cl_types::I64,
-                MemFlags::trusted(),
-                data_val,
-                cranelift_codegen::ir::immediates::Offset32::new(8),
-            );
-
-            // Read tensor dtype via safe FFI call (avoids struct offset assumptions)
-            let tensor_dtype = self.compile_call_by_name(builder, "nsl_tensor_get_dtype", &[data_val])?;
-            let dl_ptr = self.compile_call_by_name(builder, "nsl_dataloader_create", &[tensor_data, tensor_len, config_ptr, config_len, tensor_dtype])?;
+            let dl_ptr = self.compile_call_by_name(
+                builder,
+                "nsl_dataloader_create",
+                &[data_tensor, labels_tensor, config_ptr, config_len],
+            )?;
             self.compile_call_by_name(builder, "nsl_dataloader_start", &[dl_ptr])?;
             state.cleanup.dataloader_vars.push(dl_ptr);
             return Ok(dl_ptr);

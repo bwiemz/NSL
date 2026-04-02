@@ -3,6 +3,8 @@
 //! Packs a flat token stream into fixed-size batches, building causal
 //! block-diagonal attention masks that respect document boundaries (EOS tokens).
 
+use std::ffi::c_void;
+
 use crate::cpu::{create_tensor_with_shape_rs_dtype};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
@@ -26,9 +28,19 @@ pub struct PackedBatch {
 /// Returns `None` when not enough tokens remain (epoch end).
 // Safety: caller must ensure `data` points to a valid array of at least `data_len` elements.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
+    match dtype {
+        3 => unsafe { *(data as *const u16).add(index) as i64 },
+        4 => unsafe { *(data as *const i32).add(index) as i64 },
+        1 => unsafe { *(data as *const f32).add(index) as i64 },
+        _ => unsafe { *(data as *const f64).add(index) as i64 },
+    }
+}
+
 pub fn pack_batch(
-    data: *const f64,
+    data: *const c_void,
     data_len: usize,
+    data_dtype: u16,
     cursor: &mut usize,
     batch_size: usize,
     seq_len: usize,
@@ -42,8 +54,7 @@ pub fn pack_batch(
     // Read tokens from stream
     let mut input_ids = Vec::with_capacity(total);
     for i in 0..total {
-        let val = unsafe { *data.add(*cursor + i) } as i64;
-        input_ids.push(val);
+        input_ids.push(read_flat_value(data, data_dtype, *cursor + i));
     }
     *cursor += total;
 
@@ -143,6 +154,9 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     nsl_dict_set_str(dict, k_ids, ids_ptr);
     nsl_dict_set_str(dict, k_lbl, lbl_ptr);
     nsl_dict_set_str(dict, k_mask, mask_ptr);
+    crate::string::nsl_string_free(k_ids);
+    crate::string::nsl_string_free(k_lbl);
+    crate::string::nsl_string_free(k_mask);
 
     dict
 }
@@ -184,8 +198,9 @@ mod tests {
         let mut cursor: usize = 0;
 
         let batch = pack_batch(
-            stream.as_ptr(),
+            stream.as_ptr() as *const c_void,
             stream.len(),
+            0,
             &mut cursor,
             2,  // batch_size
             4,  // seq_len
@@ -215,8 +230,9 @@ mod tests {
         let mut cursor: usize = 0;
 
         let batch = pack_batch(
-            stream.as_ptr(),
+            stream.as_ptr() as *const c_void,
             stream.len(),
+            0,
             &mut cursor,
             1,  // batch_size
             4,  // seq_len
@@ -250,8 +266,9 @@ mod tests {
         let mut cursor: usize = 0;
 
         let result = pack_batch(
-            stream.as_ptr(),
+            stream.as_ptr() as *const c_void,
             stream.len(),
+            0,
             &mut cursor,
             1,  // batch_size
             4,  // seq_len (needs 4 tokens, only 3 available)
@@ -268,8 +285,9 @@ mod tests {
         let mut cursor: usize = 0;
 
         let batch = pack_batch(
-            stream.as_ptr(),
+            stream.as_ptr() as *const c_void,
             stream.len(),
+            0,
             &mut cursor,
             1,  // batch_size
             4,  // seq_len
