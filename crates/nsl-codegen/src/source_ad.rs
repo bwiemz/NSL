@@ -152,8 +152,9 @@ impl AdjointGenerator {
             AdjointExpr::Transpose(v, d0, d1) => {
                 self.emit_op(PrimalOp::Transpose { dim0: d0, dim1: d1 }, vec![v])
             }
-            AdjointExpr::Reshape(v) => {
-                self.emit_op(PrimalOp::Reshape { target_ndim: 0 }, vec![v])
+            AdjointExpr::ReshapeLike(v, target) => {
+                let shape = self.emit_op(PrimalOp::Passthrough("shape".into()), vec![target]);
+                self.emit_op(PrimalOp::Passthrough("reshape".into()), vec![v, shape])
             }
             // --- Expand backward: sum-reduce gradient over broadcast-expanded dims ---
             AdjointExpr::ReduceToShape(grad, target) => {
@@ -1623,6 +1624,11 @@ impl<'a> WengertExtractor<'a> {
         fn_def: &nsl_ast::decl::FnDef,
         extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,
     ) -> Option<VarId> {
+        // Inline callee locals in an isolated symbol scope so names like
+        // `batch` inside a model method do not overwrite caller bindings such
+        // as the train-step batch dict.
+        let saved_symbols = self.symbol_to_var.clone();
+
         // Bind the pre-extracted argument VarIds to parameter symbols
         for (sym, name, var) in extracted_args {
             self.symbol_to_var.insert(sym, var);
@@ -1634,11 +1640,17 @@ impl<'a> WengertExtractor<'a> {
 
         // Extract the method body
         if !self.extract_stmts(&fn_def.body.stmts) {
+            self.symbol_to_var = saved_symbols;
+            self.list.output = saved_output;
             return None;
         }
 
         // The method's return value is the list output (set by Return stmt extraction)
         let result = self.list.output;
+
+        // Restore caller scope now that the callee result has been captured.
+        self.symbol_to_var = saved_symbols;
+        self.list.output = saved_output;
 
         // If the method didn't set output (no return statement), check if a variable
         // was assigned that should be the result

@@ -1766,18 +1766,25 @@ impl Compiler<'_> {
             ))
         })?;
 
-        // Build param_list by recursively collecting all tensor fields from the
-        // model struct. This correctly handles nested sub-models and FixedArray
-        // fields (e.g., blocks: [TransformerBlock; 8]) by probing the tensor
-        // magic number, instead of blindly treating every struct field as a tensor.
-        let num_slots = builder.ins().iconst(cl_types::I64, (layout.total_size / 8) as i64);
-        let param_list = self.compile_call_by_name(
-            builder, "nsl_collect_model_params", &[model_ptr, num_slots],
-        )?;
-        // Get actual param count at runtime (may differ from layout.fields.len())
-        let num_params_val = self.compile_call_by_name(
-            builder, "nsl_list_len", &[param_list],
-        )?;
+        // Build param_list directly from the compiler's struct layouts instead
+        // of the runtime pointer-probing collector. This keeps nested models
+        // and fixed arrays aligned with the paths source AD already resolves.
+        let param_paths = self.enumerate_model_tensor_paths(
+            &model_var_name, &model_type_name,
+        );
+        let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for path in &param_paths {
+            let param_ptr = self.load_nested_field(
+                builder, model_ptr, &layout, &model_type_name, path,
+            ).ok_or_else(|| {
+                CodegenError::new(format!(
+                    "could not resolve model parameter '{}' in train block",
+                    path,
+                ))
+            })?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[param_list, param_ptr])?;
+        }
+        let num_params_val = builder.ins().iconst(cl_types::I64, param_paths.len() as i64);
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
@@ -1928,6 +1935,11 @@ impl Compiler<'_> {
         builder.def_var(step_param_var, init_null);
         state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
 
+        let epoch_loss_var = state.new_variable();
+        builder.declare_var(epoch_loss_var, cl_types::I64);
+        let epoch_loss_null = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(epoch_loss_var, epoch_loss_null);
+
         // If DataLoader exists: emit inner batch loop
         // Structure: reset → [batch_header: next_batch → null check → batch_body | batch_exit]
         let batch_header_block;
@@ -1980,12 +1992,20 @@ impl Compiler<'_> {
         // Snapshot variables before step body for cleanup
         let vars_before_step: std::collections::HashSet<nsl_ast::Symbol> =
             state.variables.keys().copied().collect();
+        let on_step_binds_loss = callbacks.iter().any(|cb| {
+            self.resolve_sym(cb.name) == "on_step"
+                && cb.params.iter().any(|param| self.resolve_sym(param.name) == "loss")
+        });
+        let on_epoch_binds_loss = callbacks.iter().any(|cb| {
+            matches!(self.resolve_sym(cb.name), "on_epoch" | "on_epoch_end")
+                && cb.params.iter().any(|param| self.resolve_sym(param.name) == "loss")
+        });
 
         // ── 7b. Forward pass + backward pass ─────────────────────────
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
         // to the tape-based AD path.
-        let (grads_list, loss_val) = if self.features.source_ad_enabled {
+        let (grads_list, loss_val, source_ad_loss_owned) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
             eprintln!("[nsl] Using source-to-source AD for backward pass");
 
@@ -2018,7 +2038,8 @@ impl Compiler<'_> {
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
                 self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
-                self.compile_tape_backward(builder, state, step_body, param_list)?
+                let (grads, loss) = self.compile_tape_backward(builder, state, step_body, param_list)?;
+                (grads, loss, false)
             } else {
                 // 3. Build initial VarMap: map named input/param VarIds to
                 //    Cranelift Values already present in state.variables.
@@ -2116,9 +2137,10 @@ impl Compiler<'_> {
                             primal_vars.contains_key(&op.result));
                     }
                 }
-                let full_vars = crate::wengert_lower::compile_wengert_ops(
+                let full_lowered = crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, extractor.wengert_list(), &primal_vars,
                 )?;
+                let full_vars = &full_lowered.var_map;
 
                 let loss_val = *full_vars.get(&loss_var_id)
                     .ok_or_else(|| CodegenError::new("source AD: loss VarId not found in compiled forward graph"))?;
@@ -2135,6 +2157,7 @@ impl Compiler<'_> {
                 {
                     let named_params = extractor.named_param_var_ids();
                     let needed: std::collections::HashSet<crate::wengert::VarId> = named_params.iter()
+                        .filter(|(name, _)| self.is_trainable_param_name(name))
                         .filter_map(|(_, vid)| gen.adjoint_of(*vid))
                         .collect();
                     if !needed.is_empty() {
@@ -2149,8 +2172,8 @@ impl Compiler<'_> {
                 //    the forward pass. This is the key fix: the old code only
                 //    had named variables in primal_vars, so intermediate
                 //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
-                let grad_vars = match crate::wengert_lower::compile_wengert_ops(
-                    self, builder, state, &adjoint, &full_vars,
+                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+                    self, builder, state, &adjoint, full_vars,
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
@@ -2163,88 +2186,180 @@ impl Compiler<'_> {
                         return Err(e);
                     }
                 };
+                let grad_vars = &grad_lowered.var_map;
+                let freed_adjoint_vars = std::collections::HashSet::new();
+
+                if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {
+                    let summarize_owned = |label: &str,
+                                           wengert: &crate::wengert::WengertList,
+                                           owned: &[(crate::wengert::VarId, Value, crate::wengert::WengertType)]| {
+                        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                        for (var_id, _, _) in owned {
+                            if let Some(op) = wengert.ops.iter().find(|op| op.result == *var_id) {
+                                let key = format!("{:?}", op.op);
+                                *counts.entry(key).or_insert(0) += 1;
+                            }
+                        }
+                        let mut counts: Vec<_> = counts.into_iter().collect();
+                        counts.sort_by(|a, b| b.1.cmp(&a.1));
+                        eprintln!("[nsl] source-ad owned {} ops:", label);
+                        for (name, count) in counts {
+                            eprintln!("  {} -> {}", name, count);
+                        }
+                    };
+
+                    summarize_owned("primal", extractor.wengert_list(), &full_lowered.owned_values);
+                    summarize_owned("adjoint", &adjoint, &grad_lowered.owned_values);
+
+                    let mut final_grad_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                    for (param_name, vid) in extractor.named_param_var_ids() {
+                        if !self.is_trainable_param_name(param_name) {
+                            continue;
+                        }
+                        let Some(adj_vid) = gen.adjoint_of(*vid) else {
+                            continue;
+                        };
+                        if let Some(op) = adjoint.ops.iter().find(|op| op.result == adj_vid) {
+                            let key = format!("{:?}", op.op);
+                            *final_grad_counts.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                    let mut final_grad_counts: Vec<_> = final_grad_counts.into_iter().collect();
+                    final_grad_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    eprintln!("[nsl] source-ad final grad ops:");
+                    for (name, count) in final_grad_counts {
+                        eprintln!("  {} -> {}", name, count);
+                    }
+                }
 
                 // 8. Collect parameter gradients into grads_list (NslList)
                 //
-                // Collect gradients aligned with param_list (runtime DFS order).
-                //
-                // param_list is built at runtime by nsl_collect_model_params which
-                // does a DFS through nested structs, collecting all tensor fields.
-                // We replicate that DFS at compile time using struct layouts and
-                // model_field_types to enumerate ALL tensor paths in the same order.
-                // For each, we look up the source AD gradient or emit zeros_like.
+                // Seed grads_list from the runtime param_list so it always has
+                // exactly one slot per collected parameter, then overwrite the
+                // matching slots using source-AD gradients keyed by parameter
+                // pointer identity. This avoids relying on a compile-time DFS
+                // path enumeration matching the runtime collector's traversal.
                 let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-                let named_params = extractor.named_param_var_ids();
 
-                // Build a compile-time DFS enumeration of all tensor field paths
-                let all_param_paths = self.enumerate_model_tensor_paths(
-                    &model_var_name, &model_type_name,
-                );
+                // 8a. Initialize one zero gradient per runtime parameter.
+                let fill_i_var = state.new_variable();
+                builder.declare_var(fill_i_var, cl_types::I64);
+                let fill_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(fill_i_var, fill_zero);
+                let fill_hdr = builder.create_block();
+                let fill_body = builder.create_block();
+                let fill_exit = builder.create_block();
+                builder.ins().jump(fill_hdr, &[]);
+                builder.switch_to_block(fill_hdr);
+                let fi = builder.use_var(fill_i_var);
+                let fc = builder.ins().icmp(IntCC::SignedLessThan, fi, num_params_val);
+                builder.ins().brif(fc, fill_body, &[], fill_exit, &[]);
+                builder.switch_to_block(fill_body);
+                builder.seal_block(fill_body);
+                let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
+                let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
+                self.compile_call_by_name(builder, "nsl_list_push", &[grads, z])?;
+                let fill_one = builder.ins().iconst(cl_types::I64, 1);
+                let fill_next = builder.ins().iadd(fi, fill_one);
+                builder.def_var(fill_i_var, fill_next);
+                builder.ins().jump(fill_hdr, &[]);
+                builder.seal_block(fill_hdr);
+                builder.switch_to_block(fill_exit);
+                builder.seal_block(fill_exit);
+                state.current_block = Some(fill_exit);
 
-                let mut param_idx: usize = 0;
-                for path in &all_param_paths {
-                    // Find matching named param from source AD extraction
-                    let has_grad = named_params.iter()
-                        .find(|(name, _)| name == path)
-                        .and_then(|(_, vid)| gen.adjoint_of(*vid))
-                        .and_then(|adj_vid| grad_vars.get(&adj_vid).copied());
-
-                    let grad_val = if let Some(gv) = has_grad {
-                        gv
-                    } else {
-                        // No gradient for this param (unused in forward or non-differentiable).
-                        let idx = builder.ins().iconst(cl_types::I64, param_idx as i64);
-                        let param_ptr = self.compile_call_by_name(
-                            builder, "nsl_list_get", &[param_list, idx],
-                        )?;
-                        self.compile_call_by_name(
-                            builder, "nsl_tensor_zeros_like", &[param_ptr],
-                        )?
+                // 8b. Replace zero slots with actual source-AD gradients by
+                // scanning the runtime param_list for each resolved parameter
+                // leaf from the extracted forward graph.
+                for (param_name, vid) in extractor.named_param_var_ids() {
+                    if !self.is_trainable_param_name(param_name) {
+                        continue;
+                    }
+                    let Some(param_ptr) = full_vars.get(vid).copied() else {
+                        continue;
                     };
-                    self.compile_call_by_name(builder, "nsl_list_push", &[grads, grad_val])?;
-                    param_idx += 1;
+                    let Some(adj_vid) = gen.adjoint_of(*vid) else {
+                        continue;
+                    };
+                    let Some(grad_val) = grad_vars.get(&adj_vid).copied() else {
+                        continue;
+                    };
+                    let scan_i_var = state.new_variable();
+                    let scan_match_count_var = state.new_variable();
+                    builder.declare_var(scan_i_var, cl_types::I64);
+                    builder.declare_var(scan_match_count_var, cl_types::I64);
+                    let scan_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(scan_i_var, scan_zero);
+                    builder.def_var(scan_match_count_var, scan_zero);
+
+                    let scan_hdr = builder.create_block();
+                    let scan_body = builder.create_block();
+                    let scan_match = builder.create_block();
+                    let scan_next = builder.create_block();
+                    let scan_exit = builder.create_block();
+
+                    builder.ins().jump(scan_hdr, &[]);
+                    builder.switch_to_block(scan_hdr);
+                    let si = builder.use_var(scan_i_var);
+                    let scan_cond = builder.ins().icmp(IntCC::SignedLessThan, si, num_params_val);
+                    builder.ins().brif(scan_cond, scan_body, &[], scan_exit, &[]);
+
+                    builder.switch_to_block(scan_body);
+                    builder.seal_block(scan_body);
+                    let runtime_param = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, si])?;
+                    let is_match = builder.ins().icmp(IntCC::Equal, runtime_param, param_ptr);
+                    builder.ins().brif(is_match, scan_match, &[], scan_next, &[]);
+
+                    builder.switch_to_block(scan_match);
+                    builder.seal_block(scan_match);
+                    let old_grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads, si])?;
+                    let summed_grad = self.compile_call_by_name(
+                        builder, "nsl_tensor_add", &[old_grad, grad_val],
+                    )?;
+                    let match_count = builder.use_var(scan_match_count_var);
+                    let match_one = builder.ins().iconst(cl_types::I64, 1);
+                    let next_match_count = builder.ins().iadd(match_count, match_one);
+                    builder.def_var(scan_match_count_var, next_match_count);
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[old_grad])?;
+                    self.compile_call_by_name(builder, "nsl_list_set", &[grads, si, summed_grad])?;
+                    builder.ins().jump(scan_next, &[]);
+
+                    builder.switch_to_block(scan_next);
+                    builder.seal_block(scan_next);
+                    let scan_one = builder.ins().iconst(cl_types::I64, 1);
+                    let scan_inc = builder.ins().iadd(si, scan_one);
+                    builder.def_var(scan_i_var, scan_inc);
+                    builder.ins().jump(scan_hdr, &[]);
+
+                    builder.seal_block(scan_hdr);
+                    builder.switch_to_block(scan_exit);
+                    builder.seal_block(scan_exit);
+                    let match_count = builder.use_var(scan_match_count_var);
+                    let matched = builder.ins().icmp_imm(IntCC::NotEqual, match_count, 0);
+                    let missing_msg = format!(
+                        "source AD gradient could not be aligned with runtime param list: {}",
+                        param_name,
+                    );
+                    self.intern_string(&missing_msg)?;
+                    let missing_msg_ptr = self.compile_string_literal(builder, &missing_msg)?;
+                    self.compile_call_by_name(builder, "nsl_assert", &[matched, missing_msg_ptr])?;
+                    state.current_block = Some(scan_exit);
                 }
 
-                // If compile-time enumeration found fewer params than runtime
-                // (shouldn't happen if layouts are consistent), fill remaining
-                // slots with zeros_like at runtime.
-                if all_param_paths.is_empty() {
-                    // Fallback: runtime loop for all params
-                    let fill_i_var = state.new_variable();
-                    builder.declare_var(fill_i_var, cl_types::I64);
-                    let fill_zero = builder.ins().iconst(cl_types::I64, 0);
-                    builder.def_var(fill_i_var, fill_zero);
-                    let fill_hdr = builder.create_block();
-                    let fill_body = builder.create_block();
-                    let fill_exit = builder.create_block();
-                    builder.ins().jump(fill_hdr, &[]);
-                    builder.switch_to_block(fill_hdr);
-                    let fi = builder.use_var(fill_i_var);
-                    let fc = builder.ins().icmp(IntCC::SignedLessThan, fi, num_params_val);
-                    builder.ins().brif(fc, fill_body, &[], fill_exit, &[]);
-                    builder.switch_to_block(fill_body);
-                    builder.seal_block(fill_body);
-                    let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
-                    let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
-                    self.compile_call_by_name(builder, "nsl_list_push", &[grads, z])?;
-                    let fill_one = builder.ins().iconst(cl_types::I64, 1);
-                    let fill_next = builder.ins().iadd(fi, fill_one);
-                    builder.def_var(fill_i_var, fill_next);
-                    builder.ins().jump(fill_hdr, &[]);
-                    builder.seal_block(fill_hdr);
-                    builder.switch_to_block(fill_exit);
-                    builder.seal_block(fill_exit);
-                    state.current_block = Some(fill_exit);
-                }
+                let mut retained_full_vars = std::collections::HashSet::new();
+                retained_full_vars.insert(loss_var_id);
+                self.free_wengert_owned_values(builder, &grad_lowered.owned_values, &freed_adjoint_vars)?;
+                self.free_wengert_owned_values(builder, &full_lowered.owned_values, &retained_full_vars)?;
 
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
                 self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
-                (grads, loss_val)
+                (grads, loss_val, true)
             }
         } else {
             // === Tape AD path (runtime backward) ===
-            self.compile_tape_backward(builder, state, step_body, param_list)?
+            let (grads, loss) = self.compile_tape_backward(builder, state, step_body, param_list)?;
+            (grads, loss, false)
         };
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
@@ -2658,37 +2773,18 @@ impl Compiler<'_> {
                 for stmt in &cb.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
-            } else if cb_name == "on_epoch" || cb_name == "on_epoch_end" {
-                // Bind epoch counter and loss
-                for param in &cb.params {
-                    let pname = self.resolve_sym(param.name).to_string();
-                    match pname.as_str() {
-                        "epoch" => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
-                            let epoch_val = builder.use_var(epoch_counter_var);
-                            builder.def_var(var, epoch_val);
-                            state.variables.insert(param.name, (var, cl_types::I64));
-                        }
-                        "loss" => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
-                            builder.def_var(var, loss_val);
-                            state.variables.insert(param.name, (var, cl_types::I64));
-                        }
-                        _ => {
-                            let var = state.new_variable();
-                            builder.declare_var(var, cl_types::I64);
-                            let z = builder.ins().iconst(cl_types::I64, 0);
-                            builder.def_var(var, z);
-                            state.variables.insert(param.name, (var, cl_types::I64));
-                        }
-                    }
-                }
-                for stmt in &cb.body.stmts {
-                    self.compile_stmt(builder, state, stmt)?;
-                }
             }
+        }
+
+        if on_epoch_binds_loss {
+            let saved_loss = builder.use_var(epoch_loss_var);
+            self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[saved_loss])?;
+            let loss_clone = self.compile_call_by_name(builder, "nsl_tensor_clone", &[loss_val])?;
+            builder.def_var(epoch_loss_var, loss_clone);
+        }
+
+        if source_ad_loss_owned && !on_step_binds_loss {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[loss_val])?;
         }
 
         // Free step-body tensor variables to prevent GPU memory accumulation
@@ -2717,6 +2813,16 @@ impl Compiler<'_> {
             }
         }
 
+        if has_dataloader.is_some() {
+            let current_blk = state.current_block.unwrap_or(batch_body_block);
+            if !is_block_filled(builder, current_blk) {
+                let batch_to_free = builder.use_var(step_param_var);
+                self.compile_call_by_name(builder, "nsl_dict_free", &[batch_to_free])?;
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(step_param_var, zero);
+            }
+        }
+
         // ── 8. Close batch loop (if DataLoader) and increment epoch ──────
         let current = state.current_block.unwrap_or(batch_body_block);
         if has_dataloader.is_some() {
@@ -2726,16 +2832,60 @@ impl Compiler<'_> {
             }
             // Now seal batch_header — both predecessors connected (entry + back-edge)
             builder.seal_block(batch_header_block);
-            // batch_exit: all batches done → jump to epoch increment
+            // batch_exit: all batches done → run epoch callbacks then increment
             builder.switch_to_block(batch_exit_block);
             builder.seal_block(batch_exit_block);
             state.current_block = Some(batch_exit_block);
-            builder.ins().jump(increment_block, &[]);
         } else {
-            // No DataLoader — single step per epoch, jump to increment
-            if !is_block_filled(builder, current) {
-                builder.ins().jump(increment_block, &[]);
+            // No DataLoader — single step per epoch, stay in the current block for epoch callbacks
+            state.current_block = Some(current);
+        }
+
+        for cb in &callbacks {
+            let cb_name = self.resolve_sym(cb.name).to_string();
+            if cb_name == "on_epoch" || cb_name == "on_epoch_end" {
+                for param in &cb.params {
+                    let pname = self.resolve_sym(param.name).to_string();
+                    match pname.as_str() {
+                        "epoch" => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let epoch_val = builder.use_var(epoch_counter_var);
+                            builder.def_var(var, epoch_val);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                        "loss" => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let epoch_loss = builder.use_var(epoch_loss_var);
+                            builder.def_var(var, epoch_loss);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                        _ => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            let z = builder.ins().iconst(cl_types::I64, 0);
+                            builder.def_var(var, z);
+                            state.variables.insert(param.name, (var, cl_types::I64));
+                        }
+                    }
+                }
+                for stmt in &cb.body.stmts {
+                    self.compile_stmt(builder, state, stmt)?;
+                }
             }
+        }
+
+        if on_epoch_binds_loss {
+            let saved_loss = builder.use_var(epoch_loss_var);
+            self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[saved_loss])?;
+            let epoch_loss_null = builder.ins().iconst(cl_types::I64, 0);
+            builder.def_var(epoch_loss_var, epoch_loss_null);
+        }
+
+        let epoch_callback_block = state.current_block.unwrap_or(current);
+        if !is_block_filled(builder, epoch_callback_block) {
+            builder.ins().jump(increment_block, &[]);
         }
 
         builder.switch_to_block(increment_block);
@@ -2875,6 +3025,29 @@ impl Compiler<'_> {
         Ok((grads_list, loss_val))
     }
 
+    fn free_wengert_owned_values(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        owned_values: &[(crate::wengert::VarId, Value, crate::wengert::WengertType)],
+        retained: &std::collections::HashSet<crate::wengert::VarId>,
+    ) -> Result<(), CodegenError> {
+        for (var_id, value, value_type) in owned_values {
+            if retained.contains(var_id) {
+                continue;
+            }
+            match value_type {
+                crate::wengert::WengertType::Tensor => {
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[*value])?;
+                }
+                crate::wengert::WengertType::List => {
+                    self.compile_call_by_name(builder, "nsl_list_free", &[*value])?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// M43b: Emit pipeline-parallel training loop with gradient serialization.
     ///
     /// When a model carries `@pipeline(stages=N)`, the train block emits:
@@ -2894,18 +3067,15 @@ impl Compiler<'_> {
     ///   9. Cleanup — free gradient tensors, param_list, optimizer buffers,
     ///      and `nsl_pipeline_destroy()`.
     ///
-    /// Enumerate all tensor field paths in a model struct via DFS, matching the order
-    /// that `nsl_collect_model_params` uses at runtime.
+    fn is_trainable_param_name(&self, param_name: &str) -> bool {
+        let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
+        !leaf_name.starts_with('_') && leaf_name != "inv_freq"
+    }
+
+    /// Enumerate all tensor field paths in a model struct via DFS.
     ///
-    /// For a model with structure:
-    /// ```text
-    /// model NSLCoder:
-    ///     embed: Tensor
-    ///     blocks: [TransformerBlock; 2]  # each has attn_norm, attn, ffn_norm, ffn
-    ///     norm: RMSNorm
-    /// ```
-    /// Returns paths like:
-    /// `["m.embed", "m.blocks.0.attn_norm.weight", "m.blocks.0.attn_norm.eps", ...]`
+    /// This mirrors the compiler's view of nested models and fixed arrays, so
+    /// the emitted param_list and source-AD parameter resolution stay aligned.
     fn enumerate_model_tensor_paths(
         &self,
         var_name: &str,
@@ -2923,48 +3093,51 @@ impl Compiler<'_> {
         paths: &mut Vec<String>,
         depth: usize,
     ) {
-        if depth > 16 { return; } // prevent infinite recursion
+        if depth > 16 {
+            return;
+        }
+
         let layout = match self.types.struct_layouts.get(type_name) {
-            Some(l) => l.clone(),
+            Some(layout) => layout.clone(),
             None => return,
         };
         let field_types = self.models.model_field_types.get(type_name).cloned();
 
         for field in &layout.fields {
             let field_path = format!("{}.{}", prefix, field.name);
+            let field_type = field_types.as_ref().and_then(|types| types.get(&field.name));
 
-            // Check if this field has a sub-model type
-            let ft = field_types.as_ref().and_then(|m| m.get(&field.name));
-
-            if let Some(ft) = ft {
-                if ft.starts_with('[') && ft.contains(';') {
-                    // FixedArray: "[TransformerBlock;8]" — expand for each element
-                    let inner = ft.trim_start_matches('[').trim_end_matches(']');
+            if let Some(field_type) = field_type {
+                if field_type.starts_with('[') && field_type.contains(';') {
+                    let inner = field_type.trim_start_matches('[').trim_end_matches(']');
                     let parts: Vec<&str> = inner.split(';').collect();
                     if parts.len() == 2 {
                         let elem_type = parts[0].trim();
                         let count: usize = parts[1].trim().parse().unwrap_or(0);
-                        for i in 0..count {
-                            let elem_path = format!("{}.{}", field_path, i);
+                        for index in 0..count {
+                            let elem_path = format!("{}.{}", field_path, index);
                             self.enumerate_tensor_paths_recursive(
-                                &elem_path, elem_type, paths, depth + 1,
+                                &elem_path,
+                                elem_type,
+                                paths,
+                                depth + 1,
                             );
                         }
                     }
-                } else {
-                    // Sub-model struct: recurse into it
-                    self.enumerate_tensor_paths_recursive(
-                        &field_path, ft, paths, depth + 1,
-                    );
+                    continue;
                 }
-            } else {
-                // Leaf field — only include if it's a tensor (i64 pointer type).
-                // Skip scalar fields like eps: float (F64) or count: int (I64 but
-                // model_field_types would have it as a sub-model if it were a struct).
-                // Tensors are stored as i64 pointers; scalar floats are F64.
-                if field.cl_type == cl_types::I64 {
-                    paths.push(field_path);
-                }
+
+                self.enumerate_tensor_paths_recursive(
+                    &field_path,
+                    field_type,
+                    paths,
+                    depth + 1,
+                );
+                continue;
+            }
+
+            if field.cl_type == cl_types::I64 && self.is_trainable_param_name(&field_path) {
+                paths.push(field_path);
             }
         }
     }
@@ -2979,7 +3152,7 @@ impl Compiler<'_> {
     /// 5. Load `wq` field from the GroupedQueryAttention layout (tensor pointer)
     ///
     /// Returns None if the path cannot be resolved through the struct layouts.
-    fn load_nested_field(
+    pub(crate) fn load_nested_field(
         &self,
         builder: &mut FunctionBuilder,
         base_ptr: Value,

@@ -13,6 +13,42 @@ use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::{nsl_tensor_contiguous, nsl_tensor_free, nsl_tensor_to_device, NslTensor};
 
+#[inline]
+fn publish_cpu_result_to_device(result: Box<NslTensor>, target_device: u8, context: &str) -> i64 {
+    let out = NslTensor::publish(result);
+    if target_device > 0 {
+        #[cfg(not(feature = "cuda"))]
+        let _ = context;
+        #[cfg(feature = "cuda")]
+        crate::cuda::inner::set_oom_context(context);
+        let gpu_out = nsl_tensor_to_device(out, target_device as i64);
+        nsl_tensor_free(out);
+        gpu_out
+    } else {
+        out
+    }
+}
+
+#[inline]
+fn prepare_cpu_input(tensor_ptr: i64) -> (i64, i64, u8) {
+    let contig_ptr = nsl_tensor_contiguous(tensor_ptr);
+    let device = NslTensor::from_ptr(contig_ptr).device;
+    let cpu_ptr = if device > 0 {
+        nsl_tensor_to_device(contig_ptr, 0)
+    } else {
+        contig_ptr
+    };
+    (contig_ptr, cpu_ptr, device)
+}
+
+#[inline]
+fn release_cpu_input(contig_ptr: i64, cpu_ptr: i64) {
+    if cpu_ptr != contig_ptr {
+        nsl_tensor_free(cpu_ptr);
+    }
+    nsl_tensor_free(contig_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // 1. nsl_tensor_compare — elementwise comparison → 0.0 / 1.0 tensor
 // ---------------------------------------------------------------------------
@@ -23,10 +59,10 @@ use super::{nsl_tensor_contiguous, nsl_tensor_free, nsl_tensor_to_device, NslTen
 ///   0 = Gt, 1 = GtEq, 2 = Lt, 3 = LtEq, 4 = Eq, 5 = NotEq
 #[no_mangle]
 pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i64 {
-    let a_c = nsl_tensor_contiguous(a_ptr);
-    let b_c = nsl_tensor_contiguous(b_ptr);
-    let a = NslTensor::from_ptr(a_c);
-    let b = NslTensor::from_ptr(b_c);
+    let (a_contig, a_cpu, a_device) = prepare_cpu_input(a_ptr);
+    let (b_contig, b_cpu, _b_device) = prepare_cpu_input(b_ptr);
+    let a = NslTensor::from_ptr(a_cpu);
+    let b = NslTensor::from_ptr(b_cpu);
     let len = a.len as usize;
     let b_len = b.len as usize;
     let b_is_scalar = b_len == 1;
@@ -59,11 +95,10 @@ pub extern "C" fn nsl_tensor_compare(a_ptr: i64, b_ptr: i64, cmp_kind: i64) -> i
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor::new(data, shape, strides, ndim, a.len, a.device, dtype, 1, 0));
-    let out = NslTensor::publish(result);
-    nsl_tensor_free(a_c);
-    nsl_tensor_free(b_c);
-    out
+    let result = Box::new(NslTensor::new(data, shape, strides, ndim, a.len, 0, dtype, 1, 0));
+    release_cpu_input(a_contig, a_cpu);
+    release_cpu_input(b_contig, b_cpu);
+    publish_cpu_result_to_device(result, a_device, "ad_compare")
 }
 
 #[inline(always)]
@@ -102,13 +137,13 @@ fn compare_f64(av: f64, bv: f64, cmp_kind: i64) -> bool {
 /// the condition tensor (0.0 = false, anything else = true).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64) -> i64 {
-    let cond_c = nsl_tensor_contiguous(cond_ptr);
-    let true_c = nsl_tensor_contiguous(true_ptr);
-    let false_c = nsl_tensor_contiguous(false_ptr);
+    let (cond_contig, cond_cpu, _cond_device) = prepare_cpu_input(cond_ptr);
+    let (true_contig, true_cpu, true_device) = prepare_cpu_input(true_ptr);
+    let (false_contig, false_cpu, _false_device) = prepare_cpu_input(false_ptr);
 
-    let cond = NslTensor::from_ptr(cond_c);
-    let tv = NslTensor::from_ptr(true_c);
-    let fv = NslTensor::from_ptr(false_c);
+    let cond = NslTensor::from_ptr(cond_cpu);
+    let tv = NslTensor::from_ptr(true_cpu);
+    let fv = NslTensor::from_ptr(false_cpu);
 
     let len = tv.len as usize;
     let cond_scalar = cond.len == 1;
@@ -158,12 +193,11 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
         buf as *mut c_void
     };
 
-    let result = Box::new(NslTensor::new(data, shape, strides, ndim, len as i64, tv.device, dtype, 1, 0));
-    let out = NslTensor::publish(result);
-    nsl_tensor_free(cond_c);
-    nsl_tensor_free(true_c);
-    nsl_tensor_free(false_c);
-    out
+    let result = Box::new(NslTensor::new(data, shape, strides, ndim, len as i64, 0, dtype, 1, 0));
+    release_cpu_input(cond_contig, cond_cpu);
+    release_cpu_input(true_contig, true_cpu);
+    release_cpu_input(false_contig, false_cpu);
+    publish_cpu_result_to_device(result, true_device, "ad_where")
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +246,8 @@ pub extern "C" fn nsl_tensor_pad_zero(
     pad_before: i64,
     pad_after: i64,
 ) -> i64 {
-    let t_c = nsl_tensor_contiguous(tensor_ptr);
-    let tensor = NslTensor::from_ptr(t_c);
+    let (t_contig, t_cpu, source_device) = prepare_cpu_input(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_cpu);
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
@@ -295,14 +329,13 @@ pub extern "C" fn nsl_tensor_pad_zero(
         strides_ptr,
         ndim as i64,
         out_len as i64,
-        tensor.device,
+        0,
         dtype,
         1,
         0,
     ));
-    let out = NslTensor::publish(result);
-    nsl_tensor_free(t_c);
-    out
+    release_cpu_input(t_contig, t_cpu);
+    publish_cpu_result_to_device(result, source_device, "ad_pad_zero")
 }
 
 // ---------------------------------------------------------------------------
@@ -322,11 +355,11 @@ pub extern "C" fn nsl_tensor_pad_zero(
 #[no_mangle]
 pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i64) -> i64 {
     let _ = dim; // reserved for future generalisation
-    let src_c = nsl_tensor_contiguous(src_ptr);
-    let src = NslTensor::from_ptr(src_c);
+    let (src_contig, src_cpu, source_device) = prepare_cpu_input(src_ptr);
+    let src = NslTensor::from_ptr(src_cpu);
 
-    let idx_c = nsl_tensor_contiguous(indices_ptr);
-    let idx = NslTensor::from_ptr(idx_c);
+    let (idx_contig, idx_cpu, _idx_device) = prepare_cpu_input(indices_ptr);
+    let idx = NslTensor::from_ptr(idx_cpu);
 
     if src.ndim < 2 {
         eprintln!("nsl: scatter_add requires src to be at least 2D");
@@ -396,15 +429,14 @@ pub extern "C" fn nsl_tensor_scatter_add(src_ptr: i64, indices_ptr: i64, dim: i6
         strides_ptr,
         2,
         out_len as i64,
-        src.device,
+        0,
         dtype,
         1,
         0,
     ));
-    let out = NslTensor::publish(result);
-    nsl_tensor_free(src_c);
-    nsl_tensor_free(idx_c);
-    out
+    release_cpu_input(src_contig, src_cpu);
+    release_cpu_input(idx_contig, idx_cpu);
+    publish_cpu_result_to_device(result, source_device, "ad_scatter_add")
 }
 
 // ---------------------------------------------------------------------------
@@ -426,11 +458,27 @@ pub extern "C" fn nsl_embedding_backward(
     weight_ptr: i64,
 ) -> i64 {
     let grad_c = nsl_tensor_contiguous(grad_ptr);
-    let grad = NslTensor::from_ptr(grad_c);
     let idx_c = nsl_tensor_contiguous(indices_ptr);
-    let idx = NslTensor::from_ptr(idx_c);
     let weight_c = nsl_tensor_contiguous(weight_ptr);
-    let weight = NslTensor::from_ptr(weight_c);
+    let out_device = NslTensor::from_ptr(grad_c).device;
+    let (grad_cpu, grad_needs_free) = if NslTensor::from_ptr(grad_c).device > 0 {
+        (nsl_tensor_to_device(grad_c, 0), true)
+    } else {
+        (grad_c, false)
+    };
+    let (idx_cpu, idx_needs_free) = if NslTensor::from_ptr(idx_c).device > 0 {
+        (nsl_tensor_to_device(idx_c, 0), true)
+    } else {
+        (idx_c, false)
+    };
+    let (weight_cpu, weight_needs_free) = if NslTensor::from_ptr(weight_c).device > 0 {
+        (nsl_tensor_to_device(weight_c, 0), true)
+    } else {
+        (weight_c, false)
+    };
+    let grad = NslTensor::from_ptr(grad_cpu);
+    let idx = NslTensor::from_ptr(idx_cpu);
+    let weight = NslTensor::from_ptr(weight_cpu);
 
     if weight.ndim < 2 {
         eprintln!("nsl: embedding_backward requires 2D weight, got {}D", weight.ndim);
@@ -482,16 +530,18 @@ pub extern "C" fn nsl_embedding_backward(
         strides_ptr,
         2,
         out_len as i64,
-        grad.device,
+        0,
         dtype,
         1,
         0,
     ));
-    let out = NslTensor::publish(result);
+    if grad_needs_free { nsl_tensor_free(grad_cpu); }
+    if idx_needs_free { nsl_tensor_free(idx_cpu); }
+    if weight_needs_free { nsl_tensor_free(weight_cpu); }
     nsl_tensor_free(grad_c);
     nsl_tensor_free(idx_c);
     nsl_tensor_free(weight_c);
-    out
+    publish_cpu_result_to_device(result, out_device, "ad_embedding_backward")
 }
 
 // ---------------------------------------------------------------------------
@@ -501,10 +551,11 @@ pub extern "C" fn nsl_embedding_backward(
 /// Compute the cross-entropy loss backward gradient w.r.t. logits.
 ///
 /// `logits` shape: `[N, C]`
-/// `targets` shape: `[N]` (integer class indices)
+/// `targets` shape: `[N]` (integer class indices, with negative values ignored)
 /// `grad_output` shape: scalar or `[1]`
 ///
-/// Returns: `grad_output * (softmax(logits) - one_hot(targets)) / N`
+/// Returns: `grad_output * (softmax(logits) - one_hot(targets)) / num_valid`
+/// for valid targets, and zero rows for ignored targets (< 0).
 #[no_mangle]
 pub extern "C" fn nsl_cross_entropy_backward(
     grad_output_ptr: i64,
@@ -512,11 +563,27 @@ pub extern "C" fn nsl_cross_entropy_backward(
     targets_ptr: i64,
 ) -> i64 {
     let logits_c = nsl_tensor_contiguous(logits_ptr);
-    let logits = NslTensor::from_ptr(logits_c);
     let targets_c = nsl_tensor_contiguous(targets_ptr);
-    let targets = NslTensor::from_ptr(targets_c);
     let grad_out_c = nsl_tensor_contiguous(grad_output_ptr);
-    let grad_out = NslTensor::from_ptr(grad_out_c);
+    let out_device = NslTensor::from_ptr(logits_c).device;
+    let (logits_cpu, logits_needs_free) = if NslTensor::from_ptr(logits_c).device > 0 {
+        (nsl_tensor_to_device(logits_c, 0), true)
+    } else {
+        (logits_c, false)
+    };
+    let (targets_cpu, targets_needs_free) = if NslTensor::from_ptr(targets_c).device > 0 {
+        (nsl_tensor_to_device(targets_c, 0), true)
+    } else {
+        (targets_c, false)
+    };
+    let (grad_out_cpu, grad_out_needs_free) = if NslTensor::from_ptr(grad_out_c).device > 0 {
+        (nsl_tensor_to_device(grad_out_c, 0), true)
+    } else {
+        (grad_out_c, false)
+    };
+    let logits = NslTensor::from_ptr(logits_cpu);
+    let targets = NslTensor::from_ptr(targets_cpu);
+    let grad_out = NslTensor::from_ptr(grad_out_cpu);
 
     if logits.ndim < 2 {
         eprintln!("nsl: cross_entropy_backward requires 2D logits, got {}D", logits.ndim);
@@ -527,16 +594,24 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let c = unsafe { *logits.shape.add(1) } as usize; // num classes
     let dtype = logits.dtype;
 
+    let mut num_valid = 0usize;
+    for i in 0..n {
+        if targets.read_index(i) >= 0 {
+            num_valid += 1;
+        }
+    }
+    let denom = num_valid.max(1) as f64;
+
     // Compute softmax along last dim, then subtract 1.0 at target positions
     let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data = checked_alloc(n * c * elem_size);
 
     // Get grad_output scalar
     let go = if grad_out.len == 1 {
-        if dtype == 1 {
-            (unsafe { *grad_out.data_f32() }) as f64
-        } else {
-            unsafe { *grad_out.data_f64() }
+        match grad_out.dtype {
+            1 => (unsafe { *grad_out.data_f32() }) as f64,
+            4 => unsafe { *(grad_out.data as *const i32) as f64 },
+            _ => unsafe { *grad_out.data_f64() },
         }
     } else {
         1.0
@@ -560,12 +635,20 @@ pub extern "C" fn nsl_cross_entropy_backward(
                 unsafe { *dst.add(i * c + j) = e; }
                 sum_exp += e;
             }
-            let target_idx = targets.read_index(i) as usize;
-            let scale = (go / n as f64) as f32;
+            let target_raw = targets.read_index(i);
+            let valid = target_raw >= 0;
+            let target_idx = target_raw as usize;
+            let scale = (go / denom) as f32;
             for j in 0..c {
                 let sm = unsafe { *dst.add(i * c + j) } / sum_exp;
-                let one_hot = if j == target_idx { 1.0f32 } else { 0.0f32 };
-                unsafe { *dst.add(i * c + j) = (sm - one_hot) * scale; }
+                let one_hot = if valid && j == target_idx { 1.0f32 } else { 0.0f32 };
+                unsafe {
+                    *dst.add(i * c + j) = if valid {
+                        (sm - one_hot) * scale
+                    } else {
+                        0.0
+                    };
+                }
             }
         }
     } else {
@@ -584,12 +667,20 @@ pub extern "C" fn nsl_cross_entropy_backward(
                 unsafe { *dst.add(i * c + j) = e; }
                 sum_exp += e;
             }
-            let target_idx = targets.read_index(i) as usize;
-            let scale = go / n as f64;
+            let target_raw = targets.read_index(i);
+            let valid = target_raw >= 0;
+            let target_idx = target_raw as usize;
+            let scale = go / denom;
             for j in 0..c {
                 let sm = unsafe { *dst.add(i * c + j) } / sum_exp;
-                let one_hot = if j == target_idx { 1.0 } else { 0.0 };
-                unsafe { *dst.add(i * c + j) = (sm - one_hot) * scale; }
+                let one_hot = if valid && j == target_idx { 1.0 } else { 0.0 };
+                unsafe {
+                    *dst.add(i * c + j) = if valid {
+                        (sm - one_hot) * scale
+                    } else {
+                        0.0
+                    };
+                }
             }
         }
     }
@@ -606,16 +697,18 @@ pub extern "C" fn nsl_cross_entropy_backward(
         strides_ptr,
         2,
         (n * c) as i64,
-        logits.device,
+        0,
         dtype,
         1,
         0,
     ));
-    let out = NslTensor::publish(result);
+    if logits_needs_free { nsl_tensor_free(logits_cpu); }
+    if targets_needs_free { nsl_tensor_free(targets_cpu); }
+    if grad_out_needs_free { nsl_tensor_free(grad_out_cpu); }
     nsl_tensor_free(logits_c);
     nsl_tensor_free(targets_c);
     nsl_tensor_free(grad_out_c);
-    out
+    publish_cpu_result_to_device(result, out_device, "ad_cross_entropy_backward")
 }
 
 // ---------------------------------------------------------------------------
@@ -639,9 +732,7 @@ pub extern "C" fn nsl_tensor_logsoftmax(tensor_ptr: i64, dim: i64) -> i64 {
                 {
                     let c_ptr = nsl_tensor_contiguous(tensor_ptr);
                     let result = crate::cuda::gpu_log_softmax_f32(c_ptr);
-                    if c_ptr != tensor_ptr {
-                        nsl_tensor_free(c_ptr);
-                    }
+                    nsl_tensor_free(c_ptr);
                     if autodiff::is_recording() {
                         NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
                         autodiff::maybe_record(autodiff::TapeOp::LogSoftmax {
@@ -780,8 +871,8 @@ fn logsoftmax_base_offset(
 /// For lower-rank tensors the last two dims are used similarly.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_repeat(tensor_ptr: i64, kernel: i64) -> i64 {
-    let t_c = nsl_tensor_contiguous(tensor_ptr);
-    let tensor = NslTensor::from_ptr(t_c);
+    let (t_contig, t_cpu, source_device) = prepare_cpu_input(tensor_ptr);
+    let tensor = NslTensor::from_ptr(t_cpu);
     let ndim = tensor.ndim as usize;
     let k = kernel as usize;
 
@@ -855,14 +946,13 @@ pub extern "C" fn nsl_tensor_repeat(tensor_ptr: i64, kernel: i64) -> i64 {
         strides_ptr,
         ndim as i64,
         out_len as i64,
-        tensor.device,
+        0,
         dtype,
         1,
         0,
     ));
-    let out = NslTensor::publish(result);
-    nsl_tensor_free(t_c);
-    out
+    release_cpu_input(t_contig, t_cpu);
+    publish_cpu_result_to_device(result, source_device, "ad_repeat")
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +991,13 @@ pub extern "C" fn nsl_tensor_repeat(tensor_ptr: i64, kernel: i64) -> i64 {
 pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
     let _ = dim; // dim is reserved; currently always operates on the last dim
     let t_c = nsl_tensor_contiguous(tensor_ptr);
-    let tensor = NslTensor::from_ptr(t_c);
+    let source_device = NslTensor::from_ptr(t_c).device;
+    let t_cpu = if source_device > 0 {
+        super::nsl_tensor_to_device(t_c, 0)
+    } else {
+        t_c
+    };
+    let tensor = NslTensor::from_ptr(t_cpu);
     let ndim = tensor.ndim as usize;
 
     if ndim == 0 {
@@ -955,14 +1051,16 @@ pub extern "C" fn nsl_tensor_rope_inverse(tensor_ptr: i64, dim: i64) -> i64 {
         strides,
         tensor.ndim,
         tensor.len,
-        tensor.device,
+        0,
         dtype,
         1,
         0,
     ));
-    let out = NslTensor::publish(result);
+    if t_cpu != t_c {
+        nsl_tensor_free(t_cpu);
+    }
     nsl_tensor_free(t_c);
-    out
+    publish_cpu_result_to_device(result, source_device, "ad_rope_inverse")
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1297,8 @@ mod tests {
     use super::*;
     use crate::tensor::creation::tensor_from_shape_list;
     use crate::list::{nsl_list_new, nsl_list_push};
+    use crate::cpu::create_tensor_with_shape_rs_dtype;
+    use crate::tensor::nsl_tensor_to_device;
 
     // Helper: create a 1D f32 tensor from a slice of values
     fn make_1d_f32(vals: &[f32]) -> i64 {
@@ -1310,6 +1410,45 @@ mod tests {
         assert!((sum - 1.0_f32).abs() < 1e-5_f32);
         nsl_tensor_free(a);
         nsl_tensor_free(out);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cross_entropy_backward_gpu_f64_seed() {
+        let logits = create_tensor_with_shape_rs_dtype(&[2, 3], 1);
+        let logits_t = NslTensor::from_ptr(logits);
+        let logits_vals = [1.0_f32, 0.0, -1.0, 0.5, 1.5, -0.5];
+        for (index, value) in logits_vals.iter().enumerate() {
+            unsafe { *logits_t.data_f32().add(index) = *value; }
+        }
+
+        let targets = create_tensor_with_shape_rs_dtype(&[2], 4);
+        let targets_t = NslTensor::from_ptr(targets);
+        unsafe {
+            *targets_t.data_i32().add(0) = 0;
+            *targets_t.data_i32().add(1) = 1;
+        }
+
+        let grad_out = nsl_tensor_scalar(1.0, 0);
+        let logits_gpu = nsl_tensor_to_device(logits, 1);
+        let grad_gpu = nsl_cross_entropy_backward(grad_out, logits_gpu, targets);
+        let grad_cpu = nsl_tensor_to_device(grad_gpu, 0);
+        let grad_t = NslTensor::from_ptr(grad_cpu);
+
+        assert_eq!(grad_t.ndim, 2);
+        assert_eq!(unsafe { *grad_t.shape.add(0) }, 2);
+        assert_eq!(unsafe { *grad_t.shape.add(1) }, 3);
+        for i in 0..6 {
+            let value = unsafe { *grad_t.data_f64().add(i) };
+            assert!(value.is_finite(), "gradient element {i} was not finite: {value}");
+        }
+
+        nsl_tensor_free(logits);
+        nsl_tensor_free(targets);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(logits_gpu);
+        nsl_tensor_free(grad_gpu);
+        nsl_tensor_free(grad_cpu);
     }
 }
 

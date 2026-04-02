@@ -204,7 +204,7 @@ pub(crate) mod inner {
         });
     }
 
-    fn get_oom_context() -> String {
+    pub(crate) fn current_oom_context() -> String {
         OOM_CONTEXT.with(|c| c.borrow().clone())
     }
 
@@ -222,7 +222,7 @@ pub(crate) mod inner {
 
     fn oom_diagnostic(requested: usize, alloc_num: u64, pool_freed: usize) -> String {
         let (free_vram, total_vram) = query_vram();
-        let ctx = get_oom_context();
+        let ctx = current_oom_context();
         let op_line = if ctx.is_empty() {
             String::new()
         } else {
@@ -668,12 +668,19 @@ pub(crate) mod inner {
         ensure_context();
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
+            let ctx = current_oom_context();
+            let ctx_suffix = if ctx.is_empty() {
+                String::new()
+            } else {
+                format!(" [context: {}]", ctx)
+            };
             assert_eq!(
                 result,
                 CUresult::CUDA_SUCCESS,
-                "cuMemcpyHtoD_v2({} bytes) failed: {:?}",
+                "cuMemcpyHtoD_v2({} bytes) failed: {:?}{}",
                 size_bytes,
-                result
+                result,
+                ctx_suffix
             );
         }
     }
@@ -906,6 +913,61 @@ fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
     result_gpu
 }
 
+#[cfg(feature = "cuda")]
+fn gpu_broadcast_shape(a: &crate::tensor::NslTensor, b: &crate::tensor::NslTensor) -> Option<Vec<i64>> {
+    let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
+    let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
+    let out_ndim = a_shape.len().max(b_shape.len());
+    let mut out_shape = vec![1i64; out_ndim];
+    for i in 0..out_ndim {
+        let a_dim = if i < out_ndim - a_shape.len() { 1 } else { a_shape[i - (out_ndim - a_shape.len())] };
+        let b_dim = if i < out_ndim - b_shape.len() { 1 } else { b_shape[i - (out_ndim - b_shape.len())] };
+        if a_dim == b_dim || a_dim == 1 || b_dim == 1 {
+            out_shape[i] = a_dim.max(b_dim);
+        } else {
+            return None;
+        }
+    }
+    Some(out_shape)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_prepare_binary_operand(ptr: i64, out_shape: &[i64]) -> (i64, bool) {
+    let tensor = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
+    let current_shape = unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) };
+    let needs_expand = current_shape != out_shape;
+
+    if !needs_expand && tensor.is_contiguous() {
+        return (ptr, false);
+    }
+
+    let contig = if needs_expand {
+        let shape_list = crate::list::nsl_list_new();
+        for &dim in out_shape {
+            crate::list::nsl_list_push(shape_list, dim);
+        }
+        let expanded = crate::tensor::nsl_tensor_expand(ptr, shape_list);
+        crate::list::nsl_list_free(shape_list);
+        let contig = crate::tensor::nsl_tensor_contiguous(expanded);
+        crate::tensor::nsl_tensor_free(expanded);
+        contig
+    } else {
+        crate::tensor::nsl_tensor_contiguous(ptr)
+    };
+
+    (contig, contig != ptr)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_prepare_binary_operands(a_ptr: i64, b_ptr: i64) -> Option<(i64, i64, bool, bool)> {
+    let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
+    let b = unsafe { &*(b_ptr as *const crate::tensor::NslTensor) };
+    let out_shape = gpu_broadcast_shape(a, b)?;
+    let (a_prepared, free_a) = gpu_prepare_binary_operand(a_ptr, &out_shape);
+    let (b_prepared, free_b) = gpu_prepare_binary_operand(b_ptr, &out_shape);
+    Some((a_prepared, b_prepared, free_a, free_b))
+}
+
 /// GPU elementwise binary op.
 /// Falls back to CPU on GPU OOM (transfers to CPU, computes, transfers back).
 #[cfg(feature = "cuda")]
@@ -914,9 +976,23 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
-    // Fall back to CPU broadcast path when shapes differ
-    if a.len != b.len {
-        return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
+    if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
+        if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr) {
+            if prepared_a != a_ptr || prepared_b != b_ptr {
+                let result = gpu_elementwise_binary(prepared_a, prepared_b, ptx, kernel_name);
+                if free_a {
+                    crate::tensor::nsl_tensor_free(prepared_a);
+                }
+                if free_b {
+                    crate::tensor::nsl_tensor_free(prepared_b);
+                }
+                return result;
+            }
+        }
+        // Fall back to CPU only when GPU broadcast materialization is impossible.
+        if a.len != b.len {
+            return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
+        }
     }
 
     let n = a.len as usize;
@@ -1050,6 +1126,116 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    out_ptr as i64
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+
+    fn cpu_fallback_rotate_half(ptr: i64, device: i32) -> i64 {
+        let cpu_input = crate::tensor::nsl_tensor_to_device(ptr, 0);
+        let cpu_rotated = crate::tensor::shape_ops::nsl_tensor_rotate_half(cpu_input);
+        let gpu_rotated = crate::tensor::nsl_tensor_to_device(cpu_rotated, device as i64);
+        crate::tensor::nsl_tensor_free(cpu_input);
+        crate::tensor::nsl_tensor_free(cpu_rotated);
+        gpu_rotated
+    }
+
+    const KERNEL_NAME: &str = "nsl_rotate_half_f32\0";
+
+    inner::set_oom_context(KERNEL_NAME.trim_end_matches('\0'));
+
+    let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
+    assert!(tensor.device > 0, "gpu_rotate_half_f32 requires a CUDA tensor");
+
+    let contiguous_ptr = if tensor.is_contiguous() {
+        tensor_ptr
+    } else {
+        crate::tensor::nsl_tensor_contiguous(tensor_ptr)
+    };
+    let contiguous = unsafe { &*(contiguous_ptr as *const NslTensor) };
+
+    let ndim = contiguous.ndim as usize;
+    assert!(ndim > 0, "nsl: rotate_half requires at least 1 dimension");
+
+    let last_dim = unsafe { *contiguous.shape.add(ndim - 1) } as usize;
+    assert!(
+        last_dim.is_multiple_of(2),
+        "nsl: rotate_half requires even last dimension, got {}",
+        last_dim
+    );
+
+    if contiguous.dtype != 1 {
+        let result = cpu_fallback_rotate_half(contiguous_ptr, tensor.device as i32);
+        if contiguous_ptr != tensor_ptr {
+            crate::tensor::nsl_tensor_free(contiguous_ptr);
+        }
+        return result;
+    }
+
+    let n = contiguous.len as usize;
+    let out_data = match inner::try_alloc_managed(n * 4) {
+        Some(ptr) => ptr,
+        None => {
+            let result = cpu_fallback_rotate_half(contiguous_ptr, tensor.device as i32);
+            if contiguous_ptr != tensor_ptr {
+                crate::tensor::nsl_tensor_free(contiguous_ptr);
+            }
+            return result;
+        }
+    };
+
+    let shape = NslTensor::copy_shape(contiguous.shape, contiguous.ndim);
+    let strides = NslTensor::compute_strides(shape, contiguous.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        contiguous.ndim,
+        contiguous.len,
+        contiguous.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = contiguous.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let mut last_dim_val = last_dim as u64;
+    let mut half_val = (last_dim / 2) as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut last_dim_val as *mut _ as *mut std::ffi::c_void,
+        &mut half_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::ROTATE_HALF_F32_PTX.as_ptr(),
+        KERNEL_NAME.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU kernel '{}' failed: {}",
+        KERNEL_NAME.trim_end_matches('\0'),
+        result as u32
+    );
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    if contiguous_ptr != tensor_ptr {
+        crate::tensor::nsl_tensor_free(contiguous_ptr);
+    }
     out_ptr as i64
 }
 

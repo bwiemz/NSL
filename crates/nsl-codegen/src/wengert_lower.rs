@@ -13,6 +13,11 @@ use std::collections::HashMap;
 
 pub type VarMap = HashMap<VarId, Value>;
 
+pub struct LoweredWengert {
+    pub var_map: VarMap,
+    pub owned_values: Vec<(VarId, Value, WengertType)>,
+}
+
 /// Lower a WengertList to Cranelift IR by dispatching each PrimalOp to its runtime FFI call.
 ///
 /// `primal_vars` maps VarIds from the forward pass to their Cranelift Values (i64 tensor pointers).
@@ -23,8 +28,9 @@ pub fn compile_wengert_ops(
     _state: &mut FuncState,
     wengert: &WengertList,
     primal_vars: &VarMap,
-) -> Result<VarMap, CodegenError> {
+) -> Result<LoweredWengert, CodegenError> {
     let mut var_map = primal_vars.clone();
+    let mut owned_values = Vec::new();
     // Clone var_types so the lowerer can look up types for any VarId and
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
@@ -64,9 +70,12 @@ pub fn compile_wengert_ops(
             }
             _ => type_for_op(&op.op),
         };
+        if should_cleanup_result(&op.op, result_type) {
+            owned_values.push((op.result, result_val, result_type));
+        }
         var_types.insert(op.result, result_type);
     }
-    Ok(var_map)
+    Ok(LoweredWengert { var_map, owned_values })
 }
 
 /// Resolve all input VarIds for a WengertOp to their Cranelift Values.
@@ -94,25 +103,57 @@ fn call(
     compiler.compile_call_by_name(builder, name, args)
 }
 
+fn should_cleanup_result(op: &PrimalOp, result_type: WengertType) -> bool {
+    if !matches!(result_type, WengertType::Tensor | WengertType::List) {
+        return false;
+    }
+    match op {
+        PrimalOp::Input(_) | PrimalOp::Param(_) | PrimalOp::Constant(_) => false,
+        PrimalOp::Passthrough(name) if name.starts_with("dict_get:") => false,
+        _ => true,
+    }
+}
+
+fn free_tensor_value(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    value: Value,
+) -> Result<(), CodegenError> {
+    let _ = call(compiler, builder, "nsl_tensor_free", &[value])?;
+    Ok(())
+}
+
+fn free_tensor_if_owned(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    value: Value,
+    owned: bool,
+) -> Result<(), CodegenError> {
+    if owned {
+        free_tensor_value(compiler, builder, value)?;
+    }
+    Ok(())
+}
+
 /// Promote an Integer (i64) to a scalar Tensor if needed for mixed-type arithmetic.
 fn promote_to_tensor(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
     val: Value,
     ty: WengertType,
-) -> Result<Value, CodegenError> {
+) -> Result<(Value, bool), CodegenError> {
     match ty {
         WengertType::Integer => {
             let f = builder.ins().fcvt_from_sint(cl_types::F64, val);
             let dt = builder.ins().iconst(cl_types::I64, 0); // f64
-            call(compiler, builder, "nsl_tensor_scalar", &[f, dt])
+            Ok((call(compiler, builder, "nsl_tensor_scalar", &[f, dt])?, true))
         }
         WengertType::Scalar => {
             // f64 scalar → wrap in a scalar tensor for tensor arithmetic
             let dt = builder.ins().iconst(cl_types::I64, 0); // f64
-            call(compiler, builder, "nsl_tensor_scalar", &[val, dt])
+            Ok((call(compiler, builder, "nsl_tensor_scalar", &[val, dt])?, true))
         }
-        _ => Ok(val), // Already a tensor pointer (i64)
+        _ => Ok((val, false)), // Already a tensor pointer (i64)
     }
 }
 
@@ -185,7 +226,7 @@ fn lower_single_op(
         | PrimalOp::Gelu | PrimalOp::Silu | PrimalOp::Exp
         | PrimalOp::Log | PrimalOp::Sqrt | PrimalOp::Abs | PrimalOp::Neg => {
             let a_ty = var_types.get(&op.inputs[0]).copied().unwrap_or(WengertType::Tensor);
-            let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+            let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
             let rt_name = match &op.op {
                 PrimalOp::Relu => "nsl_tensor_relu",
                 PrimalOp::Sigmoid => "nsl_tensor_sigmoid",
@@ -199,7 +240,9 @@ fn lower_single_op(
                 PrimalOp::Neg => "nsl_tensor_neg",
                 _ => unreachable!(),
             };
-            call(compiler, builder, rt_name, &[a])
+            let result = call(compiler, builder, rt_name, &[a])?;
+            free_tensor_if_owned(compiler, builder, a, free_a)?;
+            Ok(result)
         }
         PrimalOp::Clamp { min, max } => {
             let min_v = builder.ins().f64const(*min);
@@ -216,9 +259,12 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().iadd(inputs[0], inputs[1]))
             } else {
-                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                call(compiler, builder, "nsl_tensor_add", &[a, b])
+                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let result = call(compiler, builder, "nsl_tensor_add", &[a, b])?;
+                free_tensor_if_owned(compiler, builder, a, free_a)?;
+                free_tensor_if_owned(compiler, builder, b, free_b)?;
+                Ok(result)
             }
         }
         PrimalOp::Sub => {
@@ -227,9 +273,12 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().isub(inputs[0], inputs[1]))
             } else {
-                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                call(compiler, builder, "nsl_tensor_sub", &[a, b])
+                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let result = call(compiler, builder, "nsl_tensor_sub", &[a, b])?;
+                free_tensor_if_owned(compiler, builder, a, free_a)?;
+                free_tensor_if_owned(compiler, builder, b, free_b)?;
+                Ok(result)
             }
         }
         PrimalOp::Mul => {
@@ -238,9 +287,12 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().imul(inputs[0], inputs[1]))
             } else {
-                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                call(compiler, builder, "nsl_tensor_mul", &[a, b])
+                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let result = call(compiler, builder, "nsl_tensor_mul", &[a, b])?;
+                free_tensor_if_owned(compiler, builder, a, free_a)?;
+                free_tensor_if_owned(compiler, builder, b, free_b)?;
+                Ok(result)
             }
         }
         PrimalOp::Div => {
@@ -249,9 +301,12 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().sdiv(inputs[0], inputs[1]))
             } else {
-                let a = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let b = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                call(compiler, builder, "nsl_tensor_div", &[a, b])
+                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let result = call(compiler, builder, "nsl_tensor_div", &[a, b])?;
+                free_tensor_if_owned(compiler, builder, a, free_a)?;
+                free_tensor_if_owned(compiler, builder, b, free_b)?;
+                Ok(result)
             }
         }
 
@@ -438,15 +493,41 @@ fn lower_single_op(
         // === Loss functions (3 ops) ===
         // Loss functions are composite: we lower them to sequences of existing FFI calls.
         PrimalOp::CrossEntropyLoss => {
-            // cross_entropy(logits, targets) = mean(-logsoftmax(logits)[targets])
-            // Uses numerically stable logsoftmax (log-sum-exp trick) instead of
-            // separate softmax → log (which loses precision for large logits).
-            let neg_one = builder.ins().iconst(cl_types::I64, -1);
-            let log_sm = call(compiler, builder, "nsl_tensor_logsoftmax", &[inputs[0], neg_one])?;
-            let neg_log = call(compiler, builder, "nsl_tensor_neg", &[log_sm])?;
-            let gathered = call(compiler, builder, "nsl_tensor_gather", &[neg_log, neg_one, inputs[1]])?;
-            let keepdim = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_mean_dim", &[gathered, neg_one, keepdim])
+            // Match stdlib/nsl/nn/losses.nsl semantics, including ignore labels
+            // encoded as -100 by the DataLoader.
+            let dim_one = builder.ins().iconst(cl_types::I64, 1);
+            let safe_min = builder.ins().f64const(0.0);
+            let safe_max = builder.ins().f64const(2147483647.0);
+            let safe_targets = call(compiler, builder, "nsl_tensor_clamp", &[inputs[1], safe_min, safe_max])?;
+            let log_probs = call(compiler, builder, "nsl_tensor_logsoftmax", &[inputs[0], dim_one])?;
+            let gathered = call(compiler, builder, "nsl_tensor_gather", &[log_probs, dim_one, safe_targets])?;
+            let nll = call(compiler, builder, "nsl_tensor_neg", &[gathered])?;
+
+            let one_f = builder.ins().f64const(1.0);
+            let zero_f = builder.ins().f64const(0.0);
+            let eps_f = builder.ins().f64const(1e-8);
+            let targets_plus_one = call(compiler, builder, "nsl_tensor_add_scalar", &[inputs[1], one_f])?;
+            let valid_mask = call(compiler, builder, "nsl_tensor_clamp", &[targets_plus_one, zero_f, one_f])?;
+            let masked_nll = call(compiler, builder, "nsl_tensor_mul", &[nll, valid_mask])?;
+            let num_valid = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+            let num_valid_eps = call(compiler, builder, "nsl_tensor_add_scalar", &[num_valid, eps_f])?;
+            let total = call(compiler, builder, "nsl_tensor_sum", &[masked_nll])?;
+            let result = call(compiler, builder, "nsl_tensor_div", &[total, num_valid_eps])?;
+            for temp in [
+                safe_targets,
+                log_probs,
+                gathered,
+                nll,
+                targets_plus_one,
+                valid_mask,
+                masked_nll,
+                num_valid,
+                num_valid_eps,
+                total,
+            ] {
+                free_tensor_value(compiler, builder, temp)?;
+            }
+            Ok(result)
         }
         PrimalOp::MSELoss => {
             // mse_loss(pred, target) = mean((pred - target)^2)
@@ -454,7 +535,10 @@ fn lower_single_op(
             let sq = call(compiler, builder, "nsl_tensor_mul", &[diff, diff])?;
             let d = builder.ins().iconst(cl_types::I64, -1);
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_mean_dim", &[sq, d, keepdim])
+            let result = call(compiler, builder, "nsl_tensor_mean_dim", &[sq, d, keepdim])?;
+            free_tensor_value(compiler, builder, diff)?;
+            free_tensor_value(compiler, builder, sq)?;
+            Ok(result)
         }
         PrimalOp::L1Loss => {
             // l1_loss(pred, target) = mean(|pred - target|)
@@ -462,7 +546,10 @@ fn lower_single_op(
             let abs_diff = call(compiler, builder, "nsl_tensor_abs", &[diff])?;
             let d = builder.ins().iconst(cl_types::I64, -1);
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
-            call(compiler, builder, "nsl_tensor_mean_dim", &[abs_diff, d, keepdim])
+            let result = call(compiler, builder, "nsl_tensor_mean_dim", &[abs_diff, d, keepdim])?;
+            free_tensor_value(compiler, builder, diff)?;
+            free_tensor_value(compiler, builder, abs_diff)?;
+            Ok(result)
         }
 
         // === Attention (4 ops) ===
@@ -476,13 +563,13 @@ fn lower_single_op(
             let scale_ty = op.inputs.get(3)
                 .and_then(|vid| var_types.get(vid).copied())
                 .unwrap_or(WengertType::Tensor);
-            let scale = if inputs.len() > 3 {
+            let (scale, free_scale) = if inputs.len() > 3 {
                 promote_to_tensor(compiler, builder, inputs[3], scale_ty)?
             } else {
                 // Default scale: 1.0
                 let one = builder.ins().f64const(1.0);
                 let dt = builder.ins().iconst(cl_types::I64, 1);
-                call(compiler, builder, "nsl_tensor_scalar", &[one, dt])?
+                (call(compiler, builder, "nsl_tensor_scalar", &[one, dt])?, true)
             };
 
             // K_T = transpose(K, -2, -1)
@@ -494,13 +581,16 @@ fn lower_single_op(
             // scaled = scores * scale
             let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
             let scaled = call(compiler, builder, "nsl_tensor_mul_scalar", &[scores, scale_item])?;
+            free_tensor_if_owned(compiler, builder, scale, free_scale)?;
 
             // Apply causal mask if needed
             let masked = if *causal {
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
                 let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim_neg2])?;
                 let mask = call(compiler, builder, "nsl_tensor_causal_mask", &[seq_len])?;
-                call(compiler, builder, "nsl_tensor_add", &[scaled, mask])?
+                let masked = call(compiler, builder, "nsl_tensor_add", &[scaled, mask])?;
+                free_tensor_value(compiler, builder, mask)?;
+                masked
             } else {
                 scaled
             };
@@ -508,7 +598,15 @@ fn lower_single_op(
             // attn_weights = softmax(masked, -1)
             let attn_weights = call(compiler, builder, "nsl_tensor_softmax", &[masked, dim_m1])?;
             // output = attn_weights @ V
-            call(compiler, builder, "nsl_tensor_matmul", &[attn_weights, v])
+            let result = call(compiler, builder, "nsl_tensor_matmul", &[attn_weights, v])?;
+            free_tensor_value(compiler, builder, k_t)?;
+            free_tensor_value(compiler, builder, scores)?;
+            if *causal {
+                free_tensor_value(compiler, builder, scaled)?;
+            }
+            free_tensor_value(compiler, builder, masked)?;
+            free_tensor_value(compiler, builder, attn_weights)?;
+            Ok(result)
         }
         PrimalOp::FlashAttentionBackwardExtract { .. } => {
             // Fused attention backward component extraction.

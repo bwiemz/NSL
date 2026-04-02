@@ -345,10 +345,16 @@ impl Compiler<'_> {
                         fields.push(StructField { name: field_name.clone(), cl_type, offset });
                         offset += size;
 
-                        // Check if this is a nested model field
+                        // Record named non-builtin field types so nested model
+                        // traversal still works for forward references where the
+                        // referenced layout may not have been collected yet.
                         if let nsl_ast::types::TypeExprKind::Named(type_sym) = &type_ann.kind {
                             let type_name = self.resolve_sym(*type_sym).to_string();
-                            if self.types.struct_layouts.contains_key(&type_name) {
+                            let is_builtin_named = matches!(
+                                type_name.as_str(),
+                                "Tensor" | "int" | "float" | "bool" | "str"
+                            );
+                            if !is_builtin_named {
                                 field_type_map.insert(field_name, type_name);
                             }
                         }

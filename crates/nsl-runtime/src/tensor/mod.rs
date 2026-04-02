@@ -999,6 +999,17 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         crate::cuda::inner::memcpy_dtod(dst.data, src.data, byte_count);
         return;
     } else if dst.device > 0 && src.device == 0 {
+        if byte_count == 12_582_912 {
+            eprintln!(
+                "[nsl] memcpy_htod@copy_data dst_shape={:?} src_shape={:?} dst_device={} src_device={} dst_ptr={:?} src_ptr={:?}",
+                get_shape_vec(dst),
+                get_shape_vec(src),
+                dst.device,
+                src.device,
+                dst.data,
+                src.data
+            );
+        }
         crate::cuda::inner::memcpy_htod(dst.data, src.data, byte_count);
         return;
     } else if dst.device == 0 && src.device > 0 {
@@ -1047,6 +1058,17 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         }
         // Copy result back to device
         let byte_count = (dc.len as usize) * dc.element_size();
+        if byte_count == 12_582_912 {
+            eprintln!(
+                "[nsl] memcpy_htod@add_inplace dst_shape={:?} src_shape={:?} dst_device={} src_device={} dst_ptr={:?} src_ptr={:?}",
+                get_shape_vec(dst),
+                get_shape_vec(dc),
+                dst.device,
+                dc.device,
+                dst.data,
+                dc.data
+            );
+        }
         crate::cuda::inner::memcpy_htod(dst.data, dc.data, byte_count);
         nsl_tensor_free(dst_cpu);
         if src_cpu != src_ptr { nsl_tensor_free(src_cpu); }
@@ -1166,6 +1188,15 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
         for i in 0..len {
             unsafe { *staging.add(i) = 1.0f32; }
         }
+        if byte_size == 12_582_912 {
+            eprintln!(
+                "[nsl] memcpy_htod@ones_like shape={:?} device={} dst_ptr={:?} src_ptr={:?}",
+                get_shape_vec(result_t),
+                result_t.device,
+                result_t.data,
+                staging
+            );
+        }
         crate::cuda::inner::memcpy_htod(
             result_t.data,
             staging as *const std::ffi::c_void,
@@ -1251,15 +1282,11 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
                     unsafe { *cpu_t.data_f64().add(i) *= scale; }
                 }
             }
-            // Copy scaled data back to GPU
-            #[allow(unused_variables)]
-            let byte_size = if cpu_t.dtype == 1 {
-                cpu_t.len as usize * std::mem::size_of::<f32>()
-            } else {
-                cpu_t.len as usize * std::mem::size_of::<f64>()
-            };
-            #[cfg(feature = "cuda")]
-            crate::cuda::inner::memcpy_htod(tensor.data, cpu_t.data, byte_size);
+            // Convert the scaled CPU copy back through the standard device transfer path
+            // so GPU f32 gradients don't receive an oversized raw f64 memcpy.
+            let scaled_gpu = nsl_tensor_to_device(cpu_ptr, tensor.device as i64);
+            nsl_tensor_copy_data(tensor_ptr, scaled_gpu);
+            nsl_tensor_free(scaled_gpu);
         } else if tensor.dtype == 1 {
             let scale_f32 = scale as f32;
             for i in 0..tensor.len as usize {
@@ -1390,10 +1417,9 @@ pub extern "C" fn nsl_tensor_layernorm(
                 let g_gpu = nsl_tensor_to_device(weight_ptr, target_device);
                 let b_gpu = nsl_tensor_to_device(bias_ptr, target_device);
                 let result = crate::cuda::gpu_layernorm_f32(c_input, g_gpu, b_gpu, eps as f32);
-                if c_input != input_ptr { nsl_tensor_free(c_input); }
-                // Clean up device transfers if they created new tensors
-                if g_gpu != weight_ptr { nsl_tensor_free(g_gpu); }
-                if b_gpu != bias_ptr { nsl_tensor_free(b_gpu); }
+                nsl_tensor_free(c_input);
+                nsl_tensor_free(g_gpu);
+                nsl_tensor_free(b_gpu);
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                     NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1594,8 +1620,8 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
                 let c_input = nsl_tensor_contiguous(input_ptr);
                 let g_gpu = nsl_tensor_to_device(weight_ptr, target_device);
                 let result = crate::cuda::gpu_rmsnorm_f32(c_input, g_gpu, eps as f32);
-                if c_input != input_ptr { nsl_tensor_free(c_input); }
-                if g_gpu != weight_ptr { nsl_tensor_free(g_gpu); }
+                nsl_tensor_free(c_input);
+                nsl_tensor_free(g_gpu);
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                     NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1742,7 +1768,7 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
             {
                 let c_ptr = nsl_tensor_contiguous(tensor_ptr);
                 let (result_ptr, mask_ptr) = crate::cuda::gpu_dropout_f32(c_ptr, p);
-                if c_ptr != tensor_ptr { nsl_tensor_free(c_ptr); }
+                nsl_tensor_free(c_ptr);
                 // Record tape op for backward
                 if autodiff::is_recording() {
                     // No refcount bump on a — identity-only (tape_id)
@@ -1854,7 +1880,7 @@ pub extern "C" fn nsl_tensor_conv2d(
                 c_input, weight_ptr, bias_ptr,
                 stride_h as u64, stride_w as u64, pad_h as u64, pad_w as u64,
             );
-            if c_input != input_ptr { nsl_tensor_free(c_input); }
+            nsl_tensor_free(c_input);
             // Record tape op on the result (same as CPU path)
             if autodiff::is_recording() {
                 NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1997,7 +2023,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
             let (result, argmax_vec) = crate::cuda::gpu_maxpool2d_f32(
                 c_input, kernel_h as u64, kernel_w as u64, stride as u64, padding as u64,
             );
-            if c_input != input_ptr { nsl_tensor_free(c_input); }
+            nsl_tensor_free(c_input);
             // Record tape op with argmax indices
             if autodiff::is_recording() {
                 NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -2197,45 +2223,122 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         return tensor_ptr;
     }
 
+    // Preserve broadcast/transpose/reshape-style CPU views on GPU when they still
+    // reference the owner's base pointer. This avoids expanding large CPU views
+    // just to transfer them, letting downstream GPU code materialize if needed.
+    if t.device == 0 && target > 0 && !t.is_contiguous() && t.data_owner != 0 {
+        #[cfg(feature = "cuda")]
+        {
+            let mut root_cpu_ptr = t.data_owner;
+            loop {
+                let owner = NslTensor::from_ptr(root_cpu_ptr);
+                if owner.data_owner == 0 {
+                    break;
+                }
+                root_cpu_ptr = owner.data_owner;
+            }
+
+            let root_cpu = NslTensor::from_ptr(root_cpu_ptr);
+            if t.data == root_cpu.data {
+                let root_gpu_ptr = nsl_tensor_to_device(root_cpu_ptr, target as i64);
+                let root_gpu = NslTensor::from_ptr(root_gpu_ptr);
+                let shape = NslTensor::copy_shape(t.shape, t.ndim);
+                let strides = NslTensor::copy_shape(t.strides, t.ndim);
+                let view = Box::new(NslTensor::new(
+                    root_gpu.data,
+                    shape,
+                    strides,
+                    t.ndim,
+                    t.len,
+                    target,
+                    root_gpu.dtype,
+                    0,
+                    root_gpu_ptr,
+                ));
+                return NslTensor::publish(view);
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!("CUDA support not compiled");
+        }
+    }
+
+    // Materialize views before cross-device copies. Copying a non-contiguous
+    // tensor's raw backing storage as if it were row-major corrupts transfers
+    // for broadcast/transpose/reshape views produced heavily in source-AD.
+    let transfer_src_ptr = if t.is_contiguous() {
+        tensor_ptr
+    } else {
+        nsl_tensor_contiguous(tensor_ptr)
+    };
+    let transfer_src = unsafe { &*(transfer_src_ptr as *const NslTensor) };
+
     #[allow(unused_variables)]
-    let len = t.len as usize;
+    let len = transfer_src.len as usize;
 
     if t.device == 0 && target > 0 {
         #[cfg(feature = "cuda")]
         {
             // i32 tensors (token IDs): bitwise copy to GPU via memcpy_htod
-            if t.dtype == 4 {
+            if transfer_src.dtype == 4 {
                 let dst_size = len * std::mem::size_of::<i32>();
                 let dst = crate::cuda::inner::alloc_managed(dst_size);
-                crate::cuda::inner::memcpy_htod(dst, t.data, dst_size);
-                let shape = NslTensor::copy_shape(t.shape, t.ndim);
-                let strides = NslTensor::compute_strides(shape, t.ndim);
+                crate::cuda::inner::memcpy_htod(dst, transfer_src.data, dst_size);
+                let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
+                let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
                 let new_t = Box::new(NslTensor::new(
-                    dst, shape, strides, t.ndim, t.len, target, 4, 1, 0,
+                    dst, shape, strides, transfer_src.ndim, transfer_src.len, target, 4, 1, 0,
                 ));
+                if transfer_src_ptr != tensor_ptr {
+                    nsl_tensor_free(transfer_src_ptr);
+                }
                 return NslTensor::publish(new_t);
             }
 
             let dst_size = len * std::mem::size_of::<f32>();
             let dst = crate::cuda::inner::alloc_managed(dst_size);
-            if t.dtype == 1 {
+            if dst_size == 12_582_912 {
+                let shape: Vec<i64> = unsafe {
+                    std::slice::from_raw_parts(transfer_src.shape, transfer_src.ndim as usize)
+                }
+                .to_vec();
+                eprintln!(
+                    "[nsl] to_device HtoD 12582912 bytes: shape={:?} dtype={} source_device={} contiguous_src={} target_device={} owns_data={} data_owner={} data_ptr={:?}",
+                    shape,
+                    transfer_src.dtype,
+                    transfer_src.device,
+                    transfer_src_ptr == tensor_ptr,
+                    target,
+                    transfer_src.owns_data,
+                    transfer_src.data_owner,
+                    transfer_src.data
+                );
+            }
+            if transfer_src.dtype == 1 {
                 // f32→f32: direct host-to-device copy
-                crate::cuda::inner::memcpy_htod(dst, t.data, dst_size);
+                crate::cuda::inner::memcpy_htod(dst, transfer_src.data, dst_size);
             } else {
-                // f64→f32: convert on CPU into pinned staging buffer, then copy to device
-                let staging = crate::cuda::inner::staging_alloc(dst_size) as *mut f32;
-                let src = t.data_f64();
+                // f64→f32: convert on CPU into a temporary heap buffer, then copy to device.
+                // Avoid the pinned staging pool here; source-AD backward performs many
+                // large conversions of temporary tensors, and simple heap staging is more
+                // robust than reusing pinned buffers in this hot path.
+                let staging = checked_alloc(dst_size) as *mut f32;
+                let src = transfer_src.data_f64();
                 for i in 0..len {
                     unsafe { *staging.add(i) = *src.add(i) as f32; }
                 }
                 crate::cuda::inner::memcpy_htod(dst, staging as *const std::ffi::c_void, dst_size);
-                crate::cuda::inner::staging_free(staging as *mut std::ffi::c_void, dst_size);
+                unsafe { checked_free(staging as *mut u8, dst_size); }
             }
-            let shape = NslTensor::copy_shape(t.shape, t.ndim);
-            let strides = NslTensor::compute_strides(shape, t.ndim);
+            let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
+            let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
             let new_t = Box::new(NslTensor::new(
-                dst, shape, strides, t.ndim, t.len, target, 1, 1, 0,
+                dst, shape, strides, transfer_src.ndim, transfer_src.len, target, 1, 1, 0,
             ));
+            if transfer_src_ptr != tensor_ptr {
+                nsl_tensor_free(transfer_src_ptr);
+            }
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
@@ -2248,29 +2351,32 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
             // i32 tensors (token IDs): bitwise copy back to CPU via memcpy_dtoh
-            if t.dtype == 4 {
+            if transfer_src.dtype == 4 {
                 let dst_size = len * std::mem::size_of::<i32>();
                 let dst = checked_alloc(dst_size);
                 crate::cuda::inner::memcpy_dtoh(
                     dst as *mut std::ffi::c_void,
-                    t.data,
+                    transfer_src.data,
                     dst_size,
                 );
-                let shape = NslTensor::copy_shape(t.shape, t.ndim);
-                let strides = NslTensor::compute_strides(shape, t.ndim);
+                let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
+                let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
                 let new_t = Box::new(NslTensor::new(
                     dst as *mut std::ffi::c_void,
-                    shape, strides, t.ndim, t.len, 0, 4, 1, 0,
+                    shape, strides, transfer_src.ndim, transfer_src.len, 0, 4, 1, 0,
                 ));
+                if transfer_src_ptr != tensor_ptr {
+                    nsl_tensor_free(transfer_src_ptr);
+                }
                 return NslTensor::publish(new_t);
             }
 
-            // f32 (GPU) → f64 (CPU): copy to pinned staging, then convert
+            // f32 (GPU) → f64 (CPU): copy to a temporary heap buffer, then convert.
             let src_size = len * std::mem::size_of::<f32>();
-            let staging = crate::cuda::inner::staging_alloc(src_size) as *mut f32;
+            let staging = checked_alloc(src_size) as *mut f32;
             crate::cuda::inner::memcpy_dtoh(
                 staging as *mut std::ffi::c_void,
-                t.data,
+                transfer_src.data,
                 src_size,
             );
             let dst_size = len * std::mem::size_of::<f64>();
@@ -2278,13 +2384,16 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             for i in 0..len {
                 unsafe { *dst.add(i) = *staging.add(i) as f64; }
             }
-            crate::cuda::inner::staging_free(staging as *mut std::ffi::c_void, src_size);
-            let shape = NslTensor::copy_shape(t.shape, t.ndim);
-            let strides = NslTensor::compute_strides(shape, t.ndim);
+            unsafe { checked_free(staging as *mut u8, src_size); }
+            let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
+            let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
             let new_t = Box::new(NslTensor::new(
                 dst as *mut std::ffi::c_void,
-                shape, strides, t.ndim, t.len, 0, 0, 1, 0,
+                shape, strides, transfer_src.ndim, transfer_src.len, 0, 0, 1, 0,
             ));
+            if transfer_src_ptr != tensor_ptr {
+                nsl_tensor_free(transfer_src_ptr);
+            }
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]

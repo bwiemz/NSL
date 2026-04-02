@@ -1010,14 +1010,16 @@ impl Compiler<'_> {
                 }
             } else {
                 // Leaf tensor field -- determine transpose flag
-                let is_linear_like = {
-                    let names: Vec<&str> = layout.fields.iter().map(|f| f.name.as_str()).collect();
-                    (names.contains(&"w") && names.contains(&"b"))
-                        || (names.contains(&"weight") && names.contains(&"bias"))
-                };
-                let needs_transpose =
-                    is_linear_like && (field.name == "weight" || field.name == "w");
-                entries.push((field_path, abs_offset, needs_transpose));
+                if field.cl_type == cl_types::I64 {
+                    let is_linear_like = {
+                        let names: Vec<&str> = layout.fields.iter().map(|f| f.name.as_str()).collect();
+                        (names.contains(&"w") && names.contains(&"b"))
+                            || (names.contains(&"weight") && names.contains(&"bias"))
+                    };
+                    let needs_transpose =
+                        is_linear_like && (field.name == "weight" || field.name == "w");
+                    entries.push((field_path, abs_offset, needs_transpose));
+                }
             }
         }
 
@@ -1171,7 +1173,13 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, path_str.len() as i64);
 
-        // Look up model struct layout
+        if !self.types.struct_layouts.contains_key(&model_name) {
+            return Err(CodegenError::new(format!(
+                "model_save(): no struct layout found for model '{}'",
+                model_name
+            )));
+        }
+
         let layout = self.types.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "model_save(): no struct layout found for model '{}'",
@@ -1179,25 +1187,35 @@ impl Compiler<'_> {
             ))
         })?;
 
+        // Collect recursive leaf tensor names so checkpoint headers stay stable
+        // for nested sub-models and fixed arrays.
+        let param_metadata = self.generate_param_metadata(&model_name, "", 0);
+
         // Build NslList of parameter name pointers (null-terminated C strings)
         let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for field in &layout.fields {
-            let name_data_id = self.intern_string(&field.name)?;
+        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+            let name_data_id = self.intern_string(field_name)?;
             let gv = self.module.declare_data_in_func(name_data_id, builder.func);
             let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
             self.compile_call_by_name(builder, "nsl_list_push", &[names_list, name_ptr])?;
         }
 
-        // Build NslList of parameter tensor pointers (load from model struct fields)
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for field in &layout.fields {
-            let field_val = builder.ins().load(
-                field.cl_type,
-                MemFlags::trusted(),
+        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+            let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
+            let tensor_ptr = self.load_nested_field(
+                builder,
                 model_val,
-                field.offset as i32,
-            );
-            self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, field_val])?;
+                &layout,
+                &model_name,
+                &nested_path,
+            ).ok_or_else(|| {
+                CodegenError::new(format!(
+                    "model_save(): could not resolve model parameter '{}'",
+                    field_name
+                ))
+            })?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
         // Call nsl_model_save(path_ptr, path_len, names_list, tensors_list)
@@ -1251,7 +1269,13 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, path_str.len() as i64);
 
-        // Look up model struct layout
+        if !self.types.struct_layouts.contains_key(&model_name) {
+            return Err(CodegenError::new(format!(
+                "model_load(): no struct layout found for model '{}'",
+                model_name
+            )));
+        }
+
         let layout = self.types.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
             CodegenError::new(format!(
                 "model_load(): no struct layout found for model '{}'",
@@ -1259,16 +1283,23 @@ impl Compiler<'_> {
             ))
         })?;
 
-        // Build NslList of parameter tensor pointers (load from model struct fields)
+        let param_metadata = self.generate_param_metadata(&model_name, "", 0);
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for field in &layout.fields {
-            let field_val = builder.ins().load(
-                field.cl_type,
-                MemFlags::trusted(),
+        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+            let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
+            let tensor_ptr = self.load_nested_field(
+                builder,
                 model_val,
-                field.offset as i32,
-            );
-            self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, field_val])?;
+                &layout,
+                &model_name,
+                &nested_path,
+            ).ok_or_else(|| {
+                CodegenError::new(format!(
+                    "model_load(): could not resolve model parameter '{}'",
+                    field_name
+                ))
+            })?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
         // Call nsl_model_load(path_ptr, path_len, tensors_list)

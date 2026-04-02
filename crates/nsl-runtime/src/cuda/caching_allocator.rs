@@ -54,6 +54,8 @@ struct Block {
     next: *mut Block,
     /// Index into `CachingAllocator::segments`.
     segment_idx: usize,
+    /// CUDA op context captured when the block was handed out.
+    context: String,
 }
 
 /// SAFETY: Block contains raw pointers to GPU memory and sibling Blocks.
@@ -283,6 +285,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let block = unsafe { &mut *block_ptr };
         block.allocated = true;
         block.requested_size = size_bytes;
+        block.context = super::inner::current_oom_context();
 
         // Update segment
         let seg = &mut self.segments[block.segment_idx];
@@ -327,6 +330,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             prev: std::ptr::null_mut(),
             next: std::ptr::null_mut(),
             segment_idx: seg_idx,
+            context: String::new(),
         }));
 
         self.segments.push(Segment {
@@ -358,6 +362,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let blk = unsafe { &mut *block };
         blk.allocated = true;
         blk.requested_size = size_bytes;
+        blk.context = super::inner::current_oom_context();
 
         let seg = &mut self.segments[seg_idx];
         seg.allocated_count += 1;
@@ -388,6 +393,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             prev: block_ptr,
             next: block.next,
             segment_idx: block.segment_idx,
+            context: String::new(),
         }));
 
         // Update next block's prev pointer
@@ -427,6 +433,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let old_requested = block.requested_size;
         block.allocated = false;
         block.requested_size = 0;
+        block.context.clear();
 
         let seg = &mut self.segments[block.segment_idx];
         seg.allocated_count -= 1;
@@ -659,6 +666,29 @@ pub(crate) fn print_memory_summary() {
             format!("{} B", b)
         }
     };
+    let mut context_totals: HashMap<String, (usize, usize)> = HashMap::new();
+    for &block_ptr in alloc.allocated_blocks.values() {
+        let block = unsafe { &*block_ptr };
+        let key = if block.context.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            block.context.clone()
+        };
+        let entry = context_totals.entry(key).or_insert((0, 0));
+        entry.0 += block.size;
+        entry.1 += 1;
+    }
+    let mut top_contexts: Vec<_> = context_totals.into_iter().collect();
+    top_contexts.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let mut top_context_lines = String::new();
+    for (context, (bytes, count)) in top_contexts.into_iter().take(8) {
+        top_context_lines.push_str(&format!(
+            "         {}: {} ({} blocks)\n",
+            context,
+            fmt(bytes),
+            count,
+        ));
+    }
     eprintln!(
         "\n[nsl] GPU Memory Summary\n\
          ========================\n\
@@ -673,7 +703,8 @@ pub(crate) fn print_memory_summary() {
          Cache misses:     {}\n\
          Block splits:     {}\n\
          Block coalesces:  {}\n\
-         Fragmentation:    {}\n",
+         Fragmentation:    {}\n\
+         Top contexts:\n{}",
         fmt(s.allocated_bytes), s.num_allocs,
         fmt(s.reserved_bytes), alloc.segments.len(),
         fmt(s.reserved_bytes.saturating_sub(s.allocated_bytes)), s.num_free_blocks,
@@ -686,6 +717,7 @@ pub(crate) fn print_memory_summary() {
         s.num_splits,
         s.num_coalesces,
         fmt(s.internal_fragmentation_bytes),
+        top_context_lines,
     );
 }
 

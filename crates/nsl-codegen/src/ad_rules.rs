@@ -15,7 +15,7 @@ pub enum AdjointExpr {
     Broadcast(VarId),
     ScaleBroadcast(VarId, f64),
     Transpose(VarId, usize, usize),
-    Reshape(VarId),
+    ReshapeLike(VarId, VarId),
     Identity(VarId),
     // Compound backward rules (multi-step, lowered to op sequences in M40b)
     ExpBackward(VarId, VarId),
@@ -189,7 +189,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }],
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::Reshape(output_bar),
+            expr: AdjointExpr::ReshapeLike(output_bar, op.inputs[0]),
         }],
         // Select(cond, true_val, false_val) -> result
         // d(result)/d(true_val) = cond ? 1 : 0, so adj_true = cond ? adj_out : 0
@@ -433,9 +433,18 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // do NOT propagate gradients — they produce non-tensor values.
         PrimalOp::Passthrough(name) => {
             match name.as_str() {
-                // Shape-preserving identity: gradient flows through unchanged
-                "reshape" | "contiguous" | "squeeze" | "unsqueeze"
-                | "cos" | "sin" | "rotate_half" => {
+                // Reshape-like ops must restore the original input shape in backward.
+                "reshape" | "squeeze" | "unsqueeze" => {
+                    if op.inputs.is_empty() { vec![] }
+                    else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::ReshapeLike(output_bar, op.inputs[0]),
+                        }]
+                    }
+                }
+                // Shape-preserving identity: gradient flows through unchanged.
+                "contiguous" | "cos" | "sin" | "rotate_half" => {
                     if op.inputs.is_empty() { vec![] }
                     else {
                         vec![InputAdjoint {
@@ -936,11 +945,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reshape_backward_identity() {
-        // reshape backward should still be Identity (not ReduceToShape)
-        let op = make_op(1, PrimalOp::Passthrough("reshape".into()), vec![0]);
+    fn test_reshape_backward_restores_shape() {
+        let op = make_op(1, PrimalOp::Passthrough("reshape".into()), vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::Identity(100)));
+        assert_eq!(adj[0].input_var, 0);
+        assert!(matches!(adj[0].expr, AdjointExpr::ReshapeLike(100, 0)));
     }
 }
