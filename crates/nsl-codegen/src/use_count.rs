@@ -165,6 +165,9 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
             count_expr(counts, then_expr);
             count_expr(counts, else_expr);
         }
+        ExprKind::BlockExpr(block) => {
+            count_block(counts, block);
+        }
         ExprKind::ListLiteral(elems) | ExprKind::TupleLiteral(elems) => {
             for e in elems { count_expr(counts, e); }
         }

@@ -15,7 +15,7 @@ use nsl_ast::expr::*;
 use nsl_ast::operator::*;
 use nsl_ast::pattern::{Pattern, PatternKind};
 use nsl_ast::stmt::*;
-use nsl_ast::types::TypeExpr;
+use nsl_ast::types::{TypeExpr, TypeExprKind};
 use nsl_ast::{Module, NodeId, Symbol};
 use nsl_errors::{Diagnostic, Span};
 use nsl_lexer::Interner;
@@ -123,7 +123,24 @@ impl<'a> TypeChecker<'a> {
                     self.declare_symbol(enum_def.name, Type::Unknown, stmt.span, true, false);
                 }
                 StmtKind::TraitDef(trait_def) => {
-                    self.declare_symbol(trait_def.name, Type::Unknown, stmt.span, true, false);
+                    self.declare_symbol(
+                        trait_def.name,
+                        Type::Trait {
+                            name: trait_def.name,
+                            type_params: trait_def.type_params.iter().map(|tp| tp.name).collect(),
+                            type_args: Vec::new(),
+                            methods: Vec::new(),
+                        },
+                        stmt.span,
+                        true,
+                        false,
+                    );
+                }
+                StmtKind::TokenizerDef(def) => {
+                    self.declare_symbol(def.name, Type::Unknown, stmt.span, true, false);
+                }
+                StmtKind::DatasetDef(def) => {
+                    self.declare_symbol(def.name, Type::Unknown, stmt.span, true, false);
                 }
                 StmtKind::DatatypeDef(def) => {
                     self.declare_symbol(def.name, Type::Unknown, stmt.span, true, false);
@@ -198,6 +215,42 @@ impl<'a> TypeChecker<'a> {
             diagnostics: &mut self.diagnostics,
         };
         resolver.resolve(type_expr, self.current_scope)
+    }
+
+    fn check_type_param_bounds(&mut self, type_params: &[TypeParam]) {
+        for type_param in type_params {
+            for bound in &type_param.bounds {
+                let bound_ty = self.resolve_type(bound);
+                let unknown_non_trait = if matches!(bound_ty, Type::Unknown) {
+                    match &bound.kind {
+                        TypeExprKind::Named(sym) | TypeExprKind::Generic { name: sym, .. } => self
+                            .scopes
+                            .lookup(self.current_scope, *sym)
+                            .map(|(_, info)| matches!(info.ty, Type::Unknown))
+                            .unwrap_or(false),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+
+                if matches!(bound_ty, Type::Trait { .. } | Type::Error) {
+                    continue;
+                }
+
+                if matches!(bound_ty, Type::Unknown) && !unknown_non_trait {
+                    continue;
+                }
+
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "type parameter '{}' bound must reference a trait",
+                        self.resolve_name(type_param.name),
+                    ))
+                    .with_label(bound.span, "this bound is not a trait"),
+                );
+            }
+        }
     }
 
     fn declare_symbol(

@@ -160,6 +160,7 @@ impl<'a> TypeChecker<'a> {
                     effect: Effect::Inferred,
                 }
             }
+            ExprKind::BlockExpr(block) => self.check_block_expr(block),
             ExprKind::ListComp {
                 element,
                 generators,
@@ -190,20 +191,94 @@ impl<'a> TypeChecker<'a> {
                 self.check_expr(condition);
                 let then_ty = self.check_expr(then_expr);
                 let else_ty = self.check_expr(else_expr);
-                // Warn if either branch is NoneLiteral — this means the parser
-                // inserted a placeholder for a missing branch or non-expression tail.
-                // In value position (let x = if ...), this is almost certainly a bug.
-                if matches!(else_expr.kind, ExprKind::NoneLiteral) {
+
+                let is_parser_placeholder = |branch: &Expr| {
+                    matches!(branch.kind, ExprKind::NoneLiteral) && branch.span.is_empty()
+                };
+
+                let branch_missing_value = |branch: &Expr| match &branch.kind {
+                    ExprKind::BlockExpr(block) => !Self::block_expr_has_reachable_value(block),
+                    _ => false,
+                };
+
+                if is_parser_placeholder(then_expr) || branch_missing_value(then_expr) {
                     self.diagnostics.push(
-                        Diagnostic::warning("if-expression without else branch evaluates to None")
-                            .with_label(expr.span, "consider adding an else branch"),
+                        Diagnostic::error("if-expression then-branch must end with a value")
+                            .with_label(then_expr.span, "this branch does not yield a value"),
                     );
                 }
-                // Use the more specific type when one branch is Unknown
-                if matches!(then_ty, Type::Unknown) {
+
+                if is_parser_placeholder(else_expr) {
+                    self.diagnostics.push(
+                        Diagnostic::error("if-expression requires an else branch that yields a value")
+                            .with_label(expr.span, "add an else branch with a value"),
+                    );
+                }
+
+                if branch_missing_value(else_expr) {
+                    self.diagnostics.push(
+                        Diagnostic::error("if-expression else-branch must end with a value")
+                            .with_label(else_expr.span, "this branch does not yield a value"),
+                    );
+                }
+
+                if is_parser_placeholder(then_expr)
+                    || branch_missing_value(then_expr)
+                    || is_parser_placeholder(else_expr)
+                    || branch_missing_value(else_expr)
+                {
+                    Type::Unknown
+                } else if matches!(then_ty, Type::Unknown) {
                     else_ty
-                } else {
+                } else if matches!(else_ty, Type::Unknown) {
                     then_ty
+                } else if is_assignable(&then_ty, &else_ty) {
+                    if matches!(else_ty, Type::Function { .. }) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "if-expression function values are not supported yet"
+                            )
+                            .with_label(
+                                expr.span,
+                                "lift the function selection into a statement or bind each branch separately",
+                            ),
+                        );
+                        Type::Unknown
+                    } else {
+                        else_ty
+                    }
+                } else if is_assignable(&else_ty, &then_ty) {
+                    if matches!(then_ty, Type::Function { .. }) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "if-expression function values are not supported yet"
+                            )
+                            .with_label(
+                                expr.span,
+                                "lift the function selection into a statement or bind each branch separately",
+                            ),
+                        );
+                        Type::Unknown
+                    } else {
+                        then_ty
+                    }
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "if-expression branch type mismatch: then branch has type {}, else branch has type {}",
+                            display_type(&then_ty),
+                            display_type(&else_ty)
+                        ))
+                        .with_label(
+                            then_expr.span,
+                            format!("then branch is {}", display_type(&then_ty)),
+                        )
+                        .with_label(
+                            else_expr.span,
+                            format!("else branch is {}", display_type(&else_ty)),
+                        ),
+                    );
+                    Type::Unknown
                 }
             }
             ExprKind::Range { start, end, .. } => {
@@ -248,5 +323,232 @@ impl<'a> TypeChecker<'a> {
 
         self.type_map.insert(expr.id, ty.clone());
         ty
+    }
+}
+
+impl<'a> TypeChecker<'a> {
+    fn check_block_expr(&mut self, block: &Block) -> Type {
+        self.check_block_expr_shadowing(block, self.current_scope);
+
+        let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+        let prev = self.current_scope;
+        self.current_scope = scope;
+
+        for stmt in &block.stmts {
+            self.check_stmt(stmt);
+        }
+
+        let result_ty = if Self::block_expr_has_reachable_value(block) {
+            let last = block.stmts.last().expect("reachable block expression must have a tail statement");
+            if let StmtKind::Expr(expr) = &last.kind {
+                self.type_map.get(&expr.id).cloned().unwrap_or(Type::Unknown)
+            } else {
+                Type::Unknown
+            }
+        } else {
+            Type::Unknown
+        };
+
+        self.current_scope = prev;
+        result_ty
+    }
+
+    fn block_expr_has_reachable_value(block: &Block) -> bool {
+        let Some(last) = block.stmts.last() else {
+            return false;
+        };
+
+        if !matches!(last.kind, StmtKind::Expr(_)) {
+            return false;
+        }
+
+        block.stmts[..block.stmts.len().saturating_sub(1)]
+            .iter()
+            .all(|stmt| !Self::stmt_terminates_control_flow(stmt))
+    }
+
+    fn stmt_terminates_control_flow(stmt: &Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::Return(_) | StmtKind::Yield(_) | StmtKind::Break | StmtKind::Continue => {
+                true
+            }
+            StmtKind::If {
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
+                Self::block_terminates_control_flow(then_block)
+                    && elif_clauses
+                        .iter()
+                        .all(|(_, block)| Self::block_terminates_control_flow(block))
+                    && else_block
+                        .as_ref()
+                        .is_some_and(Self::block_terminates_control_flow)
+            }
+            StmtKind::Match { arms, .. } => {
+                !arms.is_empty()
+                    && arms
+                        .iter()
+                        .all(|arm| Self::block_terminates_control_flow(&arm.body))
+            }
+            _ => false,
+        }
+    }
+
+    fn block_terminates_control_flow(block: &Block) -> bool {
+        block.stmts
+            .last()
+            .is_some_and(Self::stmt_terminates_control_flow)
+    }
+
+    fn check_block_expr_shadowing(&mut self, block: &Block, outer_scope: ScopeId) {
+        let mut visible = std::collections::HashSet::new();
+        for stmt in &block.stmts {
+            self.check_block_expr_stmt_shadowing(stmt, outer_scope, &mut visible);
+        }
+    }
+
+    fn check_block_expr_stmt_shadowing(
+        &mut self,
+        stmt: &Stmt,
+        outer_scope: ScopeId,
+        visible: &mut std::collections::HashSet<Symbol>,
+    ) {
+        match &stmt.kind {
+            StmtKind::VarDecl { pattern, .. } => {
+                self.check_block_expr_pattern_shadowing(pattern, outer_scope, visible);
+            }
+            StmtKind::If {
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
+                let mut then_visible = visible.clone();
+                self.check_block_expr_shadowing_with_visible(then_block, outer_scope, &mut then_visible);
+                for (_, block) in elif_clauses {
+                    let mut elif_visible = visible.clone();
+                    self.check_block_expr_shadowing_with_visible(block, outer_scope, &mut elif_visible);
+                }
+                if let Some(block) = else_block {
+                    let mut else_visible = visible.clone();
+                    self.check_block_expr_shadowing_with_visible(block, outer_scope, &mut else_visible);
+                }
+            }
+            StmtKind::For { pattern, body, .. } => {
+                self.check_block_expr_pattern_shadowing(pattern, outer_scope, visible);
+                let mut body_visible = visible.clone();
+                self.check_block_expr_shadowing_with_visible(body, outer_scope, &mut body_visible);
+            }
+            StmtKind::While { body, .. } => {
+                let mut body_visible = visible.clone();
+                self.check_block_expr_shadowing_with_visible(body, outer_scope, &mut body_visible);
+            }
+            StmtKind::WhileLet { pattern, body, .. } => {
+                self.check_block_expr_pattern_shadowing(pattern, outer_scope, visible);
+                let mut body_visible = visible.clone();
+                self.check_block_expr_shadowing_with_visible(body, outer_scope, &mut body_visible);
+            }
+            StmtKind::Match { arms, .. } => {
+                for arm in arms {
+                    let mut arm_visible = visible.clone();
+                    self.check_block_expr_pattern_shadowing(&arm.pattern, outer_scope, &mut arm_visible);
+                    self.check_block_expr_shadowing_with_visible(&arm.body, outer_scope, &mut arm_visible);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_block_expr_shadowing_with_visible(
+        &mut self,
+        block: &Block,
+        outer_scope: ScopeId,
+        visible: &mut std::collections::HashSet<Symbol>,
+    ) {
+        for stmt in &block.stmts {
+            self.check_block_expr_stmt_shadowing(stmt, outer_scope, visible);
+        }
+    }
+
+    fn check_block_expr_pattern_shadowing(
+        &mut self,
+        pattern: &Pattern,
+        outer_scope: ScopeId,
+        visible: &mut std::collections::HashSet<Symbol>,
+    ) {
+        match &pattern.kind {
+            PatternKind::Ident(sym) => {
+                if visible.contains(sym) || self.scopes.lookup(outer_scope, *sym).is_some() {
+                    let name = self.resolve_name(*sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "shadowing outer binding `{name}` inside an if-expression block is not supported yet"
+                        ))
+                        .with_label(pattern.span, "rename this binding or lift it out of the if-expression"),
+                    );
+                }
+                visible.insert(*sym);
+            }
+            PatternKind::Tuple(items) | PatternKind::List(items) => {
+                for item in items {
+                    self.check_block_expr_pattern_shadowing(item, outer_scope, visible);
+                }
+            }
+            PatternKind::Struct { fields, rest } => {
+                for field in fields {
+                    if let Some(pattern) = &field.pattern {
+                        self.check_block_expr_pattern_shadowing(pattern, outer_scope, visible);
+                    } else {
+                        self.check_block_expr_pattern_shadowing(
+                            &Pattern {
+                                kind: PatternKind::Ident(field.name),
+                                span: field.span,
+                                id: pattern.id,
+                            },
+                            outer_scope,
+                            visible,
+                        );
+                    }
+                }
+                if let Some(rest) = rest {
+                    if visible.contains(rest) || self.scopes.lookup(outer_scope, *rest).is_some() {
+                        let name = self.resolve_name(*rest);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "shadowing outer binding `{name}` inside an if-expression block is not supported yet"
+                            ))
+                            .with_label(pattern.span, "rename this binding or lift it out of the if-expression"),
+                        );
+                    }
+                    visible.insert(*rest);
+                }
+            }
+            PatternKind::Constructor { args, .. } | PatternKind::Or(args) => {
+                for arg in args {
+                    self.check_block_expr_pattern_shadowing(arg, outer_scope, visible);
+                }
+            }
+            PatternKind::Guarded { pattern: inner, .. } => {
+                self.check_block_expr_pattern_shadowing(inner, outer_scope, visible);
+            }
+            PatternKind::Rest(Some(sym)) => {
+                if visible.contains(sym) || self.scopes.lookup(outer_scope, *sym).is_some() {
+                    let name = self.resolve_name(*sym);
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "shadowing outer binding `{name}` inside an if-expression block is not supported yet"
+                        ))
+                        .with_label(pattern.span, "rename this binding or lift it out of the if-expression"),
+                    );
+                }
+                visible.insert(*sym);
+            }
+            PatternKind::Typed { pattern: inner, .. } => {
+                self.check_block_expr_pattern_shadowing(inner, outer_scope, visible);
+            }
+            _ => {}
+        }
     }
 }

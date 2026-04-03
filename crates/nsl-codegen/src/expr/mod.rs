@@ -98,6 +98,9 @@ impl Compiler<'_> {
             ExprKind::Lambda { params, body } => {
                 self.compile_lambda(builder, state, params, body)
             }
+            ExprKind::BlockExpr(block) => {
+                self.compile_block_expr(builder, state, block)
+            }
             ExprKind::TupleLiteral(elements) => {
                 self.compile_tuple_literal(builder, state, elements)
             }

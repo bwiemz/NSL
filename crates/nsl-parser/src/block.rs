@@ -499,6 +499,80 @@ pub fn parse_kernel_def_stmt(p: &mut Parser) -> Stmt {
 }
 
 pub fn parse_tokenizer_def_stmt(p: &mut Parser) -> Stmt {
+    fn parse_key_value_entry(p: &mut Parser) -> KeyValueEntry {
+        let start = p.current_span();
+        let (key, _) = p.expect_ident();
+        p.expect(&TokenKind::Eq);
+        let value = parse_expr(p);
+        let span = start.merge(value.span);
+        KeyValueEntry { key, value, span }
+    }
+
+    fn parse_key_value_block(p: &mut Parser) -> Vec<KeyValueEntry> {
+        p.skip_newlines();
+        p.expect(&TokenKind::Indent);
+        p.skip_newlines();
+
+        let mut entries = Vec::new();
+        while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+            p.skip_newlines();
+            if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
+                break;
+            }
+            if !matches!(p.peek(), TokenKind::Ident(_)) || !matches!(p.peek_at(1), &TokenKind::Eq) {
+                p.diagnostics.push(
+                    nsl_errors::Diagnostic::error("expected key = value entry")
+                        .with_label(p.current_span(), "invalid tokenizer entry"),
+                );
+                p.synchronize();
+                p.eat(&TokenKind::Newline);
+                continue;
+            }
+            let entry = parse_key_value_entry(p);
+            p.expect_end_of_stmt();
+            entries.push(entry);
+            p.skip_newlines();
+        }
+        p.eat(&TokenKind::Dedent);
+        entries
+    }
+
+    fn parse_inline_key_values(p: &mut Parser) -> Vec<KeyValueEntry> {
+        let mut entries = Vec::new();
+        loop {
+            let entry = parse_key_value_entry(p);
+            entries.push(entry);
+            if !p.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        entries
+    }
+
+    fn parse_rule_list(p: &mut Parser) -> Vec<nsl_ast::Symbol> {
+        let mut rules = Vec::new();
+        loop {
+            let (rule, _) = p.expect_ident();
+            rules.push(rule);
+            if !p.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        rules
+    }
+
+    fn skip_unknown_tokenizer_section(p: &mut Parser) {
+        if p.eat(&TokenKind::Newline) {
+            p.skip_newlines();
+            if p.at(&TokenKind::Indent) {
+                let _ = p.parse_block();
+                return;
+            }
+        }
+        p.synchronize();
+        p.eat(&TokenKind::Newline);
+    }
+
     let start = p.current_span();
     p.advance(); // consume 'tokenizer'
 
@@ -524,7 +598,72 @@ pub fn parse_tokenizer_def_stmt(p: &mut Parser) -> Stmt {
         if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
             break;
         }
-        stmts.push(crate::stmt::parse_stmt(p));
+
+        if let TokenKind::Ident(sym) = p.peek().clone() {
+            let section_span = p.current_span();
+            let section_name = p.interner.resolve(sym).unwrap_or("").to_string();
+            p.advance();
+            p.expect(&TokenKind::Colon);
+
+            match section_name.as_str() {
+                "special_tokens" => {
+                    let entries = parse_key_value_block(p);
+                    let span = section_span.merge(p.prev_span());
+                    stmts.push(TokenizerStmt::SpecialTokens { entries, span });
+                }
+                "normalize" => {
+                    let rules = parse_rule_list(p);
+                    p.expect_end_of_stmt();
+                    let span = section_span.merge(p.prev_span());
+                    stmts.push(TokenizerStmt::Normalize { rules, span });
+                }
+                "pre_tokenize" => {
+                    let rules = parse_rule_list(p);
+                    p.expect_end_of_stmt();
+                    let span = section_span.merge(p.prev_span());
+                    stmts.push(TokenizerStmt::PreTokenize { rules, span });
+                }
+                "padding" => {
+                    let entries = if p.eat(&TokenKind::Newline) {
+                        parse_key_value_block(p)
+                    } else {
+                        let entries = parse_inline_key_values(p);
+                        p.expect_end_of_stmt();
+                        entries
+                    };
+                    let span = section_span.merge(p.prev_span());
+                    stmts.push(TokenizerStmt::Padding { entries, span });
+                }
+                "truncation" => {
+                    let entries = if p.eat(&TokenKind::Newline) {
+                        parse_key_value_block(p)
+                    } else {
+                        let entries = parse_inline_key_values(p);
+                        p.expect_end_of_stmt();
+                        entries
+                    };
+                    let span = section_span.merge(p.prev_span());
+                    stmts.push(TokenizerStmt::Truncation { entries, span });
+                }
+                _ => {
+                    p.diagnostics.push(
+                        nsl_errors::Diagnostic::error(format!(
+                            "unexpected tokenizer section '{section_name}'"
+                        ))
+                        .with_label(section_span, "unexpected tokenizer section"),
+                    );
+                    skip_unknown_tokenizer_section(p);
+                }
+            }
+            continue;
+        }
+
+        p.diagnostics.push(
+            nsl_errors::Diagnostic::error("expected tokenizer section")
+                .with_label(p.current_span(), "invalid tokenizer body entry"),
+        );
+        p.synchronize();
+        p.eat(&TokenKind::Newline);
     }
     p.eat(&TokenKind::Dedent);
 
@@ -562,7 +701,23 @@ pub fn parse_dataset_def_stmt(p: &mut Parser) -> Stmt {
         if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
             break;
         }
-        stmts.push(crate::stmt::parse_stmt(p));
+        if !matches!(p.peek(), TokenKind::Ident(_)) || !matches!(p.peek_at(1), &TokenKind::Eq) {
+            p.diagnostics.push(
+                nsl_errors::Diagnostic::error("expected dataset field assignment")
+                    .with_label(p.current_span(), "invalid dataset body entry"),
+            );
+            p.synchronize();
+            p.eat(&TokenKind::Newline);
+            continue;
+        }
+
+        let start = p.current_span();
+        let (key, _) = p.expect_ident();
+        p.expect(&TokenKind::Eq);
+        let value = parse_expr(p);
+        p.expect_end_of_stmt();
+        let span = start.merge(value.span);
+        stmts.push(KeyValueEntry { key, value, span });
     }
     p.eat(&TokenKind::Dedent);
 
@@ -908,6 +1063,52 @@ mod serve_tests {
             assert_eq!(sb.endpoints.len(), 1);
         } else {
             panic!("Expected ServeBlock");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_dataset_tests {
+    use nsl_ast::block::TokenizerStmt;
+
+    #[test]
+    fn parse_tokenizer_dsl_sections() {
+        let source = "tokenizer tok(algorithm=bpe, vocab_size=1024):\n    special_tokens:\n        pad = \"<pad>\"\n        eos = \"<eos>\"\n\n    normalize: nfkc, lowercase\n    pre_tokenize: whitespace, byte_fallback\n\n    padding:\n        side = left\n        pad_to = longest\n\n    truncation:\n        max_length = 128\n        strategy = longest_first\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let file_id = nsl_errors::FileId(0);
+        let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
+        let result = crate::parse(&tokens, &mut interner);
+
+        assert!(result.diagnostics.is_empty(), "unexpected parser diagnostics: {:?}", result.diagnostics);
+        assert_eq!(result.module.stmts.len(), 1);
+
+        if let nsl_ast::stmt::StmtKind::TokenizerDef(tok) = &result.module.stmts[0].kind {
+            assert_eq!(tok.body.len(), 5);
+            assert!(matches!(tok.body[0], TokenizerStmt::SpecialTokens { .. }));
+            assert!(matches!(tok.body[1], TokenizerStmt::Normalize { .. }));
+            assert!(matches!(tok.body[2], TokenizerStmt::PreTokenize { .. }));
+            assert!(matches!(tok.body[3], TokenizerStmt::Padding { .. }));
+            assert!(matches!(tok.body[4], TokenizerStmt::Truncation { .. }));
+        } else {
+            panic!("Expected TokenizerDef");
+        }
+    }
+
+    #[test]
+    fn parse_dataset_field_entries() {
+        let source = "dataset train_data(\"demo\"):\n    source = \"data.bin\"\n    sequence_length = 128\n    packing = true\n    pack_separator = 0\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let file_id = nsl_errors::FileId(0);
+        let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
+        let result = crate::parse(&tokens, &mut interner);
+
+        assert!(result.diagnostics.is_empty(), "unexpected parser diagnostics: {:?}", result.diagnostics);
+        assert_eq!(result.module.stmts.len(), 1);
+
+        if let nsl_ast::stmt::StmtKind::DatasetDef(ds) = &result.module.stmts[0].kind {
+            assert_eq!(ds.body.len(), 4);
+        } else {
+            panic!("Expected DatasetDef");
         }
     }
 }

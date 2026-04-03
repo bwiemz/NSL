@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::types::{DeviceExpr, DimExpr as AstDimExpr, DimValue, TypeExpr, TypeExprKind};
 use nsl_ast::Symbol;
@@ -177,11 +179,161 @@ impl<'a> TypeResolver<'a> {
                 }
             }
             _ => {
-                // For user-defined generics, just resolve the base name for now.
-                // Full generic instantiation deferred to M3.
-                self.resolve_named(name, span, scope)
+                let base = self.resolve_named(name, span, scope);
+                match base {
+                    Type::Struct {
+                        name,
+                        type_params,
+                        fields,
+                        ..
+                    } => {
+                        let Some((type_args, bindings)) =
+                            self.resolve_user_bindings(&name_str, &type_params, args, span, scope)
+                        else {
+                            return Type::Error;
+                        };
+                        Type::Struct {
+                            name,
+                            type_params,
+                            type_args,
+                            fields: fields
+                                .iter()
+                                .map(|(field_name, field_ty)| {
+                                    (*field_name, substitute_type(field_ty, &bindings))
+                                })
+                                .collect(),
+                        }
+                    }
+                    Type::Enum {
+                        name,
+                        type_params,
+                        variants,
+                        ..
+                    } => {
+                        let Some((type_args, bindings)) =
+                            self.resolve_user_bindings(&name_str, &type_params, args, span, scope)
+                        else {
+                            return Type::Error;
+                        };
+                        Type::Enum {
+                            name,
+                            type_params,
+                            type_args,
+                            variants: variants
+                                .iter()
+                                .map(|(variant_name, field_tys)| {
+                                    (
+                                        *variant_name,
+                                        field_tys
+                                            .iter()
+                                            .map(|field_ty| substitute_type(field_ty, &bindings))
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        }
+                    }
+                    Type::Trait {
+                        name,
+                        type_params,
+                        methods,
+                        ..
+                    } => {
+                        let Some((type_args, bindings)) =
+                            self.resolve_user_bindings(&name_str, &type_params, args, span, scope)
+                        else {
+                            return Type::Error;
+                        };
+                        Type::Trait {
+                            name,
+                            type_params,
+                            type_args,
+                            methods: methods
+                                .iter()
+                                .map(|(method_name, method_ty)| {
+                                    (*method_name, substitute_type(method_ty, &bindings))
+                                })
+                                .collect(),
+                        }
+                    }
+                    Type::Model {
+                        name,
+                        type_params,
+                        fields,
+                        methods,
+                        ..
+                    } => {
+                        let Some((type_args, bindings)) =
+                            self.resolve_user_bindings(&name_str, &type_params, args, span, scope)
+                        else {
+                            return Type::Error;
+                        };
+                        Type::Model {
+                            name,
+                            type_params,
+                            type_args,
+                            fields: fields
+                                .iter()
+                                .map(|(field_name, field_ty)| {
+                                    (*field_name, substitute_type(field_ty, &bindings))
+                                })
+                                .collect(),
+                            methods: methods
+                                .iter()
+                                .map(|(method_name, method_ty)| {
+                                    (*method_name, substitute_type(method_ty, &bindings))
+                                })
+                                .collect(),
+                        }
+                    }
+                    Type::Unknown | Type::Error => base,
+                    _ => {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("type `{name_str}` is not generic"))
+                                .with_label(span, "unexpected type arguments"),
+                        );
+                        Type::Error
+                    }
+                }
             }
         }
+    }
+
+    fn resolve_user_bindings(
+        &mut self,
+        name: &str,
+        type_params: &[Symbol],
+        args: &[TypeExpr],
+        span: Span,
+        scope: ScopeId,
+    ) -> Option<(Vec<Type>, HashMap<Symbol, Type>)> {
+        if type_params.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(format!("type `{name}` is not generic"))
+                    .with_label(span, "unexpected type arguments"),
+            );
+            return None;
+        }
+
+        if type_params.len() != args.len() {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "{name} expects {} type argument(s), got {}",
+                    type_params.len(),
+                    args.len()
+                ))
+                .with_label(span, "wrong number of type arguments"),
+            );
+            return None;
+        }
+
+        let type_args: Vec<Type> = args.iter().map(|arg| self.resolve(arg, scope)).collect();
+        let bindings = type_params
+            .iter()
+            .copied()
+            .zip(type_args.iter().cloned())
+            .collect();
+        Some((type_args, bindings))
     }
 
     fn resolve_shape(&self, dims: &[AstDimExpr]) -> Shape {
@@ -305,5 +457,208 @@ impl<'a> TypeResolver<'a> {
                 }).unwrap_or(Effect::pure())
             }
         }
+    }
+}
+
+fn nested_generic_bindings(
+    bindings: &HashMap<Symbol, Type>,
+    type_params: &[Symbol],
+    type_args: &[Type],
+) -> HashMap<Symbol, Type> {
+    // An uninstantiated nested nominal type still owns its own type parameters.
+    // Drop same-named outer bindings so Wrapper<T> containing Box<T> keeps Box
+    // generic until Box itself is instantiated.
+    if type_args.is_empty() && !type_params.is_empty() {
+        let mut shadowed = bindings.clone();
+        for param in type_params {
+            shadowed.remove(param);
+        }
+        shadowed
+    } else {
+        bindings.clone()
+    }
+}
+
+fn substitute_type(ty: &Type, bindings: &HashMap<Symbol, Type>) -> Type {
+    match ty {
+        Type::TypeVar(sym) => bindings.get(sym).cloned().unwrap_or(Type::TypeVar(*sym)),
+        Type::List(inner) => Type::List(Box::new(substitute_type(inner, bindings))),
+        Type::Dict(key, value) => Type::Dict(
+            Box::new(substitute_type(key, bindings)),
+            Box::new(substitute_type(value, bindings)),
+        ),
+        Type::Tuple(items) => {
+            Type::Tuple(items.iter().map(|item| substitute_type(item, bindings)).collect())
+        }
+        Type::Optional(inner) => Type::Optional(Box::new(substitute_type(inner, bindings))),
+        Type::Function { params, ret, effect } => Type::Function {
+            params: params.iter().map(|param| substitute_type(param, bindings)).collect(),
+            ret: Box::new(substitute_type(ret, bindings)),
+            effect: effect.clone(),
+        },
+        Type::Borrow(inner) => Type::Borrow(Box::new(substitute_type(inner, bindings))),
+        Type::Struct {
+            name,
+            type_params,
+            type_args,
+            fields,
+        } => {
+            let effective_bindings = nested_generic_bindings(bindings, type_params, type_args);
+            Type::Struct {
+                name: *name,
+                type_params: type_params.clone(),
+                type_args: type_args
+                    .iter()
+                    .map(|arg| substitute_type(arg, &effective_bindings))
+                    .collect(),
+                fields: fields
+                    .iter()
+                    .map(|(field_name, field_ty)| {
+                        (*field_name, substitute_type(field_ty, &effective_bindings))
+                    })
+                    .collect(),
+            }
+        }
+        Type::Enum {
+            name,
+            type_params,
+            type_args,
+            variants,
+        } => {
+            let effective_bindings = nested_generic_bindings(bindings, type_params, type_args);
+            Type::Enum {
+                name: *name,
+                type_params: type_params.clone(),
+                type_args: type_args
+                    .iter()
+                    .map(|arg| substitute_type(arg, &effective_bindings))
+                    .collect(),
+                variants: variants
+                    .iter()
+                    .map(|(variant_name, field_tys)| {
+                        (
+                            *variant_name,
+                            field_tys
+                                .iter()
+                                .map(|field_ty| substitute_type(field_ty, &effective_bindings))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        Type::Trait {
+            name,
+            type_params,
+            type_args,
+            methods,
+        } => {
+            let effective_bindings = nested_generic_bindings(bindings, type_params, type_args);
+            Type::Trait {
+                name: *name,
+                type_params: type_params.clone(),
+                type_args: type_args
+                    .iter()
+                    .map(|arg| substitute_type(arg, &effective_bindings))
+                    .collect(),
+                methods: methods
+                    .iter()
+                    .map(|(method_name, method_ty)| {
+                        (*method_name, substitute_type(method_ty, &effective_bindings))
+                    })
+                    .collect(),
+            }
+        }
+        Type::Model {
+            name,
+            type_params,
+            type_args,
+            fields,
+            methods,
+        } => {
+            let effective_bindings = nested_generic_bindings(bindings, type_params, type_args);
+            Type::Model {
+                name: *name,
+                type_params: type_params.clone(),
+                type_args: type_args
+                    .iter()
+                    .map(|arg| substitute_type(arg, &effective_bindings))
+                    .collect(),
+                fields: fields
+                    .iter()
+                    .map(|(field_name, field_ty)| {
+                        (*field_name, substitute_type(field_ty, &effective_bindings))
+                    })
+                    .collect(),
+                methods: methods
+                    .iter()
+                    .map(|(method_name, method_ty)| {
+                        (*method_name, substitute_type(method_ty, &effective_bindings))
+                    })
+                    .collect(),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use string_interner::backend::BucketBackend;
+    use string_interner::{DefaultSymbol, StringInterner};
+
+    type TestInterner = StringInterner<BucketBackend<DefaultSymbol>>;
+
+    fn sym(interner: &mut TestInterner, name: &str) -> Symbol {
+        Symbol(interner.get_or_intern(name))
+    }
+
+    #[test]
+    fn substitute_type_instantiates_generic_enum_variants() {
+        let mut interner = TestInterner::new();
+        let t = sym(&mut interner, "T");
+        let e = sym(&mut interner, "E");
+        let result = sym(&mut interner, "Result");
+        let ok = sym(&mut interner, "Ok");
+        let err = sym(&mut interner, "Err");
+
+        let ty = Type::Enum {
+            name: result,
+            type_params: vec![t, e],
+            type_args: vec![Type::TypeVar(t), Type::TypeVar(e)],
+            variants: vec![(ok, vec![Type::TypeVar(t)]), (err, vec![Type::TypeVar(e)])],
+        };
+
+        let bindings = HashMap::from([(t, Type::Int), (e, Type::Str)]);
+
+        assert_eq!(
+            substitute_type(&ty, &bindings),
+            Type::Enum {
+                name: result,
+                type_params: vec![t, e],
+                type_args: vec![Type::Int, Type::Str],
+                variants: vec![(ok, vec![Type::Int]), (err, vec![Type::Str])],
+            }
+        );
+    }
+
+    #[test]
+    fn substitute_type_preserves_uninstantiated_inner_generic_type_params() {
+        let mut interner = TestInterner::new();
+        let t = sym(&mut interner, "T");
+        let box_name = sym(&mut interner, "Box");
+        let value = sym(&mut interner, "value");
+
+        let ty = Type::Struct {
+            name: box_name,
+            type_params: vec![t],
+            type_args: Vec::new(),
+            fields: vec![(value, Type::TypeVar(t))],
+        };
+
+        let bindings = HashMap::from([(t, Type::Int)]);
+
+        assert_eq!(substitute_type(&ty, &bindings), ty);
     }
 }

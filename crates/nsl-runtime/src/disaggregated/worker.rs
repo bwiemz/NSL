@@ -26,7 +26,8 @@ struct WorkerContext {
     kv_cache_handle: i64, // opaque KvCacheManager handle (0 = not set)
 }
 
-/// Configuration for worker loops, passed from the router.
+/// Configuration for worker loops, passed from codegen/router FFI.
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     /// Maximum sequence length before forcing EOS.
@@ -41,6 +42,14 @@ pub struct WorkerConfig {
     pub head_dim: u32,
     /// Number of transformer layers.
     pub num_layers: u32,
+    /// Number of speculative draft tokens reserved per decode iteration.
+    pub speculative_tokens: u32,
+    /// Speculative method selector: 0=Draft, 1=Medusa, 2=Eagle2, 3=Lookahead.
+    pub speculative_method: u32,
+    /// Branching factor for tree-based speculative methods.
+    pub speculative_tree_width: u32,
+    /// `f32::to_bits()` for the configured speculative temperature.
+    pub speculative_temperature_bits: u32,
     /// EOS token ID.
     pub eos_token_id: i64,
 }
@@ -54,6 +63,10 @@ impl Default for WorkerConfig {
             num_kv_heads: 32,
             head_dim: 128,
             num_layers: 32,
+            speculative_tokens: 0,
+            speculative_method: 0,
+            speculative_tree_width: 1,
+            speculative_temperature_bits: 0,
             eos_token_id: 2,
         }
     }
@@ -547,8 +560,16 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
         WorkerConfig::default()
     };
 
-    // Active sequences being decoded: request_id -> (tokens_generated, max_tokens, last_token_id)
-    let mut active_sequences: std::collections::HashMap<u64, (u32, u32, i64)> =
+    // Structured speculative config is now threaded into the worker loop via
+    // WorkerConfig instead of the old non-null sentinel-pointer hack.
+    let _speculative_tokens = config.speculative_tokens;
+    let _speculative_method = config.speculative_method;
+    let _speculative_tree_width = config.speculative_tree_width;
+    let _speculative_temperature = f32::from_bits(config.speculative_temperature_bits);
+
+    // Active sequences being decoded:
+    // request_id -> (prompt_len, tokens_generated, max_tokens, last_token_id)
+    let mut active_sequences: std::collections::HashMap<u64, (u32, u32, u32, i64)> =
         std::collections::HashMap::new();
 
     // KV transfer backend for receiving from prefill workers
@@ -566,7 +587,18 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                 }
                 // Process one decode step per active sequence
                 let mut completed = Vec::new();
-                for (&request_id, (tokens_generated, max_tokens, last_token_id)) in active_sequences.iter_mut() {
+                for (&request_id, (prompt_len, tokens_generated, max_tokens, last_token_id)) in active_sequences.iter_mut() {
+                    if *tokens_generated >= *max_tokens
+                        || prompt_len.saturating_add(*tokens_generated) >= config.max_seq_len
+                    {
+                        post_response(&RouterMessage::DecodeComplete {
+                            request_id,
+                            total_tokens: *tokens_generated,
+                        });
+                        completed.push(request_id);
+                        continue;
+                    }
+
                     // Step 2: Run model decode step.
                     // When model_ptr is valid, pass the last token through the model
                     // and sample from the output logits.
@@ -603,9 +635,10 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                     *last_token_id = token_id;
                     *tokens_generated += 1;
 
+                    let total_seq_len = prompt_len.saturating_add(*tokens_generated);
                     let is_eos = token_id == config.eos_token_id
                         || *tokens_generated >= *max_tokens
-                        || *tokens_generated >= config.max_seq_len;
+                        || total_seq_len >= config.max_seq_len;
 
                     // Step 3: Stream token to router
                     post_response(&RouterMessage::TokenGenerated {
@@ -633,7 +666,7 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
         match msg {
             RouterMessage::StartDecode {
                 request_id,
-                prompt_len: _,
+                prompt_len,
                 max_tokens,
                 temperature_bits: _,
                 top_p_bits: _,
@@ -641,7 +674,7 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                 // Admit new sequence into active set.
                 // last_token_id starts at 0 (BOS); prefill would have set this
                 // via the KV transfer but for stub mode we use 0.
-                active_sequences.insert(request_id, (0, max_tokens, 0));
+                active_sequences.insert(request_id, (prompt_len, 0, max_tokens, 0));
             }
             _ => {
                 // Unexpected message — ignore
@@ -719,6 +752,31 @@ mod tests {
     }
 
     #[test]
+    fn worker_config_struct_carries_speculative_fields() {
+        let _lock = setup();
+        let cfg = WorkerConfig {
+            max_seq_len: 1024,
+            kv_blocks_per_worker: 96,
+            block_size: 16,
+            num_kv_heads: 32,
+            head_dim: 128,
+            num_layers: 32,
+            speculative_tokens: 4,
+            speculative_method: 2,
+            speculative_tree_width: 3,
+            speculative_temperature_bits: 0.75f32.to_bits(),
+            eos_token_id: 2,
+        };
+
+        assert_eq!(cfg.max_seq_len, 1024);
+        assert_eq!(cfg.kv_blocks_per_worker, 96);
+        assert_eq!(cfg.speculative_tokens, 4);
+        assert_eq!(cfg.speculative_method, 2);
+        assert_eq!(cfg.speculative_tree_width, 3);
+        assert_eq!(cfg.speculative_temperature_bits, 0.75f32.to_bits());
+    }
+
+    #[test]
     fn prefill_processes_start_prefill_message() {
         let _lock = setup();
         assert_eq!(nsl_disagg_worker_init(1, 0, 0), 0);
@@ -744,6 +802,44 @@ mod tests {
                 assert_eq!(*num_kv_blocks, 8);
             }
             other => panic!("expected PrefillComplete, got {:?}", other),
+        }
+
+        assert_eq!(nsl_disagg_worker_destroy(), 0);
+    }
+
+    #[test]
+    fn prefill_loop_respects_custom_worker_config() {
+        let _lock = setup();
+        assert_eq!(nsl_disagg_worker_init(1, 0, 0), 0);
+
+        post_message(&RouterMessage::StartPrefill {
+            request_id: 77,
+            token_ids_ptr: 0,
+            num_tokens: 17,
+            target_decode_rank: 1,
+        });
+
+        let cfg = WorkerConfig {
+            max_seq_len: 2048,
+            kv_blocks_per_worker: 64,
+            block_size: 8,
+            num_kv_heads: 32,
+            head_dim: 128,
+            num_layers: 32,
+            speculative_tokens: 0,
+            speculative_method: 0,
+            speculative_tree_width: 1,
+            speculative_temperature_bits: 0,
+            eos_token_id: 2,
+        };
+        assert_eq!(nsl_disagg_prefill_loop(&cfg as *const WorkerConfig as i64), 0);
+
+        let responses = drain_responses();
+        let complete = responses.iter().find(|m| matches!(m, RouterMessage::PrefillComplete { .. }));
+        assert!(complete.is_some(), "prefill should complete request 77");
+        if let Some(RouterMessage::PrefillComplete { request_id, num_kv_blocks }) = complete {
+            assert_eq!(*request_id, 77);
+            assert_eq!(*num_kv_blocks, 3, "17 tokens with block_size=8 should use 3 KV blocks");
         }
 
         assert_eq!(nsl_disagg_worker_destroy(), 0);
@@ -788,6 +884,138 @@ mod tests {
         if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
             assert_eq!(*request_id, 99);
             assert_eq!(*total_tokens, 3);
+        }
+
+        assert_eq!(nsl_disagg_worker_destroy(), 0);
+    }
+
+    #[test]
+    fn decode_loop_respects_custom_worker_config() {
+        let _lock = setup();
+        assert_eq!(nsl_disagg_worker_init(2, 1, 0), 0);
+
+        post_message(&RouterMessage::StartDecode {
+            request_id: 7,
+            prompt_len: 10,
+            max_tokens: 3,
+            temperature_bits: 0.7f64.to_bits(),
+            top_p_bits: 0.9f64.to_bits(),
+        });
+
+        let cfg = WorkerConfig {
+            max_seq_len: 1,
+            kv_blocks_per_worker: 64,
+            block_size: 16,
+            num_kv_heads: 32,
+            head_dim: 128,
+            num_layers: 32,
+            speculative_tokens: 2,
+            speculative_method: 1,
+            speculative_tree_width: 4,
+            speculative_temperature_bits: 0.25f32.to_bits(),
+            eos_token_id: 2,
+        };
+        assert_eq!(nsl_disagg_decode_loop(&cfg as *const WorkerConfig as i64), 0);
+
+        let responses = drain_responses();
+        let token_msgs: Vec<_> = responses.iter()
+            .filter(|m| matches!(m, RouterMessage::TokenGenerated { .. }))
+            .collect();
+        let complete_msgs: Vec<_> = responses.iter()
+            .filter(|m| matches!(m, RouterMessage::DecodeComplete { .. }))
+            .collect();
+
+        assert!(token_msgs.is_empty(), "prompt_len already exceeds max_seq_len, so decode should emit no tokens");
+        assert_eq!(complete_msgs.len(), 1, "custom max_seq_len should still complete the request");
+        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+            assert_eq!(*request_id, 7);
+            assert_eq!(*total_tokens, 0);
+        }
+
+        assert_eq!(nsl_disagg_worker_destroy(), 0);
+    }
+
+    #[test]
+    fn decode_loop_respects_zero_max_tokens() {
+        let _lock = setup();
+        assert_eq!(nsl_disagg_worker_init(2, 1, 0), 0);
+
+        post_message(&RouterMessage::StartDecode {
+            request_id: 8,
+            prompt_len: 0,
+            max_tokens: 0,
+            temperature_bits: 1.0f64.to_bits(),
+            top_p_bits: 1.0f64.to_bits(),
+        });
+
+        assert_eq!(nsl_disagg_decode_loop(0), 0);
+
+        let responses = drain_responses();
+        let token_msgs: Vec<_> = responses
+            .iter()
+            .filter(|m| matches!(m, RouterMessage::TokenGenerated { .. }))
+            .collect();
+        let complete_msgs: Vec<_> = responses
+            .iter()
+            .filter(|m| matches!(m, RouterMessage::DecodeComplete { .. }))
+            .collect();
+
+        assert!(token_msgs.is_empty(), "max_tokens=0 should emit no tokens");
+        assert_eq!(complete_msgs.len(), 1, "max_tokens=0 should complete immediately");
+        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+            assert_eq!(*request_id, 8);
+            assert_eq!(*total_tokens, 0);
+        }
+
+        assert_eq!(nsl_disagg_worker_destroy(), 0);
+    }
+
+    #[test]
+    fn decode_loop_stops_exactly_at_sequence_length_boundary() {
+        let _lock = setup();
+        assert_eq!(nsl_disagg_worker_init(2, 1, 0), 0);
+
+        post_message(&RouterMessage::StartDecode {
+            request_id: 9,
+            prompt_len: 2,
+            max_tokens: 5,
+            temperature_bits: 1.0f64.to_bits(),
+            top_p_bits: 1.0f64.to_bits(),
+        });
+
+        let cfg = WorkerConfig {
+            max_seq_len: 3,
+            kv_blocks_per_worker: 64,
+            block_size: 16,
+            num_kv_heads: 32,
+            head_dim: 128,
+            num_layers: 32,
+            speculative_tokens: 0,
+            speculative_method: 0,
+            speculative_tree_width: 1,
+            speculative_temperature_bits: 0,
+            eos_token_id: 2,
+        };
+        assert_eq!(nsl_disagg_decode_loop(&cfg as *const WorkerConfig as i64), 0);
+
+        let responses = drain_responses();
+        let token_msgs: Vec<_> = responses
+            .iter()
+            .filter(|m| matches!(m, RouterMessage::TokenGenerated { .. }))
+            .collect();
+        let complete_msgs: Vec<_> = responses
+            .iter()
+            .filter(|m| matches!(m, RouterMessage::DecodeComplete { .. }))
+            .collect();
+
+        assert_eq!(token_msgs.len(), 1, "one final token should be emitted when it lands exactly on max_seq_len");
+        assert_eq!(complete_msgs.len(), 1, "request should complete at the exact sequence-length boundary");
+        if let RouterMessage::TokenGenerated { is_eos, .. } = token_msgs[0] {
+            assert_eq!(*is_eos, 1, "the boundary token should terminate the sequence");
+        }
+        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+            assert_eq!(*request_id, 9);
+            assert_eq!(*total_tokens, 1);
         }
 
         assert_eq!(nsl_disagg_worker_destroy(), 0);

@@ -124,6 +124,12 @@ impl Compiler<'_> {
             ExprKind::MemberAccess { object, .. } | ExprKind::Paren(object) => {
                 self.collect_strings_in_expr(object)
             }
+            ExprKind::BlockExpr(block) => {
+                for stmt in &block.stmts {
+                    self.collect_strings_in_stmt(stmt)?;
+                }
+                Ok(())
+            }
             ExprKind::IfExpr { condition, then_expr, else_expr } => {
                 self.collect_strings_in_expr(condition)?;
                 self.collect_strings_in_expr(then_expr)?;

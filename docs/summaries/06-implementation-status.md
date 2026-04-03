@@ -1,18 +1,18 @@
 # NeuralScript: Implementation Status & Maturity Assessment
 
-**Last updated:** 2026-03-26
-**Audit method:** Full codebase scan (282 files, ~131,800 LOC), stub pattern analysis, NotebookLM cross-reference
+**Last updated:** 2026-04-02
+**Audit method:** Full codebase scan (285 Rust source files, ~131,800 LOC), stub pattern analysis, NotebookLM cross-reference
 
 ## Version History
 - **v0.1.0** (2026-03-12): Core language, tensors, autodiff, models, training DSL, GPU/CUDA
-- **v0.2.0** (2026-03-15): Production inference — PagedAttention, FlashAttention, continuous batching, tensor parallelism, graph fusion
-- **v0.9.0** (current): All M9-M62 compiler/runtime features implemented — FlashAttention-3 (Hopper wgmma), 50+ AD rules, EAGLE-2 dynamic draft trees + Lookahead decoding, MXFP8/NVFP4 Blackwell quantization, FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, cost-guided fusion, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, disaggregated worker loops, NVLink/RDMA/TCP KV transfer, GPTQ OBQ algorithm, x86_64 unikernel boot stub
+- **v0.2.0** (2026-03-15): Inference-focused release — PagedAttention, FlashAttention, continuous batching, plus early tensor-parallel and graph-fusion work
+- **v0.9.0** (current): Most M9-M62 compiler/runtime features have landed — FlashAttention-3 scaffolding, 50+ AD rules, speculative decoding core with lookahead plus tree-method scaffolding, Blackwell quantization scaffolding (MXFP8/NVFP4 helpers and runtime quantizers), FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, fusion analysis/profitability scaffolding, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, and x86_64 unikernel boot-stub generation. Some subsystems still retain deferred or fallback-only paths (for example RDMA ibverbs wiring, GDS cuFile integration, parts of speculative serving, and several backend-specific runtime paths).
 
 ## Codebase Size
-- ~131,800 lines of Rust across 282 files in 8 crates
-- 120+ runtime source files (~48,000 LOC)
-- 85+ codegen source files (~52,000 LOC)
-- 31 semantic analysis files (~8,000 LOC)
+- ~131,800 lines of Rust across 285 files in 8 crates
+- 128 runtime source files (51,574 LOC)
+- 84 codegen source files (49,991 LOC)
+- 34 semantic analysis files (10,809 LOC)
 - 1,558 tests passing across all crates
 - Full stdlib in NSL
 
@@ -45,8 +45,8 @@ All complete and shipped in v0.1.0.
 | M18 | Interop (ONNX, SafeTensors, HuggingFace) | Production | SafeTensors I/O, ONNX export, HF model loading |
 | M21-M22 | INT4/INT8 quantization | Production | Per-tensor/channel/group, AWQ, GPTQ (full OBQ) |
 
-### Production Inference (M23-M31) — PRODUCTION
-All complete, shipped in v0.2.0.
+### Production Inference (M23-M31) — MOSTLY SHIPPED
+Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31 remain more functional/partial than fully productionized.
 
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
@@ -54,18 +54,18 @@ All complete, shipped in v0.2.0.
 | M24 | Standalone export | Production | Zero-dependency binary, weight embedding |
 | M25 | PagedAttention | Production | Paged KV-cache, CoW, memory watermark |
 | M26 | @autotune + elementwise fusion | Production | Fused PTX kernels, kernel profiling |
-| M27 | FlashAttention-2/3 | Production | **Hopper wgmma.mma_async**, warp specialization, TMA, paged KV, RoPE/GQA fusion |
+| M27 | FlashAttention-2/3 | Production | Tiled attention, paged KV, RoPE/GQA fusion, plus Hopper-specific wgmma/TMA scaffolding that is present but still partially placeholder |
 | M28 | Dynamic shapes | Production | Symbolic dims, stride-based codegen |
 | M29 | Continuous batching | Production | serve block, chunked prefill, ragged tensors |
 | M30 | Tensor parallelism | Functional | @shard decorator, worker-per-GPU, simulated collective ops |
-| M31 | Graph-level fusion | Production | Epilogue + reduction fusion, **cost-guided profitability**, register pressure estimation |
+| M31 | Graph-level fusion | Functional | Fusion analysis, epilogue + reduction patterns, **cost-guided profitability** and register pressure estimation; full graph-rewrite integration remains uneven |
 
 ### Scaling Features (M32-M35) — FUNCTIONAL TO PRODUCTION
 
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
 | M32 | Mixture of Experts | Functional | @moe decorator, router, dispatch, aux loss, expert parallel FFI (all-to-all stub) |
-| M33 | Speculative Decoding | **Production** | DraftModelRunner (524 LOC), EAGLE-2 dynamic confidence-scored trees, Lookahead n-gram decoding, rejection sampling (greedy + stochastic), tree attention masks |
+| M33 | Speculative Decoding | Functional | DraftModelRunner (524 LOC), Lookahead n-gram decoding, rejection sampling (greedy + stochastic), tree attention masks; EAGLE-2/Medusa tree-method plumbing remains partial |
 | M34 | Ring Attention | Functional | @context_parallel extraction, ring comm basic |
 | M35 | FP8/AWQ/GPTQ Quantization | **Production** | E4M3/E5M2, H100 MMA PTX, calibration, AWQ 4-bit, **GPTQ full OBQ** (Hessian-based error compensation, Cholesky inverse, act-order, blocked updates) |
 
@@ -83,7 +83,7 @@ All complete, shipped in v0.2.0.
 
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
-| M41 | Disaggregated Inference | **Production** | Router, KV transfer (KVXF format), **real prefill/decode worker loops**, **NVLink/RDMA/TCP transport backends**, auto-detection, CUDA IPC GPU-direct, PCI bus scan |
+| M41 | Disaggregated Inference | Functional | Router, KV transfer (KVXF format), **real prefill/decode worker loops**, NVLink/TCP transport backends, auto-detection, CUDA IPC GPU-direct, PCI bus scan; RDMA backend currently falls back to TCP until ibverbs is wired |
 | M42 | KV Compression | Functional | INT8/INT4/FP8 quantization, H2O eviction, sliding window |
 | M43 | Pipeline Parallelism | **Functional** | Config parsed, 1F1B/GPipe schedules, SharedMemPipeline backend with mailbox pattern, condvar signaling |
 | M44 | Constrained Decoding | Functional | Thompson NFA → DFA → Hopcroft minimize, token alignment, logit masking |
@@ -107,13 +107,13 @@ All complete, shipped in v0.2.0.
 | M52 | Weight-Aware Compilation | Production | SafeTensors loading, constant folding, dead weight elimination, sparsity detection |
 | M53 | WCET Proofs | **Production** | Two-tier model: GPU statistical bounds + FPGA certified path (wcet_matmul_fpga_certified, wcet_elementwise_fpga_certified), DO-178C reporting |
 | M54 | Unikernels | **Functional** | Config, linker script, boot config, **x86_64 boot stub** (Multiboot2, GDT, page tables, SSE/AVX), **bump allocator**, serial console, **PCI GPU discovery** (VFIO + direct), ELF image builder |
-| M55 | ZK Inference | **Production** | **AST-to-ZkDag** compilation, Halo2 + Plonky3 backends, IR lowering, witness gen, **Jolt lookup-native gates**, **folding proofs** (sumcheck + Fiat-Shamir), Mersenne-31 field, **INT8→M31 mapping**, **CLI pipeline** (build/verify/stats) |
+| M55 | ZK Inference | **Functional** | **AST-to-ZkDag** compilation, IR lowering, witness gen, **Jolt lookup-native gates**, **folding proofs** (sumcheck + Fiat-Shamir), Mersenne-31 field, **INT8→M31 mapping**, **CLI pipeline** (build/verify/stats); Halo2/Plonky3 backend coverage remains partial |
 
 ### Adoption & Scale (M56-M62)
 
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
-| M56-M61 | Multi-Agent, FPGA, Elastic, Topology, Exabyte, Cluster Debug | Not started | — |
+| M56-M61 | Multi-Agent, FPGA, Elastic, Topology, Exabyte, Cluster Debug | Mixed | M58 elastic fault-tolerance runtime pieces and M60 distributed data-streaming modules are present; the rest remain not started or partial |
 | M62 | Legacy Interop (C API / PyTorch FFI) | **Production** | NslTensorDesc, dtype mapping, **real model_forward** (calls compiled function), DLPack v0.8 |
 
 ---
@@ -125,12 +125,14 @@ All complete, shipped in v0.2.0.
 | Foundation (M9-M22) | 14 | 14 | 0 | 0 | 0 | 0 |
 | Inference (M23-M31) | 9 | 8 | 1 | 0 | 0 | 0 |
 | Scaling (M32-M55) | 24 | 11 | 10 | 1 | 1 | 1 |
-| Frontier (M56-M62) | 7 | 1 | 0 | 0 | 0 | 6 |
-| **Total** | **54** | **34** | **11** | **1** | **1** | **7** |
+| Frontier (M56-M62) | 7 | 1 | 2 | 0 | 0 | 4 |
+| **Total** | **54** | **34** | **13** | **1** | **1** | **5** |
 
 ---
 
-## What's Production-Ready Today
+## What's Shipped Today
+
+This list includes both production-ready features and higher-value functional subsystems that are already present in tree.
 
 1. **Core language**: Variables, functions, control flow, pattern matching, modules, imports
 2. **Tensor operations**: Creation, arithmetic, reductions, shape ops, 30+ activations (CPU + GPU)
@@ -138,11 +140,11 @@ All complete, shipped in v0.2.0.
 4. **Autodiff**: Tape-based + source-to-source with 50+ backward rules (softmax, layernorm, cross-entropy, dropout, conv2d, attention, RoPE)
 5. **Models**: model keyword, parameter management, serialization (.nslm), @shared weights
 6. **Training**: train block, 6 optimizers, 7 schedulers, loss functions, gradient checkpointing
-7. **GPU**: 15+ PTX kernels, .to(cuda), kernel keyword, FlashAttention-3 (Hopper wgmma)
+7. **GPU**: 15+ PTX kernels, .to(cuda), kernel keyword, FlashAttention-3 scaffolding with Hopper-specific wgmma/TMA work still partially placeholder
 8. **Quantization**: INT4/8, FP8 E4M3/E5M2 (H100 MMA), AWQ, GPTQ (full OBQ with Hessian-based error compensation)
-9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding (EAGLE-2, Lookahead)
-10. **Disaggregated inference**: Prefill/decode worker separation, NVLink/RDMA/TCP KV transfer, auto-detection
-11. **Optimization**: Cost-guided fusion (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
+9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding core with Lookahead plus partial EAGLE-2/Medusa tree-method scaffolding
+10. **Disaggregated inference**: Prefill/decode worker separation, NVLink/TCP KV transfer, RDMA backend scaffold with TCP fallback, auto-detection
+11. **Optimization**: Fusion analysis/pattern detection (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
 12. **Sparse tensors**: Format-agnostic @layout, TACO merge lattices, COO/CSR/CSC/BSR, GPU SpMM/SpMV
 13. **Weight-aware compilation**: Constant folding, dead weight elimination, sparsity-aware codegen, scaling fusion
 14. **Interop**: C API (real forward pass), DLPack, SafeTensors, ONNX export, HuggingFace loading
@@ -153,9 +155,9 @@ All complete, shipped in v0.2.0.
 
 | Plan | Area | Priority | Effort |
 |------|------|----------|--------|
-| nsl-coder-50m-implementation | 50M code generation model trained on NSL | LOW | TBD |
+| 2026-03-28-nsl-coder-rl-design | NSL-Coder-RL design for a small 10-15M compiler-guided code generation model | LOW | TBD |
 
-All compiler, runtime, and optimization plans have been implemented.
+Most compiler, runtime, and optimization plans have been implemented, but a small set of partial integrations and stubbed backends still remain in tree.
 
 ## Future Roadmaps
 

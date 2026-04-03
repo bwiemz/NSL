@@ -363,3 +363,321 @@ fn call_multiple(x: &Tensor<[4], f32>) -> float:
         type_errs
     );
 }
+
+#[test]
+fn test_tokenizer_dataset_defs_validate_cleanly() {
+    let src = r#"
+tokenizer demo_tokenizer(algorithm=bpe, vocab_size=1024):
+    special_tokens:
+        pad = "<pad>"
+        eos = "<eos>"
+
+    normalize: nfkc, lowercase
+    pre_tokenize: whitespace, byte_fallback
+
+    padding:
+        side = left
+        pad_to = longest
+
+    truncation:
+        max_length = 128
+        strategy = longest_first
+
+dataset train_data("demo"):
+    source = "data.bin"
+    format = binary
+    sequence_length = 128
+    packing = true
+    pack_separator = 0
+    shuffle = false
+    max_samples = 100
+"#;
+    let diags = check_source_all(src);
+    let relevant: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("tokenizer") || s.contains("dataset") || s.contains("padding")
+        })
+        .collect();
+    assert!(
+        relevant.is_empty(),
+        "expected tokenizer/dataset validation to pass cleanly, got: {:?}",
+        relevant
+    );
+}
+
+#[test]
+fn test_tokenizer_invalid_padding_side_reports_error() {
+    let src = r#"
+tokenizer bad_tokenizer(algorithm=bpe, vocab_size=128):
+    padding:
+        side = center
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            let s = format!("{:?}", d);
+            s.contains("padding.side") || s.contains("left, right")
+        }),
+        "expected tokenizer padding validation error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_dataset_unknown_field_reports_error() {
+    let src = r#"
+dataset bad_data("demo"):
+    source = "data.bin"
+    unexpected = 1
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("unknown dataset field 'unexpected'")),
+        "expected dataset field validation error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_duplicate_tokenizer_section_reports_error() {
+    let src = r#"
+tokenizer dup_sections(algorithm=bpe, vocab_size=128):
+    padding:
+        side = left
+
+    padding:
+        side = right
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("duplicate tokenizer section 'padding'")),
+        "expected duplicate tokenizer section error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_duplicate_dataset_field_reports_error() {
+    let src = r#"
+dataset dup_fields("demo"):
+    source = "data.bin"
+    sequence_length = 128
+    sequence_length = 256
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("duplicate dataset field 'sequence_length'")),
+        "expected duplicate dataset field error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_tokenizer_vocab_size_type_mismatch_reports_error() {
+    let src = r#"
+tokenizer bad_vocab(algorithm=bpe, vocab_size="large"):
+    normalize: nfkc
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("tokenizer vocab_size must be int")),
+        "expected tokenizer vocab_size type error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_trait_definition_and_bounds_validate_cleanly() {
+    let src = r#"
+struct Box<T: Comparable<T>>:
+    value: T
+
+trait Named<T: Display>:
+    fn name(self) -> str:
+        return "named"
+
+trait Display:
+    fn render(self) -> str
+
+trait Comparable<T>:
+    fn eq(self, other: T) -> bool
+"#;
+    let diags = check_source_all(src);
+    let relevant: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("duplicate trait method") || s.contains("bound must reference a trait") || s.contains("undefined type")
+        })
+        .collect();
+    assert!(
+        relevant.is_empty(),
+        "expected trait definitions and trait bounds to validate cleanly, got: {:?}",
+        relevant
+    );
+}
+
+#[test]
+fn test_duplicate_trait_method_reports_error() {
+    let src = r#"
+trait Duplicate:
+    fn render(self) -> str
+    fn render(self) -> str
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("duplicate trait method 'render' in trait 'Duplicate'")),
+        "expected duplicate trait method error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_non_trait_bound_reports_error() {
+    let src = r#"
+struct Bad<T: int>:
+    value: T
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("type parameter 'T' bound must reference a trait")),
+        "expected non-trait bound error, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn test_user_defined_generic_struct_instantiation_substitutes_fields() {
+    let src = r#"
+struct Box<T>:
+    value: T
+
+struct Wrapper<T>:
+    inner: Box<T>
+
+fn read_value(wrapper: Wrapper<int>) -> int:
+    return wrapper.inner.value
+"#;
+    let diags = check_source_all(src);
+    let relevant: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("undefined type") || s.contains("wrong number of type arguments") || s.contains("type mismatch")
+        })
+        .collect();
+    assert!(
+        relevant.is_empty(),
+        "expected nested generic struct instantiation to type-check, got: {:?}",
+        relevant
+    );
+}
+
+#[test]
+fn test_user_defined_generic_model_instantiation_substitutes_method_types() {
+    let src = r#"
+model Holder<T>:
+    value: T
+
+    fn get(self) -> T:
+        return self.value
+
+fn read_holder(holder: Holder<int>) -> int:
+    return holder.value
+"#;
+    let diags = check_source_all(src);
+    let relevant: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("undefined type") || s.contains("wrong number of type arguments") || s.contains("type mismatch")
+        })
+        .collect();
+    assert!(
+        relevant.is_empty(),
+        "expected generic model instantiation to type-check, got: {:?}",
+        relevant
+    );
+}
+
+#[test]
+fn test_user_defined_generic_multi_param_and_deep_instantiation_type_checks() {
+    let src = r#"
+struct Box<T>:
+    value: T
+
+struct Pair<A, B>:
+    first: A
+    second: B
+
+model Holder<T>:
+    value: T
+
+    fn get(self) -> T:
+        return self.value
+
+model Mapper<K, V>:
+    entry: Pair<K, V>
+
+    fn value(self) -> V:
+        return self.entry.second
+
+struct Deep<T>:
+    item: Pair<Box<T>, Holder<T>>
+
+fn read_pair(pair: Pair<int, str>) -> str:
+    return pair.second
+
+fn read_mapper(mapper: Mapper<int, str>) -> str:
+    return mapper.value()
+
+fn read_deep(deep: Deep<int>) -> int:
+    return deep.item.second.get()
+"#;
+    let diags = check_source_all(src);
+    let relevant: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            let s = format!("{:?}", d);
+            s.contains("undefined type") || s.contains("wrong number of type arguments") || s.contains("type mismatch")
+        })
+        .collect();
+    assert!(
+        relevant.is_empty(),
+        "expected multi-parameter and deep generic instantiation to type-check, got: {:?}",
+        relevant
+    );
+}
+
+#[test]
+fn test_user_defined_generic_type_arity_mismatch_reports_error() {
+    let src = r#"
+struct Box<T>:
+    value: T
+
+fn bad(box: Box<int, str>) -> int:
+    return 0
+"#;
+    let diags = check_source_all(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("Box expects 1 type argument(s), got 2")),
+        "expected user-defined generic arity error, got: {:?}",
+        diags
+    );
+}

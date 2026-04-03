@@ -63,6 +63,8 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
 
+    BlockExpr(crate::stmt::Block),
+
     ListComp {
         element: Box<Expr>,
         generators: Vec<CompGenerator>,

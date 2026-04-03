@@ -49,6 +49,13 @@ pub struct ActiveBorrow {
     pub created_at: Span,
 }
 
+#[derive(Clone)]
+pub struct OwnershipSnapshot {
+    pub states: HashMap<Symbol, OwnershipState>,
+    tensor_bindings: HashMap<Symbol, Span>,
+    active_borrows: HashMap<Symbol, Vec<ActiveBorrow>>,
+}
+
 // ---------------------------------------------------------------------------
 // Checker
 // ---------------------------------------------------------------------------
@@ -207,6 +214,41 @@ impl<'a> OwnershipChecker<'a> {
         self.states = snapshot;
     }
 
+    pub fn snapshot_all(&self) -> OwnershipSnapshot {
+        OwnershipSnapshot {
+            states: self.states.clone(),
+            tensor_bindings: self.tensor_bindings.clone(),
+            active_borrows: self.active_borrows.clone(),
+        }
+    }
+
+    pub fn restore_all(&mut self, snapshot: OwnershipSnapshot) {
+        self.states = snapshot.states;
+        self.tensor_bindings = snapshot.tensor_bindings;
+        self.active_borrows = snapshot.active_borrows;
+    }
+
+    pub fn check_branch_local_unconsumed(
+        &mut self,
+        before: &OwnershipSnapshot,
+        after: &OwnershipSnapshot,
+    ) {
+        for (&sym, state) in &after.states {
+            if before.states.contains_key(&sym) {
+                continue;
+            }
+            if let OwnershipState::Owned = state {
+                let name = self.resolve_sym(sym).to_string();
+                if let Some(&def_span) = after.tensor_bindings.get(&sym) {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("linear tensor '{name}' not consumed"))
+                            .with_label(def_span, "defined here but never consumed"),
+                    );
+                }
+            }
+        }
+    }
+
     /// Check that branch consumption is symmetric and merge state.
     pub fn check_branch_symmetry(
         &mut self,
@@ -215,20 +257,27 @@ impl<'a> OwnershipChecker<'a> {
         after_else: &HashMap<Symbol, OwnershipState>,
         if_span: Span,
     ) {
+        self.check_multi_branch_symmetry(before, &[after_then.clone(), after_else.clone()], if_span);
+    }
+
+    pub fn check_multi_branch_symmetry(
+        &mut self,
+        before: &HashMap<Symbol, OwnershipState>,
+        branches: &[HashMap<Symbol, OwnershipState>],
+        if_span: Span,
+    ) {
         for (&sym, before_state) in before {
             if before_state.is_shared() || before_state.is_consumed() {
                 continue;
             }
-            let consumed_in_then = after_then
-                .get(&sym)
-                .map(|s| s.is_consumed())
-                .unwrap_or(false);
-            let consumed_in_else = after_else
-                .get(&sym)
-                .map(|s| s.is_consumed())
-                .unwrap_or(false);
+            let consumed: Vec<bool> = branches
+                .iter()
+                .map(|branch| branch.get(&sym).map(|s| s.is_consumed()).unwrap_or(false))
+                .collect();
+            let consumed_in_any = consumed.iter().any(|flag| *flag);
+            let consumed_in_all = consumed.iter().all(|flag| *flag);
 
-            if consumed_in_then != consumed_in_else {
+            if consumed_in_any != consumed_in_all {
                 let name = self.resolve_sym(sym).to_string();
                 self.diagnostics.push(
                     Diagnostic::error(format!(
@@ -245,10 +294,14 @@ impl<'a> OwnershipChecker<'a> {
             if before_state.is_shared() || before_state.is_consumed() {
                 continue;
             }
-            let consumed_in_then = after_then.get(&sym).map(|s| s.is_consumed()).unwrap_or(false);
-            let consumed_in_else = after_else.get(&sym).map(|s| s.is_consumed()).unwrap_or(false);
-            if consumed_in_then && consumed_in_else {
-                if let Some(OwnershipState::Consumed { at, by }) = after_then.get(&sym) {
+            let consumed_in_all = branches
+                .iter()
+                .all(|branch| branch.get(&sym).map(|s| s.is_consumed()).unwrap_or(false));
+            if consumed_in_all {
+                if let Some(OwnershipState::Consumed { at, by }) = branches
+                    .iter()
+                    .find_map(|branch| branch.get(&sym))
+                {
                     self.states
                         .insert(sym, OwnershipState::Consumed { at: *at, by: by.clone() });
                 }

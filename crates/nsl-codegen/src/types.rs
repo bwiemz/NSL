@@ -25,6 +25,7 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
         Type::Str => types::I64,
         Type::List(_) => types::I64,
         Type::Struct { .. } => types::I64,
+        Type::Trait { .. } => types::I64,
         Type::Model { .. } => types::I64,
         Type::Dict(_, _) => types::I64,
         Type::Tuple(_) => types::I64,

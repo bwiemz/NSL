@@ -7,15 +7,41 @@ use cranelift_module::{Linkage, Module};
 
 use nsl_ast::expr::{Expr, ExprKind, SubscriptKind, FStringPart};
 use nsl_ast::operator::BinOp;
+use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::Symbol;
 use nsl_semantic::types::Type;
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
-use crate::types::{nsl_type_to_cl, pointer_type};
+use crate::types::{is_block_filled, nsl_type_to_cl, pointer_type};
 
 impl Compiler<'_> {
+    pub(crate) fn compile_block_expr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        block: &Block,
+    ) -> Result<Value, CodegenError> {
+        if block.stmts.is_empty() {
+            return Err(CodegenError::new("block expression must end with a value"));
+        }
+
+        for stmt in &block.stmts[..block.stmts.len() - 1] {
+            self.compile_stmt(builder, state, stmt)?;
+            if state.current_block.map(|block| is_block_filled(builder, block)).unwrap_or(false) {
+                return Err(CodegenError::new(
+                    "block expression must end with a reachable value",
+                ));
+            }
+        }
+
+        match &block.stmts[block.stmts.len() - 1].kind {
+            StmtKind::Expr(expr) => self.compile_expr(builder, state, expr),
+            _ => Err(CodegenError::new("block expression must end with a value")),
+        }
+    }
+
     pub(crate) fn compile_if_expr(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -23,30 +49,182 @@ impl Compiler<'_> {
         condition: &Expr,
         then_expr: &Expr,
         else_expr: &Expr,
-        _full_expr: &Expr,
+        full_expr: &Expr,
     ) -> Result<Value, CodegenError> {
-        let cond_val = self.compile_expr(builder, state, condition)?;
+        state.flags.conditional_depth += 1;
+        let cond_val = self.compile_expr(builder, state, condition);
+        state.flags.conditional_depth -= 1;
+        let cond_val = cond_val?;
         let then_block = builder.create_block();
         let else_block = builder.create_block();
         let merge_block = builder.create_block();
+        let incoming_variables = state.variables.clone();
+        let incoming_variable_types = state.variable_types.clone();
+        let incoming_sparse_vars = state.ownership.sparse_vars.clone();
+        let incoming_loader_symbols = state.dataloader_symbols.clone();
+        let mut reaching_loader_sets: Vec<std::collections::HashSet<nsl_ast::Symbol>> = Vec::new();
+        let incoming_loader_vars = state.cleanup.dataloader_vars.clone();
+        let mut reaching_loader_var_sets: Vec<Vec<Value>> = Vec::new();
+        let temp_base_len = state.cleanup.tensor_temporaries.len();
+        let linear_base_len = state.ownership.linear_consume_pending.len();
 
-        let result_type = nsl_type_to_cl(&self.node_type(then_expr.id).clone());
+        let result_sem_ty = self.node_type(full_expr.id).clone();
+        let result_type = nsl_type_to_cl(&result_sem_ty);
         builder.append_block_param(merge_block, result_type);
         builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
 
         builder.switch_to_block(then_block);
         builder.seal_block(then_block);
-        let then_val = self.compile_expr(builder, state, then_expr)?;
-        builder.ins().jump(merge_block, &[then_val]);
+        state.current_block = Some(then_block);
+        state.variables = incoming_variables.clone();
+        state.variable_types = incoming_variable_types.clone();
+        state.ownership.sparse_vars = incoming_sparse_vars.clone();
+        state.dataloader_symbols = incoming_loader_symbols.clone();
+        state.cleanup.dataloader_vars = incoming_loader_vars.clone();
+        state.cleanup.tensor_temporaries.truncate(temp_base_len);
+        state.ownership.linear_consume_pending.truncate(linear_base_len);
+        state.flags.conditional_depth += 1;
+        let then_val = self.compile_expr(builder, state, then_expr);
+        state.flags.conditional_depth -= 1;
+        let then_val = then_val?;
+        let then_val = self.coerce_expr_value(
+            builder,
+            then_val,
+            &self.node_type(then_expr.id).clone(),
+            &result_sem_ty,
+        );
+        let current_then = state.current_block.unwrap_or(then_block);
+        let mut then_result_is_temp = false;
+        let mut then_result_is_linear = false;
+        if !is_block_filled(builder, current_then) {
+            then_result_is_linear = state.ownership.linear_consume_pending[linear_base_len..]
+                .contains(&then_val);
+            then_result_is_temp = !then_result_is_linear
+                && state.cleanup.tensor_temporaries[temp_base_len..].contains(&then_val);
+
+            if result_sem_ty.is_tensor() && !then_result_is_linear && !then_result_is_temp {
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_retain", &[then_val]);
+                then_result_is_temp = true;
+            }
+
+            for temp in state.cleanup.tensor_temporaries[temp_base_len..].to_vec() {
+                if temp != then_val {
+                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
+                }
+            }
+            state.cleanup.tensor_temporaries.truncate(temp_base_len);
+
+            for consumed in state.ownership.linear_consume_pending[linear_base_len..].to_vec() {
+                if consumed != then_val {
+                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[consumed]);
+                }
+            }
+            state.ownership.linear_consume_pending.truncate(linear_base_len);
+
+            reaching_loader_sets.push(state.dataloader_symbols.clone());
+            reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
+            builder.ins().jump(merge_block, &[then_val]);
+        } else {
+            state.cleanup.tensor_temporaries.truncate(temp_base_len);
+            state.ownership.linear_consume_pending.truncate(linear_base_len);
+        }
 
         builder.switch_to_block(else_block);
         builder.seal_block(else_block);
-        let else_val = self.compile_expr(builder, state, else_expr)?;
-        builder.ins().jump(merge_block, &[else_val]);
+        state.current_block = Some(else_block);
+        state.variables = incoming_variables.clone();
+        state.variable_types = incoming_variable_types.clone();
+        state.ownership.sparse_vars = incoming_sparse_vars.clone();
+        state.dataloader_symbols = incoming_loader_symbols.clone();
+        state.cleanup.dataloader_vars = incoming_loader_vars.clone();
+        state.cleanup.tensor_temporaries.truncate(temp_base_len);
+        state.ownership.linear_consume_pending.truncate(linear_base_len);
+        state.flags.conditional_depth += 1;
+        let else_val = self.compile_expr(builder, state, else_expr);
+        state.flags.conditional_depth -= 1;
+        let else_val = else_val?;
+        let else_val = self.coerce_expr_value(
+            builder,
+            else_val,
+            &self.node_type(else_expr.id).clone(),
+            &result_sem_ty,
+        );
+        let current_else = state.current_block.unwrap_or(else_block);
+        let mut else_result_is_temp = false;
+        let mut else_result_is_linear = false;
+        if !is_block_filled(builder, current_else) {
+            else_result_is_linear = state.ownership.linear_consume_pending[linear_base_len..]
+                .contains(&else_val);
+            else_result_is_temp = !else_result_is_linear
+                && state.cleanup.tensor_temporaries[temp_base_len..].contains(&else_val);
+
+            if result_sem_ty.is_tensor() && !else_result_is_linear && !else_result_is_temp {
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_retain", &[else_val]);
+                else_result_is_temp = true;
+            }
+
+            for temp in state.cleanup.tensor_temporaries[temp_base_len..].to_vec() {
+                if temp != else_val {
+                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
+                }
+            }
+            state.cleanup.tensor_temporaries.truncate(temp_base_len);
+
+            for consumed in state.ownership.linear_consume_pending[linear_base_len..].to_vec() {
+                if consumed != else_val {
+                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[consumed]);
+                }
+            }
+            state.ownership.linear_consume_pending.truncate(linear_base_len);
+
+            reaching_loader_sets.push(state.dataloader_symbols.clone());
+            reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
+            builder.ins().jump(merge_block, &[else_val]);
+        } else {
+            state.cleanup.tensor_temporaries.truncate(temp_base_len);
+            state.ownership.linear_consume_pending.truncate(linear_base_len);
+        }
+
+        state.variables = incoming_variables.clone();
+        state.variable_types = incoming_variable_types;
+        state.ownership.sparse_vars = incoming_sparse_vars;
+
+        state.dataloader_symbols = if let Some(first) = reaching_loader_sets.first().cloned() {
+            reaching_loader_sets
+                .into_iter()
+                .skip(1)
+                .fold(first, |acc, branch_set| {
+                    acc.into_iter()
+                        .filter(|sym| branch_set.contains(sym))
+                        .collect()
+                })
+        } else {
+            incoming_loader_symbols
+        };
+        state.cleanup.dataloader_vars =
+            if let Some(first) = reaching_loader_var_sets.first().cloned() {
+                reaching_loader_var_sets
+                    .into_iter()
+                    .skip(1)
+                    .fold(first, |acc, branch_vec| {
+                        acc.into_iter()
+                            .filter(|value| branch_vec.contains(value))
+                            .collect()
+                    })
+            } else {
+                incoming_loader_vars
+            };
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
-        Ok(builder.block_params(merge_block)[0])
+        state.current_block = Some(merge_block);
+        let merged_result = builder.block_params(merge_block)[0];
+        if then_result_is_linear || else_result_is_linear {
+            state.ownership.linear_consume_pending.push(merged_result);
+        } else if then_result_is_temp || else_result_is_temp {
+            state.cleanup.tensor_temporaries.push(merged_result);
+        }
+        Ok(merged_result)
     }
 
     pub(crate) fn compile_lambda(
@@ -228,6 +406,11 @@ impl Compiler<'_> {
                     self.collect_free_vars(v, param_syms, state, out, seen);
                 }
             }
+            ExprKind::BlockExpr(block) => {
+                for stmt in &block.stmts {
+                    self.collect_free_vars_in_stmt(stmt, param_syms, state, out, seen);
+                }
+            }
             ExprKind::IfExpr { condition, then_expr, else_expr } => {
                 self.collect_free_vars(condition, param_syms, state, out, seen);
                 self.collect_free_vars(then_expr, param_syms, state, out, seen);
@@ -236,6 +419,152 @@ impl Compiler<'_> {
             // Literals and other leaf nodes -- no free variables
             _ => {}
         }
+    }
+
+    fn collect_free_vars_in_stmt(
+        &self,
+        stmt: &Stmt,
+        param_syms: &std::collections::HashSet<nsl_ast::Symbol>,
+        state: &FuncState,
+        out: &mut Vec<(nsl_ast::Symbol, cl_types::Type)>,
+        seen: &mut std::collections::HashSet<nsl_ast::Symbol>,
+    ) {
+        match &stmt.kind {
+            StmtKind::VarDecl { value: Some(expr), .. }
+            | StmtKind::Expr(expr)
+            | StmtKind::Return(Some(expr))
+            | StmtKind::Yield(Some(expr)) => {
+                self.collect_free_vars(expr, param_syms, state, out, seen);
+            }
+            StmtKind::Assign { target, value, .. } => {
+                self.collect_free_vars(target, param_syms, state, out, seen);
+                self.collect_free_vars(value, param_syms, state, out, seen);
+            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
+                self.collect_free_vars(condition, param_syms, state, out, seen);
+                for branch_stmt in &then_block.stmts {
+                    self.collect_free_vars_in_stmt(branch_stmt, param_syms, state, out, seen);
+                }
+                for (elif_cond, elif_block) in elif_clauses {
+                    self.collect_free_vars(elif_cond, param_syms, state, out, seen);
+                    for branch_stmt in &elif_block.stmts {
+                        self.collect_free_vars_in_stmt(branch_stmt, param_syms, state, out, seen);
+                    }
+                }
+                if let Some(else_block) = else_block {
+                    for branch_stmt in &else_block.stmts {
+                        self.collect_free_vars_in_stmt(branch_stmt, param_syms, state, out, seen);
+                    }
+                }
+            }
+            StmtKind::For { iterable, body, .. }
+            | StmtKind::While { condition: iterable, body }
+            | StmtKind::WhileLet { expr: iterable, body, .. } => {
+                self.collect_free_vars(iterable, param_syms, state, out, seen);
+                for body_stmt in &body.stmts {
+                    self.collect_free_vars_in_stmt(body_stmt, param_syms, state, out, seen);
+                }
+            }
+            StmtKind::Match { subject, arms } => {
+                self.collect_free_vars(subject, param_syms, state, out, seen);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.collect_free_vars(guard, param_syms, state, out, seen);
+                    }
+                    for arm_stmt in &arm.body.stmts {
+                        self.collect_free_vars_in_stmt(arm_stmt, param_syms, state, out, seen);
+                    }
+                }
+            }
+            StmtKind::Return(None)
+            | StmtKind::Yield(None)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::VarDecl { value: None, .. }
+            | StmtKind::FnDef(_)
+            | StmtKind::StructDef(_)
+            | StmtKind::ModelDef(_)
+            | StmtKind::EnumDef(_)
+            | StmtKind::TraitDef(_)
+            | StmtKind::Import(_)
+            | StmtKind::FromImport(_)
+            | StmtKind::TrainBlock(_)
+            | StmtKind::GradBlock(_)
+            | StmtKind::QuantBlock(_)
+            | StmtKind::KernelDef(_)
+            | StmtKind::TokenizerDef(_)
+            | StmtKind::DatasetDef(_)
+            | StmtKind::DatatypeDef(_)
+            | StmtKind::ServeBlock(_) => {}
+            StmtKind::Decorated { stmt, .. } => {
+                self.collect_free_vars_in_stmt(stmt, param_syms, state, out, seen);
+            }
+        }
+    }
+
+    fn coerce_expr_value(
+        &self,
+        builder: &mut FunctionBuilder,
+        value: Value,
+        source_ty: &Type,
+        target_ty: &Type,
+    ) -> Value {
+        let source_ty = source_ty.strip_borrow();
+        let target_ty = target_ty.strip_borrow();
+        let source_cl = builder.func.dfg.value_type(value);
+        let target_cl = nsl_type_to_cl(target_ty);
+
+        if source_cl == target_cl {
+            return value;
+        }
+
+        if target_cl.is_float() {
+            if source_cl.is_float() {
+                if source_cl == cl_types::F32 && target_cl == cl_types::F64 {
+                    return builder.ins().fpromote(target_cl, value);
+                }
+                if source_cl == cl_types::F64 && target_cl == cl_types::F32 {
+                    return builder.ins().fdemote(target_cl, value);
+                }
+                return value;
+            }
+
+            let widened = if source_cl.bits() < 64 {
+                if matches!(source_ty, Type::Bool | Type::Uint8) {
+                    builder.ins().uextend(cl_types::I64, value)
+                } else {
+                    builder.ins().sextend(cl_types::I64, value)
+                }
+            } else {
+                value
+            };
+
+            return if matches!(source_ty, Type::Bool | Type::Uint8) {
+                builder.ins().fcvt_from_uint(target_cl, widened)
+            } else {
+                builder.ins().fcvt_from_sint(target_cl, widened)
+            };
+        }
+
+        if target_cl.is_int() && source_cl.is_int() {
+            if source_cl.bits() < target_cl.bits() {
+                return if matches!(source_ty, Type::Bool | Type::Uint8) {
+                    builder.ins().uextend(target_cl, value)
+                } else {
+                    builder.ins().sextend(target_cl, value)
+                };
+            }
+            if source_cl.bits() > target_cl.bits() {
+                return builder.ins().ireduce(target_cl, value);
+            }
+        }
+
+        value
     }
 
     pub(crate) fn compile_higher_order_call(

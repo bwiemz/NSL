@@ -8,7 +8,7 @@ NSL compiles to native code via Cranelift with zero Python or C++ dependencies. 
 
 - **Python-familiar syntax** with indentation-based blocks, `let`/`const`, `fn`, `model`
 - **Compile-time tensor shape checking** — catch dimension mismatches before running
-- **Native autodiff** — `grad` is a keyword, not a library call
+- **Native autodiff** — `grad(...)` and `train(...)` use tape AD by default, with `--source-ad` for compile-time lowering when possible
 - **Declarative training** — `train` blocks replace boilerplate training loops
 - **GPU/CUDA native** — `kernel` keyword for custom GPU ops, `.to(cuda)` for device transfer
 - **No GIL, no runtime** — just `nsl run model.nsl`
@@ -134,6 +134,12 @@ for batch in loader:
     print(loss)
 ```
 
+## Autodiff Modes
+
+NSL uses tape-based reverse-mode AD by default for `train(...)` and standalone `grad(...)` blocks. Pass `--source-ad` to ask the compiler to lower supported static graphs at compile time instead.
+
+If source AD cannot extract or resolve a supported gradient graph, NSL emits a diagnostic and falls back to tape AD rather than changing program behavior.
+
 ## CLI Reference
 
 ```bash
@@ -142,6 +148,10 @@ nsl build file.nsl                  # Compile to native executable
 nsl check file.nsl                  # Type-check without running
 nsl fmt file.nsl                    # Format code
 nsl test tests/*.nsl                # Run test suite
+
+# Autodiff backend selection
+nsl run --source-ad file.nsl        # Prefer compile-time source-to-source AD
+nsl run --tape-ad file.nsl          # Force runtime tape AD
 
 # Compile-time analysis
 nsl check --perf file.nsl           # Roofline performance analysis

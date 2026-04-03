@@ -1,10 +1,10 @@
 //! M54a: Unikernel configuration and codegen support.
 //!
 //! This module provides the configuration types and generation functions
-//! for bare-metal unikernel deployment. The actual boot stub, virtio drivers,
-//! and ELF emission are deferred to M54b; this module produces the *inputs*
-//! a unikernel build would consume: linker script, boot config JSON, and
-//! memory layout calculations.
+//! for bare-metal unikernel deployment. Boot-stub generation and image-builder
+//! support now live in `unikernel_boot.rs`; this module still owns the config,
+//! linker script, boot config JSON, and memory layout calculations that feed
+//! that build pipeline.
 
 use std::fmt;
 

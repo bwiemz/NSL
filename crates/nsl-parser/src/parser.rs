@@ -183,9 +183,13 @@ impl<'a> Parser<'a> {
 
     /// Expect a newline or EOF or DEDENT (end of statement).
     pub fn expect_end_of_stmt(&mut self) {
+        let previous_was_dedent = self.pos > 0
+            && matches!(self.tokens[self.pos - 1].kind, TokenKind::Dedent);
+
         if !self.at(&TokenKind::Newline)
             && !self.at(&TokenKind::Eof)
             && !self.at(&TokenKind::Dedent)
+            && !previous_was_dedent
         {
             let span = self.current_span();
             self.diagnostics.push(

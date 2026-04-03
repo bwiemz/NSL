@@ -44,9 +44,7 @@ x += 1            # silently corrupts y
 In NSL, the ownership checker prevents this at compile time.
 
 ### Current Status
-- **M38a (semantics)**: Ownership rules, use-after-move, borrow checking, `&T` syntax, autodiff integration — **implemented**
-- **M38b (codegen)**: Elide reference counting for owned values, insert frees at consumption — **implemented** (basic decision tree)
-- **FBIP (planned)**: Refcount-checked in-place mutation — when `refcount == 1`, mutate tensor in-place instead of allocating. Plan exists: `fbip-inplace-mutation.md`
+- **FBIP**: Refcount-checked and compiler-proven in-place mutation — runtime `refcount == 1` fast path plus static reuse analysis and GPU in-place kernels are **implemented**
 
 ---
 

@@ -96,10 +96,41 @@ pub struct KernelDef {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct KeyValueEntry {
+    pub key: Symbol,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum TokenizerStmt {
+    SpecialTokens {
+        entries: Vec<KeyValueEntry>,
+        span: Span,
+    },
+    Normalize {
+        rules: Vec<Symbol>,
+        span: Span,
+    },
+    PreTokenize {
+        rules: Vec<Symbol>,
+        span: Span,
+    },
+    Padding {
+        entries: Vec<KeyValueEntry>,
+        span: Span,
+    },
+    Truncation {
+        entries: Vec<KeyValueEntry>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TokenizerDef {
     pub name: Symbol,
     pub config: Vec<Arg>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<TokenizerStmt>,
     pub span: Span,
 }
 
@@ -107,7 +138,7 @@ pub struct TokenizerDef {
 pub struct DatasetDef {
     pub name: Symbol,
     pub source: Expr,
-    pub body: Vec<Stmt>,
+    pub body: Vec<KeyValueEntry>,
     pub span: Span,
 }
 

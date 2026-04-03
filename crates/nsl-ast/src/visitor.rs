@@ -221,14 +221,27 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
             v.visit_block(&k.body);
         }
         StmtKind::TokenizerDef(t) => {
-            for s in &t.body {
-                v.visit_stmt(s);
+            for arg in &t.config {
+                v.visit_expr(&arg.value);
+            }
+            for item in &t.body {
+                match item {
+                    crate::block::TokenizerStmt::SpecialTokens { entries, .. }
+                    | crate::block::TokenizerStmt::Padding { entries, .. }
+                    | crate::block::TokenizerStmt::Truncation { entries, .. } => {
+                        for entry in entries {
+                            v.visit_expr(&entry.value);
+                        }
+                    }
+                    crate::block::TokenizerStmt::Normalize { .. }
+                    | crate::block::TokenizerStmt::PreTokenize { .. } => {}
+                }
             }
         }
         StmtKind::DatasetDef(d) => {
             v.visit_expr(&d.source);
-            for s in &d.body {
-                v.visit_stmt(s);
+            for entry in &d.body {
+                v.visit_expr(&entry.value);
             }
         }
         StmtKind::StructDef(s) => {
@@ -287,6 +300,9 @@ pub fn walk_expr(v: &mut impl Visitor, expr: &Expr) {
         }
         ExprKind::Lambda { body, .. } => {
             v.visit_expr(body);
+        }
+        ExprKind::BlockExpr(block) => {
+            v.visit_block(block);
         }
         ExprKind::ListLiteral(items) | ExprKind::TupleLiteral(items) => {
             for item in items {

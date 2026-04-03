@@ -15,7 +15,7 @@ impl<'a> TypeChecker<'a> {
             StmtKind::ModelDef(model_def) => self.check_model_def(model_def),
             StmtKind::StructDef(struct_def) => self.check_struct_def(struct_def),
             StmtKind::EnumDef(enum_def) => self.check_enum_def(enum_def),
-            StmtKind::TraitDef(_) => {} // Deferred
+            StmtKind::TraitDef(trait_def) => self.check_trait_def(trait_def),
             StmtKind::If {
                 condition,
                 then_block,
@@ -49,6 +49,8 @@ impl<'a> TypeChecker<'a> {
                     Type::FixedModelArray { element_model, .. } => {
                         Type::Model {
                             name: *element_model,
+                            type_params: Vec::new(),
+                            type_args: Vec::new(),
                             fields: Vec::new(),
                             methods: Vec::new(),
                         }
@@ -712,6 +714,8 @@ impl<'a> TypeChecker<'a> {
                 // Register output variable with quantized Model type
                 let quant_model_ty = Type::Model {
                     name: quant.name,
+                    type_params: Vec::new(),
+                    type_args: Vec::new(),
                     fields: quantized_fields,
                     methods: model_methods,
                 };
@@ -732,14 +736,10 @@ impl<'a> TypeChecker<'a> {
                 self.current_scope = prev_scope;
             }
             StmtKind::TokenizerDef(tok) => {
-                // Declare the tokenizer name; body validation deferred to M3.
-                self.declare_symbol(tok.name, Type::Unknown, tok.span, true, false);
+                self.check_tokenizer_def(tok);
             }
             StmtKind::DatasetDef(ds) => {
-                // Declare the dataset name; body validation deferred to M3.
-                // Dataset body uses DSL field assignments (source=, packing=, etc.)
-                // that aren't general variable assignments.
-                self.declare_symbol(ds.name, Type::Unknown, ds.span, true, false);
+                self.check_dataset_def(ds);
             }
             StmtKind::DatatypeDef(def) => {
                 if def.bits.is_none() {

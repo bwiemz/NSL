@@ -116,61 +116,79 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
     match &stmt.kind {
         StmtKind::VarDecl { pattern, value, .. } => {
             if let Some(expr) = value {
-                walk_expr(expr, checker);
+                walk_expr(expr, checker, type_map);
             }
-            register_pattern_bindings(pattern, checker, type_map, stmt);
+            register_pattern_bindings(pattern, checker, type_map, value.as_ref());
         }
         StmtKind::Assign { target, value, .. } => {
-            walk_expr(target, checker);
-            walk_expr(value, checker);
+            walk_expr(target, checker, type_map);
+            walk_expr(value, checker, type_map);
         }
-        StmtKind::Expr(expr) => walk_expr(expr, checker),
+        StmtKind::Expr(expr) => walk_expr(expr, checker, type_map),
         StmtKind::Return(Some(expr)) | StmtKind::Yield(Some(expr)) => {
-            walk_expr(expr, checker);
+            walk_expr(expr, checker, type_map);
         }
         StmtKind::Return(None) | StmtKind::Yield(None) => {}
         StmtKind::If { condition, then_block, elif_clauses, else_block } => {
-            walk_expr(condition, checker);
+            walk_expr(condition, checker, type_map);
 
-            let before = checker.snapshot();
+            let before = checker.snapshot_all();
+            let mut branch_states = Vec::new();
+
             walk_block(then_block, checker, type_map);
-            let after_then = checker.snapshot();
+            let after_then = checker.snapshot_all();
+            checker.check_branch_local_unconsumed(&before, &after_then);
+            branch_states.push(after_then.states.clone());
 
-            checker.restore(before.clone());
+            checker.restore_all(before.clone());
             for (cond, block) in elif_clauses {
-                walk_expr(cond, checker);
+                walk_expr(cond, checker, type_map);
                 walk_block(block, checker, type_map);
+                let after_elif = checker.snapshot_all();
+                checker.check_branch_local_unconsumed(&before, &after_elif);
+                branch_states.push(after_elif.states.clone());
+                checker.restore_all(before.clone());
             }
             if let Some(block) = else_block {
                 walk_block(block, checker, type_map);
+                let after_else = checker.snapshot_all();
+                checker.check_branch_local_unconsumed(&before, &after_else);
+                branch_states.push(after_else.states.clone());
+            } else {
+                branch_states.push(before.states.clone());
             }
-            let after_else = checker.snapshot();
 
-            checker.check_branch_symmetry(&before, &after_then, &after_else, condition.span);
+            checker.restore_all(before.clone());
+
+            checker.check_multi_branch_symmetry(
+                &before.states,
+                &branch_states,
+                condition.span,
+            );
         }
         StmtKind::While { condition, body, .. } => {
-            walk_expr(condition, checker);
+            walk_expr(condition, checker, type_map);
             checker.enter_loop();
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
         StmtKind::WhileLet { expr, body, .. } => {
-            walk_expr(expr, checker);
+            walk_expr(expr, checker, type_map);
             checker.enter_loop();
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
         StmtKind::For { iterable, body, .. } => {
-            walk_expr(iterable, checker);
+            walk_expr(iterable, checker, type_map);
             checker.enter_loop();
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
         StmtKind::Match { subject, arms } => {
-            walk_expr(subject, checker);
+            walk_expr(subject, checker, type_map);
             for arm in arms {
                 if let Some(guard) = &arm.guard {
-                    walk_expr(guard, checker);
+                    walk_expr(guard, checker, type_map);
                 }
                 walk_block(&arm.body, checker, type_map);
             }
@@ -181,83 +199,108 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
     }
 }
 
-fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>) {
+fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap) {
     match &expr.kind {
         ExprKind::Ident(sym) => {
             checker.use_binding(*sym, expr.span, "expression");
         }
         ExprKind::BinaryOp { left, right, .. } => {
-            walk_expr(left, checker);
-            walk_expr(right, checker);
+            walk_expr(left, checker, type_map);
+            walk_expr(right, checker, type_map);
         }
-        ExprKind::UnaryOp { operand, .. } => walk_expr(operand, checker),
+        ExprKind::UnaryOp { operand, .. } => walk_expr(operand, checker, type_map),
         ExprKind::Pipe { left, right } => {
-            walk_expr(left, checker);
-            walk_expr(right, checker);
+            walk_expr(left, checker, type_map);
+            walk_expr(right, checker, type_map);
         }
-        ExprKind::MemberAccess { object, .. } => walk_expr(object, checker),
+        ExprKind::MemberAccess { object, .. } => walk_expr(object, checker, type_map),
         ExprKind::Subscript { object, index } => {
-            walk_expr(object, checker);
-            walk_subscript(index, checker);
+            walk_expr(object, checker, type_map);
+            walk_subscript(index, checker, type_map);
         }
         ExprKind::Call { callee, args } => {
-            walk_expr(callee, checker);
-            for arg in args { walk_expr(&arg.value, checker); }
+            walk_expr(callee, checker, type_map);
+            for arg in args { walk_expr(&arg.value, checker, type_map); }
         }
-        ExprKind::Lambda { body, .. } => walk_expr(body, checker),
+        ExprKind::Lambda { body, .. } => walk_expr(body, checker, type_map),
+        ExprKind::BlockExpr(block) => walk_block(block, checker, type_map),
         ExprKind::ListComp { element, generators } => {
-            walk_expr(element, checker);
+            walk_expr(element, checker, type_map);
             for gen in generators {
-                walk_expr(&gen.iterable, checker);
-                for cond in &gen.conditions { walk_expr(cond, checker); }
+                walk_expr(&gen.iterable, checker, type_map);
+                for cond in &gen.conditions { walk_expr(cond, checker, type_map); }
             }
         }
         ExprKind::IfExpr { condition, then_expr, else_expr } => {
-            walk_expr(condition, checker);
-            walk_expr(then_expr, checker);
-            walk_expr(else_expr, checker);
+            walk_expr(condition, checker, type_map);
+
+            let before = checker.snapshot_all();
+            walk_expr(then_expr, checker, type_map);
+            let after_then = checker.snapshot_all();
+            checker.check_branch_local_unconsumed(&before, &after_then);
+
+            checker.restore_all(before.clone());
+            walk_expr(else_expr, checker, type_map);
+            let after_else = checker.snapshot_all();
+            checker.check_branch_local_unconsumed(&before, &after_else);
+
+            checker.restore_all(before.clone());
+
+            checker.check_branch_symmetry(
+                &before.states,
+                &after_then.states,
+                &after_else.states,
+                expr.span,
+            );
         }
         ExprKind::ListLiteral(elems) | ExprKind::TupleLiteral(elems) => {
-            for e in elems { walk_expr(e, checker); }
+            for e in elems { walk_expr(e, checker, type_map); }
         }
         ExprKind::DictLiteral(pairs) => {
-            for (k, v) in pairs { walk_expr(k, checker); walk_expr(v, checker); }
+            for (k, v) in pairs {
+                walk_expr(k, checker, type_map);
+                walk_expr(v, checker, type_map);
+            }
         }
         ExprKind::FString(parts) => {
             for part in parts {
                 if let nsl_ast::expr::FStringPart::Expr(e) = part {
-                    walk_expr(e, checker);
+                    walk_expr(e, checker, type_map);
                 }
             }
         }
         ExprKind::Range { start, end, .. } => {
-            if let Some(e) = start { walk_expr(e, checker); }
-            if let Some(e) = end { walk_expr(e, checker); }
+            if let Some(e) = start { walk_expr(e, checker, type_map); }
+            if let Some(e) = end { walk_expr(e, checker, type_map); }
         }
-        ExprKind::Paren(e) | ExprKind::Await(e) => walk_expr(e, checker),
+        ExprKind::Paren(e) | ExprKind::Await(e) => walk_expr(e, checker, type_map),
         ExprKind::MatchExpr { subject, arms } => {
-            walk_expr(subject, checker);
+            walk_expr(subject, checker, type_map);
             for arm in arms {
                 if let Some(guard) = &arm.guard {
-                    walk_expr(guard, checker);
+                    walk_expr(guard, checker, type_map);
                 }
-                for stmt in &arm.body.stmts { walk_stmt(stmt, checker, &TypeMap::default()); }
+                for stmt in &arm.body.stmts { walk_stmt(stmt, checker, type_map); }
             }
         }
         _ => {} // Literals, SelfRef, Error
     }
 }
 
-fn walk_subscript(index: &nsl_ast::expr::SubscriptKind, checker: &mut OwnershipChecker<'_>) {
+fn walk_subscript(
+    index: &nsl_ast::expr::SubscriptKind,
+    checker: &mut OwnershipChecker<'_>,
+    type_map: &TypeMap,
+) {
     match index {
-        nsl_ast::expr::SubscriptKind::Index(e) => walk_expr(e, checker),
+        nsl_ast::expr::SubscriptKind::Index(e) => walk_expr(e, checker, type_map),
         nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => {
-            if let Some(e) = lower { walk_expr(e, checker); }
-            if let Some(e) = upper { walk_expr(e, checker); }
-            if let Some(e) = step { walk_expr(e, checker); }
+            if let Some(e) = lower { walk_expr(e, checker, type_map); }
+            if let Some(e) = upper { walk_expr(e, checker, type_map); }
+            if let Some(e) = step { walk_expr(e, checker, type_map); }
         }
         nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
-            for d in dims { walk_subscript(d, checker); }
+            for d in dims { walk_subscript(d, checker, type_map); }
         }
     }
 }
@@ -266,11 +309,12 @@ fn register_pattern_bindings(
     pattern: &nsl_ast::pattern::Pattern,
     checker: &mut OwnershipChecker<'_>,
     type_map: &TypeMap,
-    stmt: &Stmt,
+    value: Option<&Expr>,
 ) {
     match &pattern.kind {
         PatternKind::Ident(sym) => {
-            let is_tensor = type_map.get(&stmt.id)
+            let is_tensor = value
+                .and_then(|expr| type_map.get(&expr.id))
                 .map(|ty| ty.is_tensor())
                 .unwrap_or(false);
             if is_tensor {
@@ -278,10 +322,12 @@ fn register_pattern_bindings(
             }
         }
         PatternKind::Tuple(pats) | PatternKind::List(pats) => {
-            for p in pats { register_pattern_bindings(p, checker, type_map, stmt); }
+            for p in pats {
+                register_pattern_bindings(p, checker, type_map, value);
+            }
         }
         PatternKind::Typed { pattern: inner, .. } => {
-            register_pattern_bindings(inner, checker, type_map, stmt);
+            register_pattern_bindings(inner, checker, type_map, value);
         }
         _ => {}
     }

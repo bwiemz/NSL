@@ -122,14 +122,26 @@ pub enum Type {
     // Nominal user-defined types
     Struct {
         name: Symbol,
+        type_params: Vec<Symbol>,
+        type_args: Vec<Type>,
         fields: Vec<(Symbol, Type)>,
     },
     Enum {
         name: Symbol,
+        type_params: Vec<Symbol>,
+        type_args: Vec<Type>,
         variants: Vec<(Symbol, Vec<Type>)>,
+    },
+    Trait {
+        name: Symbol,
+        type_params: Vec<Symbol>,
+        type_args: Vec<Type>,
+        methods: Vec<(Symbol, Type)>,
     },
     Model {
         name: Symbol,
+        type_params: Vec<Symbol>,
+        type_args: Vec<Type>,
         fields: Vec<(Symbol, Type)>,
         methods: Vec<(Symbol, Type)>,
     },
@@ -563,6 +575,7 @@ pub fn display_type(ty: &Type) -> String {
             format!("({}) -> {}{}", ps.join(", "), display_type(ret), eff_str)
         }
         Type::QuantizedTensor => "QuantizedTensor".into(),
+        Type::Trait { .. } => "trait".into(),
         Type::Module { .. } => "module".into(),
         Type::Unknown => "unknown".into(),
         Type::Error => "error".into(),

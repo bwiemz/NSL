@@ -8,8 +8,72 @@ use nsl_ast::block::ServeBlock;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::speculative::SpeculativeMethod;
+
+const WORKER_CONFIG_SIZE: u32 = 48;
+const WORKER_CONFIG_ALIGN: u8 = 8;
+const WORKER_DEFAULT_BLOCK_SIZE: i64 = 16;
+const WORKER_DEFAULT_NUM_KV_HEADS: i64 = 32;
+const WORKER_DEFAULT_HEAD_DIM: i64 = 128;
+const WORKER_DEFAULT_NUM_LAYERS: i64 = 32;
+const WORKER_DEFAULT_EOS_TOKEN_ID: i64 = 2;
+
+const WORKER_MAX_SEQ_LEN_OFFSET: i32 = 0;
+const WORKER_KV_BLOCKS_OFFSET: i32 = 4;
+const WORKER_BLOCK_SIZE_OFFSET: i32 = 8;
+const WORKER_NUM_KV_HEADS_OFFSET: i32 = 12;
+const WORKER_HEAD_DIM_OFFSET: i32 = 16;
+const WORKER_NUM_LAYERS_OFFSET: i32 = 20;
+const WORKER_SPEC_TOKENS_OFFSET: i32 = 24;
+const WORKER_SPEC_METHOD_OFFSET: i32 = 28;
+const WORKER_SPEC_TREE_WIDTH_OFFSET: i32 = 32;
+const WORKER_SPEC_TEMP_BITS_OFFSET: i32 = 36;
+const WORKER_EOS_TOKEN_OFFSET: i32 = 40;
 
 impl Compiler<'_> {
+    fn build_worker_config_slot(
+        &self,
+        builder: &mut FunctionBuilder,
+        max_seq_len: i64,
+        kv_blocks: i64,
+        speculative_tokens: i64,
+        speculative_method: i64,
+        speculative_tree_width: i64,
+        speculative_temperature_bits: i64,
+    ) -> cranelift_codegen::ir::StackSlot {
+        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            WORKER_CONFIG_SIZE,
+            WORKER_CONFIG_ALIGN,
+        ));
+
+        let max_seq_len_val = builder.ins().iconst(cl_types::I32, max_seq_len);
+        let kv_blocks_val = builder.ins().iconst(cl_types::I32, kv_blocks);
+        let block_size_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_BLOCK_SIZE);
+        let num_kv_heads_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_NUM_KV_HEADS);
+        let head_dim_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_HEAD_DIM);
+        let num_layers_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_NUM_LAYERS);
+        let speculative_tokens_val = builder.ins().iconst(cl_types::I32, speculative_tokens);
+        let speculative_method_val = builder.ins().iconst(cl_types::I32, speculative_method);
+        let speculative_tree_width_val = builder.ins().iconst(cl_types::I32, speculative_tree_width);
+        let speculative_temp_bits_val = builder.ins().iconst(cl_types::I32, speculative_temperature_bits);
+        let eos_val = builder.ins().iconst(cl_types::I64, WORKER_DEFAULT_EOS_TOKEN_ID);
+
+        builder.ins().stack_store(max_seq_len_val, slot, WORKER_MAX_SEQ_LEN_OFFSET);
+        builder.ins().stack_store(kv_blocks_val, slot, WORKER_KV_BLOCKS_OFFSET);
+        builder.ins().stack_store(block_size_val, slot, WORKER_BLOCK_SIZE_OFFSET);
+        builder.ins().stack_store(num_kv_heads_val, slot, WORKER_NUM_KV_HEADS_OFFSET);
+        builder.ins().stack_store(head_dim_val, slot, WORKER_HEAD_DIM_OFFSET);
+        builder.ins().stack_store(num_layers_val, slot, WORKER_NUM_LAYERS_OFFSET);
+        builder.ins().stack_store(speculative_tokens_val, slot, WORKER_SPEC_TOKENS_OFFSET);
+        builder.ins().stack_store(speculative_method_val, slot, WORKER_SPEC_METHOD_OFFSET);
+        builder.ins().stack_store(speculative_tree_width_val, slot, WORKER_SPEC_TREE_WIDTH_OFFSET);
+        builder.ins().stack_store(speculative_temp_bits_val, slot, WORKER_SPEC_TEMP_BITS_OFFSET);
+        builder.ins().stack_store(eos_val, slot, WORKER_EOS_TOKEN_OFFSET);
+
+        slot
+    }
+
     pub fn compile_serve_block(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -155,6 +219,43 @@ impl Compiler<'_> {
         // Step 1: Get role from env var via FFI (returns 0=router, 1=prefill, 2=decode)
         let role = self.compile_call_by_name(builder, "nsl_disagg_get_role", &[])?;
 
+        let speculative_config = self.features.speculative_configs.values().next();
+        let speculative_tokens = speculative_config
+            .map(|info| info.num_tokens as i64)
+            .unwrap_or(0);
+        let speculative_method = speculative_config
+            .map(|info| match info.method {
+                SpeculativeMethod::Draft => 0,
+                SpeculativeMethod::Medusa => 1,
+                SpeculativeMethod::Eagle2 => 2,
+                SpeculativeMethod::Lookahead => 3,
+            })
+            .unwrap_or(0);
+        let speculative_tree_width = speculative_config
+            .map(|info| info.tree_width as i64)
+            .unwrap_or(1);
+        let speculative_temperature_bits = speculative_config
+            .map(|info| info.temperature.to_bits() as i64)
+            .unwrap_or(0);
+        let prefill_config_slot = self.build_worker_config_slot(
+            builder,
+            _max_seq_len,
+            kv_blocks,
+            0,
+            0,
+            1,
+            0,
+        );
+        let decode_config_slot = self.build_worker_config_slot(
+            builder,
+            _max_seq_len,
+            kv_blocks,
+            speculative_tokens,
+            speculative_method,
+            speculative_tree_width,
+            speculative_temperature_bits,
+        );
+
         // Step 2: Branch on role
         let router_block = builder.create_block();
         let check_prefill_block = builder.create_block();
@@ -205,8 +306,8 @@ impl Compiler<'_> {
         // M41b: Initialize KV transfer backend for this worker
         let v_kv_backend = builder.ins().iconst(cl_types::I64, kv_backend_id);
         self.compile_call_by_name(builder, "nsl_kv_transfer_init", &[v_kv_backend, rank])?;
-        let config_zero = builder.ins().iconst(cl_types::I64, 0);
-        self.compile_call_by_name(builder, "nsl_disagg_prefill_loop", &[config_zero])?;
+        let prefill_config = builder.ins().stack_addr(cl_types::I64, prefill_config_slot, 0);
+        self.compile_call_by_name(builder, "nsl_disagg_prefill_loop", &[prefill_config])?;
         self.compile_call_by_name(builder, "nsl_kv_transfer_destroy", &[])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;
         builder.ins().jump(merge_block, &[]);
@@ -223,18 +324,8 @@ impl Compiler<'_> {
         // M41b: Initialize KV transfer backend for this worker
         let v_kv_backend2 = builder.ins().iconst(cl_types::I64, kv_backend_id);
         self.compile_call_by_name(builder, "nsl_kv_transfer_init", &[v_kv_backend2, rank2])?;
-        // M33: Check for speculative decoding config — if any @speculative decorator was
-        // collected during the compilation pass, log that speculative mode is active.
-        // The actual draft→verify loop replacement is deferred (needs draft model forward
-        // function wired); for now we pass a flag to the decode loop.
-        let speculative_flag: i64 = if self.features.speculative_configs.values().next().is_some() {
-            eprintln!("[nsl] Speculative decoding enabled for serve block");
-            1
-        } else {
-            0
-        };
-        let config_zero2 = builder.ins().iconst(cl_types::I64, speculative_flag);
-        self.compile_call_by_name(builder, "nsl_disagg_decode_loop", &[config_zero2])?;
+        let decode_config = builder.ins().stack_addr(cl_types::I64, decode_config_slot, 0);
+        self.compile_call_by_name(builder, "nsl_disagg_decode_loop", &[decode_config])?;
         self.compile_call_by_name(builder, "nsl_kv_transfer_destroy", &[])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;
         builder.ins().jump(merge_block, &[]);
@@ -242,6 +333,7 @@ impl Compiler<'_> {
         // --- Merge block ---
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
+        state.current_block = Some(merge_block);
 
         Ok(())
     }

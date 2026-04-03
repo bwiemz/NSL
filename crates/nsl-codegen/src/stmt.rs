@@ -1039,7 +1039,10 @@ impl Compiler<'_> {
         else_block: &Option<nsl_ast::stmt::Block>,
     ) -> Result<(), CodegenError> {
         let merge_block = builder.create_block();
-        let cond_val = self.compile_expr(builder, state, condition)?;
+        state.flags.conditional_depth += 1;
+        let cond_val = self.compile_expr(builder, state, condition);
+        state.flags.conditional_depth -= 1;
+        let cond_val = cond_val?;
         let incoming_loader_symbols = state.dataloader_symbols.clone();
         let mut reaching_loader_sets: Vec<std::collections::HashSet<nsl_ast::Symbol>> = Vec::new();
         let incoming_loader_vars = state.cleanup.dataloader_vars.clone();
@@ -1491,12 +1494,33 @@ impl Compiler<'_> {
                 }
             }
             ExprKind::Ident(sym) => state.dataloader_symbols.contains(sym),
+            ExprKind::Paren(inner) => self.expr_is_dataloader_handle(state, inner),
+            ExprKind::BlockExpr(block) => block
+                .stmts
+                .last()
+                .is_some_and(|stmt| matches!(&stmt.kind, StmtKind::Expr(expr) if self.expr_is_dataloader_handle(state, expr))),
+            ExprKind::IfExpr { then_expr, else_expr, .. } => {
+                self.expr_is_dataloader_handle(state, then_expr)
+                    && self.expr_is_dataloader_handle(state, else_expr)
+            }
             _ => false,
         }
     }
 
     fn expr_is_borrowed_batch_handle(&self, state: &FuncState, expr: &nsl_ast::expr::Expr) -> bool {
-        matches!(&expr.kind, ExprKind::Ident(sym) if state.borrowed_batch_symbols.contains(sym))
+        match &expr.kind {
+            ExprKind::Ident(sym) => state.borrowed_batch_symbols.contains(sym),
+            ExprKind::Paren(inner) => self.expr_is_borrowed_batch_handle(state, inner),
+            ExprKind::BlockExpr(block) => block
+                .stmts
+                .last()
+                .is_some_and(|stmt| matches!(&stmt.kind, StmtKind::Expr(expr) if self.expr_is_borrowed_batch_handle(state, expr))),
+            ExprKind::IfExpr { then_expr, else_expr, .. } => {
+                self.expr_is_borrowed_batch_handle(state, then_expr)
+                    && self.expr_is_borrowed_batch_handle(state, else_expr)
+            }
+            _ => false,
+        }
     }
 
     /// Check if an iterable expression is a real DataLoader handle.
@@ -4016,73 +4040,17 @@ impl Compiler<'_> {
         state: &mut FuncState,
         grad: &nsl_ast::block::GradBlock,
     ) -> Result<(), CodegenError> {
-        // M40b: Source-to-source AD strategy selection
-        // When source AD is enabled, attempt to extract a static computation graph
-        // (Wengert list) from the grad block body. If extraction succeeds, the
-        // backward pass can be emitted directly as Cranelift IR (deferred: backward
-        // codegen). If extraction fails (e.g., dynamic control flow), fall through
-        // to the tape-based AD path below.
-        if self.features.source_ad_enabled {
-            // Future: WengertExtractor would analyze grad.body here.
-            //   let extractor = crate::wengert::WengertExtractor::new();
-            //   if let Ok(graph) = extractor.extract(&grad.body) {
-            //       return self.compile_source_ad_backward(builder, state, grad, &graph);
-            //   }
-            // For now, always fall through to tape AD — backward Cranelift emission
-            // is not yet wired.
-        }
-        // Existing tape-based AD path continues below.
-
         // 1. Compile targets expression to get param tensor ptr
         let targets_val = self.compile_expr(builder, state, &grad.targets)?;
 
-        // 2. Wrap single tensor in a 1-element list for the tape API
-        let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        self.compile_call_by_name(builder, "nsl_list_push", &[param_list, targets_val])?;
-
-        // 3. Start tape recording
-        self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
-
-        // 4. Compile body — all tensor ops auto-record on the global tape.
-        //    The last expression is the loss (a scalar tensor).
-        let mut loss_val = None;
-        for (i, stmt) in grad.body.stmts.iter().enumerate() {
-            if i == grad.body.stmts.len() - 1 {
-                if let StmtKind::Expr(ref expr) = stmt.kind {
-                    loss_val = Some(self.compile_expr(builder, state, expr)?);
-                } else {
-                    self.compile_stmt(builder, state, stmt)?;
-                }
-            } else {
-                self.compile_stmt(builder, state, stmt)?;
+        let (loss_tensor, grad_tensor) = if self.features.source_ad_enabled {
+            match self.compile_source_ad_grad_block(builder, state, grad, targets_val)? {
+                Some(source_ad) => source_ad,
+                None => self.compile_tape_grad_block(builder, state, grad, targets_val)?,
             }
-        }
-
-        let loss_tensor = loss_val.ok_or_else(|| {
-            CodegenError::new("grad block must end with an expression (the loss)")
-        })?;
-
-        // 5. Run backward pass
-        let grads_list = self.compile_call_by_name(
-            builder,
-            "nsl_tape_backward",
-            &[loss_tensor, param_list],
-        )?;
-
-        // 6. Stop tape (cleans up saved tensor refcounts)
-        self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
-
-        // 7. Get gradient for the single param (index 0)
-        let zero = builder.ins().iconst(cl_types::I64, 0);
-        let grad_tensor = self.compile_call_by_name(
-            builder,
-            "nsl_list_get",
-            &[grads_list, zero],
-        )?;
-
-        // 7b. Free the temporary lists (grad_tensor was extracted, still alive)
-        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
-        self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
+        } else {
+            self.compile_tape_grad_block(builder, state, grad, targets_val)?
+        };
 
         // 8. Bind output variables if pattern exists
         //    loss is bound as scalar tensor ptr (I64) — use .item() for f64
@@ -4114,6 +4082,326 @@ impl Compiler<'_> {
         }
 
         Ok(())
+    }
+
+    fn compile_source_ad_grad_block(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        grad: &nsl_ast::block::GradBlock,
+        targets_val: Value,
+    ) -> Result<Option<(Value, Value)>, CodegenError> {
+        eprintln!("[nsl] Using source-to-source AD for grad block");
+
+        let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+        extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
+        extractor.set_model_field_types(self.models.model_field_types.clone());
+        self.register_source_ad_model_instances(&mut extractor, state);
+
+        for &sym in state.variables.keys() {
+            extractor.register_input(sym);
+        }
+
+        if !extractor.extract_stmts(&grad.body.stmts) {
+            eprintln!(
+                "[nsl] source AD extraction failed in grad block, falling back to tape-based AD"
+            );
+            return Ok(None);
+        }
+
+        let loss_expr = grad
+            .body
+            .stmts
+            .last()
+            .and_then(|stmt| match &stmt.kind {
+                StmtKind::Expr(expr) => Some(expr),
+                _ => None,
+            })
+            .ok_or_else(|| CodegenError::new("grad block must end with an expression (the loss)"))?;
+
+        let Some(loss_var_id) = self.resolve_source_ad_expr_var_id(&extractor, loss_expr, true)
+        else {
+            eprintln!(
+                "[nsl] source AD could not resolve grad block loss, falling back to tape-based AD"
+            );
+            return Ok(None);
+        };
+        extractor.set_output(loss_var_id);
+
+        let target_var_id = match &grad.targets.kind {
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                self.resolve_source_ad_expr_var_id(&extractor, &grad.targets, false)
+            }
+            _ => {
+                eprintln!(
+                    "[nsl] source AD does not yet resolve this grad target shape, falling back to tape-based AD"
+                );
+                return Ok(None);
+            }
+        };
+        let Some(target_var_id) = target_var_id else {
+            eprintln!(
+                "[nsl] source AD could not resolve grad target, falling back to tape-based AD"
+            );
+            return Ok(None);
+        };
+
+        let state_vars_by_name: std::collections::HashMap<String, Value> = state
+            .variables
+            .iter()
+            .map(|(sym, (cvar, _))| (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar)))
+            .collect();
+        let mut primal_vars = crate::wengert_lower::VarMap::new();
+
+        for (sym, vid) in extractor.symbol_var_map() {
+            if primal_vars.contains_key(vid) {
+                continue;
+            }
+            if let Some(&(cvar, _)) = state.variables.get(sym) {
+                primal_vars.insert(*vid, builder.use_var(cvar));
+            } else {
+                let name = self.resolve_sym(*sym).to_string();
+                if let Some(&val) = state_vars_by_name.get(&name) {
+                    primal_vars.insert(*vid, val);
+                }
+            }
+        }
+
+        for op in &extractor.wengert_list().ops {
+            if let crate::wengert::PrimalOp::Input(name) = &op.op {
+                if primal_vars.contains_key(&op.result) {
+                    continue;
+                }
+                if let Some(&val) = state_vars_by_name.get(name) {
+                    primal_vars.insert(op.result, val);
+                }
+            }
+        }
+
+        for (compound_name, vid) in extractor.named_param_var_ids() {
+            if primal_vars.contains_key(vid) {
+                continue;
+            }
+            if let Some(val) = self.load_source_ad_named_param(builder, state, compound_name) {
+                primal_vars.insert(*vid, val);
+            }
+        }
+
+        let full_lowered = crate::wengert_lower::compile_wengert_ops(
+            self,
+            builder,
+            state,
+            extractor.wengert_list(),
+            &primal_vars,
+        )?;
+        let full_vars = &full_lowered.var_map;
+
+        let loss_tensor = *full_vars.get(&loss_var_id).ok_or_else(|| {
+            CodegenError::new("source AD: loss VarId not found in compiled grad graph")
+        })?;
+
+        let mut retained_full_vars = std::collections::HashSet::new();
+        retained_full_vars.insert(loss_var_id);
+
+        let mut grad_tensor = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[targets_val])?;
+
+        let start_var = extractor.next_var_id();
+        let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+        let mut adjoint = gen.generate(extractor.wengert_list());
+
+        if let Some(target_adj_var) = gen.adjoint_of(target_var_id) {
+            let needed = std::collections::HashSet::from([target_adj_var]);
+            adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
+
+            if !adjoint.ops.is_empty() {
+                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+                    self,
+                    builder,
+                    state,
+                    &adjoint,
+                    full_vars,
+                ) {
+                    Ok(gv) => gv,
+                    Err(e) => {
+                        eprintln!(
+                            "[nsl] source AD lowering failed ({}) in grad block; rerun without --source-ad",
+                            e
+                        );
+                        return Err(e);
+                    }
+                };
+
+                let mut retained_adjoint_vars = std::collections::HashSet::new();
+                if let Some(grad_val) = grad_lowered.var_map.get(&target_adj_var).copied() {
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_tensor])?;
+                    grad_tensor = grad_val;
+                    retained_adjoint_vars.insert(target_adj_var);
+                }
+                self.free_wengert_owned_values(
+                    builder,
+                    &grad_lowered.owned_values,
+                    &retained_adjoint_vars,
+                )?;
+            }
+        }
+
+        self.free_wengert_owned_values(builder, &full_lowered.owned_values, &retained_full_vars)?;
+        Ok(Some((loss_tensor, grad_tensor)))
+    }
+
+    fn compile_tape_grad_block(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        grad: &nsl_ast::block::GradBlock,
+        targets_val: Value,
+    ) -> Result<(Value, Value), CodegenError> {
+
+        // 2. Wrap single tensor in a 1-element list for the tape API
+        let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        self.compile_call_by_name(builder, "nsl_list_push", &[param_list, targets_val])?;
+
+        // 3. Start tape recording
+        self.compile_call_by_name(builder, "nsl_tape_start", &[param_list])?;
+
+        // 4. Compile body — all tensor ops auto-record on the global tape.
+        //    The last expression is the loss (a scalar tensor).
+        state.flags.in_tape_region = true;
+        let mut loss_val = None;
+        for (i, stmt) in grad.body.stmts.iter().enumerate() {
+            if i == grad.body.stmts.len() - 1 {
+                if let StmtKind::Expr(ref expr) = stmt.kind {
+                    loss_val = Some(self.compile_expr(builder, state, expr)?);
+                } else {
+                    self.compile_stmt(builder, state, stmt)?;
+                }
+            } else {
+                self.compile_stmt(builder, state, stmt)?;
+            }
+        }
+        state.flags.in_tape_region = false;
+
+        let loss_tensor = loss_val.ok_or_else(|| {
+            CodegenError::new("grad block must end with an expression (the loss)")
+        })?;
+
+        // 5. Run backward pass
+        let grads_list = self.compile_call_by_name(
+            builder,
+            "nsl_tape_backward",
+            &[loss_tensor, param_list],
+        )?;
+
+        // 6. Stop tape (cleans up saved tensor refcounts)
+        self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
+
+        // 7. Get gradient for the single param (index 0)
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        let grad_tensor = self.compile_call_by_name(
+            builder,
+            "nsl_list_get",
+            &[grads_list, zero],
+        )?;
+
+        // 7b. Free the temporary lists (grad_tensor was extracted, still alive)
+        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[param_list])?;
+
+        Ok((loss_tensor, grad_tensor))
+    }
+
+    fn register_source_ad_model_instances(
+        &self,
+        extractor: &mut crate::source_ad::WengertExtractor<'_>,
+        state: &FuncState,
+    ) {
+        for &sym in state.variables.keys() {
+            if let Some(model_type_name) = self.resolve_source_ad_model_type_name(state, sym) {
+                extractor.register_model_instance(sym, &model_type_name);
+            }
+        }
+    }
+
+    fn resolve_source_ad_model_type_name(
+        &self,
+        state: &FuncState,
+        sym: nsl_ast::Symbol,
+    ) -> Option<String> {
+        self.models
+            .model_var_types
+            .get(&sym)
+            .cloned()
+            .or_else(|| {
+                state.variable_types.get(&sym).and_then(|ty| match ty {
+                    Type::Model { name, .. } | Type::Struct { name, .. } => {
+                        Some(self.resolve_sym(*name).to_string())
+                    }
+                    _ => None,
+                })
+            })
+            .filter(|name| self.types.struct_layouts.contains_key(name))
+    }
+
+    fn resolve_source_ad_expr_name(&self, expr: &nsl_ast::expr::Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(sym) => Some(self.resolve_sym(*sym).to_string()),
+            ExprKind::MemberAccess { object, member } => {
+                let prefix = self.resolve_source_ad_expr_name(object)?;
+                let member_name = self.resolve_sym(*member).to_string();
+                Some(format!("{}.{}", prefix, member_name))
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_source_ad_expr_var_id(
+        &self,
+        extractor: &crate::source_ad::WengertExtractor<'_>,
+        expr: &nsl_ast::expr::Expr,
+        allow_last_op_fallback: bool,
+    ) -> Option<crate::wengert::VarId> {
+        match &expr.kind {
+            ExprKind::Ident(sym) => extractor.symbol_var_map().get(sym).copied(),
+            ExprKind::MemberAccess { .. } => {
+                let name = self.resolve_source_ad_expr_name(expr)?;
+                extractor
+                    .named_param_var_ids()
+                    .iter()
+                    .find_map(|(compound_name, vid)| (compound_name == &name).then_some(*vid))
+                    .or_else(|| {
+                        extractor
+                            .wengert_list()
+                            .var_names
+                            .iter()
+                            .find_map(|(vid, existing_name)| (existing_name == &name).then_some(*vid))
+                    })
+            }
+            _ if allow_last_op_fallback => extractor.wengert_list().ops.last().map(|op| op.result),
+            _ => None,
+        }
+    }
+
+    fn load_source_ad_named_param(
+        &self,
+        builder: &mut FunctionBuilder,
+        state: &FuncState,
+        compound_name: &str,
+    ) -> Option<Value> {
+        let root_name = compound_name.split('.').next()?;
+        let (&root_sym, &(root_var, _)) = state
+            .variables
+            .iter()
+            .find(|(sym, _)| self.resolve_sym(**sym) == root_name)?;
+        let model_type_name = self.resolve_source_ad_model_type_name(state, root_sym)?;
+        let layout = self.types.struct_layouts.get(&model_type_name)?;
+        let root_ptr = builder.use_var(root_var);
+        self.load_nested_field(
+            builder,
+            root_ptr,
+            layout,
+            &model_type_name,
+            compound_name,
+        )
     }
 
     // ── Quant block codegen ──────────────────────────────────────────

@@ -643,7 +643,7 @@ fn walk_stmt(
         StmtKind::VarDecl { pattern, value, .. } => {
             // Record uses in the RHS expression
             if let Some(expr) = value {
-                walk_expr_uses(expr, interner, analyzer, name_to_id);
+                walk_expr_uses(expr, type_map, interner, analyzer, name_to_id);
             }
 
             // Check if this binding is a tensor with static shape
@@ -674,19 +674,19 @@ fn walk_stmt(
         }
 
         StmtKind::Expr(expr) | StmtKind::Return(Some(expr)) => {
-            walk_expr_uses(expr, interner, analyzer, name_to_id);
+            walk_expr_uses(expr, type_map, interner, analyzer, name_to_id);
         }
 
         StmtKind::Assign { target, value, .. } => {
-            walk_expr_uses(target, interner, analyzer, name_to_id);
-            walk_expr_uses(value, interner, analyzer, name_to_id);
+            walk_expr_uses(target, type_map, interner, analyzer, name_to_id);
+            walk_expr_uses(value, type_map, interner, analyzer, name_to_id);
         }
 
         StmtKind::If { condition, then_block, elif_clauses, else_block } => {
-            walk_expr_uses(condition, interner, analyzer, name_to_id);
+            walk_expr_uses(condition, type_map, interner, analyzer, name_to_id);
             walk_stmts(&then_block.stmts, type_map, interner, analyzer, name_to_id);
             for (cond, block) in elif_clauses {
-                walk_expr_uses(cond, interner, analyzer, name_to_id);
+                walk_expr_uses(cond, type_map, interner, analyzer, name_to_id);
                 walk_stmts(&block.stmts, type_map, interner, analyzer, name_to_id);
             }
             if let Some(block) = else_block {
@@ -695,7 +695,7 @@ fn walk_stmt(
         }
 
         StmtKind::For { body, iterable, .. } => {
-            walk_expr_uses(iterable, interner, analyzer, name_to_id);
+            walk_expr_uses(iterable, type_map, interner, analyzer, name_to_id);
             let loop_entry = analyzer.current_pp();
             walk_stmts(&body.stmts, type_map, interner, analyzer, name_to_id);
             let loop_exit = analyzer.current_pp();
@@ -705,7 +705,7 @@ fn walk_stmt(
         }
 
         StmtKind::While { condition, body } => {
-            walk_expr_uses(condition, interner, analyzer, name_to_id);
+            walk_expr_uses(condition, type_map, interner, analyzer, name_to_id);
             let loop_entry = analyzer.current_pp();
             walk_stmts(&body.stmts, type_map, interner, analyzer, name_to_id);
             let loop_exit = analyzer.current_pp();
@@ -719,6 +719,7 @@ fn walk_stmt(
 /// Walk an expression to record uses of tensor variables.
 fn walk_expr_uses(
     expr: &nsl_ast::expr::Expr,
+    type_map: &nsl_semantic::checker::TypeMap,
     interner: &nsl_lexer::Interner,
     analyzer: &mut LivenessAnalyzer,
     name_to_id: &HashMap<String, TensorAllocId>,
@@ -735,44 +736,49 @@ fn walk_expr_uses(
         }
 
         ExprKind::Call { callee, args, .. } => {
-            walk_expr_uses(callee, interner, analyzer, name_to_id);
+            walk_expr_uses(callee, type_map, interner, analyzer, name_to_id);
             for arg in args {
-                walk_expr_uses(&arg.value, interner, analyzer, name_to_id);
+                walk_expr_uses(&arg.value, type_map, interner, analyzer, name_to_id);
             }
         }
 
         ExprKind::BinaryOp { left, right, .. } => {
-            walk_expr_uses(left, interner, analyzer, name_to_id);
-            walk_expr_uses(right, interner, analyzer, name_to_id);
+            walk_expr_uses(left, type_map, interner, analyzer, name_to_id);
+            walk_expr_uses(right, type_map, interner, analyzer, name_to_id);
         }
 
         ExprKind::UnaryOp { operand, .. } => {
-            walk_expr_uses(operand, interner, analyzer, name_to_id);
+            walk_expr_uses(operand, type_map, interner, analyzer, name_to_id);
         }
 
         ExprKind::MemberAccess { object, .. } => {
-            walk_expr_uses(object, interner, analyzer, name_to_id);
+            walk_expr_uses(object, type_map, interner, analyzer, name_to_id);
         }
 
         ExprKind::Subscript { object, .. } => {
-            walk_expr_uses(object, interner, analyzer, name_to_id);
+            walk_expr_uses(object, type_map, interner, analyzer, name_to_id);
         }
 
         ExprKind::ListLiteral(items) | ExprKind::TupleLiteral(items) => {
             for item in items {
-                walk_expr_uses(item, interner, analyzer, name_to_id);
+                walk_expr_uses(item, type_map, interner, analyzer, name_to_id);
             }
         }
 
         ExprKind::Pipe { left, right, .. } => {
-            walk_expr_uses(left, interner, analyzer, name_to_id);
-            walk_expr_uses(right, interner, analyzer, name_to_id);
+            walk_expr_uses(left, type_map, interner, analyzer, name_to_id);
+            walk_expr_uses(right, type_map, interner, analyzer, name_to_id);
+        }
+
+        ExprKind::BlockExpr(block) => {
+            let mut local_name_to_id = name_to_id.clone();
+            walk_stmts(&block.stmts, type_map, interner, analyzer, &mut local_name_to_id);
         }
 
         ExprKind::IfExpr { condition, then_expr, else_expr, .. } => {
-            walk_expr_uses(condition, interner, analyzer, name_to_id);
-            walk_expr_uses(then_expr, interner, analyzer, name_to_id);
-            walk_expr_uses(else_expr, interner, analyzer, name_to_id);
+            walk_expr_uses(condition, type_map, interner, analyzer, name_to_id);
+            walk_expr_uses(then_expr, type_map, interner, analyzer, name_to_id);
+            walk_expr_uses(else_expr, type_map, interner, analyzer, name_to_id);
         }
 
         _ => {} // Literals, etc.

@@ -99,8 +99,8 @@ train(model=m, epochs=100, grad_clip=1.0):
 **Gradient accumulation:** `grad_accumulation=N` for effective batch size scaling
 
 ### Automatic Differentiation
-- **Tape-based reverse-mode AD** — `grad` keyword, implicit tape in `train` blocks
-- **Source-to-source AD** — Wengert extraction, 50+ backward rules
+- **Tape-based reverse-mode AD** — default backend for `grad(...)` and `train(...)`
+- **Source-to-source AD** — opt-in via `--source-ad` for `train(...)` and standalone `grad(...)`, with diagnostic fallback to tape AD when extraction or target resolution is unsupported
 - **Supported ops:** matmul, add, sub, mul, div, exp, log, sqrt, abs, clamp, relu, gelu, silu, sigmoid, tanh, softmax, layernorm, rmsnorm, dropout, conv2d, maxpool2d, embedding_lookup, gather, scatter, attention, RoPE
 - **`@no_grad`** decorator to exclude functions from tape
 - **`@checkpoint`** decorator for activation checkpointing
@@ -165,7 +165,8 @@ quant static:
 - CPU naive path (correctness-verified against manual computation)
 - GPU path: tiled attention with online softmax, MMA tensor cores
 - Causal masking support
-- Plans: Hopper wgmma.mma_async upgrade, logsumexp backward
+- Hopper wgmma path exists, but parts of the Hopper-specialized TMA/wgmma kernel plumbing are still placeholder-level
+- Logsumexp save/backward support is implemented
 
 ### Continuous Batching (M29)
 - `serve` block DSL with `@endpoint` decorator
@@ -176,10 +177,11 @@ quant static:
 
 ### Speculative Decoding (M33)
 - `@speculative` decorator with configurable draft models
-- EAGLE-2 dynamic confidence-scored draft trees
-- Medusa multi-head speculation
+- EAGLE-2 dynamic confidence-scored draft tree scaffolding
+- Medusa multi-head speculation scaffolding
 - Tree attention masks for parallel verification
 - Rejection sampling (greedy + stochastic)
+- Disaggregated serve/decode wiring supports the basic speculative lookahead path; tree-specific method/tree-width controls are still not fully wired end to end
 
 ---
 
@@ -188,7 +190,7 @@ quant static:
 ### Mixture of Experts (M32)
 - `@moe` decorator with top-k gating
 - Capacity-based routing with auxiliary load-balancing loss
-- Expert parallel dispatch
+- Expert routing/dispatch, with expert-parallel all-to-all still stubbed
 
 ### Memory Planning (M36)
 - Compile-time tensor liveness analysis
@@ -204,12 +206,7 @@ quant static:
 - Fusion profitability estimation
 
 ### Graph-Level Fusion (M31)
-- Epilogue fusion detection (matmul + bias + activation)
-- Reduction fusion detection (Welford merge for layernorm/softmax)
-- DAG-based fusion analysis with consumer counting
-- `@fuse_graph` decorator
-- Cost-guided profitability filtering
-- Status: analysis infrastructure complete, IR rewriting pending
+- Status: analysis is implemented and selective rewrite paths exist, but end-to-end graph-pass integration remains uneven and some decorator/training-path follow-ups remain
 
 ### Ownership & Linear Types (M38)
 - Use-after-move detection at compile time
@@ -222,7 +219,9 @@ quant static:
 ### Source-to-Source AD (M40)
 - Wengert list extraction from AST
 - Reverse-mode adjoint generation
+- Enabled for `train(...)` and standalone `grad(...)` under `--source-ad`
 - If/else branch support with condition saving
+- Unsupported extraction, unresolved grad targets, or lowering failures emit a diagnostic and fall back to tape AD instead of changing gradient semantics
 - Dead gradient elimination
 
 ---
@@ -232,6 +231,8 @@ quant static:
 ### Disaggregated Inference (M41)
 - Router with prefill/decode worker pools
 - KV transfer protocol (KVXF format with dtype support)
+- Structured worker configs are threaded into prefill/decode loops, including speculative-lookahead metadata used by disaggregated serve
+- Decode limits are enforced over total sequence length (`prompt_len + generated_tokens`); `max_tokens: 0` completes immediately
 - Policies: LeastLoaded, RoundRobin, MemoryAware
 
 ### Multi-Backend (M47)
@@ -370,7 +371,7 @@ Per-op analysis targeting H100-SXM (FP32, batch=1, seq=1024):
 ## Roadmap
 
 ### Completed (M9-M55)
-All compiler and runtime milestones are implemented. See [docs/summaries/](docs/summaries/) for detailed status.
+Milestone work from M9-M55 is present in the repo, with maturity ranging from production to functional and a few subsystems still relying on stubs or fallbacks. See [docs/summaries/](docs/summaries/) for the current per-milestone status.
 
 ### In Progress
 - **NSL-Coder-50M** — 50M parameter code generation model (pretraining verified)

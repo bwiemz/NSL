@@ -7,6 +7,11 @@ impl<'a> TypeChecker<'a> {
         let prev = self.current_scope;
         self.current_scope = scope;
 
+        for tp in &model_def.type_params {
+            self.declare_symbol(tp.name, Type::TypeVar(tp.name), tp.span, true, false);
+        }
+        self.check_type_param_bounds(&model_def.type_params);
+
         // Declare constructor params
         for param in &model_def.params {
             let param_ty = param
@@ -340,6 +345,8 @@ impl<'a> TypeChecker<'a> {
         // Build complete self type with all fields and methods
         let complete_self_type = Type::Model {
             name: model_def.name,
+            type_params: model_def.type_params.iter().map(|tp| tp.name).collect(),
+            type_args: Vec::new(),
             fields: fields.clone(),
             methods: methods.clone(),
         };
@@ -396,6 +403,8 @@ impl<'a> TypeChecker<'a> {
         // Build and register the model type
         let model_ty = Type::Model {
             name: model_def.name,
+            type_params: model_def.type_params.iter().map(|tp| tp.name).collect(),
+            type_args: Vec::new(),
             fields,
             methods,
         };

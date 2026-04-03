@@ -246,6 +246,9 @@ impl DeterminismChecker {
             ExprKind::Subscript { object, .. } => {
                 self.scan_expr(object, interner);
             }
+            ExprKind::BlockExpr(block) => {
+                self.scan_block(block, interner);
+            }
             ExprKind::IfExpr { condition, then_expr, else_expr } => {
                 self.scan_expr(condition, interner);
                 self.scan_expr(then_expr, interner);

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 
 impl<'a> TypeChecker<'a> {
@@ -204,6 +206,291 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 _ => {} // other config entries validated elsewhere
+            }
+        }
+    }
+
+    pub(crate) fn check_tokenizer_def(&mut self, tok: &TokenizerDef) {
+        self.declare_symbol(tok.name, Type::Unknown, tok.span, true, false);
+
+        let mut seen_config = HashSet::new();
+        for arg in &tok.config {
+            let Some(name_sym) = arg.name else {
+                self.diagnostics.push(
+                    Diagnostic::error("tokenizer config entries must be named")
+                        .with_label(arg.span, "expected key = value"),
+                );
+                continue;
+            };
+
+            let name = self.resolve_name(name_sym);
+            if !seen_config.insert(name_sym) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("duplicate tokenizer config entry '{name}'"))
+                        .with_label(arg.span, "duplicate config entry"),
+                );
+            }
+
+            match name.as_str() {
+                "algorithm" => {
+                    self.check_enum_ident(
+                        &arg.value,
+                        &[
+                            "bpe",
+                            "wordpiece",
+                            "sentencepiece",
+                            "unigram",
+                            "char",
+                            "byte",
+                        ],
+                        "tokenizer algorithm",
+                    );
+                }
+                "vocab_size" => {
+                    self.check_assignable_expr(&arg.value, &Type::Int, "tokenizer vocab_size");
+                }
+                "model_file" => {
+                    self.check_assignable_expr(&arg.value, &Type::Str, "tokenizer model_file");
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("unknown tokenizer config entry '{name}'"))
+                            .with_label(arg.span, "unknown tokenizer config entry"),
+                    );
+                }
+            }
+        }
+
+        let mut seen_sections = HashSet::new();
+        for item in &tok.body {
+            let (section_name, section_span) = match item {
+                TokenizerStmt::SpecialTokens { span, .. } => ("special_tokens", *span),
+                TokenizerStmt::Normalize { span, .. } => ("normalize", *span),
+                TokenizerStmt::PreTokenize { span, .. } => ("pre_tokenize", *span),
+                TokenizerStmt::Padding { span, .. } => ("padding", *span),
+                TokenizerStmt::Truncation { span, .. } => ("truncation", *span),
+            };
+            if !seen_sections.insert(section_name) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("duplicate tokenizer section '{section_name}'"))
+                        .with_label(section_span, "duplicate tokenizer section"),
+                );
+            }
+
+            match item {
+                TokenizerStmt::SpecialTokens { entries, .. } => {
+                    let mut seen_keys = HashSet::new();
+                    for entry in entries {
+                        self.check_duplicate_key(&mut seen_keys, entry, "special token");
+                        match entry.value.kind {
+                            ExprKind::StringLiteral(_) => {}
+                            _ => {
+                                self.diagnostics.push(
+                                    Diagnostic::error("special token values must be string literals")
+                                        .with_label(entry.value.span, "expected string literal"),
+                                );
+                            }
+                        }
+                    }
+                }
+                TokenizerStmt::Normalize { rules, span } => {
+                    self.check_symbol_list_duplicates(rules, *span, "normalize rule");
+                }
+                TokenizerStmt::PreTokenize { rules, span } => {
+                    self.check_symbol_list_duplicates(rules, *span, "pre-tokenize rule");
+                }
+                TokenizerStmt::Padding { entries, .. } => {
+                    let mut seen_keys = HashSet::new();
+                    for entry in entries {
+                        self.check_duplicate_key(&mut seen_keys, entry, "padding entry");
+                        let key = self.resolve_name(entry.key);
+                        match key.as_str() {
+                            "side" => {
+                                self.check_enum_ident(
+                                    &entry.value,
+                                    &["left", "right"],
+                                    "padding.side",
+                                );
+                            }
+                            "pad_to" => match &entry.value.kind {
+                                ExprKind::Ident(sym)
+                                    if self.resolve_name(*sym) == "longest" => {}
+                                ExprKind::Ident(_) => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "padding.pad_to must be an integer or 'longest'",
+                                        )
+                                        .with_label(entry.value.span, "invalid pad_to value"),
+                                    );
+                                }
+                                _ => {
+                                    self.check_assignable_expr(
+                                        &entry.value,
+                                        &Type::Int,
+                                        "padding.pad_to",
+                                    );
+                                }
+                            },
+                            _ => {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "unknown padding entry '{key}'"
+                                    ))
+                                    .with_label(entry.span, "unknown padding entry"),
+                                );
+                            }
+                        }
+                    }
+                }
+                TokenizerStmt::Truncation { entries, .. } => {
+                    let mut seen_keys = HashSet::new();
+                    for entry in entries {
+                        self.check_duplicate_key(&mut seen_keys, entry, "truncation entry");
+                        let key = self.resolve_name(entry.key);
+                        match key.as_str() {
+                            "max_length" => {
+                                self.check_assignable_expr(
+                                    &entry.value,
+                                    &Type::Int,
+                                    "truncation.max_length",
+                                );
+                            }
+                            "strategy" => {
+                                self.check_enum_ident(
+                                    &entry.value,
+                                    &["longest_first", "only_first", "only_second"],
+                                    "truncation.strategy",
+                                );
+                            }
+                            _ => {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "unknown truncation entry '{key}'"
+                                    ))
+                                    .with_label(entry.span, "unknown truncation entry"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn check_dataset_def(&mut self, ds: &DatasetDef) {
+        self.declare_symbol(ds.name, Type::Unknown, ds.span, true, false);
+
+        self.check_assignable_expr(&ds.source, &Type::Str, "dataset name");
+
+        let mut seen_fields = HashSet::new();
+        let mut has_source_field = false;
+        for entry in &ds.body {
+            self.check_duplicate_key(&mut seen_fields, entry, "dataset field");
+            let key = self.resolve_name(entry.key);
+            match key.as_str() {
+                "source" => {
+                    has_source_field = true;
+                    self.check_expr(&entry.value);
+                }
+                "format" => match &entry.value.kind {
+                    ExprKind::Ident(_) | ExprKind::StringLiteral(_) => {}
+                    _ => {
+                        self.check_expr(&entry.value);
+                    }
+                },
+                "transform" | "filter" => {
+                    self.check_expr(&entry.value);
+                }
+                "shuffle" | "packing" => {
+                    self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
+                }
+                "sequence_length" | "max_samples" | "shuffle_buffer" | "pack_separator" => {
+                    self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
+                }
+                "resume_from" => {
+                    self.check_assignable_expr(&entry.value, &Type::Str, "dataset resume_from");
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("unknown dataset field '{key}'"))
+                            .with_label(entry.span, "unknown dataset field"),
+                    );
+                }
+            }
+        }
+
+        if !has_source_field {
+            self.diagnostics.push(
+                Diagnostic::error("dataset body must declare 'source'")
+                    .with_label(ds.span, "missing source field"),
+            );
+        }
+    }
+
+    fn check_duplicate_key(
+        &mut self,
+        seen: &mut HashSet<Symbol>,
+        entry: &KeyValueEntry,
+        context: &str,
+    ) {
+        if !seen.insert(entry.key) {
+            let key = self.resolve_name(entry.key);
+            self.diagnostics.push(
+                Diagnostic::error(format!("duplicate {context} '{key}'"))
+                    .with_label(entry.span, "duplicate entry"),
+            );
+        }
+    }
+
+    fn check_symbol_list_duplicates(&mut self, items: &[Symbol], span: Span, context: &str) {
+        let mut seen = HashSet::new();
+        for item in items {
+            if !seen.insert(*item) {
+                let name = self.resolve_name(*item);
+                self.diagnostics.push(
+                    Diagnostic::error(format!("duplicate {context} '{name}'"))
+                        .with_label(span, "duplicate entry"),
+                );
+            }
+        }
+    }
+
+    fn check_assignable_expr(&mut self, expr: &Expr, expected: &Type, context: &str) {
+        let ty = self.check_expr(expr);
+        if !is_assignable(&ty, expected) {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "{context} must be {}, got {}",
+                    display_type(expected),
+                    display_type(&ty)
+                ))
+                .with_label(expr.span, "wrong type"),
+            );
+        }
+    }
+
+    fn check_enum_ident(&mut self, expr: &Expr, allowed: &[&str], context: &str) {
+        match &expr.kind {
+            ExprKind::Ident(sym) => {
+                let value = self.resolve_name(*sym);
+                if !allowed.iter().any(|candidate| *candidate == value) {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "{context} must be one of: {}",
+                            allowed.join(", ")
+                        ))
+                        .with_label(expr.span, format!("found '{value}'")),
+                    );
+                }
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "{context} must be one of: {}",
+                        allowed.join(", ")
+                    ))
+                    .with_label(expr.span, "expected identifier value"),
+                );
             }
         }
     }

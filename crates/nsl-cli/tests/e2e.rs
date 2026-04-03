@@ -115,6 +115,29 @@ fn run_example(name: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn run_example_with_run_args(name: &str, run_args: &[&str]) -> String {
+    let root = workspace_root();
+    let example_path = root.join(format!("examples/{}.nsl", name));
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(run_args)
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        panic!(
+            "nsl run failed for '{}' with args {:?} (exit {:?}):\nstderr: {}",
+            name,
+            run_args,
+            output.status.code(),
+            stderr
+        );
+    }
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 fn expected_output(name: &str) -> String {
     let root = workspace_root();
     let path = root.join(format!("tests/expected/{}.txt", name));
@@ -130,6 +153,18 @@ fn assert_output_matches(name: &str) {
         expected.trim(),
         "Output mismatch for example '{}'",
         name
+    );
+}
+
+fn assert_output_matches_with_run_args(name: &str, run_args: &[&str]) {
+    let actual = normalize(&run_example_with_run_args(name, run_args));
+    let expected = normalize(&expected_output(name));
+    assert_eq!(
+        actual.trim(),
+        expected.trim(),
+        "Output mismatch for example '{}' with args {:?}",
+        name,
+        run_args
     );
 }
 
@@ -169,6 +204,80 @@ fn e2e_m12_grad_matmul() {
 }
 
 #[test]
+fn e2e_m12_grad_basic_source_ad() {
+    assert_output_matches_with_run_args("m12_grad_basic", &["--source-ad"]);
+}
+
+#[test]
+fn e2e_m12_grad_model_source_ad() {
+    assert_output_matches_with_run_args("m12_grad_model", &["--source-ad"]);
+}
+
+#[test]
+fn e2e_m12_grad_source_ad_fallback() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m12_grad_source_ad_fallback.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "nsl run failed for source AD fallback example (exit {:?}):\nstderr: {}",
+        output.status.code(),
+        stderr
+    );
+
+    let actual = normalize(&String::from_utf8_lossy(&output.stdout));
+    let expected = normalize(&expected_output("m12_grad_source_ad_fallback"));
+    assert_eq!(
+        actual.trim(),
+        expected.trim(),
+        "Output mismatch for source AD fallback example"
+    );
+    assert!(
+        stderr.contains("source AD extraction failed in grad block, falling back to tape-based AD"),
+        "Expected source AD fallback diagnostic in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_m12_grad_source_ad_unresolved_target_fallback() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m12_grad_source_ad_unresolved_target_fallback.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "nsl run failed for unresolved-target fallback example (exit {:?}):\nstderr: {}",
+        output.status.code(),
+        stderr
+    );
+
+    let actual = normalize(&String::from_utf8_lossy(&output.stdout));
+    let expected = normalize(&expected_output("m12_grad_source_ad_unresolved_target_fallback"));
+    assert_eq!(
+        actual.trim(),
+        expected.trim(),
+        "Output mismatch for unresolved-target fallback example"
+    );
+    assert!(
+        stderr.contains("source AD could not resolve grad target, falling back to tape-based AD"),
+        "Expected unresolved-target fallback diagnostic in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
 fn e2e_m13_stdlib_import() {
     assert_output_matches("m13_stdlib_import");
 }
@@ -196,6 +305,341 @@ fn e2e_m23_byod_block() {
 #[test]
 fn e2e_m23_byod_error() {
     assert_output_matches("m23_byod_error");
+}
+
+#[test]
+fn e2e_if_expr_block_valid() {
+    assert_output_matches("m5_if_expr_block_valid");
+}
+
+#[test]
+fn e2e_if_expr_block_prelude_valid() {
+    assert_output_matches("m5_if_expr_block_prelude_valid");
+}
+
+#[test]
+fn e2e_if_expr_numeric_join() {
+    assert_output_matches("m5_if_expr_numeric_join");
+}
+
+#[test]
+fn e2e_if_expr_tensor_mixed_cleanup() {
+    assert_output_matches("m5_if_expr_tensor_mixed_cleanup");
+}
+
+#[test]
+fn e2e_if_expr_missing_else_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_missing_else.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_if_expr_missing_else, but it succeeded"
+    );
+    assert!(
+        !stderr.contains("expected newline or end of statement"),
+        "Unexpected parser error for block if-expression example: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("if-expression") || stderr.contains("else branch"),
+        "Expected if-expression validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_if_expr_non_value_branch_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_non_value_branch.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_if_expr_non_value_branch, but it succeeded"
+    );
+    assert!(
+        !stderr.contains("expected newline or end of statement"),
+        "Unexpected parser error for block if-expression example: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("if-expression") || stderr.contains("yield a value"),
+        "Expected if-expression branch validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_if_expr_branch_type_mismatch_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_branch_type_mismatch.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_if_expr_branch_type_mismatch, but it succeeded"
+    );
+    assert!(
+        !stderr.contains("Compilation error: Verifier errors"),
+        "Unexpected codegen verifier error for if-expression type mismatch: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("if-expression branch type mismatch"),
+        "Expected if-expression branch type mismatch in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_if_expr_shadowing_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_shadowing_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_if_expr_shadowing_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("shadowing outer binding") && stderr.contains("if-expression block"),
+        "Expected if-expression shadowing validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_if_expr_lambda_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_lambda_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_if_expr_lambda_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("if-expression function values are not supported yet"),
+        "Expected if-expression lambda validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_triple_quoted_fstring() {
+    assert_output_matches("m5_triple_fstring");
+}
+
+#[test]
+fn e2e_tokenizer_dataset_defs_valid() {
+    assert_output_matches("m5_tokenizer_dataset_valid");
+}
+
+#[test]
+fn e2e_tokenizer_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_tokenizer_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_tokenizer_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("padding.side") || stderr.contains("left, right"),
+        "Expected tokenizer validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_dataset_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_dataset_validation_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_dataset_validation_error, but it succeeded"
+    );
+    assert!(
+        stderr.contains("unknown dataset field 'unexpected'"),
+        "Expected dataset validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_user_defined_generic_instantiation_check() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_generic_instantiation_check.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl check");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "Expected generic instantiation check to succeed, but it failed: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("undefined type") && !stderr.contains("wrong number of type arguments"),
+        "Unexpected generic-instantiation diagnostics: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_user_defined_generic_instantiation_arity_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_generic_instantiation_arity_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl check");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected generic-instantiation arity check to fail, but it succeeded"
+    );
+    assert!(
+        stderr.contains("Box expects 1 type argument(s), got 2"),
+        "Expected generic-instantiation arity error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_trait_definition_check() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_trait_definition_check.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl check");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "Expected trait-definition check to succeed, but it failed: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("duplicate trait method") && !stderr.contains("bound must reference a trait"),
+        "Unexpected trait-definition diagnostics: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_trait_definition_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_trait_definition_error.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl check");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected trait-definition check to fail, but it succeeded"
+    );
+    assert!(
+        stderr.contains("type parameter 'T' bound must reference a trait"),
+        "Expected trait-bound validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_if_expr_dataloader_validation_error() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_dataloader_rejected.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "Expected compile error for m5_if_expr_dataloader_rejected, but it succeeded"
+    );
+    assert!(
+        stderr.contains("DataLoader creation is only supported in straight-line function scope"),
+        "Expected DataLoader conditional-scope validation error in stderr, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn e2e_if_expr_linear_types_check() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_if_expr_linear_types_valid.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .arg(&example_path)
+        .arg("--linear-types")
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl check");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "Expected linear-types check to succeed for m5_if_expr_linear_types_valid, but it failed: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("consumed in one branch") && !stderr.contains("use after move"),
+        "Unexpected ownership error for if-expression branch symmetry example: {}",
+        stderr
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +1121,31 @@ fn e2e_m33_speculative_validation_error() {
 #[test]
 fn e2e_m33_speculative_decode() {
     assert_output_matches("m33_speculative_decode");
+}
+
+#[test]
+fn e2e_m33_speculative_serve_decode() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m33_speculative_serve_decode.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .env("NSL_ROLE", "2")
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute speculative serve decode example");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "speculative serve decode example failed (exit {:?}):\nstderr: {}",
+        output.status.code(),
+        stderr
+    );
+
+    let actual = normalize(&String::from_utf8_lossy(&output.stdout));
+    let expected = expected_output("m33_speculative_serve_decode");
+    assert_eq!(actual.trim(), expected.trim());
 }
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ The `gpu_target.rs` abstraction and `kernel_ir.rs` intermediate representation (
 Production-quality implementation in `flash_attention.rs` (~2,600 lines):
 
 - **Tiled attention** with online softmax (numerically stable)
-- **Hopper wgmma.mma_async** (sm_90+): asynchronous matrix multiply with TMA loads and warp specialization (producer/consumer warps), pingpong scheduling to hide softmax latency behind tensor core compute
+- **Hopper-specific path** (sm_90+): runtime dispatch and codegen exist for wgmma-based kernels, but the generated TMA/wgmma path still contains placeholder pieces and simplified load plumbing rather than a fully finished production Hopper kernel
 - **Ampere mma.sync** (sm_80): `mma.sync.aligned.m16n8k16` fallback for A100-class GPUs
 - **Paged KV-cache** integration (block table lookup during attention)
 - **RoPE fusion** (half-split and adjacent rotary embedding applied in-register)
@@ -161,12 +161,12 @@ Per-operation FLOP and byte transfer calculations:
 | Operation | FLOP Formula | Bytes Formula |
 |-----------|-------------|---------------|
 | Matmul [M,K]@[K,N] | 2·M·K·N | (M·K + K·N + M·N)·sizeof |
-| Softmax [B,S] | 5·B·S | 3·B·S·sizeof |
-| LayerNorm [B,S,D] | 8·B·S·D | 3·B·S·D·sizeof |
-| RMSNorm | 5·B·S·D | 3·B·S·D·sizeof |
+| Softmax [B,S] | 7·B·S | 2·B·S·sizeof |
+| LayerNorm [B,S,D] | 8·B·S·D | (2·B·S·D + 2·D)·sizeof read, B·S·D·sizeof write |
+| RMSNorm | 5·B·S·D | (B·S·D + D)·sizeof read, B·S·D·sizeof write |
 | Elementwise | B·S·D | 2·B·S·D·sizeof |
-| FlashAttention | 2·B·H·S²·D | O(B·H·S·D) |
-| Reduction | elements | 2·elements·sizeof |
+| FlashAttention | 4·B·H·S²·D | 3·B·H·S·D·sizeof read, B·H·S·D·sizeof write |
+| Reduction | elements | elements·sizeof read, (elements / reduced_dim)·sizeof write |
 
 Classifies operations as compute-bound, memory-bound, or balanced based on arithmetic intensity (FLOP/byte ratio vs. hardware peak).
 
@@ -208,7 +208,7 @@ Production-quality FP8 support targeting H100 (sm_90):
 
 Activated via `@fp8_compute` decorator.
 
-**Planned upgrade**: MXFP8 per-block scaling (E8M0 scale per 32 elements) and NVFP4 (E2M1 with Hadamard preprocessing) for Blackwell GPUs. Plan: `mxfp8-per-block-scaling.md`.
+**Blackwell support status**: MXFP8 per-block scaling (E8M0 scale per 32 elements) and NVFP4 (E2M1 with Hadamard preprocessing) have runtime quantizers and decorator/config parsing in tree, but end-to-end lowering and hardware-specific integration are still follow-up work.
 
 ---
 

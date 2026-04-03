@@ -634,69 +634,47 @@ fn parse_if_expr(p: &mut Parser) -> Expr {
     p.advance(); // consume 'if'
     let condition = parse_expr(p);
 
-    // Parse the then-branch block (colon + indented body).
-    p.expect(&TokenKind::Colon);
-    let then_block = p.parse_block();
-
-    // Extract the last expression from the then-block as the if-expression's value.
-    // KNOWN LIMITATION: If the block is empty or the last statement is not an expression,
-    // we produce `NoneLiteral` as a placeholder. This means `if cond: pass` silently
-    // evaluates to `None` rather than being a type error. A future semantic pass should
-    // reject if-expressions whose branches don't yield a value.
-    let then_expr = if let Some(last) = then_block.stmts.last() {
-        if let nsl_ast::stmt::StmtKind::Expr(e) = &last.kind {
-            e.clone()
-        } else {
-            Expr {
-                kind: ExprKind::NoneLiteral,
-                span: start,
-                id: p.next_node_id(),
-            }
-        }
-    } else {
+    let block_expr = |p: &mut Parser, block: nsl_ast::stmt::Block| {
+        let span = block.span;
         Expr {
-            kind: ExprKind::NoneLiteral,
-            span: start,
+            kind: ExprKind::BlockExpr(block),
+            span,
             id: p.next_node_id(),
         }
     };
 
+    let placeholder_expr = |p: &mut Parser| Expr {
+        kind: ExprKind::NoneLiteral,
+        // Synthetic empty span at the start of the `if` keyword so semantic
+        // analysis can distinguish parser placeholders from an explicit `None`.
+        span: nsl_errors::Span::new(start.file_id, start.start, start.start),
+        id: p.next_node_id(),
+    };
+
+    // Preserve the full branch blocks so semantic/codegen can validate that the
+    // final statement yields the branch value without discarding any leading work.
+    p.expect(&TokenKind::Colon);
+    let then_block = p.parse_block();
+    let then_expr = block_expr(p, then_block);
+
     // Parse the else-branch if present.
-    // KNOWN LIMITATION: If-expressions used as values (e.g., `let x = if cond: a else: b`)
-    // require an else branch to be well-typed, but the parser currently accepts a missing
-    // else clause and fills in `NoneLiteral`. This is intentional at the parser level:
-    // if-statements (not used as values) legitimately omit `else`. Distinguishing the two
-    // contexts requires type information, so enforcement is deferred to the semantic checker.
-    // TODO(semantic): Reject if-expressions in value position that lack an else branch.
+    // If-expressions used as values require an else branch to be well-typed, but the parser
+    // stays permissive and fills in a synthetic placeholder when `else` is absent. Semantic
+    // analysis rejects that placeholder when this node is checked as an expression value.
     let else_expr = if p.eat(&TokenKind::Else) {
         p.expect(&TokenKind::Colon);
         let else_block = p.parse_block();
-        if let Some(last) = else_block.stmts.last() {
-            if let nsl_ast::stmt::StmtKind::Expr(e) = &last.kind {
-                e.clone()
-            } else {
-                Expr {
-                    kind: ExprKind::NoneLiteral,
-                    span: start,
-                    id: p.next_node_id(),
-                }
-            }
-        } else {
-            Expr {
-                kind: ExprKind::NoneLiteral,
-                span: start,
-                id: p.next_node_id(),
-            }
-        }
+        block_expr(p, else_block)
     } else {
-        Expr {
-            kind: ExprKind::NoneLiteral,
-            span: start,
-            id: p.next_node_id(),
-        }
+        placeholder_expr(p)
     };
 
-    let span = start.merge(else_expr.span);
+    let end = if else_expr.span.is_empty() {
+        then_expr.span
+    } else {
+        else_expr.span
+    };
+    let span = start.merge(end);
     Expr {
         kind: ExprKind::IfExpr {
             condition: Box::new(condition),
