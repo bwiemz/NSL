@@ -192,7 +192,7 @@ impl<'a> TypeChecker<'a> {
             .map(|t| self.resolve_type(t))
             .unwrap_or(Type::Void);
         let effect = if let Some(eff_expr) = &fn_def.return_effect {
-            let resolver = TypeResolver {
+            let mut resolver = TypeResolver {
                 interner: self.interner,
                 scopes: self.scopes,
                 diagnostics: &mut self.diagnostics,

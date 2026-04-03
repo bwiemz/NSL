@@ -420,7 +420,7 @@ impl<'a> TypeResolver<'a> {
     }
 
     /// Resolve an effect expression into a semantic Effect.
-    pub fn resolve_effect_expr(&self, eff: &nsl_ast::decl::EffectExpr, _scope: ScopeId) -> Effect {
+    pub fn resolve_effect_expr(&mut self, eff: &nsl_ast::decl::EffectExpr, _scope: ScopeId) -> Effect {
         use nsl_ast::decl::EffectExpr;
         use crate::effects::EffectSet;
 
@@ -444,7 +444,14 @@ impl<'a> TypeResolver<'a> {
                     "RANDOM" | "Random" => Effect::Concrete(EffectSet::RANDOM),
                     "MUTATION" | "Mutation" => Effect::Concrete(EffectSet::MUTATION),
                     "COMMUNICATION" | "Communication" => Effect::Concrete(EffectSet::COMMUNICATION),
-                    _ => Effect::Concrete(EffectSet::PURE),
+                    "PURE" | "Pure" => Effect::Concrete(EffectSet::PURE),
+                    _ => {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("unknown effect `{name}`"))
+                                .with_label(Span::dummy(), "not a recognized effect name"),
+                        );
+                        Effect::Concrete(EffectSet::PURE)
+                    }
                 }
             }
             EffectExpr::Union(parts) => {
