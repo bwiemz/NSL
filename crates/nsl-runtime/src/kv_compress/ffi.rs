@@ -94,6 +94,131 @@ pub extern "C" fn nsl_kv_quantize_and_store(
 }
 
 // ---------------------------------------------------------------------------
+// GPU dequantization FFI
+// ---------------------------------------------------------------------------
+
+/// Dequantize KV-cache data on GPU, writing f32 output.
+///
+/// Parameters (all i64 for Cranelift):
+/// - data_ptr: device pointer to quantized data (i8/u8)
+/// - out_ptr: device pointer to f32 output buffer (pre-allocated)
+/// - meta_ptr: host pointer to KvBlockQuantMeta (null for FP8)
+/// - n: total number of elements to dequantize
+/// - num_heads: attention heads (for INT8 per-head scale indexing)
+/// - block_size: tokens per block
+/// - head_dim: dimension per head
+/// - scheme: KvQuantScheme discriminant (1-4)
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn nsl_kv_dequantize_gpu(
+    data_ptr: i64,
+    out_ptr: i64,
+    meta_ptr: i64,
+    n: i64,
+    num_heads: i64,
+    block_size: i64,
+    head_dim: i64,
+    scheme: i64,
+) -> i64 {
+    if data_ptr == 0 || out_ptr == 0 || n <= 0 {
+        return -1;
+    }
+
+    let qs = KvQuantScheme::from_i64(scheme);
+    let n_val = n as u64;
+
+    #[cfg(feature = "cuda")]
+    {
+        use std::ffi::c_void;
+
+        let data = data_ptr as *const c_void;
+        let out = out_ptr as *mut c_void;
+        let head_stride = (block_size * head_dim) as u64;
+
+        match qs {
+            KvQuantScheme::None => {
+                // No dequantization — copy f32 data
+                crate::cuda::inner::memcpy_dtod(out, data, n_val as usize * 4);
+            }
+            KvQuantScheme::Int8PerHead => {
+                if meta_ptr == 0 { return -1; }
+                let meta = unsafe { &*(meta_ptr as *const KvBlockQuantMeta) };
+                // Upload scales to GPU
+                let scales_bytes = meta.num_scales as usize * 4;
+                let gpu_scales = crate::cuda::inner::alloc_managed(scales_bytes);
+                crate::cuda::inner::memcpy_htod(
+                    gpu_scales,
+                    meta.scales.as_ptr() as *const c_void,
+                    scales_bytes,
+                );
+                crate::cuda::gpu_dequant_int8_per_head_f32(
+                    data, out, gpu_scales as *const c_void, n_val, head_stride,
+                );
+                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                crate::cuda::inner::free_managed(gpu_scales);
+            }
+            KvQuantScheme::Int8PerToken => {
+                if meta_ptr == 0 { return -1; }
+                let meta = unsafe { &*(meta_ptr as *const KvBlockQuantMeta) };
+                let scales_bytes = meta.num_scales as usize * 4;
+                let gpu_scales = crate::cuda::inner::alloc_managed(scales_bytes);
+                crate::cuda::inner::memcpy_htod(
+                    gpu_scales,
+                    meta.scales.as_ptr() as *const c_void,
+                    scales_bytes,
+                );
+                crate::cuda::gpu_dequant_int8_per_token_f32(
+                    data, out, gpu_scales as *const c_void, n_val, head_stride, head_dim as u64,
+                );
+                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                crate::cuda::inner::free_managed(gpu_scales);
+            }
+            KvQuantScheme::Int4PerGroup => {
+                if meta_ptr == 0 { return -1; }
+                let meta = unsafe { &*(meta_ptr as *const KvBlockQuantMeta) };
+                let num_groups = meta.num_scales as usize;
+                let bytes = num_groups * 4;
+                let gpu_scales = crate::cuda::inner::alloc_managed(bytes);
+                let gpu_zp = crate::cuda::inner::alloc_managed(bytes);
+                crate::cuda::inner::memcpy_htod(
+                    gpu_scales,
+                    meta.scales.as_ptr() as *const c_void,
+                    bytes,
+                );
+                crate::cuda::inner::memcpy_htod(
+                    gpu_zp,
+                    meta.zero_points.as_ptr() as *const c_void,
+                    bytes,
+                );
+                crate::cuda::gpu_dequant_int4_per_group_f32(
+                    data, out,
+                    gpu_scales as *const c_void,
+                    gpu_zp as *const c_void,
+                    n_val,
+                    quantize::INT4_GROUP_SIZE as u64,
+                );
+                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                crate::cuda::inner::free_managed(gpu_scales);
+                crate::cuda::inner::free_managed(gpu_zp);
+            }
+            KvQuantScheme::Fp8 => {
+                crate::cuda::gpu_dequant_fp8_e4m3_f32(data, out, n_val);
+                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            }
+        }
+        0
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (data_ptr, out_ptr, meta_ptr, n, num_heads, block_size, head_dim, qs);
+        eprintln!("[nsl] nsl_kv_dequantize_gpu requires CUDA");
+        -1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sliding Window FFI
 // ---------------------------------------------------------------------------
 

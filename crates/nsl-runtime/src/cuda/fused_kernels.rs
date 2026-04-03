@@ -2590,3 +2590,231 @@ TS_RED_DONE:\n\
     st.global.f32 [%rd7], %f4;\n\
 TS_DONE: ret;\n\
 }\0";
+
+// ---------------------------------------------------------------------------
+// M42b: KV-cache dequantization kernels (GPU)
+// ---------------------------------------------------------------------------
+
+// INT8 dequantization: output[i] = input_i8[i] * scales[head_index]
+// Layout: [num_heads, block_size, head_dim] (head-major)
+// Params: inp (i8*), out (f32*), scales (f32*), n (total elements),
+//         head_stride (block_size * head_dim)
+pub(crate) const DEQUANT_INT8_PER_HEAD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_dequant_int8_per_head_f32(\n\
+    .param .u64 inp, .param .u64 out, .param .u64 scales,\n\
+    .param .u64 n, .param .u64 head_stride\n\
+) {\n\
+    .reg .u64 %rd<12>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .s16 %rs1;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [scales];\n\
+    ld.param.u64 %rd4, [n];\n\
+    ld.param.u64 %rd5, [head_stride];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd6, %r3;\n\
+    setp.ge.u64 %p1, %rd6, %rd4;\n\
+    @%p1 bra DQ8H_DONE;\n\
+    // head_index = i / head_stride\n\
+    div.u64 %rd7, %rd6, %rd5;\n\
+    // Load scale for this head\n\
+    shl.b64 %rd8, %rd7, 2;\n\
+    add.u64 %rd8, %rd3, %rd8;\n\
+    ld.global.f32 %f1, [%rd8];\n\
+    // Load i8 value, convert to f32, multiply by scale\n\
+    add.u64 %rd9, %rd1, %rd6;\n\
+    ld.global.s8 %rs1, [%rd9];\n\
+    cvt.rn.f32.s16 %f2, %rs1;\n\
+    mul.f32 %f3, %f2, %f1;\n\
+    // Store f32 result\n\
+    shl.b64 %rd10, %rd6, 2;\n\
+    add.u64 %rd10, %rd2, %rd10;\n\
+    st.global.f32 [%rd10], %f3;\n\
+DQ8H_DONE: ret;\n\
+}\0";
+
+// INT8 per-token dequantization: output[i] = input_i8[i] * scales[token_index]
+// Layout: [num_heads, block_size, head_dim] — token index = (i % head_stride) / head_dim
+// Params: inp, out, scales, n, head_dim
+pub(crate) const DEQUANT_INT8_PER_TOKEN_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_dequant_int8_per_token_f32(\n\
+    .param .u64 inp, .param .u64 out, .param .u64 scales,\n\
+    .param .u64 n, .param .u64 head_stride, .param .u64 head_dim\n\
+) {\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .s16 %rs1;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [scales];\n\
+    ld.param.u64 %rd4, [n];\n\
+    ld.param.u64 %rd5, [head_stride];\n\
+    ld.param.u64 %rd6, [head_dim];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd7, %r3;\n\
+    setp.ge.u64 %p1, %rd7, %rd4;\n\
+    @%p1 bra DQ8T_DONE;\n\
+    // token_index = (i % head_stride) / head_dim\n\
+    rem.u64 %rd8, %rd7, %rd5;\n\
+    div.u64 %rd8, %rd8, %rd6;\n\
+    // Load scale\n\
+    shl.b64 %rd9, %rd8, 2;\n\
+    add.u64 %rd9, %rd3, %rd9;\n\
+    ld.global.f32 %f1, [%rd9];\n\
+    // Load i8, convert, multiply\n\
+    add.u64 %rd10, %rd1, %rd7;\n\
+    ld.global.s8 %rs1, [%rd10];\n\
+    cvt.rn.f32.s16 %f2, %rs1;\n\
+    mul.f32 %f3, %f2, %f1;\n\
+    // Store\n\
+    shl.b64 %rd11, %rd7, 2;\n\
+    add.u64 %rd11, %rd2, %rd11;\n\
+    st.global.f32 [%rd11], %f3;\n\
+DQ8T_DONE: ret;\n\
+}\0";
+
+// INT4 per-group dequantization: unpack nibble, apply scale + zero_point
+// output[i] = nibble(i) * scales[group] + zero_points[group]
+// Params: inp (packed u8*), out (f32*), scales (f32*), zero_points (f32*),
+//         n (total elements), group_size
+pub(crate) const DEQUANT_INT4_PER_GROUP_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_dequant_int4_per_group_f32(\n\
+    .param .u64 inp, .param .u64 out,\n\
+    .param .u64 scales, .param .u64 zero_points,\n\
+    .param .u64 n, .param .u64 group_size\n\
+) {\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .u32 %r<8>;\n\
+    .reg .f32 %f<5>;\n\
+    .reg .u16 %rh1;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [scales];\n\
+    ld.param.u64 %rd4, [zero_points];\n\
+    ld.param.u64 %rd5, [n];\n\
+    ld.param.u64 %rd6, [group_size];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd7, %r3;\n\
+    setp.ge.u64 %p1, %rd7, %rd5;\n\
+    @%p1 bra DQ4G_DONE;\n\
+    // byte_idx = i / 2\n\
+    shr.u64 %rd8, %rd7, 1;\n\
+    add.u64 %rd9, %rd1, %rd8;\n\
+    ld.global.u8 %rh1, [%rd9];\n\
+    // Check if even (low nibble) or odd (high nibble)\n\
+    and.b64 %rd10, %rd7, 1;\n\
+    setp.ne.u64 %p2, %rd10, 0;\n\
+    cvt.u32.u16 %r4, %rh1;\n\
+    @%p2 bra DQ4G_HIGH;\n\
+    and.b32 %r4, %r4, 15;\n\
+    bra DQ4G_APPLY;\n\
+DQ4G_HIGH:\n\
+    shr.u32 %r4, %r4, 4;\n\
+    and.b32 %r4, %r4, 15;\n\
+DQ4G_APPLY:\n\
+    cvt.rn.f32.u32 %f1, %r4;\n\
+    // group = i / group_size\n\
+    div.u64 %rd11, %rd7, %rd6;\n\
+    shl.b64 %rd12, %rd11, 2;\n\
+    add.u64 %rd13, %rd3, %rd12;\n\
+    ld.global.f32 %f2, [%rd13];\n\
+    add.u64 %rd13, %rd4, %rd12;\n\
+    ld.global.f32 %f3, [%rd13];\n\
+    // output = nibble * scale + zero_point\n\
+    fma.rn.f32 %f4, %f1, %f2, %f3;\n\
+    shl.b64 %rd12, %rd7, 2;\n\
+    add.u64 %rd12, %rd2, %rd12;\n\
+    st.global.f32 [%rd12], %f4;\n\
+DQ4G_DONE: ret;\n\
+}\0";
+
+// FP8 E4M3 dequantization: bit manipulation to convert u8 → f32
+// E4M3: 1 sign + 4 exponent + 3 mantissa, bias=7
+// Params: inp (u8*), out (f32*), n
+pub(crate) const DEQUANT_FP8_E4M3_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_52\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_dequant_fp8_e4m3_f32(\n\
+    .param .u64 inp, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u64 %rd<8>;\n\
+    .reg .u32 %r<10>;\n\
+    .reg .f32 %f1;\n\
+    .reg .u16 %rh1;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DQFP8_DONE;\n\
+    // Load u8 value\n\
+    add.u64 %rd5, %rd1, %rd4;\n\
+    ld.global.u8 %rh1, [%rd5];\n\
+    cvt.u32.u16 %r4, %rh1;\n\
+    // Extract sign (bit 7), exp (bits 6-3), mantissa (bits 2-0)\n\
+    shr.u32 %r5, %r4, 7;\n\
+    and.b32 %r5, %r5, 1;\n\
+    shr.u32 %r6, %r4, 3;\n\
+    and.b32 %r6, %r6, 15;\n\
+    and.b32 %r7, %r4, 7;\n\
+    // Check for zero (exp==0 && mantissa==0)\n\
+    or.b32 %r8, %r6, %r7;\n\
+    setp.eq.u32 %p2, %r8, 0;\n\
+    @%p2 bra DQFP8_ZERO;\n\
+    // Build f32: sign<<31 | (exp-7+127)<<23 | mantissa<<20\n\
+    add.u32 %r6, %r6, 120;\n\
+    shl.b32 %r5, %r5, 31;\n\
+    shl.b32 %r6, %r6, 23;\n\
+    shl.b32 %r7, %r7, 20;\n\
+    or.b32 %r8, %r5, %r6;\n\
+    or.b32 %r8, %r8, %r7;\n\
+    mov.b32 %f1, %r8;\n\
+    bra DQFP8_STORE;\n\
+DQFP8_ZERO:\n\
+    // Preserve signed zero\n\
+    shl.b32 %r5, %r5, 31;\n\
+    mov.b32 %f1, %r5;\n\
+DQFP8_STORE:\n\
+    shl.b64 %rd6, %rd4, 2;\n\
+    add.u64 %rd6, %rd2, %rd6;\n\
+    st.global.f32 [%rd6], %f1;\n\
+DQFP8_DONE: ret;\n\
+}\0";

@@ -2265,6 +2265,155 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
 }
 
 // ---------------------------------------------------------------------------
+// M42b: KV-cache GPU dequantization
+// ---------------------------------------------------------------------------
+
+/// Dequantize INT8 per-head data on GPU: output[i] = input_i8[i] * scales[head].
+/// `data_ptr`: device pointer to i8 quantized data
+/// `out_ptr`: device pointer to f32 output (must be pre-allocated, n elements)
+/// `scales_ptr`: device pointer to f32 scales array (num_heads entries)
+/// `n`: total number of elements
+/// `head_stride`: block_size * head_dim (elements per head)
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dequant_int8_per_head_f32(
+    data_ptr: *const std::ffi::c_void,
+    out_ptr: *mut std::ffi::c_void,
+    scales_ptr: *const std::ffi::c_void,
+    n: u64,
+    head_stride: u64,
+) {
+    use fused_kernels::DEQUANT_INT8_PER_HEAD_F32_PTX;
+
+    let mut inp = data_ptr as u64;
+    let mut out = out_ptr as u64;
+    let mut sc = scales_ptr as u64;
+    let mut n_val = n;
+    let mut hs = head_stride;
+
+    let args: [*mut std::ffi::c_void; 5] = [
+        &mut inp as *mut _ as *mut std::ffi::c_void,
+        &mut out as *mut _ as *mut std::ffi::c_void,
+        &mut sc as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut hs as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((n + 255) / 256) as i64;
+
+    let result = inner::kernel_launch(
+        DEQUANT_INT8_PER_HEAD_F32_PTX.as_ptr(), b"nsl_dequant_int8_per_head_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU dequant_int8_per_head kernel failed: {:?}", result);
+}
+
+/// Dequantize INT8 per-token data on GPU.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dequant_int8_per_token_f32(
+    data_ptr: *const std::ffi::c_void,
+    out_ptr: *mut std::ffi::c_void,
+    scales_ptr: *const std::ffi::c_void,
+    n: u64,
+    head_stride: u64,
+    head_dim: u64,
+) {
+    use fused_kernels::DEQUANT_INT8_PER_TOKEN_F32_PTX;
+
+    let mut inp = data_ptr as u64;
+    let mut out = out_ptr as u64;
+    let mut sc = scales_ptr as u64;
+    let mut n_val = n;
+    let mut hs = head_stride;
+    let mut hd = head_dim;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut inp as *mut _ as *mut std::ffi::c_void,
+        &mut out as *mut _ as *mut std::ffi::c_void,
+        &mut sc as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut hs as *mut _ as *mut std::ffi::c_void,
+        &mut hd as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((n + 255) / 256) as i64;
+
+    let result = inner::kernel_launch(
+        DEQUANT_INT8_PER_TOKEN_F32_PTX.as_ptr(), b"nsl_dequant_int8_per_token_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU dequant_int8_per_token kernel failed: {:?}", result);
+}
+
+/// Dequantize INT4 per-group data on GPU.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dequant_int4_per_group_f32(
+    data_ptr: *const std::ffi::c_void,
+    out_ptr: *mut std::ffi::c_void,
+    scales_ptr: *const std::ffi::c_void,
+    zero_points_ptr: *const std::ffi::c_void,
+    n: u64,
+    group_size: u64,
+) {
+    use fused_kernels::DEQUANT_INT4_PER_GROUP_F32_PTX;
+
+    let mut inp = data_ptr as u64;
+    let mut out = out_ptr as u64;
+    let mut sc = scales_ptr as u64;
+    let mut zp = zero_points_ptr as u64;
+    let mut n_val = n;
+    let mut gs = group_size;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut inp as *mut _ as *mut std::ffi::c_void,
+        &mut out as *mut _ as *mut std::ffi::c_void,
+        &mut sc as *mut _ as *mut std::ffi::c_void,
+        &mut zp as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut gs as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((n + 255) / 256) as i64;
+
+    let result = inner::kernel_launch(
+        DEQUANT_INT4_PER_GROUP_F32_PTX.as_ptr(), b"nsl_dequant_int4_per_group_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU dequant_int4_per_group kernel failed: {:?}", result);
+}
+
+/// Dequantize FP8 E4M3 data on GPU: bit-manipulation u8 → f32.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dequant_fp8_e4m3_f32(
+    data_ptr: *const std::ffi::c_void,
+    out_ptr: *mut std::ffi::c_void,
+    n: u64,
+) {
+    use fused_kernels::DEQUANT_FP8_E4M3_F32_PTX;
+
+    let mut inp = data_ptr as u64;
+    let mut out = out_ptr as u64;
+    let mut n_val = n;
+
+    let args: [*mut std::ffi::c_void; 3] = [
+        &mut inp as *mut _ as *mut std::ffi::c_void,
+        &mut out as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = ((n + 255) / 256) as i64;
+
+    let result = inner::kernel_launch(
+        DEQUANT_FP8_E4M3_F32_PTX.as_ptr(), b"nsl_dequant_fp8_e4m3_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU dequant_fp8_e4m3 kernel failed: {:?}", result);
+}
+
+// ---------------------------------------------------------------------------
 // M46b: Deterministic GPU global sum — single-thread sequential accumulation
 // ---------------------------------------------------------------------------
 
