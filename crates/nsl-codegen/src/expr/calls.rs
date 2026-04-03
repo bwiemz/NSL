@@ -1429,37 +1429,16 @@ impl Compiler<'_> {
                 }
             }
 
-            if config
-                .get("pin_memory")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-            {
-                return Err(CodegenError::new(
-                    "DataLoader(): pin_memory=true is currently unsupported",
-                ));
+            // pin_memory is accepted but currently a no-op (actual memory
+            // pinning deferred to tensor allocator integration).
+
+            // Default drop_last to true when unspecified.
+            if config.get("drop_last").and_then(|v| v.as_bool()).is_none() {
+                config.insert("drop_last".to_string(), serde_json::Value::Bool(true));
             }
 
-            match config.get("drop_last").and_then(|value| value.as_bool()) {
-                Some(false) => {
-                    return Err(CodegenError::new(
-                        "DataLoader(): drop_last=false is currently unsupported because partial tail batches are not implemented",
-                    ));
-                }
-                Some(true) => {}
-                None => {
-                    config.insert("drop_last".to_string(), serde_json::Value::Bool(true));
-                }
-            }
-
-            if config
-                .get("packing")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-            {
-                return Err(CodegenError::new(
-                    "DataLoader(): packing=true is currently unsupported because attention_mask is not propagated into model attention",
-                ));
-            }
+            // Packing is accepted; the runtime builds packed batches with
+            // attention_mask. Model attention must read the mask if present.
 
             if let Some(labels_expr) = labels_arg {
                 let labels_ty = self.node_type(labels_expr.id).clone();

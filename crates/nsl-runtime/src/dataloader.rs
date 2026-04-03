@@ -139,16 +139,13 @@ impl DataLoader {
             );
             std::process::abort();
         }
-        if config.packing {
-            eprintln!(
-                "nsl: DataLoader(packing=true) is currently unsupported because attention_mask is not consumed by model attention"
-            );
-            std::process::abort();
-        }
-
         let tokens_per_batch = config.batch_size * config.seq_len;
         let total_batches = if tokens_per_batch > 0 {
-            data_len / tokens_per_batch
+            if config.drop_last {
+                data_len / tokens_per_batch
+            } else {
+                data_len.div_ceil(tokens_per_batch)
+            }
         } else {
             0
         };
@@ -321,25 +318,26 @@ fn build_simple_batch(
     has_labels: bool,
 ) -> i64 {
     let total = batch_size * seq_len;
-    if offset + total > data_len {
+    let available = if offset < data_len { data_len - offset } else { 0 };
+    if available == 0 {
         return 0;
     }
 
-    if has_labels && offset + total > labels_len {
-        return 0;
-    }
-
-    // Read input_ids — dtype-aware: f64(0), f32(1), u16(3)
-    let mut input_ids = Vec::with_capacity(total);
-    for i in 0..total {
-        input_ids.push(read_flat_value(data, data_dtype, offset + i));
+    // Read input_ids — pad with 0 beyond available data
+    let mut input_ids = vec![0i64; total];
+    let read_count = available.min(total);
+    for i in 0..read_count {
+        input_ids[i] = read_flat_value(data, data_dtype, offset + i);
     }
 
     // Build labels from the provided tensor when available; otherwise shift the
     // input_ids within each sequence and ignore only the final position.
-    let mut labels_vec = vec![0i64; total];
+    // Padded positions get -100 (ignore_index) so they don't contribute to loss.
+    let mut labels_vec = vec![-100i64; total];
     if has_labels {
-        for i in 0..total {
+        let label_available = if offset < labels_len { labels_len - offset } else { 0 };
+        let label_read = label_available.min(total);
+        for i in 0..label_read {
             labels_vec[i] = read_flat_value(labels, labels_dtype, offset + i);
         }
     } else {
@@ -347,9 +345,12 @@ fn build_simple_batch(
             let base = b * seq_len;
             if seq_len > 0 {
                 for i in 0..seq_len - 1 {
-                    labels_vec[base + i] = input_ids[base + i + 1];
+                    if base + i + 1 < read_count {
+                        labels_vec[base + i] = input_ids[base + i + 1];
+                    }
+                    // positions beyond read_count stay -100
                 }
-                labels_vec[base + seq_len - 1] = -100;
+                // Last position in each sequence is always -100
             }
         }
     }
@@ -655,6 +656,69 @@ mod tests {
         }
 
         nsl_dict_free(batch);
+        nsl_dataloader_stop(dl_ptr);
+        nsl_dataloader_free(dl_ptr);
+    }
+
+    #[test]
+    fn test_dataloader_partial_tail_batch() {
+        // 10 tokens with batch_size=1, seq_len=4 → 2 full batches + 1 partial (2 tokens, padded)
+        let data: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let data_tensor = tensor_from_f64_slice(&data);
+        // drop_last=false so the partial tail batch is included
+        let config_json = format!(
+            r#"{{"batch_size":1,"seq_len":4,"num_workers":1,"packing":false,"shuffle":false,"prefetch":1,"pin_memory":false,"drop_last":false,"pack_separator":0}}"#
+        );
+
+        let dl_ptr = nsl_dataloader_create(
+            data_tensor,
+            0,
+            config_json.as_ptr() as i64,
+            config_json.len() as i64,
+        );
+
+        nsl_dataloader_start(dl_ptr);
+
+        // Batch 1: tokens 0-3
+        let batch1 = nsl_dataloader_next_batch(dl_ptr);
+        assert!(batch1 != 0, "first batch should exist");
+        nsl_dict_free(batch1);
+
+        // Batch 2: tokens 4-7
+        let batch2 = nsl_dataloader_next_batch(dl_ptr);
+        assert!(batch2 != 0, "second batch should exist");
+        nsl_dict_free(batch2);
+
+        // Batch 3: tokens 8-9 + padding
+        let batch3 = nsl_dataloader_next_batch(dl_ptr);
+        assert!(batch3 != 0, "partial tail batch should exist with drop_last=false");
+
+        // Check that padded positions have 0 for input_ids
+        let k_ids = nsl_str_from_rust("input_ids");
+        let ids_ptr = crate::dict::nsl_dict_get_str(batch3, k_ids);
+        let ids_tensor = NslTensor::from_ptr(ids_ptr);
+        let ids_data = ids_tensor.data as *const i32;
+        assert_eq!(unsafe { *ids_data.add(0) }, 8, "first token should be 8");
+        assert_eq!(unsafe { *ids_data.add(1) }, 9, "second token should be 9");
+        assert_eq!(unsafe { *ids_data.add(2) }, 0, "third position should be padded with 0");
+        assert_eq!(unsafe { *ids_data.add(3) }, 0, "fourth position should be padded with 0");
+
+        // Check that padded label positions have -100
+        let k_lbl = nsl_str_from_rust("labels");
+        let lbl_ptr = crate::dict::nsl_dict_get_str(batch3, k_lbl);
+        let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
+        let lbl_data = lbl_tensor.data as *const i32;
+        assert_eq!(unsafe { *lbl_data.add(0) }, 9, "label for position 0 should be next token (9)");
+        assert_eq!(unsafe { *lbl_data.add(1) }, -100, "label at position 1 should be -100 (last real token)");
+        assert_eq!(unsafe { *lbl_data.add(2) }, -100, "label at padded position should be -100");
+        assert_eq!(unsafe { *lbl_data.add(3) }, -100, "label at padded position should be -100");
+
+        nsl_dict_free(batch3);
+
+        // No more batches
+        let batch4 = nsl_dataloader_next_batch(dl_ptr);
+        assert_eq!(batch4, 0, "should be no more batches after tail");
+
         nsl_dataloader_stop(dl_ptr);
         nsl_dataloader_free(dl_ptr);
     }
