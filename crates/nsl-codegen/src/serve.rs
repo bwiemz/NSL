@@ -57,7 +57,7 @@ impl Compiler<'_> {
         let speculative_method_val = builder.ins().iconst(cl_types::I32, speculative_method);
         let speculative_tree_width_val = builder.ins().iconst(cl_types::I32, speculative_tree_width);
         let speculative_temp_bits_val = builder.ins().iconst(cl_types::I32, speculative_temperature_bits);
-        let eos_val = builder.ins().iconst(cl_types::I64, WORKER_DEFAULT_EOS_TOKEN_ID);
+        let eos_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_EOS_TOKEN_ID);
 
         builder.ins().stack_store(max_seq_len_val, slot, WORKER_MAX_SEQ_LEN_OFFSET);
         builder.ins().stack_store(kv_blocks_val, slot, WORKER_KV_BLOCKS_OFFSET);

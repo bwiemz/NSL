@@ -223,6 +223,11 @@ impl Compiler<'_> {
             state.ownership.linear_consume_pending.push(merged_result);
         } else if then_result_is_temp || else_result_is_temp {
             state.cleanup.tensor_temporaries.push(merged_result);
+        } else if result_sem_ty.is_tensor() {
+            // Defensive: if only one branch reached merge and the result is a
+            // tensor that wasn't explicitly tracked (e.g. the other branch
+            // diverged), ensure the merged value is still freed at scope exit.
+            state.cleanup.tensor_temporaries.push(merged_result);
         }
         Ok(merged_result)
     }
