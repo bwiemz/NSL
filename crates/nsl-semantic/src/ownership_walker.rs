@@ -172,14 +172,18 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
-        StmtKind::WhileLet { expr, body, .. } => {
+        StmtKind::WhileLet { pattern, expr, body } => {
             walk_expr(expr, checker, type_map);
+            // The bound value has the same type as the expression
+            register_pattern_bindings(pattern, checker, type_map, Some(expr));
             checker.enter_loop();
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
-        StmtKind::For { iterable, body, .. } => {
+        StmtKind::For { pattern, iterable, body } => {
             walk_expr(iterable, checker, type_map);
+            let elem_ty = iter_element_type(type_map.get(&iterable.id));
+            register_pattern_bindings_with_type(pattern, checker, &elem_ty);
             checker.enter_loop();
             walk_block(body, checker, type_map);
             checker.exit_loop();
@@ -187,6 +191,10 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
         StmtKind::Match { subject, arms } => {
             walk_expr(subject, checker, type_map);
             for arm in arms {
+                // Register match arm pattern bindings (subject's type)
+                register_pattern_bindings(
+                    &arm.pattern, checker, type_map, Some(subject),
+                );
                 if let Some(guard) = &arm.guard {
                     walk_expr(guard, checker, type_map);
                 }
@@ -328,6 +336,45 @@ fn register_pattern_bindings(
         }
         PatternKind::Typed { pattern: inner, .. } => {
             register_pattern_bindings(inner, checker, type_map, value);
+        }
+        _ => {}
+    }
+}
+
+/// Extract the element type from an iterable type.
+fn iter_element_type(ty: Option<&crate::types::Type>) -> Option<crate::types::Type> {
+    use crate::types::Type;
+    match ty? {
+        Type::List(elem) => Some(*elem.clone()),
+        Type::Dict(key, _) => Some(*key.clone()),
+        Type::Tuple(elems) => elems.first().cloned(),
+        Type::Str => Some(Type::Str),
+        _ => None,
+    }
+}
+
+/// Register pattern bindings using a known element type instead of a value expression.
+fn register_pattern_bindings_with_type(
+    pattern: &nsl_ast::pattern::Pattern,
+    checker: &mut OwnershipChecker<'_>,
+    elem_ty: &Option<crate::types::Type>,
+) {
+    let is_tensor = elem_ty.as_ref().map(|ty| ty.is_tensor()).unwrap_or(false);
+    match &pattern.kind {
+        PatternKind::Ident(sym) => {
+            if is_tensor {
+                checker.register_binding(*sym, pattern.span, false);
+            }
+        }
+        PatternKind::Tuple(pats) | PatternKind::List(pats) => {
+            // For tuple destructuring in for-loops (e.g., `for (i, t) in enumerate(list):`),
+            // each sub-pattern gets the same element type as a conservative approximation.
+            for p in pats {
+                register_pattern_bindings_with_type(p, checker, elem_ty);
+            }
+        }
+        PatternKind::Typed { pattern: inner, .. } => {
+            register_pattern_bindings_with_type(inner, checker, elem_ty);
         }
         _ => {}
     }
