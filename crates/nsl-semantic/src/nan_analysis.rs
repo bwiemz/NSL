@@ -94,7 +94,21 @@ impl NanAnalyzer {
                 }
                 None
             }
-            // pow and log(softmax(...)) detection deferred to M45b
+            // pow(x, y): NaN when x < 0 and y is fractional
+            "pow" => {
+                if let Some(base) = arg_syms.first() {
+                    let c = self.get_constraint(base);
+                    if c == ValueConstraint::Unconstrained {
+                        return Some(
+                            Diagnostic::warning("pow() base may be negative — NaN risk for fractional exponents")
+                                .with_label(span, "here")
+                        );
+                    }
+                }
+                None
+            }
+            // log_softmax is stable; log(softmax(x)) is not — but that's
+            // detected in walk_expr via the nested call pattern check.
             _ => None,
         }
     }
@@ -182,6 +196,16 @@ impl NanAnalyzer {
                 self.walk_expr(expr, interner);
                 self.walk_block(body, interner);
             }
+            StmtKind::Assign { target, value, .. } => {
+                if let Some(constraint) = self.expr_constraint(value, interner) {
+                    if let ExprKind::Ident(sym) = &target.kind {
+                        if constraint != ValueConstraint::Unconstrained {
+                            self.set_constraint(*sym, constraint);
+                        }
+                    }
+                }
+                self.walk_expr(value, interner);
+            }
             StmtKind::Return(Some(expr)) | StmtKind::Expr(expr) => {
                 self.walk_expr(expr, interner);
             }
@@ -199,8 +223,11 @@ impl NanAnalyzer {
     fn walk_expr(&mut self, expr: &Expr, interner: &Interner) {
         match &expr.kind {
             ExprKind::Call { callee, args, .. } => {
-                // Resolve callee name
-                if let Some(func_name) = self.resolve_call_name(callee, interner) {
+                // Resolve callee name (handles both `log(x)` and `x.log()`)
+                let func_name = self.resolve_call_name(callee, interner)
+                    .or_else(|| self.resolve_method_name(callee, interner));
+
+                if let Some(ref name) = func_name {
                     let arg_syms: Vec<Symbol> = args.iter().filter_map(|a| {
                         if let ExprKind::Ident(sym) = &a.value.kind {
                             Some(*sym)
@@ -209,16 +236,54 @@ impl NanAnalyzer {
                         }
                     }).collect();
 
-                    if let Some(diag) = self.check_call_risk(&func_name, &arg_syms, expr.span) {
+                    // For method calls like x.log(), prepend the receiver as first arg
+                    let effective_syms = if let ExprKind::MemberAccess { object, .. } = &callee.kind {
+                        if let ExprKind::Ident(sym) = &object.kind {
+                            let mut syms = vec![*sym];
+                            syms.extend(arg_syms.iter());
+                            syms
+                        } else {
+                            arg_syms.clone()
+                        }
+                    } else {
+                        arg_syms.clone()
+                    };
+
+                    if let Some(diag) = self.check_call_risk(name, &effective_syms, expr.span) {
                         self.diagnostics.push(diag);
                     }
+
+                    // Detect log(softmax(x)) — should use log_softmax instead
+                    if name == "log" {
+                        if let Some(inner) = args.first() {
+                            if self.is_call_to(&inner.value, "softmax", interner) {
+                                self.diagnostics.push(
+                                    Diagnostic::warning("log(softmax(x)) is numerically unstable — use log_softmax(x) instead")
+                                        .with_label(expr.span, "here")
+                                );
+                            }
+                        }
+                    }
                 }
+
                 // Walk into argument sub-expressions
                 for arg in args {
                     self.walk_expr(&arg.value, interner);
                 }
             }
-            ExprKind::BinaryOp { op: _, left, right } => {
+            ExprKind::BinaryOp { op, left, right } => {
+                // Check a / b where b may be zero
+                if matches!(op, nsl_ast::operator::BinOp::Div) {
+                    if let ExprKind::Ident(sym) = &right.kind {
+                        let c = self.get_constraint(sym);
+                        if c != ValueConstraint::StrictlyPositive {
+                            self.diagnostics.push(
+                                Diagnostic::warning("division by value that may be zero — Inf risk")
+                                    .with_label(expr.span, "here")
+                            );
+                        }
+                    }
+                }
                 self.walk_expr(left, interner);
                 self.walk_expr(right, interner);
             }
@@ -265,12 +330,70 @@ impl NanAnalyzer {
         }
     }
 
+    /// Resolve a method call name from `x.method(...)` patterns.
+    fn resolve_method_name(&self, callee: &Expr, interner: &Interner) -> Option<String> {
+        if let ExprKind::MemberAccess { member, .. } = &callee.kind {
+            interner.resolve(member.0).map(|s| s.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Check if an expression is a call to a specific function name.
+    fn is_call_to(&self, expr: &Expr, name: &str, interner: &Interner) -> bool {
+        if let ExprKind::Call { callee, .. } = &expr.kind {
+            self.resolve_call_name(callee, interner)
+                .map(|n| n == name)
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
     /// Infer the constraint of an expression — used for let-binding propagation.
     fn expr_constraint(&self, expr: &Expr, interner: &Interner) -> Option<ValueConstraint> {
         match &expr.kind {
             ExprKind::Call { callee, .. } => {
-                self.resolve_call_name(callee, interner)
-                    .map(|name| self.infer_constraint(&name))
+                let name = self.resolve_call_name(callee, interner)
+                    .or_else(|| self.resolve_method_name(callee, interner));
+                name.map(|n| self.infer_constraint(&n))
+            }
+            // `relu(x) + eps` or `abs(x) + 1e-6` — adding a positive constant
+            // to a NonNegative value produces StrictlyPositive
+            ExprKind::BinaryOp { op: nsl_ast::operator::BinOp::Add, left, right } => {
+                let lc = self.expr_constraint(left, interner);
+                let rc = self.expr_constraint(right, interner);
+                let l_positive = matches!(&right.kind, ExprKind::FloatLiteral(v) if *v > 0.0)
+                    || matches!(&right.kind, ExprKind::IntLiteral(v) if *v > 0);
+                let r_non_neg = matches!(lc, Some(ValueConstraint::NonNegative | ValueConstraint::StrictlyPositive));
+                if r_non_neg && l_positive {
+                    return Some(ValueConstraint::StrictlyPositive);
+                }
+                // Symmetric: eps + relu(x)
+                let r_positive = matches!(&left.kind, ExprKind::FloatLiteral(v) if *v > 0.0)
+                    || matches!(&left.kind, ExprKind::IntLiteral(v) if *v > 0);
+                let l_non_neg = matches!(rc, Some(ValueConstraint::NonNegative | ValueConstraint::StrictlyPositive));
+                if l_non_neg && r_positive {
+                    return Some(ValueConstraint::StrictlyPositive);
+                }
+                None
+            }
+            // x * x is always NonNegative
+            ExprKind::BinaryOp { op: nsl_ast::operator::BinOp::Mul, left, right } => {
+                if let (ExprKind::Ident(a), ExprKind::Ident(b)) = (&left.kind, &right.kind) {
+                    if a == b {
+                        return Some(ValueConstraint::NonNegative);
+                    }
+                }
+                None
+            }
+            ExprKind::Ident(sym) => {
+                let c = self.get_constraint(sym);
+                if c != ValueConstraint::Unconstrained {
+                    Some(c)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -393,5 +516,82 @@ mod tests {
     fn walker_no_false_positive_on_safe_code() {
         let diags = analyze_source("fn foo(x: Tensor):\n    let y = relu(x)\n");
         assert!(diags.is_empty(), "relu(x) alone should produce no warnings");
+    }
+
+    #[test]
+    fn pow_unconstrained_warns() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let y = make_sym(&mut interner, "y");
+        let analyzer = NanAnalyzer::new();
+        let result = analyzer.check_call_risk("pow", &[x, y], Span::dummy());
+        assert!(result.is_some(), "pow() with unconstrained base should warn");
+    }
+
+    #[test]
+    fn pow_non_negative_no_warn() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let y = make_sym(&mut interner, "y");
+        let mut analyzer = NanAnalyzer::new();
+        analyzer.set_constraint(x, ValueConstraint::NonNegative);
+        let result = analyzer.check_call_risk("pow", &[x, y], Span::dummy());
+        assert!(result.is_none(), "pow() with NonNegative base should not warn");
+    }
+
+    #[test]
+    fn walker_detects_division_operator() {
+        let diags = analyze_source("fn foo(x: Tensor, y: Tensor):\n    let z = x / y\n");
+        let div_warns: Vec<_> = diags.iter().filter(|d| d.message.contains("division")).collect();
+        assert!(!div_warns.is_empty(), "a / b with unconstrained b should warn");
+    }
+
+    #[test]
+    fn walker_detects_log_softmax_pattern() {
+        let diags = analyze_source("fn foo(x: Tensor):\n    let y = log(softmax(x))\n");
+        let pattern_warns: Vec<_> = diags.iter()
+            .filter(|d| d.message.contains("log_softmax"))
+            .collect();
+        assert!(!pattern_warns.is_empty(), "log(softmax(x)) should suggest log_softmax");
+    }
+
+    #[test]
+    fn walker_relu_plus_eps_makes_strictly_positive() {
+        // relu(x) + 1e-6 should be StrictlyPositive, so log() of it should NOT warn
+        let diags = analyze_source(
+            "fn foo(x: Tensor):\n    let safe = relu(x) + 1e-6\n    let y = log(safe)\n"
+        );
+        let log_warns: Vec<_> = diags.iter().filter(|d| d.message.contains("log()")).collect();
+        assert!(log_warns.is_empty(), "log(relu(x) + eps) should not warn, but got: {:?}", log_warns);
+    }
+
+    #[test]
+    fn walker_assign_propagates_constraint() {
+        // x = relu(y) should give x NonNegative; sqrt(x) should not warn
+        let diags = analyze_source(
+            "fn foo(y: Tensor):\n    let x = y\n    x = relu(y)\n    let z = sqrt(x)\n"
+        );
+        let sqrt_warns: Vec<_> = diags.iter().filter(|d| d.message.contains("sqrt()")).collect();
+        assert!(sqrt_warns.is_empty(), "sqrt(x) after x = relu(y) should not warn");
+    }
+
+    #[test]
+    fn x_times_x_is_non_negative() {
+        let mut interner = Interner::new();
+        let x = make_sym(&mut interner, "x");
+        let analyzer = NanAnalyzer::new();
+        // Build x * x expression manually
+        let x_expr = Expr { kind: ExprKind::Ident(x), span: Span::dummy(), id: nsl_ast::NodeId(0) };
+        let mul_expr = Expr {
+            kind: ExprKind::BinaryOp {
+                op: nsl_ast::operator::BinOp::Mul,
+                left: Box::new(x_expr.clone()),
+                right: Box::new(x_expr),
+            },
+            span: Span::dummy(),
+            id: nsl_ast::NodeId(1),
+        };
+        let c = analyzer.expr_constraint(&mul_expr, &interner);
+        assert_eq!(c, Some(ValueConstraint::NonNegative), "x * x should be NonNegative");
     }
 }
