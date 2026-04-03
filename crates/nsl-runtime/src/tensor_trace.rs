@@ -171,20 +171,58 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
         *s = *t.shape.add(i) as u32;
     }
 
-    // Only compute stats for CPU f64 tensors (dtype 0, device 0).
-    // For other dtypes/devices, return zero stats with metadata.
     let len = t.len as usize;
-    if device != 0 || len == 0 || t.data.is_null() {
+    if len == 0 || t.data.is_null() {
         return TensorStats {
-            ndim,
-            dtype,
-            device,
-            _pad: 0,
-            shape,
-            min: 0.0,
-            max: 0.0,
-            mean: 0.0,
-            std: 0.0,
+            ndim, dtype, device, _pad: 0, shape,
+            min: 0.0, max: 0.0, mean: 0.0, std: 0.0,
+        };
+    }
+
+    // GPU f32 tensors — use single-pass reduction kernel.
+    #[cfg(feature = "cuda")]
+    if device != 0 {
+        let c_ptr = crate::tensor::nsl_tensor_contiguous(ptr as i64);
+        let [min_val, max_val, mean_val, std_val] =
+            crate::cuda::gpu_tensor_stats_f32(c_ptr);
+        crate::tensor::nsl_tensor_free(c_ptr);
+        return TensorStats {
+            ndim, dtype, device, _pad: 0, shape,
+            min: min_val, max: max_val, mean: mean_val, std: std_val,
+        };
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    if device != 0 {
+        return TensorStats {
+            ndim, dtype, device, _pad: 0, shape,
+            min: 0.0, max: 0.0, mean: 0.0, std: 0.0,
+        };
+    }
+
+    // CPU f32 tensors (dtype 1).
+    if dtype == 1 {
+        let data = t.data as *const f32;
+        let first = *data;
+        let mut min_val = first;
+        let mut max_val = first;
+        let mut sum = 0.0_f64;
+        for i in 0..len {
+            let v = *data.add(i);
+            if v < min_val { min_val = v; }
+            if v > max_val { max_val = v; }
+            sum += v as f64;
+        }
+        let mean_val = sum / len as f64;
+        let mut var_sum = 0.0_f64;
+        for i in 0..len {
+            let diff = *data.add(i) as f64 - mean_val;
+            var_sum += diff * diff;
+        }
+        let std_val = (var_sum / len as f64).sqrt();
+        return TensorStats {
+            ndim, dtype, device, _pad: 0, shape,
+            min: min_val, max: max_val, mean: mean_val as f32, std: std_val as f32,
         };
     }
 

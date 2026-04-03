@@ -2207,6 +2207,64 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// M45b: GPU tensor statistics — single-block reduction for min/max/sum/sum_sq
+// ---------------------------------------------------------------------------
+
+/// Compute min, max, sum, sum_of_squares for a GPU f32 tensor in a single kernel
+/// launch. Returns `[min, max, mean, std]` as f32 values on the CPU.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
+    use crate::tensor::NslTensor;
+    use fused_kernels::TENSOR_STATS_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let n = t.len as u64;
+    if n == 0 {
+        return [0.0; 4];
+    }
+
+    // Allocate 4 f32s (16 bytes) on device for kernel output: [min, max, sum, sum_sq]
+    let out_data = inner::alloc_managed(16);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut n_val = n;
+
+    let args: [*mut std::ffi::c_void; 3] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let result = inner::kernel_launch(
+        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4, // 4 shared arrays of 256 f32
+    );
+    assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    // Read back 4 f32s from device
+    let mut raw = [0f32; 4];
+    inner::memcpy_dtoh(
+        raw.as_mut_ptr() as *mut std::ffi::c_void,
+        out_data as *const std::ffi::c_void,
+        16,
+    );
+    inner::free_managed(out_data);
+
+    let min_val = raw[0];
+    let max_val = raw[1];
+    let sum_val = raw[2];
+    let sum_sq = raw[3];
+    let mean_val = sum_val / n as f32;
+    // Population std: sqrt(E[x^2] - (E[x])^2)
+    let variance = (sum_sq / n as f32) - (mean_val * mean_val);
+    let std_val = if variance > 0.0 { variance.sqrt() } else { 0.0 };
+
+    [min_val, max_val, mean_val, std_val]
+}
+
+// ---------------------------------------------------------------------------
 // M46b: Deterministic GPU global sum — single-thread sequential accumulation
 // ---------------------------------------------------------------------------
 
