@@ -16,7 +16,12 @@ use crate::cpu::create_tensor_with_shape_rs_dtype;
 use crate::dict::{nsl_dict_free_tensor_values, nsl_dict_new, nsl_dict_set_str};
 use crate::packing::{pack_batch, packed_batch_to_dict};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::NslTensor;
+use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
+
+#[inline]
+fn supports_flat_value_dtype(dtype: u16) -> bool {
+    matches!(dtype, 0 | 1 | DTYPE_U16_TOKEN)
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -66,7 +71,7 @@ struct DataLoader {
     data_tensor_ptr: i64,
     data: *const c_void,
     data_len: usize,
-    /// Source data dtype: 0=f64, 1=f32, 3=u16 (pretokenized).
+    /// Source data dtype: 0=f64, 1=f32, internal u16 token buffer dtype.
     data_dtype: u16,
     labels_tensor_ptr: i64,
     labels: *const c_void,
@@ -111,6 +116,10 @@ impl DataLoader {
         let data = data_tensor.data as *const c_void;
         let data_len = data_tensor.len as usize;
         let data_dtype = data_tensor.dtype;
+        if !supports_flat_value_dtype(data_dtype) {
+            eprintln!("nsl: DataLoader does not support source dtype {}", data_dtype);
+            std::process::abort();
+        }
 
         let (labels, labels_len, labels_dtype) = if labels_tensor_ptr != 0 {
             let labels_tensor = NslTensor::from_ptr(labels_tensor_ptr);
@@ -132,6 +141,10 @@ impl DataLoader {
         };
 
         let has_labels = !labels.is_null() && labels_len > 0;
+        if has_labels && !supports_flat_value_dtype(labels_dtype) {
+            eprintln!("nsl: DataLoader does not support label dtype {}", labels_dtype);
+            std::process::abort();
+        }
         if has_labels && labels_len != data_len {
             eprintln!(
                 "nsl: DataLoader labels length mismatch: inputs={} labels={}",
@@ -298,10 +311,10 @@ impl DataLoader {
 /// labels shifted by 1, standard causal mask.
 fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
     match dtype {
-        3 => unsafe { *(data as *const u16).add(index) as i64 },
-        4 => unsafe { *(data as *const i32).add(index) as i64 },
+        DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(index) as i64 },
         1 => unsafe { *(data as *const f32).add(index) as i64 },
-        _ => unsafe { *(data as *const f64).add(index) as i64 },
+        0 => unsafe { *(data as *const f64).add(index) as i64 },
+        _ => panic!("read_flat_value() unsupported dtype {}", dtype),
     }
 }
 
@@ -525,6 +538,7 @@ pub extern "C" fn nsl_dataloader_free(dl_ptr: i64) {
 mod tests {
     use super::*;
     use crate::dict::{nsl_dict_free, nsl_dict_len};
+    use std::fs;
 
     fn tensor_from_f64_slice(values: &[f64]) -> i64 {
         let tensor_ptr = create_tensor_with_shape_rs_dtype(&[values.len() as i64], 0);
@@ -653,6 +667,72 @@ mod tests {
         for (i, value) in expected.iter().enumerate() {
             let actual = unsafe { *labels_data.add(i) };
             assert_eq!(actual, *value, "label at position {} should match precomputed label", i);
+        }
+
+        nsl_dict_free(batch);
+        nsl_dataloader_stop(dl_ptr);
+        nsl_dataloader_free(dl_ptr);
+    }
+
+    #[test]
+    fn test_dataloader_handles_mmap_u16_tokens() {
+        let dir = std::env::temp_dir().join("nsl_test_mmap_dataloader");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("tokens_u16.bin");
+        {
+            let data: [u16; 5] = [100, 200, 50256, 42, 7];
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    data.len() * std::mem::size_of::<u16>(),
+                )
+            };
+            fs::write(&path, bytes).unwrap();
+        }
+
+        let path_str = path.to_str().unwrap();
+        let data_tensor = crate::data_source::nsl_load_mmap(
+            path_str.as_ptr() as i64,
+            path_str.len() as i64,
+            3,
+        );
+
+        let config_json = format!(
+            r#"{{"batch_size":1,"seq_len":4,"num_workers":1,"packing":false,"shuffle":false,"prefetch":1,"pin_memory":false,"drop_last":true,"pack_separator":0}}"#
+        );
+
+        let dl_ptr = nsl_dataloader_create(
+            data_tensor,
+            0,
+            config_json.as_ptr() as i64,
+            config_json.len() as i64,
+        );
+
+        nsl_dataloader_start(dl_ptr);
+
+        let batch = nsl_dataloader_next_batch(dl_ptr);
+        assert!(batch != 0, "expected one batch from mmap-backed u16 tokens");
+
+        let k_ids = nsl_str_from_rust("input_ids");
+        let ids_ptr = crate::dict::nsl_dict_get_str(batch, k_ids);
+        let ids_tensor = NslTensor::from_ptr(ids_ptr);
+        assert_eq!(ids_tensor.dtype, 4, "input_ids should be materialized as i32 tokens");
+
+        let ids_data = ids_tensor.data as *const i32;
+        let expected_ids = [100, 200, 50256, 42];
+        for (i, value) in expected_ids.iter().enumerate() {
+            let actual = unsafe { *ids_data.add(i) };
+            assert_eq!(actual, *value, "token {} should match source data", i);
+        }
+
+        let k_lbl = nsl_str_from_rust("labels");
+        let lbl_ptr = crate::dict::nsl_dict_get_str(batch, k_lbl);
+        let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
+        let lbl_data = lbl_tensor.data as *const i32;
+        let expected_labels = [200, 50256, 42, -100];
+        for (i, value) in expected_labels.iter().enumerate() {
+            let actual = unsafe { *lbl_data.add(i) };
+            assert_eq!(actual, *value, "label {} should match shifted token data", i);
         }
 
         nsl_dict_free(batch);

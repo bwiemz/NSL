@@ -175,9 +175,42 @@ pub const DTYPE_BF16: u16 = 3;
 pub const DTYPE_INT8: u16 = 4;
 pub const DTYPE_FP8E4M3: u16 = 5;
 pub const DTYPE_FP8E5M2: u16 = 6;
+pub const DTYPE_U16_TOKEN: u16 = 7;
 
 // Custom dtype IDs start at 256
 pub const DTYPE_CUSTOM_START: u16 = 256;
+
+#[inline]
+pub(crate) fn assert_elementwise_byte_copy(dtype: u16, op: &str) {
+    if dtype < DTYPE_CUSTOM_START {
+        return;
+    }
+
+    let supported = get_registry().get(&dtype).is_some_and(|info| {
+        info.block_size == 0
+            || (info.block_size == 1 && info.packed_block_size == info.element_size)
+    });
+
+    assert!(
+        supported,
+        "{op}: block-packed custom dtype {} is not supported by this byte-copy path",
+        dtype,
+    );
+}
+
+#[inline]
+pub(crate) fn dtype_element_size(dtype: u16) -> usize {
+    match dtype {
+        DTYPE_F64 => std::mem::size_of::<f64>(),
+        DTYPE_F32 => std::mem::size_of::<f32>(),
+        DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN => std::mem::size_of::<u16>(),
+        4 => std::mem::size_of::<i32>(),  // i32 token IDs
+        id if id >= DTYPE_CUSTOM_START => {
+            get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
+        }
+        _ => panic!("unknown dtype {}", dtype),
+    }
+}
 
 /// Metadata for a user-defined custom datatype
 pub struct CustomDtypeInfo {
@@ -341,29 +374,77 @@ impl NslTensor {
         self.data as *mut i32
     }
 
+    #[inline]
+    pub(crate) fn read_scalar_as_f64(&self, offset: usize) -> f64 {
+        match self.dtype {
+            4 => unsafe { *(self.data as *const i32).add(offset) as f64 },
+            DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(offset) as f64 },
+            1 => unsafe { *self.data_f32().add(offset) as f64 },
+            0 => unsafe { *self.data_f64().add(offset) },
+            _ => panic!("read_scalar_as_f64() unsupported for dtype {}", self.dtype),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_writable_storage(&self) -> bool {
+        if self.device != 0 {
+            return false;
+        }
+
+        if self.owns_data != 0 {
+            return true;
+        }
+
+        if self.data_owner != 0 {
+            return NslTensor::from_ptr(self.data_owner).has_writable_storage();
+        }
+
+        false
+    }
+
+    #[inline]
+    pub(crate) fn write_scalar_from_f64(&self, offset: usize, value: f64) {
+        assert!(
+            self.has_writable_storage(),
+            "write_scalar_from_f64() cannot mutate borrowed tensor storage (dtype={})",
+            self.dtype,
+        );
+
+        match self.dtype {
+            4 => unsafe { *(self.data as *mut i32).add(offset) = value as i32 },
+            DTYPE_U16_TOKEN => {
+                assert!(
+                    value.is_finite()
+                        && value.fract() == 0.0
+                        && (0.0..=(u16::MAX as f64)).contains(&value),
+                    "write_scalar_from_f64() invalid u16 token value {}",
+                    value,
+                );
+                unsafe { *(self.data as *mut u16).add(offset) = value as u16 };
+            }
+            1 => unsafe { *self.data_f32().add(offset) = value as f32 },
+            0 => unsafe { *self.data_f64().add(offset) = value },
+            _ => panic!("write_scalar_from_f64() unsupported for dtype {}", self.dtype),
+        }
+    }
+
     /// Read element at index `i` as an integer index value.
-    /// Handles dtype 0 (f64), 1 (f32), and 4 (i32).
+    /// Handles dtype 0 (f64), 1 (f32), 4 (i32), and internal u16 token buffers.
     /// Used by embedding_lookup, gather, and their backward passes.
     #[inline]
     pub(crate) fn read_index(&self, i: usize) -> i64 {
         match self.dtype {
+            DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(i) as i64 },
             4 => unsafe { *(self.data as *const i32).add(i) as i64 },
             1 => unsafe { *(self.data as *const f32).add(i) as i64 },
-            _ => unsafe { *(self.data as *const f64).add(i) as i64 },
+            0 => unsafe { *(self.data as *const f64).add(i) as i64 },
+            _ => panic!("read_index() unsupported for dtype {}", self.dtype),
         }
     }
 
     #[inline]
     pub(crate) fn element_size(&self) -> usize {
-        match self.dtype {
-            DTYPE_F64 => std::mem::size_of::<f64>(),
-            DTYPE_F32 => std::mem::size_of::<f32>(),
-            4 => std::mem::size_of::<i32>(),  // i32 token IDs
-            id if id >= DTYPE_CUSTOM_START => {
-                get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
-            }
-            _ => panic!("unknown dtype {}", self.dtype),
-        }
+        dtype_element_size(self.dtype)
     }
 
     /// Total byte size of the data buffer, accounting for block-packed custom dtypes.
@@ -485,6 +566,7 @@ impl NslTensor {
         let ndim = tensor.ndim as usize;
         let len = tensor.len as usize;
         let elem_size = tensor.element_size();
+        assert_elementwise_byte_copy(tensor.dtype, "nsl_tensor_contiguous");
 
         let new_shape = NslTensor::copy_shape(tensor.shape, tensor.ndim);
         let new_strides = NslTensor::compute_strides(new_shape, tensor.ndim);
@@ -507,14 +589,12 @@ impl NslTensor {
                 src_offset += idx * (src_strides[d] as usize);
             }
 
-            if tensor.dtype == 1 {
-                unsafe {
-                    *(new_data as *mut f32).add(flat) = *tensor.data_f32().add(src_offset);
-                }
-            } else {
-                unsafe {
-                    *(new_data as *mut f64).add(flat) = *tensor.data_f64().add(src_offset);
-                }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (tensor.data as *const u8).add(src_offset * elem_size),
+                    (new_data as *mut u8).add(flat * elem_size),
+                    elem_size,
+                );
             }
         }
 
@@ -629,11 +709,7 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
         offset += (idx as usize) * (unsafe { *tensor.strides.add(i) } as usize);
     }
 
-    if tensor.dtype == 1 {
-        unsafe { *tensor.data_f32().add(offset) as f64 }
-    } else {
-        unsafe { *tensor.data_f64().add(offset) }
-    }
+    tensor.read_scalar_as_f64(offset)
 }
 
 #[no_mangle]
@@ -663,11 +739,7 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
         offset += (idx as usize) * (unsafe { *tensor.strides.add(i) } as usize);
     }
 
-    if tensor.dtype == 1 {
-        unsafe { *tensor.data_f32().add(offset) = value as f32 };
-    } else {
-        unsafe { *tensor.data_f64().add(offset) = value };
-    }
+    tensor.write_scalar_from_f64(offset, value);
 }
 
 // === Scalar extraction ===
@@ -688,31 +760,49 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
         #[cfg(feature = "cuda")]
         {
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-            if tensor.dtype == 1 {
-                let mut val: f32 = 0.0;
-                crate::cuda::inner::memcpy_dtoh(
-                    &mut val as *mut f32 as *mut std::ffi::c_void,
-                    tensor.data,
-                    std::mem::size_of::<f32>(),
-                );
-                return val as f64;
-            } else {
-                let mut val: f64 = 0.0;
-                crate::cuda::inner::memcpy_dtoh(
-                    &mut val as *mut f64 as *mut std::ffi::c_void,
-                    tensor.data,
-                    std::mem::size_of::<f64>(),
-                );
-                return val;
+            match tensor.dtype {
+                4 => {
+                    let mut val: i32 = 0;
+                    crate::cuda::inner::memcpy_dtoh(
+                        &mut val as *mut i32 as *mut std::ffi::c_void,
+                        tensor.data,
+                        std::mem::size_of::<i32>(),
+                    );
+                    return val as f64;
+                }
+                DTYPE_U16_TOKEN => {
+                    let mut val: u16 = 0;
+                    crate::cuda::inner::memcpy_dtoh(
+                        &mut val as *mut u16 as *mut std::ffi::c_void,
+                        tensor.data,
+                        std::mem::size_of::<u16>(),
+                    );
+                    return val as f64;
+                }
+                1 => {
+                    let mut val: f32 = 0.0;
+                    crate::cuda::inner::memcpy_dtoh(
+                        &mut val as *mut f32 as *mut std::ffi::c_void,
+                        tensor.data,
+                        std::mem::size_of::<f32>(),
+                    );
+                    return val as f64;
+                }
+                _ => {
+                    let mut val: f64 = 0.0;
+                    crate::cuda::inner::memcpy_dtoh(
+                        &mut val as *mut f64 as *mut std::ffi::c_void,
+                        tensor.data,
+                        std::mem::size_of::<f64>(),
+                    );
+                    return val;
+                }
             }
         }
         #[cfg(not(feature = "cuda"))]
         { panic!("CUDA support not compiled"); }
     }
-    match tensor.dtype {
-        1 => unsafe { *tensor.data_f32() as f64 },
-        _ => unsafe { *tensor.data_f64() },
-    }
+    tensor.read_scalar_as_f64(0)
 }
 
 // === Display ===
@@ -731,10 +821,7 @@ pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
 
     if tensor.ndim == 0 {
         if tensor.len > 0 {
-            let val = match tensor.dtype {
-                1 => unsafe { *tensor.data_f32() as f64 },
-                _ => unsafe { *tensor.data_f64() },
-            };
+            let val = tensor.read_scalar_as_f64(0);
             print_float_value(val);
             println!();
         } else {
@@ -766,19 +853,25 @@ fn print_tensor_recursive(
 ) {
     let size = unsafe { *shape.add(dim) } as usize;
     let stride = unsafe { *strides.add(dim) } as usize;
-    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = dtype_element_size(dtype);
 
     print!("[");
     if dim as i64 == ndim - 1 {
         for i in 0..size {
             if i > 0 { print!(", "); }
             let val = match dtype {
+                DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(i * stride) as f64 },
+                4 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
+                0 => unsafe { *(data as *const f64).add(i * stride) },
                 d if d >= DTYPE_CUSTOM_START => {
                     print!("?");
                     continue;
                 }
-                _ => unsafe { *(data as *const f64).add(i * stride) },
+                _ => {
+                    print!("?");
+                    continue;
+                }
             };
             print_float_value(val);
         }
@@ -1003,6 +1096,10 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     }
     debug_assert!(dst.is_contiguous(), "copy_data requires contiguous dst");
     debug_assert!(src.is_contiguous(), "copy_data requires contiguous src");
+    if dst.device == 0 && !dst.has_writable_storage() {
+        eprintln!("nsl: copy_data cannot write into borrowed CPU storage");
+        std::process::abort();
+    }
     assert_eq!(
         dst.len, src.len,
         "nsl_tensor_copy_data: dst len {} != src len {}",
@@ -1048,6 +1145,10 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let src = NslTensor::from_ptr(src_ptr);
     debug_assert!(dst.is_contiguous(), "add_inplace requires contiguous dst");
     debug_assert!(src.is_contiguous(), "add_inplace requires contiguous src");
+    if dst.device == 0 && !dst.has_writable_storage() {
+        eprintln!("nsl: add_inplace cannot write into borrowed CPU storage");
+        std::process::abort();
+    }
     assert_eq!(
         dst.len, src.len,
         "nsl_tensor_add_inplace: dst len {} != src len {}",
@@ -1109,6 +1210,10 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    if tensor.device == 0 && !tensor.has_writable_storage() {
+        eprintln!("nsl: zero_inplace cannot write into borrowed CPU storage");
+        std::process::abort();
+    }
     let byte_count = (tensor.len as usize) * tensor.element_size();
     // Device memory: use memset
     #[cfg(feature = "cuda")]
@@ -2301,15 +2406,53 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     if t.device == 0 && target > 0 {
         #[cfg(feature = "cuda")]
         {
-            // i32 tensors (token IDs): bitwise copy to GPU via memcpy_htod
-            if transfer_src.dtype == 4 {
+            if transfer_src.dtype == DTYPE_U16_TOKEN {
                 let dst_size = len * std::mem::size_of::<i32>();
+                let dst = crate::cuda::inner::alloc_managed(dst_size);
+                let staging = checked_alloc(dst_size) as *mut i32;
+                let src = transfer_src.data as *const u16;
+                for i in 0..len {
+                    unsafe { *staging.add(i) = *src.add(i) as i32; }
+                }
+                crate::cuda::inner::memcpy_htod(dst, staging as *const std::ffi::c_void, dst_size);
+                unsafe { checked_free(staging as *mut u8, dst_size); }
+
+                let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
+                let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
+                let new_t = Box::new(NslTensor::new(
+                    dst,
+                    shape,
+                    strides,
+                    transfer_src.ndim,
+                    transfer_src.len,
+                    target,
+                    4,
+                    1,
+                    0,
+                ));
+                if transfer_src_ptr != tensor_ptr {
+                    nsl_tensor_free(transfer_src_ptr);
+                }
+                return NslTensor::publish(new_t);
+            }
+
+            if transfer_src.dtype != 0 && transfer_src.dtype != 1 {
+                assert_elementwise_byte_copy(transfer_src.dtype, "nsl_tensor_to_device");
+                let dst_size = len * transfer_src.element_size();
                 let dst = crate::cuda::inner::alloc_managed(dst_size);
                 crate::cuda::inner::memcpy_htod(dst, transfer_src.data, dst_size);
                 let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
                 let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
                 let new_t = Box::new(NslTensor::new(
-                    dst, shape, strides, transfer_src.ndim, transfer_src.len, target, 4, 1, 0,
+                    dst,
+                    shape,
+                    strides,
+                    transfer_src.ndim,
+                    transfer_src.len,
+                    target,
+                    transfer_src.dtype,
+                    1,
+                    0,
                 ));
                 if transfer_src_ptr != tensor_ptr {
                     nsl_tensor_free(transfer_src_ptr);
@@ -2371,9 +2514,9 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         {
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
-            // i32 tensors (token IDs): bitwise copy back to CPU via memcpy_dtoh
-            if transfer_src.dtype == 4 {
-                let dst_size = len * std::mem::size_of::<i32>();
+            if transfer_src.dtype != 0 && transfer_src.dtype != 1 {
+                assert_elementwise_byte_copy(transfer_src.dtype, "nsl_tensor_to_device");
+                let dst_size = len * transfer_src.element_size();
                 let dst = checked_alloc(dst_size);
                 crate::cuda::inner::memcpy_dtoh(
                     dst as *mut std::ffi::c_void,
@@ -2384,7 +2527,14 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
                 let new_t = Box::new(NslTensor::new(
                     dst as *mut std::ffi::c_void,
-                    shape, strides, transfer_src.ndim, transfer_src.len, 0, 4, 1, 0,
+                    shape,
+                    strides,
+                    transfer_src.ndim,
+                    transfer_src.len,
+                    0,
+                    transfer_src.dtype,
+                    1,
+                    0,
                 ));
                 if transfer_src_ptr != tensor_ptr {
                     nsl_tensor_free(transfer_src_ptr);
@@ -2674,11 +2824,7 @@ pub extern "C" fn nsl_tensor_set_element(
         offset += idx * stride;
     }
 
-    if tensor.dtype == 1 {
-        unsafe { *tensor.data_f32().add(offset) = value as f32 };
-    } else {
-        unsafe { *tensor.data_f64().add(offset) = value };
-    }
+    tensor.write_scalar_from_f64(offset, value);
 }
 
 #[no_mangle]
@@ -2686,23 +2832,68 @@ pub extern "C" fn nsl_tensor_slice_assign(
     target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
 ) {
     let target = NslTensor::from_ptr(target_ptr);
-    let src = NslTensor::from_ptr(src_ptr);
     let ndim = num_dims as usize;
+    if ndim != target.ndim as usize {
+        eprintln!(
+            "nsl: slice_assign: expected {} dims, got {}",
+            target.ndim,
+            ndim,
+        );
+        std::process::abort();
+    }
     let dims = unsafe { std::slice::from_raw_parts(dims_ptr as *const NslSliceDim, ndim) };
     let target_strides = crate::cpu::get_strides_vec(target);
     let target_shape = crate::cpu::get_shape_vec(target);
+
+    let src_cpu_ptr = if NslTensor::from_ptr(src_ptr).device > 0 {
+        nsl_tensor_to_device(src_ptr, 0)
+    } else {
+        src_ptr
+    };
+
+    let src_work_ptr = if NslTensor::from_ptr(src_cpu_ptr).is_contiguous() {
+        src_cpu_ptr
+    } else {
+        nsl_tensor_contiguous(src_cpu_ptr)
+    };
+    let src = NslTensor::from_ptr(src_work_ptr);
+
+    let normalize_index = |raw: i64, dim_size: usize, allow_endpoint: bool| -> usize {
+        let dim_i64 = dim_size as i64;
+        let normalized = if raw < 0 { dim_i64 + raw } else { raw };
+        let upper = if allow_endpoint { dim_i64 } else { dim_i64 - 1 };
+        if normalized < 0 || normalized > upper {
+            eprintln!(
+                "nsl: slice_assign: index {} out of bounds for dim of size {}",
+                raw,
+                dim_size,
+            );
+            std::process::abort();
+        }
+        normalized as usize
+    };
 
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ndim);
     for d in 0..ndim {
         let dim_size = target_shape[d] as usize;
         if dims[d].is_scalar != 0 {
-            let idx = if dims[d].start < 0 { (dim_size as i64 + dims[d].start) as usize } else { dims[d].start as usize };
+            let idx = normalize_index(dims[d].start, dim_size, false);
             ranges.push((idx, idx + 1));
         } else {
-            let start = if dims[d].start < 0 { (dim_size as i64 + dims[d].start) as usize } else { dims[d].start as usize };
-            let end = if dims[d].end < 0 { (dim_size as i64 + dims[d].end) as usize } else { dims[d].end.min(dim_size as i64) as usize };
+            let start = normalize_index(dims[d].start, dim_size, true);
+            let end = normalize_index(dims[d].end, dim_size, true);
             ranges.push((start, end));
         }
+    }
+
+    let selected_len: usize = ranges.iter().map(|(start, end)| end.saturating_sub(*start)).product();
+    if selected_len != src.len as usize {
+        eprintln!(
+            "nsl: slice_assign: source length {} does not match target slice length {}",
+            src.len,
+            selected_len,
+        );
+        std::process::abort();
     }
 
     let mut src_flat = 0usize;
@@ -2715,10 +2906,8 @@ pub extern "C" fn nsl_tensor_slice_assign(
     ) {
         if depth == ndim {
             if *src_flat < src.len as usize {
-                let val: f64 = if src.dtype == 1 { unsafe { *src.data_f32().add(*src_flat) as f64 } }
-                               else { unsafe { *src.data_f64().add(*src_flat) } };
-                if target.dtype == 1 { unsafe { *target.data_f32().add(target_offset) = val as f32 }; }
-                else { unsafe { *target.data_f64().add(target_offset) = val }; }
+                let val = src.read_scalar_as_f64(*src_flat);
+                target.write_scalar_from_f64(target_offset, val);
                 *src_flat += 1;
             }
             return;
@@ -2730,6 +2919,13 @@ pub extern "C" fn nsl_tensor_slice_assign(
     }
 
     recurse(0, ndim, &ranges, target, src, &target_strides, 0, &mut src_flat);
+
+    if src_work_ptr != src_cpu_ptr {
+        nsl_tensor_free(src_work_ptr);
+    }
+    if src_cpu_ptr != src_ptr {
+        nsl_tensor_free(src_cpu_ptr);
+    }
 }
 
 // ---------------------------------------------------------------------------

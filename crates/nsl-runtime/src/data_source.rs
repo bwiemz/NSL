@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 use crate::list::{nsl_list_new, nsl_list_push};
 use crate::memory::checked_alloc;
 use crate::string::nsl_str_from_rust;
-use crate::tensor::NslTensor;
+use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
 
 /// Convert a (ptr, len) pair from the NSL ABI into a Rust `String`.
 unsafe fn str_from_ptr_len(ptr: i64, len: i64) -> String {
@@ -197,7 +197,7 @@ pub extern "C" fn nsl_load_csv(
 
 /// Memory-map a binary file as a flat 1D tensor.
 ///
-/// `dtype`: 0 = f64, 1 = f32, 2 = i32, 3 = u16.
+/// `dtype`: 0 = f64, 1 = f32, 2 = i32, 3 = u16 token IDs.
 ///
 /// For f64 and f32, the tensor data points directly into the mmap region (zero-copy).
 /// For i32 and u16, values are converted to f64 and stored in a heap-allocated buffer.
@@ -257,13 +257,13 @@ pub extern "C" fn nsl_load_mmap(path_ptr: i64, path_len: i64, dtype: i64) -> i64
         3 => {
             // u16: zero-copy mmap (pre-tokenized LLM datasets).
             // Conversion to f64/f32 happens lazily per-batch in the DataLoader.
-            // dtype=3 signals to the DataLoader that the backing data is u16.
+            // Preserve the public load_mmap(..., 3) API, but store a distinct
+            // internal dtype so runtime scalar helpers do not alias BF16.
             let elem_size = std::mem::size_of::<u16>();
             let n_elements = byte_len / elem_size;
             let data_ptr = mmap.as_ptr() as *mut c_void;
             let _ = Box::into_raw(Box::new(mmap));
-            // Use dtype=3 (u16) so the DataLoader knows to convert per-batch
-            create_mmap_tensor(data_ptr, n_elements as i64, 3, 0)
+            create_mmap_tensor(data_ptr, n_elements as i64, DTYPE_U16_TOKEN, 0)
         }
         _ => {
             eprintln!("nsl: nsl_load_mmap: unsupported dtype {}", dtype);
@@ -376,11 +376,95 @@ mod tests {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         assert_eq!(tensor.len, 4);
         assert_eq!(tensor.owns_data, 0); // mmap'd data — tensor does not own the buffer
-        assert_eq!(tensor.dtype, 3); // u16 zero-copy (no conversion to f64)
+        assert_eq!(tensor.dtype, DTYPE_U16_TOKEN);
         // Verify raw u16 data is accessible
         unsafe {
             let data = tensor.data as *const u16;
             assert_eq!(*data.add(2), 50256u16);
         }
+
+        crate::tensor::nsl_tensor_free(tensor_ptr);
+    }
+
+    #[test]
+    fn test_load_mmap_u16_slice_preserves_dtype_and_values() {
+        let dir = std::env::temp_dir().join("nsl_test_mmap");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test_u16_slice.bin");
+        {
+            let data: [u16; 5] = [100, 200, 50256, 42, 7];
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    data.len() * std::mem::size_of::<u16>(),
+                )
+            };
+            fs::write(&path, bytes).unwrap();
+        }
+
+        let path_str = path.to_str().unwrap();
+        let tensor_ptr = nsl_load_mmap(
+            path_str.as_ptr() as i64,
+            path_str.len() as i64,
+            3, // dtype = u16
+        );
+
+        let slice_ptr = crate::tensor::nsl_tensor_slice(tensor_ptr, 0, 1, 4);
+        let slice = NslTensor::from_ptr(slice_ptr);
+        assert_eq!(slice.len, 3);
+        assert_eq!(slice.dtype, DTYPE_U16_TOKEN);
+        assert_eq!(slice.owns_data, 1);
+
+        unsafe {
+            let data = slice.data as *const u16;
+            assert_eq!(*data.add(0), 200u16);
+            assert_eq!(*data.add(1), 50256u16);
+            assert_eq!(*data.add(2), 42u16);
+        }
+
+        assert_eq!(slice.read_index(1), 50256);
+
+        let item_ptr = crate::tensor::nsl_tensor_slice(tensor_ptr, 0, 2, 3);
+        assert_eq!(crate::tensor::nsl_tensor_item(item_ptr), 50256.0);
+
+        crate::tensor::nsl_tensor_free(item_ptr);
+        crate::tensor::nsl_tensor_free(slice_ptr);
+        crate::tensor::nsl_tensor_free(tensor_ptr);
+    }
+
+    #[test]
+    fn test_mmap_u16_reshape_view_remains_borrowed() {
+        let dir = std::env::temp_dir().join("nsl_test_mmap");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test_u16_view.bin");
+        {
+            let data: [u16; 4] = [100, 200, 50256, 42];
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    data.len() * std::mem::size_of::<u16>(),
+                )
+            };
+            fs::write(&path, bytes).unwrap();
+        }
+
+        let path_str = path.to_str().unwrap();
+        let tensor_ptr = nsl_load_mmap(
+            path_str.as_ptr() as i64,
+            path_str.len() as i64,
+            3,
+        );
+
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 2);
+        crate::list::nsl_list_push(shape, 2);
+
+        let view_ptr = crate::tensor::nsl_tensor_reshape(tensor_ptr, shape);
+        let view = NslTensor::from_ptr(view_ptr);
+        assert!(!view.has_writable_storage());
+
+        crate::list::nsl_list_free(shape);
+        crate::tensor::nsl_tensor_free(view_ptr);
+        crate::tensor::nsl_tensor_free(tensor_ptr);
     }
 }

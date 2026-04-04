@@ -10,6 +10,26 @@ use crate::memory::checked_alloc;
 
 use super::{NslTensor, nsl_tensor_free};
 
+#[inline]
+fn alloc_preserved_dtype_buffer(dtype: u16, len: usize) -> *mut c_void {
+    checked_alloc(len * super::dtype_element_size(dtype)) as *mut c_void
+}
+
+#[inline]
+unsafe fn copy_preserved_dtype_element(
+    tensor: &NslTensor,
+    src_offset: usize,
+    dst: *mut c_void,
+    dst_offset: usize,
+) {
+    let elem_size = tensor.element_size();
+    std::ptr::copy_nonoverlapping(
+        (tensor.data as *const u8).add(src_offset * elem_size),
+        (dst as *mut u8).add(dst_offset * elem_size),
+        elem_size,
+    );
+}
+
 // === Shape query operations ===
 
 #[no_mangle]
@@ -312,6 +332,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
     }
 
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    super::assert_elementwise_byte_copy(tensor.dtype, "nsl_tensor_select");
     let ndim = tensor.ndim as usize;
 
     // Normalize dim
@@ -354,33 +375,17 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
     let out_stride_vec: Vec<i64> = (0..ndim - 1).map(|i| unsafe { *out_strides.add(i) }).collect();
     let axis_map: Vec<usize> = (0..ndim).filter(|&i| i != d).collect();
 
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-        for flat in 0..out_len as usize {
-            let mut remaining = flat;
-            let mut in_offset = base_offset;
-            for (oa, &ia) in axis_map.iter().enumerate() {
-                let i = remaining / out_stride_vec[oa] as usize;
-                remaining %= out_stride_vec[oa] as usize;
-                in_offset += i * in_strides[ia] as usize;
-            }
-            unsafe { *buf.add(flat) = *tensor.data_f32().add(in_offset) };
+    let data = alloc_preserved_dtype_buffer(tensor.dtype, out_len as usize);
+    for flat in 0..out_len as usize {
+        let mut remaining = flat;
+        let mut in_offset = base_offset;
+        for (oa, &ia) in axis_map.iter().enumerate() {
+            let i = remaining / out_stride_vec[oa] as usize;
+            remaining %= out_stride_vec[oa] as usize;
+            in_offset += i * in_strides[ia] as usize;
         }
-        buf as *mut c_void
-    } else {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        for flat in 0..out_len as usize {
-            let mut remaining = flat;
-            let mut in_offset = base_offset;
-            for (oa, &ia) in axis_map.iter().enumerate() {
-                let i = remaining / out_stride_vec[oa] as usize;
-                remaining %= out_stride_vec[oa] as usize;
-                in_offset += i * in_strides[ia] as usize;
-            }
-            unsafe { *buf.add(flat) = *tensor.data_f64().add(in_offset) };
-        }
-        buf as *mut c_void
-    };
+        unsafe { copy_preserved_dtype_element(&tensor, in_offset, data, flat) };
+    }
 
     let out = Box::new(NslTensor::new(
         data,
@@ -437,6 +442,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         .collect();
 
     let first = NslTensor::from_ptr(contiguous_ptrs[0]);
+    super::assert_elementwise_byte_copy(first.dtype, "nsl_tensor_stack");
     let in_ndim = first.ndim as usize;
     let out_ndim = (in_ndim + 1) as i64;
 
@@ -455,6 +461,13 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     for &cp in &contiguous_ptrs {
         let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, in_ndim, "nsl_tensor_stack: ndim mismatch");
+        assert_eq!(
+            t.dtype,
+            first.dtype,
+            "nsl_tensor_stack: dtype mismatch ({} vs {})",
+            t.dtype,
+            first.dtype,
+        );
         for axis in 0..in_ndim {
             let s1 = unsafe { *first.shape.add(axis) };
             let s2 = unsafe { *t.shape.add(axis) };
@@ -476,55 +489,28 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     let out_len = NslTensor::total_elements(out_shape, out_ndim);
     let per_tensor = first.len as usize;
 
-    let data: *mut c_void = if first.dtype == 1 {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-        let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
-            .map(|i| unsafe { *out_strides.add(i) })
-            .collect();
-        for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
-            let t = NslTensor::from_ptr(cp);
-            let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
-            for flat in 0..per_tensor {
-                let mut remaining = flat;
-                let mut in_multi: Vec<usize> = vec![0; in_ndim];
-                for axis in 0..in_ndim {
-                    in_multi[axis] = remaining / t_strides[axis] as usize;
-                    remaining %= t_strides[axis] as usize;
-                }
-                let mut out_offset = t_idx * out_stride_vec[insert_pos] as usize;
-                for (ia, &iv) in in_multi.iter().enumerate() {
-                    let oa = if ia < insert_pos { ia } else { ia + 1 };
-                    out_offset += iv * out_stride_vec[oa] as usize;
-                }
-                unsafe { *buf.add(out_offset) = *t.data_f32().add(flat) };
+    let data = alloc_preserved_dtype_buffer(first.dtype, out_len as usize);
+    let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
+        .map(|i| unsafe { *out_strides.add(i) })
+        .collect();
+    for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
+        let t = NslTensor::from_ptr(cp);
+        let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
+        for flat in 0..per_tensor {
+            let mut remaining = flat;
+            let mut in_multi: Vec<usize> = vec![0; in_ndim];
+            for axis in 0..in_ndim {
+                in_multi[axis] = remaining / t_strides[axis] as usize;
+                remaining %= t_strides[axis] as usize;
             }
-        }
-        buf as *mut c_void
-    } else {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        let out_stride_vec: Vec<i64> = (0..out_ndim as usize)
-            .map(|i| unsafe { *out_strides.add(i) })
-            .collect();
-        for (t_idx, &cp) in contiguous_ptrs.iter().enumerate() {
-            let t = NslTensor::from_ptr(cp);
-            let t_strides: Vec<i64> = (0..in_ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
-            for flat in 0..per_tensor {
-                let mut remaining = flat;
-                let mut in_multi: Vec<usize> = vec![0; in_ndim];
-                for axis in 0..in_ndim {
-                    in_multi[axis] = remaining / t_strides[axis] as usize;
-                    remaining %= t_strides[axis] as usize;
-                }
-                let mut out_offset = t_idx * out_stride_vec[insert_pos] as usize;
-                for (ia, &iv) in in_multi.iter().enumerate() {
-                    let oa = if ia < insert_pos { ia } else { ia + 1 };
-                    out_offset += iv * out_stride_vec[oa] as usize;
-                }
-                unsafe { *buf.add(out_offset) = *t.data_f64().add(flat) };
+            let mut out_offset = t_idx * out_stride_vec[insert_pos] as usize;
+            for (ia, &iv) in in_multi.iter().enumerate() {
+                let oa = if ia < insert_pos { ia } else { ia + 1 };
+                out_offset += iv * out_stride_vec[oa] as usize;
             }
+            unsafe { copy_preserved_dtype_element(&t, flat, data, out_offset) };
         }
-        buf as *mut c_void
-    };
+    }
 
     let out = Box::new(NslTensor::new(
         data,
@@ -734,6 +720,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
     }
 
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    super::assert_elementwise_byte_copy(tensor.dtype, "nsl_tensor_slice");
     let ndim = tensor.ndim as usize;
 
     let d = if dim < 0 { (tensor.ndim + dim) as usize } else { dim as usize };
@@ -763,41 +750,21 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         .map(|i| unsafe { *out_strides.add(i) })
         .collect();
 
-    let data: *mut c_void = if tensor.dtype == 1 {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-        for flat in 0..out_len as usize {
-            let mut remaining = flat;
-            let mut in_offset: usize = 0;
-            for axis in 0..ndim {
-                let idx = remaining / o_strides[axis] as usize;
-                remaining %= o_strides[axis] as usize;
-                if axis == d {
-                    in_offset += (idx + s as usize) * in_strides[axis] as usize;
-                } else {
-                    in_offset += idx * in_strides[axis] as usize;
-                }
+    let data = alloc_preserved_dtype_buffer(tensor.dtype, out_len as usize);
+    for flat in 0..out_len as usize {
+        let mut remaining = flat;
+        let mut in_offset: usize = 0;
+        for axis in 0..ndim {
+            let idx = remaining / o_strides[axis] as usize;
+            remaining %= o_strides[axis] as usize;
+            if axis == d {
+                in_offset += (idx + s as usize) * in_strides[axis] as usize;
+            } else {
+                in_offset += idx * in_strides[axis] as usize;
             }
-            unsafe { *buf.add(flat) = *tensor.data_f32().add(in_offset) };
         }
-        buf as *mut c_void
-    } else {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        for flat in 0..out_len as usize {
-            let mut remaining = flat;
-            let mut in_offset: usize = 0;
-            for axis in 0..ndim {
-                let idx = remaining / o_strides[axis] as usize;
-                remaining %= o_strides[axis] as usize;
-                if axis == d {
-                    in_offset += (idx + s as usize) * in_strides[axis] as usize;
-                } else {
-                    in_offset += idx * in_strides[axis] as usize;
-                }
-            }
-            unsafe { *buf.add(flat) = *tensor.data_f64().add(in_offset) };
-        }
-        buf as *mut c_void
-    };
+        unsafe { copy_preserved_dtype_element(&tensor, in_offset, data, flat) };
+    }
 
     let input_shape: Vec<i64> = (0..ndim)
         .map(|i| unsafe { *tensor.shape.add(i) })
@@ -865,6 +832,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         .collect();
 
     let first = NslTensor::from_ptr(contiguous_ptrs[0]);
+    super::assert_elementwise_byte_copy(first.dtype, "nsl_tensor_cat");
     let ndim = first.ndim as usize;
     let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
     assert!(d < ndim, "nsl_tensor_cat: dim {dim} out of range for ndim {ndim}");
@@ -875,6 +843,13 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     for &cp in &contiguous_ptrs {
         let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
+        assert_eq!(
+            t.dtype,
+            first.dtype,
+            "nsl_tensor_cat: dtype mismatch ({} vs {})",
+            t.dtype,
+            first.dtype,
+        );
         let cat_size = unsafe { *t.shape.add(d) };
         split_sizes.push(cat_size);
         total_cat_dim += cat_size;
@@ -904,53 +879,27 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         .map(|i| unsafe { *out_strides.add(i) })
         .collect();
 
-    let data: *mut c_void = if out_dtype == 1 {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-        let mut cat_offset: usize = 0;
-        for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-            let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
-            let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
-            for flat in 0..t.len as usize {
-                let mut remaining = flat;
-                let mut out_offset: usize = 0;
-                for axis in 0..ndim {
-                    let idx = remaining / t_strides[axis] as usize;
-                    remaining %= t_strides[axis] as usize;
-                    if axis == d {
-                        out_offset += (idx + cat_offset) * o_strides[axis] as usize;
-                    } else {
-                        out_offset += idx * o_strides[axis] as usize;
-                    }
+    let data = alloc_preserved_dtype_buffer(out_dtype, out_len as usize);
+    let mut cat_offset: usize = 0;
+    for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
+        let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
+        let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
+        for flat in 0..t.len as usize {
+            let mut remaining = flat;
+            let mut out_offset: usize = 0;
+            for axis in 0..ndim {
+                let idx = remaining / t_strides[axis] as usize;
+                remaining %= t_strides[axis] as usize;
+                if axis == d {
+                    out_offset += (idx + cat_offset) * o_strides[axis] as usize;
+                } else {
+                    out_offset += idx * o_strides[axis] as usize;
                 }
-                unsafe { *buf.add(out_offset) = *t.data_f32().add(flat) };
             }
-            cat_offset += sz as usize;
+            unsafe { copy_preserved_dtype_element(&t, flat, data, out_offset) };
         }
-        buf as *mut c_void
-    } else {
-        let buf = checked_alloc((out_len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        let mut cat_offset: usize = 0;
-        for (t_idx, &sz) in split_sizes.iter().enumerate().take(num_tensors) {
-            let t = NslTensor::from_ptr(contiguous_ptrs[t_idx]);
-            let t_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
-            for flat in 0..t.len as usize {
-                let mut remaining = flat;
-                let mut out_offset: usize = 0;
-                for axis in 0..ndim {
-                    let idx = remaining / t_strides[axis] as usize;
-                    remaining %= t_strides[axis] as usize;
-                    if axis == d {
-                        out_offset += (idx + cat_offset) * o_strides[axis] as usize;
-                    } else {
-                        out_offset += idx * o_strides[axis] as usize;
-                    }
-                }
-                unsafe { *buf.add(out_offset) = *t.data_f64().add(flat) };
-            }
-            cat_offset += sz as usize;
-        }
-        buf as *mut c_void
-    };
+        cat_offset += sz as usize;
+    }
 
     let out = Box::new(NslTensor::new(
         data,
@@ -1135,69 +1084,38 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
     }
 
     // Materialize: walk through all elements using multi-dim coords and source strides
+    super::assert_elementwise_byte_copy(t.dtype, "nsl_tensor_contiguous");
     let len = t.len;
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
     let out_strides = NslTensor::compute_strides(shape, t.ndim);
 
     // For each flat output index, compute the n-dim coordinates,
     // then compute the source offset using source strides.
-    if t.dtype == 1 {
-        // f32
-        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
-        for flat in 0..len as usize {
-            let mut remaining = flat;
-            let mut src_offset: usize = 0;
-            for d in 0..ndim {
-                let stride = unsafe { *out_strides.add(d) } as usize;
-                let coord = if stride > 0 { remaining / stride } else { 0 };
-                if stride > 0 {
-                    remaining %= stride;
-                }
-                let src_stride = unsafe { *t.strides.add(d) } as usize;
-                src_offset += coord * src_stride;
+    let data = alloc_preserved_dtype_buffer(t.dtype, len as usize);
+    for flat in 0..len as usize {
+        let mut remaining = flat;
+        let mut src_offset: usize = 0;
+        for d in 0..ndim {
+            let stride = unsafe { *out_strides.add(d) } as usize;
+            let coord = if stride > 0 { remaining / stride } else { 0 };
+            if stride > 0 {
+                remaining %= stride;
             }
-            unsafe { *buf.add(flat) = *t.data_f32().add(src_offset) };
+            let src_stride = unsafe { *t.strides.add(d) } as usize;
+            src_offset += coord * src_stride;
         }
-        let result = Box::new(NslTensor::new(
-            buf as *mut c_void,
-            shape,
-            out_strides,
-            t.ndim,
-            len,
-            t.device,
-            t.dtype,
-            1,
-            0,
-        ));
-        NslTensor::publish(result)
-    } else {
-        // f64
-        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-        for flat in 0..len as usize {
-            let mut remaining = flat;
-            let mut src_offset: usize = 0;
-            for d in 0..ndim {
-                let stride = unsafe { *out_strides.add(d) } as usize;
-                let coord = if stride > 0 { remaining / stride } else { 0 };
-                if stride > 0 {
-                    remaining %= stride;
-                }
-                let src_stride = unsafe { *t.strides.add(d) } as usize;
-                src_offset += coord * src_stride;
-            }
-            unsafe { *buf.add(flat) = *t.data_f64().add(src_offset) };
-        }
-        let result = Box::new(NslTensor::new(
-            buf as *mut c_void,
-            shape,
-            out_strides,
-            t.ndim,
-            len,
-            t.device,
-            t.dtype,
-            1,
-            0,
-        ));
-        NslTensor::publish(result)
+        unsafe { copy_preserved_dtype_element(&t, src_offset, data, flat) };
     }
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        out_strides,
+        t.ndim,
+        len,
+        t.device,
+        t.dtype,
+        1,
+        0,
+    ));
+    NslTensor::publish(result)
 }

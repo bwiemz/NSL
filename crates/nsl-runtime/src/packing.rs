@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use crate::cpu::{create_tensor_with_shape_rs_dtype};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::NslTensor;
+use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
 
 /// A packed batch of token sequences with attention mask.
 pub struct PackedBatch {
@@ -30,10 +30,10 @@ pub struct PackedBatch {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
     match dtype {
-        3 => unsafe { *(data as *const u16).add(index) as i64 },
-        4 => unsafe { *(data as *const i32).add(index) as i64 },
+        DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(index) as i64 },
         1 => unsafe { *(data as *const f32).add(index) as i64 },
-        _ => unsafe { *(data as *const f64).add(index) as i64 },
+        0 => unsafe { *(data as *const f64).add(index) as i64 },
+        _ => panic!("read_flat_value() unsupported dtype {}", dtype),
     }
 }
 
@@ -277,6 +277,27 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(cursor, 0); // cursor unchanged
+    }
+
+    #[test]
+    fn test_pack_batch_u16_tokens() {
+        let stream: [u16; 4] = [11, 12, 0, 13];
+        let mut cursor: usize = 0;
+
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            DTYPE_U16_TOKEN,
+            &mut cursor,
+            1,
+            4,
+            0,
+        )
+        .expect("should produce a batch");
+
+        assert_eq!(cursor, 4);
+        assert_eq!(batch.input_ids, vec![11, 12, 0, 13]);
+        assert_eq!(batch.labels, vec![12, 0, -100, -100]);
     }
 
     #[test]
