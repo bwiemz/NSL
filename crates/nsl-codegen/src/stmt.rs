@@ -1322,17 +1322,27 @@ impl Compiler<'_> {
                 builder.def_var(elem_var, zero);
                 state.variables.insert(*sym, (elem_var, cl_types::I64));
             }
-            PatternKind::Tuple(sub_patterns) => {
+            PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
                 for sub_pat in sub_patterns {
-                    if let PatternKind::Ident(sym) = &sub_pat.kind {
-                        let var = state.new_variable();
-                        builder.declare_var(var, cl_types::I64);
-                        builder.def_var(var, zero);
-                        state.variables.insert(*sym, (var, cl_types::I64));
+                    match &sub_pat.kind {
+                        PatternKind::Ident(sym) => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            builder.def_var(var, zero);
+                            state.variables.insert(*sym, (var, cl_types::I64));
+                        }
+                        PatternKind::Rest(Some(sym)) => {
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_types::I64);
+                            builder.def_var(var, zero);
+                            state.variables.insert(*sym, (var, cl_types::I64));
+                        }
+                        PatternKind::Rest(None) | PatternKind::Wildcard => {}
+                        _ => {}
                     }
                 }
             }
-            _ => return Err(CodegenError::new("only ident and tuple patterns in for loops")),
+            _ => return Err(CodegenError::new("only ident, tuple, and list patterns in for loops")),
         }
 
         let header_block = builder.create_block();
@@ -1364,16 +1374,57 @@ impl Compiler<'_> {
                 let (var, _) = state.variables[sym];
                 builder.def_var(var, elem);
             }
-            PatternKind::Tuple(sub_patterns) => {
-                // elem is a tuple (NslList ptr) — destructure it
+            PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
+                // elem is a tuple/list (NslList ptr) — destructure with Rest support
+                let rest_pos = sub_patterns.iter().position(|p| matches!(p.kind, PatternKind::Rest(_)));
+                let elem_len = if rest_pos.is_some() {
+                    Some(self.compile_call_by_name(builder, "nsl_list_len", &[elem])?)
+                } else {
+                    None
+                };
+
                 for (i, sub_pat) in sub_patterns.iter().enumerate() {
-                    if let PatternKind::Ident(sym) = &sub_pat.kind {
-                        let idx = builder.ins().iconst(cl_types::I64, i as i64);
-                        let inner_get_ref = self.module.declare_func_in_func(get_id, builder.func);
-                        let call = builder.ins().call(inner_get_ref, &[elem, idx]);
-                        let sub_elem = builder.inst_results(call)[0];
-                        let (var, _) = state.variables[sym];
-                        builder.def_var(var, sub_elem);
+                    match &sub_pat.kind {
+                        PatternKind::Ident(sym) => {
+                            let idx = match rest_pos {
+                                Some(rp) if i > rp => {
+                                    // After rest: index from end
+                                    let trailing = builder.ins().iconst(
+                                        cl_types::I64,
+                                        (sub_patterns.len() - i) as i64,
+                                    );
+                                    builder.ins().isub(elem_len.unwrap(), trailing)
+                                }
+                                _ => builder.ins().iconst(cl_types::I64, i as i64),
+                            };
+                            let inner_get_ref = self.module.declare_func_in_func(get_id, builder.func);
+                            let call = builder.ins().call(inner_get_ref, &[elem, idx]);
+                            let sub_elem = builder.inst_results(call)[0];
+                            let (var, _) = state.variables[sym];
+                            builder.def_var(var, sub_elem);
+                        }
+                        PatternKind::Rest(rest_sym) => {
+                            let lo = builder.ins().iconst(cl_types::I64, i as i64);
+                            let hi = if i + 1 < sub_patterns.len() {
+                                let trailing = builder.ins().iconst(
+                                    cl_types::I64,
+                                    sub_patterns.len().saturating_sub(i + 1) as i64,
+                                );
+                                builder.ins().isub(elem_len.unwrap(), trailing)
+                            } else {
+                                elem_len.unwrap()
+                            };
+                            let step = builder.ins().iconst(cl_types::I64, 1);
+                            let rest_val = self.compile_call_by_name(
+                                builder, "nsl_list_slice", &[elem, lo, hi, step],
+                            )?;
+                            if let Some(sym) = rest_sym {
+                                let (var, _) = state.variables[sym];
+                                builder.def_var(var, rest_val);
+                            }
+                        }
+                        PatternKind::Wildcard => {}
+                        _ => {}
                     }
                 }
             }
