@@ -179,6 +179,11 @@ fn e2e_features() {
 }
 
 #[test]
+fn e2e_m8_rest_pattern() {
+    assert_output_matches("m8_rest_pattern");
+}
+
+#[test]
 fn e2e_m9_tensors() {
     assert_output_matches("m9_tensors");
 }

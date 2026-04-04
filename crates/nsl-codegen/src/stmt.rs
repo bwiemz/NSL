@@ -112,10 +112,43 @@ impl Compiler<'_> {
     /// Each `PatternKind::Ident` binds a variable, `Wildcard` is skipped,
     /// `Tuple`/`List` recurse into nested `nsl_list_get` calls, and
     /// `Struct` destructures by field name via `nsl_dict_get`.
-    fn destructure_element_type(&self, container_ty: Option<&Type>, index: usize) -> Option<Type> {
+    fn destructure_element_type(
+        &self,
+        container_ty: Option<&Type>,
+        index: usize,
+        rest_index: Option<usize>,
+        total_patterns: usize,
+    ) -> Option<Type> {
         match container_ty? {
-            Type::Tuple(items) => items.get(index).cloned(),
+            Type::Tuple(items) => {
+                let actual_index = match rest_index {
+                    Some(rest_pos) if index > rest_pos => {
+                        let tail_count = total_patterns.saturating_sub(index);
+                        items.len().checked_sub(tail_count)?
+                    }
+                    _ => index,
+                };
+                items.get(actual_index).cloned()
+            }
             Type::List(elem_ty) => Some((**elem_ty).clone()),
+            _ => None,
+        }
+    }
+
+    fn destructure_rest_type(
+        &self,
+        container_ty: Option<&Type>,
+        rest_index: usize,
+        total_patterns: usize,
+    ) -> Option<Type> {
+        match container_ty? {
+            Type::Tuple(items) => {
+                let trailing_patterns = total_patterns.saturating_sub(rest_index + 1);
+                let end = items.len().saturating_sub(trailing_patterns);
+                let start = rest_index.min(end);
+                Some(Type::Tuple(items[start..end].to_vec()))
+            }
+            Type::List(elem_ty) => Some(Type::List(Box::new((**elem_ty).clone()))),
             _ => None,
         }
     }
@@ -140,36 +173,59 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let get_id = self.registry.runtime_fns["nsl_list_get"].0;
         let get_ref = self.module.declare_func_in_func(get_id, builder.func);
+        let rest_positions: Vec<usize> = patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, pat)| matches!(pat.kind, PatternKind::Rest(_)).then_some(i))
+            .collect();
+        if rest_positions.len() > 1 {
+            return Err(CodegenError::new(
+                "multiple rest patterns in a single destructuring pattern are not supported",
+            ));
+        }
+        let rest_index = rest_positions.first().copied();
+        let container_len = if rest_index.is_some() {
+            Some(self.compile_call_by_name(builder, "nsl_list_len", &[container_val])?)
+        } else {
+            None
+        };
 
         for (i, sub_pat) in patterns.iter().enumerate() {
+            let idx = match rest_index {
+                Some(rest_pos) if i > rest_pos => {
+                    let tail_count = builder.ins().iconst(
+                        cl_types::I64,
+                        patterns.len().saturating_sub(i) as i64,
+                    );
+                    builder.ins().isub(container_len.unwrap(), tail_count)
+                }
+                _ => builder.ins().iconst(cl_types::I64, i as i64),
+            };
             match &sub_pat.kind {
                 PatternKind::Ident(sym) => {
-                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let elem = builder.inst_results(call)[0];
                     let var = state.new_variable();
                     builder.declare_var(var, cl_types::I64);
                     builder.def_var(var, elem);
                     state.variables.insert(*sym, (var, cl_types::I64));
-                    if let Some(elem_ty) = self.destructure_element_type(container_ty, i) {
+                    if let Some(elem_ty) = self.destructure_element_type(container_ty, i, rest_index, patterns.len()) {
                         state.variable_types.insert(*sym, elem_ty);
                     }
                 }
                 PatternKind::Wildcard => {}
                 PatternKind::Tuple(nested) | PatternKind::List(nested) => {
                     // Extract the i-th element, then recurse into it
-                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let nested_val = builder.inst_results(call)[0];
-                    let nested_ty = self.destructure_element_type(container_ty, i);
+                    let nested_ty = self.destructure_element_type(container_ty, i, rest_index, patterns.len());
                     self.compile_destructure_patterns(builder, state, nested, nested_val, nested_ty.as_ref())?;
                 }
                 PatternKind::Struct { fields, .. } => {
                     // Extract the i-th element (the struct/dict), then destructure fields
-                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let struct_val = builder.inst_results(call)[0];
-                    let struct_ty = self.destructure_element_type(container_ty, i);
+                    let struct_ty = self.destructure_element_type(container_ty, i, rest_index, patterns.len());
                     for field in fields {
                         let field_name = self.resolve_sym(field.name).to_string();
                         // Ensure string is in pool, then get pointer for dict lookup
@@ -220,10 +276,9 @@ impl Compiler<'_> {
                 }
                 PatternKind::Typed { pattern, .. } => {
                     // Type annotation is semantic-only — recurse into the inner pattern
-                    let idx = builder.ins().iconst(cl_types::I64, i as i64);
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let elem = builder.inst_results(call)[0];
-                    let elem_ty = self.destructure_element_type(container_ty, i);
+                    let elem_ty = self.destructure_element_type(container_ty, i, rest_index, patterns.len());
                     match &pattern.kind {
                         PatternKind::Ident(sym) => {
                             let var = state.new_variable();
@@ -243,9 +298,35 @@ impl Compiler<'_> {
                         }
                     }
                 }
-                PatternKind::Rest(_) => {
-                    // Rest patterns (...rest) — skip for now (would need slice extraction)
-                    // TODO: implement rest pattern as nsl_list_slice(container, i, len)
+                PatternKind::Rest(rest_sym) => {
+                    let lo = builder.ins().iconst(cl_types::I64, i as i64);
+                    let hi = if i + 1 < patterns.len() {
+                        let trailing = builder.ins().iconst(
+                            cl_types::I64,
+                            patterns.len().saturating_sub(i + 1) as i64,
+                        );
+                        builder.ins().isub(container_len.unwrap(), trailing)
+                    } else {
+                        container_len.unwrap()
+                    };
+                    let step = builder.ins().iconst(cl_types::I64, 1);
+                    let rest_val = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_slice",
+                        &[container_val, lo, hi, step],
+                    )?;
+
+                    if let Some(sym) = rest_sym {
+                        let var = state.new_variable();
+                        builder.declare_var(var, cl_types::I64);
+                        builder.def_var(var, rest_val);
+                        state.variables.insert(*sym, (var, cl_types::I64));
+                        if let Some(rest_ty) = self.destructure_rest_type(container_ty, i, patterns.len()) {
+                            state.variable_types.insert(*sym, rest_ty);
+                        }
+                    } else {
+                        self.compile_call_by_name(builder, "nsl_list_free", &[rest_val])?;
+                    }
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
@@ -1323,6 +1404,16 @@ impl Compiler<'_> {
                 state.variables.insert(*sym, (elem_var, cl_types::I64));
             }
             PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
+                let rest_positions: Vec<usize> = sub_patterns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, pat)| matches!(pat.kind, PatternKind::Rest(_)).then_some(i))
+                    .collect();
+                if rest_positions.len() > 1 {
+                    return Err(CodegenError::new(
+                        "multiple rest patterns in a single destructuring pattern are not supported",
+                    ));
+                }
                 for sub_pat in sub_patterns {
                     match &sub_pat.kind {
                         PatternKind::Ident(sym) => {
@@ -1376,7 +1467,17 @@ impl Compiler<'_> {
             }
             PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
                 // elem is a tuple/list (NslList ptr) — destructure with Rest support
-                let rest_pos = sub_patterns.iter().position(|p| matches!(p.kind, PatternKind::Rest(_)));
+                let rest_positions: Vec<usize> = sub_patterns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, pat)| matches!(pat.kind, PatternKind::Rest(_)).then_some(i))
+                    .collect();
+                if rest_positions.len() > 1 {
+                    return Err(CodegenError::new(
+                        "multiple rest patterns in a single destructuring pattern are not supported",
+                    ));
+                }
+                let rest_pos = rest_positions.first().copied();
                 let elem_len = if rest_pos.is_some() {
                     Some(self.compile_call_by_name(builder, "nsl_list_len", &[elem])?)
                 } else {
@@ -1421,6 +1522,8 @@ impl Compiler<'_> {
                             if let Some(sym) = rest_sym {
                                 let (var, _) = state.variables[sym];
                                 builder.def_var(var, rest_val);
+                            } else {
+                                self.compile_call_by_name(builder, "nsl_list_free", &[rest_val])?;
                             }
                         }
                         PatternKind::Wildcard => {}

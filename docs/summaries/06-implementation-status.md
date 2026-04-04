@@ -1,12 +1,12 @@
 # NeuralScript: Implementation Status & Maturity Assessment
 
-**Last updated:** 2026-04-02
+**Last updated:** 2026-04-03
 **Audit method:** Full codebase scan (285 Rust source files, ~131,800 LOC), stub pattern analysis, NotebookLM cross-reference
 
 ## Version History
 - **v0.1.0** (2026-03-12): Core language, tensors, autodiff, models, training DSL, GPU/CUDA
 - **v0.2.0** (2026-03-15): Inference-focused release — PagedAttention, FlashAttention, continuous batching, plus early tensor-parallel and graph-fusion work
-- **v0.9.0** (current): Most M9-M62 compiler/runtime features have landed — FlashAttention-3 scaffolding, 50+ AD rules, speculative decoding core with lookahead plus tree-method scaffolding, Blackwell quantization scaffolding (MXFP8/NVFP4 helpers and runtime quantizers), FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, fusion analysis/profitability scaffolding, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, and x86_64 unikernel boot-stub generation. Some subsystems still retain deferred or fallback-only paths (for example RDMA ibverbs wiring, GDS cuFile integration, parts of speculative serving, and several backend-specific runtime paths).
+- **v0.9.0** (current): Most M9-M62 compiler/runtime features have landed — FlashAttention-3 scaffolding, 50+ AD rules, speculative decoding core with lookahead plus tree-method scaffolding, Blackwell quantization scaffolding (MXFP8/NVFP4 helpers and runtime quantizers), FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, fusion analysis/profitability scaffolding, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, x86_64 unikernel boot-stub generation, and tuple/list `*rest` destructuring in pattern bindings. Some subsystems still retain deferred or fallback-only paths (for example RDMA ibverbs wiring, GDS cuFile integration, partial tree-method speculative serving, and several backend-specific runtime paths).
 
 ## Codebase Size
 - ~131,800 lines of Rust across 285 files in 8 crates
@@ -93,7 +93,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
 | M45 | Tensor Debugger | Functional | Trace recording, Chrome JSON export, trace diff |
-| M46 | Reproducibility | Functional | Determinism checker, CPU deterministic scatter_add, GPU deferred |
+| M46 | Reproducibility | Functional | Determinism checker, CPU deterministic scatter_add, GPU deterministic scatter_add, deterministic-kernel selection for flagged ops |
 | M47 | Multi-Backend | Framework | PTX production; AMDGPU/Metal/WGSL generate plausible code but untested on real hardware |
 | M48 | Multimodal | Functional | Patch embed, mel spectrogram, cross-attention config |
 | M49 | Shape Algebra | Functional | Symbolic solver, Fourier-Motzkin constraints, range bounds |
@@ -134,7 +134,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 
 This list includes both production-ready features and higher-value functional subsystems that are already present in tree.
 
-1. **Core language**: Variables, functions, control flow, pattern matching, modules, imports
+1. **Core language**: Variables, functions, control flow, pattern matching, modules, imports, tuple/list destructuring including `*rest`
 2. **Tensor operations**: Creation, arithmetic, reductions, shape ops, 30+ activations (CPU + GPU)
 3. **Type system**: Compile-time shape checking, named dimensions, dtype tracking, borrowing (`&T`)
 4. **Autodiff**: Tape-based + source-to-source with 50+ backward rules (softmax, layernorm, cross-entropy, dropout, conv2d, attention, RoPE)

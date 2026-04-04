@@ -278,6 +278,47 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn pattern_element_type(
+        &self,
+        container_ty: &Type,
+        pattern_index: usize,
+        rest_index: Option<usize>,
+        total_patterns: usize,
+    ) -> Type {
+        match container_ty {
+            Type::Tuple(types) => {
+                let actual_index = match rest_index {
+                    Some(rest_pos) if pattern_index > rest_pos => {
+                        let tail_count = total_patterns.saturating_sub(pattern_index);
+                        types.len().saturating_sub(tail_count)
+                    }
+                    _ => pattern_index,
+                };
+                types.get(actual_index).cloned().unwrap_or(Type::Unknown)
+            }
+            Type::List(elem_ty) => (**elem_ty).clone(),
+            _ => Type::Unknown,
+        }
+    }
+
+    fn pattern_rest_type(
+        &self,
+        container_ty: &Type,
+        rest_index: usize,
+        total_patterns: usize,
+    ) -> Type {
+        match container_ty {
+            Type::Tuple(types) => {
+                let trailing_patterns = total_patterns.saturating_sub(rest_index + 1);
+                let end = types.len().saturating_sub(trailing_patterns);
+                let start = rest_index.min(end);
+                Type::Tuple(types[start..end].to_vec())
+            }
+            Type::List(elem_ty) => Type::List(elem_ty.clone()),
+            _ => Type::Unknown,
+        }
+    }
+
     fn declare_pattern(&mut self, pattern: &Pattern, ty: &Type) {
         self.declare_pattern_with_const(pattern, ty, false);
     }
@@ -287,10 +328,27 @@ impl<'a> TypeChecker<'a> {
             PatternKind::Ident(sym) => {
                 self.declare_symbol(*sym, ty.clone(), pattern.span, is_const, false);
             }
-            PatternKind::Tuple(pats) => {
-                if let Type::Tuple(types) = ty {
-                    for (p, t) in pats.iter().zip(types.iter()) {
-                        self.declare_pattern_with_const(p, t, is_const);
+            PatternKind::Tuple(pats) | PatternKind::List(pats) => {
+                let rest_positions: Vec<usize> = pats
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, pat)| matches!(pat.kind, PatternKind::Rest(_)).then_some(i))
+                    .collect();
+                let rest_index = rest_positions.first().copied();
+
+                if matches!(ty, Type::Tuple(_) | Type::List(_)) {
+                    for (i, p) in pats.iter().enumerate() {
+                        match &p.kind {
+                            PatternKind::Rest(Some(sym)) => {
+                                let rest_ty = self.pattern_rest_type(ty, i, pats.len());
+                                self.declare_symbol(*sym, rest_ty, p.span, is_const, false);
+                            }
+                            PatternKind::Rest(None) => {}
+                            _ => {
+                                let elem_ty = self.pattern_element_type(ty, i, rest_index, pats.len());
+                                self.declare_pattern_with_const(p, &elem_ty, is_const);
+                            }
+                        }
                     }
                 } else {
                     for p in pats {

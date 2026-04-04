@@ -1,0 +1,33 @@
+let [head, *rest] = [10, 20, 30, 40]
+assert(head == 10, "head")
+assert(len(rest) == 3, "rest len")
+assert(rest[0] == 20, "rest first")
+assert(rest[2] == 40, "rest last")
+
+let [first, *middle, last] = [1, 2, 3, 4, 5]
+assert(first == 1, "first")
+assert(len(middle) == 3, "middle len")
+assert(middle[0] == 2, "middle first")
+assert(middle[2] == 4, "middle last")
+assert(last == 5, "last")
+
+let (a, *tail, z) = (7, 8, 9, 10)
+assert(a == 7, "tuple head")
+assert(len(tail) == 2, "tuple tail len")
+assert(tail[0] == 8, "tuple tail first")
+assert(tail[1] == 9, "tuple tail second")
+assert(z == 10, "tuple tail last")
+
+let rows = [(1, 2, 3, 4), (5, 6, 7, 8)]
+let rest_total = 0
+for (lead, *mid, tail) in rows:
+    assert(len(mid) == 2, "loop mid len")
+    rest_total = rest_total + lead + mid[0] + mid[1] + tail
+assert(rest_total == 36, "loop named rest")
+
+let stripped_total = 0
+for (lead, *, tail) in rows:
+    stripped_total = stripped_total + lead + tail
+assert(stripped_total == 18, "loop unnamed rest")
+
+print("rest pattern ok")
