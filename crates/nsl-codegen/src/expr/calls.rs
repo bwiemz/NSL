@@ -123,6 +123,56 @@ impl Compiler<'_> {
             return self.compile_kernel_call(builder, state, &func_name.clone(), args, ptx_data_id, name_data_id);
         }
 
+        // @fuse decorated function: emit fused elementwise kernel launch
+        if let Some((op_chain, num_inputs)) = self.fusion.fused_fns.get(&func_name).cloned() {
+            if !self.fusion.disabled && !state.flags.in_tape_region {
+                let op_refs: Vec<&str> = op_chain.iter().map(|s| s.as_str()).collect();
+                if let Some(kernel) = crate::fusion::try_synthesize_fused(&op_refs, num_inputs) {
+                    // Compile input arguments
+                    let mut compiled_args = Vec::new();
+                    for arg in args {
+                        compiled_args.push(self.compile_expr(builder, state, &arg.value)?);
+                    }
+
+                    // Build op-codes list for nsl_fused_elementwise_N
+                    let op_codes: Vec<i64> = op_chain.iter().filter_map(|op| match op.as_str() {
+                        "add" => Some(0), "mul" => Some(1), "sub" => Some(2),
+                        "div" => Some(3), "relu" => Some(4), "sigmoid" => Some(5),
+                        "tanh" => Some(6), "neg" => Some(7), "exp" => Some(8),
+                        "log" => Some(9), "sqrt" => Some(10), "abs" => Some(11),
+                        "gelu" => Some(12), "silu" => Some(13),
+                        _ => None,
+                    }).collect();
+
+                    if op_codes.len() == op_chain.len() && !compiled_args.is_empty() {
+                        let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        for &code in &op_codes {
+                            let code_val = builder.ins().iconst(cl_types::I64, code);
+                            self.compile_call_by_name(builder, "nsl_list_push", &[ops_list, code_val])?;
+                        }
+                        let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
+
+                        let result = if compiled_args.len() >= 2 {
+                            self.compile_call_by_name(
+                                builder, "nsl_fused_elementwise_2",
+                                &[compiled_args[0], compiled_args[1], ops_list, num_ops],
+                            )?
+                        } else {
+                            self.compile_call_by_name(
+                                builder, "nsl_fused_elementwise_1",
+                                &[compiled_args[0], ops_list, num_ops],
+                            )?
+                        };
+                        self.compile_call_by_name(builder, "nsl_list_free", &[ops_list])?;
+
+                        let _ = kernel; // PTX is synthesized but dispatch uses runtime fused ops
+                        return Ok(result);
+                    }
+                }
+            }
+            // Fall through to normal call if fusion disabled or synthesis failed
+        }
+
         if func_name == "print" {
             return self.compile_print_call(builder, state, args);
         }

@@ -125,6 +125,9 @@ pub struct FusionState {
     pub barriers: Vec<crate::fusion_report::FusionBarrierEvent>,
     pub report_enabled: bool,
     pub disabled: bool,
+    /// @fuse-decorated functions: maps function name → (op_chain, num_inputs).
+    /// At call time, these are launched as fused kernels instead of scalar calls.
+    pub fused_fns: std::collections::HashMap<String, (Vec<String>, usize)>,
 }
 
 impl FusionState {
@@ -134,6 +137,7 @@ impl FusionState {
             barriers: Vec::new(),
             report_enabled: options.fusion_report,
             disabled: options.disable_fusion || options.debug_training,
+            fused_fns: std::collections::HashMap::new(),
         }
     }
 }

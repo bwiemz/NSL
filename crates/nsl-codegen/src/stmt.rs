@@ -598,10 +598,30 @@ impl Compiler<'_> {
                                 let fname = self.resolve_sym(fn_def.name).to_string();
                                 self.features.fp8_compute_fns.insert(fname);
                             } else if dname == "fuse" {
-                                // Validate that the body contains only fusible elementwise ops
                                 self.validate_fuse_body(fn_def)?;
-                                // TODO(M26): emit training branch + fused kernel launch for @fuse fn
-                                // For now, compile normally (unfused path is always correct).
+                                // Extract the op chain from the function body's return expression
+                                // and register it for fused kernel launch at call sites.
+                                let fname = self.resolve_sym(fn_def.name).to_string();
+                                let num_params = fn_def.params.len();
+                                if let Some(ret_expr) = fn_def.body.stmts.iter().rev().find_map(|s| {
+                                    match &s.kind {
+                                        StmtKind::Return(Some(e)) => Some(e),
+                                        StmtKind::Expr(e) => Some(e),
+                                        _ => None,
+                                    }
+                                }) {
+                                    let interner = self.interner;
+                                    let resolve = |sym: nsl_ast::Symbol| -> Option<String> {
+                                        interner.resolve(sym.0).map(|s| s.to_string())
+                                    };
+                                    if let Some((ops, _inputs)) = crate::fusion::analyze_fusible_chain(ret_expr, &resolve) {
+                                        if ops.len() >= 2 {
+                                            self.fusion.fused_fns.insert(fname.clone(), (ops, num_params));
+                                        }
+                                    }
+                                }
+                                // Still compile the function normally as fallback (CPU or when
+                                // fusion is disabled). The fused path is selected at call site.
                             } else if dname == "grammar" {
                                 // M44: @grammar decorator on nested function
                                 let fname = self.resolve_sym(fn_def.name).to_string();
