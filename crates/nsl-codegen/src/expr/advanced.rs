@@ -737,8 +737,51 @@ impl Compiler<'_> {
         let layout = self.types.struct_layouts.get(model_name).cloned().ok_or_else(|| {
             CodegenError::new(format!("no layout for model '{model_name}' in .to(device)"))
         })?;
+
+        // Transfer direct tensor fields of this model
         let num_fields = builder.ins().iconst(cl_types::I64, layout.fields.len() as i64);
         self.compile_call_by_name(builder, "nsl_model_to_device", &[model_ptr, num_fields, device_val])?;
+
+        // Recurse into sub-model fields and fixed-size model arrays
+        let field_types = self.models.model_field_types.get(model_name).cloned();
+        for field in &layout.fields {
+            let sub_type = field_types.as_ref().and_then(|ft| ft.get(&field.name).cloned());
+            let Some(sub_type) = sub_type else { continue; };
+
+            if sub_type.starts_with('[') {
+                // Fixed-size model array: [ModelType; N]
+                // Elements are stored as inline pointers at model_ptr + field.offset + i*8
+                let inner = sub_type.trim_start_matches('[').trim_end_matches(']');
+                let parts: Vec<&str> = inner.split(';').collect();
+                if parts.len() == 2 {
+                    let elem_type = parts[0].trim().to_string();
+                    let count = parts[1].trim().parse::<usize>().unwrap_or(0);
+                    if count > 0 && self.types.struct_layouts.contains_key(&elem_type) {
+                        let field_off = builder.ins().iconst(cl_types::I64, field.offset as i64);
+                        let array_base = builder.ins().iadd(model_ptr, field_off);
+                        for i in 0..count {
+                            let elem_ptr = builder.ins().load(
+                                cl_types::I64,
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                array_base,
+                                cranelift_codegen::ir::immediates::Offset32::new((i * 8) as i32),
+                            );
+                            self.emit_model_to_device(builder, &elem_type, elem_ptr, device_val)?;
+                        }
+                    }
+                }
+            } else if self.types.struct_layouts.contains_key(&sub_type) {
+                // Nested sub-model: load pointer from struct field, recurse
+                let sub_ptr = builder.ins().load(
+                    cl_types::I64,
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    model_ptr,
+                    cranelift_codegen::ir::immediates::Offset32::new(field.offset as i32),
+                );
+                self.emit_model_to_device(builder, &sub_type, sub_ptr, device_val)?;
+            }
+        }
+
         Ok(())
     }
 
