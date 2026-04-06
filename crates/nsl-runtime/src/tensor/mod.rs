@@ -3862,3 +3862,35 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
     }
     sum_sq.sqrt()
 }
+
+/// Release idle GPU memory back to the driver. Called after each training step
+/// to prevent the caching allocator from holding stale segments.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_drain_cache() {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::inner::ensure_context();
+        let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        alloc.drain_all();
+    }
+}
+
+/// Debug: print GPU memory usage.
+#[no_mangle]
+pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
+    if step > 3 { return; }
+    #[cfg(feature = "cuda")]
+    {
+        unsafe {
+            crate::cuda::inner::ensure_context();
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            cudarc::driver::sys::cuMemGetInfo_v2(&mut free, &mut total);
+            let used_mb = (total - free) / (1024 * 1024);
+            let total_mb = total / (1024 * 1024);
+            eprintln!("[gpu-mem] step={} used={}MB / {}MB", step, used_mb, total_mb);
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = step; }
+}

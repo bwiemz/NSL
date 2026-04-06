@@ -29,10 +29,10 @@ print("Model created and transferred to GPU")
 # batch_size=4 balances GPU utilization with gradient noise for this tiny corpus
 let tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
 let labels = load_mmap("models/coder-rl/data/sft_labels.bin", 2)
-let loader = DataLoader(tokens, labels=labels, batch_size=4, seq_len=2048, shuffle=true, drop_last=true)
+let loader = DataLoader(tokens, labels=labels, batch_size=2, seq_len=2048, shuffle=true, drop_last=true)
 
-print("Data loaded: 172 sequences, batch_size=4, 43 steps/epoch")
-print("Starting SFT training (10 epochs, 430 steps)...")
+print("Data loaded: 172 sequences, batch_size=2, 86 steps/epoch")
+print("Starting SFT training (10 epochs, 860 steps)...")
 print("Uniform CE baseline (~ln 4096):")
 print(8.31776616671934)
 
@@ -50,7 +50,7 @@ let epoch_loss_count = 0
 
 train(model=m, epochs=10, grad_clip=1.0):
     optimizer: AdamW(lr=0.0003, weight_decay=0.0, beta1=0.9, beta2=0.95)
-    scheduler: warmup_cosine(warmup_steps=20, total_steps=430, min_lr=0.00003)
+    scheduler: warmup_cosine(warmup_steps=40, total_steps=860, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, false)
         let ls = logits.shape

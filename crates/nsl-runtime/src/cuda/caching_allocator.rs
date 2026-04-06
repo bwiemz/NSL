@@ -618,7 +618,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 // Global static instance
 // ---------------------------------------------------------------------------
 
-pub(super) static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>> =
+pub static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>> =
     LazyLock::new(|| Mutex::new(CachingAllocator::new()));
 
 // ---------------------------------------------------------------------------

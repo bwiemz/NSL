@@ -134,6 +134,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_exit", &[types::I64], None),
     // Training diagnostics (temporary)
     ("nsl_debug_train_step", &[types::I64, types::I64, types::I64], None),
+    ("nsl_debug_gpu_mem", &[types::I64], None),
+    ("nsl_gpu_drain_cache", &[], None),
     // Stdin I/O
     ("nsl_read_line", &[], Some(types::I64)),
     // File I/O

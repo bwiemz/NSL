@@ -2830,6 +2830,12 @@ impl Compiler<'_> {
                     .any(|param| self.resolve_sym(param.name) == "loss")
         });
 
+        // Debug: GPU memory at start of step
+        {
+            let step_val = builder.use_var(step_count_var);
+            self.compile_call_by_name(builder, "nsl_debug_gpu_mem", &[step_val])?;
+        }
+
         // ── 7b. Forward pass + backward pass ─────────────────────────
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
@@ -3958,6 +3964,16 @@ impl Compiler<'_> {
             }
             state.cleanup.active_batch_vars.pop();
             state.borrowed_batch_symbols.remove(&step_param_sym);
+        }
+
+        // Drain GPU caching allocator after each step to prevent OOM from
+        // stale segments accumulating across steps.
+        self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
+
+        // Debug: GPU memory after step cleanup
+        {
+            let step_val = builder.use_var(step_count_var);
+            self.compile_call_by_name(builder, "nsl_debug_gpu_mem", &[step_val])?;
         }
 
         // ── 8. Close batch loop (if DataLoader) and increment epoch ──────
