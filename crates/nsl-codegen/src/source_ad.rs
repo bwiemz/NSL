@@ -1,9 +1,11 @@
 //! M40: Source-to-source AD — adjoint generation, dead gradient elimination,
 //! and saved tensor analysis.
 
-use std::collections::{HashMap, HashSet};
 use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
-use crate::wengert::{CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, WengertType, type_for_op};
+use crate::wengert::{
+    type_for_op, CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, WengertType,
+};
+use std::collections::{HashMap, HashSet};
 
 // M40b: Wengert extraction from typed AST
 use nsl_ast::expr::ExprKind;
@@ -65,8 +67,12 @@ impl AdjointGenerator {
         let seed_op_id = self.next_op();
         self.adjoint_vars.insert(primal.output, loss_bar);
         self.adjoint_ops.push(WengertOp {
-            id: seed_op_id, result: loss_bar, op: PrimalOp::Constant(1.0),
-            inputs: vec![], saved_for_backward: false, checkpointed: false,
+            id: seed_op_id,
+            result: loss_bar,
+            op: PrimalOp::Constant(1.0),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
         });
 
         for op in primal.ops.iter().rev() {
@@ -97,8 +103,12 @@ impl AdjointGenerator {
         let result = self.next_var();
         let op_id = self.next_op();
         self.adjoint_ops.push(WengertOp {
-            id: op_id, result, op, inputs,
-            saved_for_backward: false, checkpointed: false,
+            id: op_id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
         });
         result
     }
@@ -126,7 +136,13 @@ impl AdjointGenerator {
             AdjointExpr::MulElementwise(a, b) => self.emit_op(PrimalOp::Mul, vec![a, b]),
             AdjointExpr::MatmulTransposeLeft(grad, b) => {
                 // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support)
-                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b]);
+                let b_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![b],
+                );
                 self.emit_op(PrimalOp::Matmul, vec![grad, b_t])
             }
             AdjointExpr::MatmulTransposeRight(a, grad, b) => {
@@ -134,10 +150,19 @@ impl AdjointGenerator {
                 // When the forward matmul broadcasts (A has more dims than B),
                 // the gradient must be summed over the extra batch dimensions
                 // so it matches B's shape.
-                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
+                let a_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![a],
+                );
                 let raw_grad = self.emit_op(PrimalOp::Matmul, vec![a_t, grad]);
                 // Reduce to match B's shape: nsl_tensor_reduce_to_shape(raw_grad, B)
-                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![raw_grad, b])
+                self.emit_op(
+                    PrimalOp::Passthrough("reduce_to_shape".into()),
+                    vec![raw_grad, b],
+                )
             }
             AdjointExpr::Scale(v, s) => {
                 let scale = self.emit_constant(s);
@@ -157,9 +182,10 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Passthrough("reshape".into()), vec![v, shape])
             }
             // --- Expand backward: sum-reduce gradient over broadcast-expanded dims ---
-            AdjointExpr::ReduceToShape(grad, target) => {
-                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![grad, target])
-            }
+            AdjointExpr::ReduceToShape(grad, target) => self.emit_op(
+                PrimalOp::Passthrough("reduce_to_shape".into()),
+                vec![grad, target],
+            ),
 
             // --- Exp backward: d(exp(x))/dx = exp(x) = y. grad * y (correct as-is) ---
             AdjointExpr::ExpBackward(y_bar, y) => self.emit_op(PrimalOp::Mul, vec![y_bar, y]),
@@ -377,7 +403,10 @@ impl AdjointGenerator {
                 // The weight has shape [last_dim], so we sum over all dims except the last.
                 // Using reduce_to_shape handles arbitrary input ndim.
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![grad_x_hat, weight])
+                self.emit_op(
+                    PrimalOp::Passthrough("reduce_to_shape".into()),
+                    vec![grad_x_hat, weight],
+                )
             }
 
             // --- Dropout backward: grad * mask * (1/(1-p)) ---
@@ -390,12 +419,10 @@ impl AdjointGenerator {
             // --- Embedding backward: scatter_add(grad, indices) into weight-shaped gradient ---
             // Uses dedicated runtime function that creates a zeros tensor matching
             // the weight's shape and scatter-adds gradient rows at index positions.
-            AdjointExpr::EmbeddingBackward(y_bar, indices, weight) => {
-                self.emit_op(
-                    PrimalOp::Passthrough("embedding_backward".into()),
-                    vec![y_bar, indices, weight],
-                )
-            }
+            AdjointExpr::EmbeddingBackward(y_bar, indices, weight) => self.emit_op(
+                PrimalOp::Passthrough("embedding_backward".into()),
+                vec![y_bar, indices, weight],
+            ),
 
             // --- Gather backward: scatter_add(grad, indices, dim) ---
             AdjointExpr::GatherBackward(y_bar, indices, dim) => {
@@ -408,9 +435,15 @@ impl AdjointGenerator {
             }
 
             // --- Shape backward ops ---
-            AdjointExpr::ConcatSplit(y_bar, dim, offset, size) => {
-                self.emit_op(PrimalOp::Slice { dim, start: offset as i64, end: (offset + size) as i64, orig_dim_size: 0 }, vec![y_bar])
-            }
+            AdjointExpr::ConcatSplit(y_bar, dim, offset, size) => self.emit_op(
+                PrimalOp::Slice {
+                    dim,
+                    start: offset as i64,
+                    end: (offset + size) as i64,
+                    orig_dim_size: 0,
+                },
+                vec![y_bar],
+            ),
             AdjointExpr::SplitConcat(y_bar, _dim) => {
                 // Split backward = concat the gradient pieces (handled by accumulate_adjoint)
                 self.emit_op(PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar])
@@ -420,13 +453,21 @@ impl AdjointGenerator {
                 // pad_before = start (zeros before the slice region)
                 // pad_after = orig_dim_size - end (zeros after the slice region)
                 let pad_after = orig_dim_size - end;
-                self.emit_op(PrimalOp::PadZero { dim, pad_before: start, pad_after }, vec![y_bar])
+                self.emit_op(
+                    PrimalOp::PadZero {
+                        dim,
+                        pad_before: start,
+                        pad_after,
+                    },
+                    vec![y_bar],
+                )
             }
 
             // --- Conv/Pool backward ---
-            AdjointExpr::ConvTransposeInput(y_bar, weight, stride, padding) => {
-                self.emit_op(PrimalOp::ConvTranspose2d { stride, padding }, vec![y_bar, weight])
-            }
+            AdjointExpr::ConvTransposeInput(y_bar, weight, stride, padding) => self.emit_op(
+                PrimalOp::ConvTranspose2d { stride, padding },
+                vec![y_bar, weight],
+            ),
             AdjointExpr::ConvTransposeWeight(input, y_bar) => {
                 // Conv weight gradient requires im2col + matmul (cross-correlation),
                 // not a plain matmul on 4D tensors. The tape-based backward in
@@ -453,12 +494,10 @@ impl AdjointGenerator {
             // --- CrossEntropy backward: (softmax(logits) - one_hot(targets)) * y_bar / N ---
             // Uses dedicated runtime function that handles class-index targets
             // (not one-hot), computes softmax internally, and fuses the /N scaling.
-            AdjointExpr::CrossEntropyBackward(y_bar, logits, targets) => {
-                self.emit_op(
-                    PrimalOp::Passthrough("cross_entropy_backward".into()),
-                    vec![y_bar, logits, targets],
-                )
-            }
+            AdjointExpr::CrossEntropyBackward(y_bar, logits, targets) => self.emit_op(
+                PrimalOp::Passthrough("cross_entropy_backward".into()),
+                vec![y_bar, logits, targets],
+            ),
 
             // --- MSE backward for reduction='sum': d/d(pred) = 2*(pred - target) * grad_output ---
             // For reduction='mean', the user's NSL code divides by N before loss,
@@ -486,15 +525,27 @@ impl AdjointGenerator {
             // --- Attention backward: per-component extraction from fused kernel ---
             // Each component (dQ=0, dK=1, dV=2) is extracted via a dedicated op
             // that carries the causal flag so the runtime can apply the correct mask.
-            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, causal) => {
-                self.emit_op(PrimalOp::FlashAttentionBackwardExtract { causal, component: 0 }, vec![y_bar, q, k, v])
-            }
-            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, causal) => {
-                self.emit_op(PrimalOp::FlashAttentionBackwardExtract { causal, component: 1 }, vec![y_bar, q, k, v])
-            }
-            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, causal) => {
-                self.emit_op(PrimalOp::FlashAttentionBackwardExtract { causal, component: 2 }, vec![y_bar, q, k, v])
-            }
+            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, causal) => self.emit_op(
+                PrimalOp::FlashAttentionBackwardExtract {
+                    causal,
+                    component: 0,
+                },
+                vec![y_bar, q, k, v],
+            ),
+            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, causal) => self.emit_op(
+                PrimalOp::FlashAttentionBackwardExtract {
+                    causal,
+                    component: 1,
+                },
+                vec![y_bar, q, k, v],
+            ),
+            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, causal) => self.emit_op(
+                PrimalOp::FlashAttentionBackwardExtract {
+                    causal,
+                    component: 2,
+                },
+                vec![y_bar, q, k, v],
+            ),
 
             // --- RoPE backward: apply inverse rotation (rotate by -θ) ---
             // RoPE(x, θ) = R(θ)·x, so d/dx = R(θ)^T = R(-θ).
@@ -511,9 +562,12 @@ impl AdjointGenerator {
             let sum = self.next_var();
             let op_id = self.next_op();
             self.adjoint_ops.push(WengertOp {
-                id: op_id, result: sum, op: PrimalOp::Add,
+                id: op_id,
+                result: sum,
+                op: PrimalOp::Add,
                 inputs: vec![existing, value],
-                saved_for_backward: false, checkpointed: false,
+                saved_for_backward: false,
+                checkpointed: false,
             });
             self.adjoint_vars.insert(var, sum);
         } else {
@@ -568,10 +622,7 @@ pub struct SavedTensorInfo {
 }
 
 /// Identify which forward-pass intermediates must be saved for the backward pass.
-pub fn analyze_saved_tensors(
-    primal: &WengertList,
-    adjoint: &WengertList,
-) -> Vec<SavedTensorInfo> {
+pub fn analyze_saved_tensors(primal: &WengertList, adjoint: &WengertList) -> Vec<SavedTensorInfo> {
     let primal_vars: HashSet<VarId> = primal.ops.iter().map(|op| op.result).collect();
     let adjoint_vars: HashSet<VarId> = adjoint.ops.iter().map(|op| op.result).collect();
 
@@ -666,6 +717,42 @@ impl<'a> WengertExtractor<'a> {
         self.list.ops.push(op);
     }
 
+    fn extract_int_literal(expr: &nsl_ast::expr::Expr) -> Option<i64> {
+        match &expr.kind {
+            ExprKind::IntLiteral(v) => Some(*v),
+            ExprKind::UnaryOp {
+                op: AstUnaryOp::Neg,
+                operand,
+            } => match &operand.kind {
+                ExprKind::IntLiteral(v) => Some(-*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn encode_transpose_dim(dim: i64) -> Option<usize> {
+        match dim {
+            -2 => Some(usize::MAX - 1),
+            -1 => Some(usize::MAX),
+            value if value >= 0 => Some(value as usize),
+            _ => None,
+        }
+    }
+
+    fn extract_transpose_dims(args: &[nsl_ast::expr::Arg]) -> Option<(usize, usize)> {
+        let dim0 = args
+            .get(0)
+            .and_then(|arg| Self::extract_int_literal(&arg.value))?;
+        let dim1 = args
+            .get(1)
+            .and_then(|arg| Self::extract_int_literal(&arg.value))?;
+        Some((
+            Self::encode_transpose_dim(dim0)?,
+            Self::encode_transpose_dim(dim1)?,
+        ))
+    }
+
     /// Register a parameter symbol (needs gradient).
     pub fn register_param(&mut self, sym: nsl_ast::Symbol) {
         let var = self.alloc_var();
@@ -703,7 +790,10 @@ impl<'a> WengertExtractor<'a> {
 
     /// Set model method bodies for inline expansion during extraction.
     /// Maps model_type_name -> method_name -> FnDef.
-    pub fn set_model_method_bodies(&mut self, bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>) {
+    pub fn set_model_method_bodies(
+        &mut self,
+        bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    ) {
         self.model_method_bodies = bodies;
     }
 
@@ -717,8 +807,10 @@ impl<'a> WengertExtractor<'a> {
     /// and sets up the context-to-type mapping for method inlining.
     pub fn register_model_instance(&mut self, sym: nsl_ast::Symbol, model_type: &str) {
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
-        self.model_instance_types.insert(sym, model_type.to_string());
-        self.context_to_model_type.insert(name, model_type.to_string());
+        self.model_instance_types
+            .insert(sym, model_type.to_string());
+        self.context_to_model_type
+            .insert(name, model_type.to_string());
     }
 
     /// Get named parameter VarIds with their compound names.
@@ -733,8 +825,11 @@ impl<'a> WengertExtractor<'a> {
         for stmt in stmts {
             if !self.extract_stmt(stmt) {
                 self.is_static = false;
-                eprintln!("[source-ad] extraction failed at {:?} (line {:?})",
-                    std::mem::discriminant(&stmt.kind), stmt.span);
+                eprintln!(
+                    "[source-ad] extraction failed at {:?} (line {:?})",
+                    std::mem::discriminant(&stmt.kind),
+                    stmt.span
+                );
                 return false;
             }
         }
@@ -743,10 +838,16 @@ impl<'a> WengertExtractor<'a> {
 
     fn extract_stmt(&mut self, stmt: &nsl_ast::stmt::Stmt) -> bool {
         match &stmt.kind {
-            StmtKind::VarDecl { pattern, value: Some(val), .. } => {
+            StmtKind::VarDecl {
+                pattern,
+                value: Some(val),
+                ..
+            } => {
                 let _var_name = if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
                     self.interner.resolve(sym.0).unwrap_or("?").to_string()
-                } else { "?".to_string() };
+                } else {
+                    "?".to_string()
+                };
                 if let Some(var) = self.extract_expr(val) {
                     if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
                         self.symbol_to_var.insert(*sym, var);
@@ -755,8 +856,11 @@ impl<'a> WengertExtractor<'a> {
                     }
                     true
                 } else {
-                    eprintln!("[source-ad] VarDecl '{}' extraction failed at expr {:?}",
-                        _var_name, std::mem::discriminant(&val.kind));
+                    eprintln!(
+                        "[source-ad] VarDecl '{}' extraction failed at expr {:?}",
+                        _var_name,
+                        std::mem::discriminant(&val.kind)
+                    );
                     false
                 }
             }
@@ -770,9 +874,7 @@ impl<'a> WengertExtractor<'a> {
                 }
             }
 
-            StmtKind::Expr(expr) => {
-                self.extract_expr(expr).is_some()
-            }
+            StmtKind::Expr(expr) => self.extract_expr(expr).is_some(),
 
             // Dynamic control flow -> not static
             StmtKind::While { .. } => {
@@ -781,15 +883,20 @@ impl<'a> WengertExtractor<'a> {
             }
 
             // For loops: try to unroll if iterating over a model's FixedArray field
-            StmtKind::For { pattern, iterable, body } => {
-                self.try_unroll_for(pattern, iterable, body)
-            }
+            StmtKind::For {
+                pattern,
+                iterable,
+                body,
+            } => self.try_unroll_for(pattern, iterable, body),
 
             // If/else: extract both branches, emit Select ops for variables
             // that differ between branches. The condition is saved for backward.
-            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
-                self.extract_if(condition, then_block, elif_clauses, else_block.as_ref())
-            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => self.extract_if(condition, then_block, elif_clauses, else_block.as_ref()),
 
             // Assignment: x = expr (rebind variable to new value)
             StmtKind::Assign { target, op, value } => {
@@ -814,9 +921,7 @@ impl<'a> WengertExtractor<'a> {
     /// Returns None if the expression contains dynamic control flow.
     fn extract_expr(&mut self, expr: &nsl_ast::expr::Expr) -> Option<VarId> {
         match &expr.kind {
-            ExprKind::Ident(sym) => {
-                self.symbol_to_var.get(sym).copied()
-            }
+            ExprKind::Ident(sym) => self.symbol_to_var.get(sym).copied(),
 
             // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
@@ -826,10 +931,12 @@ impl<'a> WengertExtractor<'a> {
                     if let Some(obj_var) = self.extract_expr(object) {
                         let result = self.alloc_var();
                         self.push_op(WengertOp {
-                            id: self.list.ops.len() as u32, result,
+                            id: self.list.ops.len() as u32,
+                            result,
                             op: PrimalOp::Passthrough(member_name.to_string()),
                             inputs: vec![obj_var],
-                            saved_for_backward: false, checkpointed: false,
+                            saved_for_backward: false,
+                            checkpointed: false,
                         });
                         return Some(result);
                     }
@@ -838,10 +945,13 @@ impl<'a> WengertExtractor<'a> {
                 // Resolve the object prefix to a string
                 let obj_prefix = match &object.kind {
                     ExprKind::SelfRef => self.self_context.clone(),
-                    ExprKind::Ident(obj_sym) => {
-                        self.symbol_name_overrides.get(obj_sym).cloned()
-                            .or_else(|| Some(self.interner.resolve(obj_sym.0).unwrap_or("?").to_string()))
-                    }
+                    ExprKind::Ident(obj_sym) => self
+                        .symbol_name_overrides
+                        .get(obj_sym)
+                        .cloned()
+                        .or_else(|| {
+                            Some(self.interner.resolve(obj_sym.0).unwrap_or("?").to_string())
+                        }),
                     // Nested member access: self.attn.w_q -> resolve recursively
                     ExprKind::MemberAccess { .. } => {
                         // Try to extract the inner object as a compound name
@@ -961,7 +1071,8 @@ impl<'a> WengertExtractor<'a> {
                     if let ExprKind::Ident(obj_sym) = &object.kind {
                         let obj_type = self.model_instance_types.get(obj_sym).cloned();
                         if let Some(model_type) = obj_type {
-                            let fn_def = self.model_method_bodies
+                            let fn_def = self
+                                .model_method_bodies
                                 .get(&model_type)
                                 .and_then(|methods| methods.get(&method_name))
                                 .cloned();
@@ -978,22 +1089,32 @@ impl<'a> WengertExtractor<'a> {
                     }
 
                     // Case 2: self.sub_model.method(args) — nested model field
-                    if let ExprKind::MemberAccess { object: inner_obj, member: field_sym } = &object.kind {
+                    if let ExprKind::MemberAccess {
+                        object: inner_obj,
+                        member: field_sym,
+                    } = &object.kind
+                    {
                         let obj_prefix = match &inner_obj.kind {
                             ExprKind::SelfRef => self.self_context.clone(),
                             ExprKind::Ident(sym) => {
-                                self.symbol_name_overrides.get(sym).cloned()
-                                    .or_else(|| Some(self.interner.resolve(sym.0).unwrap_or("?").to_string()))
+                                self.symbol_name_overrides.get(sym).cloned().or_else(|| {
+                                    Some(self.interner.resolve(sym.0).unwrap_or("?").to_string())
+                                })
                             }
                             _ => None,
                         };
                         if let Some(prefix) = obj_prefix {
-                            let sub_field_name = self.interner.resolve(field_sym.0).unwrap_or("?").to_string();
+                            let sub_field_name = self
+                                .interner
+                                .resolve(field_sym.0)
+                                .unwrap_or("?")
+                                .to_string();
                             let compound_prefix = format!("{}.{}", prefix, sub_field_name);
 
                             // Find the sub-model's type
                             let parent_type = self.context_to_model_type.get(&prefix).cloned();
-                            let sub_type = parent_type.as_ref()
+                            let sub_type = parent_type
+                                .as_ref()
                                 .and_then(|pt| self.model_field_types.get(pt))
                                 .and_then(|fields| fields.get(&sub_field_name))
                                 .cloned();
@@ -1001,8 +1122,10 @@ impl<'a> WengertExtractor<'a> {
                             if let Some(ref sub_type) = sub_type {
                                 // Don't try to inline array types
                                 if !sub_type.starts_with('[') {
-                                    self.context_to_model_type.insert(compound_prefix.clone(), sub_type.clone());
-                                    let fn_def = self.model_method_bodies
+                                    self.context_to_model_type
+                                        .insert(compound_prefix.clone(), sub_type.clone());
+                                    let fn_def = self
+                                        .model_method_bodies
                                         .get(sub_type)
                                         .and_then(|methods| methods.get(&method_name))
                                         .cloned();
@@ -1030,7 +1153,8 @@ impl<'a> WengertExtractor<'a> {
                         if let Some(ctx) = self.self_context.clone() {
                             let model_type = self.context_to_model_type.get(&ctx).cloned();
                             if let Some(model_type) = model_type {
-                                let fn_def = self.model_method_bodies
+                                let fn_def = self
+                                    .model_method_bodies
                                     .get(&model_type)
                                     .and_then(|methods| methods.get(&method_name))
                                     .cloned();
@@ -1055,7 +1179,37 @@ impl<'a> WengertExtractor<'a> {
                 if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let method_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
                     match method_name.as_str() {
-                        "reshape" | "contiguous" | "transpose" | "item" | "expand" | "squeeze" | "unsqueeze" => {
+                        "transpose" => {
+                            let obj = self.extract_expr(object)?;
+                            if let Some((dim0, dim1)) = Self::extract_transpose_dims(args) {
+                                let result = self.alloc_var();
+                                self.push_op(WengertOp {
+                                    id: self.list.ops.len() as u32,
+                                    result,
+                                    op: PrimalOp::Transpose { dim0, dim1 },
+                                    inputs: vec![obj],
+                                    saved_for_backward: false,
+                                    checkpointed: false,
+                                });
+                                return Some(result);
+                            }
+
+                            let mut inputs = vec![obj];
+                            for arg in args {
+                                inputs.push(self.extract_expr(&arg.value)?);
+                            }
+                            let result = self.alloc_var();
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result,
+                                op: PrimalOp::Passthrough(method_name),
+                                inputs,
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                            return Some(result);
+                        }
+                        "reshape" | "contiguous" | "item" | "expand" | "squeeze" | "unsqueeze" => {
                             let obj = self.extract_expr(object)?;
                             let mut inputs = vec![obj];
                             for arg in args {
@@ -1063,10 +1217,12 @@ impl<'a> WengertExtractor<'a> {
                             }
                             let result = self.alloc_var();
                             self.push_op(WengertOp {
-                                id: self.list.ops.len() as u32, result,
+                                id: self.list.ops.len() as u32,
+                                result,
                                 op: PrimalOp::Passthrough(method_name),
                                 inputs,
-                                saved_for_backward: false, checkpointed: false,
+                                saved_for_backward: false,
+                                checkpointed: false,
                             });
                             return Some(result);
                         }
@@ -1075,10 +1231,12 @@ impl<'a> WengertExtractor<'a> {
                             let obj = self.extract_expr(object)?;
                             let result = self.alloc_var();
                             self.push_op(WengertOp {
-                                id: self.list.ops.len() as u32, result,
+                                id: self.list.ops.len() as u32,
+                                result,
                                 op: PrimalOp::Passthrough(method_name),
                                 inputs: vec![obj],
-                                saved_for_backward: false, checkpointed: false,
+                                saved_for_backward: false,
+                                checkpointed: false,
                             });
                             return Some(result);
                         }
@@ -1092,13 +1250,22 @@ impl<'a> WengertExtractor<'a> {
                 } else if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let method = self.interner.resolve(member.0).unwrap_or("?");
                     let obj_desc = match &object.kind {
-                        ExprKind::Ident(s) => format!("Ident({})", self.interner.resolve(s.0).unwrap_or("?")),
+                        ExprKind::Ident(s) => {
+                            format!("Ident({})", self.interner.resolve(s.0).unwrap_or("?"))
+                        }
                         ExprKind::SelfRef => "self".to_string(),
-                        ExprKind::MemberAccess { object: inner, member: m } => {
+                        ExprKind::MemberAccess {
+                            object: inner,
+                            member: m,
+                        } => {
                             let m_name = self.interner.resolve(m.0).unwrap_or("?");
                             match &inner.kind {
                                 ExprKind::SelfRef => format!("self.{}", m_name),
-                                ExprKind::Ident(s) => format!("{}.{}", self.interner.resolve(s.0).unwrap_or("?"), m_name),
+                                ExprKind::Ident(s) => format!(
+                                    "{}.{}",
+                                    self.interner.resolve(s.0).unwrap_or("?"),
+                                    m_name
+                                ),
                                 _ => format!("?.{}", m_name),
                             }
                         }
@@ -1107,7 +1274,10 @@ impl<'a> WengertExtractor<'a> {
                     eprintln!("[source-ad] unresolved method call: {}.{}() — model type not found in method bodies", obj_desc, method);
                     return None;
                 } else {
-                    eprintln!("[source-ad] unsupported callee expression: {:?}", std::mem::discriminant(&callee.kind));
+                    eprintln!(
+                        "[source-ad] unsupported callee expression: {:?}",
+                        std::mem::discriminant(&callee.kind)
+                    );
                     return None; // Complex callee -- can't extract
                 };
 
@@ -1137,30 +1307,45 @@ impl<'a> WengertExtractor<'a> {
                     "matmul" => PrimalOp::Matmul,
                     // Reductions — extract dim from second arg if present
                     "softmax" => {
-                        let dim = args.get(1).and_then(|a| match &a.value.kind {
-                            ExprKind::IntLiteral(v) => Some(*v as i64),
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
-                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                        let dim = args
+                            .get(1)
+                            .and_then(|a| match &a.value.kind {
+                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::UnaryOp {
+                                    op: AstUnaryOp::Neg,
+                                    operand,
+                                } => match &operand.kind {
+                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    _ => None,
+                                },
                                 _ => None,
-                            },
-                            _ => None,
-                        }).unwrap_or(-1);
+                            })
+                            .unwrap_or(-1);
                         PrimalOp::Softmax { dim }
                     }
                     "log_softmax" => {
-                        let dim = args.get(1).and_then(|a| match &a.value.kind {
-                            ExprKind::IntLiteral(v) => Some(*v as i64),
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
-                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                        let dim = args
+                            .get(1)
+                            .and_then(|a| match &a.value.kind {
+                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::UnaryOp {
+                                    op: AstUnaryOp::Neg,
+                                    operand,
+                                } => match &operand.kind {
+                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    _ => None,
+                                },
                                 _ => None,
-                            },
-                            _ => None,
-                        }).unwrap_or(-1);
+                            })
+                            .unwrap_or(-1);
                         PrimalOp::LogSoftmax { dim }
                     }
                     // Normalization
                     "layer_norm" | "layernorm" => PrimalOp::LayerNorm { eps: 1e-5 },
-                    "batch_norm" | "batchnorm" => PrimalOp::BatchNorm { eps: 1e-5, training: true },
+                    "batch_norm" | "batchnorm" => PrimalOp::BatchNorm {
+                        eps: 1e-5,
+                        training: true,
+                    },
                     "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm { eps: 1e-5 },
                     // Loss functions
                     "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
@@ -1171,30 +1356,45 @@ impl<'a> WengertExtractor<'a> {
                     "mean" => PrimalOp::Mean { dim: None },
                     // Regularization — extract p from second arg if literal
                     "dropout" => {
-                        let p = args.get(1).and_then(|a| match &a.value.kind {
-                            ExprKind::FloatLiteral(v) => Some(*v),
-                            _ => None,
-                        }).unwrap_or(0.1);
+                        let p = args
+                            .get(1)
+                            .and_then(|a| match &a.value.kind {
+                                ExprKind::FloatLiteral(v) => Some(*v),
+                                _ => None,
+                            })
+                            .unwrap_or(0.1);
                         PrimalOp::Dropout { p }
                     }
                     // Indexing
                     "embedding" | "embedding_lookup" => PrimalOp::Embedding,
                     "gather" => {
                         // gather(tensor, dim, indices) — extract dim from second arg
-                        let dim = args.get(1).and_then(|a| match &a.value.kind {
-                            ExprKind::IntLiteral(v) => Some(*v as i64),
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
-                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                        let dim = args
+                            .get(1)
+                            .and_then(|a| match &a.value.kind {
+                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::UnaryOp {
+                                    op: AstUnaryOp::Neg,
+                                    operand,
+                                } => match &operand.kind {
+                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    _ => None,
+                                },
                                 _ => None,
-                            },
-                            _ => None,
-                        }).unwrap_or(0);
+                            })
+                            .unwrap_or(0);
                         PrimalOp::Gather { dim }
                     }
                     // Attention
-                    "scaled_dot_product_attention" => PrimalOp::ScaledDotProductAttention { causal: true },
+                    "scaled_dot_product_attention" => {
+                        PrimalOp::ScaledDotProductAttention { causal: true }
+                    }
                     // Transpose (default: swap last two dims)
-                    "transpose" => PrimalOp::Transpose { dim0: 0, dim1: 1 },
+                    "transpose" => {
+                        let dim_args = args.get(1..).unwrap_or(&[]);
+                        let (dim0, dim1) = Self::extract_transpose_dims(dim_args).unwrap_or((0, 1));
+                        PrimalOp::Transpose { dim0, dim1 }
+                    }
                     // Shape ops (non-differentiable passthrough for AD)
                     "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze" => {
                         PrimalOp::Passthrough(func_name.clone())
@@ -1210,20 +1410,29 @@ impl<'a> WengertExtractor<'a> {
                     // Concatenation
                     "tensor_cat" | "cat" => {
                         // tensor_cat(tensors, dim) — extract dim from last arg
-                        let dim = args.last().and_then(|a| match &a.value.kind {
-                            ExprKind::IntLiteral(v) => Some(*v as i64),
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
-                                ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                        let dim = args
+                            .last()
+                            .and_then(|a| match &a.value.kind {
+                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::UnaryOp {
+                                    op: AstUnaryOp::Neg,
+                                    operand,
+                                } => match &operand.kind {
+                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    _ => None,
+                                },
                                 _ => None,
-                            },
-                            _ => None,
-                        }).unwrap_or(-1);
+                            })
+                            .unwrap_or(-1);
                         PrimalOp::Concat { dim }
                     }
                     // Negative
                     "neg" => PrimalOp::Neg,
                     // Clamp
-                    "clamp" => PrimalOp::Clamp { min: f64::NEG_INFINITY, max: f64::INFINITY },
+                    "clamp" => PrimalOp::Clamp {
+                        min: f64::NEG_INFINITY,
+                        max: f64::INFINITY,
+                    },
                     // Scalar extraction (non-differentiable)
                     "int" | "float" => PrimalOp::Passthrough(func_name.clone()),
                     _ => {
@@ -1297,25 +1506,33 @@ impl<'a> WengertExtractor<'a> {
                     // handles type conversion (extracts i64 from tensor/scalar).
                     let result = self.alloc_var();
                     self.push_op(WengertOp {
-                        id: self.list.ops.len() as u32, result,
+                        id: self.list.ops.len() as u32,
+                        result,
                         op: PrimalOp::Passthrough("subscript".into()),
                         inputs: vec![obj, idx],
-                        saved_for_backward: false, checkpointed: false,
+                        saved_for_backward: false,
+                        checkpointed: false,
                     });
                     Some(result)
-                } else { None }
+                } else {
+                    None
+                }
             }
 
             // List literal: [a, b, c] — non-differentiable
             ExprKind::ListLiteral(elements) => {
                 let mut inputs = Vec::new();
-                for elem in elements { inputs.push(self.extract_expr(elem)?); }
+                for elem in elements {
+                    inputs.push(self.extract_expr(elem)?);
+                }
                 let result = self.alloc_var();
                 self.push_op(WengertOp {
-                    id: self.list.ops.len() as u32, result,
+                    id: self.list.ops.len() as u32,
+                    result,
                     op: PrimalOp::Passthrough("list".into()),
                     inputs,
-                    saved_for_backward: false, checkpointed: false,
+                    saved_for_backward: false,
+                    checkpointed: false,
                 });
                 Some(result)
             }
@@ -1413,7 +1630,8 @@ impl<'a> WengertExtractor<'a> {
 
         // --- Merge branches with Select ops ---
         // Collect all symbols that exist in either branch
-        let all_symbols: HashSet<nsl_ast::Symbol> = then_symbols.keys()
+        let all_symbols: HashSet<nsl_ast::Symbol> = then_symbols
+            .keys()
             .chain(else_symbols.keys())
             .copied()
             .collect();
@@ -1440,7 +1658,11 @@ impl<'a> WengertExtractor<'a> {
                     });
                     self.symbol_to_var.insert(*sym, result);
                     // Propagate variable name
-                    if let Some(name) = self.list.var_names.get(&t).cloned()
+                    if let Some(name) = self
+                        .list
+                        .var_names
+                        .get(&t)
+                        .cloned()
                         .or_else(|| self.list.var_names.get(&e).cloned())
                     {
                         self.list.var_names.insert(result, name);
@@ -1454,8 +1676,16 @@ impl<'a> WengertExtractor<'a> {
 
         // Handle output (return value) merging
         if then_output != output_before || else_output != output_before {
-            let t_out = if then_output != output_before { then_output } else { output_before };
-            let e_out = if else_output != output_before { else_output } else { output_before };
+            let t_out = if then_output != output_before {
+                then_output
+            } else {
+                output_before
+            };
+            let e_out = if else_output != output_before {
+                else_output
+            } else {
+                output_before
+            };
             if t_out != e_out {
                 let result = self.alloc_var();
                 self.push_op(WengertOp {
@@ -1490,7 +1720,10 @@ impl<'a> WengertExtractor<'a> {
         // 1. Get the loop variable symbol
         let loop_var_sym = match &pattern.kind {
             nsl_ast::pattern::PatternKind::Ident(sym) => *sym,
-            _ => { self.is_static = false; return false; }
+            _ => {
+                self.is_static = false;
+                return false;
+            }
         };
 
         // 2. Resolve the iterable to get the context prefix and field name.
@@ -1501,23 +1734,31 @@ impl<'a> WengertExtractor<'a> {
                 let ctx = match &object.kind {
                     ExprKind::SelfRef => self.self_context.clone(),
                     ExprKind::Ident(sym) => {
-                        self.symbol_name_overrides.get(sym).cloned()
-                            .or_else(|| Some(self.interner.resolve(sym.0).unwrap_or("?").to_string()))
+                        self.symbol_name_overrides.get(sym).cloned().or_else(|| {
+                            Some(self.interner.resolve(sym.0).unwrap_or("?").to_string())
+                        })
                     }
                     _ => None,
                 };
                 let fname = self.interner.resolve(member.0).unwrap_or("?").to_string();
                 match ctx {
                     Some(c) => (c, fname),
-                    None => { self.is_static = false; return false; }
+                    None => {
+                        self.is_static = false;
+                        return false;
+                    }
                 }
             }
-            _ => { self.is_static = false; return false; }
+            _ => {
+                self.is_static = false;
+                return false;
+            }
         };
 
         // 3. Look up the model type for this context, then the field type
         let model_type = self.context_to_model_type.get(&context_prefix).cloned();
-        let field_info = model_type.as_ref()
+        let field_info = model_type
+            .as_ref()
             .and_then(|mt| self.model_field_types.get(mt))
             .and_then(|fields| fields.get(&field_name))
             .cloned();
@@ -1531,10 +1772,21 @@ impl<'a> WengertExtractor<'a> {
                 if parts.len() == 2 {
                     let elem = parts[0].trim().to_string();
                     let n = parts[1].trim().parse::<usize>().unwrap_or(0);
-                    if n > 0 { (elem, n) } else { self.is_static = false; return false; }
-                } else { self.is_static = false; return false; }
+                    if n > 0 {
+                        (elem, n)
+                    } else {
+                        self.is_static = false;
+                        return false;
+                    }
+                } else {
+                    self.is_static = false;
+                    return false;
+                }
             }
-            _ => { self.is_static = false; return false; }
+            _ => {
+                self.is_static = false;
+                return false;
+            }
         };
 
         // 4. Unroll: for i in 0..size, expand loop body with adjusted context
@@ -1542,11 +1794,14 @@ impl<'a> WengertExtractor<'a> {
             let iter_prefix = format!("{}.{}.{}", context_prefix, field_name, i);
 
             // Register this iteration's context -> model type
-            self.context_to_model_type.insert(iter_prefix.clone(), element_type.clone());
+            self.context_to_model_type
+                .insert(iter_prefix.clone(), element_type.clone());
 
             // Map loop variable to this iteration's context
-            self.symbol_name_overrides.insert(loop_var_sym, iter_prefix.clone());
-            self.model_instance_types.insert(loop_var_sym, element_type.clone());
+            self.symbol_name_overrides
+                .insert(loop_var_sym, iter_prefix.clone());
+            self.model_instance_types
+                .insert(loop_var_sym, element_type.clone());
 
             // Save and set self_context for nested self.field resolution
             let saved_self = self.self_context.clone();
@@ -1577,8 +1832,16 @@ impl<'a> WengertExtractor<'a> {
     ) -> Option<VarId> {
         // Pre-extract args in caller's context before switching to callee's
         let extracted = self.pre_extract_args(fn_def, call_args)?;
-        let name = self.symbol_name_overrides.get(&model_sym).cloned()
-            .unwrap_or_else(|| self.interner.resolve(model_sym.0).unwrap_or("?").to_string());
+        let name = self
+            .symbol_name_overrides
+            .get(&model_sym)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.interner
+                    .resolve(model_sym.0)
+                    .unwrap_or("?")
+                    .to_string()
+            });
         let saved_self = self.self_context.clone();
         self.self_context = Some(name);
         let result = self.inline_method_body(fn_def, extracted);
@@ -1602,7 +1865,11 @@ impl<'a> WengertExtractor<'a> {
         let mut result = Vec::new();
         let mut arg_idx = 0;
         for param in &fn_def.params {
-            let param_name = self.interner.resolve(param.name.0).unwrap_or("?").to_string();
+            let param_name = self
+                .interner
+                .resolve(param.name.0)
+                .unwrap_or("?")
+                .to_string();
             if param_name == "self" {
                 continue;
             }
@@ -1670,8 +1937,9 @@ impl<'a> WengertExtractor<'a> {
                 let obj_prefix = match &object.kind {
                     ExprKind::SelfRef => self.self_context.clone(),
                     ExprKind::Ident(sym) => {
-                        self.symbol_name_overrides.get(sym).cloned()
-                            .or_else(|| Some(self.interner.resolve(sym.0).unwrap_or("?").to_string()))
+                        self.symbol_name_overrides.get(sym).cloned().or_else(|| {
+                            Some(self.interner.resolve(sym.0).unwrap_or("?").to_string())
+                        })
                     }
                     ExprKind::MemberAccess { .. } => self.resolve_member_access_prefix(object),
                     _ => None,
@@ -1699,7 +1967,8 @@ impl<'a> WengertExtractor<'a> {
 
     /// Get the parameter VarIds (for gradient computation targets).
     pub fn param_vars(&self) -> Vec<VarId> {
-        self.param_symbols.iter()
+        self.param_symbols
+            .iter()
             .filter_map(|sym| self.symbol_to_var.get(sym).copied())
             .collect()
     }
@@ -1711,7 +1980,8 @@ impl<'a> WengertExtractor<'a> {
 
     /// Get VarIds for model parameters (unordered).
     pub fn param_var_ids(&self) -> Vec<(nsl_ast::Symbol, VarId)> {
-        self.param_symbols.iter()
+        self.param_symbols
+            .iter()
             .filter_map(|sym| self.symbol_to_var.get(sym).map(|vid| (*sym, *vid)))
             .collect()
     }
@@ -1740,7 +2010,14 @@ mod tests {
     use crate::wengert::{PrimalOp, WengertList, WengertOp};
 
     fn make_op(id: OpId, result: VarId, op: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
-        WengertOp { id, result, op, inputs, saved_for_backward: false, checkpointed: false }
+        WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        }
     }
 
     #[test]
@@ -1751,7 +2028,9 @@ mod tests {
                 make_op(1, 1, PrimalOp::Input("b".into()), vec![]),
                 make_op(2, 2, PrimalOp::Add, vec![0, 1]),
             ],
-            output: 2, var_names: HashMap::new(), var_types: HashMap::new(),
+            output: 2,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
         let mut gen = AdjointGenerator::new(10);
         let adjoint = gen.generate(&primal);
@@ -1768,7 +2047,9 @@ mod tests {
                 make_op(1, 1, PrimalOp::Input("B".into()), vec![]),
                 make_op(2, 2, PrimalOp::Matmul, vec![0, 1]),
             ],
-            output: 2, var_names: HashMap::new(), var_types: HashMap::new(),
+            output: 2,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
         let mut gen = AdjointGenerator::new(10);
         let _adjoint = gen.generate(&primal);
@@ -1805,14 +2086,18 @@ mod tests {
                 make_op(0, 0, PrimalOp::Input("x".into()), vec![]),
                 make_op(1, 1, PrimalOp::Relu, vec![0]),
             ],
-            output: 1, var_names: HashMap::new(), var_types: HashMap::new(),
+            output: 1,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
         let adjoint = WengertList {
             ops: vec![
                 make_op(0, 10, PrimalOp::Constant(1.0), vec![]),
                 make_op(1, 11, PrimalOp::Mul, vec![10, 0]),
             ],
-            output: 10, var_names: HashMap::new(), var_types: HashMap::new(),
+            output: 10,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
         let saved = analyze_saved_tensors(&primal, &adjoint);
         assert_eq!(saved.len(), 1);
@@ -1823,11 +2108,15 @@ mod tests {
     fn test_saved_tensor_no_cross_reference() {
         let primal = WengertList {
             ops: vec![make_op(0, 0, PrimalOp::Input("x".into()), vec![])],
-            output: 0, var_names: HashMap::new(), var_types: HashMap::new(),
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
         let adjoint = WengertList {
             ops: vec![make_op(0, 10, PrimalOp::Constant(1.0), vec![])],
-            output: 10, var_names: HashMap::new(), var_types: HashMap::new(),
+            output: 10,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
         };
         assert!(analyze_saved_tensors(&primal, &adjoint).is_empty());
     }
@@ -1837,6 +2126,22 @@ mod tests {
     use nsl_ast::expr::ExprKind;
     use nsl_ast::stmt::StmtKind;
     use nsl_lexer::Interner;
+
+    fn test_expr(kind: ExprKind) -> nsl_ast::expr::Expr {
+        nsl_ast::expr::Expr {
+            kind,
+            span: nsl_errors::Span::dummy(),
+            id: nsl_ast::NodeId::dummy(),
+        }
+    }
+
+    fn test_arg(value: nsl_ast::expr::Expr) -> nsl_ast::expr::Arg {
+        nsl_ast::expr::Arg {
+            name: None,
+            value,
+            span: nsl_errors::Span::dummy(),
+        }
+    }
 
     #[test]
     fn extract_simple_input() {
@@ -1874,6 +2179,65 @@ mod tests {
     }
 
     #[test]
+    fn extract_method_transpose_as_primal_transpose() {
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let transpose_sym = nsl_ast::Symbol(interner.get_or_intern("transpose"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_input(x_sym);
+
+        let call = test_expr(ExprKind::Call {
+            callee: Box::new(test_expr(ExprKind::MemberAccess {
+                object: Box::new(test_expr(ExprKind::Ident(x_sym))),
+                member: transpose_sym,
+            })),
+            args: vec![
+                test_arg(test_expr(ExprKind::IntLiteral(1))),
+                test_arg(test_expr(ExprKind::IntLiteral(2))),
+            ],
+        });
+
+        let result = extractor.extract_expr(&call);
+        assert!(result.is_some());
+
+        let list = extractor
+            .finalize()
+            .expect("static transpose extraction should succeed");
+        let transpose_op = list.ops.last().expect("transpose op should be emitted");
+        assert_eq!(transpose_op.op, PrimalOp::Transpose { dim0: 1, dim1: 2 });
+        assert_eq!(transpose_op.inputs.len(), 1);
+    }
+
+    #[test]
+    fn extract_function_transpose_preserves_literal_dims() {
+        let mut interner = Interner::new();
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let transpose_sym = nsl_ast::Symbol(interner.get_or_intern("transpose"));
+
+        let mut extractor = WengertExtractor::new(&interner);
+        extractor.register_input(x_sym);
+
+        let call = test_expr(ExprKind::Call {
+            callee: Box::new(test_expr(ExprKind::Ident(transpose_sym))),
+            args: vec![
+                test_arg(test_expr(ExprKind::Ident(x_sym))),
+                test_arg(test_expr(ExprKind::IntLiteral(1))),
+                test_arg(test_expr(ExprKind::IntLiteral(2))),
+            ],
+        });
+
+        let result = extractor.extract_expr(&call);
+        assert!(result.is_some());
+
+        let list = extractor
+            .finalize()
+            .expect("static transpose extraction should succeed");
+        let transpose_op = list.ops.last().expect("transpose op should be emitted");
+        assert_eq!(transpose_op.op, PrimalOp::Transpose { dim0: 1, dim1: 2 });
+    }
+
+    #[test]
     fn extract_detects_dynamic_while() {
         let interner = Interner::new();
         let mut extractor = WengertExtractor::new(&interner);
@@ -1885,7 +2249,10 @@ mod tests {
                     span: nsl_errors::Span::dummy(),
                     id: nsl_ast::NodeId(0),
                 },
-                body: nsl_ast::stmt::Block { stmts: vec![], span: nsl_errors::Span::dummy() },
+                body: nsl_ast::stmt::Block {
+                    stmts: vec![],
+                    span: nsl_errors::Span::dummy(),
+                },
             },
             span: nsl_errors::Span::dummy(),
             id: nsl_ast::NodeId(1),
@@ -1913,7 +2280,10 @@ mod tests {
                     span: nsl_errors::Span::dummy(),
                     id: nsl_ast::NodeId(0),
                 },
-                body: nsl_ast::stmt::Block { stmts: vec![], span: nsl_errors::Span::dummy() },
+                body: nsl_ast::stmt::Block {
+                    stmts: vec![],
+                    span: nsl_errors::Span::dummy(),
+                },
             },
             span: nsl_errors::Span::dummy(),
             id: nsl_ast::NodeId(1),
@@ -1987,10 +2357,7 @@ mod tests {
         }
     }
 
-    fn make_let_stmt(
-        sym: nsl_ast::Symbol,
-        value: nsl_ast::expr::Expr,
-    ) -> nsl_ast::stmt::Stmt {
+    fn make_let_stmt(sym: nsl_ast::Symbol, value: nsl_ast::expr::Expr) -> nsl_ast::stmt::Stmt {
         nsl_ast::stmt::Stmt {
             kind: StmtKind::VarDecl {
                 is_const: false,
@@ -2008,7 +2375,10 @@ mod tests {
     }
 
     fn make_block(stmts: Vec<nsl_ast::stmt::Stmt>) -> nsl_ast::stmt::Block {
-        nsl_ast::stmt::Block { stmts, span: dummy_span() }
+        nsl_ast::stmt::Block {
+            stmts,
+            span: dummy_span(),
+        }
     }
 
     fn make_if_stmt(
@@ -2071,7 +2441,10 @@ mod tests {
 
         let result = extractor.extract_stmts(&[if_stmt]);
         assert!(result, "Source AD should accept simple if/else");
-        assert!(extractor.is_static_graph(), "If/else should not make graph dynamic");
+        assert!(
+            extractor.is_static_graph(),
+            "If/else should not make graph dynamic"
+        );
 
         let list = extractor.finalize();
         assert!(list.is_some(), "Should produce a valid WengertList");
@@ -2159,21 +2532,41 @@ mod tests {
         let list = extractor.finalize().expect("Should produce WengertList");
 
         // Verify a Condition op was emitted
-        let has_condition = list.ops.iter().any(|op| matches!(&op.op, PrimalOp::Condition(CompareKind::Gt)));
-        assert!(has_condition, "Should contain a Condition(Gt) op for `x > 0`");
+        let has_condition = list
+            .ops
+            .iter()
+            .any(|op| matches!(&op.op, PrimalOp::Condition(CompareKind::Gt)));
+        assert!(
+            has_condition,
+            "Should contain a Condition(Gt) op for `x > 0`"
+        );
 
         // Verify a Select op was emitted
-        let select_ops: Vec<_> = list.ops.iter().filter(|op| matches!(&op.op, PrimalOp::Select)).collect();
-        assert!(!select_ops.is_empty(), "Should contain at least one Select op");
+        let select_ops: Vec<_> = list
+            .ops
+            .iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Select))
+            .collect();
+        assert!(
+            !select_ops.is_empty(),
+            "Should contain at least one Select op"
+        );
 
         // The Select op should have 3 inputs: [cond, true_val, false_val]
         for sel in &select_ops {
-            assert_eq!(sel.inputs.len(), 3, "Select should have 3 inputs (cond, true, false)");
+            assert_eq!(
+                sel.inputs.len(),
+                3,
+                "Select should have 3 inputs (cond, true, false)"
+            );
         }
 
         // The output should be the Select result
         let last_select = select_ops.last().unwrap();
-        assert_eq!(list.output, last_select.result, "Output should be the Select result");
+        assert_eq!(
+            list.output, last_select.result,
+            "Output should be the Select result"
+        );
     }
 
     #[test]
@@ -2198,14 +2591,22 @@ mod tests {
         let list = extractor.finalize().unwrap();
 
         // Find the Condition op
-        let cond_op = list.ops.iter().find(|op| matches!(&op.op, PrimalOp::Condition(_))).unwrap();
+        let cond_op = list
+            .ops
+            .iter()
+            .find(|op| matches!(&op.op, PrimalOp::Condition(_)))
+            .unwrap();
         let cond_var = cond_op.result;
 
         // Find the Select op that uses this condition
-        let select_op = list.ops.iter().find(|op| {
-            matches!(&op.op, PrimalOp::Select) && op.inputs[0] == cond_var
-        });
-        assert!(select_op.is_some(), "Select should reference the saved condition variable");
+        let select_op = list
+            .ops
+            .iter()
+            .find(|op| matches!(&op.op, PrimalOp::Select) && op.inputs[0] == cond_var);
+        assert!(
+            select_op.is_some(),
+            "Select should reference the saved condition variable"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2236,12 +2637,20 @@ mod tests {
         assert!(gen.adjoint_of(3).is_some(), "Output should have adjoint");
 
         // The param x (var 0) should have an adjoint (from Select true-branch)
-        assert!(gen.adjoint_of(0).is_some(), "Param x should have adjoint through Select");
+        assert!(
+            gen.adjoint_of(0).is_some(),
+            "Param x should have adjoint through Select"
+        );
 
         // Verify Select ops appear in adjoint list (for conditional gradient selection)
-        let has_select_in_adjoint = adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Select));
-        assert!(has_select_in_adjoint,
-            "Backward pass should contain Select ops for conditional adjoint selection");
+        let has_select_in_adjoint = adjoint
+            .ops
+            .iter()
+            .any(|op| matches!(&op.op, PrimalOp::Select));
+        assert!(
+            has_select_in_adjoint,
+            "Backward pass should contain Select ops for conditional adjoint selection"
+        );
     }
 
     #[test]
@@ -2266,11 +2675,15 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // Should have Constant(0.0) ops in the adjoint for the zero branches
-        let zero_consts: Vec<_> = adjoint.ops.iter()
+        let zero_consts: Vec<_> = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Constant(v) if *v == 0.0))
             .collect();
-        assert!(!zero_consts.is_empty(),
-            "Backward pass should contain Constant(0.0) for inactive branch adjoints");
+        assert!(
+            !zero_consts.is_empty(),
+            "Backward pass should contain Constant(0.0) for inactive branch adjoints"
+        );
     }
 
     #[test]
@@ -2284,8 +2697,8 @@ mod tests {
                 make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
                 make_op(1, 1, PrimalOp::Constant(0.0), vec![]),
                 make_op(2, 2, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
-                make_op(3, 3, PrimalOp::Mul, vec![0, 0]),  // x * x (then-branch)
-                make_op(4, 4, PrimalOp::Neg, vec![0]),       // -x (else-branch)
+                make_op(3, 3, PrimalOp::Mul, vec![0, 0]), // x * x (then-branch)
+                make_op(4, 4, PrimalOp::Neg, vec![0]),    // -x (else-branch)
                 make_op(5, 5, PrimalOp::Select, vec![2, 3, 4]),
             ],
             output: 5,
@@ -2299,11 +2712,19 @@ mod tests {
         // x should have adjoint (from both Mul and Neg, gated by Select)
         assert!(gen.adjoint_of(0).is_some(), "x should have an adjoint");
         // The true result and false result should have adjoints
-        assert!(gen.adjoint_of(3).is_some(), "true-branch result (x*x) should have adjoint");
-        assert!(gen.adjoint_of(4).is_some(), "false-branch result (-x) should have adjoint");
+        assert!(
+            gen.adjoint_of(3).is_some(),
+            "true-branch result (x*x) should have adjoint"
+        );
+        assert!(
+            gen.adjoint_of(4).is_some(),
+            "false-branch result (-x) should have adjoint"
+        );
 
         // Both branch results' adjoints should be Select ops (conditional on saved cond)
-        let select_count = adjoint.ops.iter()
+        let select_count = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
         assert!(select_count >= 2,
@@ -2369,16 +2790,26 @@ mod tests {
         let list = extractor.finalize().expect("Should produce WengertList");
 
         // Should have 2 Condition ops (one per if)
-        let cond_count = list.ops.iter()
+        let cond_count = list
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
             .count();
-        assert_eq!(cond_count, 2, "Should have 2 Condition ops for nested if/else, got {cond_count}");
+        assert_eq!(
+            cond_count, 2,
+            "Should have 2 Condition ops for nested if/else, got {cond_count}"
+        );
 
         // Should have at least 2 Select ops (one per merge point)
-        let select_count = list.ops.iter()
+        let select_count = list
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(select_count >= 2, "Should have at least 2 Select ops, got {select_count}");
+        assert!(
+            select_count >= 2,
+            "Should have at least 2 Select ops, got {select_count}"
+        );
     }
 
     #[test]
@@ -2411,14 +2842,21 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // x (var 0) should have an adjoint — gradient propagates through both Select ops
-        assert!(gen.adjoint_of(0).is_some(), "x should have adjoint through nested Select");
+        assert!(
+            gen.adjoint_of(0).is_some(),
+            "x should have adjoint through nested Select"
+        );
 
         // The adjoint list should contain multiple Select ops (from both nesting levels)
-        let adj_selects = adjoint.ops.iter()
+        let adj_selects = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(adj_selects >= 2,
-            "Adjoint should have >= 2 Select ops for nested branching, got {adj_selects}");
+        assert!(
+            adj_selects >= 2,
+            "Adjoint should have >= 2 Select ops for nested branching, got {adj_selects}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2467,11 +2905,15 @@ mod tests {
         let list = extractor.finalize().expect("Should produce WengertList");
 
         // Should have a Select op that chooses between modified y (x*2) and original y (x)
-        let select_ops: Vec<_> = list.ops.iter()
+        let select_ops: Vec<_> = list
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .collect();
-        assert!(!select_ops.is_empty(),
-            "If-without-else should produce Select op (modified vs identity)");
+        assert!(
+            !select_ops.is_empty(),
+            "If-without-else should produce Select op (modified vs identity)"
+        );
 
         // The Select should use the pre-branch value as the false (else) input
         // This is the identity case — when condition is false, y retains its original value
@@ -2492,8 +2934,8 @@ mod tests {
                 make_op(1, 1, PrimalOp::Constant(5.0), vec![]),
                 make_op(2, 2, PrimalOp::Constant(2.0), vec![]),
                 make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 1]),
-                make_op(4, 4, PrimalOp::Mul, vec![0, 2]),  // x * 2
-                make_op(5, 5, PrimalOp::Select, vec![3, 4, 0]),  // cond ? x*2 : x
+                make_op(4, 4, PrimalOp::Mul, vec![0, 2]), // x * 2
+                make_op(5, 5, PrimalOp::Select, vec![3, 4, 0]), // cond ? x*2 : x
             ],
             output: 5,
             var_names: HashMap::new(),
@@ -2507,11 +2949,15 @@ mod tests {
         assert!(gen.adjoint_of(0).is_some(), "x should have adjoint");
 
         // The backward pass should produce Select ops for conditional adjoint
-        let adj_selects = adjoint.ops.iter()
+        let adj_selects = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(adj_selects >= 1,
-            "Backward should use Select for conditional adjoint, got {adj_selects}");
+        assert!(
+            adj_selects >= 1,
+            "Backward should use Select for conditional adjoint, got {adj_selects}"
+        );
     }
 
     #[test]
@@ -2562,10 +3008,15 @@ mod tests {
         let list = extractor.finalize().expect("Should produce WengertList");
 
         // Should have 2 Condition ops (outer and elif)
-        let cond_count = list.ops.iter()
+        let cond_count = list
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
             .count();
-        assert_eq!(cond_count, 2, "Should have 2 Condition ops for if/elif/else, got {cond_count}");
+        assert_eq!(
+            cond_count, 2,
+            "Should have 2 Condition ops for if/elif/else, got {cond_count}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2603,11 +3054,16 @@ mod tests {
         // Verify the full pipeline works
         assert!(!adjoint.ops.is_empty(), "Adjoint list should not be empty");
         // x should have an adjoint
-        let x_var = primal.ops.iter()
+        let x_var = primal
+            .ops
+            .iter()
             .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
             .map(|op| op.result)
             .unwrap();
-        assert!(gen.adjoint_of(x_var).is_some(), "Param x should have adjoint in relu");
+        assert!(
+            gen.adjoint_of(x_var).is_some(),
+            "Param x should have adjoint in relu"
+        );
     }
 
     #[test]
@@ -2645,7 +3101,9 @@ mod tests {
 
         assert!(!adjoint.ops.is_empty());
         // Both branches contribute to the adjoint of x
-        let x_var = primal.ops.iter()
+        let x_var = primal
+            .ops
+            .iter()
             .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
             .map(|op| op.result)
             .unwrap();
@@ -2680,7 +3138,7 @@ mod tests {
     fn leaky_relu_gradient_structure() {
         // Build using the AST extractor to stay close to the real compiler path.
         let mut interner = Interner::new();
-        let x_sym   = nsl_ast::Symbol(interner.get_or_intern("x"));
+        let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
         let alpha_sym = nsl_ast::Symbol(interner.get_or_intern("alpha"));
 
         let mut extractor = WengertExtractor::new(&interner);
@@ -2712,12 +3170,16 @@ mod tests {
         let primal = extractor.finalize().expect("Should produce WengertList");
 
         // Structural checks on the primal
-        let cond_count = primal.ops.iter()
+        let cond_count = primal
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Condition(_)))
             .count();
         assert_eq!(cond_count, 1, "Leaky ReLU needs exactly 1 Condition op");
 
-        let select_count = primal.ops.iter()
+        let select_count = primal
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
         assert_eq!(select_count, 1, "Leaky ReLU needs exactly 1 Select op");
@@ -2728,27 +3190,39 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // x (the param) must have an adjoint
-        let x_var = primal.ops.iter()
+        let x_var = primal
+            .ops
+            .iter()
             .find(|op| matches!(&op.op, PrimalOp::Param(ref n) if n == "x"))
             .map(|op| op.result)
             .expect("x must be in primal");
-        assert!(gen.adjoint_of(x_var).is_some(),
-            "Param x should have an adjoint in leaky ReLU");
+        assert!(
+            gen.adjoint_of(x_var).is_some(),
+            "Param x should have an adjoint in leaky ReLU"
+        );
 
         // The adjoint must use Select to conditionally route gradient
-        let adj_selects = adjoint.ops.iter()
+        let adj_selects = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(adj_selects >= 1,
+        assert!(
+            adj_selects >= 1,
             "Leaky ReLU backward should use at least 1 Select op for conditional gradient, \
-             got {adj_selects}");
+             got {adj_selects}"
+        );
 
         // There must be no tape-style Input ops in the adjoint (source AD is tape-free)
-        let tape_ops = adjoint.ops.iter()
+        let tape_ops = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Input(_)))
             .count();
-        assert_eq!(tape_ops, 0,
-            "Source AD adjoint must not contain Input (tape-push) ops, got {tape_ops}");
+        assert_eq!(
+            tape_ops, 0,
+            "Source AD adjoint must not contain Input (tape-push) ops, got {tape_ops}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2774,7 +3248,7 @@ mod tests {
         // x is the param we differentiate w.r.t.; lo and hi are inputs (constants).
         let primal = WengertList {
             ops: vec![
-                make_op(0, 0, PrimalOp::Param("x".into()),  vec![]),
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
                 make_op(1, 1, PrimalOp::Input("lo".into()), vec![]),
                 make_op(2, 2, PrimalOp::Input("hi".into()), vec![]),
                 // cond_low = x < lo
@@ -2796,16 +3270,22 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // x must have an adjoint
-        assert!(gen.adjoint_of(0).is_some(),
-            "x should have an adjoint through the nested clamp Select chain");
+        assert!(
+            gen.adjoint_of(0).is_some(),
+            "x should have an adjoint through the nested clamp Select chain"
+        );
 
         // The adjoint should use multiple Select ops to gate the gradient
-        let adj_selects = adjoint.ops.iter()
+        let adj_selects = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(adj_selects >= 2,
+        assert!(
+            adj_selects >= 2,
             "Nested clamp backward needs >= 2 Select ops (one per nesting level), \
-             got {adj_selects}");
+             got {adj_selects}"
+        );
 
         // lo (var 1) and hi (var 2) are Inputs — no gradient expected
         // (they are not Params so AdjointGenerator will not produce a path to them
@@ -2862,26 +3342,46 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // Both a and b must have adjoints
-        assert!(gen.adjoint_of(1).is_some(), "Param a should have an adjoint");
-        assert!(gen.adjoint_of(2).is_some(), "Param b should have an adjoint");
+        assert!(
+            gen.adjoint_of(1).is_some(),
+            "Param a should have an adjoint"
+        );
+        assert!(
+            gen.adjoint_of(2).is_some(),
+            "Param b should have an adjoint"
+        );
 
         // The true-branch result and false-branch result should have adjoints
-        assert!(gen.adjoint_of(5).is_some(), "True-branch Mul result should have adjoint");
-        assert!(gen.adjoint_of(6).is_some(), "False-branch Add result should have adjoint");
+        assert!(
+            gen.adjoint_of(5).is_some(),
+            "True-branch Mul result should have adjoint"
+        );
+        assert!(
+            gen.adjoint_of(6).is_some(),
+            "False-branch Add result should have adjoint"
+        );
 
         // The backward pass must contain Select ops (one per branch input of the primal Select)
-        let adj_selects = adjoint.ops.iter()
+        let adj_selects = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(adj_selects >= 2,
-            "Multi-variable branch backward needs >= 2 Select ops, got {adj_selects}");
+        assert!(
+            adj_selects >= 2,
+            "Multi-variable branch backward needs >= 2 Select ops, got {adj_selects}"
+        );
 
         // No tape-style markers in source AD adjoint
-        let tape_inputs = adjoint.ops.iter()
+        let tape_inputs = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Input(_)))
             .count();
-        assert_eq!(tape_inputs, 0,
-            "Source AD adjoint must be tape-free (no Input ops), got {tape_inputs}");
+        assert_eq!(
+            tape_inputs, 0,
+            "Source AD adjoint must be tape-free (no Input ops), got {tape_inputs}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2915,23 +3415,35 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // Structural: must not contain Input ops (tape-push markers)
-        let has_tape_input = adjoint.ops.iter()
+        let has_tape_input = adjoint
+            .ops
+            .iter()
             .any(|op| matches!(&op.op, PrimalOp::Input(_)));
-        assert!(!has_tape_input,
-            "Source AD adjoint for branching code must not contain tape Input ops");
+        assert!(
+            !has_tape_input,
+            "Source AD adjoint for branching code must not contain tape Input ops"
+        );
 
         // Must not contain Param ops (tape-checkpoint markers) beyond what primal already has
         // (AdjointGenerator never introduces Param ops; it only uses Constant/Select/arithmetic)
-        let has_new_param = adjoint.ops.iter()
+        let has_new_param = adjoint
+            .ops
+            .iter()
             .any(|op| matches!(&op.op, PrimalOp::Param(_)));
-        assert!(!has_new_param,
-            "Source AD adjoint must not introduce new Param ops");
+        assert!(
+            !has_new_param,
+            "Source AD adjoint must not introduce new Param ops"
+        );
 
         // Must contain Select ops to encode the branch gradient
-        let has_select = adjoint.ops.iter()
+        let has_select = adjoint
+            .ops
+            .iter()
             .any(|op| matches!(&op.op, PrimalOp::Select));
-        assert!(has_select,
-            "Source AD adjoint must use Select (not tape push/pop) for branch gradients");
+        assert!(
+            has_select,
+            "Source AD adjoint must use Select (not tape push/pop) for branch gradients"
+        );
 
         // x must have an adjoint — the whole point of AD
         assert!(gen.adjoint_of(0).is_some(), "x must have adjoint");
@@ -2961,18 +3473,32 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // No tape-style ops in the backward pass
-        assert!(!adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Input(_))),
-            "Nested-branch adjoint must be tape-free");
-        assert!(!adjoint.ops.iter().any(|op| matches!(&op.op, PrimalOp::Param(_))),
-            "Nested-branch adjoint must not introduce Param ops");
+        assert!(
+            !adjoint
+                .ops
+                .iter()
+                .any(|op| matches!(&op.op, PrimalOp::Input(_))),
+            "Nested-branch adjoint must be tape-free"
+        );
+        assert!(
+            !adjoint
+                .ops
+                .iter()
+                .any(|op| matches!(&op.op, PrimalOp::Param(_))),
+            "Nested-branch adjoint must not introduce Param ops"
+        );
 
         // Must be richer in Select ops than a straight-line function would be
-        let adj_selects = adjoint.ops.iter()
+        let adj_selects = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Select))
             .count();
-        assert!(adj_selects >= 2,
+        assert!(
+            adj_selects >= 2,
             "Nested-branch adjoint should have >= 2 Select ops (source AD encodes branches \
-             structurally, not via tape), got {adj_selects}");
+             structurally, not via tape), got {adj_selects}"
+        );
     }
 
     #[test]
@@ -2986,12 +3512,12 @@ mod tests {
         // f(x) = if x > 0 { x } else { 0.01 * x }  (leaky ReLU)
         let primal = WengertList {
             ops: vec![
-                make_op(0, 0, PrimalOp::Param("x".into()),         vec![]),
-                make_op(1, 1, PrimalOp::Constant(0.01),             vec![]),
-                make_op(2, 2, PrimalOp::Constant(0.0),              vec![]),
+                make_op(0, 0, PrimalOp::Param("x".into()), vec![]),
+                make_op(1, 1, PrimalOp::Constant(0.01), vec![]),
+                make_op(2, 2, PrimalOp::Constant(0.0), vec![]),
                 make_op(3, 3, PrimalOp::Condition(CompareKind::Gt), vec![0, 2]),
-                make_op(4, 4, PrimalOp::Mul, vec![1, 0]),            // 0.01 * x
-                make_op(5, 5, PrimalOp::Select, vec![3, 0, 4]),      // cond ? x : 0.01*x
+                make_op(4, 4, PrimalOp::Mul, vec![1, 0]), // 0.01 * x
+                make_op(5, 5, PrimalOp::Select, vec![3, 0, 4]), // cond ? x : 0.01*x
             ],
             output: 5,
             var_names: HashMap::new(),
@@ -3002,22 +3528,40 @@ mod tests {
         let adjoint = gen.generate(&primal);
 
         // Count op types
-        let tape_ops = adjoint.ops.iter()
+        let tape_ops = adjoint
+            .ops
+            .iter()
             .filter(|op| matches!(&op.op, PrimalOp::Input(_) | PrimalOp::Param(_)))
             .count();
-        let structural_ops = adjoint.ops.iter()
-            .filter(|op| matches!(&op.op,
-                PrimalOp::Select | PrimalOp::Condition(_) | PrimalOp::Constant(_)))
+        let structural_ops = adjoint
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.op,
+                    PrimalOp::Select | PrimalOp::Condition(_) | PrimalOp::Constant(_)
+                )
+            })
             .count();
-        let arithmetic_ops = adjoint.ops.iter()
-            .filter(|op| matches!(&op.op,
-                PrimalOp::Add | PrimalOp::Mul | PrimalOp::Neg | PrimalOp::Sub))
+        let arithmetic_ops = adjoint
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.op,
+                    PrimalOp::Add | PrimalOp::Mul | PrimalOp::Neg | PrimalOp::Sub
+                )
+            })
             .count();
 
-        assert_eq!(tape_ops, 0,
-            "Source AD for leaky ReLU must have 0 tape ops, got {tape_ops}");
-        assert!(structural_ops + arithmetic_ops > 0,
-            "Adjoint must have actual gradient computation ops");
+        assert_eq!(
+            tape_ops, 0,
+            "Source AD for leaky ReLU must have 0 tape ops, got {tape_ops}"
+        );
+        assert!(
+            structural_ops + arithmetic_ops > 0,
+            "Adjoint must have actual gradient computation ops"
+        );
 
         // x must have an adjoint
         assert!(gen.adjoint_of(0).is_some(), "x must have an adjoint");

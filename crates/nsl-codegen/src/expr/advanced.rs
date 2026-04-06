@@ -5,7 +5,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{Linkage, Module};
 
-use nsl_ast::expr::{Expr, ExprKind, SubscriptKind, FStringPart};
+use nsl_ast::expr::{Expr, ExprKind, FStringPart, SubscriptKind};
 use nsl_ast::operator::BinOp;
 use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::Symbol;
@@ -29,7 +29,11 @@ impl Compiler<'_> {
 
         for stmt in &block.stmts[..block.stmts.len() - 1] {
             self.compile_stmt(builder, state, stmt)?;
-            if state.current_block.map(|block| is_block_filled(builder, block)).unwrap_or(false) {
+            if state
+                .current_block
+                .map(|block| is_block_filled(builder, block))
+                .unwrap_or(false)
+            {
                 return Err(CodegenError::new(
                     "block expression must end with a reachable value",
                 ));
@@ -71,7 +75,9 @@ impl Compiler<'_> {
         let result_sem_ty = self.node_type(full_expr.id).clone();
         let result_type = nsl_type_to_cl(&result_sem_ty);
         builder.append_block_param(merge_block, result_type);
-        builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
+        builder
+            .ins()
+            .brif(cond_val, then_block, &[], else_block, &[]);
 
         builder.switch_to_block(then_block);
         builder.seal_block(then_block);
@@ -82,7 +88,10 @@ impl Compiler<'_> {
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.cleanup.tensor_temporaries.truncate(temp_base_len);
-        state.ownership.linear_consume_pending.truncate(linear_base_len);
+        state
+            .ownership
+            .linear_consume_pending
+            .truncate(linear_base_len);
         state.flags.conditional_depth += 1;
         let then_val = self.compile_expr(builder, state, then_expr);
         state.flags.conditional_depth -= 1;
@@ -97,8 +106,8 @@ impl Compiler<'_> {
         let mut then_result_is_temp = false;
         let mut then_result_is_linear = false;
         if !is_block_filled(builder, current_then) {
-            then_result_is_linear = state.ownership.linear_consume_pending[linear_base_len..]
-                .contains(&then_val);
+            then_result_is_linear =
+                state.ownership.linear_consume_pending[linear_base_len..].contains(&then_val);
             then_result_is_temp = !then_result_is_linear
                 && state.cleanup.tensor_temporaries[temp_base_len..].contains(&then_val);
 
@@ -119,14 +128,20 @@ impl Compiler<'_> {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[consumed]);
                 }
             }
-            state.ownership.linear_consume_pending.truncate(linear_base_len);
+            state
+                .ownership
+                .linear_consume_pending
+                .truncate(linear_base_len);
 
             reaching_loader_sets.push(state.dataloader_symbols.clone());
             reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
             builder.ins().jump(merge_block, &[then_val]);
         } else {
             state.cleanup.tensor_temporaries.truncate(temp_base_len);
-            state.ownership.linear_consume_pending.truncate(linear_base_len);
+            state
+                .ownership
+                .linear_consume_pending
+                .truncate(linear_base_len);
         }
 
         builder.switch_to_block(else_block);
@@ -138,7 +153,10 @@ impl Compiler<'_> {
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.cleanup.tensor_temporaries.truncate(temp_base_len);
-        state.ownership.linear_consume_pending.truncate(linear_base_len);
+        state
+            .ownership
+            .linear_consume_pending
+            .truncate(linear_base_len);
         state.flags.conditional_depth += 1;
         let else_val = self.compile_expr(builder, state, else_expr);
         state.flags.conditional_depth -= 1;
@@ -153,8 +171,8 @@ impl Compiler<'_> {
         let mut else_result_is_temp = false;
         let mut else_result_is_linear = false;
         if !is_block_filled(builder, current_else) {
-            else_result_is_linear = state.ownership.linear_consume_pending[linear_base_len..]
-                .contains(&else_val);
+            else_result_is_linear =
+                state.ownership.linear_consume_pending[linear_base_len..].contains(&else_val);
             else_result_is_temp = !else_result_is_linear
                 && state.cleanup.tensor_temporaries[temp_base_len..].contains(&else_val);
 
@@ -175,14 +193,20 @@ impl Compiler<'_> {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[consumed]);
                 }
             }
-            state.ownership.linear_consume_pending.truncate(linear_base_len);
+            state
+                .ownership
+                .linear_consume_pending
+                .truncate(linear_base_len);
 
             reaching_loader_sets.push(state.dataloader_symbols.clone());
             reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
             builder.ins().jump(merge_block, &[else_val]);
         } else {
             state.cleanup.tensor_temporaries.truncate(temp_base_len);
-            state.ownership.linear_consume_pending.truncate(linear_base_len);
+            state
+                .ownership
+                .linear_consume_pending
+                .truncate(linear_base_len);
         }
 
         state.variables = incoming_variables.clone();
@@ -269,20 +293,27 @@ impl Compiler<'_> {
         sig.returns.push(AbiParam::new(ret_type));
 
         // Declare the function in the module
-        let func_id = self.module
+        let func_id = self
+            .module
             .declare_function(&lambda_name, Linkage::Local, &sig)
-            .map_err(|e| CodegenError::new(format!("failed to declare lambda '{lambda_name}': {e}")))?;
+            .map_err(|e| {
+                CodegenError::new(format!("failed to declare lambda '{lambda_name}': {e}"))
+            })?;
 
         // Store for compilation and in functions table
-        self.registry.functions.insert(lambda_name.clone(), (func_id, sig.clone()));
-        self.registry.pending_lambdas.push(crate::compiler::PendingLambda {
-            name: lambda_name,
-            func_id,
-            sig,
-            params: param_info,
-            body: body.clone(),
-            captures: capture_info,
-        });
+        self.registry
+            .functions
+            .insert(lambda_name.clone(), (func_id, sig.clone()));
+        self.registry
+            .pending_lambdas
+            .push(crate::compiler::PendingLambda {
+                name: lambda_name,
+                func_id,
+                sig,
+                params: param_info,
+                body: body.clone(),
+                captures: capture_info,
+            });
 
         // Get function address
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
@@ -301,10 +332,14 @@ impl Compiler<'_> {
             let closure_ptr = builder.inst_results(call)[0];
 
             // Store fn_ptr at offset 0
-            builder.ins().store(MemFlags::trusted(), addr, closure_ptr, 0);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), addr, closure_ptr, 0);
             // Store num_captures at offset 8
             let num_cap = builder.ins().iconst(cl_types::I64, captures.len() as i64);
-            builder.ins().store(MemFlags::trusted(), num_cap, closure_ptr, 8);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), num_cap, closure_ptr, 8);
             // Store each captured variable at offset 16 + i*8
             for (i, (sym, _cl_type)) in captures.iter().enumerate() {
                 let (var, _) = *state.variables.get(sym).ok_or_else(|| {
@@ -315,7 +350,9 @@ impl Compiler<'_> {
                 })?;
                 let val = builder.use_var(var);
                 let offset = (16 + i * 8) as i32;
-                builder.ins().store(MemFlags::trusted(), val, closure_ptr, offset);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), val, closure_ptr, offset);
             }
 
             // NOTE: nsl_closure_free is now implemented in the runtime (memory.rs).
@@ -384,11 +421,19 @@ impl Compiler<'_> {
             ExprKind::Subscript { object, index } => {
                 self.collect_free_vars(object, param_syms, state, out, seen);
                 match index.as_ref() {
-                    SubscriptKind::Index(e) => self.collect_free_vars(e, param_syms, state, out, seen),
+                    SubscriptKind::Index(e) => {
+                        self.collect_free_vars(e, param_syms, state, out, seen)
+                    }
                     SubscriptKind::Slice { lower, upper, step } => {
-                        if let Some(e) = lower { self.collect_free_vars(e, param_syms, state, out, seen); }
-                        if let Some(e) = upper { self.collect_free_vars(e, param_syms, state, out, seen); }
-                        if let Some(e) = step { self.collect_free_vars(e, param_syms, state, out, seen); }
+                        if let Some(e) = lower {
+                            self.collect_free_vars(e, param_syms, state, out, seen);
+                        }
+                        if let Some(e) = upper {
+                            self.collect_free_vars(e, param_syms, state, out, seen);
+                        }
+                        if let Some(e) = step {
+                            self.collect_free_vars(e, param_syms, state, out, seen);
+                        }
                     }
                     _ => {}
                 }
@@ -416,7 +461,11 @@ impl Compiler<'_> {
                     self.collect_free_vars_in_stmt(stmt, param_syms, state, out, seen);
                 }
             }
-            ExprKind::IfExpr { condition, then_expr, else_expr } => {
+            ExprKind::IfExpr {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 self.collect_free_vars(condition, param_syms, state, out, seen);
                 self.collect_free_vars(then_expr, param_syms, state, out, seen);
                 self.collect_free_vars(else_expr, param_syms, state, out, seen);
@@ -435,7 +484,9 @@ impl Compiler<'_> {
         seen: &mut std::collections::HashSet<nsl_ast::Symbol>,
     ) {
         match &stmt.kind {
-            StmtKind::VarDecl { value: Some(expr), .. }
+            StmtKind::VarDecl {
+                value: Some(expr), ..
+            }
             | StmtKind::Expr(expr)
             | StmtKind::Return(Some(expr))
             | StmtKind::Yield(Some(expr)) => {
@@ -468,8 +519,15 @@ impl Compiler<'_> {
                 }
             }
             StmtKind::For { iterable, body, .. }
-            | StmtKind::While { condition: iterable, body }
-            | StmtKind::WhileLet { expr: iterable, body, .. } => {
+            | StmtKind::While {
+                condition: iterable,
+                body,
+            }
+            | StmtKind::WhileLet {
+                expr: iterable,
+                body,
+                ..
+            } => {
                 self.collect_free_vars(iterable, param_syms, state, out, seen);
                 for body_stmt in &body.stmts {
                     self.collect_free_vars_in_stmt(body_stmt, param_syms, state, out, seen);
@@ -580,7 +638,9 @@ impl Compiler<'_> {
         args: &[nsl_ast::expr::Arg],
     ) -> Result<Value, CodegenError> {
         if args.len() != 2 {
-            return Err(CodegenError::new(format!("{func_name}() takes exactly 2 arguments")));
+            return Err(CodegenError::new(format!(
+                "{func_name}() takes exactly 2 arguments"
+            )));
         }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
         if let ExprKind::Ident(sym) = &args[0].value.kind {
@@ -621,8 +681,15 @@ impl Compiler<'_> {
         if left_is_tensor && right_is_tensor {
             // M50: Sparse dispatch — if either operand is sparse, route to sparse ops
             if left_is_sparse || right_is_sparse {
-                return self.compile_sparse_binary_op(builder, state, lhs, rhs, op,
-                    left_is_sparse, right_is_sparse);
+                return self.compile_sparse_binary_op(
+                    builder,
+                    state,
+                    lhs,
+                    rhs,
+                    op,
+                    left_is_sparse,
+                    right_is_sparse,
+                );
             }
 
             // M52b: Try constant folding if both operands are known weights
@@ -652,11 +719,13 @@ impl Compiler<'_> {
                 BinOp::Sub => "nsl_tensor_sub",
                 BinOp::Mul => "nsl_tensor_mul",
                 BinOp::Div => "nsl_tensor_div",
-                BinOp::MatMul => if state.flags.is_fp8_compute {
-                    "nsl_fp8_matmul_training"
-                } else {
-                    "nsl_tensor_matmul"
-                },
+                BinOp::MatMul => {
+                    if state.flags.is_fp8_compute {
+                        "nsl_fp8_matmul_training"
+                    } else {
+                        "nsl_tensor_matmul"
+                    }
+                }
                 _ => return Err(CodegenError::new(format!("unsupported tensor op: {op:?}"))),
             };
 
@@ -685,8 +754,12 @@ impl Compiler<'_> {
             };
             let _ = scale_fused; // logged in try_fuse_weight_scale
             let result = match op {
-                BinOp::Add => self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?,
-                BinOp::Mul => self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?,
+                BinOp::Add => {
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?
+                }
+                BinOp::Mul => {
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?
+                }
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
@@ -698,26 +771,47 @@ impl Compiler<'_> {
                     let inv = builder.ins().fdiv(one, scalar);
                     self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv])?
                 }
-                _ => return Err(CodegenError::new(format!("unsupported tensor-scalar op: {op:?}"))),
+                _ => {
+                    return Err(CodegenError::new(format!(
+                        "unsupported tensor-scalar op: {op:?}"
+                    )))
+                }
             };
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else {
             // Scalar-tensor: ensure scalar is f64
             let lhs_ty = builder.func.dfg.value_type(lhs);
-            let scalar = if lhs_ty == cl_types::F64 { lhs } else { builder.ins().fcvt_from_sint(cl_types::F64, lhs) };
+            let scalar = if lhs_ty == cl_types::F64 {
+                lhs
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, lhs)
+            };
             let result = match op {
-                BinOp::Add => self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar])?,
-                BinOp::Mul => self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar])?,
+                BinOp::Add => {
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar])?
+                }
+                BinOp::Mul => {
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar])?
+                }
                 BinOp::Sub => {
                     // scalar - tensor = neg(tensor) + scalar
-                    let neg_tensor = self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
-                    let result = self.compile_call_by_name(builder, "nsl_tensor_add_scalar", &[neg_tensor, scalar])?;
+                    let neg_tensor =
+                        self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
+                    let result = self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_add_scalar",
+                        &[neg_tensor, scalar],
+                    )?;
                     // Free the intermediate neg_tensor (consumed by add_scalar)
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[neg_tensor])?;
                     result
                 }
-                _ => return Err(CodegenError::new(format!("unsupported scalar-tensor op: {op:?}"))),
+                _ => {
+                    return Err(CodegenError::new(format!(
+                        "unsupported scalar-tensor op: {op:?}"
+                    )))
+                }
             };
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
@@ -734,13 +828,24 @@ impl Compiler<'_> {
         model_ptr: Value,
         device_val: Value,
     ) -> Result<(), CodegenError> {
-        let layout = self.types.struct_layouts.get(model_name).cloned().ok_or_else(|| {
-            CodegenError::new(format!("no layout for model '{model_name}' in .to(device)"))
-        })?;
+        let layout = self
+            .types
+            .struct_layouts
+            .get(model_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::new(format!("no layout for model '{model_name}' in .to(device)"))
+            })?;
 
         // Transfer direct tensor fields of this model
-        let num_fields = builder.ins().iconst(cl_types::I64, layout.fields.len() as i64);
-        self.compile_call_by_name(builder, "nsl_model_to_device", &[model_ptr, num_fields, device_val])?;
+        let num_fields = builder
+            .ins()
+            .iconst(cl_types::I64, layout.fields.len() as i64);
+        self.compile_call_by_name(
+            builder,
+            "nsl_model_to_device",
+            &[model_ptr, num_fields, device_val],
+        )?;
 
         // Recurse into sub-model fields and fixed-size model arrays
         let field_types = self.models.model_field_types.get(model_name).cloned();
@@ -750,16 +855,19 @@ impl Compiler<'_> {
 
             if sub_type.starts_with('[') {
                 // Fixed-size model array: [ModelType; N]
-                // Elements are stored as inline pointers at model_ptr + field.offset + i*8
+                // Layout: N model pointers stored inline at model_ptr + field.offset + i*8
+                // (not a pointer to a separate array — elements are inline in the struct)
                 let inner = sub_type.trim_start_matches('[').trim_end_matches(']');
                 let parts: Vec<&str> = inner.split(';').collect();
                 if parts.len() == 2 {
                     let elem_type = parts[0].trim().to_string();
                     let count = parts[1].trim().parse::<usize>().unwrap_or(0);
                     if count > 0 && self.types.struct_layouts.contains_key(&elem_type) {
+                        // Array base = model_ptr + field_offset (inline, not indirected)
                         let field_off = builder.ins().iconst(cl_types::I64, field.offset as i64);
                         let array_base = builder.ins().iadd(model_ptr, field_off);
                         for i in 0..count {
+                            // Load model pointer from array slot: elem_ptr = *(base + i*8)
                             let elem_ptr = builder.ins().load(
                                 cl_types::I64,
                                 cranelift_codegen::ir::MemFlags::trusted(),
@@ -801,9 +909,14 @@ impl Compiler<'_> {
         // For locally defined models, use the model_methods map.
         // For imported models, fall back to the standard naming convention.
         let mangled = if let Some(methods) = self.models.model_methods.get(model_name) {
-            methods.get(method_name).ok_or_else(|| {
-                CodegenError::new(format!("model '{model_name}' has no method '{method_name}'"))
-            })?.clone()
+            methods
+                .get(method_name)
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "model '{model_name}' has no method '{method_name}'"
+                    ))
+                })?
+                .clone()
         } else {
             // Imported model: derive mangled name from convention
             format!("__nsl_model_{model_name}_{method_name}")
@@ -834,14 +947,18 @@ impl Compiler<'_> {
             "mean" => self.compile_traced_call(builder, "nsl_tensor_mean", &[obj_val]),
             "reshape" => {
                 if args.len() != 1 {
-                    return Err(CodegenError::new("reshape() takes exactly 1 argument (shape list)"));
+                    return Err(CodegenError::new(
+                        "reshape() takes exactly 1 argument (shape list)",
+                    ));
                 }
                 let shape_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_reshape", &[obj_val, shape_val])
             }
             "transpose" => {
                 if args.len() != 2 {
-                    return Err(CodegenError::new("transpose() takes exactly 2 arguments (dim0, dim1)"));
+                    return Err(CodegenError::new(
+                        "transpose() takes exactly 2 arguments (dim0, dim1)",
+                    ));
                 }
                 let d0 = self.compile_expr(builder, state, &args[0].value)?;
                 let d1 = self.compile_expr(builder, state, &args[1].value)?;
@@ -873,7 +990,9 @@ impl Compiler<'_> {
             "item" => self.compile_call_by_name(builder, "nsl_tensor_item", &[obj_val]),
             "to" => {
                 if args.len() != 1 {
-                    return Err(CodegenError::new("to() takes exactly 1 argument (device or dtype)"));
+                    return Err(CodegenError::new(
+                        "to() takes exactly 1 argument (device or dtype)",
+                    ));
                 }
                 // Check if the argument is a custom dtype name
                 if let ExprKind::Ident(arg_sym) = &args[0].value.kind {
@@ -881,11 +1000,19 @@ impl Compiler<'_> {
                     if let Some(dtype_id) = self.resolve_custom_dtype(&arg_name) {
                         // .to(CustomDtype) -- convert to custom dtype
                         let id_val = builder.ins().iconst(cl_types::I64, dtype_id as i64);
-                        return self.compile_call_by_name(builder, "nsl_tensor_to_custom_dtype", &[obj_val, id_val]);
+                        return self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_to_custom_dtype",
+                            &[obj_val, id_val],
+                        );
                     }
                     // .to(f32) / .to(f64) -- convert from custom dtype back to standard
                     if matches!(arg_name.as_str(), "f32" | "f64" | "float") {
-                        return self.compile_call_by_name(builder, "nsl_tensor_from_custom_dtype", &[obj_val]);
+                        return self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_from_custom_dtype",
+                            &[obj_val],
+                        );
                     }
                 }
                 // Fall through: device transfer (.to(cuda), .to(cpu), etc.)
@@ -895,37 +1022,51 @@ impl Compiler<'_> {
             // M18a shape ops
             "unsqueeze" => {
                 if args.len() != 1 {
-                    return Err(CodegenError::new("unsqueeze() takes exactly 1 argument (dim)"));
+                    return Err(CodegenError::new(
+                        "unsqueeze() takes exactly 1 argument (dim)",
+                    ));
                 }
                 let dim_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_unsqueeze", &[obj_val, dim_val])
             }
             "select" => {
                 if args.len() != 2 {
-                    return Err(CodegenError::new("select() takes exactly 2 arguments (dim, index)"));
+                    return Err(CodegenError::new(
+                        "select() takes exactly 2 arguments (dim, index)",
+                    ));
                 }
                 let dim_val = self.compile_expr(builder, state, &args[0].value)?;
                 let idx_val = self.compile_expr(builder, state, &args[1].value)?;
-                self.compile_call_by_name(builder, "nsl_tensor_select", &[obj_val, dim_val, idx_val])
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_select",
+                    &[obj_val, dim_val, idx_val],
+                )
             }
             "expand" => {
                 if args.len() != 1 {
-                    return Err(CodegenError::new("expand() takes exactly 1 argument (shape list)"));
+                    return Err(CodegenError::new(
+                        "expand() takes exactly 1 argument (shape list)",
+                    ));
                 }
                 let shape_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_expand", &[obj_val, shape_val])
             }
-            "contiguous" => {
-                self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[obj_val])
-            }
+            "contiguous" => self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[obj_val]),
             "slice" => {
                 if args.len() != 3 {
-                    return Err(CodegenError::new("slice() takes exactly 3 arguments (dim, start, end)"));
+                    return Err(CodegenError::new(
+                        "slice() takes exactly 3 arguments (dim, start, end)",
+                    ));
                 }
                 let dim_val = self.compile_expr(builder, state, &args[0].value)?;
                 let start_val = self.compile_expr(builder, state, &args[1].value)?;
                 let end_val = self.compile_expr(builder, state, &args[2].value)?;
-                self.compile_call_by_name(builder, "nsl_tensor_slice", &[obj_val, dim_val, start_val, end_val])
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_slice",
+                    &[obj_val, dim_val, start_val, end_val],
+                )
             }
             // M19: cumsum(dim)
             "cumsum" => {
@@ -943,7 +1084,9 @@ impl Compiler<'_> {
                 let dim_val = self.compile_expr(builder, state, &args[0].value)?;
                 self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[obj_val, dim_val])
             }
-            _ => Err(CodegenError::new(format!("unknown tensor method '.{method}()'"))),
+            _ => Err(CodegenError::new(format!(
+                "unknown tensor method '.{method}()'"
+            ))),
         }
     }
 
@@ -959,7 +1102,9 @@ impl Compiler<'_> {
         let rt_name = format!("nsl_str_{method}");
 
         if !self.registry.runtime_fns.contains_key(&rt_name) {
-            return Err(CodegenError::new(format!("unknown string method '.{method}()'")));
+            return Err(CodegenError::new(format!(
+                "unknown string method '.{method}()'"
+            )));
         }
 
         let mut arg_vals = vec![obj_val];
@@ -996,7 +1141,9 @@ impl Compiler<'_> {
                 let call = builder.ins().call(fref, &[obj_val]);
                 Ok(builder.inst_results(call)[0])
             }
-            _ => Err(CodegenError::new(format!("unknown list method '.{method}()'")))
+            _ => Err(CodegenError::new(format!(
+                "unknown list method '.{method}()'"
+            ))),
         }
     }
 
@@ -1033,7 +1180,9 @@ impl Compiler<'_> {
         let block_q_val = builder.ins().iconst(cl_types::I64, block_q);
         let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv);
         let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes);
-        let causal_val = builder.ins().iconst(cl_types::I64, if is_causal { 1 } else { 0 });
+        let causal_val = builder
+            .ins()
+            .iconst(cl_types::I64, if is_causal { 1 } else { 0 });
 
         let null = builder.ins().iconst(cl_types::I64, 0);
 
@@ -1045,7 +1194,8 @@ impl Compiler<'_> {
         let batch = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim0])?;
         let heads = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim1])?;
         let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim2])?;
-        let head_dim = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
+        let head_dim =
+            self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
 
         // Allocate logsumexp auxiliary tensor: shape [batch, heads, seq_len]
         // Must be on the same device as Q — the GPU kernel writes to it via st.global.f32,
@@ -1059,22 +1209,40 @@ impl Compiler<'_> {
         let lse_cpu = self.compile_call_by_name(builder, "nsl_tensor_zeros", &[lse_shape])?;
         // Move to GPU so the PTX kernel can write to it (managed memory)
         let cuda_device = builder.ins().iconst(cl_types::I64, 1);
-        let lse_val = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[lse_cpu, cuda_device])?;
+        let lse_val =
+            self.compile_call_by_name(builder, "nsl_tensor_to_device", &[lse_cpu, cuda_device])?;
 
         // Call flash attention FFI — returns error code (i64), output written to out_val
-        let _err = self.compile_call_by_name(builder, "nsl_flash_attention", &[
-            q_val, k_val, v_val, out_val,
-            lse_val,                        // logsumexp auxiliary output
-            scale_val,
-            batch, heads, seq_len, head_dim,
-            null, null, null, null, // paged params (null for now)
-            null, null,             // RoPE params (null for now)
-            null, null,             // seq_ids, seq_lens (M29-ready)
-            shmem_val,
-            ptx_ptr, name_ptr,
-            block_q_val, block_kv_val,
-            causal_val,
-        ])?;
+        let _err = self.compile_call_by_name(
+            builder,
+            "nsl_flash_attention",
+            &[
+                q_val,
+                k_val,
+                v_val,
+                out_val,
+                lse_val, // logsumexp auxiliary output
+                scale_val,
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                null,
+                null,
+                null,
+                null, // paged params (null for now)
+                null,
+                null, // RoPE params (null for now)
+                null,
+                null, // seq_ids, seq_lens (M29-ready)
+                shmem_val,
+                ptx_ptr,
+                name_ptr,
+                block_q_val,
+                block_kv_val,
+                causal_val,
+            ],
+        )?;
 
         // Logsumexp is consumed by the runtime's tape recording in nsl_flash_attention.
         // The TapeOp::FlashAttention variant is recorded there with the logsumexp pointer.
@@ -1123,9 +1291,7 @@ impl Compiler<'_> {
                 ));
             }
         };
-        let path_len_val = builder
-            .ins()
-            .iconst(cl_types::I64, path_str.len() as i64);
+        let path_len_val = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
 
         // 1. nsl_trace_start()
         self.compile_call_by_name(builder, "nsl_trace_start", &[])?;
@@ -1153,11 +1319,8 @@ impl Compiler<'_> {
             format!("__nsl_model_{model_name}_forward")
         };
 
-        let result = self.compile_call_by_name(
-            builder,
-            &mangled_forward,
-            &[model_val, input_val],
-        )?;
+        let result =
+            self.compile_call_by_name(builder, &mangled_forward, &[model_val, input_val])?;
 
         // 4. nsl_trace_register_output(result, "output_0")
         self.intern_string("output_0")?;
@@ -1172,11 +1335,7 @@ impl Compiler<'_> {
         let trace = self.compile_call_by_name(builder, "nsl_trace_stop", &[])?;
 
         // 6. nsl_onnx_export(trace, path_ptr, path_len)
-        self.compile_call_by_name(
-            builder,
-            "nsl_onnx_export",
-            &[trace, path_val, path_len_val],
-        )?;
+        self.compile_call_by_name(builder, "nsl_onnx_export", &[trace, path_val, path_len_val])?;
 
         // Return the forward result so callers can use the output
         Ok(result)
@@ -1206,10 +1365,7 @@ impl Compiler<'_> {
                 ));
             }
         };
-        let repo_len_val =
-            builder
-                .ins()
-                .iconst(cl_types::I64, repo_str.len() as i64);
+        let repo_len_val = builder.ins().iconst(cl_types::I64, repo_str.len() as i64);
 
         // arg 1: model variable
         let model_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -1299,10 +1455,9 @@ impl Compiler<'_> {
             );
 
             // offset 32: transpose flag
-            let transpose_val =
-                builder
-                    .ins()
-                    .iconst(cl_types::I64, if *transpose { 1 } else { 0 });
+            let transpose_val = builder
+                .ins()
+                .iconst(cl_types::I64, if *transpose { 1 } else { 0 });
             builder.ins().store(
                 MemFlags::trusted(),
                 transpose_val,
@@ -1318,7 +1473,14 @@ impl Compiler<'_> {
         self.compile_call_by_name(
             builder,
             "nsl_hf_load",
-            &[model_val, meta_ptr, meta_len_val, repo_val, repo_len_val, device_val],
+            &[
+                model_val,
+                meta_ptr,
+                meta_len_val,
+                repo_val,
+                repo_len_val,
+                device_val,
+            ],
         )?;
 
         // Free the temporary ParamMeta array
@@ -1367,29 +1529,33 @@ impl Compiler<'_> {
                         let count: usize = count_str.trim().parse().unwrap_or(0);
                         // Determine element size from the element type's struct layout
                         let elem_size = self
-                            .types.struct_layouts
+                            .types
+                            .struct_layouts
                             .get(elem_type)
                             .map(|l| l.total_size)
                             .unwrap_or(8);
                         for i in 0..count {
                             let indexed_path = format!("{}[{}]", field_path, i);
                             let indexed_offset = abs_offset + i * elem_size;
-                            let sub =
-                                self.generate_param_metadata(elem_type, &indexed_path, indexed_offset);
+                            let sub = self.generate_param_metadata(
+                                elem_type,
+                                &indexed_path,
+                                indexed_offset,
+                            );
                             entries.extend(sub);
                         }
                     }
                 } else {
                     // Nested model (e.g., "Linear", "Attention")
-                    let sub =
-                        self.generate_param_metadata(type_marker, &field_path, abs_offset);
+                    let sub = self.generate_param_metadata(type_marker, &field_path, abs_offset);
                     entries.extend(sub);
                 }
             } else {
                 // Leaf tensor field -- determine transpose flag
                 if field.cl_type == cl_types::I64 {
                     let is_linear_like = {
-                        let names: Vec<&str> = layout.fields.iter().map(|f| f.name.as_str()).collect();
+                        let names: Vec<&str> =
+                            layout.fields.iter().map(|f| f.name.as_str()).collect();
                         (names.contains(&"w") && names.contains(&"b"))
                             || (names.contains(&"weight") && names.contains(&"bias"))
                     };
@@ -1421,30 +1587,32 @@ impl Compiler<'_> {
         }
 
         let interner = self.interner;
-        let resolve = |sym: Symbol| -> Option<String> {
-            interner.resolve(sym.0).map(|s| s.to_string())
-        };
+        let resolve =
+            |sym: Symbol| -> Option<String> { interner.resolve(sym.0).map(|s| s.to_string()) };
 
         if let Some((ops, inputs)) = crate::fusion::analyze_fusible_chain(expr, &resolve) {
             if ops.len() >= 2 && !inputs.is_empty() && inputs.len() <= 2 {
                 // Convert op names to runtime op codes
-                let op_codes: Vec<i64> = ops.iter().filter_map(|op| match op.as_str() {
-                    "add" => Some(0), // FUSED_OP_ADD
-                    "mul" => Some(1),
-                    "sub" => Some(2),
-                    "div" => Some(3),
-                    "relu" => Some(4),
-                    "sigmoid" => Some(5),
-                    "tanh" => Some(6),
-                    "neg" => Some(7),
-                    "exp" => Some(8),
-                    "log" => Some(9),
-                    "sqrt" => Some(10),
-                    "abs" => Some(11),
-                    "gelu" => Some(12),
-                    "silu" => Some(13),
-                    _ => None, // Unknown op — skip fusion
-                }).collect();
+                let op_codes: Vec<i64> = ops
+                    .iter()
+                    .filter_map(|op| match op.as_str() {
+                        "add" => Some(0), // FUSED_OP_ADD
+                        "mul" => Some(1),
+                        "sub" => Some(2),
+                        "div" => Some(3),
+                        "relu" => Some(4),
+                        "sigmoid" => Some(5),
+                        "tanh" => Some(6),
+                        "neg" => Some(7),
+                        "exp" => Some(8),
+                        "log" => Some(9),
+                        "sqrt" => Some(10),
+                        "abs" => Some(11),
+                        "gelu" => Some(12),
+                        "silu" => Some(13),
+                        _ => None, // Unknown op — skip fusion
+                    })
+                    .collect();
                 if op_codes.len() != ops.len() {
                     return Ok(None); // Some op couldn't be fused — fall back
                 }
@@ -1452,9 +1620,8 @@ impl Compiler<'_> {
                 // Only fuse when ALL inputs are confirmed tensors (not Unknown/Error).
                 // Unknown types could be scalars (struct fields, function returns)
                 // which would crash the fused tensor kernel.
-                let all_confirmed_tensors = inputs.iter().all(|inp| {
-                    self.node_type(inp.id).is_tensor()
-                });
+                let all_confirmed_tensors =
+                    inputs.iter().all(|inp| self.node_type(inp.id).is_tensor());
                 if !all_confirmed_tensors {
                     return Ok(None);
                 }
@@ -1469,7 +1636,8 @@ impl Compiler<'_> {
 
                 // Compile inputs (bypass fusion to avoid infinite recursion)
                 state.flags.in_fuse_bypass = true;
-                let compiled_inputs: Vec<Value> = inputs.iter()
+                let compiled_inputs: Vec<Value> = inputs
+                    .iter()
                     .map(|inp| self.compile_expr(builder, state, inp))
                     .collect::<Result<Vec<_>, _>>()?;
                 state.flags.in_fuse_bypass = false;
@@ -1485,13 +1653,15 @@ impl Compiler<'_> {
                 let result = if compiled_inputs.len() == 2 {
                     // Binary + unary chain: nsl_fused_elementwise_2(a, b, ops, num_ops)
                     self.compile_call_by_name(
-                        builder, "nsl_fused_elementwise_2",
+                        builder,
+                        "nsl_fused_elementwise_2",
                         &[compiled_inputs[0], compiled_inputs[1], ops_list, num_ops],
                     )?
                 } else {
                     // Single input + unary chain: nsl_fused_elementwise_1(a, ops, num_ops)
                     self.compile_call_by_name(
-                        builder, "nsl_fused_elementwise_1",
+                        builder,
+                        "nsl_fused_elementwise_1",
                         &[compiled_inputs[0], ops_list, num_ops],
                     )?
                 };
@@ -1546,9 +1716,7 @@ impl Compiler<'_> {
                 ));
             }
         };
-        let path_len = builder
-            .ins()
-            .iconst(cl_types::I64, path_str.len() as i64);
+        let path_len = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
 
         if !self.types.struct_layouts.contains_key(&model_name) {
             return Err(CodegenError::new(format!(
@@ -1557,12 +1725,17 @@ impl Compiler<'_> {
             )));
         }
 
-        let layout = self.types.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
-            CodegenError::new(format!(
-                "model_save(): no struct layout found for model '{}'",
-                model_name
-            ))
-        })?;
+        let layout = self
+            .types
+            .struct_layouts
+            .get(&model_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "model_save(): no struct layout found for model '{}'",
+                    model_name
+                ))
+            })?;
 
         // Collect recursive leaf tensor names so checkpoint headers stay stable
         // for nested sub-models and fixed arrays.
@@ -1580,18 +1753,14 @@ impl Compiler<'_> {
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for (field_name, _field_offset, _needs_transpose) in &param_metadata {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
-            let tensor_ptr = self.load_nested_field(
-                builder,
-                model_val,
-                &layout,
-                &model_name,
-                &nested_path,
-            ).ok_or_else(|| {
-                CodegenError::new(format!(
-                    "model_save(): could not resolve model parameter '{}'",
-                    field_name
-                ))
-            })?;
+            let tensor_ptr = self
+                .load_nested_field(builder, model_val, &layout, &model_name, &nested_path)
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "model_save(): could not resolve model parameter '{}'",
+                        field_name
+                    ))
+                })?;
             self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
@@ -1642,9 +1811,7 @@ impl Compiler<'_> {
                 ));
             }
         };
-        let path_len = builder
-            .ins()
-            .iconst(cl_types::I64, path_str.len() as i64);
+        let path_len = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
 
         if !self.types.struct_layouts.contains_key(&model_name) {
             return Err(CodegenError::new(format!(
@@ -1653,29 +1820,30 @@ impl Compiler<'_> {
             )));
         }
 
-        let layout = self.types.struct_layouts.get(&model_name).cloned().ok_or_else(|| {
-            CodegenError::new(format!(
-                "model_load(): no struct layout found for model '{}'",
-                model_name
-            ))
-        })?;
+        let layout = self
+            .types
+            .struct_layouts
+            .get(&model_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "model_load(): no struct layout found for model '{}'",
+                    model_name
+                ))
+            })?;
 
         let param_metadata = self.generate_param_metadata(&model_name, "", 0);
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for (field_name, _field_offset, _needs_transpose) in &param_metadata {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
-            let tensor_ptr = self.load_nested_field(
-                builder,
-                model_val,
-                &layout,
-                &model_name,
-                &nested_path,
-            ).ok_or_else(|| {
-                CodegenError::new(format!(
-                    "model_load(): could not resolve model parameter '{}'",
-                    field_name
-                ))
-            })?;
+            let tensor_ptr = self
+                .load_nested_field(builder, model_val, &layout, &model_name, &nested_path)
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "model_load(): could not resolve model parameter '{}'",
+                        field_name
+                    ))
+                })?;
             self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
@@ -1710,15 +1878,23 @@ impl Compiler<'_> {
                 } else if !left_is_sparse && right_is_sparse {
                     // Dense @ Sparse → convert sparse to dense, then dense matmul
                     // (SpMM expects sparse on the left; transposing CSR is non-trivial)
-                    let dense_rhs = self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
-                    let result = self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs])?;
+                    let dense_rhs =
+                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
+                    let result =
+                        self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs])?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
                     result
                 } else {
                     // Sparse @ Sparse → convert both to dense (rare case)
-                    let dense_lhs = self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?;
-                    let dense_rhs = self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
-                    let result = self.compile_traced_call(builder, "nsl_tensor_matmul", &[dense_lhs, dense_rhs])?;
+                    let dense_lhs =
+                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?;
+                    let dense_rhs =
+                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
+                    let result = self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_matmul",
+                        &[dense_lhs, dense_rhs],
+                    )?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
                     result
@@ -1731,14 +1907,32 @@ impl Compiler<'_> {
                 } else {
                     // Mixed: convert sparse to dense, then dense add
                     let (dense_lhs, free_lhs) = if left_is_sparse {
-                        (self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?, true)
-                    } else { (lhs, false) };
+                        (
+                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
+                            true,
+                        )
+                    } else {
+                        (lhs, false)
+                    };
                     let (dense_rhs, free_rhs) = if right_is_sparse {
-                        (self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?, true)
-                    } else { (rhs, false) };
-                    let result = self.compile_traced_call(builder, "nsl_tensor_add", &[dense_lhs, dense_rhs])?;
-                    if free_lhs { self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?; }
-                    if free_rhs { self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?; }
+                        (
+                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
+                            true,
+                        )
+                    } else {
+                        (rhs, false)
+                    };
+                    let result = self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_add",
+                        &[dense_lhs, dense_rhs],
+                    )?;
+                    if free_lhs {
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
+                    }
+                    if free_rhs {
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
+                    }
                     result
                 }
             }
@@ -1749,33 +1943,69 @@ impl Compiler<'_> {
                 } else {
                     // Mixed: convert sparse to dense, then dense mul
                     let (dense_lhs, free_lhs) = if left_is_sparse {
-                        (self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?, true)
-                    } else { (lhs, false) };
+                        (
+                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
+                            true,
+                        )
+                    } else {
+                        (lhs, false)
+                    };
                     let (dense_rhs, free_rhs) = if right_is_sparse {
-                        (self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?, true)
-                    } else { (rhs, false) };
-                    let result = self.compile_traced_call(builder, "nsl_tensor_mul", &[dense_lhs, dense_rhs])?;
-                    if free_lhs { self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?; }
-                    if free_rhs { self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?; }
+                        (
+                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
+                            true,
+                        )
+                    } else {
+                        (rhs, false)
+                    };
+                    let result = self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_mul",
+                        &[dense_lhs, dense_rhs],
+                    )?;
+                    if free_lhs {
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
+                    }
+                    if free_rhs {
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
+                    }
                     result
                 }
             }
             // Sub, Div, etc.: convert to dense and use normal tensor ops
             _ => {
                 let (dense_lhs, free_lhs) = if left_is_sparse {
-                    (self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?, true)
-                } else { (lhs, false) };
+                    (
+                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
+                        true,
+                    )
+                } else {
+                    (lhs, false)
+                };
                 let (dense_rhs, free_rhs) = if right_is_sparse {
-                    (self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?, true)
-                } else { (rhs, false) };
+                    (
+                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
+                        true,
+                    )
+                } else {
+                    (rhs, false)
+                };
                 let rt_name = match op {
                     BinOp::Sub => "nsl_tensor_sub",
                     BinOp::Div => "nsl_tensor_div",
-                    _ => return Err(CodegenError::new(format!("unsupported sparse tensor op: {op:?}"))),
+                    _ => {
+                        return Err(CodegenError::new(format!(
+                            "unsupported sparse tensor op: {op:?}"
+                        )))
+                    }
                 };
                 let result = self.compile_traced_call(builder, rt_name, &[dense_lhs, dense_rhs])?;
-                if free_lhs { self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?; }
-                if free_rhs { self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?; }
+                if free_lhs {
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
+                }
+                if free_rhs {
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
+                }
                 result
             }
         };
@@ -1839,7 +2069,10 @@ impl Compiler<'_> {
             crate::weight_aware::FoldResult::Constant(ct) => {
                 eprintln!(
                     "[nsl] M52b: constant-folded {} @ {} → {:?} tensor ({} bytes)",
-                    lk, rk, ct.shape, ct.data.len()
+                    lk,
+                    rk,
+                    ct.shape,
+                    ct.data.len()
                 );
                 let val = self.embed_const_tensor(builder, state, &ct)?;
                 Ok(Some(val))
@@ -1859,13 +2092,15 @@ impl Compiler<'_> {
 
         // Create a unique .rodata symbol for this constant
         let sym_name = format!("__nsl_const_tensor_{}", self.string_pool.len());
-        let data_id = self.module
+        let data_id = self
+            .module
             .declare_data(&sym_name, Linkage::Local, false, false)
             .map_err(|e| CodegenError::new(format!("failed to declare const tensor data: {e}")))?;
 
         let mut desc = DataDescription::new();
         desc.define(ct.data.clone().into_boxed_slice());
-        self.module.define_data(data_id, &desc)
+        self.module
+            .define_data(data_id, &desc)
             .map_err(|e| CodegenError::new(format!("failed to define const tensor data: {e}")))?;
 
         // Get the data pointer as a Cranelift Value
@@ -1899,12 +2134,7 @@ impl Compiler<'_> {
     }
 
     /// Check if a matmul operand is a near-identity weight → skip the matmul.
-    fn try_identity_elim(
-        &self,
-        state: &FuncState,
-        lhs: Value,
-        rhs: Value,
-    ) -> Option<Value> {
+    fn try_identity_elim(&self, state: &FuncState, lhs: Value, rhs: Value) -> Option<Value> {
         let wmap = self.features.weight_map.as_ref()?;
 
         // Check RHS (more common: x @ W where W ≈ I)
@@ -1913,8 +2143,14 @@ impl Compiler<'_> {
                 let elim = crate::weight_aware::DeadWeightEliminator::new(
                     &self.compile_options.weight_config,
                 );
-                if elim.is_near_identity(entry, self.compile_options.weight_config.dead_weight_threshold) {
-                    eprintln!("[nsl] M52b: eliminated near-identity matmul (weight '{}')", key);
+                if elim.is_near_identity(
+                    entry,
+                    self.compile_options.weight_config.dead_weight_threshold,
+                ) {
+                    eprintln!(
+                        "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
+                        key
+                    );
                     return Some(lhs); // x @ I ≈ x
                 }
             }
@@ -1926,8 +2162,14 @@ impl Compiler<'_> {
                 let elim = crate::weight_aware::DeadWeightEliminator::new(
                     &self.compile_options.weight_config,
                 );
-                if elim.is_near_identity(entry, self.compile_options.weight_config.dead_weight_threshold) {
-                    eprintln!("[nsl] M52b: eliminated near-identity matmul (weight '{}')", key);
+                if elim.is_near_identity(
+                    entry,
+                    self.compile_options.weight_config.dead_weight_threshold,
+                ) {
+                    eprintln!(
+                        "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
+                        key
+                    );
                     return Some(rhs); // I @ x ≈ x
                 }
             }
@@ -1991,38 +2233,44 @@ impl Compiler<'_> {
 
         // row_ptrs: Vec<u32>
         let rp_name = format!("{}_row_ptrs", sym_prefix);
-        let rp_bytes: Vec<u8> = csr.row_ptrs.iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let rp_data_id = self.module
+        let rp_bytes: Vec<u8> = csr.row_ptrs.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rp_data_id = self
+            .module
             .declare_data(&rp_name, Linkage::Local, false, false)
             .map_err(|e| CodegenError::new(format!("CSR row_ptrs declare: {e}")))?;
         let mut rp_desc = DataDescription::new();
         rp_desc.define(rp_bytes.into_boxed_slice());
-        self.module.define_data(rp_data_id, &rp_desc)
+        self.module
+            .define_data(rp_data_id, &rp_desc)
             .map_err(|e| CodegenError::new(format!("CSR row_ptrs define: {e}")))?;
 
         // col_indices: Vec<u32>
         let ci_name = format!("{}_col_indices", sym_prefix);
-        let ci_bytes: Vec<u8> = csr.col_indices.iter()
+        let ci_bytes: Vec<u8> = csr
+            .col_indices
+            .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let ci_data_id = self.module
+        let ci_data_id = self
+            .module
             .declare_data(&ci_name, Linkage::Local, false, false)
             .map_err(|e| CodegenError::new(format!("CSR col_indices declare: {e}")))?;
         let mut ci_desc = DataDescription::new();
         ci_desc.define(ci_bytes.into_boxed_slice());
-        self.module.define_data(ci_data_id, &ci_desc)
+        self.module
+            .define_data(ci_data_id, &ci_desc)
             .map_err(|e| CodegenError::new(format!("CSR col_indices define: {e}")))?;
 
         // values: raw bytes (f32)
         let val_name = format!("{}_values", sym_prefix);
-        let val_data_id = self.module
+        let val_data_id = self
+            .module
             .declare_data(&val_name, Linkage::Local, false, false)
             .map_err(|e| CodegenError::new(format!("CSR values declare: {e}")))?;
         let mut val_desc = DataDescription::new();
         val_desc.define(csr.values.clone().into_boxed_slice());
-        self.module.define_data(val_data_id, &val_desc)
+        self.module
+            .define_data(val_data_id, &val_desc)
             .map_err(|e| CodegenError::new(format!("CSR values define: {e}")))?;
 
         // Get .rodata pointers as Cranelift Values
@@ -2053,17 +2301,13 @@ impl Compiler<'_> {
     /// Annotate sparsity hints when one operand is a known sparse weight.
     /// Stores a `SparsityHint` keyed by the Cranelift Value's u32 index (cast to NodeId)
     /// so that downstream passes can inspect per-matmul sparsity decisions.
-    fn annotate_sparsity_hints(
-        &mut self,
-        state: &FuncState,
-        lhs: Value,
-        rhs: Value,
-        op: BinOp,
-    ) {
-        use nsl_ast::NodeId;
+    fn annotate_sparsity_hints(&mut self, state: &FuncState, lhs: Value, rhs: Value, op: BinOp) {
         use crate::weight_aware::SparsityHint;
+        use nsl_ast::NodeId;
 
-        if op != BinOp::MatMul { return; }
+        if op != BinOp::MatMul {
+            return;
+        }
         let wmap = match self.features.weight_map {
             Some(ref w) => w,
             None => return,
@@ -2097,7 +2341,9 @@ impl Compiler<'_> {
                 };
                 // Key by rhs Value's u32 index (NodeId namespace is disjoint from
                 // Cranelift Value namespace; this is a codegen-internal hint only).
-                self.features.sparsity_hints.insert(NodeId(rhs.as_u32()), hint);
+                self.features
+                    .sparsity_hints
+                    .insert(NodeId(rhs.as_u32()), hint);
             }
         }
 
@@ -2127,7 +2373,9 @@ impl Compiler<'_> {
                 } else {
                     SparsityHint::Dense
                 };
-                self.features.sparsity_hints.insert(NodeId(lhs.as_u32()), hint);
+                self.features
+                    .sparsity_hints
+                    .insert(NodeId(lhs.as_u32()), hint);
             }
         }
     }
@@ -2142,7 +2390,9 @@ impl Compiler<'_> {
         scalar_val: Value,
         op: BinOp,
     ) -> (Option<Value>, bool) {
-        if op != BinOp::Mul { return (None, false); }
+        if op != BinOp::Mul {
+            return (None, false);
+        }
 
         // Check if the scalar comes from a known weight (e.g., scale tensor loaded from safetensors)
         if let Some(key) = state.weight_values.get(&scalar_val) {

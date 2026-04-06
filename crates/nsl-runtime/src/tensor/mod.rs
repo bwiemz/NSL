@@ -3787,3 +3787,78 @@ mod tests {
         nsl_tensor_free(ptr);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Training diagnostics (temporary — remove after flat-loss bug is resolved)
+// ---------------------------------------------------------------------------
+
+/// Debug: print gradient and parameter norms for the first N params.
+/// Called from codegen before the optimizer step loop.
+/// param_list, grads_list: NslList of tensor pointers. step: current global step.
+#[no_mangle]
+pub extern "C" fn nsl_debug_train_step(
+    param_list: i64,
+    grads_list: i64,
+    step: i64,
+) {
+    let n_params = crate::list::nsl_list_len(param_list);
+    let n_grads = crate::list::nsl_list_len(grads_list);
+    if step != 0 { return; } // only print on first step
+
+    eprintln!("[debug] step={} params={} grads={}", step, n_params, n_grads);
+
+    let show = n_params.min(n_grads);
+    for i in 0..show {
+        let p_ptr = crate::list::nsl_list_get(param_list, i);
+        let g_ptr = crate::list::nsl_list_get(grads_list, i);
+
+        let p = NslTensor::from_ptr(p_ptr);
+        let g = NslTensor::from_ptr(g_ptr);
+
+        let p_norm = tensor_l2_norm(p);
+        let g_norm = tensor_l2_norm(g);
+        let p_device = p.device;
+        let g_device = g.device;
+        let p_len = p.len;
+        let g_len = g.len;
+
+        eprintln!(
+            "  [{}] param: len={} dev={} norm={:.6}  grad: len={} dev={} norm={:.6}",
+            i, p_len, p_device, p_norm, g_len, g_device, g_norm,
+        );
+    }
+}
+
+fn tensor_l2_norm(t: &NslTensor) -> f64 {
+    if t.len == 0 || t.data.is_null() { return 0.0; }
+    let len = t.len as usize;
+
+    // Must read from correct device
+    if t.device > 0 {
+        // GPU tensor — copy to CPU for inspection
+        let cpu_ptr = nsl_tensor_to_device(t as *const NslTensor as i64, 0);
+        let cpu_t = NslTensor::from_ptr(cpu_ptr);
+        let norm = tensor_l2_norm(cpu_t);
+        nsl_tensor_free(cpu_ptr);
+        return norm;
+    }
+
+    let mut sum_sq = 0.0_f64;
+    match t.dtype {
+        1 => { // f32
+            let data = t.data as *const f32;
+            for i in 0..len {
+                let v = unsafe { *data.add(i) } as f64;
+                sum_sq += v * v;
+            }
+        }
+        _ => { // f64
+            let data = t.data as *const f64;
+            for i in 0..len {
+                let v = unsafe { *data.add(i) };
+                sum_sq += v * v;
+            }
+        }
+    }
+    sum_sq.sqrt()
+}

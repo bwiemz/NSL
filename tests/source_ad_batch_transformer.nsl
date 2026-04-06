@@ -1,0 +1,32 @@
+from nsl.nn.losses import cross_entropy
+
+model TinyTransformer:
+    embed: Tensor = randn([64, 16])
+    w_out: Tensor = randn([16, 64])
+
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let emb_3d = emb.reshape([batch, seq_len, 16])
+        let s = emb_3d.shape
+        let flat_emb = emb_3d.reshape([s[0] * s[1], s[2]])
+        let logits = flat_emb @ self.w_out
+        return logits.reshape([batch, seq_len, 64])
+
+let m = TinyTransformer()
+let tokens = full([32], 1.0)
+let loader = DataLoader(tokens, batch_size=1, seq_len=8, shuffle=false, drop_last=true)
+
+train(model = m, epochs = 2):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let logits = m.forward(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+
+print("source_ad_batch_transformer: PASS")

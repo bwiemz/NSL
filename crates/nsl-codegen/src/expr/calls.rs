@@ -75,13 +75,27 @@ impl Compiler<'_> {
                     self.emit_model_to_device(builder, &model_name, model_val, device_val)?;
                     return Ok(model_val);
                 }
-                return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
+                return self.compile_model_method_call(
+                    builder,
+                    state,
+                    object,
+                    &model_name,
+                    &member_name,
+                    args,
+                );
             }
             // Fallback for model array loop variables (type is Unknown but var was bound from model array)
             if matches!(obj_type, Type::Unknown) {
                 if let ExprKind::Ident(obj_sym) = &object.kind {
                     if let Some(model_name) = self.models.model_var_types.get(obj_sym).cloned() {
-                        return self.compile_model_method_call(builder, state, object, &model_name, &member_name, args);
+                        return self.compile_model_method_call(
+                            builder,
+                            state,
+                            object,
+                            &model_name,
+                            &member_name,
+                            args,
+                        );
                     }
                 }
                 eprintln!(
@@ -111,7 +125,9 @@ impl Compiler<'_> {
                 other => other, // forward any future named variants unchanged
             };
             if args.len() < 2 {
-                return Err(CodegenError::new("matmul rewrite: expected at least 2 arguments"));
+                return Err(CodegenError::new(
+                    "matmul rewrite: expected at least 2 arguments",
+                ));
             }
             let lhs = self.compile_expr(builder, state, &args[0].value)?;
             let rhs = self.compile_expr(builder, state, &args[1].value)?;
@@ -119,8 +135,17 @@ impl Compiler<'_> {
         }
 
         // Check if this is a kernel call (compiled GPU kernel)
-        if let Some((ptx_data_id, name_data_id)) = self.kernels.kernel_ptx_data.get(&func_name).cloned() {
-            return self.compile_kernel_call(builder, state, &func_name.clone(), args, ptx_data_id, name_data_id);
+        if let Some((ptx_data_id, name_data_id)) =
+            self.kernels.kernel_ptx_data.get(&func_name).cloned()
+        {
+            return self.compile_kernel_call(
+                builder,
+                state,
+                &func_name.clone(),
+                args,
+                ptx_data_id,
+                name_data_id,
+            );
         }
 
         // @fuse decorated function: emit fused elementwise kernel launch
@@ -135,31 +160,49 @@ impl Compiler<'_> {
                     }
 
                     // Build op-codes list for nsl_fused_elementwise_N
-                    let op_codes: Vec<i64> = op_chain.iter().filter_map(|op| match op.as_str() {
-                        "add" => Some(0), "mul" => Some(1), "sub" => Some(2),
-                        "div" => Some(3), "relu" => Some(4), "sigmoid" => Some(5),
-                        "tanh" => Some(6), "neg" => Some(7), "exp" => Some(8),
-                        "log" => Some(9), "sqrt" => Some(10), "abs" => Some(11),
-                        "gelu" => Some(12), "silu" => Some(13),
-                        _ => None,
-                    }).collect();
+                    let op_codes: Vec<i64> = op_chain
+                        .iter()
+                        .filter_map(|op| match op.as_str() {
+                            "add" => Some(0),
+                            "mul" => Some(1),
+                            "sub" => Some(2),
+                            "div" => Some(3),
+                            "relu" => Some(4),
+                            "sigmoid" => Some(5),
+                            "tanh" => Some(6),
+                            "neg" => Some(7),
+                            "exp" => Some(8),
+                            "log" => Some(9),
+                            "sqrt" => Some(10),
+                            "abs" => Some(11),
+                            "gelu" => Some(12),
+                            "silu" => Some(13),
+                            _ => None,
+                        })
+                        .collect();
 
                     if op_codes.len() == op_chain.len() && !compiled_args.is_empty() {
                         let ops_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                         for &code in &op_codes {
                             let code_val = builder.ins().iconst(cl_types::I64, code);
-                            self.compile_call_by_name(builder, "nsl_list_push", &[ops_list, code_val])?;
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_push",
+                                &[ops_list, code_val],
+                            )?;
                         }
                         let num_ops = builder.ins().iconst(cl_types::I64, op_codes.len() as i64);
 
                         let result = if compiled_args.len() >= 2 {
                             self.compile_call_by_name(
-                                builder, "nsl_fused_elementwise_2",
+                                builder,
+                                "nsl_fused_elementwise_2",
                                 &[compiled_args[0], compiled_args[1], ops_list, num_ops],
                             )?
                         } else {
                             self.compile_call_by_name(
-                                builder, "nsl_fused_elementwise_1",
+                                builder,
+                                "nsl_fused_elementwise_1",
                                 &[compiled_args[0], ops_list, num_ops],
                             )?
                         };
@@ -215,16 +258,26 @@ impl Compiler<'_> {
             return self.compile_higher_order_call(builder, state, &func_name, args);
         }
         // Paged KV cache builtins (M25) -- dispatch nsl_kv_cache_* and nsl_profiler_*
-        if matches!(func_name.as_str(),
-            "kv_cache_init" | "kv_cache_init_gpu" |
-            "kv_cache_alloc_seq" | "kv_cache_append" |
-            "kv_cache_k_ptr" | "kv_cache_v_ptr" |
-            "kv_cache_free_seq" | "kv_cache_seq_len" |
-            "kv_cache_seq_blocks" | "kv_cache_seq_num_blocks" |
-            "kv_cache_utilization" | "kv_cache_destroy" |
-            "profiler_start" | "profiler_stop" | "profiler_peak" |
-            "kernel_profiler_start" | "kernel_profiler_stop")
-        {
+        if matches!(
+            func_name.as_str(),
+            "kv_cache_init"
+                | "kv_cache_init_gpu"
+                | "kv_cache_alloc_seq"
+                | "kv_cache_append"
+                | "kv_cache_k_ptr"
+                | "kv_cache_v_ptr"
+                | "kv_cache_free_seq"
+                | "kv_cache_seq_len"
+                | "kv_cache_seq_blocks"
+                | "kv_cache_seq_num_blocks"
+                | "kv_cache_utilization"
+                | "kv_cache_destroy"
+                | "profiler_start"
+                | "profiler_stop"
+                | "profiler_peak"
+                | "kernel_profiler_start"
+                | "kernel_profiler_stop"
+        ) {
             let mut arg_vals = Vec::new();
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -257,7 +310,10 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, &rt_name, &arg_vals);
         }
         // Direct runtime builtins: enumerate, zip, sorted, reversed
-        if matches!(func_name.as_str(), "enumerate" | "zip" | "sorted" | "reversed") {
+        if matches!(
+            func_name.as_str(),
+            "enumerate" | "zip" | "sorted" | "reversed"
+        ) {
             let mut arg_vals = Vec::new();
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -270,7 +326,9 @@ impl Compiler<'_> {
         // For tensor arguments, fall through to the M14 tensor dispatch below.
         if matches!(func_name.as_str(), "sqrt" | "log" | "exp" | "sin" | "cos") {
             if args.len() != 1 {
-                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes exactly 1 argument"
+                )));
             }
             let arg_type = self.node_type(args[0].value.id).clone();
             if is_float_type(&arg_type) || is_int_type(&arg_type) {
@@ -283,7 +341,9 @@ impl Compiler<'_> {
                     }
                 } else {
                     let widened = match &arg_type {
-                        Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, val),
+                        Type::Int32 | Type::Int16 | Type::Int8 => {
+                            builder.ins().sextend(cl_types::I64, val)
+                        }
                         _ => val,
                     };
                     builder.ins().fcvt_from_sint(cl_types::F64, widened)
@@ -302,7 +362,11 @@ impl Compiler<'_> {
             let arg_type = self.node_type(args[0].value.id).clone();
             if is_float_type(&arg_type) || is_int_type(&arg_type) {
                 let val = self.compile_expr(builder, state, &args[0].value)?;
-                let rt_name = if is_float_type(&arg_type) { "nsl_abs_float" } else { "nsl_abs_int" };
+                let rt_name = if is_float_type(&arg_type) {
+                    "nsl_abs_float"
+                } else {
+                    "nsl_abs_int"
+                };
                 return self.compile_call_by_name(builder, rt_name, &[val]);
             }
             // else: tensor type -- fall through to M14 tensor dispatch
@@ -322,7 +386,9 @@ impl Compiler<'_> {
                 }
             } else {
                 let widened = match &arg_type {
-                    Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, val),
+                    Type::Int32 | Type::Int16 | Type::Int8 => {
+                        builder.ins().sextend(cl_types::I64, val)
+                    }
                     _ => val,
                 };
                 builder.ins().fcvt_from_sint(cl_types::F64, widened)
@@ -332,14 +398,20 @@ impl Compiler<'_> {
         // min/max: dispatch to int or float variant
         if matches!(func_name.as_str(), "min" | "max") {
             if args.len() != 2 {
-                return Err(CodegenError::new(format!("{func_name}() takes exactly 2 arguments")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes exactly 2 arguments"
+                )));
             }
             let a = self.compile_expr(builder, state, &args[0].value)?;
             let b = self.compile_expr(builder, state, &args[1].value)?;
             let a_type = self.node_type(args[0].value.id).clone();
             let b_type = self.node_type(args[1].value.id).clone();
             let is_float = is_float_type(&a_type) || is_float_type(&b_type);
-            let rt_name = format!("nsl_{}_{}", func_name, if is_float { "float" } else { "int" });
+            let rt_name = format!(
+                "nsl_{}_{}",
+                func_name,
+                if is_float { "float" } else { "int" }
+            );
             if is_float {
                 let a_f = if matches!(a_type, Type::F32) {
                     builder.ins().fpromote(cl_types::F64, a)
@@ -347,7 +419,9 @@ impl Compiler<'_> {
                     a
                 } else {
                     let w = match &a_type {
-                        Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, a),
+                        Type::Int32 | Type::Int16 | Type::Int8 => {
+                            builder.ins().sextend(cl_types::I64, a)
+                        }
                         _ => a,
                     };
                     builder.ins().fcvt_from_sint(cl_types::F64, w)
@@ -358,7 +432,9 @@ impl Compiler<'_> {
                     b
                 } else {
                     let w = match &b_type {
-                        Type::Int32 | Type::Int16 | Type::Int8 => builder.ins().sextend(cl_types::I64, b),
+                        Type::Int32 | Type::Int16 | Type::Int8 => {
+                            builder.ins().sextend(cl_types::I64, b)
+                        }
                         _ => b,
                     };
                     builder.ins().fcvt_from_sint(cl_types::F64, w)
@@ -408,16 +484,34 @@ impl Compiler<'_> {
             let msg_len = builder.ins().iconst(cl_types::I64, msg_str.len() as i64);
 
             if is_float {
-                let a_f = if is_float_type(&a_type) { a } else { builder.ins().fcvt_from_sint(cl_types::F64, a) };
-                let b_f = if is_float_type(&b_type) { b } else { builder.ins().fcvt_from_sint(cl_types::F64, b) };
-                return self.compile_call_by_name(builder, "nsl_assert_eq_float", &[a_f, b_f, msg_ptr, msg_len]);
+                let a_f = if is_float_type(&a_type) {
+                    a
+                } else {
+                    builder.ins().fcvt_from_sint(cl_types::F64, a)
+                };
+                let b_f = if is_float_type(&b_type) {
+                    b
+                } else {
+                    builder.ins().fcvt_from_sint(cl_types::F64, b)
+                };
+                return self.compile_call_by_name(
+                    builder,
+                    "nsl_assert_eq_float",
+                    &[a_f, b_f, msg_ptr, msg_len],
+                );
             }
-            return self.compile_call_by_name(builder, "nsl_assert_eq_int", &[a, b, msg_ptr, msg_len]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_assert_eq_int",
+                &[a, b, msg_ptr, msg_len],
+            );
         }
         // assert_close(a, b, rtol, atol)
         if func_name == "assert_close" {
             if args.len() != 4 {
-                return Err(CodegenError::new("assert_close() takes exactly 4 arguments (tensor, tensor, rtol, atol)"));
+                return Err(CodegenError::new(
+                    "assert_close() takes exactly 4 arguments (tensor, tensor, rtol, atol)",
+                ));
             }
             let a = self.compile_expr(builder, state, &args[0].value)?;
             let b = self.compile_expr(builder, state, &args[1].value)?;
@@ -427,15 +521,27 @@ impl Compiler<'_> {
             // Coerce rtol/atol to f64 if they are int
             let rtol_type = self.node_type(args[2].value.id).clone();
             let atol_type = self.node_type(args[3].value.id).clone();
-            let rtol_f = if is_float_type(&rtol_type) { rtol } else { builder.ins().fcvt_from_sint(cl_types::F64, rtol) };
-            let atol_f = if is_float_type(&atol_type) { atol } else { builder.ins().fcvt_from_sint(cl_types::F64, atol) };
+            let rtol_f = if is_float_type(&rtol_type) {
+                rtol
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, rtol)
+            };
+            let atol_f = if is_float_type(&atol_type) {
+                atol
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, atol)
+            };
 
             let msg_str = "assert_close";
             self.intern_string(msg_str)?;
             let msg_ptr = self.compile_string_literal(builder, msg_str)?;
             let msg_len = builder.ins().iconst(cl_types::I64, msg_str.len() as i64);
 
-            return self.compile_call_by_name(builder, "nsl_assert_close", &[a, b, rtol_f, atol_f, msg_ptr, msg_len]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_assert_close",
+                &[a, b, rtol_f, atol_f, msg_ptr, msg_len],
+            );
         }
         // Exit
         if func_name == "exit" {
@@ -453,7 +559,10 @@ impl Compiler<'_> {
             return self.compile_call_by_name(builder, "nsl_read_line", &[]);
         }
         // File I/O
-        if matches!(func_name.as_str(), "read_file" | "write_file" | "append_file" | "file_exists") {
+        if matches!(
+            func_name.as_str(),
+            "read_file" | "write_file" | "append_file" | "file_exists"
+        ) {
             let mut arg_vals = Vec::new();
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -471,7 +580,9 @@ impl Compiler<'_> {
         }
         if func_name == "set_training_mode" {
             if args.len() != 1 {
-                return Err(CodegenError::new("set_training_mode() takes exactly 1 argument (bool)"));
+                return Err(CodegenError::new(
+                    "set_training_mode() takes exactly 1 argument (bool)",
+                ));
             }
             let mode_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_set_training_mode", &[mode_val]);
@@ -479,7 +590,9 @@ impl Compiler<'_> {
         // Tensor creation builtins
         if matches!(func_name.as_str(), "zeros" | "ones" | "rand" | "randn") {
             if args.len() != 1 {
-                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument (shape list)")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes exactly 1 argument (shape list)"
+                )));
             }
             let shape_val = self.compile_expr(builder, state, &args[0].value)?;
             let rt_name = format!("nsl_tensor_{func_name}");
@@ -487,7 +600,9 @@ impl Compiler<'_> {
         }
         if func_name == "full" {
             if args.len() != 2 {
-                return Err(CodegenError::new("full() takes exactly 2 arguments (shape, value)"));
+                return Err(CodegenError::new(
+                    "full() takes exactly 2 arguments (shape, value)",
+                ));
             }
             let shape_val = self.compile_expr(builder, state, &args[0].value)?;
             let fill_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -501,13 +616,19 @@ impl Compiler<'_> {
         }
         if func_name == "arange" {
             if args.is_empty() || args.len() > 3 {
-                return Err(CodegenError::new("arange() takes 1-3 arguments (stop) or (start, stop[, step])"));
+                return Err(CodegenError::new(
+                    "arange() takes 1-3 arguments (stop) or (start, stop[, step])",
+                ));
             }
             let (start, stop, step) = match args.len() {
                 1 => {
                     let stop_val = self.compile_expr(builder, state, &args[0].value)?;
                     let stop_type = self.node_type(args[0].value.id).clone();
-                    let stop_f = if is_float_type(&stop_type) { stop_val } else { builder.ins().fcvt_from_sint(cl_types::F64, stop_val) };
+                    let stop_f = if is_float_type(&stop_type) {
+                        stop_val
+                    } else {
+                        builder.ins().fcvt_from_sint(cl_types::F64, stop_val)
+                    };
                     let zero = builder.ins().f64const(0.0);
                     let one = builder.ins().f64const(1.0);
                     (zero, stop_f, one)
@@ -515,23 +636,43 @@ impl Compiler<'_> {
                 2 => {
                     let start_val = self.compile_expr(builder, state, &args[0].value)?;
                     let start_type = self.node_type(args[0].value.id).clone();
-                    let start_f = if is_float_type(&start_type) { start_val } else { builder.ins().fcvt_from_sint(cl_types::F64, start_val) };
+                    let start_f = if is_float_type(&start_type) {
+                        start_val
+                    } else {
+                        builder.ins().fcvt_from_sint(cl_types::F64, start_val)
+                    };
                     let stop_val = self.compile_expr(builder, state, &args[1].value)?;
                     let stop_type = self.node_type(args[1].value.id).clone();
-                    let stop_f = if is_float_type(&stop_type) { stop_val } else { builder.ins().fcvt_from_sint(cl_types::F64, stop_val) };
+                    let stop_f = if is_float_type(&stop_type) {
+                        stop_val
+                    } else {
+                        builder.ins().fcvt_from_sint(cl_types::F64, stop_val)
+                    };
                     let one = builder.ins().f64const(1.0);
                     (start_f, stop_f, one)
                 }
                 3 => {
                     let start_val = self.compile_expr(builder, state, &args[0].value)?;
                     let start_type = self.node_type(args[0].value.id).clone();
-                    let start_f = if is_float_type(&start_type) { start_val } else { builder.ins().fcvt_from_sint(cl_types::F64, start_val) };
+                    let start_f = if is_float_type(&start_type) {
+                        start_val
+                    } else {
+                        builder.ins().fcvt_from_sint(cl_types::F64, start_val)
+                    };
                     let stop_val = self.compile_expr(builder, state, &args[1].value)?;
                     let stop_type = self.node_type(args[1].value.id).clone();
-                    let stop_f = if is_float_type(&stop_type) { stop_val } else { builder.ins().fcvt_from_sint(cl_types::F64, stop_val) };
+                    let stop_f = if is_float_type(&stop_type) {
+                        stop_val
+                    } else {
+                        builder.ins().fcvt_from_sint(cl_types::F64, stop_val)
+                    };
                     let step_val = self.compile_expr(builder, state, &args[2].value)?;
                     let step_type = self.node_type(args[2].value.id).clone();
-                    let step_f = if is_float_type(&step_type) { step_val } else { builder.ins().fcvt_from_sint(cl_types::F64, step_val) };
+                    let step_f = if is_float_type(&step_type) {
+                        step_val
+                    } else {
+                        builder.ins().fcvt_from_sint(cl_types::F64, step_val)
+                    };
                     (start_f, stop_f, step_f)
                 }
                 _ => unreachable!(),
@@ -541,11 +682,15 @@ impl Compiler<'_> {
 
         // Element-wise tensor builtins (M14)
         // Skip if there's a user-defined function with the same name (e.g., nsl.math.sign)
-        if matches!(func_name.as_str(), "exp" | "log" | "sqrt" | "abs" | "sign" | "neg")
-            && !self.registry.functions.contains_key(&func_name)
+        if matches!(
+            func_name.as_str(),
+            "exp" | "log" | "sqrt" | "abs" | "sign" | "neg"
+        ) && !self.registry.functions.contains_key(&func_name)
         {
             if args.len() != 1 {
-                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes exactly 1 argument"
+                )));
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
             // FBIP Phase 2: emit inplace variant when arg is single-use
@@ -557,7 +702,9 @@ impl Compiler<'_> {
             && !self.registry.functions.contains_key(&func_name)
         {
             if args.len() != 1 {
-                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes exactly 1 argument"
+                )));
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
             // FBIP Phase 2: emit inplace variant when arg is single-use
@@ -569,7 +716,9 @@ impl Compiler<'_> {
             && !self.registry.functions.contains_key(&func_name)
         {
             if args.len() != 1 {
-                return Err(CodegenError::new(format!("{func_name}() takes exactly 1 argument")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes exactly 1 argument"
+                )));
             }
             let val = self.compile_expr(builder, state, &args[0].value)?;
             let rt_name = format!("nsl_{func_name}");
@@ -594,7 +743,9 @@ impl Compiler<'_> {
         // softmax(tensor, dim) -- two args
         if func_name == "softmax" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
-                return Err(CodegenError::new("softmax() takes exactly 2 arguments (tensor, dim)"));
+                return Err(CodegenError::new(
+                    "softmax() takes exactly 2 arguments (tensor, dim)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -603,29 +754,51 @@ impl Compiler<'_> {
         // log_softmax(tensor, dim) -- two args
         if func_name == "log_softmax" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
-                return Err(CodegenError::new("log_softmax() takes exactly 2 arguments (tensor, dim)"));
+                return Err(CodegenError::new(
+                    "log_softmax() takes exactly 2 arguments (tensor, dim)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_traced_call(builder, "nsl_tensor_logsoftmax", &[tensor_val, dim_val]);
+            return self.compile_traced_call(
+                builder,
+                "nsl_tensor_logsoftmax",
+                &[tensor_val, dim_val],
+            );
         }
         if func_name == "clamp" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
-                return Err(CodegenError::new("clamp() takes exactly 3 arguments (tensor, min, max)"));
+                return Err(CodegenError::new(
+                    "clamp() takes exactly 3 arguments (tensor, min, max)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let min_val = self.compile_expr(builder, state, &args[1].value)?;
             let max_val = self.compile_expr(builder, state, &args[2].value)?;
             // Ensure min/max are f64
             let min_type = self.node_type(args[1].value.id).clone();
-            let min_f = if is_float_type(&min_type) { min_val } else { builder.ins().fcvt_from_sint(cl_types::F64, min_val) };
+            let min_f = if is_float_type(&min_type) {
+                min_val
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, min_val)
+            };
             let max_type = self.node_type(args[2].value.id).clone();
-            let max_f = if is_float_type(&max_type) { max_val } else { builder.ins().fcvt_from_sint(cl_types::F64, max_val) };
-            return self.compile_call_by_name(builder, "nsl_tensor_clamp", &[tensor_val, min_f, max_f]);
+            let max_f = if is_float_type(&max_type) {
+                max_val
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, max_val)
+            };
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_clamp",
+                &[tensor_val, min_f, max_f],
+            );
         }
         if func_name == "copy_data" {
             if args.len() != 2 {
-                return Err(CodegenError::new("copy_data() takes exactly 2 arguments (dest, src)"));
+                return Err(CodegenError::new(
+                    "copy_data() takes exactly 2 arguments (dest, src)",
+                ));
             }
             let dest = self.compile_expr(builder, state, &args[0].value)?;
             let src = self.compile_expr(builder, state, &args[1].value)?;
@@ -634,7 +807,9 @@ impl Compiler<'_> {
         }
         if func_name == "add_inplace" {
             if args.len() != 2 {
-                return Err(CodegenError::new("add_inplace() takes exactly 2 arguments (dest, src)"));
+                return Err(CodegenError::new(
+                    "add_inplace() takes exactly 2 arguments (dest, src)",
+                ));
             }
             let dest = self.compile_expr(builder, state, &args[0].value)?;
             let src = self.compile_expr(builder, state, &args[1].value)?;
@@ -658,7 +833,9 @@ impl Compiler<'_> {
         }
         if func_name == "reduce_max" {
             if args.len() != 3 {
-                return Err(CodegenError::new("reduce_max() takes exactly 3 arguments (tensor, dim, keepdim)"));
+                return Err(CodegenError::new(
+                    "reduce_max() takes exactly 3 arguments (tensor, dim, keepdim)",
+                ));
             }
             let t = self.compile_expr(builder, state, &args[0].value)?;
             let dim = self.compile_expr(builder, state, &args[1].value)?;
@@ -667,7 +844,9 @@ impl Compiler<'_> {
         }
         if func_name == "gather" {
             if args.len() != 3 {
-                return Err(CodegenError::new("gather() takes exactly 3 arguments (tensor, dim, indices)"));
+                return Err(CodegenError::new(
+                    "gather() takes exactly 3 arguments (tensor, dim, indices)",
+                ));
             }
             let t = self.compile_expr(builder, state, &args[0].value)?;
             let dim = self.compile_expr(builder, state, &args[1].value)?;
@@ -677,7 +856,9 @@ impl Compiler<'_> {
         // layernorm(input, weight, bias, eps) -> tensor
         if func_name == "layernorm" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 4 {
-                return Err(CodegenError::new("layernorm() takes exactly 4 arguments (input, weight, bias, eps)"));
+                return Err(CodegenError::new(
+                    "layernorm() takes exactly 4 arguments (input, weight, bias, eps)",
+                ));
             }
             let input_val = self.compile_expr(builder, state, &args[0].value)?;
             let weight_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -685,36 +866,68 @@ impl Compiler<'_> {
             let eps_val = self.compile_expr(builder, state, &args[3].value)?;
             // Ensure eps is f64
             let eps_type = self.node_type(args[3].value.id).clone();
-            let eps_f = if is_float_type(&eps_type) { eps_val } else { builder.ins().fcvt_from_sint(cl_types::F64, eps_val) };
-            return self.compile_call_by_name(builder, "nsl_tensor_layernorm", &[input_val, weight_val, bias_val, eps_f]);
+            let eps_f = if is_float_type(&eps_type) {
+                eps_val
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, eps_val)
+            };
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_layernorm",
+                &[input_val, weight_val, bias_val, eps_f],
+            );
         }
         // rmsnorm(input, weight, eps) -> tensor
         if func_name == "rmsnorm" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
-                return Err(CodegenError::new("rmsnorm() takes exactly 3 arguments (input, weight, eps)"));
+                return Err(CodegenError::new(
+                    "rmsnorm() takes exactly 3 arguments (input, weight, eps)",
+                ));
             }
             let input_val = self.compile_expr(builder, state, &args[0].value)?;
             let weight_val = self.compile_expr(builder, state, &args[1].value)?;
             let eps_val = self.compile_expr(builder, state, &args[2].value)?;
             let eps_type = self.node_type(args[2].value.id).clone();
-            let eps_f = if is_float_type(&eps_type) { eps_val } else { builder.ins().fcvt_from_sint(cl_types::F64, eps_val) };
-            return self.compile_call_by_name(builder, "nsl_tensor_rmsnorm", &[input_val, weight_val, eps_f]);
+            let eps_f = if is_float_type(&eps_type) {
+                eps_val
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, eps_val)
+            };
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_rmsnorm",
+                &[input_val, weight_val, eps_f],
+            );
         }
         // dropout(tensor, p, training) -> tensor
         if func_name == "dropout" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 3 {
-                return Err(CodegenError::new("dropout() takes exactly 3 arguments (tensor, p, training)"));
+                return Err(CodegenError::new(
+                    "dropout() takes exactly 3 arguments (tensor, p, training)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let p_val = self.compile_expr(builder, state, &args[1].value)?;
             let p_type = self.node_type(args[1].value.id).clone();
-            let p_f = if is_float_type(&p_type) { p_val } else { builder.ins().fcvt_from_sint(cl_types::F64, p_val) };
+            let p_f = if is_float_type(&p_type) {
+                p_val
+            } else {
+                builder.ins().fcvt_from_sint(cl_types::F64, p_val)
+            };
             let training_val = self.compile_expr(builder, state, &args[2].value)?;
             let training_i8 = {
                 let vt = builder.func.dfg.value_type(training_val);
-                if vt == cl_types::I8 { training_val } else { builder.ins().ireduce(cl_types::I8, training_val) }
+                if vt == cl_types::I8 {
+                    training_val
+                } else {
+                    builder.ins().ireduce(cl_types::I8, training_val)
+                }
             };
-            return self.compile_call_by_name(builder, "nsl_tensor_dropout", &[tensor_val, p_f, training_i8]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_dropout",
+                &[tensor_val, p_f, training_i8],
+            );
         }
         // conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w) -> tensor
         if func_name == "conv2d" && !self.registry.functions.contains_key(&func_name) {
@@ -728,7 +941,13 @@ impl Compiler<'_> {
             let stride_w = self.compile_expr(builder, state, &args[4].value)?;
             let pad_h = self.compile_expr(builder, state, &args[5].value)?;
             let pad_w = self.compile_expr(builder, state, &args[6].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_conv2d", &[input_val, weight_val, bias_val, stride_h, stride_w, pad_h, pad_w]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_conv2d",
+                &[
+                    input_val, weight_val, bias_val, stride_h, stride_w, pad_h, pad_w,
+                ],
+            );
         }
         // maxpool2d(input, kernel_h, kernel_w, stride, padding) -> tensor
         if func_name == "maxpool2d" && !self.registry.functions.contains_key(&func_name) {
@@ -740,30 +959,48 @@ impl Compiler<'_> {
             let kernel_w = self.compile_expr(builder, state, &args[2].value)?;
             let stride_val = self.compile_expr(builder, state, &args[3].value)?;
             let padding_val = self.compile_expr(builder, state, &args[4].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_maxpool2d", &[input_val, kernel_h, kernel_w, stride_val, padding_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_maxpool2d",
+                &[input_val, kernel_h, kernel_w, stride_val, padding_val],
+            );
         }
         // embedding_lookup(weight, indices) -> tensor
         if func_name == "embedding_lookup" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
-                return Err(CodegenError::new("embedding_lookup() takes exactly 2 arguments (weight, indices)"));
+                return Err(CodegenError::new(
+                    "embedding_lookup() takes exactly 2 arguments (weight, indices)",
+                ));
             }
             let weight_val = self.compile_expr(builder, state, &args[0].value)?;
             let indices_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_embedding_lookup", &[weight_val, indices_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_embedding_lookup",
+                &[weight_val, indices_val],
+            );
         }
         // bias_add(tensor, bias) -> tensor -- broadcasts 1D bias over 2D tensor
         if func_name == "bias_add" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
-                return Err(CodegenError::new("bias_add() takes exactly 2 arguments (tensor, bias)"));
+                return Err(CodegenError::new(
+                    "bias_add() takes exactly 2 arguments (tensor, bias)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let bias_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_bias_add", &[tensor_val, bias_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_bias_add",
+                &[tensor_val, bias_val],
+            );
         }
         // tensor_slice(tensor, dim, start, end) -> tensor
         if func_name == "tensor_slice" {
             if args.len() != 4 {
-                return Err(CodegenError::new("tensor_slice() takes exactly 4 arguments (tensor, dim, start, end)"));
+                return Err(CodegenError::new(
+                    "tensor_slice() takes exactly 4 arguments (tensor, dim, start, end)",
+                ));
             }
             let t = self.compile_expr(builder, state, &args[0].value)?;
             let dim = self.compile_expr(builder, state, &args[1].value)?;
@@ -774,7 +1011,9 @@ impl Compiler<'_> {
         // tensor_cat(list_of_tensors, dim) -> tensor
         if func_name == "tensor_cat" {
             if args.len() != 2 {
-                return Err(CodegenError::new("tensor_cat() takes exactly 2 arguments (tensor_list, dim)"));
+                return Err(CodegenError::new(
+                    "tensor_cat() takes exactly 2 arguments (tensor_list, dim)",
+                ));
             }
             let list = self.compile_expr(builder, state, &args[0].value)?;
             let dim = self.compile_expr(builder, state, &args[1].value)?;
@@ -783,16 +1022,24 @@ impl Compiler<'_> {
         // M18a: unsqueeze(tensor, dim) -- free function form
         if func_name == "unsqueeze" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
-                return Err(CodegenError::new("unsqueeze() takes exactly 2 arguments (tensor, dim)"));
+                return Err(CodegenError::new(
+                    "unsqueeze() takes exactly 2 arguments (tensor, dim)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_unsqueeze", &[tensor_val, dim_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_unsqueeze",
+                &[tensor_val, dim_val],
+            );
         }
         // M18a: stack(list_of_tensors, dim) -> tensor
         if func_name == "stack" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
-                return Err(CodegenError::new("stack() takes exactly 2 arguments (tensor_list, dim)"));
+                return Err(CodegenError::new(
+                    "stack() takes exactly 2 arguments (tensor_list, dim)",
+                ));
             }
             let list_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -801,7 +1048,9 @@ impl Compiler<'_> {
         // contiguous(tensor) -> tensor — materialize non-contiguous views
         if func_name == "contiguous" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
-                return Err(CodegenError::new("contiguous() takes exactly 1 argument (tensor)"));
+                return Err(CodegenError::new(
+                    "contiguous() takes exactly 1 argument (tensor)",
+                ));
             }
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[tensor_val]);
@@ -809,7 +1058,9 @@ impl Compiler<'_> {
         // M18a: causal_mask(seq_len) -> tensor
         if func_name == "causal_mask" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
-                return Err(CodegenError::new("causal_mask() takes exactly 1 argument (seq_len)"));
+                return Err(CodegenError::new(
+                    "causal_mask() takes exactly 1 argument (seq_len)",
+                ));
             }
             let seq_len_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len_val]);
@@ -817,7 +1068,9 @@ impl Compiler<'_> {
         // M27: scaled_dot_product_attention(Q, K, V, scale, causal=false)
         // Naive path: softmax((Q @ K.T) * scale [+ causal_mask]) @ V
         // Flash path: PTX dispatch via nsl_flash_attention when @flash_attention decorator is present
-        if func_name == "scaled_dot_product_attention" && !self.registry.functions.contains_key(&func_name) {
+        if func_name == "scaled_dot_product_attention"
+            && !self.registry.functions.contains_key(&func_name)
+        {
             if args.len() < 4 {
                 return Err(CodegenError::new(
                     "scaled_dot_product_attention() requires at least 4 arguments (Q, K, V, scale)",
@@ -852,21 +1105,27 @@ impl Compiler<'_> {
             // M34: Check for context parallelism (ring attention)
             // Look up config using the model name prefix from the mangled function name
             // ("ModelName__method_name"), mirroring the MoE/speculative patterns.
-            let cp_config = state.current_function_name.as_ref()
-                .and_then(|fn_name| {
-                    let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    self.features.context_parallel_configs.iter()
-                        .find(|(key, _)| key.starts_with(model_prefix))
-                        .map(|(_, info)| info.clone())
-                });
+            let cp_config = state.current_function_name.as_ref().and_then(|fn_name| {
+                let model_prefix = fn_name.split("__").next().unwrap_or("");
+                self.features
+                    .context_parallel_configs
+                    .iter()
+                    .find(|(key, _)| key.starts_with(model_prefix))
+                    .map(|(_, info)| info.clone())
+            });
 
             if let Some(cp_info) = cp_config {
-                eprintln!("[nsl] Context parallelism active: ring_size={}", cp_info.ring_size);
+                eprintln!(
+                    "[nsl] Context parallelism active: ring_size={}",
+                    cp_info.ring_size
+                );
 
                 // Initialize context parallel context:
                 // nsl_cp_init(ring_size, local_seq_len, num_heads, num_kv_heads, head_dim, dtype)
                 // Pass zeros for dims inferred by runtime; dtype=1 means f32.
-                let ring_size = builder.ins().iconst(cl_types::I64, cp_info.ring_size as i64);
+                let ring_size = builder
+                    .ins()
+                    .iconst(cl_types::I64, cp_info.ring_size as i64);
                 let zero = builder.ins().iconst(cl_types::I64, 0);
                 let dtype_val = builder.ins().iconst(cl_types::I64, 1); // f32
                 let cp_ctx = self.compile_call_by_name(
@@ -888,13 +1147,28 @@ impl Compiler<'_> {
                 // nsl_ring_attention(cp_ctx, q_part, k, v, scale, causal,
                 //                    null, null, null, null, null, null, null)
                 // Trailing nulls are reserved for future paged/GQA extensions.
-                let causal_flag = builder.ins().iconst(cl_types::I64, if causal { 1 } else { 0 });
+                let causal_flag = builder
+                    .ins()
+                    .iconst(cl_types::I64, if causal { 1 } else { 0 });
                 let null = builder.ins().iconst(cl_types::I64, 0);
                 let ring_result = self.compile_call_by_name(
                     builder,
                     "nsl_ring_attention",
-                    &[cp_ctx, q_part, k_val, v_val, scale_val, causal_flag,
-                      null, null, null, null, null, null, null],
+                    &[
+                        cp_ctx,
+                        q_part,
+                        k_val,
+                        v_val,
+                        scale_val,
+                        causal_flag,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                    ],
                 )?;
 
                 // Gather partitioned outputs back to full sequence:
@@ -914,21 +1188,29 @@ impl Compiler<'_> {
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
-            let k_t = self.compile_call_by_name(builder, "nsl_tensor_transpose", &[k_val, dim_m2, dim_m1])?;
+            let k_t = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_transpose",
+                &[k_val, dim_m2, dim_m1],
+            )?;
             let scores = self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t])?;
-            let scaled = self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
+            let scaled =
+                self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
 
             let masked = if causal {
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
-                let seq_len = self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
-                let mask = self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
+                let seq_len =
+                    self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
+                let mask =
+                    self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
                 self.compile_traced_call(builder, "nsl_tensor_add", &[scaled, mask])?
             } else {
                 scaled
             };
 
             let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
-            let attn_weights = self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
+            let attn_weights =
+                self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
             return self.compile_traced_call(builder, "nsl_tensor_matmul", &[attn_weights, v_val]);
         }
 
@@ -956,7 +1238,9 @@ impl Compiler<'_> {
                 };
                 return self.compile_traced_call(builder, &rt_name, &[t, dim, keepdim]);
             } else {
-                return Err(CodegenError::new(format!("{func_name}() takes 1 or 3 arguments")));
+                return Err(CodegenError::new(format!(
+                    "{func_name}() takes 1 or 3 arguments"
+                )));
             }
         }
 
@@ -972,18 +1256,26 @@ impl Compiler<'_> {
             let vocab_size = self.compile_expr(builder, state, &args[1].value)?;
             let min_freq = self.compile_expr(builder, state, &args[2].value)?;
             let special_tokens = self.compile_expr(builder, state, &args[3].value)?;
-            return self.compile_call_by_name(builder, "nsl_bpe_train", &[path_val, vocab_size, min_freq, special_tokens]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_bpe_train",
+                &[path_val, vocab_size, min_freq, special_tokens],
+            );
         }
         if func_name == "tokenizer_load" {
             if args.len() != 1 {
-                return Err(CodegenError::new("tokenizer_load() takes exactly 1 argument (path)"));
+                return Err(CodegenError::new(
+                    "tokenizer_load() takes exactly 1 argument (path)",
+                ));
             }
             let path_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_load", &[path_val]);
         }
         if func_name == "tokenizer_save" {
             if args.len() != 2 {
-                return Err(CodegenError::new("tokenizer_save() takes exactly 2 arguments (handle, path)"));
+                return Err(CodegenError::new(
+                    "tokenizer_save() takes exactly 2 arguments (handle, path)",
+                ));
             }
             let handle = self.compile_expr(builder, state, &args[0].value)?;
             let path_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -991,7 +1283,9 @@ impl Compiler<'_> {
         }
         if func_name == "tokenizer_encode" {
             if args.len() != 2 {
-                return Err(CodegenError::new("tokenizer_encode() takes exactly 2 arguments (handle, text)"));
+                return Err(CodegenError::new(
+                    "tokenizer_encode() takes exactly 2 arguments (handle, text)",
+                ));
             }
             let handle = self.compile_expr(builder, state, &args[0].value)?;
             let text_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -999,15 +1293,23 @@ impl Compiler<'_> {
         }
         if func_name == "tokenizer_decode" {
             if args.len() != 2 {
-                return Err(CodegenError::new("tokenizer_decode() takes exactly 2 arguments (handle, tensor)"));
+                return Err(CodegenError::new(
+                    "tokenizer_decode() takes exactly 2 arguments (handle, tensor)",
+                ));
             }
             let handle = self.compile_expr(builder, state, &args[0].value)?;
             let tensor_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_tokenizer_decode", &[handle, tensor_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tokenizer_decode",
+                &[handle, tensor_val],
+            );
         }
         if func_name == "tokenizer_vocab_size" {
             if args.len() != 1 {
-                return Err(CodegenError::new("tokenizer_vocab_size() takes exactly 1 argument (handle)"));
+                return Err(CodegenError::new(
+                    "tokenizer_vocab_size() takes exactly 1 argument (handle)",
+                ));
             }
             let handle = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tokenizer_vocab_size", &[handle]);
@@ -1031,11 +1333,16 @@ impl Compiler<'_> {
                 builder.ins().ireduce(cl_types::I8, truncation)
             };
             let max_len = self.compile_expr(builder, state, &args[4].value)?;
-            return self.compile_call_by_name(builder, "nsl_tokenizer_encode_batch", &[handle, texts, padding_i8, truncation_i8, max_len]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tokenizer_encode_batch",
+                &[handle, texts, padding_i8, truncation_i8, max_len],
+            );
         }
 
         // Quantization functions (M16)
-        if func_name == "nsl_qtensor_quantize" && !self.registry.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_quantize" && !self.registry.functions.contains_key(&func_name)
+        {
             if args.len() != 5 {
                 return Err(CodegenError::new("nsl_qtensor_quantize() takes exactly 5 arguments (tensor, dtype, granularity, axis, group_size)"));
             }
@@ -1044,33 +1351,53 @@ impl Compiler<'_> {
             let gran_val = self.compile_expr(builder, state, &args[2].value)?;
             let axis_val = self.compile_expr(builder, state, &args[3].value)?;
             let group_val = self.compile_expr(builder, state, &args[4].value)?;
-            return self.compile_call_by_name(builder, "nsl_qtensor_quantize", &[tensor_val, dtype_val, gran_val, axis_val, group_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_qtensor_quantize",
+                &[tensor_val, dtype_val, gran_val, axis_val, group_val],
+            );
         }
-        if func_name == "nsl_qtensor_dequantize" && !self.registry.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_dequantize"
+            && !self.registry.functions.contains_key(&func_name)
+        {
             if args.len() != 1 {
-                return Err(CodegenError::new("nsl_qtensor_dequantize() takes exactly 1 argument (qtensor)"));
+                return Err(CodegenError::new(
+                    "nsl_qtensor_dequantize() takes exactly 1 argument (qtensor)",
+                ));
             }
             let qt_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt_val]);
         }
-        if func_name == "nsl_qtensor_matmul_mixed" && !self.registry.functions.contains_key(&func_name) {
+        if func_name == "nsl_qtensor_matmul_mixed"
+            && !self.registry.functions.contains_key(&func_name)
+        {
             if args.len() != 2 {
-                return Err(CodegenError::new("nsl_qtensor_matmul_mixed() takes exactly 2 arguments (tensor, qtensor)"));
+                return Err(CodegenError::new(
+                    "nsl_qtensor_matmul_mixed() takes exactly 2 arguments (tensor, qtensor)",
+                ));
             }
             let x_val = self.compile_expr(builder, state, &args[0].value)?;
             let qw_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_qtensor_matmul_mixed", &[x_val, qw_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_qtensor_matmul_mixed",
+                &[x_val, qw_val],
+            );
         }
         if func_name == "nsl_qtensor_dtype" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
-                return Err(CodegenError::new("nsl_qtensor_dtype() takes exactly 1 argument (qtensor)"));
+                return Err(CodegenError::new(
+                    "nsl_qtensor_dtype() takes exactly 1 argument (qtensor)",
+                ));
             }
             let qt_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_dtype", &[qt_val]);
         }
         if func_name == "nsl_qtensor_shape" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {
-                return Err(CodegenError::new("nsl_qtensor_shape() takes exactly 1 argument (qtensor)"));
+                return Err(CodegenError::new(
+                    "nsl_qtensor_shape() takes exactly 1 argument (qtensor)",
+                ));
             }
             let qt_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_qtensor_shape", &[qt_val]);
@@ -1100,7 +1427,9 @@ impl Compiler<'_> {
         // Optional second arg: device (0=CPU default, 1=CUDA)
         if func_name == "load_safetensors" {
             if args.is_empty() || args.len() > 2 {
-                return Err(CodegenError::new("load_safetensors() takes 1-2 arguments (path, device=0)"));
+                return Err(CodegenError::new(
+                    "load_safetensors() takes 1-2 arguments (path, device=0)",
+                ));
             }
             let path_val = self.compile_expr(builder, state, &args[0].value)?;
             let path_str = match &args[0].value.kind {
@@ -1117,13 +1446,19 @@ impl Compiler<'_> {
             } else {
                 builder.ins().iconst(cl_types::I64, 0)
             };
-            return self.compile_call_by_name(builder, "nsl_safetensors_load", &[path_val, path_len, device_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_safetensors_load",
+                &[path_val, path_len, device_val],
+            );
         }
 
         // Safetensors save intrinsic: save_safetensors(weights_dict, "path.safetensors")
         if func_name == "save_safetensors" {
             if args.len() != 2 {
-                return Err(CodegenError::new("save_safetensors() takes exactly 2 arguments (weights_dict, path)"));
+                return Err(CodegenError::new(
+                    "save_safetensors() takes exactly 2 arguments (weights_dict, path)",
+                ));
             }
             let dict_val = self.compile_expr(builder, state, &args[0].value)?;
             let path_val = self.compile_expr(builder, state, &args[1].value)?;
@@ -1136,7 +1471,11 @@ impl Compiler<'_> {
                 }
             };
             let path_len = builder.ins().iconst(cl_types::I64, path_str.len() as i64);
-            return self.compile_call_by_name(builder, "nsl_safetensors_save", &[dict_val, path_val, path_len]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_safetensors_save",
+                &[dict_val, path_val, path_len],
+            );
         }
 
         // M32: MoE dispatch intrinsic
@@ -1156,10 +1495,14 @@ impl Compiler<'_> {
             // arbitrary entry via .values().next().
             // Look up MoE config by matching model name prefix from mangled function name.
             // Try both "ModelName__method" pattern and any config key matching.
-            let config = state.current_function_name.as_ref()
+            let config = state
+                .current_function_name
+                .as_ref()
                 .and_then(|fn_name| {
                     let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    self.features.moe_configs.iter()
+                    self.features
+                        .moe_configs
+                        .iter()
                         .find(|(key, _)| key.starts_with(model_prefix))
                         .map(|(_, info)| info.clone())
                 })
@@ -1176,9 +1519,16 @@ impl Compiler<'_> {
                 None => (8, 2, 1.25f32), // defaults
             };
 
-            let num_experts_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
-            let top_k_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, top_k as i64);
-            let cap_bits = builder.ins().iconst(cranelift_codegen::ir::types::I64, capacity_factor.to_bits() as i64);
+            let num_experts_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
+            let top_k_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, top_k as i64);
+            let cap_bits = builder.ins().iconst(
+                cranelift_codegen::ir::types::I64,
+                capacity_factor.to_bits() as i64,
+            );
 
             // Call nsl_moe_dispatch_full(tokens, logits, num_experts, top_k, capacity_factor_bits)
             // Returns a new NslTensor with the MoE output
@@ -1207,13 +1557,14 @@ impl Compiler<'_> {
 
             // Look up @speculative config using model name prefix from the mangled
             // function name ("ModelName__method_name"), mirroring the MoE pattern (M32).
-            let config = state.current_function_name.as_ref()
-                .and_then(|fn_name| {
-                    let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    self.features.speculative_configs.iter()
-                        .find(|(key, _)| key.starts_with(model_prefix))
-                        .map(|(_, info)| info.clone())
-                });
+            let config = state.current_function_name.as_ref().and_then(|fn_name| {
+                let model_prefix = fn_name.split("__").next().unwrap_or("");
+                self.features
+                    .speculative_configs
+                    .iter()
+                    .find(|(key, _)| key.starts_with(model_prefix))
+                    .map(|(_, info)| info.clone())
+            });
 
             let (temperature, num_tokens, method_id, tree_width) = match &config {
                 Some(info) => (
@@ -1241,15 +1592,30 @@ impl Compiler<'_> {
                 cranelift_codegen::ir::types::I64,
                 temperature.to_bits() as i64,
             );
-            let num_tokens_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, num_tokens);
-            let method_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, method_id);
-            let tree_width_val = builder.ins().iconst(cranelift_codegen::ir::types::I64, tree_width);
+            let num_tokens_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, num_tokens);
+            let method_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, method_id);
+            let tree_width_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, tree_width);
 
             let result = self.compile_call_by_name(
                 builder,
                 "nsl_speculative_decode_step",
-                &[draft_tokens, draft_logits, verifier_logits, draft_len, vocab_size, temp_bits,
-                  num_tokens_val, method_val, tree_width_val],
+                &[
+                    draft_tokens,
+                    draft_logits,
+                    verifier_logits,
+                    draft_len,
+                    vocab_size,
+                    temp_bits,
+                    num_tokens_val,
+                    method_val,
+                    tree_width_val,
+                ],
             )?;
             return Ok(result);
         }
@@ -1271,14 +1637,22 @@ impl Compiler<'_> {
             } else {
                 builder.ins().iconst(cl_types::I64, -1_i64)
             };
-            return self.compile_call_by_name(builder, "nsl_tensor_topk", &[tensor_val, k_val, dim_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_topk",
+                &[tensor_val, k_val, dim_val],
+            );
         }
 
         // multinomial(tensor, num_samples)
         if func_name == "multinomial" {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let n_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_tensor_multinomial", &[tensor_val, n_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_multinomial",
+                &[tensor_val, n_val],
+            );
         }
 
         // M44b: generate(model, tokens, max_tokens=256, temperature=0.7, top_p=0.9, schema=...)
@@ -1293,7 +1667,8 @@ impl Compiler<'_> {
                 // Enqueue the request — nsl_serve_enqueue(prompt_ptr, prompt_len, max_tokens, temp, top_p)
                 // tokens_val is used as prompt_ptr; model_val as prompt_len placeholder
                 let request_id = self.compile_call_by_name(
-                    builder, "nsl_serve_enqueue",
+                    builder,
+                    "nsl_serve_enqueue",
                     &[tokens_val, model_val, max_tokens, temperature, top_p],
                 )?;
 
@@ -1315,16 +1690,27 @@ impl Compiler<'_> {
                     // The runtime interprets start_state > 0 as "constrained decoding active".
                     // We use 1 to distinguish "grammar set" from "no grammar" (0).
                     let start_state = builder.ins().iconst(cl_types::I64, 1);
-                    self.compile_call_by_name(builder, "nsl_serve_set_grammar", &[request_id, start_state])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_serve_set_grammar",
+                        &[request_id, start_state],
+                    )?;
                     eprintln!("[nsl] Constrained decoding active: schema='{}'", schema);
                 } else {
                     // Check if the current function has a model-level @grammar decorator
                     let current_fn_name = state.current_function_name.clone().unwrap_or_default();
-                    if let Some(grammar_info) = self.features.grammar_configs.get(&current_fn_name) {
-                        if !grammar_info.grammar_source.is_empty() || !grammar_info.start_rule.is_empty() {
+                    if let Some(grammar_info) = self.features.grammar_configs.get(&current_fn_name)
+                    {
+                        if !grammar_info.grammar_source.is_empty()
+                            || !grammar_info.start_rule.is_empty()
+                        {
                             let src = grammar_info.grammar_source.clone();
                             let start_state = builder.ins().iconst(cl_types::I64, 1);
-                            self.compile_call_by_name(builder, "nsl_serve_set_grammar", &[request_id, start_state])?;
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_serve_set_grammar",
+                                &[request_id, start_state],
+                            )?;
                             eprintln!("[nsl] Constrained decoding active via @grammar: '{}'", src);
                         }
                     }
@@ -1333,7 +1719,9 @@ impl Compiler<'_> {
                 let _ = model_val; // suppress unused warning — model used as prompt_len placeholder
                 return Ok(request_id);
             }
-            return Err(CodegenError::new("generate() requires at least 2 arguments (model, tokens)"));
+            return Err(CodegenError::new(
+                "generate() requires at least 2 arguments (model, tokens)",
+            ));
         }
 
         // argmax(tensor, dim=-1)
@@ -1365,7 +1753,11 @@ impl Compiler<'_> {
             } else {
                 builder.ins().fcvt_from_sint(cl_types::F64, scalar_val)
             };
-            return self.compile_call_by_name(builder, "nsl_tensor_lt_scalar", &[tensor_val, scalar_f64]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_lt_scalar",
+                &[tensor_val, scalar_f64],
+            );
         }
 
         // M19: Data source intrinsics
@@ -1384,7 +1776,11 @@ impl Compiler<'_> {
             } else {
                 self.compile_call_by_name(builder, "nsl_str_len", &[field_val])?
             };
-            return self.compile_call_by_name(builder, "nsl_load_jsonl", &[path_val, path_len, field_val, field_len]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_load_jsonl",
+                &[path_val, path_len, field_val, field_len],
+            );
         }
 
         // load_csv("path", col_idx, has_header=1)
@@ -1401,7 +1797,11 @@ impl Compiler<'_> {
             } else {
                 builder.ins().iconst(cl_types::I64, 1)
             };
-            return self.compile_call_by_name(builder, "nsl_load_csv", &[path_val, path_len, col_val, header_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_load_csv",
+                &[path_val, path_len, col_val, header_val],
+            );
         }
 
         // load_mmap("path", dtype)
@@ -1413,7 +1813,11 @@ impl Compiler<'_> {
                 self.compile_call_by_name(builder, "nsl_str_len", &[path_val])?
             };
             let dtype_val = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_call_by_name(builder, "nsl_load_mmap", &[path_val, path_len, dtype_val]);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_load_mmap",
+                &[path_val, path_len, dtype_val],
+            );
         }
 
         // M19: DataLoader intrinsic
@@ -1447,14 +1851,19 @@ impl Compiler<'_> {
                     let key = self.resolve_sym(name_sym).to_string();
                     if key == "labels" {
                         if labels_arg.is_some() {
-                            return Err(CodegenError::new("DataLoader(): labels provided more than once"));
+                            return Err(CodegenError::new(
+                                "DataLoader(): labels provided more than once",
+                            ));
                         }
                         labels_arg = Some(&arg.value);
                         continue;
                     }
                     match &arg.value.kind {
                         ExprKind::IntLiteral(v) => {
-                            config.insert(key, serde_json::Value::Number(serde_json::Number::from(*v)));
+                            config.insert(
+                                key,
+                                serde_json::Value::Number(serde_json::Number::from(*v)),
+                            );
                         }
                         ExprKind::BoolLiteral(v) => {
                             config.insert(key, serde_json::Value::Bool(*v));
@@ -1518,21 +1927,35 @@ impl Compiler<'_> {
 
             // Intern the config string as data
             let config_data_id = self.intern_string(&config_json)?;
-            let config_gv = self.module.declare_data_in_func(config_data_id, builder.func);
+            let config_gv = self
+                .module
+                .declare_data_in_func(config_data_id, builder.func);
             let config_ptr = builder.ins().symbol_value(pointer_type(), config_gv);
-            let config_len = builder.ins().iconst(cl_types::I64, config_json.len() as i64);
+            let config_len = builder
+                .ins()
+                .iconst(cl_types::I64, config_json.len() as i64);
 
             // Normalize loader inputs to CPU-contiguous tensors and let the runtime keep them alive.
             let cpu_device = builder.ins().iconst(cl_types::I64, 0);
-            let data_cpu = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[data_val, cpu_device])?;
-            let data_tensor = self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[data_cpu])?;
+            let data_cpu = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_to_device",
+                &[data_val, cpu_device],
+            )?;
+            let data_tensor =
+                self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[data_cpu])?;
             self.compile_call_by_name(builder, "nsl_tensor_free", &[data_cpu])?;
 
             let zero = builder.ins().iconst(cl_types::I64, 0);
             let labels_tensor = if let Some(labels_expr) = labels_arg {
                 let labels_val = self.compile_expr(builder, state, labels_expr)?;
-                let labels_cpu = self.compile_call_by_name(builder, "nsl_tensor_to_device", &[labels_val, cpu_device])?;
-                let labels_tensor = self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[labels_cpu])?;
+                let labels_cpu = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_to_device",
+                    &[labels_val, cpu_device],
+                )?;
+                let labels_tensor =
+                    self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[labels_cpu])?;
                 self.compile_call_by_name(builder, "nsl_tensor_free", &[labels_cpu])?;
                 labels_tensor
             } else {
@@ -1550,7 +1973,9 @@ impl Compiler<'_> {
         }
 
         // Check if it's a known function or variable holding a function pointer
-        if self.registry.functions.contains_key(&func_name) || self.registry.runtime_fns.contains_key(&func_name) {
+        if self.registry.functions.contains_key(&func_name)
+            || self.registry.runtime_fns.contains_key(&func_name)
+        {
             let mut arg_vals = Vec::new();
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -1563,7 +1988,12 @@ impl Compiler<'_> {
         if let Type::Model { name, .. } = &callee_type {
             let model_name = self.resolve_sym(*name).to_string();
             return self.compile_model_method_call(
-                builder, state, callee, &model_name, "forward", args,
+                builder,
+                state,
+                callee,
+                &model_name,
+                "forward",
+                args,
             );
         }
 
@@ -1583,24 +2013,27 @@ impl Compiler<'_> {
         // has already validated that the function body is batchable during the
         // transform pass.  If compilation of the batched variant failed (non-fatal),
         // the function won't be in self.registry.functions and we fall through to the original.
-        let effective_name: &str = if let Some(batched_name) = self.vmap.batched_fn_names.get(func_name) {
-            if self.registry.functions.contains_key(batched_name.as_str()) {
-                // Batched variant exists and is compiled — dispatch to it.
-                batched_name.as_str()
+        let effective_name: &str =
+            if let Some(batched_name) = self.vmap.batched_fn_names.get(func_name) {
+                if self.registry.functions.contains_key(batched_name.as_str()) {
+                    // Batched variant exists and is compiled — dispatch to it.
+                    batched_name.as_str()
+                } else {
+                    // Batched variant declared but not compiled — use original
+                    func_name
+                }
             } else {
-                // Batched variant declared but not compiled — use original
                 func_name
-            }
-        } else {
-            func_name
-        };
+            };
 
         let (func_id, sig) = if let Some(e) = self.registry.functions.get(effective_name) {
             e.clone()
         } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
             e.clone()
         } else {
-            return Err(CodegenError::new(format!("undefined function '{effective_name}'")));
+            return Err(CodegenError::new(format!(
+                "undefined function '{effective_name}'"
+            )));
         };
 
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
@@ -1730,13 +2163,20 @@ impl Compiler<'_> {
 
         let raw_val = self.compile_expr(builder, state, callee)?;
 
-        if let Type::Function { params: param_types, ret, .. } = &callee_type {
+        if let Type::Function {
+            params: param_types,
+            ret,
+            ..
+        } = &callee_type
+        {
             if let Some(num_captures) = closure_captures {
                 // Closure call: raw_val is a pointer to { fn_ptr, num_captures, captures[] }
                 let closure_ptr = raw_val;
 
                 // Load fn_ptr from offset 0
-                let fn_ptr = builder.ins().load(cl_types::I64, MemFlags::trusted(), closure_ptr, 0);
+                let fn_ptr = builder
+                    .ins()
+                    .load(cl_types::I64, MemFlags::trusted(), closure_ptr, 0);
 
                 // Build signature: normal params + capture params (all I64)
                 let mut sig = self.module.make_signature();
@@ -1761,7 +2201,10 @@ impl Compiler<'_> {
                 // Load captured values from closure struct
                 for i in 0..num_captures {
                     let offset = (16 + i * 8) as i32;
-                    let cap_val = builder.ins().load(cl_types::I64, MemFlags::trusted(), closure_ptr, offset);
+                    let cap_val =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), closure_ptr, offset);
                     arg_vals.push(cap_val);
                 }
 
@@ -1860,7 +2303,19 @@ impl Compiler<'_> {
             return self.compile_call_by_name(
                 builder,
                 "nsl_kernel_launch",
-                &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, null_ptr, num_args_val, shared_mem],
+                &[
+                    ptx_ptr,
+                    name_ptr,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    block_z,
+                    null_ptr,
+                    num_args_val,
+                    shared_mem,
+                ],
             );
         }
 
@@ -1886,7 +2341,19 @@ impl Compiler<'_> {
         self.compile_call_by_name(
             builder,
             "nsl_kernel_launch",
-            &[ptx_ptr, name_ptr, grid_x, grid_y, grid_z, block_x, block_y, block_z, args_ptr, num_args_val, shared_mem],
+            &[
+                ptx_ptr,
+                name_ptr,
+                grid_x,
+                grid_y,
+                grid_z,
+                block_x,
+                block_y,
+                block_z,
+                args_ptr,
+                num_args_val,
+                shared_mem,
+            ],
         )
     }
 }

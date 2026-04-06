@@ -125,24 +125,49 @@ pub struct InputAdjoint {
 pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
     match &op.op {
         PrimalOp::Add => vec![
-            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::Identity(output_bar) },
-            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::Identity(output_bar) },
+            InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::Identity(output_bar),
+            },
+            InputAdjoint {
+                input_var: op.inputs[1],
+                expr: AdjointExpr::Identity(output_bar),
+            },
         ],
         PrimalOp::Sub => vec![
-            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::Identity(output_bar) },
-            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::Negate(output_bar) },
+            InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::Identity(output_bar),
+            },
+            InputAdjoint {
+                input_var: op.inputs[1],
+                expr: AdjointExpr::Negate(output_bar),
+            },
         ],
         PrimalOp::Mul => vec![
-            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::MulElementwise(output_bar, op.inputs[1]) },
-            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::MulElementwise(output_bar, op.inputs[0]) },
+            InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::MulElementwise(output_bar, op.inputs[1]),
+            },
+            InputAdjoint {
+                input_var: op.inputs[1],
+                expr: AdjointExpr::MulElementwise(output_bar, op.inputs[0]),
+            },
         ],
         PrimalOp::Div => vec![
-            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::DivNumeratorBackward(output_bar, op.inputs[1]) },
-            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::DivDenominatorBackward(output_bar, op.inputs[0], op.inputs[1]) },
+            InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::DivNumeratorBackward(output_bar, op.inputs[1]),
+            },
+            InputAdjoint {
+                input_var: op.inputs[1],
+                expr: AdjointExpr::DivDenominatorBackward(output_bar, op.inputs[0], op.inputs[1]),
+            },
         ],
-        PrimalOp::Neg => vec![
-            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::Negate(output_bar) },
-        ],
+        PrimalOp::Neg => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::Negate(output_bar),
+        }],
         PrimalOp::Relu => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::ReluBackward(output_bar, op.inputs[0]),
@@ -168,8 +193,14 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             expr: AdjointExpr::SqrtBackward(output_bar, op.result),
         }],
         PrimalOp::Matmul => vec![
-            InputAdjoint { input_var: op.inputs[0], expr: AdjointExpr::MatmulTransposeLeft(output_bar, op.inputs[1]) },
-            InputAdjoint { input_var: op.inputs[1], expr: AdjointExpr::MatmulTransposeRight(op.inputs[0], output_bar, op.inputs[1]) },
+            InputAdjoint {
+                input_var: op.inputs[0],
+                expr: AdjointExpr::MatmulTransposeLeft(output_bar, op.inputs[1]),
+            },
+            InputAdjoint {
+                input_var: op.inputs[1],
+                expr: AdjointExpr::MatmulTransposeRight(op.inputs[0], output_bar, op.inputs[1]),
+            },
         ],
         PrimalOp::Transpose { dim0, dim1 } => vec![InputAdjoint {
             input_var: op.inputs[0],
@@ -306,7 +337,11 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             // inputs[1] is the dropout mask (saved from forward)
             expr: AdjointExpr::DropoutBackward(
                 output_bar,
-                if op.inputs.len() > 1 { op.inputs[1] } else { op.inputs[0] },
+                if op.inputs.len() > 1 {
+                    op.inputs[1]
+                } else {
+                    op.inputs[0]
+                },
                 1.0 / (1.0 - p),
             ),
         }],
@@ -356,7 +391,12 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 expr: AdjointExpr::SplitConcat(output_bar, *dim),
             }]
         }
-        PrimalOp::Slice { dim, start, end, orig_dim_size } => vec![InputAdjoint {
+        PrimalOp::Slice {
+            dim,
+            start,
+            end,
+            orig_dim_size,
+        } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::SliceBackward(output_bar, *dim, *start, *end, *orig_dim_size),
         }],
@@ -379,7 +419,11 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             // inputs[1] would be argmax indices saved from forward
             expr: AdjointExpr::MaxPoolBackward(
                 output_bar,
-                if op.inputs.len() > 1 { op.inputs[1] } else { op.result },
+                if op.inputs.len() > 1 {
+                    op.inputs[1]
+                } else {
+                    op.result
+                },
             ),
         }],
         PrimalOp::AvgPool2d { kernel, .. } => vec![InputAdjoint {
@@ -416,9 +460,18 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             let k = op.inputs[1];
             let v = op.inputs[2];
             vec![
-                InputAdjoint { input_var: q, expr: AdjointExpr::AttentionBackwardQ(output_bar, q, k, v, *causal) },
-                InputAdjoint { input_var: k, expr: AdjointExpr::AttentionBackwardK(output_bar, q, k, v, *causal) },
-                InputAdjoint { input_var: v, expr: AdjointExpr::AttentionBackwardV(output_bar, q, k, v, *causal) },
+                InputAdjoint {
+                    input_var: q,
+                    expr: AdjointExpr::AttentionBackwardQ(output_bar, q, k, v, *causal),
+                },
+                InputAdjoint {
+                    input_var: k,
+                    expr: AdjointExpr::AttentionBackwardK(output_bar, q, k, v, *causal),
+                },
+                InputAdjoint {
+                    input_var: v,
+                    expr: AdjointExpr::AttentionBackwardV(output_bar, q, k, v, *causal),
+                },
             ]
         }
         PrimalOp::RoPE { dim } => vec![InputAdjoint {
@@ -435,8 +488,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             match name.as_str() {
                 // Reshape-like ops must restore the original input shape in backward.
                 "reshape" | "squeeze" | "unsqueeze" => {
-                    if op.inputs.is_empty() { vec![] }
-                    else {
+                    if op.inputs.is_empty() {
+                        vec![]
+                    } else {
                         vec![InputAdjoint {
                             input_var: op.inputs[0],
                             expr: AdjointExpr::ReshapeLike(output_bar, op.inputs[0]),
@@ -445,8 +499,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 }
                 // Shape-preserving identity: gradient flows through unchanged.
                 "contiguous" | "cos" | "sin" | "rotate_half" => {
-                    if op.inputs.is_empty() { vec![] }
-                    else {
+                    if op.inputs.is_empty() {
+                        vec![]
+                    } else {
                         vec![InputAdjoint {
                             input_var: op.inputs[0],
                             expr: AdjointExpr::Identity(output_bar),
@@ -455,8 +510,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 }
                 // Expand backward: sum-reduce gradient over broadcast-expanded dims
                 "expand" => {
-                    if op.inputs.is_empty() { vec![] }
-                    else {
+                    if op.inputs.is_empty() {
+                        vec![]
+                    } else {
                         vec![InputAdjoint {
                             input_var: op.inputs[0],
                             expr: AdjointExpr::ReduceToShape(output_bar, op.inputs[0]),
@@ -483,30 +539,53 @@ pub enum SavedRequirement {
 pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
     match op {
         // Nothing saved — gradient is independent of forward values
-        PrimalOp::Add | PrimalOp::Sub | PrimalOp::Neg
-        | PrimalOp::Transpose { .. } | PrimalOp::Reshape { .. }
-        | PrimalOp::Sum { .. } | PrimalOp::Mean { .. }
+        PrimalOp::Add
+        | PrimalOp::Sub
+        | PrimalOp::Neg
+        | PrimalOp::Transpose { .. }
+        | PrimalOp::Reshape { .. }
+        | PrimalOp::Sum { .. }
+        | PrimalOp::Mean { .. }
         | PrimalOp::Broadcast
-        | PrimalOp::Concat { .. } | PrimalOp::Split { .. } | PrimalOp::Slice { .. }
-        | PrimalOp::RoPE { .. } | PrimalOp::RoPEInverse { .. }
+        | PrimalOp::Concat { .. }
+        | PrimalOp::Split { .. }
+        | PrimalOp::Slice { .. }
+        | PrimalOp::RoPE { .. }
+        | PrimalOp::RoPEInverse { .. }
         | PrimalOp::AvgPool2d { .. }
         | PrimalOp::Passthrough(_) => SavedRequirement::Nothing,
 
         // Save inputs — gradient depends on forward input values
-        PrimalOp::Mul | PrimalOp::Div | PrimalOp::Matmul
-        | PrimalOp::Relu | PrimalOp::Log | PrimalOp::Abs
-        | PrimalOp::Gelu | PrimalOp::Silu | PrimalOp::Clamp { .. }
-        | PrimalOp::LayerNorm { .. } | PrimalOp::RMSNorm { .. } | PrimalOp::BatchNorm { .. }
+        PrimalOp::Mul
+        | PrimalOp::Div
+        | PrimalOp::Matmul
+        | PrimalOp::Relu
+        | PrimalOp::Log
+        | PrimalOp::Abs
+        | PrimalOp::Gelu
+        | PrimalOp::Silu
+        | PrimalOp::Clamp { .. }
+        | PrimalOp::LayerNorm { .. }
+        | PrimalOp::RMSNorm { .. }
+        | PrimalOp::BatchNorm { .. }
         | PrimalOp::Dropout { .. }
-        | PrimalOp::Embedding | PrimalOp::Gather { .. } | PrimalOp::ScatterAdd { .. }
+        | PrimalOp::Embedding
+        | PrimalOp::Gather { .. }
+        | PrimalOp::ScatterAdd { .. }
         | PrimalOp::Conv2d { .. }
-        | PrimalOp::CrossEntropyLoss | PrimalOp::MSELoss | PrimalOp::L1Loss
+        | PrimalOp::CrossEntropyLoss
+        | PrimalOp::MSELoss
+        | PrimalOp::L1Loss
         | PrimalOp::ScaledDotProductAttention { .. }
         | PrimalOp::Select => SavedRequirement::Inputs,
 
         // Save output — gradient depends on forward output values
-        PrimalOp::Sigmoid | PrimalOp::Tanh | PrimalOp::Exp
-        | PrimalOp::Sqrt | PrimalOp::Softmax { .. } | PrimalOp::LogSoftmax { .. }
+        PrimalOp::Sigmoid
+        | PrimalOp::Tanh
+        | PrimalOp::Exp
+        | PrimalOp::Sqrt
+        | PrimalOp::Softmax { .. }
+        | PrimalOp::LogSoftmax { .. }
         | PrimalOp::MaxPool2d { .. } => SavedRequirement::Output,
 
         // Non-differentiable — nothing needed
@@ -521,7 +600,14 @@ mod tests {
     use crate::wengert::WengertOp;
 
     fn make_op(result: VarId, op: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
-        WengertOp { id: 0, result, op, inputs, saved_for_backward: false, checkpointed: false }
+        WengertOp {
+            id: 0,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        }
     }
 
     #[test]
@@ -553,8 +639,14 @@ mod tests {
     fn test_matmul_rule() {
         let op = make_op(2, PrimalOp::Matmul, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::MatmulTransposeLeft(100, 1)));
-        assert!(matches!(adj[1].expr, AdjointExpr::MatmulTransposeRight(0, 100, 1)));
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::MatmulTransposeLeft(100, 1)
+        ));
+        assert!(matches!(
+            adj[1].expr,
+            AdjointExpr::MatmulTransposeRight(0, 100, 1)
+        ));
     }
 
     #[test]
@@ -597,8 +689,14 @@ mod tests {
     fn test_div_backward() {
         let op = make_op(2, PrimalOp::Div, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::DivNumeratorBackward(100, 1)));
-        assert!(matches!(adj[1].expr, AdjointExpr::DivDenominatorBackward(100, 0, 1)));
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::DivNumeratorBackward(100, 1)
+        ));
+        assert!(matches!(
+            adj[1].expr,
+            AdjointExpr::DivDenominatorBackward(100, 0, 1)
+        ));
     }
 
     #[test]
@@ -625,21 +723,39 @@ mod tests {
 
     #[test]
     fn test_saved_nothing() {
-        assert_eq!(saved_for_backward(&PrimalOp::Add), SavedRequirement::Nothing);
-        assert_eq!(saved_for_backward(&PrimalOp::Transpose { dim0: 0, dim1: 1 }), SavedRequirement::Nothing);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Add),
+            SavedRequirement::Nothing
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Transpose { dim0: 0, dim1: 1 }),
+            SavedRequirement::Nothing
+        );
     }
 
     #[test]
     fn test_saved_inputs() {
         assert_eq!(saved_for_backward(&PrimalOp::Mul), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Matmul), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Relu), SavedRequirement::Inputs);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Matmul),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Relu),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
     fn test_saved_output() {
-        assert_eq!(saved_for_backward(&PrimalOp::Sigmoid), SavedRequirement::Output);
-        assert_eq!(saved_for_backward(&PrimalOp::Tanh), SavedRequirement::Output);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Sigmoid),
+            SavedRequirement::Output
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Tanh),
+            SavedRequirement::Output
+        );
         assert_eq!(saved_for_backward(&PrimalOp::Exp), SavedRequirement::Output);
     }
 
@@ -654,16 +770,26 @@ mod tests {
         // No adjoint is propagated to inputs[0] (the condition is non-differentiable).
         let op = make_op(3, PrimalOp::Select, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
-        assert_eq!(adj.len(), 2, "Select should produce exactly two input adjoints");
+        assert_eq!(
+            adj.len(),
+            2,
+            "Select should produce exactly two input adjoints"
+        );
         // First: adjoint for the true branch value
-        assert_eq!(adj[0].input_var, 1, "First adjoint targets true_val (inputs[1])");
+        assert_eq!(
+            adj[0].input_var, 1,
+            "First adjoint targets true_val (inputs[1])"
+        );
         assert!(
             matches!(adj[0].expr, AdjointExpr::SelectTrue(100, 0)),
             "Expected SelectTrue(output_bar=100, cond_var=0), got {:?}",
             adj[0].expr
         );
         // Second: adjoint for the false branch value
-        assert_eq!(adj[1].input_var, 2, "Second adjoint targets false_val (inputs[2])");
+        assert_eq!(
+            adj[1].input_var, 2,
+            "Second adjoint targets false_val (inputs[2])"
+        );
         assert!(
             matches!(adj[1].expr, AdjointExpr::SelectFalse(100, 0)),
             "Expected SelectFalse(output_bar=100, cond_var=0), got {:?}",
@@ -677,7 +803,10 @@ mod tests {
         use crate::wengert::CompareKind;
         let op = make_op(1, PrimalOp::Condition(CompareKind::Gt), vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(adj.is_empty(), "Condition op should have no adjoints (non-differentiable)");
+        assert!(
+            adj.is_empty(),
+            "Condition op should have no adjoints (non-differentiable)"
+        );
     }
 
     #[test]
@@ -709,7 +838,10 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         assert!(matches!(adj[0].expr, AdjointExpr::GeluBackward(100, 0)));
-        assert_eq!(saved_for_backward(&PrimalOp::Gelu), SavedRequirement::Inputs);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Gelu),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
@@ -718,7 +850,10 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         assert!(matches!(adj[0].expr, AdjointExpr::SiluBackward(100, 0)));
-        assert_eq!(saved_for_backward(&PrimalOp::Silu), SavedRequirement::Inputs);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Silu),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
@@ -736,7 +871,10 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         assert!(matches!(adj[0].expr, AdjointExpr::SoftmaxBackward(100, 1)));
-        assert_eq!(saved_for_backward(&PrimalOp::Softmax { dim: -1 }), SavedRequirement::Output);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Softmax { dim: -1 }),
+            SavedRequirement::Output
+        );
     }
 
     #[test]
@@ -744,8 +882,14 @@ mod tests {
         let op = make_op(1, PrimalOp::Clamp { min: 0.0, max: 1.0 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::ClampBackward(100, 0, _, _)));
-        assert_eq!(saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }), SavedRequirement::Inputs);
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::ClampBackward(100, 0, _, _)
+        ));
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }),
+            SavedRequirement::Inputs
+        );
     }
 
     // --- Tier 2: Normalization / indexing / shape ---
@@ -754,11 +898,24 @@ mod tests {
     fn test_layer_norm_backward() {
         let op = make_op(3, PrimalOp::LayerNorm { eps: 1e-5 }, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
-        assert_eq!(adj.len(), 3, "LayerNorm should produce 3 adjoints (input, gamma, beta)");
-        assert!(matches!(adj[0].expr, AdjointExpr::LayerNormBackward(100, 0, 3, 3, _)));
-        assert!(matches!(adj[1].expr, AdjointExpr::NormGammaBackward(100, 0, _, -1, 1))); // gamma grad
+        assert_eq!(
+            adj.len(),
+            3,
+            "LayerNorm should produce 3 adjoints (input, gamma, beta)"
+        );
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::LayerNormBackward(100, 0, 3, 3, _)
+        ));
+        assert!(matches!(
+            adj[1].expr,
+            AdjointExpr::NormGammaBackward(100, 0, _, -1, 1)
+        )); // gamma grad
         assert!(matches!(adj[2].expr, AdjointExpr::Identity(100))); // beta grad
-        assert_eq!(saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }), SavedRequirement::Inputs);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
@@ -774,7 +931,10 @@ mod tests {
             }
             other => panic!("Expected DropoutBackward, got {:?}", other),
         }
-        assert_eq!(saved_for_backward(&PrimalOp::Dropout { p: 0.1 }), SavedRequirement::Inputs);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Dropout { p: 0.1 }),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
@@ -782,7 +942,10 @@ mod tests {
         let op = make_op(2, PrimalOp::Embedding, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::EmbeddingBackward(100, 1, 0)));
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::EmbeddingBackward(100, 1, 0)
+        ));
     }
 
     #[test]
@@ -790,7 +953,10 @@ mod tests {
         let op = make_op(2, PrimalOp::Gather { dim: 1 }, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::GatherBackward(100, 1, 1)));
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::GatherBackward(100, 1, 1)
+        ));
     }
 
     #[test]
@@ -806,39 +972,94 @@ mod tests {
 
     #[test]
     fn test_slice_backward() {
-        let op = make_op(1, PrimalOp::Slice { dim: 0, start: 2, end: 5, orig_dim_size: 10 }, vec![0]);
+        let op = make_op(
+            1,
+            PrimalOp::Slice {
+                dim: 0,
+                start: 2,
+                end: 5,
+                orig_dim_size: 10,
+            },
+            vec![0],
+        );
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::SliceBackward(100, 0, 2, 5, 10)));
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::SliceBackward(100, 0, 2, 5, 10)
+        ));
     }
 
     // --- Tier 3: Compound ops ---
 
     #[test]
     fn test_conv2d_backward() {
-        let op = make_op(2, PrimalOp::Conv2d { stride: 1, padding: 0 }, vec![0, 1]);
+        let op = make_op(
+            2,
+            PrimalOp::Conv2d {
+                stride: 1,
+                padding: 0,
+            },
+            vec![0, 1],
+        );
         let adj = apply_ad_rule(&op, 100);
-        assert_eq!(adj.len(), 2, "Conv2d should produce 2 adjoints (input, weight)");
-        assert!(matches!(adj[0].expr, AdjointExpr::ConvTransposeInput(100, 1, 1, 0)));
-        assert!(matches!(adj[1].expr, AdjointExpr::ConvTransposeWeight(0, 100)));
+        assert_eq!(
+            adj.len(),
+            2,
+            "Conv2d should produce 2 adjoints (input, weight)"
+        );
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::ConvTransposeInput(100, 1, 1, 0)
+        ));
+        assert!(matches!(
+            adj[1].expr,
+            AdjointExpr::ConvTransposeWeight(0, 100)
+        ));
     }
 
     #[test]
     fn test_maxpool_backward() {
-        let op = make_op(2, PrimalOp::MaxPool2d { kernel: 2, stride: 2 }, vec![0, 1]);
+        let op = make_op(
+            2,
+            PrimalOp::MaxPool2d {
+                kernel: 2,
+                stride: 2,
+            },
+            vec![0, 1],
+        );
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         assert!(matches!(adj[0].expr, AdjointExpr::MaxPoolBackward(100, 1)));
-        assert_eq!(saved_for_backward(&PrimalOp::MaxPool2d { kernel: 2, stride: 2 }), SavedRequirement::Output);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::MaxPool2d {
+                kernel: 2,
+                stride: 2
+            }),
+            SavedRequirement::Output
+        );
     }
 
     #[test]
     fn test_avgpool_backward() {
-        let op = make_op(1, PrimalOp::AvgPool2d { kernel: 3, stride: 3 }, vec![0]);
+        let op = make_op(
+            1,
+            PrimalOp::AvgPool2d {
+                kernel: 3,
+                stride: 3,
+            },
+            vec![0],
+        );
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         assert!(matches!(adj[0].expr, AdjointExpr::AvgPoolBackward(100, 9))); // kernel*kernel = 9
-        assert_eq!(saved_for_backward(&PrimalOp::AvgPool2d { kernel: 3, stride: 3 }), SavedRequirement::Nothing);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::AvgPool2d {
+                kernel: 3,
+                stride: 3
+            }),
+            SavedRequirement::Nothing
+        );
     }
 
     #[test]
@@ -846,8 +1067,14 @@ mod tests {
         let op = make_op(2, PrimalOp::CrossEntropyLoss, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::CrossEntropyBackward(100, 0, 1)));
-        assert_eq!(saved_for_backward(&PrimalOp::CrossEntropyLoss), SavedRequirement::Inputs);
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::CrossEntropyBackward(100, 0, 1)
+        ));
+        assert_eq!(
+            saved_for_backward(&PrimalOp::CrossEntropyLoss),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
@@ -870,12 +1097,29 @@ mod tests {
 
     #[test]
     fn test_attention_backward() {
-        let op = make_op(3, PrimalOp::ScaledDotProductAttention { causal: true }, vec![0, 1, 2]);
+        let op = make_op(
+            3,
+            PrimalOp::ScaledDotProductAttention { causal: true },
+            vec![0, 1, 2],
+        );
         let adj = apply_ad_rule(&op, 100);
-        assert_eq!(adj.len(), 3, "Attention should produce 3 adjoints (Q, K, V)");
-        assert!(matches!(adj[0].expr, AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, true)));
-        assert!(matches!(adj[1].expr, AdjointExpr::AttentionBackwardK(100, 0, 1, 2, true)));
-        assert!(matches!(adj[2].expr, AdjointExpr::AttentionBackwardV(100, 0, 1, 2, true)));
+        assert_eq!(
+            adj.len(),
+            3,
+            "Attention should produce 3 adjoints (Q, K, V)"
+        );
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, true)
+        ));
+        assert!(matches!(
+            adj[1].expr,
+            AdjointExpr::AttentionBackwardK(100, 0, 1, 2, true)
+        ));
+        assert!(matches!(
+            adj[2].expr,
+            AdjointExpr::AttentionBackwardV(100, 0, 1, 2, true)
+        ));
         assert_eq!(
             saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: true }),
             SavedRequirement::Inputs
@@ -888,7 +1132,10 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         assert!(matches!(adj[0].expr, AdjointExpr::RoPEBackward(100, 64)));
-        assert_eq!(saved_for_backward(&PrimalOp::RoPE { dim: 64 }), SavedRequirement::Nothing);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::RoPE { dim: 64 }),
+            SavedRequirement::Nothing
+        );
     }
 
     #[test]
@@ -896,42 +1143,125 @@ mod tests {
         let op = make_op(1, PrimalOp::LogSoftmax { dim: -1 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::LogSoftmaxBackward(100, 1)));
-        assert_eq!(saved_for_backward(&PrimalOp::LogSoftmax { dim: -1 }), SavedRequirement::Output);
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::LogSoftmaxBackward(100, 1)
+        ));
+        assert_eq!(
+            saved_for_backward(&PrimalOp::LogSoftmax { dim: -1 }),
+            SavedRequirement::Output
+        );
     }
 
     // --- Saved requirement tests for new ops ---
 
     #[test]
     fn test_saved_new_nothing_ops() {
-        assert_eq!(saved_for_backward(&PrimalOp::Concat { dim: 0 }), SavedRequirement::Nothing);
-        assert_eq!(saved_for_backward(&PrimalOp::Split { dim: 0, chunks: 2 }), SavedRequirement::Nothing);
-        assert_eq!(saved_for_backward(&PrimalOp::Slice { dim: 0, start: 0, end: 5, orig_dim_size: 10 }), SavedRequirement::Nothing);
-        assert_eq!(saved_for_backward(&PrimalOp::AvgPool2d { kernel: 2, stride: 2 }), SavedRequirement::Nothing);
-        assert_eq!(saved_for_backward(&PrimalOp::RoPE { dim: 64 }), SavedRequirement::Nothing);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Concat { dim: 0 }),
+            SavedRequirement::Nothing
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Split { dim: 0, chunks: 2 }),
+            SavedRequirement::Nothing
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Slice {
+                dim: 0,
+                start: 0,
+                end: 5,
+                orig_dim_size: 10
+            }),
+            SavedRequirement::Nothing
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::AvgPool2d {
+                kernel: 2,
+                stride: 2
+            }),
+            SavedRequirement::Nothing
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::RoPE { dim: 64 }),
+            SavedRequirement::Nothing
+        );
     }
 
     #[test]
     fn test_saved_new_input_ops() {
-        assert_eq!(saved_for_backward(&PrimalOp::Gelu), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Silu), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::BatchNorm { eps: 1e-5, training: true }), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Dropout { p: 0.1 }), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Embedding), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Gather { dim: 0 }), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::Conv2d { stride: 1, padding: 0 }), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::CrossEntropyLoss), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::MSELoss), SavedRequirement::Inputs);
-        assert_eq!(saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: false }), SavedRequirement::Inputs);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Gelu),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Silu),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Clamp { min: 0.0, max: 1.0 }),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::BatchNorm {
+                eps: 1e-5,
+                training: true
+            }),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Dropout { p: 0.1 }),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Embedding),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Gather { dim: 0 }),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Conv2d {
+                stride: 1,
+                padding: 0
+            }),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::CrossEntropyLoss),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::MSELoss),
+            SavedRequirement::Inputs
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: false }),
+            SavedRequirement::Inputs
+        );
     }
 
     #[test]
     fn test_saved_new_output_ops() {
-        assert_eq!(saved_for_backward(&PrimalOp::Softmax { dim: -1 }), SavedRequirement::Output);
-        assert_eq!(saved_for_backward(&PrimalOp::LogSoftmax { dim: -1 }), SavedRequirement::Output);
-        assert_eq!(saved_for_backward(&PrimalOp::MaxPool2d { kernel: 2, stride: 2 }), SavedRequirement::Output);
+        assert_eq!(
+            saved_for_backward(&PrimalOp::Softmax { dim: -1 }),
+            SavedRequirement::Output
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::LogSoftmax { dim: -1 }),
+            SavedRequirement::Output
+        );
+        assert_eq!(
+            saved_for_backward(&PrimalOp::MaxPool2d {
+                kernel: 2,
+                stride: 2
+            }),
+            SavedRequirement::Output
+        );
     }
 
     #[test]

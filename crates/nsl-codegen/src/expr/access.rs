@@ -80,7 +80,8 @@ impl Compiler<'_> {
                         if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
                             for field in &layout.fields {
                                 if field.name == member_name {
-                                    let offset_val = builder.ins().iconst(cl_types::I64, field.offset as i64);
+                                    let offset_val =
+                                        builder.ins().iconst(cl_types::I64, field.offset as i64);
                                     return Ok(builder.ins().iadd(obj_val, offset_val));
                                 }
                             }
@@ -123,7 +124,9 @@ impl Compiler<'_> {
             return match member_name.as_str() {
                 "shape" => self.compile_call_by_name(builder, "nsl_tensor_shape", &[obj_val]),
                 "ndim" => self.compile_call_by_name(builder, "nsl_tensor_ndim", &[obj_val]),
-                _ => Err(CodegenError::new(format!("unknown tensor property '.{member_name}'"))),
+                _ => Err(CodegenError::new(format!(
+                    "unknown tensor property '.{member_name}'"
+                ))),
             };
         }
 
@@ -142,10 +145,12 @@ impl Compiler<'_> {
                 self.intern_string(&member_name)?;
             }
             if let Ok(key_str) = self.compile_string_literal(builder, &member_name) {
-                let result = self.compile_call_by_name(builder, "nsl_dict_get_str", &[obj_val, key_str]);
+                let result =
+                    self.compile_call_by_name(builder, "nsl_dict_get_str", &[obj_val, key_str]);
                 if let Ok(value) = result {
                     if self.node_type(expr.id).is_tensor() {
-                        let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
+                        let cloned =
+                            self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
                         state.cleanup.tensor_temporaries.push(cloned);
                         return Ok(cloned);
                     }
@@ -154,7 +159,9 @@ impl Compiler<'_> {
             }
         }
 
-        Err(CodegenError::new(format!("member access not supported: .{member_name}")))
+        Err(CodegenError::new(format!(
+            "member access not supported: .{member_name}"
+        )))
     }
 
     pub(crate) fn compile_subscript(
@@ -176,7 +183,8 @@ impl Compiler<'_> {
                         let call = builder.ins().call(fref, &[obj_val, idx_val]);
                         let value = builder.inst_results(call)[0];
                         if value_ty.is_tensor() {
-                            let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
+                            let cloned =
+                                self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
                             state.cleanup.tensor_temporaries.push(cloned);
                             return Ok(cloned);
                         }
@@ -238,7 +246,9 @@ impl Compiler<'_> {
         args: &[nsl_ast::expr::Arg],
     ) -> Result<Value, CodegenError> {
         if args.len() != 1 {
-            return Err(CodegenError::new(format!("{target_type}() takes exactly 1 argument")));
+            return Err(CodegenError::new(format!(
+                "{target_type}() takes exactly 1 argument"
+            )));
         }
         let val = self.compile_expr(builder, state, &args[0].value)?;
         let src_type = self.node_type(args[0].value.id).clone();
@@ -249,9 +259,7 @@ impl Compiler<'_> {
                 Type::Int32 => Ok(builder.ins().sextend(cl_types::I64, val)),
                 Type::Int16 => Ok(builder.ins().sextend(cl_types::I64, val)),
                 Type::Int8 => Ok(builder.ins().sextend(cl_types::I64, val)),
-                Type::Float | Type::F64 => {
-                    Ok(builder.ins().fcvt_to_sint_sat(cl_types::I64, val))
-                }
+                Type::Float | Type::F64 => Ok(builder.ins().fcvt_to_sint_sat(cl_types::I64, val)),
                 Type::F32 => {
                     let promoted = builder.ins().fpromote(cl_types::F64, val);
                     Ok(builder.ins().fcvt_to_sint_sat(cl_types::I64, promoted))
@@ -268,9 +276,7 @@ impl Compiler<'_> {
             "float" => match &src_type {
                 Type::Float | Type::F64 => Ok(val),
                 Type::F32 => Ok(builder.ins().fpromote(cl_types::F64, val)),
-                Type::Int | Type::Int64 => {
-                    Ok(builder.ins().fcvt_from_sint(cl_types::F64, val))
-                }
+                Type::Int | Type::Int64 => Ok(builder.ins().fcvt_from_sint(cl_types::F64, val)),
                 Type::Int32 | Type::Int16 | Type::Int8 => {
                     let widened = builder.ins().sextend(cl_types::I64, val);
                     Ok(builder.ins().fcvt_from_sint(cl_types::F64, widened))
@@ -303,7 +309,9 @@ impl Compiler<'_> {
                 }
                 _ => Ok(builder.ins().icmp_imm(IntCC::NotEqual, val, 0)),
             },
-            _ => Err(CodegenError::new(format!("unknown type conversion: {target_type}()"))),
+            _ => Err(CodegenError::new(format!(
+                "unknown type conversion: {target_type}()"
+            ))),
         }
     }
 }

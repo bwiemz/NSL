@@ -1,0 +1,34 @@
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import cross_entropy
+
+model TinyGqa:
+    embed: Tensor = randn([32, 8])
+    attn: GroupedQueryAttention = GroupedQueryAttention(8, 2, 1, 0.0)
+    w_out: Tensor = randn([8, 32])
+
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        let s = input_ids.shape
+        let batch = s[0]
+        let seq_len = s[1]
+        let flat_ids = input_ids.reshape([batch * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let x = emb.reshape([batch, seq_len, 8])
+        let h = self.attn.forward(x, true)
+        let flat_h = h.reshape([batch * seq_len, 8])
+        let logits = flat_h @ self.w_out
+        return logits.reshape([batch, seq_len, 32])
+
+let m = TinyGqa()
+let input_ids = full([1, 4], 1.0)
+let labels = full([1, 4], 0.0)
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let logits = m.forward(input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+
+print("source_ad_gqa_training: PASS")

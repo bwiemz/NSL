@@ -1,0 +1,8 @@
+let a = randn([4, 2048, 384])
+
+for i in range(0, 128):
+    let g = a.to(cuda)
+    if i % 16 == 0:
+        print(i)
+
+print("repeat_to_cuda_large: PASS")

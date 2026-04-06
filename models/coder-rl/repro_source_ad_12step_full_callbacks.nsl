@@ -1,0 +1,29 @@
+from model import NSLCoderRL
+from nsl.nn.losses import cross_entropy
+
+print("coder-rl source-ad 12-step full-callback repro")
+
+let m = NSLCoderRL()
+m.to(cuda)
+let tokens = full([98304], 1.0)
+let loader = DataLoader(tokens, batch_size=4, seq_len=2048, shuffle=false, drop_last=true)
+
+train(model=m, epochs=1, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.01, beta1=0.9, beta2=0.95)
+    scheduler: warmup_cosine(warmup_steps=20, total_steps=430, min_lr=0.00003)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            if step % 10 == 0:
+                print(step)
+                print(loss)
+        on_epoch(epoch, loss):
+            print(epoch)
+            print(loss)
+
+print("coder-rl source-ad 12-step full-callback repro: PASS")

@@ -1,0 +1,23 @@
+# Source AD GPU test: linear + cross_entropy on CUDA, no embedding
+
+from nsl.nn.losses import cross_entropy
+
+model TinyLinear:
+    w: Tensor = randn([16, 100])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = TinyLinear()
+m.to(cuda)
+
+let x = randn([16, 16]).to(cuda)
+let labels = full([16], 0.0).to(cuda)
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let logits = m.forward(x)
+        let loss = cross_entropy(logits, labels)
+
+print("source_ad_gpu_linear_ce: PASS")

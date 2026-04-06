@@ -4,18 +4,45 @@ use cranelift_codegen::ir::{InstBuilder, MemFlags};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
+use nsl_ast::block::{QuantDtype, QuantGranularity, TrainSection};
+use nsl_ast::expr::{ExprKind, SubscriptKind};
 use nsl_ast::operator::AssignOp;
 use nsl_ast::pattern::PatternKind;
-use nsl_ast::expr::{ExprKind, SubscriptKind};
-use nsl_ast::block::{QuantDtype, QuantGranularity, TrainSection};
 use nsl_ast::stmt::{Stmt, StmtKind};
 use nsl_semantic::types::Type;
 
-use cranelift_codegen::ir::Value;
 use crate::compiler::Compiler;
 use crate::context::{FuncState, LoopContext};
 use crate::error::CodegenError;
 use crate::types::{is_block_filled, is_float_type, nsl_type_to_cl};
+use cranelift_codegen::ir::Value;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceAdParamDiagnosticKind {
+    TrainableTensor,
+    IgnoredConfigTensor,
+    IgnoredNonTensor,
+}
+
+fn is_trainable_param_leaf_name(param_name: &str) -> bool {
+    let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
+    !leaf_name.starts_with('_') && leaf_name != "inv_freq"
+}
+
+fn classify_source_ad_param_name(
+    param_name: &str,
+    tensor_param_paths: &std::collections::HashSet<String>,
+) -> SourceAdParamDiagnosticKind {
+    if tensor_param_paths.contains(param_name) {
+        if is_trainable_param_leaf_name(param_name) {
+            SourceAdParamDiagnosticKind::TrainableTensor
+        } else {
+            SourceAdParamDiagnosticKind::IgnoredConfigTensor
+        }
+    } else {
+        SourceAdParamDiagnosticKind::IgnoredNonTensor
+    }
+}
 
 impl Compiler<'_> {
     /// M36: Try to compile a tensor creation as a slab-managed allocation.
@@ -44,15 +71,16 @@ impl Compiler<'_> {
 
         // Check if the RHS is a tensor creation call (zeros, ones, rand, zeros_on)
         let is_tensor_creation = match &expr.kind {
-            ExprKind::Call { callee, .. } => {
-                match &callee.kind {
-                    ExprKind::Ident(func_sym) => {
-                        let func_name = self.interner.resolve(func_sym.0).unwrap_or("");
-                        matches!(func_name, "zeros" | "ones" | "rand" | "randn" | "zeros_like")
-                    }
-                    _ => false,
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(func_sym) => {
+                    let func_name = self.interner.resolve(func_sym.0).unwrap_or("");
+                    matches!(
+                        func_name,
+                        "zeros" | "ones" | "rand" | "randn" | "zeros_like"
+                    )
                 }
-            }
+                _ => false,
+            },
             // zeros_on is typically a method call: Tensor.zeros_on(shape, device)
             _ => false,
         };
@@ -74,7 +102,8 @@ impl Compiler<'_> {
         // Compute data pointer: slab_base + offset
         let slab_ptr = builder.use_var(slab_var);
         let offset_val = builder.ins().iconst(cl_types::I64, offset as i64);
-        let data_ptr = self.compile_call_by_name(builder, "nsl_slab_offset", &[slab_ptr, offset_val])?;
+        let data_ptr =
+            self.compile_call_by_name(builder, "nsl_slab_offset", &[slab_ptr, offset_val])?;
 
         // Determine device and dtype from the expression type
         let (device, dtype) = if let Some(ty) = self.type_map.get(&expr.id) {
@@ -101,7 +130,8 @@ impl Compiler<'_> {
         let dtype_val = builder.ins().iconst(cl_types::I64, dtype);
 
         let tensor = self.compile_call_by_name(
-            builder, "nsl_tensor_from_slab",
+            builder,
+            "nsl_tensor_from_slab",
             &[data_ptr, shape_val, device_val, dtype_val],
         )?;
 
@@ -153,12 +183,16 @@ impl Compiler<'_> {
         }
     }
 
-    fn destructure_field_type(&self, container_ty: Option<&Type>, field: nsl_ast::Symbol) -> Option<Type> {
+    fn destructure_field_type(
+        &self,
+        container_ty: Option<&Type>,
+        field: nsl_ast::Symbol,
+    ) -> Option<Type> {
         match container_ty? {
             Type::Dict(_, value_ty) => Some((**value_ty).clone()),
-            Type::Struct { fields, .. } | Type::Model { fields, .. } => {
-                fields.iter().find_map(|(name, ty)| (*name == field).then(|| ty.clone()))
-            }
+            Type::Struct { fields, .. } | Type::Model { fields, .. } => fields
+                .iter()
+                .find_map(|(name, ty)| (*name == field).then(|| ty.clone())),
             _ => None,
         }
     }
@@ -193,10 +227,9 @@ impl Compiler<'_> {
         for (i, sub_pat) in patterns.iter().enumerate() {
             let idx = match rest_index {
                 Some(rest_pos) if i > rest_pos => {
-                    let tail_count = builder.ins().iconst(
-                        cl_types::I64,
-                        patterns.len().saturating_sub(i) as i64,
-                    );
+                    let tail_count = builder
+                        .ins()
+                        .iconst(cl_types::I64, patterns.len().saturating_sub(i) as i64);
                     builder.ins().isub(container_len.unwrap(), tail_count)
                 }
                 _ => builder.ins().iconst(cl_types::I64, i as i64),
@@ -209,7 +242,9 @@ impl Compiler<'_> {
                     builder.declare_var(var, cl_types::I64);
                     builder.def_var(var, elem);
                     state.variables.insert(*sym, (var, cl_types::I64));
-                    if let Some(elem_ty) = self.destructure_element_type(container_ty, i, rest_index, patterns.len()) {
+                    if let Some(elem_ty) =
+                        self.destructure_element_type(container_ty, i, rest_index, patterns.len())
+                    {
                         state.variable_types.insert(*sym, elem_ty);
                     }
                 }
@@ -218,14 +253,22 @@ impl Compiler<'_> {
                     // Extract the i-th element, then recurse into it
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let nested_val = builder.inst_results(call)[0];
-                    let nested_ty = self.destructure_element_type(container_ty, i, rest_index, patterns.len());
-                    self.compile_destructure_patterns(builder, state, nested, nested_val, nested_ty.as_ref())?;
+                    let nested_ty =
+                        self.destructure_element_type(container_ty, i, rest_index, patterns.len());
+                    self.compile_destructure_patterns(
+                        builder,
+                        state,
+                        nested,
+                        nested_val,
+                        nested_ty.as_ref(),
+                    )?;
                 }
                 PatternKind::Struct { fields, .. } => {
                     // Extract the i-th element (the struct/dict), then destructure fields
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let struct_val = builder.inst_results(call)[0];
-                    let struct_ty = self.destructure_element_type(container_ty, i, rest_index, patterns.len());
+                    let struct_ty =
+                        self.destructure_element_type(container_ty, i, rest_index, patterns.len());
                     for field in fields {
                         let field_name = self.resolve_sym(field.name).to_string();
                         // Ensure string is in pool, then get pointer for dict lookup
@@ -235,10 +278,16 @@ impl Compiler<'_> {
                         let key_str = self.compile_string_literal(builder, &field_name)?;
                         let field_ty = self.destructure_field_type(struct_ty.as_ref(), field.name);
                         let mut field_val = self.compile_call_by_name(
-                            builder, "nsl_dict_get_str", &[struct_val, key_str],
+                            builder,
+                            "nsl_dict_get_str",
+                            &[struct_val, key_str],
                         )?;
                         if field_ty.as_ref().map(|ty| ty.is_tensor()).unwrap_or(false) {
-                            field_val = self.compile_call_by_name(builder, "nsl_tensor_clone", &[field_val])?;
+                            field_val = self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_clone",
+                                &[field_val],
+                            )?;
                         }
                         if let Some(ref pat) = field.pattern {
                             // Nested pattern: { x: (a, b) } → destructure the field value
@@ -253,12 +302,19 @@ impl Compiler<'_> {
                                     }
                                 }
                                 PatternKind::Tuple(nested) | PatternKind::List(nested) => {
-                                    self.compile_destructure_patterns(builder, state, nested, field_val, field_ty.as_ref())?;
+                                    self.compile_destructure_patterns(
+                                        builder,
+                                        state,
+                                        nested,
+                                        field_val,
+                                        field_ty.as_ref(),
+                                    )?;
                                 }
                                 PatternKind::Wildcard => {}
                                 _ => {
                                     return Err(CodegenError::new(format!(
-                                        "unsupported nested pattern in struct field '{}'", field_name
+                                        "unsupported nested pattern in struct field '{}'",
+                                        field_name
                                     )));
                                 }
                             }
@@ -278,7 +334,8 @@ impl Compiler<'_> {
                     // Type annotation is semantic-only — recurse into the inner pattern
                     let call = builder.ins().call(get_ref, &[container_val, idx]);
                     let elem = builder.inst_results(call)[0];
-                    let elem_ty = self.destructure_element_type(container_ty, i, rest_index, patterns.len());
+                    let elem_ty =
+                        self.destructure_element_type(container_ty, i, rest_index, patterns.len());
                     match &pattern.kind {
                         PatternKind::Ident(sym) => {
                             let var = state.new_variable();
@@ -290,7 +347,13 @@ impl Compiler<'_> {
                             }
                         }
                         PatternKind::Tuple(nested) | PatternKind::List(nested) => {
-                            self.compile_destructure_patterns(builder, state, nested, elem, elem_ty.as_ref())?;
+                            self.compile_destructure_patterns(
+                                builder,
+                                state,
+                                nested,
+                                elem,
+                                elem_ty.as_ref(),
+                            )?;
                         }
                         PatternKind::Wildcard => {}
                         _ => {
@@ -301,10 +364,9 @@ impl Compiler<'_> {
                 PatternKind::Rest(rest_sym) => {
                     let lo = builder.ins().iconst(cl_types::I64, i as i64);
                     let hi = if i + 1 < patterns.len() {
-                        let trailing = builder.ins().iconst(
-                            cl_types::I64,
-                            patterns.len().saturating_sub(i + 1) as i64,
-                        );
+                        let trailing = builder
+                            .ins()
+                            .iconst(cl_types::I64, patterns.len().saturating_sub(i + 1) as i64);
                         builder.ins().isub(container_len.unwrap(), trailing)
                     } else {
                         container_len.unwrap()
@@ -321,7 +383,9 @@ impl Compiler<'_> {
                         builder.declare_var(var, cl_types::I64);
                         builder.def_var(var, rest_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
-                        if let Some(rest_ty) = self.destructure_rest_type(container_ty, i, patterns.len()) {
+                        if let Some(rest_ty) =
+                            self.destructure_rest_type(container_ty, i, patterns.len())
+                        {
                             state.variable_types.insert(*sym, rest_ty);
                         }
                     } else {
@@ -330,7 +394,8 @@ impl Compiler<'_> {
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
-                        "unsupported pattern kind in destructuring at position {}", i
+                        "unsupported pattern kind in destructuring at position {}",
+                        i
                     )));
                 }
             }
@@ -369,9 +434,10 @@ impl Compiler<'_> {
                         }
                         let init_val = if let Some(expr) = value {
                             // M36: Check if this variable is slab-planned for zero-alloc
-                            let slab_result = self.try_compile_slab_tensor(builder, state, &sym, expr);
+                            let slab_result =
+                                self.try_compile_slab_tensor(builder, state, &sym, expr);
                             match slab_result {
-                                Ok(Some(val)) => val, // Slab allocation succeeded
+                                Ok(Some(val)) => val,                          // Slab allocation succeeded
                                 _ => self.compile_expr(builder, state, expr)?, // Normal path
                             }
                         } else {
@@ -392,13 +458,25 @@ impl Compiler<'_> {
                                 )));
                             }
                             // Free old tensor value before reassignment to prevent memory leak
-                            if state.current_block.map(|b| !is_block_filled(builder, b)).unwrap_or(true) {
+                            if state
+                                .current_block
+                                .map(|b| !is_block_filled(builder, b))
+                                .unwrap_or(true)
+                            {
                                 let old_val = builder.use_var(*var);
                                 let sem_ty = state.variable_types.get(&sym);
                                 if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
-                                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
+                                    let _ = self.compile_call_by_name(
+                                        builder,
+                                        "nsl_tensor_free",
+                                        &[old_val],
+                                    );
                                 } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
-                                    let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[old_val]);
+                                    let _ = self.compile_call_by_name(
+                                        builder,
+                                        "nsl_tensor_free_if_valid",
+                                        &[old_val],
+                                    );
                                 }
                             }
                             builder.def_var(*var, init_val);
@@ -411,7 +489,9 @@ impl Compiler<'_> {
 
                         // Record semantic type for step-variable cleanup
                         if let Some(expr) = value {
-                            state.variable_types.insert(sym, self.node_type(expr.id).clone());
+                            state
+                                .variable_types
+                                .insert(sym, self.node_type(expr.id).clone());
                             if self.expr_is_dataloader_handle(state, expr) {
                                 state.dataloader_symbols.insert(sym);
                             } else {
@@ -424,13 +504,20 @@ impl Compiler<'_> {
                         // M50: Track sparse tensor variables for end-to-end dispatch.
                         // Check if the RHS is a call to a sparse function or has Type::Sparse.
                         if let Some(expr) = value {
-                            let is_sparse_type = matches!(self.node_type(expr.id), nsl_semantic::types::Type::Sparse { .. });
+                            let is_sparse_type = matches!(
+                                self.node_type(expr.id),
+                                nsl_semantic::types::Type::Sparse { .. }
+                            );
                             let is_sparse_call = if let ExprKind::Call { callee, .. } = &expr.kind {
                                 if let ExprKind::Ident(fn_sym) = &callee.kind {
                                     let fn_name = self.resolve_sym(*fn_sym);
                                     fn_name.contains("sparse") || fn_name == "from_dense"
-                                } else { false }
-                            } else { false };
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
                             if is_sparse_type || is_sparse_call {
                                 state.ownership.sparse_vars.insert(sym);
                             }
@@ -450,11 +537,19 @@ impl Compiler<'_> {
                         let tuple_val = if let Some(expr) = value {
                             self.compile_expr(builder, state, expr)?
                         } else {
-                            return Err(CodegenError::new("tuple/list destructuring requires a value"));
+                            return Err(CodegenError::new(
+                                "tuple/list destructuring requires a value",
+                            ));
                         };
                         let tuple_ty = value.as_ref().map(|expr| self.node_type(expr.id).clone());
 
-                        self.compile_destructure_patterns(builder, state, sub_patterns, tuple_val, tuple_ty.as_ref())?;
+                        self.compile_destructure_patterns(
+                            builder,
+                            state,
+                            sub_patterns,
+                            tuple_val,
+                            tuple_ty.as_ref(),
+                        )?;
                     }
                     PatternKind::Struct { fields, .. } => {
                         // Top-level struct destructuring: let { x, y } = expr
@@ -470,12 +565,19 @@ impl Compiler<'_> {
                                 self.intern_string(&field_name)?;
                             }
                             let key_str = self.compile_string_literal(builder, &field_name)?;
-                            let field_ty = self.destructure_field_type(struct_ty.as_ref(), field.name);
+                            let field_ty =
+                                self.destructure_field_type(struct_ty.as_ref(), field.name);
                             let mut field_val = self.compile_call_by_name(
-                                builder, "nsl_dict_get_str", &[struct_val, key_str],
+                                builder,
+                                "nsl_dict_get_str",
+                                &[struct_val, key_str],
                             )?;
                             if field_ty.as_ref().map(|ty| ty.is_tensor()).unwrap_or(false) {
-                                field_val = self.compile_call_by_name(builder, "nsl_tensor_clone", &[field_val])?;
+                                field_val = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_clone",
+                                    &[field_val],
+                                )?;
                             }
                             if let Some(ref pat) = field.pattern {
                                 match &pat.kind {
@@ -489,12 +591,19 @@ impl Compiler<'_> {
                                         }
                                     }
                                     PatternKind::Tuple(nested) | PatternKind::List(nested) => {
-                                        self.compile_destructure_patterns(builder, state, nested, field_val, field_ty.as_ref())?;
+                                        self.compile_destructure_patterns(
+                                            builder,
+                                            state,
+                                            nested,
+                                            field_val,
+                                            field_ty.as_ref(),
+                                        )?;
                                     }
                                     PatternKind::Wildcard => {}
                                     _ => {
                                         return Err(CodegenError::new(format!(
-                                            "unsupported pattern in struct field '{}'", field_name
+                                            "unsupported pattern in struct field '{}'",
+                                            field_name
                                         )));
                                     }
                                 }
@@ -509,7 +618,11 @@ impl Compiler<'_> {
                             }
                         }
                     }
-                    _ => return Err(CodegenError::new("only ident, tuple, list, and struct patterns supported")),
+                    _ => {
+                        return Err(CodegenError::new(
+                            "only ident, tuple, list, and struct patterns supported",
+                        ))
+                    }
                 }
             }
 
@@ -545,7 +658,11 @@ impl Compiler<'_> {
                     if state.flags.dtype_unpack_ret_bitcast {
                         let vt = builder.func.dfg.value_type(val);
                         if vt == cranelift_codegen::ir::types::F64 {
-                            val = builder.ins().bitcast(cranelift_codegen::ir::types::I64, cranelift_codegen::ir::MemFlags::new(), val);
+                            val = builder.ins().bitcast(
+                                cranelift_codegen::ir::types::I64,
+                                cranelift_codegen::ir::MemFlags::new(),
+                                val,
+                            );
                         }
                     }
                     builder.ins().return_(&[val]);
@@ -569,15 +686,31 @@ impl Compiler<'_> {
                 self.free_linear_consumes(builder, state, None);
             }
 
-            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
-                self.compile_if_stmt(builder, state, condition, then_block, elif_clauses, else_block)?;
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
+                self.compile_if_stmt(
+                    builder,
+                    state,
+                    condition,
+                    then_block,
+                    elif_clauses,
+                    else_block,
+                )?;
             }
 
             StmtKind::While { condition, body } => {
                 self.compile_while(builder, state, condition, body)?;
             }
 
-            StmtKind::For { pattern, iterable, body } => {
+            StmtKind::For {
+                pattern,
+                iterable,
+                body,
+            } => {
                 self.compile_for(builder, state, pattern, iterable, body)?;
             }
 
@@ -586,7 +719,9 @@ impl Compiler<'_> {
             }
 
             StmtKind::Break => {
-                let exit = state.loop_stack.last()
+                let exit = state
+                    .loop_stack
+                    .last()
                     .map(|lc| lc.exit_block)
                     .ok_or_else(|| CodegenError::new("break outside loop"))?;
                 // Free tensor temporaries from current loop iteration before jumping out
@@ -595,7 +730,9 @@ impl Compiler<'_> {
             }
 
             StmtKind::Continue => {
-                let cont = state.loop_stack.last()
+                let cont = state
+                    .loop_stack
+                    .last()
                     .map(|lc| lc.continue_block)
                     .ok_or_else(|| CodegenError::new("continue outside loop"))?;
                 // Free tensor temporaries from current loop iteration before restarting
@@ -608,12 +745,17 @@ impl Compiler<'_> {
                 let base_name = self.resolve_sym(fn_def.name).to_string();
                 let unique_name = format!("__nsl_nested_{}_{}", base_name, self.next_func_index());
                 let sig = self.build_fn_signature(fn_def);
-                let func_id = self.module
+                let func_id = self
+                    .module
                     .declare_function(&unique_name, cranelift_module::Linkage::Local, &sig)
-                    .map_err(|e| CodegenError::new(format!("failed to declare nested fn '{base_name}': {e}")))?;
+                    .map_err(|e| {
+                        CodegenError::new(format!("failed to declare nested fn '{base_name}': {e}"))
+                    })?;
                 // Temporarily insert under base_name for compile_fn_def lookup, then restore
                 let prev_entry = self.registry.functions.remove(&base_name);
-                self.registry.functions.insert(base_name.clone(), (func_id, sig.clone()));
+                self.registry
+                    .functions
+                    .insert(base_name.clone(), (func_id, sig.clone()));
 
                 // Compile the nested function body
                 self.compile_fn_def(fn_def)?;
@@ -626,7 +768,9 @@ impl Compiler<'_> {
 
                 // Bind function name as a variable holding the function pointer
                 let func_ref = self.module.declare_func_in_func(func_id, builder.func);
-                let addr = builder.ins().func_addr(crate::types::pointer_type(), func_ref);
+                let addr = builder
+                    .ins()
+                    .func_addr(crate::types::pointer_type(), func_ref);
                 let var = state.new_variable();
                 builder.declare_var(var, cl_types::I64);
                 builder.def_var(var, addr);
@@ -641,10 +785,14 @@ impl Compiler<'_> {
                 self.compile_train_block(builder, state, train)?;
             }
 
-            StmtKind::StructDef(_) | StmtKind::ModelDef(_)
-            | StmtKind::EnumDef(_) | StmtKind::TraitDef(_)
-            | StmtKind::Import(_) | StmtKind::FromImport(_)
-            | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_) => {}
+            StmtKind::StructDef(_)
+            | StmtKind::ModelDef(_)
+            | StmtKind::EnumDef(_)
+            | StmtKind::TraitDef(_)
+            | StmtKind::Import(_)
+            | StmtKind::FromImport(_)
+            | StmtKind::DatasetDef(_)
+            | StmtKind::TokenizerDef(_) => {}
 
             StmtKind::DatatypeDef(_) => {
                 // M23: custom datatype codegen — implemented in Task 9
@@ -662,7 +810,11 @@ impl Compiler<'_> {
                 self.compile_quant_block(builder, state, quant)?;
             }
 
-            StmtKind::WhileLet { pattern, expr, body } => {
+            StmtKind::WhileLet {
+                pattern,
+                expr,
+                body,
+            } => {
                 self.compile_while_let(builder, state, pattern, expr, body)?;
             }
 
@@ -684,20 +836,24 @@ impl Compiler<'_> {
                                 // and register it for fused kernel launch at call sites.
                                 let fname = self.resolve_sym(fn_def.name).to_string();
                                 let num_params = fn_def.params.len();
-                                if let Some(ret_expr) = fn_def.body.stmts.iter().rev().find_map(|s| {
-                                    match &s.kind {
+                                if let Some(ret_expr) =
+                                    fn_def.body.stmts.iter().rev().find_map(|s| match &s.kind {
                                         StmtKind::Return(Some(e)) => Some(e),
                                         StmtKind::Expr(e) => Some(e),
                                         _ => None,
-                                    }
-                                }) {
+                                    })
+                                {
                                     let interner = self.interner;
                                     let resolve = |sym: nsl_ast::Symbol| -> Option<String> {
                                         interner.resolve(sym.0).map(|s| s.to_string())
                                     };
-                                    if let Some((ops, _inputs)) = crate::fusion::analyze_fusible_chain(ret_expr, &resolve) {
+                                    if let Some((ops, _inputs)) =
+                                        crate::fusion::analyze_fusible_chain(ret_expr, &resolve)
+                                    {
                                         if ops.len() >= 2 {
-                                            self.fusion.fused_fns.insert(fname.clone(), (ops, num_params));
+                                            self.fusion
+                                                .fused_fns
+                                                .insert(fname.clone(), (ops, num_params));
                                         }
                                     }
                                 }
@@ -713,18 +869,25 @@ impl Compiler<'_> {
                                         if let Some(name_sym) = arg.name {
                                             let arg_name = self.resolve_sym(name_sym).to_string();
                                             if arg_name == "start_rule" {
-                                                if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                                if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                                    &arg.value.kind
+                                                {
                                                     start_rule = s.clone();
                                                 }
                                             }
-                                        } else if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                        } else if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                            &arg.value.kind
+                                        {
                                             grammar_source = s.clone();
                                         }
                                     }
                                 }
                                 self.features.grammar_configs.insert(
                                     fname,
-                                    crate::compiler::GrammarInfo { start_rule, grammar_source },
+                                    crate::compiler::GrammarInfo {
+                                        start_rule,
+                                        grammar_source,
+                                    },
                                 );
                             }
                         }
@@ -735,7 +898,7 @@ impl Compiler<'_> {
 
             _ => {
                 return Err(CodegenError::new(
-                    "unsupported statement in M3 codegen".to_string()
+                    "unsupported statement in M3 codegen".to_string(),
                 ));
             }
         }
@@ -779,15 +942,27 @@ impl Compiler<'_> {
                     AssignOp::Assign => new_val,
                     AssignOp::AddAssign => {
                         let old = builder.use_var(var);
-                        if is_float { builder.ins().fadd(old, new_val) } else { builder.ins().iadd(old, new_val) }
+                        if is_float {
+                            builder.ins().fadd(old, new_val)
+                        } else {
+                            builder.ins().iadd(old, new_val)
+                        }
                     }
                     AssignOp::SubAssign => {
                         let old = builder.use_var(var);
-                        if is_float { builder.ins().fsub(old, new_val) } else { builder.ins().isub(old, new_val) }
+                        if is_float {
+                            builder.ins().fsub(old, new_val)
+                        } else {
+                            builder.ins().isub(old, new_val)
+                        }
                     }
                     AssignOp::MulAssign => {
                         let old = builder.use_var(var);
-                        if is_float { builder.ins().fmul(old, new_val) } else { builder.ins().imul(old, new_val) }
+                        if is_float {
+                            builder.ins().fmul(old, new_val)
+                        } else {
+                            builder.ins().imul(old, new_val)
+                        }
                     }
                     AssignOp::DivAssign => {
                         let old = builder.use_var(var);
@@ -801,13 +976,22 @@ impl Compiler<'_> {
                 };
                 // Free old tensor value before reassignment to prevent memory leak
                 if matches!(op, AssignOp::Assign) {
-                    if state.current_block.map(|b| !is_block_filled(builder, b)).unwrap_or(true) {
+                    if state
+                        .current_block
+                        .map(|b| !is_block_filled(builder, b))
+                        .unwrap_or(true)
+                    {
                         let old_val = builder.use_var(var);
                         let sem_ty = state.variable_types.get(sym);
                         if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
-                            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
+                            let _ =
+                                self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
                         } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
-                            let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[old_val]);
+                            let _ = self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_free_if_valid",
+                                &[old_val],
+                            );
                         }
                     }
                 }
@@ -841,7 +1025,11 @@ impl Compiler<'_> {
                             new_val
                         } else {
                             // Read-modify-write: get old value, apply op, write back
-                            let get_fn = if is_dict { "nsl_dict_get_str" } else { "nsl_list_get" };
+                            let get_fn = if is_dict {
+                                "nsl_dict_get_str"
+                            } else {
+                                "nsl_list_get"
+                            };
                             let get_id = self.registry.runtime_fns[get_fn].0;
                             let get_ref = self.module.declare_func_in_func(get_id, builder.func);
                             let call = builder.ins().call(get_ref, &[obj_val, idx_val]);
@@ -859,7 +1047,11 @@ impl Compiler<'_> {
                             }
                         };
 
-                        let set_fn = if is_dict { "nsl_dict_set_str" } else { "nsl_list_set" };
+                        let set_fn = if is_dict {
+                            "nsl_dict_set_str"
+                        } else {
+                            "nsl_list_set"
+                        };
                         let set_id = self.registry.runtime_fns[set_fn].0;
                         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
                         builder.ins().call(set_ref, &[obj_val, idx_val, final_val]);
@@ -885,24 +1077,42 @@ impl Compiler<'_> {
                                         obj_val,
                                         field.offset as i32,
                                     );
-                                    let is_float = field.cl_type == cl_types::F64 || field.cl_type == cl_types::F32;
+                                    let is_float = field.cl_type == cl_types::F64
+                                        || field.cl_type == cl_types::F32;
                                     match (op, is_float) {
-                                        (AssignOp::AddAssign, true) => builder.ins().fadd(old_val, new_val),
-                                        (AssignOp::SubAssign, true) => builder.ins().fsub(old_val, new_val),
-                                        (AssignOp::MulAssign, true) => builder.ins().fmul(old_val, new_val),
-                                        (AssignOp::DivAssign, true) => builder.ins().fdiv(old_val, new_val),
-                                        (AssignOp::AddAssign, false) => builder.ins().iadd(old_val, new_val),
-                                        (AssignOp::SubAssign, false) => builder.ins().isub(old_val, new_val),
-                                        (AssignOp::MulAssign, false) => builder.ins().imul(old_val, new_val),
+                                        (AssignOp::AddAssign, true) => {
+                                            builder.ins().fadd(old_val, new_val)
+                                        }
+                                        (AssignOp::SubAssign, true) => {
+                                            builder.ins().fsub(old_val, new_val)
+                                        }
+                                        (AssignOp::MulAssign, true) => {
+                                            builder.ins().fmul(old_val, new_val)
+                                        }
+                                        (AssignOp::DivAssign, true) => {
+                                            builder.ins().fdiv(old_val, new_val)
+                                        }
+                                        (AssignOp::AddAssign, false) => {
+                                            builder.ins().iadd(old_val, new_val)
+                                        }
+                                        (AssignOp::SubAssign, false) => {
+                                            builder.ins().isub(old_val, new_val)
+                                        }
+                                        (AssignOp::MulAssign, false) => {
+                                            builder.ins().imul(old_val, new_val)
+                                        }
                                         (AssignOp::DivAssign, false) => {
                                             // Inline div-by-zero guard (can't call method due to borrow)
                                             let ok_blk = builder.create_block();
                                             let trap_blk = builder.create_block();
-                                            let is_zero = builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                            let is_zero =
+                                                builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
                                             builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
                                             builder.switch_to_block(trap_blk);
                                             builder.seal_block(trap_blk);
-                                            builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                                            builder.ins().trap(
+                                                cranelift_codegen::ir::TrapCode::unwrap_user(1),
+                                            );
                                             builder.switch_to_block(ok_blk);
                                             builder.seal_block(ok_blk);
                                             state.current_block = Some(ok_blk);
@@ -939,24 +1149,42 @@ impl Compiler<'_> {
                                         obj_val,
                                         field.offset as i32,
                                     );
-                                    let is_float = field.cl_type == cl_types::F64 || field.cl_type == cl_types::F32;
+                                    let is_float = field.cl_type == cl_types::F64
+                                        || field.cl_type == cl_types::F32;
                                     match (op, is_float) {
-                                        (AssignOp::AddAssign, true) => builder.ins().fadd(old_val, new_val),
-                                        (AssignOp::SubAssign, true) => builder.ins().fsub(old_val, new_val),
-                                        (AssignOp::MulAssign, true) => builder.ins().fmul(old_val, new_val),
-                                        (AssignOp::DivAssign, true) => builder.ins().fdiv(old_val, new_val),
-                                        (AssignOp::AddAssign, false) => builder.ins().iadd(old_val, new_val),
-                                        (AssignOp::SubAssign, false) => builder.ins().isub(old_val, new_val),
-                                        (AssignOp::MulAssign, false) => builder.ins().imul(old_val, new_val),
+                                        (AssignOp::AddAssign, true) => {
+                                            builder.ins().fadd(old_val, new_val)
+                                        }
+                                        (AssignOp::SubAssign, true) => {
+                                            builder.ins().fsub(old_val, new_val)
+                                        }
+                                        (AssignOp::MulAssign, true) => {
+                                            builder.ins().fmul(old_val, new_val)
+                                        }
+                                        (AssignOp::DivAssign, true) => {
+                                            builder.ins().fdiv(old_val, new_val)
+                                        }
+                                        (AssignOp::AddAssign, false) => {
+                                            builder.ins().iadd(old_val, new_val)
+                                        }
+                                        (AssignOp::SubAssign, false) => {
+                                            builder.ins().isub(old_val, new_val)
+                                        }
+                                        (AssignOp::MulAssign, false) => {
+                                            builder.ins().imul(old_val, new_val)
+                                        }
                                         (AssignOp::DivAssign, false) => {
                                             // Inline div-by-zero guard (can't call method due to borrow)
                                             let ok_blk = builder.create_block();
                                             let trap_blk = builder.create_block();
-                                            let is_zero = builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
+                                            let is_zero =
+                                                builder.ins().icmp_imm(IntCC::Equal, new_val, 0);
                                             builder.ins().brif(is_zero, trap_blk, &[], ok_blk, &[]);
                                             builder.switch_to_block(trap_blk);
                                             builder.seal_block(trap_blk);
-                                            builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                                            builder.ins().trap(
+                                                cranelift_codegen::ir::TrapCode::unwrap_user(1),
+                                            );
                                             builder.switch_to_block(ok_blk);
                                             builder.seal_block(ok_blk);
                                             state.current_block = Some(ok_blk);
@@ -979,9 +1207,15 @@ impl Compiler<'_> {
                         )));
                     }
                 }
-                return Err(CodegenError::new(format!("member assignment not supported for .{member_name}")));
+                return Err(CodegenError::new(format!(
+                    "member assignment not supported for .{member_name}"
+                )));
             }
-            _ => return Err(CodegenError::new("only variable/subscript/member assignment supported in M4")),
+            _ => {
+                return Err(CodegenError::new(
+                    "only variable/subscript/member assignment supported in M4",
+                ))
+            }
         }
         Ok(())
     }
@@ -1046,11 +1280,7 @@ impl Compiler<'_> {
     /// Emit nsl_tensor_free calls for all tensor temporaries accumulated since the
     /// current loop scope started. Used at break/continue points.
     /// CRITICAL: Does NOT truncate tensor_temporaries — that only happens at natural scope exit.
-    fn emit_loop_scope_cleanup(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-    ) {
+    fn emit_loop_scope_cleanup(&mut self, builder: &mut FunctionBuilder, state: &mut FuncState) {
         if let Some(&scope_start) = state.cleanup.temp_scope_stack.last() {
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
@@ -1064,11 +1294,7 @@ impl Compiler<'_> {
     }
 
     /// Emit cleanup AND truncate temporaries at natural loop exit.
-    fn cleanup_loop_scope(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-    ) {
+    fn cleanup_loop_scope(&mut self, builder: &mut FunctionBuilder, state: &mut FuncState) {
         if let Some(scope_start) = state.cleanup.temp_scope_stack.pop() {
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
@@ -1163,7 +1389,9 @@ impl Compiler<'_> {
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.flags.conditional_depth += 1;
-        for s in &then_block.stmts { self.compile_stmt(builder, state, s)?; }
+        for s in &then_block.stmts {
+            self.compile_stmt(builder, state, s)?;
+        }
         state.flags.conditional_depth -= 1;
         let current = state.current_block.unwrap_or(then_bb);
         if !is_block_filled(builder, current) {
@@ -1185,7 +1413,9 @@ impl Compiler<'_> {
             } else {
                 merge_block
             };
-            builder.ins().brif(elif_cond_val, elif_then, &[], elif_next, &[]);
+            builder
+                .ins()
+                .brif(elif_cond_val, elif_then, &[], elif_next, &[]);
 
             builder.switch_to_block(elif_then);
             builder.seal_block(elif_then);
@@ -1193,7 +1423,9 @@ impl Compiler<'_> {
             state.dataloader_symbols = incoming_loader_symbols.clone();
             state.cleanup.dataloader_vars = incoming_loader_vars.clone();
             state.flags.conditional_depth += 1;
-            for s in &elif_body.stmts { self.compile_stmt(builder, state, s)?; }
+            for s in &elif_body.stmts {
+                self.compile_stmt(builder, state, s)?;
+            }
             state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(elif_then);
             if !is_block_filled(builder, current) {
@@ -1212,7 +1444,9 @@ impl Compiler<'_> {
             state.dataloader_symbols = incoming_loader_symbols.clone();
             state.cleanup.dataloader_vars = incoming_loader_vars.clone();
             state.flags.conditional_depth += 1;
-            for s in &else_body.stmts { self.compile_stmt(builder, state, s)?; }
+            for s in &else_body.stmts {
+                self.compile_stmt(builder, state, s)?;
+            }
             state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(current_else);
             if !is_block_filled(builder, current) {
@@ -1230,19 +1464,30 @@ impl Compiler<'_> {
         }
 
         state.dataloader_symbols = if let Some(first) = reaching_loader_sets.first().cloned() {
-            reaching_loader_sets.into_iter().skip(1).fold(first, |acc, branch_set| {
-                acc.into_iter().filter(|sym| branch_set.contains(sym)).collect()
-            })
+            reaching_loader_sets
+                .into_iter()
+                .skip(1)
+                .fold(first, |acc, branch_set| {
+                    acc.into_iter()
+                        .filter(|sym| branch_set.contains(sym))
+                        .collect()
+                })
         } else {
             incoming_loader_symbols
         };
-        state.cleanup.dataloader_vars = if let Some(first) = reaching_loader_var_sets.first().cloned() {
-            reaching_loader_var_sets.into_iter().skip(1).fold(first, |acc, branch_vec| {
-                acc.into_iter().filter(|value| branch_vec.contains(value)).collect()
-            })
-        } else {
-            incoming_loader_vars
-        };
+        state.cleanup.dataloader_vars =
+            if let Some(first) = reaching_loader_var_sets.first().cloned() {
+                reaching_loader_var_sets
+                    .into_iter()
+                    .skip(1)
+                    .fold(first, |acc, branch_vec| {
+                        acc.into_iter()
+                            .filter(|value| branch_vec.contains(value))
+                            .collect()
+                    })
+            } else {
+                incoming_loader_vars
+            };
 
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
@@ -1266,15 +1511,26 @@ impl Compiler<'_> {
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
         let cond_val = self.compile_expr(builder, state, condition)?;
-        builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
+        builder
+            .ins()
+            .brif(cond_val, body_block, &[], exit_block, &[]);
 
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
-        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: header_block, exit_block, batch_var: None });
-        for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
+        state
+            .cleanup
+            .temp_scope_stack
+            .push(state.cleanup.tensor_temporaries.len());
+        state.loop_stack.push(LoopContext {
+            continue_block: header_block,
+            exit_block,
+            batch_var: None,
+        });
+        for s in &body.stmts {
+            self.compile_stmt(builder, state, s)?;
+        }
         state.loop_stack.pop();
 
         let current = state.current_block.unwrap_or(body_block);
@@ -1311,7 +1567,11 @@ impl Compiler<'_> {
                 Some(var)
             }
             PatternKind::Wildcard => None,
-            _ => return Err(CodegenError::new("only ident or wildcard patterns in while-let")),
+            _ => {
+                return Err(CodegenError::new(
+                    "only ident or wildcard patterns in while-let",
+                ))
+            }
         };
 
         let header_block = builder.create_block();
@@ -1337,9 +1597,18 @@ impl Compiler<'_> {
             builder.def_var(var, val);
         }
 
-        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: header_block, exit_block, batch_var: None });
-        for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
+        state
+            .cleanup
+            .temp_scope_stack
+            .push(state.cleanup.tensor_temporaries.len());
+        state.loop_stack.push(LoopContext {
+            continue_block: header_block,
+            exit_block,
+            batch_var: None,
+        });
+        for s in &body.stmts {
+            self.compile_stmt(builder, state, s)?;
+        }
         state.loop_stack.pop();
 
         let current = state.current_block.unwrap_or(body_block);
@@ -1367,8 +1636,20 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         // Check if iterating over a fixed model array
         let iter_type = self.node_type(iterable.id).clone();
-        if let Type::FixedModelArray { element_model, size } = &iter_type {
-            return self.compile_for_model_array(builder, state, pattern, iterable, body, *element_model, *size);
+        if let Type::FixedModelArray {
+            element_model,
+            size,
+        } = &iter_type
+        {
+            return self.compile_for_model_array(
+                builder,
+                state,
+                pattern,
+                iterable,
+                body,
+                *element_model,
+                *size,
+            );
         }
 
         // DataLoader iteration uses an opaque runtime handle, not a real list.
@@ -1433,7 +1714,11 @@ impl Compiler<'_> {
                     }
                 }
             }
-            _ => return Err(CodegenError::new("only ident, tuple, and list patterns in for loops")),
+            _ => {
+                return Err(CodegenError::new(
+                    "only ident, tuple, and list patterns in for loops",
+                ))
+            }
         }
 
         let header_block = builder.create_block();
@@ -1490,15 +1775,15 @@ impl Compiler<'_> {
                             let idx = match rest_pos {
                                 Some(rp) if i > rp => {
                                     // After rest: index from end
-                                    let trailing = builder.ins().iconst(
-                                        cl_types::I64,
-                                        (sub_patterns.len() - i) as i64,
-                                    );
+                                    let trailing = builder
+                                        .ins()
+                                        .iconst(cl_types::I64, (sub_patterns.len() - i) as i64);
                                     builder.ins().isub(elem_len.unwrap(), trailing)
                                 }
                                 _ => builder.ins().iconst(cl_types::I64, i as i64),
                             };
-                            let inner_get_ref = self.module.declare_func_in_func(get_id, builder.func);
+                            let inner_get_ref =
+                                self.module.declare_func_in_func(get_id, builder.func);
                             let call = builder.ins().call(inner_get_ref, &[elem, idx]);
                             let sub_elem = builder.inst_results(call)[0];
                             let (var, _) = state.variables[sym];
@@ -1517,7 +1802,9 @@ impl Compiler<'_> {
                             };
                             let step = builder.ins().iconst(cl_types::I64, 1);
                             let rest_val = self.compile_call_by_name(
-                                builder, "nsl_list_slice", &[elem, lo, hi, step],
+                                builder,
+                                "nsl_list_slice",
+                                &[elem, lo, hi, step],
                             )?;
                             if let Some(sym) = rest_sym {
                                 let (var, _) = state.variables[sym];
@@ -1535,9 +1822,18 @@ impl Compiler<'_> {
         }
 
         // continue jumps to increment_block (not header) so counter is incremented
-        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block, batch_var: None });
-        for s in &body.stmts { self.compile_stmt(builder, state, s)?; }
+        state
+            .cleanup
+            .temp_scope_stack
+            .push(state.cleanup.tensor_temporaries.len());
+        state.loop_stack.push(LoopContext {
+            continue_block: increment_block,
+            exit_block,
+            batch_var: None,
+        });
+        for s in &body.stmts {
+            self.compile_stmt(builder, state, s)?;
+        }
         state.loop_stack.pop();
 
         let current = state.current_block.unwrap_or(body_block);
@@ -1582,13 +1878,19 @@ impl Compiler<'_> {
         // Declare loop variable
         let loop_var_sym = match &pattern.kind {
             PatternKind::Ident(sym) => *sym,
-            _ => return Err(CodegenError::new("only ident patterns supported in model array for-loops")),
+            _ => {
+                return Err(CodegenError::new(
+                    "only ident patterns supported in model array for-loops",
+                ))
+            }
         };
         let zero = builder.ins().iconst(cl_types::I64, 0);
         let elem_var = state.new_variable();
         builder.declare_var(elem_var, cl_types::I64);
         builder.def_var(elem_var, zero);
-        state.variables.insert(loop_var_sym, (elem_var, cl_types::I64));
+        state
+            .variables
+            .insert(loop_var_sym, (elem_var, cl_types::I64));
 
         // Register the loop variable's model type for method dispatch
         let model_name = self.resolve_sym(element_model).to_string();
@@ -1622,12 +1924,21 @@ impl Compiler<'_> {
         let eight = builder.ins().iconst(cl_types::I64, 8);
         let elem_offset = builder.ins().imul(counter, eight);
         let addr = builder.ins().iadd(base_val, elem_offset);
-        let elem_ptr = builder.ins().load(cl_types::I64, MemFlags::trusted(), addr, 0);
+        let elem_ptr = builder
+            .ins()
+            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
         builder.def_var(elem_var, elem_ptr);
 
         // Compile body statements
-        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
-        state.loop_stack.push(LoopContext { continue_block: increment_block, exit_block, batch_var: None });
+        state
+            .cleanup
+            .temp_scope_stack
+            .push(state.cleanup.tensor_temporaries.len());
+        state.loop_stack.push(LoopContext {
+            continue_block: increment_block,
+            exit_block,
+            batch_var: None,
+        });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
@@ -1717,7 +2028,11 @@ impl Compiler<'_> {
         // Extract loop variable symbol (must be simple ident)
         let loop_var_sym = match &pattern.kind {
             PatternKind::Ident(sym) => *sym,
-            _ => return Err(CodegenError::new("only ident patterns supported in DataLoader for-loops")),
+            _ => {
+                return Err(CodegenError::new(
+                    "only ident patterns supported in DataLoader for-loops",
+                ))
+            }
         };
 
         // Declare cranelift variable for the batch pointer
@@ -1725,7 +2040,9 @@ impl Compiler<'_> {
         builder.declare_var(batch_var, cl_types::I64);
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(batch_var, zero);
-        let prev_binding = state.variables.insert(loop_var_sym, (batch_var, cl_types::I64));
+        let prev_binding = state
+            .variables
+            .insert(loop_var_sym, (batch_var, cl_types::I64));
         let prev_var_type = state.variable_types.get(&loop_var_sym).cloned();
         let prev_loader_symbol = state.dataloader_symbols.contains(&loop_var_sym);
         let prev_borrowed_symbol = state.borrowed_batch_symbols.contains(&loop_var_sym);
@@ -1743,10 +2060,13 @@ impl Compiler<'_> {
         // Header: call nsl_dataloader_next_batch, branch on null
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
-        let batch_ptr = self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_val])?;
+        let batch_ptr =
+            self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_val])?;
         builder.def_var(batch_var, batch_ptr);
         let is_null = builder.ins().icmp_imm(IntCC::Equal, batch_ptr, 0);
-        builder.ins().brif(is_null, exhausted_exit_block, &[], body_block, &[]);
+        builder
+            .ins()
+            .brif(is_null, exhausted_exit_block, &[], body_block, &[]);
 
         // Body: compile loop body statements
         // break → break_exit_block (frees batch, then stops DL)
@@ -1758,9 +2078,16 @@ impl Compiler<'_> {
         // Rely on codegen-level tensor_temporaries for per-statement cleanup.
         // Do NOT use scope_begin/scope_end — it double-frees tensors that are
         // already freed by free_tensor_temporaries in called functions.
-        state.cleanup.temp_scope_stack.push(state.cleanup.tensor_temporaries.len());
+        state
+            .cleanup
+            .temp_scope_stack
+            .push(state.cleanup.tensor_temporaries.len());
         state.borrowed_batch_symbols.insert(loop_var_sym);
-        state.loop_stack.push(LoopContext { continue_block: cleanup_block, exit_block: break_exit_block, batch_var: Some(batch_var) });
+        state.loop_stack.push(LoopContext {
+            continue_block: cleanup_block,
+            exit_block: break_exit_block,
+            batch_var: Some(batch_var),
+        });
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
@@ -1797,10 +2124,10 @@ impl Compiler<'_> {
         builder.switch_to_block(exhausted_exit_block);
         builder.seal_block(exhausted_exit_block);
         state.current_block = Some(exhausted_exit_block);
-        builder.seal_block(exit_block);
         self.compile_call_by_name(builder, "nsl_dataloader_reset", &[dl_val])?;
         builder.ins().jump(exit_block, &[]);
 
+        builder.seal_block(exit_block);
         builder.switch_to_block(exit_block);
         state.current_block = Some(exit_block);
 
@@ -1868,14 +2195,20 @@ impl Compiler<'_> {
                         let tag_val = builder.ins().iconst(cl_types::I64, tag);
                         let cmp = builder.ins().icmp(IntCC::Equal, subject_val, tag_val);
                         let arm_block = builder.create_block();
-                        let next_block = if is_last { merge_block } else { builder.create_block() };
+                        let next_block = if is_last {
+                            merge_block
+                        } else {
+                            builder.create_block()
+                        };
                         builder.ins().brif(cmp, arm_block, &[], next_block, &[]);
 
                         builder.switch_to_block(arm_block);
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         state.flags.conditional_depth += 1;
-                        for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                        for s in &arm.body.stmts {
+                            self.compile_stmt(builder, state, s)?;
+                        }
                         state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
@@ -1894,7 +2227,9 @@ impl Compiler<'_> {
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
                         state.flags.conditional_depth += 1;
-                        for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                        for s in &arm.body.stmts {
+                            self.compile_stmt(builder, state, s)?;
+                        }
                         state.flags.conditional_depth -= 1;
                         if let Some(block) = state.current_block {
                             if !is_block_filled(builder, block) {
@@ -1908,19 +2243,29 @@ impl Compiler<'_> {
                     let lit_val = self.compile_expr(builder, state, lit_expr)?;
                     let lit_type = self.node_type(lit_expr.id).clone();
                     let cmp = if is_float_type(&lit_type) {
-                        builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, subject_val, lit_val)
+                        builder.ins().fcmp(
+                            cranelift_codegen::ir::condcodes::FloatCC::Equal,
+                            subject_val,
+                            lit_val,
+                        )
                     } else {
                         builder.ins().icmp(IntCC::Equal, subject_val, lit_val)
                     };
                     let arm_block = builder.create_block();
-                    let next_block = if is_last { merge_block } else { builder.create_block() };
+                    let next_block = if is_last {
+                        merge_block
+                    } else {
+                        builder.create_block()
+                    };
                     builder.ins().brif(cmp, arm_block, &[], next_block, &[]);
 
                     builder.switch_to_block(arm_block);
                     builder.seal_block(arm_block);
                     state.current_block = Some(arm_block);
                     state.flags.conditional_depth += 1;
-                    for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                    for s in &arm.body.stmts {
+                        self.compile_stmt(builder, state, s)?;
+                    }
                     state.flags.conditional_depth -= 1;
                     let current = state.current_block.unwrap_or(arm_block);
                     if !is_block_filled(builder, current) {
@@ -1944,14 +2289,20 @@ impl Compiler<'_> {
                         let tag_val = builder.ins().iconst(cl_types::I64, tag);
                         let cmp = builder.ins().icmp(IntCC::Equal, subject_val, tag_val);
                         let arm_block = builder.create_block();
-                        let next_block = if is_last { merge_block } else { builder.create_block() };
+                        let next_block = if is_last {
+                            merge_block
+                        } else {
+                            builder.create_block()
+                        };
                         builder.ins().brif(cmp, arm_block, &[], next_block, &[]);
 
                         builder.switch_to_block(arm_block);
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         state.flags.conditional_depth += 1;
-                        for s in &arm.body.stmts { self.compile_stmt(builder, state, s)?; }
+                        for s in &arm.body.stmts {
+                            self.compile_stmt(builder, state, s)?;
+                        }
                         state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
@@ -2016,14 +2367,18 @@ impl Compiler<'_> {
                         if let ExprKind::Ident(sym) = &arg.value.kind {
                             model_sym = Some(*sym);
                         } else {
-                            return Err(CodegenError::new("train 'model' arg must be an identifier"));
+                            return Err(CodegenError::new(
+                                "train 'model' arg must be an identifier",
+                            ));
                         }
                     }
                     "epochs" => {
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             epochs = *n;
                         } else {
-                            return Err(CodegenError::new("train 'epochs' arg must be an integer literal"));
+                            return Err(CodegenError::new(
+                                "train 'epochs' arg must be an integer literal",
+                            ));
                         }
                     }
                     "grad_accumulation" => {
@@ -2156,12 +2511,13 @@ impl Compiler<'_> {
         }
 
         if optimizer_name.is_empty() {
-            return Err(CodegenError::new("train block requires an optimizer section"));
+            return Err(CodegenError::new(
+                "train block requires an optimizer section",
+            ));
         }
 
-        let (step_body, step_param_sym) = step_body.ok_or_else(|| {
-            CodegenError::new("train block requires a step section")
-        })?;
+        let (step_body, step_param_sym) =
+            step_body.ok_or_else(|| CodegenError::new("train block requires a step section"))?;
 
         // ── 3. Resolve model type and build param list ──────────────────
         // Get the model pointer from state
@@ -2178,12 +2534,17 @@ impl Compiler<'_> {
         // state.variable_types (set for let-bound vars), then fall back to
         // scanning the type_map (unreliable — picks the first model type).
         let model_var_name = self.resolve_sym(model_sym).to_string();
-        let model_type_name = self.models.model_var_types.get(&model_sym)
+        let model_type_name = self
+            .models
+            .model_var_types
+            .get(&model_sym)
             .cloned()
             .or_else(|| {
                 // Check semantic type from variable_types
-                state.variable_types.get(&model_sym).and_then(|ty| {
-                    match ty {
+                state
+                    .variable_types
+                    .get(&model_sym)
+                    .and_then(|ty| match ty {
                         nsl_semantic::types::Type::Model { name, .. } => {
                             Some(self.resolve_sym(*name).to_string())
                         }
@@ -2191,37 +2552,41 @@ impl Compiler<'_> {
                             Some(self.resolve_sym(*name).to_string())
                         }
                         _ => None,
-                    }
-                })
+                    })
             })
             .unwrap_or_else(|| model_var_name.clone());
 
-        let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
-            CodegenError::new(format!(
-                "no struct layout found for model '{}' in train block",
-                model_type_name
-            ))
-        })?;
+        let layout = self
+            .types
+            .struct_layouts
+            .get(&model_type_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "no struct layout found for model '{}' in train block",
+                    model_type_name
+                ))
+            })?;
 
         // Build param_list directly from the compiler's struct layouts instead
         // of the runtime pointer-probing collector. This keeps nested models
         // and fixed arrays aligned with the paths source AD already resolves.
-        let param_paths = self.enumerate_model_tensor_paths(
-            &model_var_name, &model_type_name,
-        );
+        let param_paths = self.enumerate_model_tensor_paths(&model_var_name, &model_type_name);
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for path in &param_paths {
-            let param_ptr = self.load_nested_field(
-                builder, model_ptr, &layout, &model_type_name, path,
-            ).ok_or_else(|| {
-                CodegenError::new(format!(
-                    "could not resolve model parameter '{}' in train block",
-                    path,
-                ))
-            })?;
+            let param_ptr = self
+                .load_nested_field(builder, model_ptr, &layout, &model_type_name, path)
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "could not resolve model parameter '{}' in train block",
+                        path,
+                    ))
+                })?;
             self.compile_call_by_name(builder, "nsl_list_push", &[param_list, param_ptr])?;
         }
-        let num_params_val = builder.ins().iconst(cl_types::I64, param_paths.len() as i64);
+        let num_params_val = builder
+            .ins()
+            .iconst(cl_types::I64, param_paths.len() as i64);
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
@@ -2260,7 +2625,9 @@ impl Compiler<'_> {
             state.current_block = Some(init_header);
 
             let idx = builder.use_var(init_counter_var);
-            let cond = builder.ins().icmp(IntCC::SignedLessThan, idx, num_params_val);
+            let cond = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, idx, num_params_val);
             builder.ins().brif(cond, init_body, &[], init_exit, &[]);
 
             builder.switch_to_block(init_body);
@@ -2271,7 +2638,8 @@ impl Compiler<'_> {
             let buf1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
-                let buf2 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+                let buf2 =
+                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
                 self.compile_call_by_name(builder, "nsl_list_push", &[state_list_2, buf2])?;
             }
 
@@ -2316,7 +2684,9 @@ impl Compiler<'_> {
             builder.switch_to_block(accum_hdr);
             // Don't seal accum_hdr yet — back-edge not added
             let ai = builder.use_var(accum_i_var);
-            let ac = builder.ins().icmp(IntCC::SignedLessThan, ai, num_params_val);
+            let ac = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, ai, num_params_val);
             builder.ins().brif(ac, accum_body, &[], accum_exit, &[]);
             builder.switch_to_block(accum_body);
             builder.seal_block(accum_body);
@@ -2354,7 +2724,9 @@ impl Compiler<'_> {
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
         let counter = builder.use_var(epoch_counter_var);
-        let cond = builder.ins().icmp(IntCC::SignedLessThan, counter, epochs_val);
+        let cond = builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, counter, epochs_val);
         builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 
         builder.switch_to_block(body_block);
@@ -2370,7 +2742,9 @@ impl Compiler<'_> {
         builder.declare_var(step_param_var, cl_types::I64);
         let init_null = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_param_var, init_null);
-        state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
+        state
+            .variables
+            .insert(step_param_sym, (step_param_var, cl_types::I64));
 
         let epoch_loss_var = state.new_variable();
         builder.declare_var(epoch_loss_var, cl_types::I64);
@@ -2395,10 +2769,13 @@ impl Compiler<'_> {
             // Batch header: get next batch, check for null (exhausted)
             // Don't seal yet — back-edge from batch body will be added later
             builder.switch_to_block(batch_header_block);
-            let batch_ptr = self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_handle])?;
+            let batch_ptr =
+                self.compile_call_by_name(builder, "nsl_dataloader_next_batch", &[dl_handle])?;
             let null_check = builder.ins().iconst(cl_types::I64, 0);
             let is_done = builder.ins().icmp(IntCC::Equal, batch_ptr, null_check);
-            builder.ins().brif(is_done, batch_exit_block, &[], batch_body_block, &[]);
+            builder
+                .ins()
+                .brif(is_done, batch_exit_block, &[], batch_body_block, &[]);
 
             // Batch body
             builder.switch_to_block(batch_body_block);
@@ -2410,7 +2787,7 @@ impl Compiler<'_> {
         } else {
             // No DataLoader — step body runs once per epoch (backward compat)
             batch_header_block = body_block; // unused, just needs a value
-            batch_body_block = body_block;   // we're already in it
+            batch_body_block = body_block; // we're already in it
         }
 
         // 7a. Prefetch batch tensors to GPU (if on GPU) to overlap
@@ -2421,8 +2798,10 @@ impl Compiler<'_> {
             // Prefetch input_ids and labels from the batch dict
             let k_ids = self.compile_string_literal(builder, "input_ids")?;
             let k_lbl = self.compile_string_literal(builder, "labels")?;
-            let ids_tensor = self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_ids])?;
-            let lbl_tensor = self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_lbl])?;
+            let ids_tensor =
+                self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_ids])?;
+            let lbl_tensor =
+                self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_lbl])?;
             let device_1 = builder.ins().iconst(cl_types::I64, 1);
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[ids_tensor, device_1])?;
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
@@ -2436,20 +2815,26 @@ impl Compiler<'_> {
         // Snapshot variables before step body for cleanup
         let vars_before_step: std::collections::HashSet<nsl_ast::Symbol> =
             state.variables.keys().copied().collect();
-        let on_step_binds_loss = callbacks.iter().any(|cb| {
+        let _on_step_binds_loss = callbacks.iter().any(|cb| {
             self.resolve_sym(cb.name) == "on_step"
-                && cb.params.iter().any(|param| self.resolve_sym(param.name) == "loss")
+                && cb
+                    .params
+                    .iter()
+                    .any(|param| self.resolve_sym(param.name) == "loss")
         });
         let on_epoch_binds_loss = callbacks.iter().any(|cb| {
             matches!(self.resolve_sym(cb.name), "on_epoch" | "on_epoch_end")
-                && cb.params.iter().any(|param| self.resolve_sym(param.name) == "loss")
+                && cb
+                    .params
+                    .iter()
+                    .any(|param| self.resolve_sym(param.name) == "loss")
         });
 
         // ── 7b. Forward pass + backward pass ─────────────────────────
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
         // to the tape-based AD path.
-        let (grads_list, loss_val, source_ad_loss_owned) = if self.features.source_ad_enabled {
+        let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
             eprintln!("[nsl] Using source-to-source AD for backward pass");
 
@@ -2482,21 +2867,28 @@ impl Compiler<'_> {
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
                 self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
-                let (grads, loss) = self.compile_tape_backward(builder, state, step_body, param_list)?;
-                (grads, loss, false)
+                let (grads, loss) =
+                    self.compile_tape_backward(builder, state, step_body, param_list)?;
+                (grads, loss, false, std::collections::HashSet::new())
             } else {
                 // 3. Build initial VarMap: map named input/param VarIds to
                 //    Cranelift Values already present in state.variables.
                 let mut primal_vars = crate::wengert_lower::VarMap::new();
                 // Build primal_vars from state.variables using both Symbol-based
                 // and name-based matching to handle cross-module Symbol mismatches.
-                let state_vars_by_name: std::collections::HashMap<String, Value> = state.variables.iter()
-                    .map(|(sym, (cvar, _))| (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar)))
+                let state_vars_by_name: std::collections::HashMap<String, Value> = state
+                    .variables
+                    .iter()
+                    .map(|(sym, (cvar, _))| {
+                        (self.resolve_sym(*sym).to_string(), builder.use_var(*cvar))
+                    })
                     .collect();
 
                 // First pass: map symbol_var_map entries via Symbol match or name fallback
                 for (sym, vid) in extractor.symbol_var_map() {
-                    if primal_vars.contains_key(vid) { continue; }
+                    if primal_vars.contains_key(vid) {
+                        continue;
+                    }
                     if let Some(&(cvar, _)) = state.variables.get(sym) {
                         primal_vars.insert(*vid, builder.use_var(cvar));
                     } else {
@@ -2534,10 +2926,16 @@ impl Compiler<'_> {
                 // components and walked through struct layouts + array indices,
                 // emitting a chain of Cranelift loads at each level.
                 for (compound_name, vid) in extractor.named_param_var_ids() {
-                    if primal_vars.contains_key(vid) { continue; }
+                    if primal_vars.contains_key(vid) {
+                        continue;
+                    }
 
                     if let Some(val) = self.load_nested_field(
-                        builder, model_ptr, &layout, &model_type_name, compound_name,
+                        builder,
+                        model_ptr,
+                        &layout,
+                        &model_type_name,
+                        compound_name,
                     ) {
                         primal_vars.insert(*vid, val);
                     } else {
@@ -2573,21 +2971,39 @@ impl Compiler<'_> {
                 state.flags.in_tape_region = false;
                 // Debug: dump primal Wengert ops
                 if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-                    eprintln!("[wengert] primal_vars: {:?}", primal_vars.keys().collect::<Vec<_>>());
+                    eprintln!(
+                        "[wengert] primal_vars: {:?}",
+                        primal_vars.keys().collect::<Vec<_>>()
+                    );
                     for op in &extractor.wengert_list().ops {
-                        let name = extractor.wengert_list().var_names.get(&op.result).cloned().unwrap_or_default();
-                        eprintln!("[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
-                            op.result, name, op.op, op.inputs,
-                            primal_vars.contains_key(&op.result));
+                        let name = extractor
+                            .wengert_list()
+                            .var_names
+                            .get(&op.result)
+                            .cloned()
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
+                            op.result,
+                            name,
+                            op.op,
+                            op.inputs,
+                            primal_vars.contains_key(&op.result)
+                        );
                     }
                 }
                 let full_lowered = crate::wengert_lower::compile_wengert_ops(
-                    self, builder, state, extractor.wengert_list(), &primal_vars,
+                    self,
+                    builder,
+                    state,
+                    extractor.wengert_list(),
+                    &primal_vars,
                 )?;
                 let full_vars = &full_lowered.var_map;
 
-                let loss_val = *full_vars.get(&loss_var_id)
-                    .ok_or_else(|| CodegenError::new("source AD: loss VarId not found in compiled forward graph"))?;
+                let loss_val = *full_vars.get(&loss_var_id).ok_or_else(|| {
+                    CodegenError::new("source AD: loss VarId not found in compiled forward graph")
+                })?;
 
                 // 6. Generate adjoint backward graph from the primal list.
                 let start_var = extractor.next_var_id();
@@ -2600,14 +3016,14 @@ impl Compiler<'_> {
                 // would cascade skip in the lowerer.
                 {
                     let named_params = extractor.named_param_var_ids();
-                    let needed: std::collections::HashSet<crate::wengert::VarId> = named_params.iter()
+                    let needed: std::collections::HashSet<crate::wengert::VarId> = named_params
+                        .iter()
                         .filter(|(name, _)| self.is_trainable_param_name(name))
                         .filter_map(|(_, vid)| gen.adjoint_of(*vid))
                         .collect();
                     if !needed.is_empty() {
-                        adjoint.ops = crate::source_ad::eliminate_dead_gradients(
-                            &adjoint.ops, &needed,
-                        );
+                        adjoint.ops =
+                            crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
                     }
                 }
 
@@ -2636,8 +3052,13 @@ impl Compiler<'_> {
                 if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {
                     let summarize_owned = |label: &str,
                                            wengert: &crate::wengert::WengertList,
-                                           owned: &[(crate::wengert::VarId, Value, crate::wengert::WengertType)]| {
-                        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                                           owned: &[(
+                        crate::wengert::VarId,
+                        Value,
+                        crate::wengert::WengertType,
+                    )]| {
+                        let mut counts: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
                         for (var_id, _, _) in owned {
                             if let Some(op) = wengert.ops.iter().find(|op| op.result == *var_id) {
                                 let key = format!("{:?}", op.op);
@@ -2652,10 +3073,15 @@ impl Compiler<'_> {
                         }
                     };
 
-                    summarize_owned("primal", extractor.wengert_list(), &full_lowered.owned_values);
+                    summarize_owned(
+                        "primal",
+                        extractor.wengert_list(),
+                        &full_lowered.owned_values,
+                    );
                     summarize_owned("adjoint", &adjoint, &grad_lowered.owned_values);
 
-                    let mut final_grad_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                    let mut final_grad_counts: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
                     for (param_name, vid) in extractor.named_param_var_ids() {
                         if !self.is_trainable_param_name(param_name) {
                             continue;
@@ -2696,7 +3122,9 @@ impl Compiler<'_> {
                 builder.ins().jump(fill_hdr, &[]);
                 builder.switch_to_block(fill_hdr);
                 let fi = builder.use_var(fill_i_var);
-                let fc = builder.ins().icmp(IntCC::SignedLessThan, fi, num_params_val);
+                let fc = builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, fi, num_params_val);
                 builder.ins().brif(fc, fill_body, &[], fill_exit, &[]);
                 builder.switch_to_block(fill_body);
                 builder.seal_block(fill_body);
@@ -2715,19 +3143,55 @@ impl Compiler<'_> {
                 // 8b. Replace zero slots with actual source-AD gradients by
                 // scanning the runtime param_list for each resolved parameter
                 // leaf from the extracted forward graph.
+                let tensor_param_paths: std::collections::HashSet<String> = self
+                    .enumerate_all_model_tensor_paths(&model_var_name, &model_type_name)
+                    .into_iter()
+                    .collect();
+                let trainable_tensor_param_paths: std::collections::HashSet<String> =
+                    tensor_param_paths
+                        .iter()
+                        .filter(|path| self.is_trainable_param_name(path))
+                        .cloned()
+                        .collect();
+                let mut seen_trainable_tensor_params: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                let mut grad_connected = 0usize;
+                let mut grad_ignored_config_tensor = 0usize;
+                let mut grad_ignored_non_tensor = 0usize;
+                let mut grad_skipped_no_primal = 0usize;
+                let mut grad_skipped_no_adjoint = 0usize;
+                let mut grad_skipped_no_lowered = 0usize;
                 for (param_name, vid) in extractor.named_param_var_ids() {
-                    if !self.is_trainable_param_name(param_name) {
-                        continue;
+                    match classify_source_ad_param_name(param_name, &tensor_param_paths) {
+                        SourceAdParamDiagnosticKind::TrainableTensor => {
+                            seen_trainable_tensor_params.insert(param_name.clone());
+                        }
+                        SourceAdParamDiagnosticKind::IgnoredConfigTensor => {
+                            grad_ignored_config_tensor += 1;
+                            continue;
+                        }
+                        SourceAdParamDiagnosticKind::IgnoredNonTensor => {
+                            grad_ignored_non_tensor += 1;
+                            continue;
+                        }
                     }
                     let Some(param_ptr) = full_vars.get(vid).copied() else {
+                        eprintln!("[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
+                        grad_skipped_no_primal += 1;
                         continue;
                     };
                     let Some(adj_vid) = gen.adjoint_of(*vid) else {
+                        eprintln!("[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
+                        grad_skipped_no_adjoint += 1;
                         continue;
                     };
                     let Some(grad_val) = grad_vars.get(&adj_vid).copied() else {
+                        eprintln!("[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
+                        grad_skipped_no_lowered += 1;
                         continue;
                     };
+                    grad_connected += 1;
                     let scan_i_var = state.new_variable();
                     let scan_match_count_var = state.new_variable();
                     builder.declare_var(scan_i_var, cl_types::I64);
@@ -2745,20 +3209,30 @@ impl Compiler<'_> {
                     builder.ins().jump(scan_hdr, &[]);
                     builder.switch_to_block(scan_hdr);
                     let si = builder.use_var(scan_i_var);
-                    let scan_cond = builder.ins().icmp(IntCC::SignedLessThan, si, num_params_val);
-                    builder.ins().brif(scan_cond, scan_body, &[], scan_exit, &[]);
+                    let scan_cond = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, si, num_params_val);
+                    builder
+                        .ins()
+                        .brif(scan_cond, scan_body, &[], scan_exit, &[]);
 
                     builder.switch_to_block(scan_body);
                     builder.seal_block(scan_body);
-                    let runtime_param = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, si])?;
+                    let runtime_param =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, si])?;
                     let is_match = builder.ins().icmp(IntCC::Equal, runtime_param, param_ptr);
-                    builder.ins().brif(is_match, scan_match, &[], scan_next, &[]);
+                    builder
+                        .ins()
+                        .brif(is_match, scan_match, &[], scan_next, &[]);
 
                     builder.switch_to_block(scan_match);
                     builder.seal_block(scan_match);
-                    let old_grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads, si])?;
+                    let old_grad =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[grads, si])?;
                     let summed_grad = self.compile_call_by_name(
-                        builder, "nsl_tensor_add", &[old_grad, grad_val],
+                        builder,
+                        "nsl_tensor_add",
+                        &[old_grad, grad_val],
                     )?;
                     let match_count = builder.use_var(scan_match_count_var);
                     let match_one = builder.ins().iconst(cl_types::I64, 1);
@@ -2790,26 +3264,68 @@ impl Compiler<'_> {
                     state.current_block = Some(scan_exit);
                 }
 
+                let grad_missing_trainable = trainable_tensor_param_paths
+                    .len()
+                    .saturating_sub(seen_trainable_tensor_params.len());
+                eprintln!(
+                    "[nsl] source AD gradient summary: {}/{} trainable tensor params connected, {} missing-from-forward, {} no-primal, {} no-adjoint, {} cascade-skip, {} ignored config-tensor, {} ignored non-tensor",
+                    grad_connected,
+                    trainable_tensor_param_paths.len(),
+                    grad_missing_trainable,
+                    grad_skipped_no_primal,
+                    grad_skipped_no_adjoint,
+                    grad_skipped_no_lowered,
+                    grad_ignored_config_tensor,
+                    grad_ignored_non_tensor,
+                );
+
                 let mut retained_full_vars = std::collections::HashSet::new();
                 retained_full_vars.insert(loss_var_id);
-                self.free_wengert_owned_values(builder, &grad_lowered.owned_values, &freed_adjoint_vars)?;
-                self.free_wengert_owned_values(builder, &full_lowered.owned_values, &retained_full_vars)?;
+                self.free_wengert_owned_values(
+                    builder,
+                    &grad_lowered.owned_values,
+                    &freed_adjoint_vars,
+                )?;
+                self.free_wengert_owned_values(
+                    builder,
+                    &full_lowered.owned_values,
+                    &retained_full_vars,
+                )?;
+
+                // Collect all Cranelift Values freed by the Wengert cleanup so the
+                // step-variable sweep (below) doesn't double-free them.
+                let mut wengert_freed: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                for (vid, val, _) in &grad_lowered.owned_values {
+                    if !freed_adjoint_vars.contains(vid) {
+                        wengert_freed.insert(*val);
+                    }
+                }
+                for (vid, val, _) in &full_lowered.owned_values {
+                    if !retained_full_vars.contains(vid) {
+                        wengert_freed.insert(*val);
+                    }
+                }
 
                 let false_val = builder.ins().iconst(cl_types::I8, 0);
                 self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
-                (grads, loss_val, true)
+                (grads, loss_val, true, wengert_freed)
             }
         } else {
             // === Tape AD path (runtime backward) ===
-            let (grads, loss) = self.compile_tape_backward(builder, state, step_body, param_list)?;
-            (grads, loss, false)
+            let (grads, loss) =
+                self.compile_tape_backward(builder, state, step_body, param_list)?;
+            (grads, loss, false, std::collections::HashSet::new())
         };
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
         if self.compile_options.debug_training {
-            self.compile_call_by_name(builder, "nsl_debug_grad_checksum", &[grads_list, num_params_val])?;
+            self.compile_call_by_name(
+                builder,
+                "nsl_debug_grad_checksum",
+                &[grads_list, num_params_val],
+            )?;
         }
 
         // 7e2. Gradient clipping (only if grad_clip was specified)
@@ -2834,14 +3350,20 @@ impl Compiler<'_> {
             builder.ins().jump(ga_hdr, &[]);
             builder.switch_to_block(ga_hdr);
             let gai = builder.use_var(ga_i_var);
-            let gac = builder.ins().icmp(IntCC::SignedLessThan, gai, num_params_val);
+            let gac = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, gai, num_params_val);
             builder.ins().brif(gac, ga_body, &[], ga_exit, &[]);
             builder.switch_to_block(ga_body);
             builder.seal_block(ga_body);
             let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
             let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
             let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-            self.compile_call_by_name(builder, "nsl_grad_accumulate_add", &[accum_buf, grad, n_elems])?;
+            self.compile_call_by_name(
+                builder,
+                "nsl_grad_accumulate_add",
+                &[accum_buf, grad, n_elems],
+            )?;
             self.compile_call_by_name(builder, "nsl_tensor_free", &[grad])?;
             let ga_one = builder.ins().iconst(cl_types::I64, 1);
             let ga_next = builder.ins().iadd(gai, ga_one);
@@ -2866,7 +3388,9 @@ impl Compiler<'_> {
             let rem = builder.ins().srem(sc_plus_one, accum_val);
             let zero_check = builder.ins().iconst(cl_types::I64, 0);
             let should_step = builder.ins().icmp(IntCC::Equal, rem, zero_check);
-            builder.ins().brif(should_step, optimizer_block, &[], post_optimizer_block, &[]);
+            builder
+                .ins()
+                .brif(should_step, optimizer_block, &[], post_optimizer_block, &[]);
 
             builder.switch_to_block(optimizer_block);
             builder.seal_block(optimizer_block);
@@ -2881,7 +3405,11 @@ impl Compiler<'_> {
 
         // 7f. Optimizer step: for each param, call optimizer step function
         // When accumulating, use accum_list (accumulated grads); otherwise use grads_list directly.
-        let opt_grads = if let Some(accum) = accum_list { accum } else { grads_list };
+        let opt_grads = if let Some(accum) = accum_list {
+            accum
+        } else {
+            grads_list
+        };
 
         let optimizer_fn_name = match optimizer_name.as_str() {
             "sgd" => "nsl__optim__sgd__sgd_step",
@@ -2892,7 +3420,8 @@ impl Compiler<'_> {
             "soap" => "nsl__optim__soap__soap_step",
             _ => {
                 return Err(CodegenError::new(format!(
-                    "unsupported optimizer '{}' in train block", optimizer_name
+                    "unsupported optimizer '{}' in train block",
+                    optimizer_name
                 )));
             }
         };
@@ -2919,7 +3448,9 @@ impl Compiler<'_> {
         let momentum_const = builder.ins().f64const(momentum_value);
         let dampening_const = builder.ins().f64const(dampening_value);
         let weight_decay_const = builder.ins().f64const(weight_decay_value);
-        let nesterov_const = builder.ins().iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
+        let nesterov_const = builder
+            .ins()
+            .iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
         let beta1_const = builder.ins().f64const(beta1_value);
         let beta2_const = builder.ins().f64const(beta2_value);
         let eps_const = builder.ins().f64const(eps_value);
@@ -2927,7 +3458,11 @@ impl Compiler<'_> {
         // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step
         let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
         if zero_enabled {
-            self.compile_call_by_name(builder, "nsl_zero_reduce_grads", &[opt_grads, num_params_val])?;
+            self.compile_call_by_name(
+                builder,
+                "nsl_zero_reduce_grads",
+                &[opt_grads, num_params_val],
+            )?;
         }
 
         // 7f. Optimizer step loop: for i in 0..num_params (runtime loop)
@@ -2946,7 +3481,9 @@ impl Compiler<'_> {
             state.current_block = Some(opt_header);
 
             let idx = builder.use_var(opt_i_var);
-            let opt_cond = builder.ins().icmp(IntCC::SignedLessThan, idx, num_params_val);
+            let opt_cond = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, idx, num_params_val);
             builder.ins().brif(opt_cond, opt_body, &[], opt_exit, &[]);
 
             builder.switch_to_block(opt_body);
@@ -2954,54 +3491,109 @@ impl Compiler<'_> {
             state.current_block = Some(opt_body);
 
             // Get param, gradient, state buffers via runtime list indexing
-            let param_val = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
+            let param_val =
+                self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
             let grad_val = self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, idx])?;
             let s1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, idx])?;
 
             match optimizer_name.as_str() {
                 "sgd" => {
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, lr, momentum_const, dampening_const, weight_decay_const, nesterov_const],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            lr,
+                            momentum_const,
+                            dampening_const,
+                            weight_decay_const,
+                            nesterov_const,
+                        ],
                     )?;
                 }
                 "adam" | "adamw" => {
-                    let s2 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
+                    let s2 =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
                     let t_val = builder.use_var(step_count_var);
                     let one = builder.ins().iconst(cl_types::I64, 1);
                     let t_plus_one = builder.ins().iadd(t_val, one);
                     let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, s2, lr, beta1_const, beta2_const, eps_const, weight_decay_const, t_float],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            s2,
+                            lr,
+                            beta1_const,
+                            beta2_const,
+                            eps_const,
+                            weight_decay_const,
+                            t_float,
+                        ],
                     )?;
                 }
                 "lion" => {
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, lr, beta1_const, beta2_const, weight_decay_const],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            lr,
+                            beta1_const,
+                            beta2_const,
+                            weight_decay_const,
+                        ],
                     )?;
                 }
                 "muon" => {
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, lr, momentum_const, weight_decay_const, nesterov_const],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            lr,
+                            momentum_const,
+                            weight_decay_const,
+                            nesterov_const,
+                        ],
                     )?;
                 }
                 "soap" => {
-                    let s2 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
+                    let s2 =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
                     let t_val_s = builder.use_var(step_count_var);
                     let one_s = builder.ins().iconst(cl_types::I64, 1);
                     let t_plus_s = builder.ins().iadd(t_val_s, one_s);
                     let t_float_s = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_s);
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, s2, lr, beta1_const, beta2_const, eps_const, t_float_s],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            s2,
+                            lr,
+                            beta1_const,
+                            beta2_const,
+                            eps_const,
+                            t_float_s,
+                        ],
                     )?;
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
-                        "unsupported optimizer '{}' in train block", optimizer_name
+                        "unsupported optimizer '{}' in train block",
+                        optimizer_name
                     )));
                 }
             }
@@ -3035,7 +3627,9 @@ impl Compiler<'_> {
             builder.ins().jump(c_header, &[]);
             builder.switch_to_block(c_header);
             let ci = builder.use_var(cleanup_i_var);
-            let cc = builder.ins().icmp(IntCC::SignedLessThan, ci, num_params_val);
+            let cc = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, ci, num_params_val);
             builder.ins().brif(cc, c_body, &[], c_exit, &[]);
             builder.switch_to_block(c_body);
             builder.seal_block(c_body);
@@ -3062,7 +3656,9 @@ impl Compiler<'_> {
             builder.ins().jump(c_header, &[]);
             builder.switch_to_block(c_header);
             let ci = builder.use_var(cleanup_i_var);
-            let cc = builder.ins().icmp(IntCC::SignedLessThan, ci, num_params_val);
+            let cc = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, ci, num_params_val);
             builder.ins().brif(cc, c_body, &[], c_exit, &[]);
             builder.switch_to_block(c_body);
             builder.seal_block(c_body);
@@ -3126,48 +3722,124 @@ impl Compiler<'_> {
                     self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float])?
                 }
                 "step_lr" => {
-                    let step_size = scheduler_args.iter().find(|(n, _)| n == "step_size").map(|(_, v)| *v).unwrap_or(10.0);
-                    let gamma = scheduler_args.iter().find(|(n, _)| n == "gamma").map(|(_, v)| *v).unwrap_or(0.1);
+                    let step_size = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "step_size")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(10.0);
+                    let gamma = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "gamma")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.1);
                     let ss_val = builder.ins().f64const(step_size);
                     let g_val = builder.ins().f64const(gamma);
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ss_val, g_val])?
+                    self.compile_call_by_name(
+                        builder,
+                        &sched_fn,
+                        &[base_lr_val, step_float, ss_val, g_val],
+                    )?
                 }
                 "exponential_lr" => {
-                    let gamma = scheduler_args.iter().find(|(n, _)| n == "gamma").map(|(_, v)| *v).unwrap_or(0.95);
+                    let gamma = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "gamma")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.95);
                     let g_val = builder.ins().f64const(gamma);
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, g_val])?
+                    self.compile_call_by_name(
+                        builder,
+                        &sched_fn,
+                        &[base_lr_val, step_float, g_val],
+                    )?
                 }
                 "linear_decay" => {
-                    let total_steps = scheduler_args.iter().find(|(n, _)| n == "total_steps").map(|(_, v)| *v).unwrap_or(1000.0);
-                    let end_factor = scheduler_args.iter().find(|(n, _)| n == "end_factor").map(|(_, v)| *v).unwrap_or(0.0);
+                    let total_steps = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "total_steps")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1000.0);
+                    let end_factor = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "end_factor")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0);
                     let ts_val = builder.ins().f64const(total_steps);
                     let ef_val = builder.ins().f64const(end_factor);
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ts_val, ef_val])?
+                    self.compile_call_by_name(
+                        builder,
+                        &sched_fn,
+                        &[base_lr_val, step_float, ts_val, ef_val],
+                    )?
                 }
                 "cosine_anneal" => {
-                    let t_max = scheduler_args.iter().find(|(n, _)| n == "t_max").map(|(_, v)| *v).unwrap_or(1000.0);
-                    let eta_min = scheduler_args.iter().find(|(n, _)| n == "eta_min").map(|(_, v)| *v).unwrap_or(0.0);
+                    let t_max = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "t_max")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1000.0);
+                    let eta_min = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "eta_min")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0);
                     let tm_val = builder.ins().f64const(t_max);
                     let em_val = builder.ins().f64const(eta_min);
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, tm_val, em_val])?
+                    self.compile_call_by_name(
+                        builder,
+                        &sched_fn,
+                        &[base_lr_val, step_float, tm_val, em_val],
+                    )?
                 }
                 "warmup_cosine" => {
-                    let ws = scheduler_args.iter().find(|(n, _)| n == "warmup_steps").map(|(_, v)| *v).unwrap_or(100.0);
-                    let ts = scheduler_args.iter().find(|(n, _)| n == "total_steps").map(|(_, v)| *v).unwrap_or(1000.0);
-                    let ml = scheduler_args.iter().find(|(n, _)| n == "min_lr").map(|(_, v)| *v).unwrap_or(1e-5);
+                    let ws = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "warmup_steps")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(100.0);
+                    let ts = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "total_steps")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1000.0);
+                    let ml = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "min_lr")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1e-5);
                     let ws_val = builder.ins().f64const(ws);
                     let ts_val = builder.ins().f64const(ts);
                     let ml_val = builder.ins().f64const(ml);
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ws_val, ts_val, ml_val])?
+                    self.compile_call_by_name(
+                        builder,
+                        &sched_fn,
+                        &[base_lr_val, step_float, ws_val, ts_val, ml_val],
+                    )?
                 }
                 "one_cycle" => {
-                    let max_lr = scheduler_args.iter().find(|(n, _)| n == "max_lr").map(|(_, v)| *v).unwrap_or(lr_value * 10.0);
-                    let total_steps = scheduler_args.iter().find(|(n, _)| n == "total_steps").map(|(_, v)| *v).unwrap_or(1000.0);
-                    let pct_start = scheduler_args.iter().find(|(n, _)| n == "pct_start").map(|(_, v)| *v).unwrap_or(0.3);
+                    let max_lr = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "max_lr")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(lr_value * 10.0);
+                    let total_steps = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "total_steps")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1000.0);
+                    let pct_start = scheduler_args
+                        .iter()
+                        .find(|(n, _)| n == "pct_start")
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.3);
                     let ml_val = builder.ins().f64const(max_lr);
                     let ts_val = builder.ins().f64const(total_steps);
                     let ps_val = builder.ins().f64const(pct_start);
-                    self.compile_call_by_name(builder, &sched_fn, &[base_lr_val, step_float, ml_val, ts_val, ps_val])?
+                    self.compile_call_by_name(
+                        builder,
+                        &sched_fn,
+                        &[base_lr_val, step_float, ml_val, ts_val, ps_val],
+                    )?
                 }
                 _ => base_lr_val, // fallback: no change
             };
@@ -3229,33 +3901,46 @@ impl Compiler<'_> {
             builder.def_var(epoch_loss_var, loss_clone);
         }
 
-        if source_ad_loss_owned && !on_step_binds_loss {
+        // Free the loss tensor after callbacks have used it. The on_epoch path
+        // already cloned it into epoch_loss_var, and on_step has finished reading.
+        // Previously guarded by !on_step_binds_loss which leaked one loss per step.
+        if source_ad_loss_owned {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[loss_val])?;
+            wengert_freed_vals.insert(loss_val);
         }
 
-        // Free step-body tensor variables to prevent GPU memory accumulation
-        {
-            let current_blk = state.current_block.unwrap_or(batch_body_block);
-            if !is_block_filled(builder, current_blk) {
-                let zero = builder.ins().iconst(cl_types::I64, 0);
-                let step_tensor_vars: Vec<_> = state.variables.iter()
-                    .filter(|(sym, _)| !vars_before_step.contains(sym))
-                    .filter_map(|(sym, (var, _))| {
-                        let sem_ty = state.variable_types.get(sym);
-                        let is_tensor = sem_ty.map(|t| t.is_tensor()).unwrap_or(false);
-                        let is_unknown = sem_ty.map(|t| t.is_indeterminate()).unwrap_or(true);
-                        if is_tensor || is_unknown { Some((*var, is_tensor)) } else { None }
-                    })
-                    .collect();
-                for (var, is_tensor) in step_tensor_vars {
-                    let val = builder.use_var(var);
+        // Free step-body tensor variables to prevent GPU memory accumulation.
+        // In source AD mode, Wengert lowering already frees its owned intermediates,
+        // so this sweep must skip values that were released earlier in the step.
+        let current_blk = state.current_block.unwrap_or(batch_body_block);
+        if !is_block_filled(builder, current_blk) {
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            let step_tensor_vars: Vec<_> = state
+                .variables
+                .iter()
+                .filter(|(sym, _)| !vars_before_step.contains(sym))
+                .filter_map(|(sym, (var, _))| {
+                    let sem_ty = state.variable_types.get(sym);
+                    let is_tensor = sem_ty.map(|t| t.is_tensor()).unwrap_or(false);
+                    let is_unknown = sem_ty.map(|t| t.is_indeterminate()).unwrap_or(true);
+                    if is_tensor || is_unknown {
+                        Some((*var, is_tensor))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (var, is_tensor) in step_tensor_vars {
+                let val = builder.use_var(var);
+                if !wengert_freed_vals.contains(&val) {
                     if is_tensor {
                         let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[val]);
                     } else {
-                        let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[val]);
+                        let _ =
+                            self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[val]);
                     }
-                    builder.def_var(var, zero);
                 }
+                builder.def_var(var, zero);
             }
         }
 
@@ -3263,7 +3948,11 @@ impl Compiler<'_> {
             let current_blk = state.current_block.unwrap_or(batch_body_block);
             if !is_block_filled(builder, current_blk) {
                 let batch_to_free = builder.use_var(step_param_var);
-                self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[batch_to_free])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_dict_free_tensor_values",
+                    &[batch_to_free],
+                )?;
                 let zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(step_param_var, zero);
             }
@@ -3366,14 +4055,17 @@ impl Compiler<'_> {
             builder.ins().jump(f_header, &[]);
             builder.switch_to_block(f_header);
             let fi = builder.use_var(free_i_var);
-            let fc = builder.ins().icmp(IntCC::SignedLessThan, fi, num_params_val);
+            let fc = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, fi, num_params_val);
             builder.ins().brif(fc, f_body, &[], f_exit, &[]);
             builder.switch_to_block(f_body);
             builder.seal_block(f_body);
             let buf1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, fi])?;
             self.compile_call_by_name(builder, "nsl_tensor_free", &[buf1])?;
             if num_state_buffers >= 2 {
-                let buf2 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fi])?;
+                let buf2 =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fi])?;
                 self.compile_call_by_name(builder, "nsl_tensor_free", &[buf2])?;
             }
             let f_one = builder.ins().iconst(cl_types::I64, 1);
@@ -3402,7 +4094,9 @@ impl Compiler<'_> {
             builder.ins().jump(fa_hdr, &[]);
             builder.switch_to_block(fa_hdr);
             let fai = builder.use_var(fa_i_var);
-            let fac = builder.ins().icmp(IntCC::SignedLessThan, fai, num_params_val);
+            let fac = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, fai, num_params_val);
             builder.ins().brif(fac, fa_body, &[], fa_exit, &[]);
             builder.switch_to_block(fa_body);
             builder.seal_block(fa_body);
@@ -3464,11 +4158,8 @@ impl Compiler<'_> {
         };
 
         // Run backward pass
-        let grads_list = self.compile_call_by_name(
-            builder,
-            "nsl_tape_backward",
-            &[loss_val, param_list],
-        )?;
+        let grads_list =
+            self.compile_call_by_name(builder, "nsl_tape_backward", &[loss_val, param_list])?;
 
         // Stop tape and restore eval mode
         self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
@@ -3521,21 +4212,22 @@ impl Compiler<'_> {
     ///      and `nsl_pipeline_destroy()`.
     ///
     fn is_trainable_param_name(&self, param_name: &str) -> bool {
-        let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
-        !leaf_name.starts_with('_') && leaf_name != "inv_freq"
+        is_trainable_param_leaf_name(param_name)
+    }
+
+    fn enumerate_all_model_tensor_paths(&self, var_name: &str, type_name: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        self.enumerate_tensor_paths_recursive(var_name, type_name, &mut paths, 0, true);
+        paths
     }
 
     /// Enumerate all tensor field paths in a model struct via DFS.
     ///
     /// This mirrors the compiler's view of nested models and fixed arrays, so
     /// the emitted param_list and source-AD parameter resolution stay aligned.
-    fn enumerate_model_tensor_paths(
-        &self,
-        var_name: &str,
-        type_name: &str,
-    ) -> Vec<String> {
+    fn enumerate_model_tensor_paths(&self, var_name: &str, type_name: &str) -> Vec<String> {
         let mut paths = Vec::new();
-        self.enumerate_tensor_paths_recursive(var_name, type_name, &mut paths, 0);
+        self.enumerate_tensor_paths_recursive(var_name, type_name, &mut paths, 0, false);
         paths
     }
 
@@ -3545,6 +4237,7 @@ impl Compiler<'_> {
         type_name: &str,
         paths: &mut Vec<String>,
         depth: usize,
+        include_nontrainable: bool,
     ) {
         if depth > 16 {
             return;
@@ -3558,7 +4251,9 @@ impl Compiler<'_> {
 
         for field in &layout.fields {
             let field_path = format!("{}.{}", prefix, field.name);
-            let field_type = field_types.as_ref().and_then(|types| types.get(&field.name));
+            let field_type = field_types
+                .as_ref()
+                .and_then(|types| types.get(&field.name));
 
             if let Some(field_type) = field_type {
                 if field_type.starts_with('[') && field_type.contains(';') {
@@ -3574,6 +4269,7 @@ impl Compiler<'_> {
                                 elem_type,
                                 paths,
                                 depth + 1,
+                                include_nontrainable,
                             );
                         }
                     }
@@ -3585,11 +4281,14 @@ impl Compiler<'_> {
                     field_type,
                     paths,
                     depth + 1,
+                    include_nontrainable,
                 );
                 continue;
             }
 
-            if field.cl_type == cl_types::I64 && self.is_trainable_param_name(&field_path) {
+            if field.cl_type == cl_types::I64
+                && (include_nontrainable || self.is_trainable_param_name(&field_path))
+            {
                 paths.push(field_path);
             }
         }
@@ -3614,7 +4313,9 @@ impl Compiler<'_> {
         compound_name: &str,
     ) -> Option<Value> {
         let parts: Vec<&str> = compound_name.split('.').collect();
-        if parts.len() < 2 { return None; }
+        if parts.len() < 2 {
+            return None;
+        }
 
         // State: current struct pointer and current type name (for layout/field_type lookup)
         let mut current_ptr = base_ptr;
@@ -3654,7 +4355,9 @@ impl Compiler<'_> {
             let field = current_layout.fields.iter().find(|f| f.name == part)?;
 
             // Check if this field is a FixedArray type
-            let field_type = self.models.model_field_types
+            let field_type = self
+                .models
+                .model_field_types
                 .get(&current_type_name)
                 .and_then(|ft| ft.get(part))
                 .cloned();
@@ -3732,7 +4435,11 @@ impl Compiler<'_> {
             },
         );
         let v_micro = builder.ins().iconst(cl_types::I64, 8); // default micro-batches
-        self.compile_call_by_name(builder, "nsl_pipeline_init", &[v_stages, v_schedule, v_micro])?;
+        self.compile_call_by_name(
+            builder,
+            "nsl_pipeline_init",
+            &[v_stages, v_schedule, v_micro],
+        )?;
 
         // ── 2. Extract config from train(...) args ──────────────────────
         let mut model_sym: Option<nsl_ast::Symbol> = None;
@@ -3834,12 +4541,13 @@ impl Compiler<'_> {
         })?;
 
         if optimizer_name.is_empty() {
-            return Err(CodegenError::new("pipelined train block requires an optimizer section"));
+            return Err(CodegenError::new(
+                "pipelined train block requires an optimizer section",
+            ));
         }
 
-        let (step_body, step_param_sym) = step_body.ok_or_else(|| {
-            CodegenError::new("pipelined train block requires a step section")
-        })?;
+        let (step_body, step_param_sym) = step_body
+            .ok_or_else(|| CodegenError::new("pipelined train block requires a step section"))?;
 
         // ── 3. Resolve model and build param_list ───────────────────────
         let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
@@ -3874,22 +4582,29 @@ impl Compiler<'_> {
             found_name.unwrap_or_else(|| model_var_name.clone())
         };
 
-        let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
-            CodegenError::new(format!(
-                "no struct layout found for model '{}' in pipelined train block",
-                model_type_name
-            ))
-        })?;
+        let layout = self
+            .types
+            .struct_layouts
+            .get(&model_type_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "no struct layout found for model '{}' in pipelined train block",
+                    model_type_name
+                ))
+            })?;
 
         // Build param_list by recursively collecting tensor fields (same as
         // non-pipelined path — handles nested sub-models and FixedArray fields).
-        let num_slots = builder.ins().iconst(cl_types::I64, (layout.total_size / 8) as i64);
+        let num_slots = builder
+            .ins()
+            .iconst(cl_types::I64, (layout.total_size / 8) as i64);
         let param_list = self.compile_call_by_name(
-            builder, "nsl_collect_model_params", &[model_ptr, num_slots],
+            builder,
+            "nsl_collect_model_params",
+            &[model_ptr, num_slots],
         )?;
-        let num_params_val = self.compile_call_by_name(
-            builder, "nsl_list_len", &[param_list],
-        )?;
+        let num_params_val = self.compile_call_by_name(builder, "nsl_list_len", &[param_list])?;
 
         // ── 4. Create optimizer state buffers (runtime NslLists) ────────
         let num_state_buffers = match optimizer_name.as_str() {
@@ -3914,11 +4629,13 @@ impl Compiler<'_> {
             let body = builder.create_block();
             let exit = builder.create_block();
             builder.ins().jump(hdr, &[]);
-            builder.switch_to_block(hdr); builder.seal_block(hdr);
+            builder.switch_to_block(hdr);
+            builder.seal_block(hdr);
             let i = builder.use_var(init_i);
             let c = builder.ins().icmp(IntCC::SignedLessThan, i, num_params_val);
             builder.ins().brif(c, body, &[], exit, &[]);
-            builder.switch_to_block(body); builder.seal_block(body);
+            builder.switch_to_block(body);
+            builder.seal_block(body);
             state.current_block = Some(body);
             let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, i])?;
             let b1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
@@ -3931,7 +4648,8 @@ impl Compiler<'_> {
             let next = builder.ins().iadd(i, one);
             builder.def_var(init_i, next);
             builder.ins().jump(hdr, &[]);
-            builder.switch_to_block(exit); builder.seal_block(exit);
+            builder.switch_to_block(exit);
+            builder.seal_block(exit);
             state.current_block = Some(exit);
         }
 
@@ -3940,7 +4658,9 @@ impl Compiler<'_> {
         builder.declare_var(step_param_var, cl_types::I64);
         let init_null = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_param_var, init_null);
-        state.variables.insert(step_param_sym, (step_param_var, cl_types::I64));
+        state
+            .variables
+            .insert(step_param_sym, (step_param_var, cl_types::I64));
 
         let step_count_var = state.new_variable();
         builder.declare_var(step_count_var, cl_types::I64);
@@ -3973,7 +4693,9 @@ impl Compiler<'_> {
                 }
             }
             found.ok_or_else(|| {
-                CodegenError::new("pipelined train step body must assign to a variable named 'loss'")
+                CodegenError::new(
+                    "pipelined train step body must assign to a variable named 'loss'",
+                )
             })?
         };
 
@@ -3985,15 +4707,14 @@ impl Compiler<'_> {
         let zero_stream = builder.ins().iconst(cl_types::I64, 0);
         let next_stage = builder.ins().iconst(cl_types::I64, 1);
         self.compile_call_by_name(
-            builder, "nsl_pipeline_send",
+            builder,
+            "nsl_pipeline_send",
             &[loss_val, next_stage, zero_tag, zero_stream],
         )?;
 
         // ── 8. Backward pass — tape backward + stop ─────────────────────
-        let grads_list = self.compile_call_by_name(
-            builder, "nsl_tape_backward",
-            &[loss_val, param_list],
-        )?;
+        let grads_list =
+            self.compile_call_by_name(builder, "nsl_tape_backward", &[loss_val, param_list])?;
         self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
 
         let false_val = builder.ins().iconst(cl_types::I8, 0);
@@ -4013,22 +4734,28 @@ impl Compiler<'_> {
             let gs_body = builder.create_block();
             let gs_exit = builder.create_block();
             builder.ins().jump(gs_hdr, &[]);
-            builder.switch_to_block(gs_hdr); builder.seal_block(gs_hdr);
+            builder.switch_to_block(gs_hdr);
+            builder.seal_block(gs_hdr);
             let gi = builder.use_var(gs_i);
-            let gc = builder.ins().icmp(IntCC::SignedLessThan, gi, num_params_val);
+            let gc = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, gi, num_params_val);
             builder.ins().brif(gc, gs_body, &[], gs_exit, &[]);
-            builder.switch_to_block(gs_body); builder.seal_block(gs_body);
+            builder.switch_to_block(gs_body);
+            builder.seal_block(gs_body);
             state.current_block = Some(gs_body);
             let grad_val = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gi])?;
             self.compile_call_by_name(
-                builder, "nsl_pipeline_send_grad",
+                builder,
+                "nsl_pipeline_send_grad",
                 &[grad_val, prev_stage, gi, zero_stream],
             )?;
             let g_one = builder.ins().iconst(cl_types::I64, 1);
             let g_next = builder.ins().iadd(gi, g_one);
             builder.def_var(gs_i, g_next);
             builder.ins().jump(gs_hdr, &[]);
-            builder.switch_to_block(gs_exit); builder.seal_block(gs_exit);
+            builder.switch_to_block(gs_exit);
+            builder.seal_block(gs_exit);
             state.current_block = Some(gs_exit);
         }
 
@@ -4042,7 +4769,8 @@ impl Compiler<'_> {
             "soap" => "nsl__optim__soap__soap_step",
             _ => {
                 return Err(CodegenError::new(format!(
-                    "unsupported optimizer '{}' in pipelined train block", optimizer_name
+                    "unsupported optimizer '{}' in pipelined train block",
+                    optimizer_name
                 )));
             }
         };
@@ -4066,7 +4794,9 @@ impl Compiler<'_> {
         let momentum_const = builder.ins().f64const(momentum_value);
         let dampening_const = builder.ins().f64const(dampening_value);
         let weight_decay_const = builder.ins().f64const(weight_decay_value);
-        let nesterov_const = builder.ins().iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
+        let nesterov_const = builder
+            .ins()
+            .iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
         let beta1_const = builder.ins().f64const(beta1_value);
         let beta2_const = builder.ins().f64const(beta2_value);
         let eps_const = builder.ins().f64const(eps_value);
@@ -4080,61 +4810,121 @@ impl Compiler<'_> {
             let opt_body = builder.create_block();
             let opt_exit = builder.create_block();
             builder.ins().jump(opt_hdr, &[]);
-            builder.switch_to_block(opt_hdr); builder.seal_block(opt_hdr);
+            builder.switch_to_block(opt_hdr);
+            builder.seal_block(opt_hdr);
             let idx = builder.use_var(opt_i);
-            let oc = builder.ins().icmp(IntCC::SignedLessThan, idx, num_params_val);
+            let oc = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, idx, num_params_val);
             builder.ins().brif(oc, opt_body, &[], opt_exit, &[]);
-            builder.switch_to_block(opt_body); builder.seal_block(opt_body);
+            builder.switch_to_block(opt_body);
+            builder.seal_block(opt_body);
             state.current_block = Some(opt_body);
 
-            let param_val = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
-            let grad_val = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, idx])?;
+            let param_val =
+                self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
+            let grad_val =
+                self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, idx])?;
             let s1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, idx])?;
 
             match optimizer_name.as_str() {
                 "sgd" => {
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, lr, momentum_const, dampening_const, weight_decay_const, nesterov_const],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            lr,
+                            momentum_const,
+                            dampening_const,
+                            weight_decay_const,
+                            nesterov_const,
+                        ],
                     )?;
                 }
                 "adam" | "adamw" => {
-                    let s2 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
+                    let s2 =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
                     let t_val = builder.use_var(step_count_var);
                     let one = builder.ins().iconst(cl_types::I64, 1);
                     let t_plus_one = builder.ins().iadd(t_val, one);
                     let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, s2, lr, beta1_const, beta2_const, eps_const, weight_decay_const, t_float],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            s2,
+                            lr,
+                            beta1_const,
+                            beta2_const,
+                            eps_const,
+                            weight_decay_const,
+                            t_float,
+                        ],
                     )?;
                 }
                 "lion" => {
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, lr, beta1_const, beta2_const, weight_decay_const],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            lr,
+                            beta1_const,
+                            beta2_const,
+                            weight_decay_const,
+                        ],
                     )?;
                 }
                 "muon" => {
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, lr, momentum_const, weight_decay_const, nesterov_const],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            lr,
+                            momentum_const,
+                            weight_decay_const,
+                            nesterov_const,
+                        ],
                     )?;
                 }
                 "soap" => {
-                    let s2 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
+                    let s2 =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
                     let t_val_p = builder.use_var(step_count_var);
                     let one_p = builder.ins().iconst(cl_types::I64, 1);
                     let t_plus_p = builder.ins().iadd(t_val_p, one_p);
                     let t_float_p = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_p);
                     self.compile_call_by_name(
-                        builder, &opt_fn,
-                        &[param_val, grad_val, s1, s2, lr, beta1_const, beta2_const, eps_const, t_float_p],
+                        builder,
+                        &opt_fn,
+                        &[
+                            param_val,
+                            grad_val,
+                            s1,
+                            s2,
+                            lr,
+                            beta1_const,
+                            beta2_const,
+                            eps_const,
+                            t_float_p,
+                        ],
                     )?;
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
-                        "unsupported optimizer '{}' in pipelined train block", optimizer_name
+                        "unsupported optimizer '{}' in pipelined train block",
+                        optimizer_name
                     )));
                 }
             }
@@ -4143,7 +4933,8 @@ impl Compiler<'_> {
             let o_next = builder.ins().iadd(idx, o_one);
             builder.def_var(opt_i, o_next);
             builder.ins().jump(opt_hdr, &[]);
-            builder.switch_to_block(opt_exit); builder.seal_block(opt_exit);
+            builder.switch_to_block(opt_exit);
+            builder.seal_block(opt_exit);
             state.current_block = Some(opt_exit);
         }
 
@@ -4167,11 +4958,15 @@ impl Compiler<'_> {
             let cl_body = builder.create_block();
             let cl_exit = builder.create_block();
             builder.ins().jump(cl_hdr, &[]);
-            builder.switch_to_block(cl_hdr); builder.seal_block(cl_hdr);
+            builder.switch_to_block(cl_hdr);
+            builder.seal_block(cl_hdr);
             let ci = builder.use_var(cl_i);
-            let cc = builder.ins().icmp(IntCC::SignedLessThan, ci, num_params_val);
+            let cc = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, ci, num_params_val);
             builder.ins().brif(cc, cl_body, &[], cl_exit, &[]);
-            builder.switch_to_block(cl_body); builder.seal_block(cl_body);
+            builder.switch_to_block(cl_body);
+            builder.seal_block(cl_body);
             state.current_block = Some(cl_body);
             // Free gradient
             let gv = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, ci])?;
@@ -4180,14 +4975,16 @@ impl Compiler<'_> {
             let sb1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, ci])?;
             self.compile_call_by_name(builder, "nsl_tensor_free", &[sb1])?;
             if num_state_buffers >= 2 {
-                let sb2 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, ci])?;
+                let sb2 =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, ci])?;
                 self.compile_call_by_name(builder, "nsl_tensor_free", &[sb2])?;
             }
             let cl_one = builder.ins().iconst(cl_types::I64, 1);
             let cl_next = builder.ins().iadd(ci, cl_one);
             builder.def_var(cl_i, cl_next);
             builder.ins().jump(cl_hdr, &[]);
-            builder.switch_to_block(cl_exit); builder.seal_block(cl_exit);
+            builder.switch_to_block(cl_exit);
+            builder.seal_block(cl_exit);
             state.current_block = Some(cl_exit);
         }
         self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
@@ -4249,7 +5046,7 @@ impl Compiler<'_> {
                 }
                 _ => {
                     return Err(CodegenError::new(
-                        "grad block output must be `let (loss, grads) = grad(...):`"
+                        "grad block output must be `let (loss, grads) = grad(...):`",
                     ));
                 }
             }
@@ -4291,7 +5088,9 @@ impl Compiler<'_> {
                 StmtKind::Expr(expr) => Some(expr),
                 _ => None,
             })
-            .ok_or_else(|| CodegenError::new("grad block must end with an expression (the loss)"))?;
+            .ok_or_else(|| {
+                CodegenError::new("grad block must end with an expression (the loss)")
+            })?;
 
         let Some(loss_var_id) = self.resolve_source_ad_expr_var_id(&extractor, loss_expr, true)
         else {
@@ -4377,7 +5176,8 @@ impl Compiler<'_> {
         let mut retained_full_vars = std::collections::HashSet::new();
         retained_full_vars.insert(loss_var_id);
 
-        let mut grad_tensor = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[targets_val])?;
+        let mut grad_tensor =
+            self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[targets_val])?;
 
         let start_var = extractor.next_var_id();
         let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
@@ -4389,11 +5189,7 @@ impl Compiler<'_> {
 
             if !adjoint.ops.is_empty() {
                 let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
-                    self,
-                    builder,
-                    state,
-                    &adjoint,
-                    full_vars,
+                    self, builder, state, &adjoint, full_vars,
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
@@ -4430,7 +5226,6 @@ impl Compiler<'_> {
         grad: &nsl_ast::block::GradBlock,
         targets_val: Value,
     ) -> Result<(Value, Value), CodegenError> {
-
         // 2. Wrap single tensor in a 1-element list for the tape API
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         self.compile_call_by_name(builder, "nsl_list_push", &[param_list, targets_val])?;
@@ -4460,22 +5255,16 @@ impl Compiler<'_> {
         })?;
 
         // 5. Run backward pass
-        let grads_list = self.compile_call_by_name(
-            builder,
-            "nsl_tape_backward",
-            &[loss_tensor, param_list],
-        )?;
+        let grads_list =
+            self.compile_call_by_name(builder, "nsl_tape_backward", &[loss_tensor, param_list])?;
 
         // 6. Stop tape (cleans up saved tensor refcounts)
         self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;
 
         // 7. Get gradient for the single param (index 0)
         let zero = builder.ins().iconst(cl_types::I64, 0);
-        let grad_tensor = self.compile_call_by_name(
-            builder,
-            "nsl_list_get",
-            &[grads_list, zero],
-        )?;
+        let grad_tensor =
+            self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, zero])?;
 
         // 7b. Free the temporary lists (grad_tensor was extracted, still alive)
         self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
@@ -4543,11 +5332,9 @@ impl Compiler<'_> {
                     .iter()
                     .find_map(|(compound_name, vid)| (compound_name == &name).then_some(*vid))
                     .or_else(|| {
-                        extractor
-                            .wengert_list()
-                            .var_names
-                            .iter()
-                            .find_map(|(vid, existing_name)| (existing_name == &name).then_some(*vid))
+                        extractor.wengert_list().var_names.iter().find_map(
+                            |(vid, existing_name)| (existing_name == &name).then_some(*vid),
+                        )
                     })
             }
             _ if allow_last_op_fallback => extractor.wengert_list().ops.last().map(|op| op.result),
@@ -4569,13 +5356,7 @@ impl Compiler<'_> {
         let model_type_name = self.resolve_source_ad_model_type_name(state, root_sym)?;
         let layout = self.types.struct_layouts.get(&model_type_name)?;
         let root_ptr = builder.use_var(root_var);
-        self.load_nested_field(
-            builder,
-            root_ptr,
-            layout,
-            &model_type_name,
-            compound_name,
-        )
+        self.load_nested_field(builder, root_ptr, layout, &model_type_name, compound_name)
     }
 
     // ── Quant block codegen ──────────────────────────────────────────
@@ -4623,12 +5404,17 @@ impl Compiler<'_> {
             found_name.unwrap_or_else(|| self.resolve_sym(source_sym).to_string())
         };
 
-        let layout = self.types.struct_layouts.get(&model_type_name).cloned().ok_or_else(|| {
-            CodegenError::new(format!(
-                "no struct layout found for model '{}' in quant block",
-                model_type_name
-            ))
-        })?;
+        let layout = self
+            .types
+            .struct_layouts
+            .get(&model_type_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "no struct layout found for model '{}' in quant block",
+                    model_type_name
+                ))
+            })?;
 
         // 3. Compute dtype/granularity integer codes for the runtime call
         let dtype_code: i64 = match quant.default_dtype {
@@ -4650,7 +5436,9 @@ impl Compiler<'_> {
         let gs_v = builder.ins().iconst(cl_types::I64, gs_val);
 
         // 4. Allocate a new struct with the same layout as the source model
-        let alloc_size = builder.ins().iconst(cl_types::I64, layout.total_size.max(8) as i64);
+        let alloc_size = builder
+            .ins()
+            .iconst(cl_types::I64, layout.total_size.max(8) as i64);
         let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
 
         // 5. For each field: quantize→dequantize (or clone if excluded)
@@ -4666,7 +5454,9 @@ impl Compiler<'_> {
             if is_excluded {
                 // Copy as-is via clone (bumps refcount internally)
                 let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[src_val])?;
-                builder.ins().store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
             } else {
                 // Quantize then immediately dequantize — validates the roundtrip and
                 // shows quantization effects (precision loss) while storing a regular
@@ -4679,7 +5469,9 @@ impl Compiler<'_> {
                 let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
                 // Release the intermediate QuantizedTensor (refcount-aware)
                 self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
-                builder.ins().store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
             }
         }
 
@@ -4732,4 +5524,46 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == pb.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_source_ad_param_name, is_trainable_param_leaf_name, SourceAdParamDiagnosticKind,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn source_ad_param_classification_separates_tensor_and_non_tensor_noise() {
+        let tensor_paths: HashSet<String> = [
+            "m.blocks.0.attn.wq".to_string(),
+            "m.blocks.0.attn._dropout_p".to_string(),
+            "m.blocks.0.attn.rope.inv_freq".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(is_trainable_param_leaf_name("m.blocks.0.attn.wq"));
+        assert!(!is_trainable_param_leaf_name("m.blocks.0.attn._dropout_p"));
+        assert!(!is_trainable_param_leaf_name(
+            "m.blocks.0.attn.rope.inv_freq"
+        ));
+
+        assert_eq!(
+            classify_source_ad_param_name("m.blocks.0.attn.wq", &tensor_paths),
+            SourceAdParamDiagnosticKind::TrainableTensor,
+        );
+        assert_eq!(
+            classify_source_ad_param_name("m.blocks.0.attn._dropout_p", &tensor_paths),
+            SourceAdParamDiagnosticKind::IgnoredConfigTensor,
+        );
+        assert_eq!(
+            classify_source_ad_param_name("m.blocks.0.attn.rope.inv_freq", &tensor_paths),
+            SourceAdParamDiagnosticKind::IgnoredConfigTensor,
+        );
+        assert_eq!(
+            classify_source_ad_param_name("m.blocks.0.attn_norm.eps", &tensor_paths),
+            SourceAdParamDiagnosticKind::IgnoredNonTensor,
+        );
+    }
 }

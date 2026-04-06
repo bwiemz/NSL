@@ -1,0 +1,15 @@
+# M12 Source-AD grad unresolved-target fallback test
+# --source-ad should fall back to tape AD when the grad target is syntactically
+# valid but absent from the extracted forward graph.
+
+model Tiny:
+    w: Tensor = ones([3])
+
+let m = Tiny()
+let x = ones([3])
+
+let (loss, grads) = grad(m.w):
+    sum(x)
+
+print(loss)
+print(grads)

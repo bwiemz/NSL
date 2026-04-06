@@ -38,8 +38,10 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
             use std::sync::atomic::{AtomicBool, Ordering};
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!("[nsl-codegen] warning: Type::Unknown reached codegen (defaulting to I64). \
-                           This may indicate a type inference gap.");
+                eprintln!(
+                    "[nsl-codegen] warning: Type::Unknown reached codegen (defaulting to I64). \
+                           This may indicate a type inference gap."
+                );
             }
             types::I64
         }
@@ -79,7 +81,13 @@ pub fn is_float_type(ty: &Type) -> bool {
         Type::Borrow(inner) => is_float_type(inner),
         _ => matches!(
             ty,
-            Type::Float | Type::F64 | Type::F32 | Type::Fp16 | Type::Bf16 | Type::Fp8E4m3 | Type::Fp8E5m2
+            Type::Float
+                | Type::F64
+                | Type::F32
+                | Type::Fp16
+                | Type::Bf16
+                | Type::Fp8E4m3
+                | Type::Fp8E5m2
         ),
     }
 }

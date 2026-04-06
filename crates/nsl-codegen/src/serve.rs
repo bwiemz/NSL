@@ -49,27 +49,64 @@ impl Compiler<'_> {
 
         let max_seq_len_val = builder.ins().iconst(cl_types::I32, max_seq_len);
         let kv_blocks_val = builder.ins().iconst(cl_types::I32, kv_blocks);
-        let block_size_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_BLOCK_SIZE);
-        let num_kv_heads_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_NUM_KV_HEADS);
+        let block_size_val = builder
+            .ins()
+            .iconst(cl_types::I32, WORKER_DEFAULT_BLOCK_SIZE);
+        let num_kv_heads_val = builder
+            .ins()
+            .iconst(cl_types::I32, WORKER_DEFAULT_NUM_KV_HEADS);
         let head_dim_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_HEAD_DIM);
-        let num_layers_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_NUM_LAYERS);
+        let num_layers_val = builder
+            .ins()
+            .iconst(cl_types::I32, WORKER_DEFAULT_NUM_LAYERS);
         let speculative_tokens_val = builder.ins().iconst(cl_types::I32, speculative_tokens);
         let speculative_method_val = builder.ins().iconst(cl_types::I32, speculative_method);
-        let speculative_tree_width_val = builder.ins().iconst(cl_types::I32, speculative_tree_width);
-        let speculative_temp_bits_val = builder.ins().iconst(cl_types::I32, speculative_temperature_bits);
-        let eos_val = builder.ins().iconst(cl_types::I32, WORKER_DEFAULT_EOS_TOKEN_ID);
+        let speculative_tree_width_val =
+            builder.ins().iconst(cl_types::I32, speculative_tree_width);
+        let speculative_temp_bits_val = builder
+            .ins()
+            .iconst(cl_types::I32, speculative_temperature_bits);
+        let eos_val = builder
+            .ins()
+            .iconst(cl_types::I32, WORKER_DEFAULT_EOS_TOKEN_ID);
 
-        builder.ins().stack_store(max_seq_len_val, slot, WORKER_MAX_SEQ_LEN_OFFSET);
-        builder.ins().stack_store(kv_blocks_val, slot, WORKER_KV_BLOCKS_OFFSET);
-        builder.ins().stack_store(block_size_val, slot, WORKER_BLOCK_SIZE_OFFSET);
-        builder.ins().stack_store(num_kv_heads_val, slot, WORKER_NUM_KV_HEADS_OFFSET);
-        builder.ins().stack_store(head_dim_val, slot, WORKER_HEAD_DIM_OFFSET);
-        builder.ins().stack_store(num_layers_val, slot, WORKER_NUM_LAYERS_OFFSET);
-        builder.ins().stack_store(speculative_tokens_val, slot, WORKER_SPEC_TOKENS_OFFSET);
-        builder.ins().stack_store(speculative_method_val, slot, WORKER_SPEC_METHOD_OFFSET);
-        builder.ins().stack_store(speculative_tree_width_val, slot, WORKER_SPEC_TREE_WIDTH_OFFSET);
-        builder.ins().stack_store(speculative_temp_bits_val, slot, WORKER_SPEC_TEMP_BITS_OFFSET);
-        builder.ins().stack_store(eos_val, slot, WORKER_EOS_TOKEN_OFFSET);
+        builder
+            .ins()
+            .stack_store(max_seq_len_val, slot, WORKER_MAX_SEQ_LEN_OFFSET);
+        builder
+            .ins()
+            .stack_store(kv_blocks_val, slot, WORKER_KV_BLOCKS_OFFSET);
+        builder
+            .ins()
+            .stack_store(block_size_val, slot, WORKER_BLOCK_SIZE_OFFSET);
+        builder
+            .ins()
+            .stack_store(num_kv_heads_val, slot, WORKER_NUM_KV_HEADS_OFFSET);
+        builder
+            .ins()
+            .stack_store(head_dim_val, slot, WORKER_HEAD_DIM_OFFSET);
+        builder
+            .ins()
+            .stack_store(num_layers_val, slot, WORKER_NUM_LAYERS_OFFSET);
+        builder
+            .ins()
+            .stack_store(speculative_tokens_val, slot, WORKER_SPEC_TOKENS_OFFSET);
+        builder
+            .ins()
+            .stack_store(speculative_method_val, slot, WORKER_SPEC_METHOD_OFFSET);
+        builder.ins().stack_store(
+            speculative_tree_width_val,
+            slot,
+            WORKER_SPEC_TREE_WIDTH_OFFSET,
+        );
+        builder.ins().stack_store(
+            speculative_temp_bits_val,
+            slot,
+            WORKER_SPEC_TEMP_BITS_OFFSET,
+        );
+        builder
+            .ins()
+            .stack_store(eos_val, slot, WORKER_EOS_TOKEN_OFFSET);
 
         slot
     }
@@ -150,9 +187,16 @@ impl Compiler<'_> {
 
         if is_disaggregated {
             self.compile_disaggregated_serve(
-                builder, state, serve,
-                max_batch, max_seq_len, kv_blocks, prefill_chunk,
-                prefill_workers, decode_workers, &kv_transfer_backend,
+                builder,
+                state,
+                serve,
+                max_batch,
+                max_seq_len,
+                kv_blocks,
+                prefill_chunk,
+                prefill_workers,
+                decode_workers,
+                &kv_transfer_backend,
             )?;
         } else {
             // Monolithic M29 path (unchanged)
@@ -237,15 +281,8 @@ impl Compiler<'_> {
         let speculative_temperature_bits = speculative_config
             .map(|info| info.temperature.to_bits() as i64)
             .unwrap_or(0);
-        let prefill_config_slot = self.build_worker_config_slot(
-            builder,
-            _max_seq_len,
-            kv_blocks,
-            0,
-            0,
-            1,
-            0,
-        );
+        let prefill_config_slot =
+            self.build_worker_config_slot(builder, _max_seq_len, kv_blocks, 0, 0, 1, 0);
         let decode_config_slot = self.build_worker_config_slot(
             builder,
             _max_seq_len,
@@ -265,15 +302,25 @@ impl Compiler<'_> {
 
         // if role == 0 → router_block, else → check_prefill_block
         let zero = builder.ins().iconst(cl_types::I64, 0);
-        let is_router = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, role, zero);
-        builder.ins().brif(is_router, router_block, &[], check_prefill_block, &[]);
+        let is_router =
+            builder
+                .ins()
+                .icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, role, zero);
+        builder
+            .ins()
+            .brif(is_router, router_block, &[], check_prefill_block, &[]);
 
         // check_prefill_block: if role == 1 → prefill_block, else → decode_block
         builder.switch_to_block(check_prefill_block);
         builder.seal_block(check_prefill_block);
         let one = builder.ins().iconst(cl_types::I64, 1);
-        let is_prefill = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, role, one);
-        builder.ins().brif(is_prefill, prefill_block, &[], decode_block, &[]);
+        let is_prefill =
+            builder
+                .ins()
+                .icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, role, one);
+        builder
+            .ins()
+            .brif(is_prefill, prefill_block, &[], decode_block, &[]);
 
         // --- Router block ---
         builder.switch_to_block(router_block);
@@ -283,7 +330,9 @@ impl Compiler<'_> {
         let v_batch = builder.ins().iconst(cl_types::I64, max_batch);
         let v_kv = builder.ins().iconst(cl_types::I64, kv_blocks);
         self.compile_call_by_name(
-            builder, "nsl_disagg_init", &[v_prefill, v_decode, v_batch, v_kv],
+            builder,
+            "nsl_disagg_init",
+            &[v_prefill, v_decode, v_batch, v_kv],
         )?;
         // Router runs endpoint bodies (sets up the event loop)
         for endpoint in &serve.endpoints {
@@ -301,12 +350,16 @@ impl Compiler<'_> {
         let rank = self.compile_call_by_name(builder, "nsl_disagg_get_rank", &[])?;
         let model_zero = builder.ins().iconst(cl_types::I64, 0); // model ptr placeholder
         self.compile_call_by_name(
-            builder, "nsl_disagg_worker_init", &[role_prefill, rank, model_zero],
+            builder,
+            "nsl_disagg_worker_init",
+            &[role_prefill, rank, model_zero],
         )?;
         // M41b: Initialize KV transfer backend for this worker
         let v_kv_backend = builder.ins().iconst(cl_types::I64, kv_backend_id);
         self.compile_call_by_name(builder, "nsl_kv_transfer_init", &[v_kv_backend, rank])?;
-        let prefill_config = builder.ins().stack_addr(cl_types::I64, prefill_config_slot, 0);
+        let prefill_config = builder
+            .ins()
+            .stack_addr(cl_types::I64, prefill_config_slot, 0);
         self.compile_call_by_name(builder, "nsl_disagg_prefill_loop", &[prefill_config])?;
         self.compile_call_by_name(builder, "nsl_kv_transfer_destroy", &[])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;
@@ -319,12 +372,16 @@ impl Compiler<'_> {
         let rank2 = self.compile_call_by_name(builder, "nsl_disagg_get_rank", &[])?;
         let model_zero2 = builder.ins().iconst(cl_types::I64, 0);
         self.compile_call_by_name(
-            builder, "nsl_disagg_worker_init", &[role_decode, rank2, model_zero2],
+            builder,
+            "nsl_disagg_worker_init",
+            &[role_decode, rank2, model_zero2],
         )?;
         // M41b: Initialize KV transfer backend for this worker
         let v_kv_backend2 = builder.ins().iconst(cl_types::I64, kv_backend_id);
         self.compile_call_by_name(builder, "nsl_kv_transfer_init", &[v_kv_backend2, rank2])?;
-        let decode_config = builder.ins().stack_addr(cl_types::I64, decode_config_slot, 0);
+        let decode_config = builder
+            .ins()
+            .stack_addr(cl_types::I64, decode_config_slot, 0);
         self.compile_call_by_name(builder, "nsl_disagg_decode_loop", &[decode_config])?;
         self.compile_call_by_name(builder, "nsl_kv_transfer_destroy", &[])?;
         self.compile_call_by_name(builder, "nsl_disagg_worker_destroy", &[])?;

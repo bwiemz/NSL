@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::{self, types as cl_types};
 use cranelift_frontend::Variable;
 use nsl_ast::Symbol;
+use std::collections::{HashMap, HashSet};
 
 /// Per-function loop tracking for break/continue.
 pub struct LoopContext {

@@ -1,0 +1,15 @@
+# M12 Source-AD grad fallback test
+# --source-ad should fall back to tape AD when extraction sees dynamic control flow,
+# while still preserving tape-owned temporaries in the final inline loss expression.
+
+let w = ones([3])
+let x = ones([3])
+
+let (loss, grads) = grad(w):
+    let i = 0
+    while i < 1:
+        i = i + 1
+    (x * w).sum()
+
+print(loss)
+print(grads)

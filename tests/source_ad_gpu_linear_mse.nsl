@@ -1,0 +1,23 @@
+# Source AD GPU test: linear + mse_loss on CUDA
+
+from nsl.nn.losses import mse_loss
+
+model TinyLinear:
+    w: Tensor = randn([16, 16])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = TinyLinear()
+m.to(cuda)
+
+let x = randn([8, 16]).to(cuda)
+let target = zeros([8, 16]).to(cuda)
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, target)
+
+print("source_ad_gpu_linear_mse: PASS")

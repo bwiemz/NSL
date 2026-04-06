@@ -135,10 +135,7 @@ pub fn parse_listen_addr(s: &str) -> Result<ListenAddr, String> {
         .collect::<Result<Vec<_>, _>>()?;
 
     if octets.len() != 4 {
-        return Err(format!(
-            "expected 4 octets in host, got {}",
-            octets.len()
-        ));
+        return Err(format!("expected 4 octets in host, got {}", octets.len()));
     }
 
     Ok(ListenAddr {
@@ -329,8 +326,8 @@ impl UnikernelConfig {
 /// in a dedicated `.weights` section, and reserves a stack region.
 pub fn generate_linker_script(config: &UnikernelConfig) -> String {
     let entry_addr = match config.boot_protocol {
-        BootProtocol::LinuxBoot => "0x100000",    // 1 MiB (Linux boot protocol)
-        BootProtocol::Multiboot2 => "0x100000",   // 1 MiB (Multiboot2)
+        BootProtocol::LinuxBoot => "0x100000", // 1 MiB (Linux boot protocol)
+        BootProtocol::Multiboot2 => "0x100000", // 1 MiB (Multiboot2)
     };
 
     format!(
@@ -503,11 +500,17 @@ mod tests {
         let usable = total - KERNEL_RESERVED_BYTES;
         assert_eq!(layout.model_pool, usable * 60 / 100);
         assert_eq!(layout.kv_cache_pool, usable * 30 / 100);
-        assert_eq!(layout.heap_available, usable - layout.model_pool - layout.kv_cache_pool);
+        assert_eq!(
+            layout.heap_available,
+            usable - layout.model_pool - layout.kv_cache_pool
+        );
 
         // All pools sum to total
         assert_eq!(
-            layout.kernel_reserved + layout.model_pool + layout.kv_cache_pool + layout.heap_available,
+            layout.kernel_reserved
+                + layout.model_pool
+                + layout.kv_cache_pool
+                + layout.heap_available,
             total
         );
     }
@@ -614,12 +617,21 @@ mod tests {
         assert_eq!(format!("{}", WeightSource::Embedded), "embedded");
         assert_eq!(format!("{}", WeightSource::Disk), "disk");
         assert_eq!(format!("{}", WeightSource::Network), "network");
-        assert_eq!(format!("{}", GpuInitStrategy::VfioPassthrough), "vfio-passthrough");
-        assert_eq!(format!("{}", GpuInitStrategy::DirectRegister), "direct-register");
+        assert_eq!(
+            format!("{}", GpuInitStrategy::VfioPassthrough),
+            "vfio-passthrough"
+        );
+        assert_eq!(
+            format!("{}", GpuInitStrategy::DirectRegister),
+            "direct-register"
+        );
         assert_eq!(format!("{}", BootProtocol::Multiboot2), "multiboot2");
         assert_eq!(format!("{}", BootProtocol::LinuxBoot), "linux-boot");
 
-        let addr = ListenAddr { host: [127, 0, 0, 1], port: 3000 };
+        let addr = ListenAddr {
+            host: [127, 0, 0, 1],
+            port: 3000,
+        };
         assert_eq!(format!("{addr}"), "127.0.0.1:3000");
     }
 }

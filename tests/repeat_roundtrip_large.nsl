@@ -1,0 +1,9 @@
+let a = randn([4, 2048, 384]).to(cuda)
+
+for i in range(0, 128):
+    let cpu = a.to(cpu)
+    let gpu = cpu.to(cuda)
+    if i % 16 == 0:
+        print(i)
+
+print("repeat_roundtrip_large: PASS")

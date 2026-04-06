@@ -1,0 +1,7 @@
+let a = randn([4, 6, 2048, 64])
+let b = randn([2048, 64])
+
+let a_gpu = a.to(cuda)
+let c = a_gpu * b
+print(c.shape)
+print("gpu_cpu_broadcast_mul_rope_shape: PASS")

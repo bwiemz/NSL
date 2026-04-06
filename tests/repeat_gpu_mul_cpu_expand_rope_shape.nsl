@@ -1,0 +1,10 @@
+let x = randn([4, 6, 2048, 64]).to(cuda)
+let freq = randn([2048, 64])
+let expanded = freq.unsqueeze(0).unsqueeze(0).expand([4, 6, 2048, 64])
+
+for i in range(0, 128):
+    let y = x * expanded
+    if i % 16 == 0:
+        print(i)
+
+print("repeat_gpu_mul_cpu_expand_rope_shape: PASS")

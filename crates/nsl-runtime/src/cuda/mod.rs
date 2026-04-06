@@ -171,21 +171,6 @@ pub(crate) mod inner {
         alloc.drain_all()
     }
 
-    /// Drain all cached allocations from the pinned host memory pool.
-    fn pinned_pool_drain() -> usize {
-        let mut pool = PINNED_POOL.lock().unwrap();
-        let mut freed = 0usize;
-        ensure_context();
-        for (bucket_size, deque) in pool.buckets.iter_mut() {
-            while let Some(ptr) = deque.pop_front() {
-                unsafe { cuMemFreeHost(ptr); }
-                freed += bucket_size;
-            }
-        }
-        pool.buckets.clear();
-        freed
-    }
-
     /// Thread-local context string describing the current GPU operation.
     /// Set before allocations so OOM messages identify which op failed.
     ///
@@ -313,12 +298,6 @@ pub(crate) mod inner {
             return Some(ptr);
         }
 
-        // Attempt 4: drain pinned pool (reduces system memory pressure) and retry
-        let _pinned_drained = pinned_pool_drain();
-        if let Some(ptr) = caching_alloc(size_bytes) {
-            return Some(ptr);
-        }
-
         None
     }
 
@@ -364,12 +343,6 @@ pub(crate) mod inner {
         // Retry unconditionally: even if drain freed 0 bytes, cuCtxSynchronize
         // above may have completed async frees the caching allocator can now use.
         let pool_freed = pool_drain();
-        if let Some(ptr) = caching_alloc(size_bytes) {
-            return ptr;
-        }
-
-        // Step 3: drain pinned pool (reduces system memory pressure) and retry
-        let _pinned_freed = pinned_pool_drain();
         if let Some(ptr) = caching_alloc(size_bytes) {
             return ptr;
         }
@@ -427,74 +400,6 @@ pub(crate) mod inner {
                     eprintln!("nsl: cuMemFree failed: {:?} for {:p}", result, ptr);
                 }
             }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Pinned staging pool: caches page-locked host memory buffers for
-    // CPU↔GPU transfers. Avoids repeated cuMemAllocHost/cuMemFreeHost
-    // syscalls during training loops (~50+ transfers per step).
-    // ------------------------------------------------------------------
-
-    /// Round up to next power-of-2 for pinned pool bucket sizing.
-    fn pinned_bucket_size(requested: usize) -> usize {
-        if requested == 0 { return 0; }
-        let s = requested.max(4096);
-        s.next_power_of_two()
-    }
-
-    const PINNED_POOL_MAX_PER_BUCKET: usize = 4;
-    const PINNED_POOL_MAX_ALLOC: usize = 64 * 1024 * 1024; // 64 MB
-
-    struct PinnedPool {
-        buckets: HashMap<usize, std::collections::VecDeque<*mut c_void>>,
-    }
-    unsafe impl Send for PinnedPool {}
-
-    static PINNED_POOL: std::sync::LazyLock<std::sync::Mutex<PinnedPool>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(PinnedPool {
-            buckets: HashMap::new(),
-        }));
-
-    /// Get a pinned (page-locked) staging buffer. Reuses pooled buffers.
-    pub(crate) fn staging_alloc(size_bytes: usize) -> *mut c_void {
-        if size_bytes == 0 { return std::ptr::null_mut(); }
-        if size_bytes > PINNED_POOL_MAX_ALLOC {
-            // Large allocations: use regular heap memory instead of pinned.
-            // cuMemcpyHtoD/DtoH work with any host pointer; pinned memory
-            // only helps with concurrent stream overlap which we don't use.
-            // This avoids exhausting CUDA's pinned memory limit during training
-            // when transferring large tensors (e.g., logits [B, S, V]).
-            return crate::memory::checked_alloc(size_bytes) as *mut c_void;
-        }
-        let bsize = pinned_bucket_size(size_bytes);
-        {
-            let mut pool = PINNED_POOL.lock().unwrap();
-            if let Some(deque) = pool.buckets.get_mut(&bsize) {
-                if let Some(ptr) = deque.pop_front() {
-                    return ptr;
-                }
-            }
-        }
-        alloc_pinned(bsize) // allocate at bucket size for reuse
-    }
-
-    /// Return a pinned staging buffer to the pool.
-    pub(crate) fn staging_free(ptr: *mut c_void, size_bytes: usize) {
-        if ptr.is_null() { return; }
-        if size_bytes > PINNED_POOL_MAX_ALLOC {
-            // Large allocations were heap-allocated, not pinned
-            unsafe { crate::memory::checked_free(ptr as *mut u8, size_bytes); }
-            return;
-        }
-        let bsize = pinned_bucket_size(size_bytes);
-        let mut pool = PINNED_POOL.lock().unwrap();
-        let deque = pool.buckets.entry(bsize).or_insert_with(std::collections::VecDeque::new);
-        if deque.len() < PINNED_POOL_MAX_PER_BUCKET {
-            deque.push_back(ptr);
-        } else {
-            drop(pool);
-            free_pinned(ptr);
         }
     }
 
@@ -632,7 +537,9 @@ pub(crate) mod inner {
         }
     }
 
-    /// Allocate pinned (page-locked) host memory for fast DMA transfers.
+    /// Test-only helper for allocating pinned (page-locked) host memory.
+    /// Production tensor transfers use plain heap staging instead.
+    #[cfg(test)]
     pub(crate) fn alloc_pinned(size_bytes: usize) -> *mut c_void {
         ensure_context();
         unsafe {
@@ -650,6 +557,7 @@ pub(crate) mod inner {
     }
 
     /// Free pinned host memory allocated with `alloc_pinned`.
+    #[cfg(test)]
     pub(crate) fn free_pinned(ptr: *mut c_void) {
         ensure_context();
         unsafe {
@@ -914,9 +822,27 @@ fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
 }
 
 #[cfg(feature = "cuda")]
+fn tensor_shape_slice<'a>(tensor: &'a crate::tensor::NslTensor) -> &'a [i64] {
+    assert!(tensor.ndim >= 0, "tensor has negative ndim: {}", tensor.ndim);
+    let ndim = tensor.ndim as usize;
+    if ndim == 0 {
+        return &[];
+    }
+    assert!(
+        !tensor.shape.is_null(),
+        "tensor shape is null for ndim {} (len={}, device={}, dtype={})",
+        tensor.ndim,
+        tensor.len,
+        tensor.device,
+        tensor.dtype,
+    );
+    unsafe { std::slice::from_raw_parts(tensor.shape, ndim) }
+}
+
+#[cfg(feature = "cuda")]
 fn gpu_broadcast_shape(a: &crate::tensor::NslTensor, b: &crate::tensor::NslTensor) -> Option<Vec<i64>> {
-    let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
-    let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
+    let a_shape = tensor_shape_slice(a);
+    let b_shape = tensor_shape_slice(b);
     let out_ndim = a_shape.len().max(b_shape.len());
     let mut out_shape = vec![1i64; out_ndim];
     for i in 0..out_ndim {
@@ -934,7 +860,7 @@ fn gpu_broadcast_shape(a: &crate::tensor::NslTensor, b: &crate::tensor::NslTenso
 #[cfg(feature = "cuda")]
 fn gpu_prepare_binary_operand(ptr: i64, out_shape: &[i64]) -> (i64, bool) {
     let tensor = unsafe { &*(ptr as *const crate::tensor::NslTensor) };
-    let current_shape = unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) };
+    let current_shape = tensor_shape_slice(tensor);
     let needs_expand = current_shape != out_shape;
 
     if !needs_expand && tensor.is_contiguous() {
@@ -3989,6 +3915,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use crate::tensor::{DTYPE_F32, NslTensor};
 
     const VEC_ADD_PTX: &str = "\
 .version 7.0
@@ -4094,6 +4021,53 @@ DONE:
         inner::free_managed(a);
         inner::free_managed(b);
         inner::free_managed(c);
+    }
+
+    #[test]
+    fn tensor_shape_slice_handles_zero_rank_null_shape() {
+        let scalar = NslTensor::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            1,
+            1,
+            DTYPE_F32,
+            0,
+            0,
+        );
+
+        assert!(tensor_shape_slice(&scalar).is_empty());
+    }
+
+    #[test]
+    fn gpu_broadcast_shape_accepts_zero_rank_scalar_tensor() {
+        let scalar = NslTensor::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            1,
+            1,
+            DTYPE_F32,
+            0,
+            0,
+        );
+        let mut vec_shape = [4_i64];
+        let vector = NslTensor::new(
+            std::ptr::null_mut(),
+            vec_shape.as_mut_ptr(),
+            std::ptr::null_mut(),
+            1,
+            4,
+            1,
+            DTYPE_F32,
+            0,
+            0,
+        );
+
+        assert_eq!(gpu_broadcast_shape(&vector, &scalar), Some(vec![4]));
+        assert_eq!(gpu_broadcast_shape(&scalar, &vector), Some(vec![4]));
     }
 
     #[test]

@@ -1,0 +1,40 @@
+from nsl.nn.losses import cross_entropy
+
+model Inner:
+    w: Tensor = randn([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return relu(x @ self.w)
+
+model Outer:
+    embed: Tensor = randn([16, 8])
+    block: Inner = Inner()
+    tail: Inner = Inner()
+    head: Tensor = randn([8, 16])
+
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        let s = input_ids.shape
+        let batch = s[0]
+        let seq_len = s[1]
+        let flat_ids = input_ids.reshape([batch * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let x = emb.reshape([batch * seq_len, 8])
+        let h1 = self.block.forward(x)
+        let h2 = self.tail.forward(h1)
+        let logits = h2 @ self.head
+        return logits.reshape([batch, seq_len, 16])
+
+let m = Outer()
+let input_ids = full([2, 4], 1.0)
+let labels = full([2, 4], 0.0)
+
+train(model = m, epochs = 2):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let logits = m.forward(input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+
+print("source_ad_nested_training: PASS")
