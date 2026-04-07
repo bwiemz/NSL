@@ -3921,6 +3921,25 @@ pub(crate) fn debug_track_gpu_free(bytes: usize) {
     GPU_TENSOR_BYTES.fetch_sub(bytes as i64, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Debug: print GPU allocated block summary grouped by context.
+#[no_mangle]
+pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
+    if step > 2 { return; } // only first 3 steps
+    #[cfg(feature = "cuda")]
+    {
+        let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        let summary = alloc.allocated_block_summary();
+        eprintln!("[gpu-alloc-summary] step={} live blocks:", step);
+        for (ctx, count, bytes) in &summary {
+            if *bytes > 1024 {
+                eprintln!("  {} — {} blocks, {}KB", ctx, count, bytes / 1024);
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = step; }
+}
+
 /// Debug: print GPU memory usage + caching allocator stats.
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_mem(step: i64) {

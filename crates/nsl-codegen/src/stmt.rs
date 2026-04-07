@@ -3983,6 +3983,7 @@ impl Compiler<'_> {
         {
             let step_val = builder.use_var(step_count_var);
             self.compile_call_by_name(builder, "nsl_debug_gpu_mem", &[step_val])?;
+            self.compile_call_by_name(builder, "nsl_debug_gpu_alloc_summary", &[step_val])?;
         }
 
         // ── 8. Close batch loop (if DataLoader) and increment epoch ──────

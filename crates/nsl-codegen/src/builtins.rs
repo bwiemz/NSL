@@ -138,6 +138,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_gpu_drain_cache", &[], None),
     ("nsl_gpu_set_persistent_pool", &[], None),
     ("nsl_gpu_set_transient_pool", &[], None),
+    ("nsl_debug_gpu_alloc_summary", &[types::I64], None),
     // Stdin I/O
     ("nsl_read_line", &[], Some(types::I64)),
     // File I/O

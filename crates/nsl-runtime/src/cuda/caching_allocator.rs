@@ -645,6 +645,24 @@ impl<D: DriverAlloc> CachingAllocator<D> {
     pub(crate) fn is_allocated(&self, ptr: *mut c_void) -> bool {
         self.allocated_blocks.contains_key(&(ptr as usize))
     }
+
+    /// Return a summary of all currently allocated blocks grouped by context.
+    /// Format: Vec<(context, count, total_bytes)> sorted by total_bytes descending.
+    pub fn allocated_block_summary(&self) -> Vec<(String, usize, usize)> {
+        let mut by_context: HashMap<String, (usize, usize)> = HashMap::new();
+        for (_, &block_ptr) in &self.allocated_blocks {
+            let block = unsafe { &*block_ptr };
+            let ctx = if block.context.is_empty() { "(no context)" } else { &block.context };
+            let entry = by_context.entry(ctx.to_string()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += block.size;
+        }
+        let mut result: Vec<_> = by_context.into_iter()
+            .map(|(ctx, (count, bytes))| (ctx, count, bytes))
+            .collect();
+        result.sort_by(|a, b| b.2.cmp(&a.2));
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
