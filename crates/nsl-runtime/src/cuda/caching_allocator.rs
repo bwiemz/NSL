@@ -18,6 +18,19 @@ use std::sync::{LazyLock, Mutex};
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Allocation pool tag — persistent allocations (model weights, optimizer states)
+/// live in their own segments, preventing transient per-step intermediates from
+/// fragmenting persistent memory and blocking segment release on drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AllocPool {
+    /// Model weights, optimizer moment buffers, DataLoader tensors.
+    /// These segments are never released by drain_all.
+    Persistent,
+    /// Forward/backward intermediates, gradients, temporaries.
+    /// These segments are released by drain_all when fully free.
+    Transient,
+}
+
 /// Small/large pool boundary (1 MB).
 const SMALL_THRESHOLD: usize = 1 << 20;
 /// Alignment for small allocations.
@@ -56,6 +69,8 @@ struct Block {
     segment_idx: usize,
     /// CUDA op context captured when the block was handed out.
     context: String,
+    /// Pool tag inherited from parent segment.
+    pool: AllocPool,
 }
 
 /// SAFETY: Block contains raw pointers to GPU memory and sibling Blocks.
@@ -74,6 +89,8 @@ struct Segment {
     allocated_count: usize,
     /// Whether this is a small-pool or large-pool segment.
     is_small: bool,
+    /// Pool tag — controls whether drain_all releases this segment.
+    pool: AllocPool,
 }
 
 unsafe impl Send for Segment {}
@@ -257,14 +274,25 @@ impl<D: DriverAlloc> CachingAllocator<D> {
     }
 
     /// Try to allocate from the free-list (cache hit). Returns None on miss.
+    /// Prefers blocks from the current pool to avoid mixing persistent and
+    /// transient allocations in the same segment (prevents fragmentation).
     pub(crate) fn alloc_from_cache(&mut self, size_bytes: usize) -> Option<*mut c_void> {
         if size_bytes == 0 { return None; }
         let rounded = Self::round_size(size_bytes);
         let small = Self::is_small(rounded);
+        let current_pool = get_alloc_pool();
         let search_key = FreeBlockKey { size: rounded, ptr: 0 };
 
-        // Best-fit: find smallest free block >= rounded size
-        let found_key = self.free_set(small).range(search_key..).next().copied();
+        // Best-fit: prefer a free block from the same pool.
+        // Fall back to any pool only as a last resort.
+        let found_key = self.free_set(small).range(search_key..).find(|k| {
+            self.all_blocks.get(&k.ptr)
+                .map(|&bptr| unsafe { (*bptr).pool } == current_pool)
+                .unwrap_or(false)
+        }).copied().or_else(|| {
+            // Fallback: any pool (prevents OOM when same-pool is exhausted)
+            self.free_set(small).range(search_key..).next().copied()
+        });
         let found_key = found_key?;
 
         // Remove from free-list
@@ -321,6 +349,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let base_ptr = self.driver.alloc(segment_size).ok()?;
 
         // Create segment
+        let pool = get_alloc_pool();
         let seg_idx = self.segments.len();
         let block = Box::into_raw(Box::new(Block {
             ptr: base_ptr,
@@ -331,6 +360,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             next: std::ptr::null_mut(),
             segment_idx: seg_idx,
             context: String::new(),
+            pool,
         }));
 
         self.segments.push(Segment {
@@ -339,6 +369,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             blocks_head: block,
             allocated_count: 0,
             is_small: small,
+            pool,
         });
 
         self.all_blocks.insert(base_ptr as usize, block);
@@ -394,6 +425,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             next: block.next,
             segment_idx: block.segment_idx,
             context: String::new(),
+            pool: block.pool,
         }));
 
         // Update next block's prev pointer
@@ -534,13 +566,14 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         true
     }
 
-    /// Drain all fully-free segments back to the driver. Returns bytes freed.
+    /// Drain fully-free Transient segments back to the driver. Returns bytes freed.
+    /// Persistent segments are never drained (they hold model weights/optimizer states).
     pub(crate) fn drain_all(&mut self) -> usize {
         let mut freed = 0usize;
         let mut to_remove: Vec<usize> = Vec::new();
 
         for (idx, seg) in self.segments.iter().enumerate() {
-            if seg.allocated_count == 0 {
+            if seg.allocated_count == 0 && seg.pool == AllocPool::Transient {
                 to_remove.push(idx);
             }
         }
@@ -620,6 +653,23 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
 pub static CACHING_ALLOCATOR: LazyLock<Mutex<CachingAllocator>> =
     LazyLock::new(|| Mutex::new(CachingAllocator::new()));
+
+thread_local! {
+    /// Current allocation pool tag. Code that allocates persistent tensors
+    /// (model weights, optimizer states) should set this to Persistent before
+    /// allocating, then restore to Transient after.
+    static CURRENT_POOL: std::cell::Cell<AllocPool> = const { std::cell::Cell::new(AllocPool::Transient) };
+}
+
+/// Set the current allocation pool for subsequent GPU allocations.
+pub fn set_alloc_pool(pool: AllocPool) {
+    CURRENT_POOL.with(|p| p.set(pool));
+}
+
+/// Get the current allocation pool.
+pub fn get_alloc_pool() -> AllocPool {
+    CURRENT_POOL.with(|p| p.get())
+}
 
 // ---------------------------------------------------------------------------
 // Configuration parsing

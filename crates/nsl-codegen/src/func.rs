@@ -15,7 +15,11 @@ impl Compiler<'_> {
         self.compile_fn_def_named(fn_def, None)
     }
 
-    pub fn compile_fn_def_named(&mut self, fn_def: &FnDef, name_override: Option<&str>) -> Result<(), CodegenError> {
+    pub fn compile_fn_def_named(
+        &mut self,
+        fn_def: &FnDef,
+        name_override: Option<&str>,
+    ) -> Result<(), CodegenError> {
         let name = if let Some(override_name) = name_override {
             override_name.to_string()
         } else {
@@ -157,6 +161,30 @@ impl Compiler<'_> {
 
             let current = state.current_block.unwrap_or(entry);
             if !crate::types::is_block_filled(&builder, current) {
+                // Free intermediate tensor temporaries before implicit return
+                self.free_tensor_temporaries(&mut builder, &mut state, None);
+                // M38b: Free linear tensors consumed during the function body
+                self.free_linear_consumes(&mut builder, &mut state, None);
+                // Free all tensor-typed local variables (let-bound tensors that would
+                // otherwise leak on implicit return — explicit return handles this in
+                // stmt.rs via free_tensor_temporaries, but locals aren't temporaries).
+                {
+                    let param_syms: std::collections::HashSet<nsl_ast::Symbol> =
+                        fn_def.params.iter().map(|p| p.name).collect();
+                    let locals: Vec<_> = state.variables.iter()
+                        .filter(|(sym, _)| !param_syms.contains(sym))
+                        .filter_map(|(sym, (var, _))| {
+                            let is_tensor = state.variable_types.get(sym)
+                                .map(|t| t.is_tensor())
+                                .unwrap_or(false);
+                            if is_tensor { Some(*var) } else { None }
+                        })
+                        .collect();
+                    for var in locals {
+                        let val = builder.use_var(var);
+                        let _ = self.compile_call_by_name(&mut builder, "nsl_tensor_free", &[val]);
+                    }
+                }
                 // Stop and free any DataLoaders before implicit function return
                 self.teardown_dataloaders(&mut builder, &mut state);
                 // @no_grad: resume tape before implicit return

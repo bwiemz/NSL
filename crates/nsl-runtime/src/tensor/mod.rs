@@ -349,7 +349,11 @@ impl NslTensor {
     #[inline]
     pub(crate) fn publish(tensor: Box<NslTensor>) -> i64 {
         let bytes = (tensor.len as usize) * tensor.element_size();
+        let device = tensor.device;
         crate::math::track_alloc(bytes);
+        if device > 0 {
+            debug_track_gpu_alloc(bytes);
+        }
         let ptr = Box::into_raw(tensor) as i64;
         scope_track(ptr);
         ptr
@@ -965,6 +969,9 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
         let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
         if prev > 1 {
             return; // still referenced — don't free
+        }
+        if tensor.device > 0 {
+            debug_track_gpu_free((tensor.len as usize) * tensor.element_size());
         }
         (
             true,
@@ -3863,6 +3870,24 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
     sum_sq.sqrt()
 }
 
+/// Set GPU allocator pool to Persistent (for model weights, optimizer states).
+#[no_mangle]
+pub extern "C" fn nsl_gpu_set_persistent_pool() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::caching_allocator::set_alloc_pool(
+        crate::cuda::caching_allocator::AllocPool::Persistent,
+    );
+}
+
+/// Set GPU allocator pool to Transient (for forward/backward intermediates).
+#[no_mangle]
+pub extern "C" fn nsl_gpu_set_transient_pool() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::caching_allocator::set_alloc_pool(
+        crate::cuda::caching_allocator::AllocPool::Transient,
+    );
+}
+
 /// Release idle GPU memory back to the driver. Called after each training step
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
@@ -3870,15 +3895,36 @@ pub extern "C" fn nsl_gpu_drain_cache() {
     #[cfg(feature = "cuda")]
     {
         crate::cuda::inner::ensure_context();
+        // Sync first to ensure all async GPU ops complete so freed blocks are actually available
+        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
         let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
-        alloc.drain_all();
+        let freed = alloc.drain_all();
+        if freed > 0 {
+            eprintln!("[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
+        }
     }
 }
 
-/// Debug: print GPU memory usage.
+/// Global counter for live GPU tensor allocations (debug only).
+static GPU_TENSOR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static GPU_TENSOR_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Track a GPU tensor creation.
+pub(crate) fn debug_track_gpu_alloc(bytes: usize) {
+    GPU_TENSOR_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GPU_TENSOR_BYTES.fetch_add(bytes as i64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Track a GPU tensor free.
+pub(crate) fn debug_track_gpu_free(bytes: usize) {
+    GPU_TENSOR_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    GPU_TENSOR_BYTES.fetch_sub(bytes as i64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Debug: print GPU memory usage + caching allocator stats.
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
-    if step > 3 { return; }
+    if step > 5 { return; }
     #[cfg(feature = "cuda")]
     {
         unsafe {
@@ -3887,8 +3933,15 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             let mut total: usize = 0;
             cudarc::driver::sys::cuMemGetInfo_v2(&mut free, &mut total);
             let used_mb = (total - free) / (1024 * 1024);
-            let total_mb = total / (1024 * 1024);
-            eprintln!("[gpu-mem] step={} used={}MB / {}MB", step, used_mb, total_mb);
+            let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+            let stats = alloc.stats();
+            eprintln!(
+                "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB allocs={} frees={}",
+                step, used_mb,
+                stats.allocated_bytes / (1024 * 1024),
+                stats.reserved_bytes / (1024 * 1024),
+                stats.num_allocs, stats.num_driver_frees,
+            );
         }
     }
     #[cfg(not(feature = "cuda"))]

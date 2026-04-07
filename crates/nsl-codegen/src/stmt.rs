@@ -1223,7 +1223,7 @@ impl Compiler<'_> {
     /// Free intermediate tensor temporaries accumulated during expression compilation.
     /// `keep` is the final result value that should NOT be freed (it's owned by a variable).
     /// All other temporaries are intermediates from compound expressions (e.g. `a + b` in `a + b + c`).
-    fn free_tensor_temporaries(
+    pub(crate) fn free_tensor_temporaries(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
@@ -1252,7 +1252,7 @@ impl Compiler<'_> {
     ///
     /// Only active when `state.ownership.lowering.is_some()` — the pending list
     /// is empty otherwise so the loop is a no-op.
-    fn free_linear_consumes(
+    pub(crate) fn free_linear_consumes(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
@@ -2571,6 +2571,9 @@ impl Compiler<'_> {
         // Build param_list directly from the compiler's struct layouts instead
         // of the runtime pointer-probing collector. This keeps nested models
         // and fixed arrays aligned with the paths source AD already resolves.
+        // Persistent pool for param_list and optimizer state allocation
+        self.compile_call_by_name(builder, "nsl_gpu_set_persistent_pool", &[])?;
+
         let param_paths = self.enumerate_model_tensor_paths(&model_var_name, &model_type_name);
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for path in &param_paths {
@@ -2829,6 +2832,9 @@ impl Compiler<'_> {
                     .iter()
                     .any(|param| self.resolve_sym(param.name) == "loss")
         });
+
+        // Switch to transient GPU pool for forward/backward intermediates
+        self.compile_call_by_name(builder, "nsl_gpu_set_transient_pool", &[])?;
 
         // Debug: GPU memory at start of step
         {
@@ -3966,8 +3972,11 @@ impl Compiler<'_> {
             state.borrowed_batch_symbols.remove(&step_param_sym);
         }
 
-        // Drain GPU caching allocator after each step to prevent OOM from
-        // stale segments accumulating across steps.
+        // Switch back to persistent pool (for epoch callbacks, optimizer state updates)
+        self.compile_call_by_name(builder, "nsl_gpu_set_persistent_pool", &[])?;
+
+        // Drain GPU caching allocator — only releases Transient segments,
+        // which are now fully free since forward/backward intermediates were freed.
         self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
 
         // Debug: GPU memory after step cleanup
