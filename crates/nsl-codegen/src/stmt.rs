@@ -1418,6 +1418,31 @@ impl Compiler<'_> {
         }
     }
 
+    /// ELTLS: free all TapeHeld tensors accumulated during the current tape
+    /// region. Called after nsl_tape_backward runs and before the block's
+    /// normal scope cleanup. See spec §7.3.
+    ///
+    /// Tape-held tensors were promoted by set_ownership_from_op or
+    /// promote_to_tape_held when a DataRequired op touched them during
+    /// forward pass. The tape holds raw pointers to their data for backward;
+    /// we must not free until backward completes.
+    pub(crate) fn free_tape_held_tensors(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+    ) {
+        let held = std::mem::take(&mut state.cleanup.tape_held);
+        for val in held {
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[val]);
+            state.cleanup.expr_ownership.remove(&val);
+        }
+    }
+
     /// M38b: Free linear tensors that were consumed during the current statement.
     /// Called after `free_tensor_temporaries` at each statement boundary.
     /// `keep` is the value being assigned to a variable (should NOT be freed).
@@ -3160,6 +3185,8 @@ impl Compiler<'_> {
                 //    This IS the forward pass — each WengertOp is compiled to
                 //    its runtime FFI call, and ALL intermediate VarId → Value
                 //    mappings are recorded in full_vars.
+                // ELTLS: free tape-held tensors before clearing the tape flag.
+                self.free_tape_held_tensors(builder, state);
                 state.flags.in_tape_region = false;
                 // Debug: dump primal Wengert ops
                 if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
@@ -4349,6 +4376,8 @@ impl Compiler<'_> {
         for stmt in &step_body.stmts {
             self.compile_stmt(builder, state, stmt)?;
         }
+        // ELTLS: free tape-held tensors before clearing the tape flag.
+        self.free_tape_held_tensors(builder, state);
         state.flags.in_tape_region = false;
 
         // Find loss variable — look for "loss" in state.variables by name
@@ -4889,6 +4918,8 @@ impl Compiler<'_> {
         for stmt in &step_body.stmts {
             self.compile_stmt(builder, state, stmt)?;
         }
+        // ELTLS: free tape-held tensors before clearing the tape flag.
+        self.free_tape_held_tensors(builder, state);
         state.flags.in_tape_region = false;
 
         // Find loss variable
@@ -5456,6 +5487,8 @@ impl Compiler<'_> {
                 self.compile_stmt(builder, state, stmt)?;
             }
         }
+        // ELTLS: free tape-held tensors before clearing the tape flag.
+        self.free_tape_held_tensors(builder, state);
         state.flags.in_tape_region = false;
 
         let loss_tensor = loss_val.ok_or_else(|| {
