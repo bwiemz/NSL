@@ -55,7 +55,15 @@ impl Compiler<'_> {
                 for arg in args {
                     arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
                 }
-                return self.compile_call_by_name(builder, &member_name, &arg_vals);
+                let result = self.compile_call_by_name(builder, &member_name, &arg_vals)?;
+                self.register_ffi_result_ownership(
+                    builder,
+                    state,
+                    &member_name,
+                    result,
+                    &arg_vals,
+                );
+                return Ok(result);
             }
             if matches!(obj_type, Type::Str) {
                 return self.compile_str_method_call(builder, state, object, &member_name, args);
@@ -1988,7 +1996,15 @@ impl Compiler<'_> {
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
             }
-            return self.compile_call_by_name(builder, &func_name, &arg_vals);
+            let result = self.compile_call_by_name(builder, &func_name, &arg_vals)?;
+            self.register_ffi_result_ownership(
+                builder,
+                state,
+                &func_name,
+                result,
+                &arg_vals,
+            );
+            return Ok(result);
         }
 
         // Forward dispatch: if callee is a model instance, invoke its forward method
@@ -2056,6 +2072,48 @@ impl Compiler<'_> {
     /// Look up a custom dtype name in the registry and return its numeric id.
     pub(crate) fn resolve_custom_dtype(&self, name: &str) -> Option<u16> {
         self.types.custom_dtype_ids.get(name).copied()
+    }
+
+    /// ELTLS: register the ownership of a tensor value produced by a known
+    /// runtime FFI. Consults the ffi_ownership table and routes the result
+    /// through set_ownership / Borrowed propagation / NotATensor skip.
+    /// Un-listed FFIs bump the unknown-ownership counter for rollout
+    /// measurement (spec §6.2).
+    pub(crate) fn register_ffi_result_ownership(
+        &self,
+        builder: &FunctionBuilder,
+        state: &mut FuncState,
+        fn_name: &str,
+        result: Value,
+        arg_vals: &[Value],
+    ) {
+        use crate::ffi_ownership::{ffi_ownership_kind, FfiOwnershipKind};
+        use crate::ownership_expr::Ownership;
+
+        // Only consult the table for runtime FFIs; user-defined functions
+        // have their ownership resolved at the callee's return site.
+        if !self.registry.runtime_fns.contains_key(fn_name) {
+            return;
+        }
+        match ffi_ownership_kind(fn_name) {
+            Some(FfiOwnershipKind::OwnedNewResult) => {
+                self.set_ownership(builder, state, result, Ownership::Owned);
+            }
+            Some(FfiOwnershipKind::BorrowedFromInput(idx)) => {
+                if let Some(&src_val) = arg_vals.get(idx) {
+                    let src_own = self.get_ownership(state, src_val);
+                    self.set_ownership(builder, state, result, src_own);
+                }
+            }
+            Some(FfiOwnershipKind::NotATensor) => {
+                // Scalar result — no tracking.
+            }
+            None => {
+                // Un-listed FFI — record the fallback hit so the
+                // instrumentation counter surfaces migration gaps.
+                self.note_unknown_fallback(state, result);
+            }
+        }
     }
 
     pub(crate) fn compile_print_call(

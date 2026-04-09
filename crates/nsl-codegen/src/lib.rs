@@ -33,6 +33,7 @@ pub mod memory_planner;
 pub mod moe;
 pub mod moe_kernels;
 pub mod multimodal;
+pub mod ffi_ownership;
 pub mod ownership;
 pub mod ownership_expr;
 pub mod pipeline;
