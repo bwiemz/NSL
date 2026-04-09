@@ -11,6 +11,7 @@ use nsl_semantic::types::Type;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::ownership_expr::Ownership;
 use crate::types::{is_float_type, nsl_type_to_cl, pointer_type};
 
 impl Compiler<'_> {
@@ -458,7 +459,16 @@ impl Compiler<'_> {
         builder.switch_to_block(merge_block);
         builder.seal_block(merge_block);
         state.current_block = Some(merge_block);
-        Ok(builder.block_params(merge_block)[0])
+        let merged = builder.block_params(merge_block)[0];
+        // ELTLS: register tensor-typed match phi results as Owned.
+        // Consumers don't read this map yet (Phase 1 instrumentation only),
+        // so registering is safe even though the logical ownership of the
+        // phi merge value still needs refinement in later commits.
+        let result_ty = self.node_type(full_expr.id).clone();
+        if result_ty.is_tensor() || result_ty.is_indeterminate() {
+            self.set_ownership(builder, state, merged, Ownership::Owned);
+        }
+        Ok(merged)
     }
 
     pub(crate) fn compile_match_arm_value(
