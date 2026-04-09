@@ -12,6 +12,7 @@ use cranelift_frontend::FunctionBuilder;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::ownership_expr::Ownership;
 use crate::types::is_float_type;
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::operator::UnaryOp;
@@ -40,7 +41,21 @@ impl Compiler<'_> {
 
             ExprKind::Ident(sym) => {
                 if let Some((var, _)) = state.variables.get(sym) {
-                    let val = builder.use_var(*var);
+                    let var = *var;
+                    let val = builder.use_var(var);
+                    // ELTLS: register tensor-typed Ident references as
+                    // BorrowedFromVar for ownership tracking. Must be done
+                    // BEFORE the M38b linear-consume path below because
+                    // subsequent consumer commits may inspect the map.
+                    let ident_ty = self.node_type(expr.id).clone();
+                    if ident_ty.is_tensor() || ident_ty.is_indeterminate() {
+                        self.set_ownership(
+                            builder,
+                            state,
+                            val,
+                            Ownership::BorrowedFromVar(var),
+                        );
+                    }
                     // M38b: If ownership lowering says this linear binding should be
                     // freed at consumption, enqueue it for post-statement cleanup.
                     // The actual nsl_tensor_free is emitted in free_linear_consumes()

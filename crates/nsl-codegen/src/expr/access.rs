@@ -10,6 +10,7 @@ use nsl_semantic::types::Type;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::ownership_expr::Ownership;
 
 impl Compiler<'_> {
     pub(crate) fn compile_member_access(
@@ -63,6 +64,12 @@ impl Compiler<'_> {
                             obj_val,
                             field.offset as i32,
                         );
+                        // ELTLS: non-weight struct field accesses stay
+                        // Unknown for Phase 1 — plumbing the receiver
+                        // variable's Cranelift Variable to build a
+                        // BorrowedFromVar entry is out of scope for this
+                        // task. Consumers reading expr_ownership will hit
+                        // the Unknown fallback and bump the counter.
                         return Ok(val);
                     }
                 }
@@ -110,6 +117,18 @@ impl Compiler<'_> {
                                 }
                             }
                         }
+                        // ELTLS: register model weight field accesses as
+                        // BorrowedWeight. state.weight_values is populated
+                        // just above when the loaded field matches a known
+                        // model weight.
+                        if state.weight_values.contains_key(&val) {
+                            self.set_ownership(
+                                builder,
+                                state,
+                                val,
+                                Ownership::BorrowedWeight,
+                            );
+                        }
                         return Ok(val);
                     }
                 }
@@ -152,6 +171,8 @@ impl Compiler<'_> {
                         let cloned =
                             self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
                         state.cleanup.tensor_temporaries.push(cloned);
+                        // ELTLS: nsl_tensor_clone returns a fresh owned tensor.
+                        self.set_ownership(builder, state, cloned, Ownership::Owned);
                         return Ok(cloned);
                     }
                     return Ok(value);
@@ -186,6 +207,9 @@ impl Compiler<'_> {
                             let cloned =
                                 self.compile_call_by_name(builder, "nsl_tensor_clone", &[value])?;
                             state.cleanup.tensor_temporaries.push(cloned);
+                            // ELTLS: subscript-via-dict clones the stored
+                            // tensor, producing a fresh owned value.
+                            self.set_ownership(builder, state, cloned, Ownership::Owned);
                             return Ok(cloned);
                         }
                         Ok(value)
