@@ -219,6 +219,16 @@ fn e2e_m12_grad_model_source_ad() {
 }
 
 #[test]
+fn e2e_m15_tensor_call_temp_cleanup() {
+    assert_output_matches("m15_tensor_call_temp_cleanup");
+}
+
+#[test]
+fn e2e_m15_conditional_alias_cleanup() {
+    assert_output_matches("m15_conditional_alias_cleanup");
+}
+
+#[test]
 fn e2e_m12_grad_source_ad_fallback() {
     let root = workspace_root();
     let example_path = root.join("examples/m12_grad_source_ad_fallback.nsl");
@@ -620,6 +630,41 @@ fn e2e_if_expr_dataloader_validation_error() {
         stderr.contains("DataLoader creation is only supported in straight-line function scope"),
         "Expected DataLoader conditional-scope validation error in stderr, got: {}",
         stderr
+    );
+}
+
+#[test]
+fn e2e_dataloader_loop_exit_values() {
+    let root = workspace_root();
+    let example_path = root.join("examples/m5_dataloader_loop_exit_values.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .arg(&example_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "Expected DataLoader loop exit example to run successfully, but it failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        !stderr.contains("Compilation error: Verifier errors"),
+        "Unexpected verifier failure for DataLoader loop exit example: {}",
+        stderr
+    );
+    let stdout_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.starts_with("   Creating library "))
+        .collect();
+    assert_eq!(
+        stdout_lines,
+        vec!["2", "16", "1.5"],
+        "Unexpected stdout for DataLoader loop exit example: {}",
+        stdout
     );
 }
 
@@ -1350,7 +1395,7 @@ fn build_nslm_f32(tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Vec<u8> {
     // Pad to 64-byte alignment from byte 0
     let total_header = 4 + 4 + 8 + header_bytes.len();
     let padding = (64 - (total_header % 64)) % 64;
-    out.extend(std::iter::repeat(0u8).take(padding));
+    out.extend(std::iter::repeat_n(0u8, padding));
 
     out.extend_from_slice(&raw_data);
     out

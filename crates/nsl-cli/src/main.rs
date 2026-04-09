@@ -14,6 +14,9 @@ use clap::Parser as ClapParser;
 use nsl_errors::{Level, SourceMap};
 use nsl_lexer::Interner;
 
+// The clap command enum carries many subcommand-specific flags, so keeping it
+// as a single enum is clearer than splitting every large variant into boxes.
+#[allow(clippy::large_enum_variant)]
 #[derive(ClapParser)]
 #[command(name = "nsl", about = "NeuralScript Language Toolchain", version)]
 enum Cli {
@@ -1332,7 +1335,7 @@ fn run_build_shared_single(
         nsl_codegen::linker::default_shared_lib_path(file)
     };
 
-    match nsl_codegen::linker::link_shared(&[obj_path.clone()], &lib_path) {
+    match nsl_codegen::linker::link_shared(std::slice::from_ref(&obj_path), &lib_path) {
         Ok(()) => {
             let _ = std::fs::remove_file(&obj_path);
             println!("Built shared library {}", lib_path.display());
@@ -2386,7 +2389,6 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
 ///   [16 .. 16+header_size]  JSON: {"params":[{"name":...,"shape":[...],"dtype":"f32"|"f64","offset":N,"nbytes":N}]}
 ///   padding to next 64-byte boundary (from offset 16+header_size)
 ///   raw little-endian tensor data concatenated in params order
-
 fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_path: &std::path::Path) -> Result<(), String> {
     use std::collections::HashMap;
 
@@ -2928,7 +2930,7 @@ entry = \"main.nsl\"
     println!("Created project '{name}'. Run: cd {name} && nsl run main.nsl");
 }
 
-fn run_tokenize(dirs: &[String], output: &PathBuf, vocab_size: usize, min_freq: u64, ext: &str) {
+fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, min_freq: u64, ext: &str) {
     use std::io::Write;
 
     // Default directories if none specified
@@ -3038,12 +3040,9 @@ fn run_tokenize(dirs: &[String], output: &PathBuf, vocab_size: usize, min_freq: 
 
     // Test: encode a sample string
     let sample = "fn forward(self, x: Tensor) -> Tensor:";
-    match tokenizer.encode(sample, false) {
-        Ok(encoding) => {
-            let tokens = encoding.get_tokens();
-            eprintln!("[tokenize] Sample: \"{}\" -> {} tokens: {:?}", sample, tokens.len(), &tokens[..tokens.len().min(10)]);
-        }
-        Err(_) => {}
+    if let Ok(encoding) = tokenizer.encode(sample, false) {
+        let tokens = encoding.get_tokens();
+        eprintln!("[tokenize] Sample: \"{}\" -> {} tokens: {:?}", sample, tokens.len(), &tokens[..tokens.len().min(10)]);
     }
 }
 

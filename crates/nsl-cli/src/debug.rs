@@ -415,7 +415,7 @@ mod tests {
         let entries_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 entries.as_ptr() as *const u8,
-                entries.len() * std::mem::size_of::<TraceEntry>(),
+                std::mem::size_of_val(entries),
             )
         };
         file.write_all(entries_bytes).unwrap();
