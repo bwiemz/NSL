@@ -1,0 +1,15 @@
+fn conditional_alias(x: Tensor, y: Tensor, flag: bool):
+    let alias = x
+    if flag:
+        alias = y + y
+
+let x = ones([2, 2])
+let y = full([2, 2], 2.0)
+
+conditional_alias(x, y, false)
+assert_close(x, ones([2, 2]), 0.000001, 0.000001)
+
+conditional_alias(x, y, true)
+assert_close(x, ones([2, 2]), 0.000001, 0.000001)
+
+print("ok")

@@ -1,0 +1,16 @@
+# M33: speculative serve decode path — verify disaggregated decode wiring
+
+model SpecMain:
+    @speculative(draft_model="DraftModel", num_tokens=4, temperature=0.25)
+    head: int = 0
+
+serve SpecServer:
+    decode_workers: 2
+    max_seq_len: 32
+    kv_blocks: 8
+
+    @endpoint
+    fn handle(prompt: str) -> str:
+        let x = 0
+
+print("speculative serve decode ok")

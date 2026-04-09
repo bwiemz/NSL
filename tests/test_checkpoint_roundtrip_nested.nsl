@@ -1,0 +1,28 @@
+model Inner:
+    w: Tensor = full([2, 2], 2.0)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Outer:
+    stem: Tensor = full([2, 2], 1.0)
+    inner: Inner = Inner()
+    blocks: [Inner; 2] = Inner()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let y = x @ self.stem
+        return y @ self.inner.w
+
+let x = full([2, 2], 1.0)
+let m = Outer()
+let expected = m.forward(x)
+
+model_save(m, "test_checkpoint_nested.nslm")
+
+let m2 = Outer()
+model_load(m2, "test_checkpoint_nested.nslm")
+
+let actual = m2.forward(x)
+assert_close(actual, expected, 0.0001, 0.0001)
+
+print("checkpoint_roundtrip_nested: PASS")

@@ -1,0 +1,7 @@
+let y = sqrt(full([2, 2], 4.0)) + 1.0
+assert_close(y, full([2, 2], 3.0), 0.0001, 0.0001)
+
+let z = tanh(zeros([2])) + 1.0
+assert_close(z, ones([2]), 0.0001, 0.0001)
+
+print("ok")
