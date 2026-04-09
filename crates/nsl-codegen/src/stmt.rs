@@ -1438,6 +1438,77 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// ELTLS Task 16.1: pre-scan a loop body block for top-level VarDecl
+    /// statements that have a simple Ident target, returning the list of
+    /// symbols. These symbols are candidates for pre-declaration in the
+    /// pre-loop scope so that their second-and-later rebinds are detected
+    /// as reassignments (firing eltls_clear_old_slot and freeing the
+    /// previous iteration's value).
+    ///
+    /// Conservative: does NOT filter by type here — nsl_tensor_free_if_valid
+    /// handles non-tensor values as runtime no-ops. Does NOT descend into
+    /// nested blocks (those are separate scopes and won't share state).
+    /// Skips Decorated VarDecls by unwrapping one level of Decorated.
+    pub(crate) fn eltls_collect_loop_let_idents(
+        &self,
+        stmts: &[nsl_ast::stmt::Stmt],
+    ) -> Vec<nsl_ast::Symbol> {
+        let mut out = Vec::new();
+        for stmt in stmts {
+            let inner = match &stmt.kind {
+                nsl_ast::stmt::StmtKind::Decorated { stmt, .. } => &stmt.kind,
+                other => other,
+            };
+            if let nsl_ast::stmt::StmtKind::VarDecl { pattern, value, .. } = inner {
+                // Only top-level simple Ident targets
+                if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
+                    // Skip declarations with no initializer — nothing useful
+                    // to free, and they wouldn't trigger eltls anyway.
+                    if value.is_some() {
+                        out.push(*sym);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// ELTLS Task 16.1: pre-declare the collected loop-body let-ident
+    /// symbols in the current (pre-loop) scope. Each slot is initialized
+    /// to an i64 zero, which nsl_tensor_free_if_valid treats as a no-op.
+    /// Also records the symbol in state.eltls_loop_predeclared so that
+    /// eltls_clear_old_slot unlocks the slot-free path without requiring
+    /// a variable_types entry (which is only recorded once the VarDecl
+    /// has been compiled).
+    ///
+    /// Skips symbols already present in state.variables (parameter,
+    /// outer-scope let, etc.) — those are not loop-local rebinds and
+    /// should not be touched here.
+    pub(crate) fn eltls_predeclare_loop_lets(
+        &self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        syms: &[nsl_ast::Symbol],
+    ) {
+        if syms.is_empty() {
+            return;
+        }
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        for &sym in syms {
+            if state.variables.contains_key(&sym) {
+                continue;
+            }
+            if state.param_symbols.contains(&sym) {
+                continue;
+            }
+            let var = state.new_variable();
+            builder.declare_var(var, cl_types::I64);
+            builder.def_var(var, zero);
+            state.variables.insert(sym, (var, cl_types::I64));
+            state.eltls_loop_predeclared.insert(sym);
+        }
+    }
+
     /// ELTLS (spec §6.5): clear a tensor-typed variable's old value before
     /// reassignment. Emits nsl_tensor_free on the old pointer and purges all
     /// tracking queues (new AND legacy). Skipped for initial let bindings
@@ -1479,31 +1550,33 @@ impl Compiler<'_> {
             return; // DataLoader handle itself
         }
         // Additional semantic filter: only emit free if the variable's type is
-        // actually a tensor or indeterminate. Values stored in I64 slots that
-        // are integers, booleans, lists, or dicts should NOT be freed via
-        // nsl_tensor_free. Missing sem_ty → skip (matches prior legacy
-        // VarDecl/Assign behaviour, which only emitted frees when the
-        // recorded type was tensor/indeterminate).
-        let sem_ty = match state.variable_types.get(&sym) {
-            Some(ty) if ty.is_tensor() || ty.is_indeterminate() => ty.clone(),
-            _ => return,
-        };
+        // actually a tensor or indeterminate, OR the slot was pre-declared by
+        // the loop-predeclare pass (which records the sym in
+        // eltls_loop_predeclared). Values stored in I64 slots that are
+        // integers, booleans, lists, or dicts should NOT be freed via
+        // nsl_tensor_free — but nsl_tensor_free_if_valid handles them as
+        // no-ops by probing the magic field, so loop-predeclared slots are
+        // safe to unconditionally attempt the free on.
+        let is_loop_predeclared = state.eltls_loop_predeclared.contains(&sym);
+        if !is_loop_predeclared {
+            match state.variable_types.get(&sym) {
+                Some(ty) if ty.is_tensor() || ty.is_indeterminate() => {}
+                _ => return,
+            }
+        }
         // Don't emit frees into a filled block.
         if let Some(block) = state.current_block {
             if is_block_filled(builder, block) {
                 return;
             }
         }
-        // Read the old value and free it. Use strict free only for known
-        // tensor-typed slots; indeterminate slots fall back to _if_valid
-        // which probes the magic field and tolerates null/garbage.
+        // Read the old value and free it via the safe variant that handles
+        // null pointers, invalid magic, and non-tensor i64 values as no-ops.
+        // This is required for loop-pre-declared slots that start at zero on
+        // the first iteration, and is a safer default for reassignment
+        // paths generally (a stale non-tensor would otherwise crash).
         let old_val = builder.use_var(var);
-        let free_fn = if sem_ty.is_tensor() {
-            "nsl_tensor_free"
-        } else {
-            "nsl_tensor_free_if_valid"
-        };
-        let _ = self.compile_call_by_name(builder, free_fn, &[old_val]);
+        let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[old_val]);
         // Purge tracking queues so the statement/function cleanup paths don't
         // try to free this value again.
         state.cleanup.expr_ownership.remove(&old_val);
@@ -1843,6 +1916,12 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
+        // body so the second-and-later rebinds fire eltls_clear_old_slot
+        // and free the previous iteration's tensor.
+        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
+        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
+
         state
             .cleanup
             .temp_scope_stack
@@ -1856,6 +1935,9 @@ impl Compiler<'_> {
             self.compile_stmt(builder, state, s)?;
         }
         state.loop_stack.pop();
+        for sym in &predecl_syms {
+            state.eltls_loop_predeclared.remove(sym);
+        }
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
@@ -1921,6 +2003,11 @@ impl Compiler<'_> {
             builder.def_var(var, val);
         }
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from
+        // the body so rebinds across iterations free the previous value.
+        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
+        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
+
         state
             .cleanup
             .temp_scope_stack
@@ -1934,6 +2021,9 @@ impl Compiler<'_> {
             self.compile_stmt(builder, state, s)?;
         }
         state.loop_stack.pop();
+        for sym in &predecl_syms {
+            state.eltls_loop_predeclared.remove(sym);
+        }
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
@@ -2145,6 +2235,13 @@ impl Compiler<'_> {
             _ => unreachable!(),
         }
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
+        // body so the second-and-later rebinds fire eltls_clear_old_slot.
+        // This is the primary fix for the `for batch in dl: let y = model(batch)`
+        // training leak pattern.
+        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
+        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
+
         // continue jumps to increment_block (not header) so counter is incremented
         state
             .cleanup
@@ -2159,6 +2256,9 @@ impl Compiler<'_> {
             self.compile_stmt(builder, state, s)?;
         }
         state.loop_stack.pop();
+        for sym in &predecl_syms {
+            state.eltls_loop_predeclared.remove(sym);
+        }
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
@@ -2253,6 +2353,10 @@ impl Compiler<'_> {
             .load(cl_types::I64, MemFlags::trusted(), addr, 0);
         builder.def_var(elem_var, elem_ptr);
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
+        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
+        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
+
         // Compile body statements
         state
             .cleanup
@@ -2267,6 +2371,9 @@ impl Compiler<'_> {
             self.compile_stmt(builder, state, s)?;
         }
         state.loop_stack.pop();
+        for sym in &predecl_syms {
+            state.eltls_loop_predeclared.remove(sym);
+        }
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {
@@ -2399,6 +2506,19 @@ impl Compiler<'_> {
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
+        // THIS IS THE PRIMARY FIX FOR THE TRAINING-LOOP LEAK:
+        //   for batch in dataloader:
+        //       let y = model(batch)     # previously leaked y each iteration
+        //       let loss = loss_fn(y, batch["labels"])
+        //       ...
+        // By pre-declaring y and loss in the pre-loop scope with zero init,
+        // each subsequent rebind is detected as a reassignment and
+        // eltls_clear_old_slot fires nsl_tensor_free_if_valid on the
+        // previous iteration's tensor.
+        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
+        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
+
         // Rely on codegen-level tensor_temporaries for per-statement cleanup.
         // Do NOT use scope_begin/scope_end — it double-frees tensors that are
         // already freed by free_tensor_temporaries in called functions.
@@ -2417,6 +2537,9 @@ impl Compiler<'_> {
         }
         state.loop_stack.pop();
         state.borrowed_batch_symbols.remove(&loop_var_sym);
+        for sym in &predecl_syms {
+            state.eltls_loop_predeclared.remove(sym);
+        }
 
         let current = state.current_block.unwrap_or(body_block);
         if !is_block_filled(builder, current) {

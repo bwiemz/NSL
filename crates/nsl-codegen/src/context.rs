@@ -207,6 +207,14 @@ pub struct FuncState {
     pub current_function_name: Option<String>,
     /// Semantic types for variables, used by step-variable cleanup to identify tensors.
     pub variable_types: HashMap<Symbol, nsl_semantic::types::Type>,
+    /// ELTLS Task 16.1: Symbols that were pre-declared by the loop-body
+    /// let-tensor predeclare pass. Used by eltls_clear_old_slot to unlock
+    /// the slot-free path even when variable_types has no recorded entry
+    /// (e.g., the first iteration of the loop before the let statement
+    /// has been compiled). The slot is initialized to zero by the
+    /// predeclare pass, and nsl_tensor_free_if_valid tolerates the null
+    /// pointer on the first iteration.
+    pub eltls_loop_predeclared: HashSet<Symbol>,
 }
 
 impl Default for FuncState {
@@ -235,6 +243,7 @@ impl FuncState {
             weight_values: HashMap::new(),
             current_function_name: None,
             variable_types: HashMap::new(),
+            eltls_loop_predeclared: HashSet::new(),
         }
     }
 
