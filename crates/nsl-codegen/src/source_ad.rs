@@ -1361,8 +1361,32 @@ impl<'a> WengertExtractor<'a> {
                     // Reductions
                     "sum" => PrimalOp::Sum { dim: None },
                     "mean" => PrimalOp::Mean { dim: None },
-                    // Regularization — extract p from second arg if literal
+                    // Regularization — extract p from second arg if literal.
+                    //
+                    // CRITICAL: dropout(x, p, training) — when the training
+                    // arg statically resolves to a Constant(0.0), we MUST
+                    // skip emitting Dropout entirely and pass the input
+                    // through. Otherwise the wengert lower hardcodes
+                    // training=1 in nsl_tensor_dropout, ablating ~p% of
+                    // every activation on every step regardless of the
+                    // user's training=false. The model never sees a stable
+                    // representation and loss plateaus near random.
                     "dropout" => {
+                        // Check the training arg (input_vars[2]) — if it
+                        // resolves to PrimalOp::Constant(0.0), this is an
+                        // inference-mode dropout call: emit identity.
+                        let training_is_false = input_vars.get(2).is_some_and(|&tv| {
+                            self.list.ops.iter().any(|op| {
+                                op.result == tv
+                                    && matches!(op.op, PrimalOp::Constant(c) if c == 0.0)
+                            })
+                        });
+                        if training_is_false {
+                            // Skip allocating a fresh result var — return
+                            // the input directly so downstream uses see the
+                            // passthrough.
+                            return Some(input_vars[0]);
+                        }
                         let p = args
                             .get(1)
                             .and_then(|a| match &a.value.kind {
