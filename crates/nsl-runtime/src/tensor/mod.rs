@@ -7,6 +7,7 @@ pub mod shape_ops;
 pub mod activation;
 pub mod trig;
 pub mod ad_ops;
+pub mod fbip_flags;
 
 // Re-export everything from sub-modules so the public API is unchanged.
 pub use creation::*;
