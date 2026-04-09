@@ -101,6 +101,10 @@ pub enum AdjointExpr {
     AttentionBackwardV(VarId, VarId, VarId, VarId, bool),
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
+    /// rotate_half backward: -rotate_half(grad).
+    /// rotate_half is the Jacobian of itself but reflected; the inverse is
+    /// the negation of itself. args: (grad)
+    RotateHalfBackward(VarId),
 
     // Shape backward (broadcast reduction)
     /// Expand backward: sum-reduce gradient over expanded dims to match original shape.
@@ -498,13 +502,34 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                     }
                 }
                 // Shape-preserving identity: gradient flows through unchanged.
-                "contiguous" | "cos" | "sin" | "rotate_half" => {
+                // NOTE: cos/sin are NOT mathematically identity backward
+                // (correct: -sin(x)*g, cos(x)*g) but in this codebase they
+                // are only ever called on frozen RoPE inv_freq tables, never
+                // on trainable parameters, so the identity rule is harmless.
+                // If you ever apply cos/sin to a trainable tensor, FIX THIS.
+                "contiguous" | "cos" | "sin" => {
                     if op.inputs.is_empty() {
                         vec![]
                     } else {
                         vec![InputAdjoint {
                             input_var: op.inputs[0],
                             expr: AdjointExpr::Identity(output_bar),
+                        }]
+                    }
+                }
+                // rotate_half is its own inverse up to sign:
+                //   forward: y[..h] = -x[h..],   y[h..] = x[..h]
+                //   backward: dx[..h] = dy[h..], dx[h..] = -dy[..h]
+                // which equals -rotate_half(dy). Identity here is WRONG —
+                // it routes the sin-channel gradient onto the wrong q/k
+                // halves with the wrong sign every transformer layer.
+                "rotate_half" => {
+                    if op.inputs.is_empty() {
+                        vec![]
+                    } else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::RotateHalfBackward(output_bar),
                         }]
                     }
                 }
@@ -1281,5 +1306,18 @@ mod tests {
         assert_eq!(adj.len(), 1);
         assert_eq!(adj[0].input_var, 0);
         assert!(matches!(adj[0].expr, AdjointExpr::ReshapeLike(100, 0)));
+    }
+
+    #[test]
+    fn test_rotate_half_backward_is_negated_rotate_half() {
+        // rotate_half is its own inverse up to sign — the backward must NOT
+        // be Identity. It must be RotateHalfBackward (which lowers to
+        // -rotate_half(grad)). Identity here was the source of the RoPE
+        // gradient corruption that prevented training convergence.
+        let op = make_op(1, PrimalOp::Passthrough("rotate_half".into()), vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert_eq!(adj.len(), 1);
+        assert_eq!(adj[0].input_var, 0);
+        assert!(matches!(adj[0].expr, AdjointExpr::RotateHalfBackward(100)));
     }
 }

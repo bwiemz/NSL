@@ -554,6 +554,19 @@ impl AdjointGenerator {
             AdjointExpr::RoPEBackward(y_bar, dim) => {
                 self.emit_op(PrimalOp::RoPEInverse { dim }, vec![y_bar])
             }
+
+            // --- rotate_half backward: -rotate_half(grad) ---
+            // forward: y[..h] = -x[h..], y[h..] = x[..h]
+            // backward: dx[..h] = dy[h..], dx[h..] = -dy[..h]
+            // which equals -rotate_half(dy). Lower as a Passthrough rotate_half
+            // followed by Neg.
+            AdjointExpr::RotateHalfBackward(y_bar) => {
+                let rotated = self.emit_op(
+                    PrimalOp::Passthrough("rotate_half".into()),
+                    vec![y_bar],
+                );
+                self.emit_op(PrimalOp::Neg, vec![rotated])
+            }
         }
     }
 
