@@ -301,27 +301,47 @@ fn emit_scalar_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx, "    mul.lo.u32 %r11, %r2, {tile_size};").unwrap();
     writeln!(ptx, "    add.u32 %r11, %r11, %r3;        // global col").unwrap();
     writeln!(ptx).unwrap();
-    writeln!(ptx, "    setp.ge.u32 %p1, %r10, %r9;     // row >= num_tokens?").unwrap();
-    writeln!(ptx, "    setp.ge.u32 %p2, %r11, %r6;     // col >= intermediate_dim?").unwrap();
+    writeln!(
+        ptx,
+        "    setp.ge.u32 %p1, %r10, %r9;     // row >= num_tokens?"
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    setp.ge.u32 %p2, %r11, %r6;     // col >= intermediate_dim?"
+    )
+    .unwrap();
     writeln!(ptx, "    mov.f32 %f0, 0.0;               // accumulator").unwrap();
     writeln!(ptx).unwrap();
 
     // K-dimension tile loop
     writeln!(ptx, "    mov.u32 %r12, 0;                // k_tile_start").unwrap();
     writeln!(ptx, "TILE_LOOP:").unwrap();
-    writeln!(ptx, "    setp.ge.u32 %p3, %r12, %r5;     // k >= hidden_dim?").unwrap();
+    writeln!(
+        ptx,
+        "    setp.ge.u32 %p3, %r12, %r5;     // k >= hidden_dim?"
+    )
+    .unwrap();
     writeln!(ptx, "    @%p3 bra TILE_DONE;").unwrap();
     writeln!(ptx, "    bar.sync 0;").unwrap();
     writeln!(ptx).unwrap();
 
     // Load tile_A: A[row, k_tile_start + tid.x]
-    writeln!(ptx, "    add.u32 %r13, %r12, %r3;        // k = k_tile_start + tid.x").unwrap();
+    writeln!(
+        ptx,
+        "    add.u32 %r13, %r12, %r3;        // k = k_tile_start + tid.x"
+    )
+    .unwrap();
     writeln!(ptx, "    setp.lt.u32 %p4, %r13, %r5;").unwrap();
     writeln!(ptx, "    setp.lt.u32 %p5, %r10, %r9;").unwrap();
     writeln!(ptx, "    and.pred %p4, %p4, %p5;").unwrap();
     writeln!(ptx, "    @!%p4 mov.f32 %f1, 0.0;").unwrap();
     writeln!(ptx, "    @%p4 {{").unwrap();
-    writeln!(ptx, "        add.u32 %r14, %r7, %r10;    // global_row = start + row").unwrap();
+    writeln!(
+        ptx,
+        "        add.u32 %r14, %r7, %r10;    // global_row = start + row"
+    )
+    .unwrap();
     writeln!(ptx, "        mul.lo.u32 %r14, %r14, %r5; // * hidden_dim").unwrap();
     writeln!(ptx, "        add.u32 %r14, %r14, %r13;   // + k").unwrap();
     writeln!(ptx, "        cvt.u64.u32 %rd8, %r14;").unwrap();
@@ -336,15 +356,27 @@ fn emit_scalar_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx).unwrap();
 
     // Load tile_B: B[k_tile_start + tid.y, col]
-    writeln!(ptx, "    add.u32 %r16, %r12, %r4;        // k = k_tile_start + tid.y").unwrap();
+    writeln!(
+        ptx,
+        "    add.u32 %r16, %r12, %r4;        // k = k_tile_start + tid.y"
+    )
+    .unwrap();
     writeln!(ptx, "    setp.lt.u32 %p4, %r16, %r5;").unwrap();
     writeln!(ptx, "    setp.lt.u32 %p5, %r11, %r6;").unwrap();
     writeln!(ptx, "    and.pred %p4, %p4, %p5;").unwrap();
     writeln!(ptx, "    @!%p4 mov.f32 %f2, 0.0;").unwrap();
     writeln!(ptx, "    @%p4 {{").unwrap();
-    writeln!(ptx, "        mul.lo.u32 %r17, %r0, %r5;  // expert * hidden_dim").unwrap();
+    writeln!(
+        ptx,
+        "        mul.lo.u32 %r17, %r0, %r5;  // expert * hidden_dim"
+    )
+    .unwrap();
     writeln!(ptx, "        add.u32 %r17, %r17, %r16;   // + k").unwrap();
-    writeln!(ptx, "        mul.lo.u32 %r17, %r17, %r6; // * intermediate_dim").unwrap();
+    writeln!(
+        ptx,
+        "        mul.lo.u32 %r17, %r17, %r6; // * intermediate_dim"
+    )
+    .unwrap();
     writeln!(ptx, "        add.u32 %r17, %r17, %r11;   // + col").unwrap();
     writeln!(ptx, "        cvt.u64.u32 %rd10, %r17;").unwrap();
     writeln!(ptx, "        mul.lo.u64 %rd10, %rd10, 4;").unwrap();
@@ -388,7 +420,11 @@ fn emit_scalar_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx, "    or.pred %p4, %p1, %p2;").unwrap();
     writeln!(ptx, "    @%p4 bra GEMM_DONE;").unwrap();
     writeln!(ptx, "    add.u32 %r22, %r7, %r10;        // global_row").unwrap();
-    writeln!(ptx, "    mul.lo.u32 %r22, %r22, %r6;     // * intermediate_dim").unwrap();
+    writeln!(
+        ptx,
+        "    mul.lo.u32 %r22, %r22, %r6;     // * intermediate_dim"
+    )
+    .unwrap();
     writeln!(ptx, "    add.u32 %r22, %r22, %r11;       // + col").unwrap();
     writeln!(ptx, "    cvt.u64.u32 %rd12, %r22;").unwrap();
     writeln!(ptx, "    mul.lo.u64 %rd12, %rd12, 4;").unwrap();
@@ -408,12 +444,24 @@ fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
     let mma_k: usize = 16;
     let n_tiles = tile_size / mma_n;
 
-    writeln!(ptx, "    // MMA tiled GEMM (tile_size={tile_size}, m16n8k16)").unwrap();
+    writeln!(
+        ptx,
+        "    // MMA tiled GEMM (tile_size={tile_size}, m16n8k16)"
+    )
+    .unwrap();
 
     // MMA-specific registers
-    writeln!(ptx, "    .reg .b32 %aq_0, %aq_1, %aq_2, %aq_3;  // A-fragment").unwrap();
+    writeln!(
+        ptx,
+        "    .reg .b32 %aq_0, %aq_1, %aq_2, %aq_3;  // A-fragment"
+    )
+    .unwrap();
     for nt in 0..n_tiles {
-        writeln!(ptx, "    .reg .b32 %bk_{nt}_0, %bk_{nt}_1;      // B-fragment n={nt}").unwrap();
+        writeln!(
+            ptx,
+            "    .reg .b32 %bk_{nt}_0, %bk_{nt}_1;      // B-fragment n={nt}"
+        )
+        .unwrap();
     }
     for nt in 0..n_tiles {
         writeln!(ptx, "    .reg .f32 %acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3;  // accumulator n={nt}").unwrap();
@@ -431,7 +479,11 @@ fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx, "    // A-row = (laneid % 4) * 2 + (laneid / 16)").unwrap();
     writeln!(ptx, "    and.b32 %mma_a_row, %mma_laneid, 3;").unwrap();
     writeln!(ptx, "    shl.b32 %mma_a_row, %mma_a_row, 1;").unwrap();
-    writeln!(ptx, "    shr.u32 %mma_addr, %mma_laneid, 4;  // temp = laneid/16").unwrap();
+    writeln!(
+        ptx,
+        "    shr.u32 %mma_addr, %mma_laneid, 4;  // temp = laneid/16"
+    )
+    .unwrap();
     writeln!(ptx, "    add.u32 %mma_a_row, %mma_a_row, %mma_addr;").unwrap();
     writeln!(ptx).unwrap();
 
@@ -457,12 +509,20 @@ fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
 
     // Cooperative load of A and B tiles into shared memory
     // Each thread loads tile_size*tile_size/blockDim elements
-    writeln!(ptx, "    // Cooperative tile load (A and B) into shared memory").unwrap();
+    writeln!(
+        ptx,
+        "    // Cooperative tile load (A and B) into shared memory"
+    )
+    .unwrap();
     writeln!(ptx, "    cvt.u64.u32 %rd8, %r3;          // tid.x").unwrap();
     writeln!(ptx, "    cvt.u64.u32 %rd9, %r4;          // tid.y").unwrap();
     // Simplified: each thread loads one element of A and one of B per iteration
     // Full cooperative load would loop, but for clarity:
-    writeln!(ptx, "    // (cooperative load logic — each thread loads multiple elements)").unwrap();
+    writeln!(
+        ptx,
+        "    // (cooperative load logic — each thread loads multiple elements)"
+    )
+    .unwrap();
     writeln!(ptx, "    bar.sync 0;").unwrap();
     writeln!(ptx).unwrap();
 
@@ -477,11 +537,26 @@ fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx, "    // Load A-fragment from tile_A, convert f32->f16").unwrap();
     for i in 0..4 {
         let k_pair = i * 4;
-        writeln!(ptx, "    mul.lo.u32 %mma_addr, %mma_a_row, {};  // row * tile_size * 4", tile_size * 4).unwrap();
-        writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, {};      // + k_pair={} * 4 bytes", k_pair * 4, k_pair).unwrap();
+        writeln!(
+            ptx,
+            "    mul.lo.u32 %mma_addr, %mma_a_row, {};  // row * tile_size * 4",
+            tile_size * 4
+        )
+        .unwrap();
+        writeln!(
+            ptx,
+            "    add.u32 %mma_addr, %mma_addr, {};      // + k_pair={} * 4 bytes",
+            k_pair * 4,
+            k_pair
+        )
+        .unwrap();
         writeln!(ptx, "    // Offset by k_inner block").unwrap();
         writeln!(ptx, "    mul.lo.u32 %r15, %mma_k_blk, 4;").unwrap();
-        writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, %r15;    // + k_inner offset").unwrap();
+        writeln!(
+            ptx,
+            "    add.u32 %mma_addr, %mma_addr, %r15;    // + k_inner offset"
+        )
+        .unwrap();
         writeln!(ptx, "    ld.shared.f32 %mma_f32_lo, [tile_A + %mma_addr];").unwrap();
         writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, 4;").unwrap();
         writeln!(ptx, "    ld.shared.f32 %mma_f32_hi, [tile_A + %mma_addr];").unwrap();
@@ -496,8 +571,18 @@ fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
         writeln!(ptx, "    // Load B-fragment for n_tile={nt}").unwrap();
         for bi in 0..2 {
             let k_pair = bi * 8;
-            writeln!(ptx, "    mul.lo.u32 %mma_addr, %mma_a_row, {};", tile_size * 4).unwrap();
-            writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, {};", nt * mma_n * 4 + k_pair * 4).unwrap();
+            writeln!(
+                ptx,
+                "    mul.lo.u32 %mma_addr, %mma_a_row, {};",
+                tile_size * 4
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    add.u32 %mma_addr, %mma_addr, {};",
+                nt * mma_n * 4 + k_pair * 4
+            )
+            .unwrap();
             writeln!(ptx, "    mul.lo.u32 %r15, %mma_k_blk, 4;").unwrap();
             writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, %r15;").unwrap();
             writeln!(ptx, "    ld.shared.f32 %mma_f32_lo, [tile_B + %mma_addr];").unwrap();
@@ -513,10 +598,18 @@ fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
     // Issue MMA for each n-tile
     for nt in 0..n_tiles {
         writeln!(ptx, "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").unwrap();
-        writeln!(ptx, "        {{%acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3}},").unwrap();
+        writeln!(
+            ptx,
+            "        {{%acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3}},"
+        )
+        .unwrap();
         writeln!(ptx, "        {{%aq_0, %aq_1, %aq_2, %aq_3}},").unwrap();
         writeln!(ptx, "        {{%bk_{nt}_0, %bk_{nt}_1}},").unwrap();
-        writeln!(ptx, "        {{%acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3}};").unwrap();
+        writeln!(
+            ptx,
+            "        {{%acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3}};"
+        )
+        .unwrap();
     }
     writeln!(ptx).unwrap();
 
@@ -651,7 +744,10 @@ GATHER_DONE:
 /// All MoE PTX kernel names and their generators.
 pub fn all_moe_kernels() -> Vec<(&'static str, Vec<u8>)> {
     vec![
-        ("moe_token_sort_histogram", gen_moe_token_sort_histogram_ptx()),
+        (
+            "moe_token_sort_histogram",
+            gen_moe_token_sort_histogram_ptx(),
+        ),
         ("moe_scatter", gen_moe_scatter_ptx()),
         ("expert_batched_gemm", gen_expert_batched_gemm_ptx()),
         ("moe_gather", gen_moe_gather_ptx()),
@@ -674,20 +770,28 @@ mod tests {
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
 
         // Must NOT contain hardcoded [64] shared memory
-        assert!(!ptx.contains("local_hist[64]"),
-            "Histogram must not hardcode 64-element shared memory");
+        assert!(
+            !ptx.contains("local_hist[64]"),
+            "Histogram must not hardcode 64-element shared memory"
+        );
 
         // Must use dynamic (extern) shared memory
-        assert!(ptx.contains(".extern .shared"),
-            "Histogram must use extern (dynamic) shared memory");
+        assert!(
+            ptx.contains(".extern .shared"),
+            "Histogram must use extern (dynamic) shared memory"
+        );
 
         // Must have cooperative zero loop (handles num_experts > blockDim.x)
-        assert!(ptx.contains("HIST_ZERO_LOOP"),
-            "Must have cooperative zero initialization loop");
+        assert!(
+            ptx.contains("HIST_ZERO_LOOP"),
+            "Must have cooperative zero initialization loop"
+        );
 
         // Must have cooperative writeback loop
-        assert!(ptx.contains("HIST_WRITE_LOOP"),
-            "Must have cooperative writeback loop");
+        assert!(
+            ptx.contains("HIST_WRITE_LOOP"),
+            "Must have cooperative writeback loop"
+        );
     }
 
     #[test]
@@ -707,8 +811,10 @@ mod tests {
         let ptx_bytes = gen_moe_token_sort_histogram_ptx();
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
 
-        assert!(ptx.contains("atom.shared.add.u32"),
-            "Histogram must use atomic add to shared memory");
+        assert!(
+            ptx.contains("atom.shared.add.u32"),
+            "Histogram must use atomic add to shared memory"
+        );
     }
 
     #[test]
@@ -738,9 +844,15 @@ mod tests {
         assert!(ptx.contains("fma.rn.f32"), "scalar FMA matmul");
         assert!(ptx.contains("tile_A"), "shared memory tile A");
         assert!(ptx.contains("tile_B"), "shared memory tile B");
-        assert!(ptx.contains("boundaries_ptr"), "expert boundaries parameter");
+        assert!(
+            ptx.contains("boundaries_ptr"),
+            "expert boundaries parameter"
+        );
         assert!(ptx.contains(".target sm_52"), "scalar targets sm_52");
-        assert!(!ptx.contains("mma.sync.aligned"), "scalar should NOT have MMA");
+        assert!(
+            !ptx.contains("mma.sync.aligned"),
+            "scalar should NOT have MMA"
+        );
     }
 
     #[test]
@@ -749,8 +861,10 @@ mod tests {
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
 
         assert!(ptx.contains("expert_batched_gemm"), "kernel name");
-        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
-            "64x64 MMA tiles should use tensor core instructions");
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "64x64 MMA tiles should use tensor core instructions"
+        );
         assert!(ptx.contains(".target sm_80"), "MMA targets sm_80");
         assert!(ptx.contains("cvt.rn.f16.f32"), "must convert f32 -> f16");
         assert!(ptx.contains("%aq_"), "A-fragment registers");
@@ -759,7 +873,10 @@ mod tests {
 
         // 64/8 = 8 n-tiles, so 8 MMA instructions per K-inner iteration
         let mma_count = ptx.matches("mma.sync.aligned").count();
-        assert_eq!(mma_count, 8, "8 MMA instructions for 64x64 tile (8 n-tiles)");
+        assert_eq!(
+            mma_count, 8,
+            "8 MMA instructions for 64x64 tile (8 n-tiles)"
+        );
     }
 
     #[test]
@@ -780,7 +897,10 @@ mod tests {
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
 
         assert!(ptx.contains("fma.rn.f32"), "default should use scalar FMA");
-        assert!(!ptx.contains("mma.sync.aligned"), "default should NOT use MMA");
+        assert!(
+            !ptx.contains("mma.sync.aligned"),
+            "default should NOT use MMA"
+        );
     }
 
     #[test]

@@ -27,16 +27,30 @@ pub fn lower_kir_to_wgsl(ir: &KernelIR) -> Vec<u8> {
                 KirType::Ptr(inner, _) => kir_type_to_wgsl(inner),
                 _ => "f32",
             };
-            writeln!(wgsl, "@group(0) @binding({}) var<storage, {}> {}: array<{}>;",
-                i, access, param.name, inner_type).unwrap();
+            writeln!(
+                wgsl,
+                "@group(0) @binding({}) var<storage, {}> {}: array<{}>;",
+                i, access, param.name, inner_type
+            )
+            .unwrap();
         }
     }
     writeln!(wgsl).unwrap();
 
     // Compute shader entry
     let wg = ir.workgroup_size;
-    writeln!(wgsl, "@compute @workgroup_size({}, {}, {})", wg[0], wg[1], wg[2]).unwrap();
-    writeln!(wgsl, "fn {}(@builtin(global_invocation_id) gid: vec3<u32>) {{", ir.name).unwrap();
+    writeln!(
+        wgsl,
+        "@compute @workgroup_size({}, {}, {})",
+        wg[0], wg[1], wg[2]
+    )
+    .unwrap();
+    writeln!(
+        wgsl,
+        "fn {}(@builtin(global_invocation_id) gid: vec3<u32>) {{",
+        ir.name
+    )
+    .unwrap();
     writeln!(wgsl, "    let tid = gid.x;").unwrap();
 
     // Body
@@ -58,9 +72,9 @@ fn kir_type_to_wgsl(ty: &KirType) -> &'static str {
         KirType::F32 => "f32",
         KirType::F16 => "f16",
         // WebGPU has no f64 or i64/u64 in storage buffers
-        KirType::F64 => "f32",  // downgrade
-        KirType::U64 => "u32",  // downgrade
-        KirType::I64 => "i32",  // downgrade
+        KirType::F64 => "f32", // downgrade
+        KirType::U64 => "u32", // downgrade
+        KirType::I64 => "i32", // downgrade
         _ => "f32",
     }
 }
@@ -79,22 +93,27 @@ fn lower_op_to_wgsl(op: &KirOp) -> String {
         KirOp::Log(dst, a) => format!("var v{} = log(v{});", dst, a),
         KirOp::Tanh(dst, a) => format!("var v{} = tanh(v{});", dst, a),
         KirOp::ThreadId(dst, _) => format!("var v{} = tid;", dst),
-        KirOp::BlockIdx(dst, _) => format!("var v{} = gid.y;  // WGSL: use y component for block-like index", dst),
+        KirOp::BlockIdx(dst, _) => format!(
+            "var v{} = gid.y;  // WGSL: use y component for block-like index",
+            dst
+        ),
         KirOp::GlobalId(dst, _) => format!("var v{} = tid;", dst),
         KirOp::Barrier => "workgroupBarrier();".to_string(),
         KirOp::Load(dst, ptr, _) => format!("var v{} = v{}[tid];  // WGSL: array access", dst, ptr),
         KirOp::Store(ptr, val, _) => format!("v{}[tid] = v{};  // WGSL: array store", ptr, val),
-        KirOp::Const(dst, c) => {
-            match &c.value {
-                ConstValue::F32(v) => format!("var v{}: f32 = {:.6};", dst, v),
-                ConstValue::U32(v) => format!("var v{}: u32 = {}u;", dst, v),
-                ConstValue::I32(v) => format!("var v{}: i32 = {};", dst, v),
-                ConstValue::F64(v) => format!("var v{}: f32 = {:.6};  // WGSL: f64 downgraded to f32", dst, v),
-                _ => format!("// const v{}", dst),
-            }
-        }
+        KirOp::Const(dst, c) => match &c.value {
+            ConstValue::F32(v) => format!("var v{}: f32 = {:.6};", dst, v),
+            ConstValue::U32(v) => format!("var v{}: u32 = {}u;", dst, v),
+            ConstValue::I32(v) => format!("var v{}: i32 = {};", dst, v),
+            ConstValue::F64(v) => format!(
+                "var v{}: f32 = {:.6};  // WGSL: f64 downgraded to f32",
+                dst, v
+            ),
+            _ => format!("// const v{}", dst),
+        },
         KirOp::WarpShuffle(_, _, _) => {
-            "// ERROR: WGSL does not support warp shuffle — feature gate should have caught this".to_string()
+            "// ERROR: WGSL does not support warp shuffle — feature gate should have caught this"
+                .to_string()
         }
         _ => "// unhandled op".to_string(),
     }

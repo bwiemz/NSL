@@ -100,9 +100,16 @@ impl<F: Field> FoldingProver<F> {
     pub fn fold_layer(&mut self, ir: &ZkIR, witness: &[F]) -> Result<(), ZkError> {
         // M55e: Track lookup multiplicities for Jolt argument
         for inst in &ir.instructions {
-            if let ZkInstruction::Lookup { table, input, input_bits, .. } = inst {
+            if let ZkInstruction::Lookup {
+                table,
+                input,
+                input_bits,
+                ..
+            } = inst
+            {
                 let table_size = 1usize << (*input_bits as usize).min(16); // cap at 16-bit tables
-                let mult = self.lookup_multiplicities
+                let mult = self
+                    .lookup_multiplicities
                     .entry(table.clone())
                     .or_insert_with(|| LookupMultiplicities::new(table_size));
                 // Record the lookup access by input wire value
@@ -111,7 +118,8 @@ impl<F: Field> FoldingProver<F> {
                     // Map field element to table index (raw unsigned value)
                     let raw_bytes = witness[input_idx].to_bytes_vec();
                     let table_idx = if raw_bytes.len() >= 4 {
-                        u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]) as usize
+                        u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]])
+                            as usize
                     } else {
                         0usize
                     };
@@ -164,18 +172,33 @@ impl<F: Field> FoldingProver<F> {
             acc.instance.iter().map(|v| v.field_mul(v)).collect()
         } else {
             // Constraint: instance[i] * witness[i] for overlapping indices
-            let len = acc.instance.len().max(acc.witness.len()).next_power_of_two().max(2);
+            let len = acc
+                .instance
+                .len()
+                .max(acc.witness.len())
+                .next_power_of_two()
+                .max(2);
             let mut poly = Vec::with_capacity(len);
             for i in 0..len {
-                let a = if i < acc.instance.len() { &acc.instance[i] } else { &F::zero() };
-                let b = if i < acc.witness.len() { &acc.witness[i] } else { &F::zero() };
+                let a = if i < acc.instance.len() {
+                    &acc.instance[i]
+                } else {
+                    &F::zero()
+                };
+                let b = if i < acc.witness.len() {
+                    &acc.witness[i]
+                } else {
+                    &F::zero()
+                };
                 poly.push(a.field_mul(b));
             }
             poly
         };
 
         // Compute the claim: sum of constraint polynomial
-        let claim = constraint_poly.iter().fold(F::zero(), |s, v| s.field_add(v));
+        let claim = constraint_poly
+            .iter()
+            .fold(F::zero(), |s, v| s.field_add(v));
 
         // Run interactive sumcheck with Fiat-Shamir
         let sumcheck_proof = sumcheck::sumcheck_prove_interactive(&constraint_poly, &claim);
@@ -228,7 +251,10 @@ impl<F: Field> FoldingProver<F> {
         if !self.lookup_trace_values.is_empty() {
             // Random challenge for log-derivative argument (derived from proof state)
             let beta = if !self.challenges.is_empty() {
-                self.challenges.last().unwrap().field_mul(&F::from_u64(31))
+                self.challenges
+                    .last()
+                    .unwrap()
+                    .field_mul(&F::from_u64(31))
                     .field_add(&F::from_u64(17))
             } else {
                 F::from_u64(42)
@@ -236,9 +262,8 @@ impl<F: Field> FoldingProver<F> {
             let beta = if beta == F::zero() { F::one() } else { beta };
 
             // Compute trace-side log-derivative sum
-            let trace_sum = super::lookup_native::log_derivative_trace_sum(
-                &self.lookup_trace_values, &beta
-            );
+            let trace_sum =
+                super::lookup_native::log_derivative_trace_sum(&self.lookup_trace_values, &beta);
             proof_data.extend_from_slice(&trace_sum.to_bytes_vec());
 
             // Compute table-side log-derivative sums (one per table)
@@ -254,11 +279,7 @@ impl<F: Field> FoldingProver<F> {
         Ok(ZkProof {
             data: proof_data,
             num_folds: self.num_folds,
-            public_inputs: acc
-                .instance
-                .iter()
-                .map(|v| v.to_bytes_vec())
-                .collect(),
+            public_inputs: acc.instance.iter().map(|v| v.to_bytes_vec()).collect(),
             public_outputs: Vec::new(),
         })
     }
@@ -349,12 +370,19 @@ impl<F: Field> super::backend::FoldingBackend<F> for FoldingProver<F> {
             return Err(ZkError::VerificationFailed("proof too short".to_string()));
         }
 
-        let num_folds = u32::from_le_bytes([proof.data[0], proof.data[1], proof.data[2], proof.data[3]]);
-        let instance_len = u32::from_le_bytes([proof.data[4], proof.data[5], proof.data[6], proof.data[7]]) as usize;
-        let num_rounds = u32::from_le_bytes([proof.data[8], proof.data[9], proof.data[10], proof.data[11]]) as usize;
+        let num_folds =
+            u32::from_le_bytes([proof.data[0], proof.data[1], proof.data[2], proof.data[3]]);
+        let instance_len =
+            u32::from_le_bytes([proof.data[4], proof.data[5], proof.data[6], proof.data[7]])
+                as usize;
+        let num_rounds =
+            u32::from_le_bytes([proof.data[8], proof.data[9], proof.data[10], proof.data[11]])
+                as usize;
 
         if num_folds != proof.num_folds {
-            return Err(ZkError::VerificationFailed("num_folds mismatch".to_string()));
+            return Err(ZkError::VerificationFailed(
+                "num_folds mismatch".to_string(),
+            ));
         }
 
         // Verify we have enough data for the declared structure
@@ -366,16 +394,20 @@ impl<F: Field> super::backend::FoldingBackend<F> for FoldingProver<F> {
             + field_size; // final_eval (at minimum)
 
         if proof.data.len() < min_size {
-            return Err(ZkError::VerificationFailed(
-                format!("proof data too short: {} < {}", proof.data.len(), min_size)
-            ));
+            return Err(ZkError::VerificationFailed(format!(
+                "proof data too short: {} < {}",
+                proof.data.len(),
+                min_size
+            )));
         }
 
         // Verify public inputs match the committed instance
         if proof.public_inputs.len() != instance_len {
-            return Err(ZkError::VerificationFailed(
-                format!("instance length mismatch: {} vs {}", proof.public_inputs.len(), instance_len)
-            ));
+            return Err(ZkError::VerificationFailed(format!(
+                "instance length mismatch: {} vs {}",
+                proof.public_inputs.len(),
+                instance_len
+            )));
         }
 
         // Parse the sumcheck transcript and verify it
@@ -394,16 +426,22 @@ impl<F: Field> super::backend::FoldingBackend<F> for FoldingProver<F> {
         let mut parsed_challenges = Vec::new();
 
         for _round in 0..num_rounds {
-            if offset + 4 > proof.data.len() { break; }
+            if offset + 4 > proof.data.len() {
+                break;
+            }
             let num_evals = u32::from_le_bytes([
-                proof.data[offset], proof.data[offset + 1],
-                proof.data[offset + 2], proof.data[offset + 3],
+                proof.data[offset],
+                proof.data[offset + 1],
+                proof.data[offset + 2],
+                proof.data[offset + 3],
             ]) as usize;
             offset += 4;
 
             let mut evals = Vec::with_capacity(num_evals);
             for _ in 0..num_evals {
-                if offset + field_size > proof.data.len() { break; }
+                if offset + field_size > proof.data.len() {
+                    break;
+                }
                 evals.push(F::from_bytes(&proof.data[offset..offset + field_size]));
                 offset += field_size;
             }
@@ -412,16 +450,18 @@ impl<F: Field> super::backend::FoldingBackend<F> for FoldingProver<F> {
 
             // Verify: g(0) + g(1) == current_claim
             if !round_poly.check_sum(&current_claim) {
-                return Err(ZkError::VerificationFailed(
-                    format!("sumcheck round {} failed: g(0) + g(1) != claim", _round)
-                ));
+                return Err(ZkError::VerificationFailed(format!(
+                    "sumcheck round {} failed: g(0) + g(1) != claim",
+                    _round
+                )));
             }
 
             // Read the challenge for this round
             // (challenges come after all round polys in the serialized format)
             // We'll reconstruct them from Fiat-Shamir
             if round_poly.evals.len() >= 2 {
-                let ch = round_poly.evals[0].field_mul(&F::from_u64(7))
+                let ch = round_poly.evals[0]
+                    .field_mul(&F::from_u64(7))
                     .field_add(&round_poly.evals[1].field_mul(&F::from_u64(13)))
                     .field_add(&F::from_u64(_round as u64 + 1));
                 let ch = if ch == F::zero() { F::one() } else { ch };
@@ -527,7 +567,10 @@ mod tests {
         // For a real folding scheme, the proof would be constant-size
         // because only the final decider proof is emitted.
         // Our v1 includes the transcript, so we just verify it's reasonable.
-        assert!(size_12 < size_6 * 3, "proof size should grow sub-linearly, not quadratically");
+        assert!(
+            size_12 < size_6 * 3,
+            "proof size should grow sub-linearly, not quadratically"
+        );
     }
 
     #[test]
@@ -545,8 +588,10 @@ mod tests {
         let proof = prover.finalize().unwrap();
 
         let result = <FoldingProver<Mersenne31Field> as FoldingBackend<Mersenne31Field>>::verify(
-            &proof, &[]
-        ).unwrap();
+            &proof,
+            &[],
+        )
+        .unwrap();
         assert!(result);
     }
 

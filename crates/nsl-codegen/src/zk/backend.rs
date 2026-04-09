@@ -94,11 +94,7 @@ pub trait ZkBackend {
     ) -> Result<(Self::ProvingKey, Self::VerificationKey), ZkError>;
 
     /// Generate a proof for the given witness under `pk`.
-    fn prove(
-        &self,
-        pk: &Self::ProvingKey,
-        witness: &Witness,
-    ) -> Result<Self::Proof, ZkError>;
+    fn prove(&self, pk: &Self::ProvingKey, witness: &Witness) -> Result<Self::Proof, ZkError>;
 
     /// Verify a proof against public inputs.
     ///

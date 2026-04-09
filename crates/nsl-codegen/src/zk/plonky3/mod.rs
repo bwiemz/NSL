@@ -26,9 +26,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::zk::backend::{
-    CompiledCircuit, Witness, ZkBackend, ZkConfig, ZkError, ZkIR,
-};
+use crate::zk::backend::{CompiledCircuit, Witness, ZkBackend, ZkConfig, ZkError, ZkIR};
 use crate::zk::field::FieldElement;
 use crate::zk::field_m31::Mersenne31Field;
 use crate::zk::ir::ZkInstruction;
@@ -219,7 +217,10 @@ fn merkle_build(leaves: &[[u8; 32]]) -> (Vec<[u8; 32]>, [u8; 32]) {
         return (leaves.to_vec(), leaves[0]);
     }
     // n must be a power of 2 for a full binary tree
-    debug_assert!(n.is_power_of_two(), "merkle_build: n={n} must be power of 2");
+    debug_assert!(
+        n.is_power_of_two(),
+        "merkle_build: n={n} must be power of 2"
+    );
 
     let mut tree = Vec::with_capacity(2 * n - 1);
     tree.extend_from_slice(leaves);
@@ -250,7 +251,11 @@ fn merkle_path(tree: &[[u8; 32]], n: usize, leaf_index: usize) -> Vec<[u8; 32]> 
     let mut level_len = n;
 
     while level_len > 1 {
-        let sibling = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         path.push(tree[level_start + sibling]);
         idx /= 2;
         level_start += level_len;
@@ -394,9 +399,9 @@ fn multiplicative_subgroup(n: usize) -> Vec<Mersenne31Field> {
     // n distinct elements and that the evaluator/interpolator use the same domain.
     // We use powers of a generator g = 3 (a primitive root of M31).
     let g_full = Mersenne31Field(3); // generator of the full multiplicative group
-    // Step = (p-1) / n — but only works when n | (p-1)
-    // For domains that don't divide (p-1), we just use consecutive powers of g_full.
-    // This still gives distinct elements for n < p.
+                                     // Step = (p-1) / n — but only works when n | (p-1)
+                                     // For domains that don't divide (p-1), we just use consecutive powers of g_full.
+                                     // This still gives distinct elements for n < p.
     let mut domain = Vec::with_capacity(n);
     let mut cur = Mersenne31Field::one();
     for _ in 0..n {
@@ -419,10 +424,8 @@ fn split_even_odd(coeffs: &[Mersenne31Field]) -> (Vec<Mersenne31Field>, Vec<Mers
             odd.push(*c);
         }
     }
-    even
-        .resize(half, Mersenne31Field::zero());
-    odd
-        .resize(half, Mersenne31Field::zero());
+    even.resize(half, Mersenne31Field::zero());
+    odd.resize(half, Mersenne31Field::zero());
     (even, odd)
 }
 
@@ -477,22 +480,47 @@ fn build_trace(
             }
             ZkInstruction::Const { out, value: _ } => {
                 let vo = witness_to_m31(witness, *out);
-                [m31(OP_CONST), vo, Mersenne31Field::zero(), vo, Mersenne31Field::zero()]
+                [
+                    m31(OP_CONST),
+                    vo,
+                    Mersenne31Field::zero(),
+                    vo,
+                    Mersenne31Field::zero(),
+                ]
             }
             ZkInstruction::AssertEq { a, b } => {
                 let va = witness_to_m31(witness, *a);
                 let vb = witness_to_m31(witness, *b);
-                [m31(OP_ASSERT_EQ), va, vb, Mersenne31Field::zero(), Mersenne31Field::zero()]
+                [
+                    m31(OP_ASSERT_EQ),
+                    va,
+                    vb,
+                    Mersenne31Field::zero(),
+                    Mersenne31Field::zero(),
+                ]
             }
             ZkInstruction::DotProduct { out, a, b } => {
                 // Summarize the dot product: store a[0], b[0], output
-                let va = if !a.is_empty() { witness_to_m31(witness, a[0]) } else { Mersenne31Field::zero() };
-                let vb = if !b.is_empty() { witness_to_m31(witness, b[0]) } else { Mersenne31Field::zero() };
+                let va = if !a.is_empty() {
+                    witness_to_m31(witness, a[0])
+                } else {
+                    Mersenne31Field::zero()
+                };
+                let vb = if !b.is_empty() {
+                    witness_to_m31(witness, b[0])
+                } else {
+                    Mersenne31Field::zero()
+                };
                 let vo = witness_to_m31(witness, *out);
                 let len_field = m31(a.len() as u32);
                 [m31(OP_DOT_PRODUCT), va, vb, vo, len_field]
             }
-            ZkInstruction::FixedMul { out, a, b, frac_bits } => {
+            ZkInstruction::FixedMul {
+                out,
+                a,
+                b,
+                frac_bits,
+            } => {
                 let va = witness_to_m31(witness, *a);
                 let vb = witness_to_m31(witness, *b);
                 let vo = witness_to_m31(witness, *out);
@@ -501,17 +529,43 @@ fn build_trace(
             ZkInstruction::Lookup { out, input, .. } => {
                 let vi = witness_to_m31(witness, *input);
                 let vo = witness_to_m31(witness, *out);
-                [m31(OP_LOOKUP), vi, Mersenne31Field::zero(), vo, Mersenne31Field::zero()]
+                [
+                    m31(OP_LOOKUP),
+                    vi,
+                    Mersenne31Field::zero(),
+                    vo,
+                    Mersenne31Field::zero(),
+                ]
             }
             ZkInstruction::Requantize { out, input, .. } => {
                 let vi = witness_to_m31(witness, *input);
                 let vo = witness_to_m31(witness, *out);
-                [m31(OP_REQUANTIZE), vi, Mersenne31Field::zero(), vo, Mersenne31Field::zero()]
+                [
+                    m31(OP_REQUANTIZE),
+                    vi,
+                    Mersenne31Field::zero(),
+                    vo,
+                    Mersenne31Field::zero(),
+                ]
             }
             ZkInstruction::Remap { out, input, .. } => {
-                let vi = if !input.is_empty() { witness_to_m31(witness, input[0]) } else { Mersenne31Field::zero() };
-                let vo = if !out.is_empty() { witness_to_m31(witness, out[0]) } else { Mersenne31Field::zero() };
-                [m31(OP_REMAP), vi, Mersenne31Field::zero(), vo, Mersenne31Field::zero()]
+                let vi = if !input.is_empty() {
+                    witness_to_m31(witness, input[0])
+                } else {
+                    Mersenne31Field::zero()
+                };
+                let vo = if !out.is_empty() {
+                    witness_to_m31(witness, out[0])
+                } else {
+                    Mersenne31Field::zero()
+                };
+                [
+                    m31(OP_REMAP),
+                    vi,
+                    Mersenne31Field::zero(),
+                    vo,
+                    Mersenne31Field::zero(),
+                ]
             }
         };
         rows.push(row);
@@ -564,12 +618,14 @@ fn fri_commit(
         // Evaluate current polynomial on a domain of size 2 * degree
         let eval_size = current_coeffs.len().next_power_of_two().max(2);
         let domain = multiplicative_subgroup(eval_size);
-        let evals: Vec<Mersenne31Field> = domain.iter()
+        let evals: Vec<Mersenne31Field> = domain
+            .iter()
             .map(|x| poly_eval(&current_coeffs, x))
             .collect();
 
         // Commit evaluations via Merkle tree
-        let leaves: Vec<[u8; 32]> = evals.iter()
+        let leaves: Vec<[u8; 32]> = evals
+            .iter()
             .map(|v| hash_m31_slice(std::slice::from_ref(v)))
             .collect();
         let (_tree, root) = merkle_build(&leaves);
@@ -586,7 +642,11 @@ fn fri_commit(
         let mut folded = Vec::with_capacity(new_len);
         for i in 0..new_len {
             let e = even[i];
-            let o = if i < odd.len() { odd[i] } else { Mersenne31Field::zero() };
+            let o = if i < odd.len() {
+                odd[i]
+            } else {
+                Mersenne31Field::zero()
+            };
             folded.push(e.add(&challenge.mul(&o)));
         }
         current_coeffs = folded;
@@ -717,23 +777,29 @@ impl ZkBackend for Plonky3Backend {
 
         // Determine constraint degree: Mul and FixedMul have degree 2, others degree 1
         let _constraint_degree = if ir.instructions.iter().any(|inst| {
-            matches!(inst, ZkInstruction::Mul { .. } | ZkInstruction::FixedMul { .. })
+            matches!(
+                inst,
+                ZkInstruction::Mul { .. } | ZkInstruction::FixedMul { .. }
+            )
         }) {
             2
         } else {
             1
         };
 
-        Ok(CompiledCircuit { ir: ZkIR {
-            name: ir.name.clone(),
-            instructions: ir.instructions.clone(),
-            public_inputs: ir.public_inputs.clone(),
-            public_outputs: ir.public_outputs.clone(),
-            private_inputs: ir.private_inputs.clone(),
-            num_wires: ir.num_wires,
-            lookup_tables: ir.lookup_tables.clone(),
-            wire_names: ir.wire_names.clone(),
-        }, k })
+        Ok(CompiledCircuit {
+            ir: ZkIR {
+                name: ir.name.clone(),
+                instructions: ir.instructions.clone(),
+                public_inputs: ir.public_inputs.clone(),
+                public_outputs: ir.public_outputs.clone(),
+                private_inputs: ir.private_inputs.clone(),
+                num_wires: ir.num_wires,
+                lookup_tables: ir.lookup_tables.clone(),
+                wire_names: ir.wire_names.clone(),
+            },
+            k,
+        })
     }
 
     fn setup(
@@ -745,7 +811,10 @@ impl ZkBackend for Plonky3Backend {
 
         // Determine constraint degree
         let constraint_degree = if circuit.ir.instructions.iter().any(|inst| {
-            matches!(inst, ZkInstruction::Mul { .. } | ZkInstruction::FixedMul { .. })
+            matches!(
+                inst,
+                ZkInstruction::Mul { .. } | ZkInstruction::FixedMul { .. }
+            )
         }) {
             2
         } else {
@@ -773,11 +842,7 @@ impl ZkBackend for Plonky3Backend {
         Ok((pk, vk))
     }
 
-    fn prove(
-        &self,
-        pk: &Self::ProvingKey,
-        witness: &Witness,
-    ) -> Result<Self::Proof, ZkError> {
+    fn prove(&self, pk: &Self::ProvingKey, witness: &Witness) -> Result<Self::Proof, ZkError> {
         // 1. Build execution trace
         let trace_rows = build_trace(&pk.ir_instructions, witness);
         let num_rows = trace_rows.len();
@@ -793,9 +858,7 @@ impl ZkBackend for Plonky3Backend {
         }
 
         // 3. Commit trace via Merkle tree
-        let leaves: Vec<[u8; 32]> = trace_rows.iter()
-            .map(|row| hash_m31_slice(row))
-            .collect();
+        let leaves: Vec<[u8; 32]> = trace_rows.iter().map(|row| hash_m31_slice(row)).collect();
         let (trace_tree, trace_root) = merkle_build(&leaves);
 
         // 4. Start Fiat-Shamir transcript
@@ -809,9 +872,7 @@ impl ZkBackend for Plonky3Backend {
         let mut all_coeffs = Vec::new();
 
         for col in 0..TRACE_WIDTH {
-            let evals: Vec<Mersenne31Field> = trace_rows.iter()
-                .map(|row| row[col])
-                .collect();
+            let evals: Vec<Mersenne31Field> = trace_rows.iter().map(|row| row[col]).collect();
             let coeffs = interpolate(&domain, &evals);
             all_coeffs.push(coeffs);
         }
@@ -843,7 +904,8 @@ impl ZkBackend for Plonky3Backend {
         );
 
         // 9. Collect public outputs
-        let public_outputs: Vec<Vec<u8>> = witness.public_output_values()
+        let public_outputs: Vec<Vec<u8>> = witness
+            .public_output_values()
             .iter()
             .map(|fe| {
                 let m = Mersenne31Field::from_u64(fe.limbs[0]);
@@ -888,7 +950,12 @@ impl ZkBackend for Plonky3Backend {
         for opening in &proof.query_openings {
             // Verify Merkle path
             let leaf_hash = hash_u32_slice(&opening.values);
-            if !merkle_verify(&proof.trace_commitment, &leaf_hash, opening.index, &opening.merkle_path) {
+            if !merkle_verify(
+                &proof.trace_commitment,
+                &leaf_hash,
+                opening.index,
+                &opening.merkle_path,
+            ) {
                 return Err(ZkError::VerificationFailed(format!(
                     "Merkle path verification failed at index {}",
                     opening.index
@@ -924,7 +991,9 @@ impl ZkBackend for Plonky3Backend {
         }
 
         // 5. Check that FRI layers are structurally valid
-        let expected_rounds = if n <= 2 { 0 } else {
+        let expected_rounds = if n <= 2 {
+            0
+        } else {
             ((n as f64).log2().ceil() as usize).saturating_sub(1)
         };
         // Allow some tolerance in round count (padding can affect this)
@@ -942,7 +1011,9 @@ impl ZkBackend for Plonky3Backend {
     fn estimate_proof_size(&self, circuit: &CompiledCircuit) -> u64 {
         let config = FriConfig::default();
         let n = 1usize << circuit.k;
-        let num_fri_layers = if n <= 2 { 1 } else {
+        let num_fri_layers = if n <= 2 {
+            1
+        } else {
             ((n as f64).log2().ceil() as usize).max(1)
         };
         let log_n = num_fri_layers;
@@ -1002,15 +1073,13 @@ mod tests {
 
     #[test]
     fn merkle_path_verify_roundtrip() {
-        let leaves: Vec<[u8; 32]> = (0..8u8)
-            .map(|i| sha256_hash(&[i]))
-            .collect();
+        let leaves: Vec<[u8; 32]> = (0..8u8).map(|i| sha256_hash(&[i])).collect();
         let (tree, root) = merkle_build(&leaves);
 
-        for i in 0..8 {
+        for (i, leaf) in leaves.iter().enumerate().take(8) {
             let path = merkle_path(&tree, 8, i);
             assert!(
-                merkle_verify(&root, &leaves[i], i, &path),
+                merkle_verify(&root, leaf, i, &path),
                 "Merkle verification failed for leaf {i}"
             );
         }
@@ -1018,9 +1087,7 @@ mod tests {
 
     #[test]
     fn merkle_path_tampered_fails() {
-        let leaves: Vec<[u8; 32]> = (0..4u8)
-            .map(|i| sha256_hash(&[i]))
-            .collect();
+        let leaves: Vec<[u8; 32]> = (0..4u8).map(|i| sha256_hash(&[i])).collect();
         let (tree, root) = merkle_build(&leaves);
         let path = merkle_path(&tree, 4, 0);
 
@@ -1117,7 +1184,10 @@ mod tests {
         t2.append(b"data B");
         let c2 = t2.challenge_u32();
 
-        assert_ne!(c1, c2, "different inputs should produce different challenges");
+        assert_ne!(
+            c1, c2,
+            "different inputs should produce different challenges"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1191,7 +1261,10 @@ mod tests {
         let config = ZkConfig::default();
 
         let circuit = backend.compile(&ir, &config).unwrap();
-        assert!(circuit.k >= 1, "k should be at least 1 for a single instruction");
+        assert!(
+            circuit.k >= 1,
+            "k should be at least 1 for a single instruction"
+        );
     }
 
     #[test]
@@ -1253,8 +1326,16 @@ mod tests {
         let w2 = ir.alloc_wire("c");
         let w3 = ir.alloc_wire("d");
         // c = a + b, d = c + a
-        ir.push(ZkInstruction::Add { out: w2, a: w0, b: w1 });
-        ir.push(ZkInstruction::Add { out: w3, a: w2, b: w0 });
+        ir.push(ZkInstruction::Add {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
+        ir.push(ZkInstruction::Add {
+            out: w3,
+            a: w2,
+            b: w0,
+        });
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w3]);
 
@@ -1263,11 +1344,13 @@ mod tests {
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
         let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(
-            &ir,
-            &[FieldElement::from_u64(10), FieldElement::from_u64(20)],
-            &[],
-        ).unwrap();
+        let witness = gen
+            .generate(
+                &ir,
+                &[FieldElement::from_u64(10), FieldElement::from_u64(20)],
+                &[],
+            )
+            .unwrap();
         // c = 10 + 20 = 30, d = 30 + 10 = 40
         assert_eq!(witness.get(w3), FieldElement::from_u64(40));
 
@@ -1284,7 +1367,10 @@ mod tests {
         let w0 = ir.alloc_wire("input");
         let wc = ir.alloc_wire("const_100");
         let out = ir.alloc_wire("output");
-        ir.push(ZkInstruction::Const { out: wc, value: FieldElement::from_u64(100) });
+        ir.push(ZkInstruction::Const {
+            out: wc,
+            value: FieldElement::from_u64(100),
+        });
         ir.push(ZkInstruction::Add { out, a: w0, b: wc });
         ir.set_public_inputs(vec![w0]);
         ir.set_public_outputs(vec![out]);
@@ -1294,7 +1380,9 @@ mod tests {
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
         let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(&ir, &[FieldElement::from_u64(42)], &[]).unwrap();
+        let witness = gen
+            .generate(&ir, &[FieldElement::from_u64(42)], &[])
+            .unwrap();
         assert_eq!(witness.get(out), FieldElement::from_u64(142));
 
         let proof = backend.prove(&pk, &witness).unwrap();
@@ -1325,7 +1413,10 @@ mod tests {
 
         // Verification should fail (Merkle path won't match tampered leaf)
         let result = backend.verify(&vk, &proof, &[]);
-        assert!(result.is_err() || matches!(result, Ok(false)), "tampered proof should be rejected");
+        assert!(
+            result.is_err() || matches!(result, Ok(false)),
+            "tampered proof should be rejected"
+        );
     }
 
     #[test]
@@ -1364,17 +1455,30 @@ mod tests {
         let w1 = ir.alloc_wire("b");
         let w2 = ir.alloc_wire("c");
         let w3 = ir.alloc_wire("d");
-        ir.push(ZkInstruction::Mul { out: w2, a: w0, b: w1 });
-        ir.push(ZkInstruction::Add { out: w3, a: w2, b: w0 });
-        ir.push(ZkInstruction::Const { out: w2, value: FieldElement::from_u64(99) });
+        ir.push(ZkInstruction::Mul {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
+        ir.push(ZkInstruction::Add {
+            out: w3,
+            a: w2,
+            b: w0,
+        });
+        ir.push(ZkInstruction::Const {
+            out: w2,
+            value: FieldElement::from_u64(99),
+        });
         ir.set_public_inputs(vec![w0, w1]);
 
         let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(
-            &ir,
-            &[FieldElement::from_u64(3), FieldElement::from_u64(5)],
-            &[],
-        ).unwrap();
+        let witness = gen
+            .generate(
+                &ir,
+                &[FieldElement::from_u64(3), FieldElement::from_u64(5)],
+                &[],
+            )
+            .unwrap();
 
         let trace = build_trace(&ir.instructions, &witness);
         assert!(trace.len().is_power_of_two());
@@ -1398,13 +1502,28 @@ mod tests {
         let w4 = ir.alloc_wire("final");
 
         // sum = x + y
-        ir.push(ZkInstruction::Add { out: w2, a: w0, b: w1 });
+        ir.push(ZkInstruction::Add {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
         // product = x * y
-        ir.push(ZkInstruction::Mul { out: w3, a: w0, b: w1 });
+        ir.push(ZkInstruction::Mul {
+            out: w3,
+            a: w0,
+            b: w1,
+        });
         // const_5 = 5
-        ir.push(ZkInstruction::Const { out: wc, value: FieldElement::from_u64(5) });
+        ir.push(ZkInstruction::Const {
+            out: wc,
+            value: FieldElement::from_u64(5),
+        });
         // final = product + const_5
-        ir.push(ZkInstruction::Add { out: w4, a: w3, b: wc });
+        ir.push(ZkInstruction::Add {
+            out: w4,
+            a: w3,
+            b: wc,
+        });
 
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2, w4]);
@@ -1414,11 +1533,13 @@ mod tests {
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
         let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(
-            &ir,
-            &[FieldElement::from_u64(3), FieldElement::from_u64(4)],
-            &[],
-        ).unwrap();
+        let witness = gen
+            .generate(
+                &ir,
+                &[FieldElement::from_u64(3), FieldElement::from_u64(4)],
+                &[],
+            )
+            .unwrap();
         // sum = 7, product = 12, final = 17
         assert_eq!(witness.get(w2), FieldElement::from_u64(7));
         assert_eq!(witness.get(w4), FieldElement::from_u64(17));
@@ -1444,11 +1565,13 @@ mod tests {
         let (pk, mut vk) = backend.setup(&circuit).unwrap();
 
         let mut gen = WitnessGenerator::new();
-        let witness = gen.generate(
-            &ir,
-            &[FieldElement::from_u64(77), FieldElement::from_u64(77)],
-            &[],
-        ).unwrap();
+        let witness = gen
+            .generate(
+                &ir,
+                &[FieldElement::from_u64(77), FieldElement::from_u64(77)],
+                &[],
+            )
+            .unwrap();
 
         let proof = backend.prove(&pk, &witness).unwrap();
         vk.trace_commitment_root = proof.trace_commitment;

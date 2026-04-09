@@ -116,8 +116,12 @@ impl NFA {
         for &s in states {
             for (label, target) in &self.states[s as usize].transitions {
                 match label {
-                    TransitionLabel::Byte(byte) if *byte == b => { result.insert(*target); }
-                    TransitionLabel::ByteRange(lo, hi) if b >= *lo && b <= *hi => { result.insert(*target); }
+                    TransitionLabel::Byte(byte) if *byte == b => {
+                        result.insert(*target);
+                    }
+                    TransitionLabel::ByteRange(lo, hi) if b >= *lo && b <= *hi => {
+                        result.insert(*target);
+                    }
                     _ => {}
                 }
             }
@@ -148,7 +152,9 @@ pub fn grammar_to_nfa(grammar: &Grammar) -> NFA {
     };
 
     // Inline rule references: build a map of rule name -> rule body
-    let rule_map: HashMap<&str, &[Alternative]> = grammar.rules.iter()
+    let rule_map: HashMap<&str, &[Alternative]> = grammar
+        .rules
+        .iter()
         .map(|r| (r.name.as_str(), r.alternatives.as_slice()))
         .collect();
 
@@ -158,7 +164,8 @@ pub fn grammar_to_nfa(grammar: &Grammar) -> NFA {
         panic!("grammar contains recursive rule references -- only non-recursive grammars can be compiled to FSMs");
     }
 
-    let start_rule = rule_map.get(grammar.start_rule.as_str())
+    let start_rule = rule_map
+        .get(grammar.start_rule.as_str())
         .expect("start rule not found in grammar");
 
     let frag = build_alternatives_fragment(&mut nfa, start_rule, &rule_map);
@@ -171,7 +178,9 @@ pub fn grammar_to_nfa(grammar: &Grammar) -> NFA {
 fn has_recursive_rules(rule_map: &HashMap<&str, &[Alternative]>) -> bool {
     fn collects_refs<'a>(element: &'a GrammarElement, out: &mut HashSet<&'a str>) {
         match element {
-            GrammarElement::RuleRef(name) => { out.insert(name.as_str()); }
+            GrammarElement::RuleRef(name) => {
+                out.insert(name.as_str());
+            }
             GrammarElement::Repeat(inner, _) => collects_refs(inner, out),
             GrammarElement::Sequence(elems) | GrammarElement::Choice(elems) => {
                 for elem in elems {
@@ -202,7 +211,9 @@ fn has_recursive_rules(rule_map: &HashMap<&str, &[Alternative]>) -> bool {
             if node == start && visited.contains(&start) {
                 return true; // cycle back to start
             }
-            if !visited.insert(node) { continue; }
+            if !visited.insert(node) {
+                continue;
+            }
             if let Some(neighbors) = adj.get(node) {
                 for &n in neighbors {
                     stack.push(n);
@@ -242,16 +253,24 @@ fn build_sequence_fragment(
 ) -> NFAFragment {
     if elements.is_empty() {
         let s = nfa.new_state();
-        return NFAFragment { start: s, accept: s };
+        return NFAFragment {
+            start: s,
+            accept: s,
+        };
     }
 
-    let frags: Vec<NFAFragment> = elements.iter()
+    let frags: Vec<NFAFragment> = elements
+        .iter()
         .map(|e| build_element_fragment(nfa, e, rule_map))
         .collect();
 
     // Chain: frag[0].accept -> epsilon -> frag[1].start -> ... -> frag[n].accept
     for i in 0..frags.len() - 1 {
-        nfa.add_transition(frags[i].accept, TransitionLabel::Epsilon, frags[i + 1].start);
+        nfa.add_transition(
+            frags[i].accept,
+            TransitionLabel::Epsilon,
+            frags[i + 1].start,
+        );
     }
 
     NFAFragment {
@@ -269,7 +288,10 @@ fn build_element_fragment(
         GrammarElement::Literal(s) => {
             if s.is_empty() {
                 let state = nfa.new_state();
-                return NFAFragment { start: state, accept: state };
+                return NFAFragment {
+                    start: state,
+                    accept: state,
+                };
             }
             let start = nfa.new_state();
             let mut current = start;
@@ -278,7 +300,10 @@ fn build_element_fragment(
                 nfa.add_transition(current, TransitionLabel::Byte(b), next);
                 current = next;
             }
-            NFAFragment { start, accept: current }
+            NFAFragment {
+                start,
+                accept: current,
+            }
         }
 
         GrammarElement::CharClass(ranges) => {
@@ -288,7 +313,11 @@ fn build_element_fragment(
                 if range.lo == range.hi {
                     nfa.add_transition(start, TransitionLabel::Byte(range.lo), accept);
                 } else {
-                    nfa.add_transition(start, TransitionLabel::ByteRange(range.lo, range.hi), accept);
+                    nfa.add_transition(
+                        start,
+                        TransitionLabel::ByteRange(range.lo, range.hi),
+                        accept,
+                    );
                 }
             }
             NFAFragment { start, accept }
@@ -307,7 +336,10 @@ fn build_element_fragment(
             } else {
                 // Unknown rule -- produce empty fragment (semantic checker should catch this)
                 let s = nfa.new_state();
-                NFAFragment { start: s, accept: s }
+                NFAFragment {
+                    start: s,
+                    accept: s,
+                }
             }
         }
 
@@ -343,9 +375,7 @@ fn build_element_fragment(
             NFAFragment { start, accept }
         }
 
-        GrammarElement::Sequence(elements) => {
-            build_sequence_fragment(nfa, elements, rule_map)
-        }
+        GrammarElement::Sequence(elements) => build_sequence_fragment(nfa, elements, rule_map),
 
         GrammarElement::Choice(choices) => {
             let start = nfa.new_state();
@@ -467,11 +497,17 @@ pub fn minimize_dfa(dfa: &DFA) -> DFA {
 
     // Initial partition: accept states vs non-accept states
     let accept_set: HashSet<StateId> = dfa.accept.clone();
-    let non_accept_set: HashSet<StateId> = (0..n as StateId).filter(|s| !accept_set.contains(s)).collect();
+    let non_accept_set: HashSet<StateId> = (0..n as StateId)
+        .filter(|s| !accept_set.contains(s))
+        .collect();
 
     let mut partitions: Vec<HashSet<StateId>> = Vec::new();
-    if !accept_set.is_empty() { partitions.push(accept_set); }
-    if !non_accept_set.is_empty() { partitions.push(non_accept_set); }
+    if !accept_set.is_empty() {
+        partitions.push(accept_set);
+    }
+    if !non_accept_set.is_empty() {
+        partitions.push(non_accept_set);
+    }
 
     let mut changed = true;
     while changed {
@@ -491,15 +527,19 @@ pub fn minimize_dfa(dfa: &DFA) -> DFA {
             same.insert(representative);
 
             for &state in partition {
-                if state == representative { continue; }
+                if state == representative {
+                    continue;
+                }
 
                 let mut equivalent = true;
                 'byte_loop: for byte in 0..=255u8 {
                     let target_rep = dfa.transitions[representative as usize][byte as usize];
                     let target_state = dfa.transitions[state as usize][byte as usize];
 
-                    let part_rep = target_rep.and_then(|t| partitions.iter().position(|p| p.contains(&t)));
-                    let part_state = target_state.and_then(|t| partitions.iter().position(|p| p.contains(&t)));
+                    let part_rep =
+                        target_rep.and_then(|t| partitions.iter().position(|p| p.contains(&t)));
+                    let part_state =
+                        target_state.and_then(|t| partitions.iter().position(|p| p.contains(&t)));
 
                     if part_rep != part_state {
                         equivalent = false;
@@ -527,7 +567,8 @@ pub fn minimize_dfa(dfa: &DFA) -> DFA {
     }
 
     // Build minimized DFA
-    let state_to_partition: HashMap<StateId, usize> = partitions.iter()
+    let state_to_partition: HashMap<StateId, usize> = partitions
+        .iter()
         .enumerate()
         .flat_map(|(i, p)| p.iter().map(move |&s| (s, i)))
         .collect();
@@ -590,9 +631,12 @@ mod tests {
         Grammar {
             rules: vec![Rule {
                 name: "start".into(),
-                alternatives: choices.iter().map(|s| Alternative {
-                    elements: vec![GrammarElement::Literal(s.to_string())],
-                }).collect(),
+                alternatives: choices
+                    .iter()
+                    .map(|s| Alternative {
+                        elements: vec![GrammarElement::Literal(s.to_string())],
+                    })
+                    .collect(),
             }],
             start_rule: "start".into(),
         }
@@ -627,7 +671,10 @@ mod tests {
                 name: "start".into(),
                 alternatives: vec![Alternative {
                     elements: vec![GrammarElement::Repeat(
-                        Box::new(GrammarElement::CharClass(vec![CharRange { lo: b'0', hi: b'9' }])),
+                        Box::new(GrammarElement::CharClass(vec![CharRange {
+                            lo: b'0',
+                            hi: b'9',
+                        }])),
                         RepeatMode::OneOrMore,
                     )],
                 }],
@@ -706,7 +753,10 @@ mod tests {
                 Rule {
                     name: "digit".into(),
                     alternatives: vec![Alternative {
-                        elements: vec![GrammarElement::CharClass(vec![CharRange { lo: b'0', hi: b'9' }])],
+                        elements: vec![GrammarElement::CharClass(vec![CharRange {
+                            lo: b'0',
+                            hi: b'9',
+                        }])],
                     }],
                 },
             ],
@@ -740,7 +790,12 @@ mod tests {
         assert!(minimized.num_states() <= unminimized.num_states());
         // Both should accept the same strings
         for s in [b"aa".as_slice(), b"ab", b"ba", b"bb", b"a", b"b", b"abc"] {
-            assert_eq!(unminimized.accepts(s), minimized.accepts(s), "mismatch on {:?}", s);
+            assert_eq!(
+                unminimized.accepts(s),
+                minimized.accepts(s),
+                "mismatch on {:?}",
+                s
+            );
         }
     }
 

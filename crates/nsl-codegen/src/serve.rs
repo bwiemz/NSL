@@ -30,16 +30,20 @@ const WORKER_SPEC_TREE_WIDTH_OFFSET: i32 = 32;
 const WORKER_SPEC_TEMP_BITS_OFFSET: i32 = 36;
 const WORKER_EOS_TOKEN_OFFSET: i32 = 40;
 
+struct WorkerConfigSpec {
+    max_seq_len: i64,
+    kv_blocks: i64,
+    speculative_tokens: i64,
+    speculative_method: i64,
+    speculative_tree_width: i64,
+    speculative_temperature_bits: i64,
+}
+
 impl Compiler<'_> {
     fn build_worker_config_slot(
         &self,
         builder: &mut FunctionBuilder,
-        max_seq_len: i64,
-        kv_blocks: i64,
-        speculative_tokens: i64,
-        speculative_method: i64,
-        speculative_tree_width: i64,
-        speculative_temperature_bits: i64,
+        spec: WorkerConfigSpec,
     ) -> cranelift_codegen::ir::StackSlot {
         let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -47,8 +51,8 @@ impl Compiler<'_> {
             WORKER_CONFIG_ALIGN,
         ));
 
-        let max_seq_len_val = builder.ins().iconst(cl_types::I32, max_seq_len);
-        let kv_blocks_val = builder.ins().iconst(cl_types::I32, kv_blocks);
+        let max_seq_len_val = builder.ins().iconst(cl_types::I32, spec.max_seq_len);
+        let kv_blocks_val = builder.ins().iconst(cl_types::I32, spec.kv_blocks);
         let block_size_val = builder
             .ins()
             .iconst(cl_types::I32, WORKER_DEFAULT_BLOCK_SIZE);
@@ -59,13 +63,13 @@ impl Compiler<'_> {
         let num_layers_val = builder
             .ins()
             .iconst(cl_types::I32, WORKER_DEFAULT_NUM_LAYERS);
-        let speculative_tokens_val = builder.ins().iconst(cl_types::I32, speculative_tokens);
-        let speculative_method_val = builder.ins().iconst(cl_types::I32, speculative_method);
+        let speculative_tokens_val = builder.ins().iconst(cl_types::I32, spec.speculative_tokens);
+        let speculative_method_val = builder.ins().iconst(cl_types::I32, spec.speculative_method);
         let speculative_tree_width_val =
-            builder.ins().iconst(cl_types::I32, speculative_tree_width);
+            builder.ins().iconst(cl_types::I32, spec.speculative_tree_width);
         let speculative_temp_bits_val = builder
             .ins()
-            .iconst(cl_types::I32, speculative_temperature_bits);
+            .iconst(cl_types::I32, spec.speculative_temperature_bits);
         let eos_val = builder
             .ins()
             .iconst(cl_types::I32, WORKER_DEFAULT_EOS_TOKEN_ID);
@@ -281,16 +285,27 @@ impl Compiler<'_> {
         let speculative_temperature_bits = speculative_config
             .map(|info| info.temperature.to_bits() as i64)
             .unwrap_or(0);
-        let prefill_config_slot =
-            self.build_worker_config_slot(builder, _max_seq_len, kv_blocks, 0, 0, 1, 0);
+        let prefill_config_slot = self.build_worker_config_slot(
+            builder,
+            WorkerConfigSpec {
+                max_seq_len: _max_seq_len,
+                kv_blocks,
+                speculative_tokens: 0,
+                speculative_method: 0,
+                speculative_tree_width: 1,
+                speculative_temperature_bits: 0,
+            },
+        );
         let decode_config_slot = self.build_worker_config_slot(
             builder,
-            _max_seq_len,
-            kv_blocks,
-            speculative_tokens,
-            speculative_method,
-            speculative_tree_width,
-            speculative_temperature_bits,
+            WorkerConfigSpec {
+                max_seq_len: _max_seq_len,
+                kv_blocks,
+                speculative_tokens,
+                speculative_method,
+                speculative_tree_width,
+                speculative_temperature_bits,
+            },
         );
 
         // Step 2: Branch on role

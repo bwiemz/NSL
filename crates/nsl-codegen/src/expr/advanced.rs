@@ -116,14 +116,17 @@ impl Compiler<'_> {
                 then_result_is_temp = true;
             }
 
-            for temp in state.cleanup.tensor_temporaries[temp_base_len..].to_vec() {
+            for temp in state.cleanup.tensor_temporaries[temp_base_len..].iter().copied() {
                 if temp != then_val {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
                 }
             }
             state.cleanup.tensor_temporaries.truncate(temp_base_len);
 
-            for consumed in state.ownership.linear_consume_pending[linear_base_len..].to_vec() {
+            for consumed in state.ownership.linear_consume_pending[linear_base_len..]
+                .iter()
+                .copied()
+            {
                 if consumed != then_val {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[consumed]);
                 }
@@ -181,14 +184,17 @@ impl Compiler<'_> {
                 else_result_is_temp = true;
             }
 
-            for temp in state.cleanup.tensor_temporaries[temp_base_len..].to_vec() {
+            for temp in state.cleanup.tensor_temporaries[temp_base_len..].iter().copied() {
                 if temp != else_val {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
                 }
             }
             state.cleanup.tensor_temporaries.truncate(temp_base_len);
 
-            for consumed in state.ownership.linear_consume_pending[linear_base_len..].to_vec() {
+            for consumed in state.ownership.linear_consume_pending[linear_base_len..]
+                .iter()
+                .copied()
+            {
                 if consumed != else_val {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[consumed]);
                 }

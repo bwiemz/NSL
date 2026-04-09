@@ -101,10 +101,7 @@ pub enum ZkOp {
     /// Matrix transpose.
     Transpose { input: usize },
     /// Reshape (reinterpret shape without data movement).
-    Reshape {
-        input: usize,
-        new_shape: Vec<usize>,
-    },
+    Reshape { input: usize, new_shape: Vec<usize> },
     /// Requantize to a different bit-width.
     Requantize {
         input: usize,
@@ -186,13 +183,19 @@ fn lower_matmul(
     let k = k_a;
 
     // Determine if B has known zero values (for sparsity elimination).
-    let b_values = if let ZkOp::Weight { values: Some(v), .. } = &dag.ops[b_idx] {
+    let b_values = if let ZkOp::Weight {
+        values: Some(v), ..
+    } = &dag.ops[b_idx]
+    {
         Some(v.as_slice())
     } else {
         None
     };
     // Also check if A has known zero values.
-    let a_values = if let ZkOp::Weight { values: Some(v), .. } = &dag.ops[a_idx] {
+    let a_values = if let ZkOp::Weight {
+        values: Some(v), ..
+    } = &dag.ops[a_idx]
+    {
         Some(v.as_slice())
     } else {
         None
@@ -812,44 +815,20 @@ pub fn lower_dag_to_zkir(dag: &ZkDag, config: &ZkConfig) -> ZkIR {
         }
 
         let info = match &dag.ops[idx] {
-            ZkOp::Matmul { a, b } => {
-                lower_matmul(dag, &mut ir, &op_info, idx, *a, *b, config)
+            ZkOp::Matmul { a, b } => lower_matmul(dag, &mut ir, &op_info, idx, *a, *b, config),
+            ZkOp::Add { a, b } => lower_elementwise_add(&mut ir, &op_info, idx, *a, *b),
+            ZkOp::Mul { a, b } => lower_elementwise_mul(&mut ir, &op_info, idx, *a, *b, config),
+            ZkOp::Relu { input } => lower_activation(&mut ir, &op_info, idx, *input, "relu"),
+            ZkOp::Gelu { input } => lower_activation(&mut ir, &op_info, idx, *input, "gelu"),
+            ZkOp::Sigmoid { input } => lower_activation(&mut ir, &op_info, idx, *input, "sigmoid"),
+            ZkOp::Tanh { input } => lower_activation(&mut ir, &op_info, idx, *input, "tanh"),
+            ZkOp::Exp { input } => lower_activation(&mut ir, &op_info, idx, *input, "exp"),
+            ZkOp::Log { input } => lower_activation(&mut ir, &op_info, idx, *input, "log"),
+            ZkOp::Softmax { input, dim: _ } => lower_softmax(&mut ir, &op_info, idx, *input),
+            ZkOp::LayerNorm { input, gamma, beta } => {
+                lower_layer_norm(&mut ir, &op_info, idx, *input, *gamma, *beta, config)
             }
-            ZkOp::Add { a, b } => {
-                lower_elementwise_add(&mut ir, &op_info, idx, *a, *b)
-            }
-            ZkOp::Mul { a, b } => {
-                lower_elementwise_mul(&mut ir, &op_info, idx, *a, *b, config)
-            }
-            ZkOp::Relu { input } => {
-                lower_activation(&mut ir, &op_info, idx, *input, "relu")
-            }
-            ZkOp::Gelu { input } => {
-                lower_activation(&mut ir, &op_info, idx, *input, "gelu")
-            }
-            ZkOp::Sigmoid { input } => {
-                lower_activation(&mut ir, &op_info, idx, *input, "sigmoid")
-            }
-            ZkOp::Tanh { input } => {
-                lower_activation(&mut ir, &op_info, idx, *input, "tanh")
-            }
-            ZkOp::Exp { input } => {
-                lower_activation(&mut ir, &op_info, idx, *input, "exp")
-            }
-            ZkOp::Log { input } => {
-                lower_activation(&mut ir, &op_info, idx, *input, "log")
-            }
-            ZkOp::Softmax { input, dim: _ } => {
-                lower_softmax(&mut ir, &op_info, idx, *input)
-            }
-            ZkOp::LayerNorm {
-                input,
-                gamma,
-                beta,
-            } => lower_layer_norm(&mut ir, &op_info, idx, *input, *gamma, *beta, config),
-            ZkOp::Transpose { input } => {
-                lower_transpose(&mut ir, &op_info, idx, *input)
-            }
+            ZkOp::Transpose { input } => lower_transpose(&mut ir, &op_info, idx, *input),
             ZkOp::Reshape { input, new_shape } => {
                 lower_reshape(&mut ir, &op_info, idx, *input, new_shape)
             }
@@ -858,7 +837,15 @@ pub fn lower_dag_to_zkir(dag: &ZkDag, config: &ZkConfig) -> ZkIR {
                 scale,
                 zero_point,
                 target_bits,
-            } => lower_requantize(&mut ir, &op_info, idx, *input, *scale, *zero_point, *target_bits),
+            } => lower_requantize(
+                &mut ir,
+                &op_info,
+                idx,
+                *input,
+                *scale,
+                *zero_point,
+                *target_bits,
+            ),
             ZkOp::Input { .. } | ZkOp::Weight { .. } => unreachable!(),
         };
 
@@ -1065,17 +1052,24 @@ fn remap_op(
     index_map: &std::collections::HashMap<usize, usize>,
     layer_idx: usize,
 ) -> ZkOp {
-    let remap = |old: usize| -> usize {
-        *index_map.get(&old).unwrap_or(&0)
-    };
+    let remap = |old: usize| -> usize { *index_map.get(&old).unwrap_or(&0) };
 
     match op {
-        ZkOp::Input { name, shape, dtype_bits } => ZkOp::Input {
+        ZkOp::Input {
+            name,
+            shape,
+            dtype_bits,
+        } => ZkOp::Input {
             name: name.clone(),
             shape: shape.clone(),
             dtype_bits: *dtype_bits,
         },
-        ZkOp::Weight { name, shape, dtype_bits, values } => ZkOp::Weight {
+        ZkOp::Weight {
+            name,
+            shape,
+            dtype_bits,
+            values,
+        } => ZkOp::Weight {
             name: name.clone(),
             shape: shape.clone(),
             dtype_bits: *dtype_bits,
@@ -1083,7 +1077,10 @@ fn remap_op(
         },
         ZkOp::Matmul { a, b } => {
             if index_map.contains_key(a) && index_map.contains_key(b) {
-                ZkOp::Matmul { a: remap(*a), b: remap(*b) }
+                ZkOp::Matmul {
+                    a: remap(*a),
+                    b: remap(*b),
+                }
             } else {
                 // Reference outside this layer — create placeholder input
                 ZkOp::Input {
@@ -1095,7 +1092,10 @@ fn remap_op(
         }
         ZkOp::Add { a, b } => {
             if index_map.contains_key(a) && index_map.contains_key(b) {
-                ZkOp::Add { a: remap(*a), b: remap(*b) }
+                ZkOp::Add {
+                    a: remap(*a),
+                    b: remap(*b),
+                }
             } else {
                 ZkOp::Input {
                     name: format!("layer{layer_idx}_add_input"),
@@ -1106,7 +1106,10 @@ fn remap_op(
         }
         ZkOp::Mul { a, b } => {
             if index_map.contains_key(a) && index_map.contains_key(b) {
-                ZkOp::Mul { a: remap(*a), b: remap(*b) }
+                ZkOp::Mul {
+                    a: remap(*a),
+                    b: remap(*b),
+                }
             } else {
                 ZkOp::Input {
                     name: format!("layer{layer_idx}_mul_input"),
@@ -1115,24 +1118,46 @@ fn remap_op(
                 }
             }
         }
-        ZkOp::Relu { input } => ZkOp::Relu { input: remap(*input) },
-        ZkOp::Gelu { input } => ZkOp::Gelu { input: remap(*input) },
-        ZkOp::Sigmoid { input } => ZkOp::Sigmoid { input: remap(*input) },
-        ZkOp::Tanh { input } => ZkOp::Tanh { input: remap(*input) },
-        ZkOp::Softmax { input, dim } => ZkOp::Softmax { input: remap(*input), dim: *dim },
+        ZkOp::Relu { input } => ZkOp::Relu {
+            input: remap(*input),
+        },
+        ZkOp::Gelu { input } => ZkOp::Gelu {
+            input: remap(*input),
+        },
+        ZkOp::Sigmoid { input } => ZkOp::Sigmoid {
+            input: remap(*input),
+        },
+        ZkOp::Tanh { input } => ZkOp::Tanh {
+            input: remap(*input),
+        },
+        ZkOp::Softmax { input, dim } => ZkOp::Softmax {
+            input: remap(*input),
+            dim: *dim,
+        },
         ZkOp::LayerNorm { input, gamma, beta } => ZkOp::LayerNorm {
             input: remap(*input),
             gamma: remap(*gamma),
             beta: remap(*beta),
         },
-        ZkOp::Exp { input } => ZkOp::Exp { input: remap(*input) },
-        ZkOp::Log { input } => ZkOp::Log { input: remap(*input) },
-        ZkOp::Transpose { input } => ZkOp::Transpose { input: remap(*input) },
+        ZkOp::Exp { input } => ZkOp::Exp {
+            input: remap(*input),
+        },
+        ZkOp::Log { input } => ZkOp::Log {
+            input: remap(*input),
+        },
+        ZkOp::Transpose { input } => ZkOp::Transpose {
+            input: remap(*input),
+        },
         ZkOp::Reshape { input, new_shape } => ZkOp::Reshape {
             input: remap(*input),
             new_shape: new_shape.clone(),
         },
-        ZkOp::Requantize { input, scale, zero_point, target_bits } => ZkOp::Requantize {
+        ZkOp::Requantize {
+            input,
+            scale,
+            zero_point,
+            target_bits,
+        } => ZkOp::Requantize {
             input: remap(*input),
             scale: *scale,
             zero_point: *zero_point,
@@ -1240,7 +1265,10 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, ZkInstruction::Lookup { table, .. } if table == "relu"))
             .count();
-        assert_eq!(lookups, 4, "4-element relu should produce 4 lookup instructions");
+        assert_eq!(
+            lookups, 4,
+            "4-element relu should produce 4 lookup instructions"
+        );
         assert!(
             ir.lookup_tables.contains_key(&("relu".to_string(), 8)),
             "relu table should be registered with input_bits=8"
@@ -1402,7 +1430,10 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, ZkInstruction::FixedMul { .. }))
             .count();
-        assert_eq!(fixed_muls, 2, "2-element mul should produce 2 FixedMul instructions");
+        assert_eq!(
+            fixed_muls, 2,
+            "2-element mul should produce 2 FixedMul instructions"
+        );
     }
 
     #[test]
@@ -1433,14 +1464,12 @@ mod tests {
     #[test]
     fn lower_known_weights_emit_const() {
         let dag = ZkDag {
-            ops: vec![
-                ZkOp::Weight {
-                    name: "w".into(),
-                    shape: vec![2],
-                    dtype_bits: 8,
-                    values: Some(vec![42, -7]),
-                },
-            ],
+            ops: vec![ZkOp::Weight {
+                name: "w".into(),
+                shape: vec![2],
+                dtype_bits: 8,
+                values: Some(vec![42, -7]),
+            }],
             output_idx: 0,
             input_indices: vec![],
             weight_indices: vec![0],
@@ -1451,7 +1480,10 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, ZkInstruction::Const { .. }))
             .count();
-        assert_eq!(consts, 2, "2 known weights should produce 2 Const instructions");
+        assert_eq!(
+            consts, 2,
+            "2 known weights should produce 2 Const instructions"
+        );
     }
 
     #[test]
@@ -1484,16 +1516,35 @@ mod tests {
         let dag = ZkDag {
             ops: vec![
                 // Layer 1
-                ZkOp::Input { name: "x".into(), shape: vec![1, 4], dtype_bits: 8 },
-                ZkOp::Weight { name: "w1".into(), shape: vec![4, 4], dtype_bits: 8, values: None },
+                ZkOp::Input {
+                    name: "x".into(),
+                    shape: vec![1, 4],
+                    dtype_bits: 8,
+                },
+                ZkOp::Weight {
+                    name: "w1".into(),
+                    shape: vec![4, 4],
+                    dtype_bits: 8,
+                    values: None,
+                },
                 ZkOp::Matmul { a: 0, b: 1 },
                 ZkOp::Relu { input: 2 },
                 // Layer 2
-                ZkOp::Weight { name: "w2".into(), shape: vec![4, 4], dtype_bits: 8, values: None },
+                ZkOp::Weight {
+                    name: "w2".into(),
+                    shape: vec![4, 4],
+                    dtype_bits: 8,
+                    values: None,
+                },
                 ZkOp::Matmul { a: 3, b: 4 },
                 ZkOp::Relu { input: 5 },
                 // Layer 3
-                ZkOp::Weight { name: "w3".into(), shape: vec![4, 4], dtype_bits: 8, values: None },
+                ZkOp::Weight {
+                    name: "w3".into(),
+                    shape: vec![4, 4],
+                    dtype_bits: 8,
+                    values: None,
+                },
                 ZkOp::Matmul { a: 6, b: 7 },
                 ZkOp::Relu { input: 8 },
             ],
@@ -1503,7 +1554,11 @@ mod tests {
         };
 
         let layers = lower_model_for_folding(&dag, &ZkConfig::default());
-        assert_eq!(layers.len(), 3, "3-layer MLP should produce 3 foldable ZkIRs");
+        assert_eq!(
+            layers.len(),
+            3,
+            "3-layer MLP should produce 3 foldable ZkIRs"
+        );
     }
 
     #[test]
@@ -1533,7 +1588,10 @@ mod tests {
         assert_eq!(remaps.len(), 1);
         if let ZkInstruction::Remap { permutation, .. } = &remaps[0] {
             let identity: Vec<usize> = (0..6).collect();
-            assert_eq!(permutation, &identity, "reshape should use identity permutation");
+            assert_eq!(
+                permutation, &identity,
+                "reshape should use identity permutation"
+            );
         }
     }
 }

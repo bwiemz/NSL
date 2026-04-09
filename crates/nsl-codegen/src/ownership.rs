@@ -7,8 +7,8 @@
 //! The optimization has zero runtime effect until wired into `stmt.rs`/`func.rs`.
 //! Tracked for M38c.
 
-use std::collections::{HashMap, HashSet};
 use nsl_ast::Symbol;
+use std::collections::{HashMap, HashSet};
 
 /// Borrow kind for active borrows.
 #[derive(Debug, Clone, PartialEq)]
@@ -227,7 +227,9 @@ mod tests {
     use super::*;
     use nsl_ast::Symbol;
 
-    type Interner = string_interner::StringInterner<string_interner::backend::BucketBackend<string_interner::DefaultSymbol>>;
+    type Interner = string_interner::StringInterner<
+        string_interner::backend::BucketBackend<string_interner::DefaultSymbol>,
+    >;
 
     fn make_sym(interner: &mut Interner, name: &str) -> Symbol {
         Symbol(interner.get_or_intern(name))
@@ -328,10 +330,13 @@ mod tests {
         lowering.mark_linear(x);
 
         let decisions = lowering.decide(&x, true, None, true);
-        assert_eq!(decisions, vec![
-            OwnershipDecision::FreeAtConsumption,
-            OwnershipDecision::PoisonAfterMove,
-        ]);
+        assert_eq!(
+            decisions,
+            vec![
+                OwnershipDecision::FreeAtConsumption,
+                OwnershipDecision::PoisonAfterMove,
+            ]
+        );
     }
 
     #[test]
@@ -351,7 +356,9 @@ mod tests {
         let x = make_sym(&mut interner, "x");
         let b = make_sym(&mut interner, "ref_x");
         let mut lowering = OwnershipLowering::new();
-        lowering.active_borrows.insert(x, BorrowKind::Immutable { borrower: b });
+        lowering
+            .active_borrows
+            .insert(x, BorrowKind::Immutable { borrower: b });
 
         let decisions = lowering.decide(&x, false, None, false);
         assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
@@ -390,9 +397,18 @@ mod tests {
     fn autodiff_classify_coverage() {
         use nsl_semantic::ownership_autodiff::{classify_backward_access, BackwardAccess};
         assert_eq!(classify_backward_access("Add"), BackwardAccess::ShapeOnly);
-        assert_eq!(classify_backward_access("MatMul"), BackwardAccess::DataRequired);
-        assert_eq!(classify_backward_access("Dropout"), BackwardAccess::AuxDataRequired);
-        assert_eq!(classify_backward_access("UnknownOp"), BackwardAccess::DataRequired);
+        assert_eq!(
+            classify_backward_access("MatMul"),
+            BackwardAccess::DataRequired
+        );
+        assert_eq!(
+            classify_backward_access("Dropout"),
+            BackwardAccess::AuxDataRequired
+        );
+        assert_eq!(
+            classify_backward_access("UnknownOp"),
+            BackwardAccess::DataRequired
+        );
     }
 
     #[test]
@@ -421,7 +437,9 @@ mod tests {
 
         // w is linear; w_ref is an active borrow of w
         lowering.mark_linear(w);
-        lowering.active_borrows.insert(w, BorrowKind::Immutable { borrower: w_ref });
+        lowering
+            .active_borrows
+            .insert(w, BorrowKind::Immutable { borrower: w_ref });
 
         // Using w in a grad-scope DataRequired op (MatMul) — BorrowedNoAction
         // because the borrow map entry for w takes priority.
@@ -440,7 +458,9 @@ mod tests {
         let mut lowering = OwnershipLowering::new();
 
         lowering.mark_linear(x);
-        lowering.active_borrows.insert(x, BorrowKind::Immutable { borrower: x_ref });
+        lowering
+            .active_borrows
+            .insert(x, BorrowKind::Immutable { borrower: x_ref });
 
         let decisions = lowering.decide(&x, false, Some("Add"), false);
         assert_eq!(decisions, vec![OwnershipDecision::BorrowedNoAction]);
@@ -524,7 +544,9 @@ mod tests {
         let a_ref = make_sym(&mut interner, "a_ref");
         let mut lowering = OwnershipLowering::new();
         lowering.mark_linear(a);
-        lowering.active_borrows.insert(a, BorrowKind::Immutable { borrower: a_ref });
+        lowering
+            .active_borrows
+            .insert(a, BorrowKind::Immutable { borrower: a_ref });
 
         assert!(!lowering.is_consumed_once(&a));
         assert_eq!(lowering.decide_clone(&a), CloneDecision::Keep);
@@ -571,7 +593,9 @@ mod tests {
         let b = make_sym(&mut interner, "ref_x");
         let mut lowering = OwnershipLowering::new();
         lowering.mark_linear(x);
-        lowering.active_borrows.insert(x, BorrowKind::Immutable { borrower: b });
+        lowering
+            .active_borrows
+            .insert(x, BorrowKind::Immutable { borrower: b });
 
         assert!(!lowering.should_use_inplace(&x));
     }
@@ -599,7 +623,9 @@ mod tests {
         lowering.mark_linear(weight);
 
         // Forward pass: borrow active
-        lowering.active_borrows.insert(weight, BorrowKind::Immutable { borrower: w_ref });
+        lowering
+            .active_borrows
+            .insert(weight, BorrowKind::Immutable { borrower: w_ref });
         let fwd_decisions = lowering.decide(&weight, false, Some("MatMul"), false);
         assert_eq!(fwd_decisions, vec![OwnershipDecision::BorrowedNoAction]);
 

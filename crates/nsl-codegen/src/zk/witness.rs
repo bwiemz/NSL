@@ -273,7 +273,11 @@ mod tests {
         let w0 = ir.alloc_wire("a");
         let w1 = ir.alloc_wire("b");
         let w2 = ir.alloc_wire("out");
-        ir.push(ZkInstruction::Add { out: w2, a: w0, b: w1 });
+        ir.push(ZkInstruction::Add {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2]);
 
@@ -294,7 +298,11 @@ mod tests {
         let w0 = ir.alloc_wire("a");
         let w1 = ir.alloc_wire("b");
         let w2 = ir.alloc_wire("out");
-        ir.push(ZkInstruction::Mul { out: w2, a: w0, b: w1 });
+        ir.push(ZkInstruction::Mul {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2]);
 
@@ -485,8 +493,8 @@ mod tests {
         let witness = gen
             .generate(
                 &ir,
-                &[FieldElement::from_u64(5)],   // public input
-                &[FieldElement::from_u64(7)],   // private weight
+                &[FieldElement::from_u64(5)], // public input
+                &[FieldElement::from_u64(7)], // private weight
             )
             .unwrap();
         assert_eq!(witness.get(out), FieldElement::from_u64(35));
@@ -557,7 +565,11 @@ mod tests {
         let mut ir = ZkIR::new("test_wire_value");
         let w0 = ir.alloc_wire("x");
         let w1 = ir.alloc_wire("y");
-        ir.push(ZkInstruction::Add { out: w1, a: w0, b: w0 });
+        ir.push(ZkInstruction::Add {
+            out: w1,
+            a: w0,
+            b: w0,
+        });
         ir.set_public_inputs(vec![w0]);
 
         let mut gen = WitnessGenerator::new();

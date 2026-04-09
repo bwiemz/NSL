@@ -1,7 +1,7 @@
 //! M39: Automatic batching (vmap) — compile-time AST-to-AST batch transformation.
 
-use std::collections::{HashMap, HashSet};
 use nsl_ast::Symbol;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,7 +113,10 @@ impl BatchTracker {
 
     /// Get the batch status of a symbol.
     pub fn status(&self, sym: &Symbol) -> BatchStatus {
-        self.statuses.get(sym).cloned().unwrap_or(BatchStatus::Unknown)
+        self.statuses
+            .get(sym)
+            .cloned()
+            .unwrap_or(BatchStatus::Unknown)
     }
 
     /// Classify the result of a binary operation: variant if either operand is variant.
@@ -133,7 +136,10 @@ impl BatchTracker {
     pub fn classify_call(&self, args: &[Symbol]) -> BatchStatus {
         if args.iter().any(|a| self.status(a) == BatchStatus::Variant) {
             BatchStatus::Variant
-        } else if args.iter().all(|a| self.status(a) == BatchStatus::Invariant) {
+        } else if args
+            .iter()
+            .all(|a| self.status(a) == BatchStatus::Invariant)
+        {
             BatchStatus::Invariant
         } else {
             BatchStatus::Unknown
@@ -215,8 +221,8 @@ pub fn classify_matmul_rewrite(
 
 use nsl_ast::decl::FnDef;
 use nsl_ast::expr::{Expr, ExprKind, SubscriptKind};
-use nsl_ast::stmt::{Stmt, StmtKind, Block};
 use nsl_ast::pattern::PatternKind;
+use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::{NodeId, Span};
 use nsl_lexer::Interner;
 
@@ -276,8 +282,11 @@ impl<'a> VmapTransformer<'a> {
         // Step 3: Build batched function name (as String — interning happens
         // later in the compiler when registering the function, since we only
         // have &Interner here, not &mut Interner).
-        let original_name = self.interner.resolve(fn_def.name.0)
-            .unwrap_or("unknown").to_string();
+        let original_name = self
+            .interner
+            .resolve(fn_def.name.0)
+            .unwrap_or("unknown")
+            .to_string();
         let batched_name = format!("{}_batched", original_name);
 
         // Step 4: Build batched FnDef (reuses original name Symbol for now;
@@ -295,7 +304,11 @@ impl<'a> VmapTransformer<'a> {
         };
 
         let matmul_rewrites = std::mem::take(&mut self.matmul_rewrites);
-        Ok(VmapResult { batched_fn, batched_name, matmul_rewrites })
+        Ok(VmapResult {
+            batched_fn,
+            batched_name,
+            matmul_rewrites,
+        })
     }
 
     /// Transform a block of statements.
@@ -309,7 +322,11 @@ impl<'a> VmapTransformer<'a> {
     /// Transform a single statement.
     fn transform_stmt(&mut self, stmt: &mut Stmt) -> Result<(), VmapError> {
         match &mut stmt.kind {
-            StmtKind::VarDecl { pattern, value: Some(ref mut val), .. } => {
+            StmtKind::VarDecl {
+                pattern,
+                value: Some(ref mut val),
+                ..
+            } => {
                 // Transform the value expression
                 self.transform_expr(val)?;
 
@@ -340,7 +357,13 @@ impl<'a> VmapTransformer<'a> {
                 self.transform_expr(expr)?;
             }
 
-            StmtKind::If { condition, then_block, elif_clauses, else_block, .. } => {
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
                 self.transform_expr(condition)?;
                 self.transform_block(then_block)?;
                 for (cond, block) in elif_clauses {
@@ -387,8 +410,7 @@ impl<'a> VmapTransformer<'a> {
 
                 // Check for special function rewrites
                 if let ExprKind::Ident(func_sym) = &callee.kind {
-                    let func_name = self.interner.resolve(func_sym.0)
-                        .unwrap_or("").to_string();
+                    let func_name = self.interner.resolve(func_sym.0).unwrap_or("").to_string();
 
                     match func_name.as_str() {
                         "matmul" => {
@@ -416,9 +438,15 @@ impl<'a> VmapTransformer<'a> {
                         self.transform_expr(idx_expr)?;
                     }
                     SubscriptKind::Slice { lower, upper, step } => {
-                        if let Some(ref mut e) = lower { self.transform_expr(e)?; }
-                        if let Some(ref mut e) = upper { self.transform_expr(e)?; }
-                        if let Some(ref mut e) = step { self.transform_expr(e)?; }
+                        if let Some(ref mut e) = lower {
+                            self.transform_expr(e)?;
+                        }
+                        if let Some(ref mut e) = upper {
+                            self.transform_expr(e)?;
+                        }
+                        if let Some(ref mut e) = step {
+                            self.transform_expr(e)?;
+                        }
                     }
                     SubscriptKind::MultiDim(ref mut dims) => {
                         for dim in dims {
@@ -460,7 +488,10 @@ impl<'a> VmapTransformer<'a> {
                 }
             }
             ExprKind::Call { args, .. } => {
-                if args.iter().any(|a| self.classify_expr(&a.value) == BatchStatus::Variant) {
+                if args
+                    .iter()
+                    .any(|a| self.classify_expr(&a.value) == BatchStatus::Variant)
+                {
                     BatchStatus::Variant
                 } else {
                     BatchStatus::Invariant
@@ -519,9 +550,10 @@ impl<'a> VmapTransformer<'a> {
 
             // Find and shift the dim argument (positional arg at index 1, or keyword "dim")
             for arg in args.iter_mut().skip(1) {
-                let is_dim_arg = arg.name.is_some_and(|n| {
-                    self.interner.resolve(n.0).unwrap_or("") == "dim"
-                }) || arg.name.is_none(); // positional second arg is dim
+                let is_dim_arg = arg
+                    .name
+                    .is_some_and(|n| self.interner.resolve(n.0).unwrap_or("") == "dim")
+                    || arg.name.is_none(); // positional second arg is dim
 
                 if is_dim_arg {
                     if let ExprKind::IntLiteral(d) = &arg.value.kind {
@@ -572,7 +604,11 @@ impl<'a> VmapTransformer<'a> {
 #[derive(Debug)]
 pub enum VmapError {
     /// A batch dimension mismatch was detected.
-    BatchMismatch { expected: String, got: String, span: Span },
+    BatchMismatch {
+        expected: String,
+        got: String,
+        span: Span,
+    },
     /// An unsupported operation was found in the vmap body.
     UnsupportedOp { op: String, span: Span },
 }
@@ -580,10 +616,10 @@ pub enum VmapError {
 impl std::fmt::Display for VmapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VmapError::BatchMismatch { expected, got, .. } =>
-                write!(f, "vmap batch mismatch: expected {expected}, got {got}"),
-            VmapError::UnsupportedOp { op, .. } =>
-                write!(f, "vmap: unsupported operation '{op}'"),
+            VmapError::BatchMismatch { expected, got, .. } => {
+                write!(f, "vmap batch mismatch: expected {expected}, got {got}")
+            }
+            VmapError::UnsupportedOp { op, .. } => write!(f, "vmap: unsupported operation '{op}'"),
         }
     }
 }

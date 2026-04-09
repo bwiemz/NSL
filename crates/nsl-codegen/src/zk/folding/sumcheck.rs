@@ -85,17 +85,18 @@ impl<F: Field> UnivariatePoly<F> {
 /// # Returns
 /// * `round_polys` — one univariate polynomial per round
 /// * `final_eval` — evaluation of `f` at the challenge point
-pub fn sumcheck_prove<F: Field>(
-    polynomial: &[F],
-    claim: &F,
-) -> (Vec<UnivariatePoly<F>>, F) {
+pub fn sumcheck_prove<F: Field>(polynomial: &[F], claim: &F) -> (Vec<UnivariatePoly<F>>, F) {
     let n = polynomial.len();
     if n == 0 {
         return (vec![], F::zero());
     }
 
     // Number of variables = log2(n), or 0 if n=1
-    let num_vars = if n <= 1 { 0 } else { (n as f64).log2().ceil() as usize };
+    let num_vars = if n <= 1 {
+        0
+    } else {
+        (n as f64).log2().ceil() as usize
+    };
 
     if num_vars == 0 {
         return (vec![], polynomial[0].clone());
@@ -173,10 +174,7 @@ pub struct SumcheckProof<F: Field> {
 ///   4. After all rounds, check final_eval == last claim
 ///
 /// Returns Ok(true) if the proof is valid, Ok(false) if invalid.
-pub fn sumcheck_verify<F: Field>(
-    proof: &SumcheckProof<F>,
-    initial_claim: &F,
-) -> bool {
+pub fn sumcheck_verify<F: Field>(proof: &SumcheckProof<F>, initial_claim: &F) -> bool {
     let mut current_claim = initial_claim.clone();
 
     for (i, round_poly) in proof.round_polys.iter().enumerate() {
@@ -205,10 +203,7 @@ pub fn sumcheck_verify<F: Field>(
 ///
 /// Like `sumcheck_prove` but generates random challenges from the round polynomials
 /// using a simple hash-based Fiat-Shamir transform.
-pub fn sumcheck_prove_interactive<F: Field>(
-    polynomial: &[F],
-    _claim: &F,
-) -> SumcheckProof<F> {
+pub fn sumcheck_prove_interactive<F: Field>(polynomial: &[F], _claim: &F) -> SumcheckProof<F> {
     let n = polynomial.len();
     if n == 0 {
         return SumcheckProof {
@@ -218,7 +213,11 @@ pub fn sumcheck_prove_interactive<F: Field>(
         };
     }
 
-    let num_vars = if n <= 1 { 0 } else { (n as f64).log2().ceil() as usize };
+    let num_vars = if n <= 1 {
+        0
+    } else {
+        (n as f64).log2().ceil() as usize
+    };
     if num_vars == 0 {
         return SumcheckProof {
             round_polys: vec![],
@@ -233,7 +232,9 @@ pub fn sumcheck_prove_interactive<F: Field>(
 
     for round in 0..num_vars {
         let half = current_evals.len() / 2;
-        if half == 0 { break; }
+        if half == 0 {
+            break;
+        }
 
         // Compute round polynomial
         let mut sum_0 = F::zero();
@@ -249,10 +250,15 @@ pub fn sumcheck_prove_interactive<F: Field>(
 
         // Fiat-Shamir challenge: derive from round polynomial evaluations
         // Simple hash: challenge = sum_0 * 7 + sum_1 * 13 + round + 1
-        let challenge = sum_0.field_mul(&F::from_u64(7))
+        let challenge = sum_0
+            .field_mul(&F::from_u64(7))
             .field_add(&sum_1.field_mul(&F::from_u64(13)))
             .field_add(&F::from_u64(round as u64 + 1));
-        let challenge = if challenge == F::zero() { F::one() } else { challenge };
+        let challenge = if challenge == F::zero() {
+            F::one()
+        } else {
+            challenge
+        };
 
         // Bind variable to challenge for next round
         let mut next_evals = Vec::with_capacity(half);

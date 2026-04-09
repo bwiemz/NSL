@@ -27,9 +27,22 @@ pub fn lower_kir_to_amdgpu(ir: &KernelIR) -> Vec<u8> {
     // Prologue: load kernel arguments from kernarg segment
     for (i, param) in ir.params.iter().enumerate() {
         let offset = i * 8; // 8 bytes per param (all 64-bit aligned)
-        writeln!(asm, "  ; param {}: {} (offset {})", param.name, param.ty.amdgpu_type(), offset).unwrap();
-        writeln!(asm, "  s_load_dwordx2 s[{}:{}], s[4:5], {:#x}",
-            i * 2, i * 2 + 1, offset).unwrap();
+        writeln!(
+            asm,
+            "  ; param {}: {} (offset {})",
+            param.name,
+            param.ty.amdgpu_type(),
+            offset
+        )
+        .unwrap();
+        writeln!(
+            asm,
+            "  s_load_dwordx2 s[{}:{}], s[4:5], {:#x}",
+            i * 2,
+            i * 2 + 1,
+            offset
+        )
+        .unwrap();
     }
     writeln!(asm, "  s_waitcnt lgkmcnt(0)").unwrap();
     writeln!(asm).unwrap();
@@ -74,7 +87,10 @@ fn lower_op_to_amdgpu(op: &KirOp, ir: &KernelIR) -> String {
         }
         KirOp::GlobalId(dst, dim) => {
             let _ = ir;
-            format!("; globalId dim={} -> v{} (workgroup_id * workgroup_size + local_id)", dim, dst)
+            format!(
+                "; globalId dim={} -> v{} (workgroup_id * workgroup_size + local_id)",
+                dim, dst
+            )
         }
         KirOp::Barrier => "s_barrier".to_string(),
         KirOp::WarpShuffle(dst, val, offset) => {

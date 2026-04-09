@@ -23,7 +23,8 @@ fn snapshot_flash_attention_basic() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]); // strip null
@@ -41,7 +42,8 @@ fn snapshot_flash_attention_paged() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
@@ -59,7 +61,8 @@ fn snapshot_flash_attention_rope_gqa() {
         rope_q: true,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 4,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
@@ -77,7 +80,8 @@ fn snapshot_flash_attention_tree_mask() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: true, gpu_sm: 80,
+        tree_mask: true,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
@@ -99,7 +103,8 @@ fn flash_attention_ptx_has_logsumexp_param() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -122,7 +127,8 @@ fn flash_attention_ptx_loads_logsumexp_base() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -145,7 +151,8 @@ fn flash_attention_ptx_computes_logsumexp() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -192,7 +199,8 @@ fn flash_attention_ptx_logsumexp_has_bounds_check() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -215,7 +223,8 @@ fn flash_attention_ptx_logsumexp_register_declarations() {
         rope_q: false,
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80,
+        tree_mask: false,
+        gpu_sm: 80,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -363,22 +372,12 @@ fn snapshot_fusion_graph_transformer_block() {
         let inputs: Vec<_> = node
             .inputs
             .iter()
-            .map(|i| {
-                graph.nodes[*i as usize]
-                    .name
-                    .as_deref()
-                    .unwrap_or("?")
-            })
+            .map(|i| graph.nodes[*i as usize].name.as_deref().unwrap_or("?"))
             .collect();
         let consumers: Vec<_> = node
             .consumers
             .iter()
-            .map(|c| {
-                graph.nodes[*c as usize]
-                    .name
-                    .as_deref()
-                    .unwrap_or("?")
-            })
+            .map(|c| graph.nodes[*c as usize].name.as_deref().unwrap_or("?"))
             .collect();
         desc.push_str(&format!(
             "{name}: op={op}, inputs=[{}], consumers=[{}], output={}\n",

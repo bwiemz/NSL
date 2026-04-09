@@ -43,24 +43,29 @@ impl GpuTarget {
     /// Supported features for this target.
     pub fn features(&self) -> FeatureSet {
         match self {
-            GpuTarget::Cuda => FeatureSet::SHARED_MEMORY
-                | FeatureSet::WARP_SHUFFLE
-                | FeatureSet::TENSOR_CORES
-                | FeatureSet::ATOMIC_FLOAT
-                | FeatureSet::F16_ARITHMETIC
-                | FeatureSet::BF16_ARITHMETIC,
-            GpuTarget::Rocm => FeatureSet::SHARED_MEMORY
-                | FeatureSet::WARP_SHUFFLE
-                | FeatureSet::TENSOR_CORES
-                | FeatureSet::ATOMIC_FLOAT
-                | FeatureSet::F16_ARITHMETIC
-                | FeatureSet::BF16_ARITHMETIC,
-            GpuTarget::Metal => FeatureSet::SHARED_MEMORY
-                | FeatureSet::WARP_SHUFFLE
-                | FeatureSet::ATOMIC_FLOAT
-                | FeatureSet::F16_ARITHMETIC,
-            GpuTarget::WebGpu => FeatureSet::SHARED_MEMORY
-                | FeatureSet::F16_ARITHMETIC,
+            GpuTarget::Cuda => {
+                FeatureSet::SHARED_MEMORY
+                    | FeatureSet::WARP_SHUFFLE
+                    | FeatureSet::TENSOR_CORES
+                    | FeatureSet::ATOMIC_FLOAT
+                    | FeatureSet::F16_ARITHMETIC
+                    | FeatureSet::BF16_ARITHMETIC
+            }
+            GpuTarget::Rocm => {
+                FeatureSet::SHARED_MEMORY
+                    | FeatureSet::WARP_SHUFFLE
+                    | FeatureSet::TENSOR_CORES
+                    | FeatureSet::ATOMIC_FLOAT
+                    | FeatureSet::F16_ARITHMETIC
+                    | FeatureSet::BF16_ARITHMETIC
+            }
+            GpuTarget::Metal => {
+                FeatureSet::SHARED_MEMORY
+                    | FeatureSet::WARP_SHUFFLE
+                    | FeatureSet::ATOMIC_FLOAT
+                    | FeatureSet::F16_ARITHMETIC
+            }
+            GpuTarget::WebGpu => FeatureSet::SHARED_MEMORY | FeatureSet::F16_ARITHMETIC,
         }
     }
 
@@ -107,34 +112,56 @@ impl FeatureSet {
     /// Human-readable list of feature names.
     pub fn names(self) -> Vec<&'static str> {
         let mut names = Vec::new();
-        if self.0 & 0x01 != 0 { names.push("shared_memory"); }
-        if self.0 & 0x02 != 0 { names.push("warp_shuffle"); }
-        if self.0 & 0x04 != 0 { names.push("tensor_cores"); }
-        if self.0 & 0x08 != 0 { names.push("atomic_float"); }
-        if self.0 & 0x10 != 0 { names.push("subgroup_ops"); }
-        if self.0 & 0x20 != 0 { names.push("f16_arithmetic"); }
-        if self.0 & 0x40 != 0 { names.push("bf16_arithmetic"); }
+        if self.0 & 0x01 != 0 {
+            names.push("shared_memory");
+        }
+        if self.0 & 0x02 != 0 {
+            names.push("warp_shuffle");
+        }
+        if self.0 & 0x04 != 0 {
+            names.push("tensor_cores");
+        }
+        if self.0 & 0x08 != 0 {
+            names.push("atomic_float");
+        }
+        if self.0 & 0x10 != 0 {
+            names.push("subgroup_ops");
+        }
+        if self.0 & 0x20 != 0 {
+            names.push("f16_arithmetic");
+        }
+        if self.0 & 0x40 != 0 {
+            names.push("bf16_arithmetic");
+        }
         names
     }
 }
 
 impl std::ops::BitOr for FeatureSet {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { FeatureSet(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        FeatureSet(self.0 | rhs.0)
+    }
 }
 
 impl std::ops::BitOrAssign for FeatureSet {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 impl std::ops::BitAnd for FeatureSet {
     type Output = Self;
-    fn bitand(self, rhs: Self) -> Self { FeatureSet(self.0 & rhs.0) }
+    fn bitand(self, rhs: Self) -> Self {
+        FeatureSet(self.0 & rhs.0)
+    }
 }
 
 impl std::ops::Not for FeatureSet {
     type Output = Self;
-    fn not(self) -> Self { FeatureSet(!self.0) }
+    fn not(self) -> Self {
+        FeatureSet(!self.0)
+    }
 }
 
 #[cfg(test)]

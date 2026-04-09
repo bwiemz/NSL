@@ -59,9 +59,9 @@ impl GpuSpec {
     /// Crossover point for a given dtype byte width (FLOPs/byte threshold).
     pub fn crossover(&self, dtype_bytes: usize) -> f64 {
         match dtype_bytes {
-            1 => self.crossover_fp8,   // FP8
-            2 => self.crossover_fp16,  // FP16/BF16
-            _ => self.crossover_fp32,  // FP32/F64
+            1 => self.crossover_fp8,  // FP8
+            2 => self.crossover_fp16, // FP16/BF16
+            _ => self.crossover_fp32, // FP32/F64
         }
     }
 
@@ -107,20 +107,40 @@ impl GpuSpec {
 
     /// Returns the appropriate PTX version string for this GPU's features.
     pub fn ptx_version(&self) -> &'static str {
-        if self.sm_version >= 100 { "8.6" }  // Blackwell requires PTX ISA 8.6+
-        else if self.sm_version >= 90 { "8.4" }  // Required for wgmma, TMA, setmaxnreg, mbarrier
-        else { "7.0" }
+        if self.sm_version >= 100 {
+            "8.6"
+        }
+        // Blackwell requires PTX ISA 8.6+
+        else if self.sm_version >= 90 {
+            "8.4"
+        }
+        // Required for wgmma, TMA, setmaxnreg, mbarrier
+        else {
+            "7.0"
+        }
     }
 
     /// Returns the PTX target string for this GPU.
     pub fn ptx_target(&self) -> &'static str {
-        if self.sm_version >= 100 { "sm_100" }  // Blackwell
-        else if self.sm_version >= 90 { "sm_90a" }  // Hopper with async features (wgmma, TMA)
-        else if self.sm_version >= 89 { "sm_89" }
-        else if self.sm_version >= 87 { "sm_87" }
-        else if self.sm_version >= 86 { "sm_86" }
-        else if self.sm_version >= 80 { "sm_80" }
-        else { "sm_52" }
+        if self.sm_version >= 100 {
+            "sm_100"
+        }
+        // Blackwell
+        else if self.sm_version >= 90 {
+            "sm_90a"
+        }
+        // Hopper with async features (wgmma, TMA)
+        else if self.sm_version >= 89 {
+            "sm_89"
+        } else if self.sm_version >= 87 {
+            "sm_87"
+        } else if self.sm_version >= 86 {
+            "sm_86"
+        } else if self.sm_version >= 80 {
+            "sm_80"
+        } else {
+            "sm_52"
+        }
     }
 
     /// Returns true if the GPU supports TMA (Tensor Memory Accelerator, cp.async.bulk.tensor).
@@ -137,135 +157,304 @@ impl GpuSpec {
 
     /// Warp group size: 128 threads on Hopper (4 warps collaborate), 32 on older.
     pub fn warp_group_size(&self) -> u32 {
-        if self.sm_version >= 90 { 128 } else { 32 }
+        if self.sm_version >= 90 {
+            128
+        } else {
+            32
+        }
     }
 }
 
 /// Built-in GPU specification database.
 pub const GPU_DATABASE: &[GpuSpec] = &[
     GpuSpec {
-        name: "A100-SXM", sm_version: 80,
-        peak_fp16_tflops: 312.0, peak_fp8_tflops: 0.0, peak_fp32_tflops: 19.5,
-        peak_bandwidth_gbs: 2039.0, vram_gb: 80.0, l2_cache_mb: 40.0,
-        crossover_fp16: 153.0, crossover_fp8: 0.0, crossover_fp32: 9.6,
-        base_clock_mhz: 765, kernel_launch_overhead_ns: 6000, sync_overhead_ns: 3000,
-        pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 40 * 1024 * 1024,
-        l1_cache_kb: 192, l1_bandwidth_gbs: 14400.0, l2_bandwidth_gbs: 4800.0,
-        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 108,
+        name: "A100-SXM",
+        sm_version: 80,
+        peak_fp16_tflops: 312.0,
+        peak_fp8_tflops: 0.0,
+        peak_fp32_tflops: 19.5,
+        peak_bandwidth_gbs: 2039.0,
+        vram_gb: 80.0,
+        l2_cache_mb: 40.0,
+        crossover_fp16: 153.0,
+        crossover_fp8: 0.0,
+        crossover_fp32: 9.6,
+        base_clock_mhz: 765,
+        kernel_launch_overhead_ns: 6000,
+        sync_overhead_ns: 3000,
+        pcie_bandwidth_gbps: 32.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 40 * 1024 * 1024,
+        l1_cache_kb: 192,
+        l1_bandwidth_gbs: 14400.0,
+        l2_bandwidth_gbs: 4800.0,
+        max_warps_per_sm: 64,
+        registers_per_sm: 65536,
+        num_sms: 108,
         empirical_p95_ratio: 1.30,
     },
     GpuSpec {
-        name: "A100-PCIe", sm_version: 80,
-        peak_fp16_tflops: 312.0, peak_fp8_tflops: 0.0, peak_fp32_tflops: 19.5,
-        peak_bandwidth_gbs: 1555.0, vram_gb: 40.0, l2_cache_mb: 40.0,
-        crossover_fp16: 200.6, crossover_fp8: 0.0, crossover_fp32: 12.5,
-        base_clock_mhz: 765, kernel_launch_overhead_ns: 6000, sync_overhead_ns: 3000,
-        pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 40 * 1024 * 1024,
-        l1_cache_kb: 192, l1_bandwidth_gbs: 14400.0, l2_bandwidth_gbs: 4800.0,
-        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 108,
+        name: "A100-PCIe",
+        sm_version: 80,
+        peak_fp16_tflops: 312.0,
+        peak_fp8_tflops: 0.0,
+        peak_fp32_tflops: 19.5,
+        peak_bandwidth_gbs: 1555.0,
+        vram_gb: 40.0,
+        l2_cache_mb: 40.0,
+        crossover_fp16: 200.6,
+        crossover_fp8: 0.0,
+        crossover_fp32: 12.5,
+        base_clock_mhz: 765,
+        kernel_launch_overhead_ns: 6000,
+        sync_overhead_ns: 3000,
+        pcie_bandwidth_gbps: 32.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 40 * 1024 * 1024,
+        l1_cache_kb: 192,
+        l1_bandwidth_gbs: 14400.0,
+        l2_bandwidth_gbs: 4800.0,
+        max_warps_per_sm: 64,
+        registers_per_sm: 65536,
+        num_sms: 108,
         empirical_p95_ratio: 1.30,
     },
     GpuSpec {
-        name: "H100-SXM", sm_version: 90,
-        peak_fp16_tflops: 989.0, peak_fp8_tflops: 1979.0, peak_fp32_tflops: 67.0,
-        peak_bandwidth_gbs: 3350.0, vram_gb: 80.0, l2_cache_mb: 50.0,
-        crossover_fp16: 295.2, crossover_fp8: 590.7, crossover_fp32: 20.0,
-        base_clock_mhz: 1095, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
-        pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.5, l2_cache_bytes: 50 * 1024 * 1024,
-        l1_cache_kb: 256, l1_bandwidth_gbs: 19200.0, l2_bandwidth_gbs: 6000.0,
-        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 132,
+        name: "H100-SXM",
+        sm_version: 90,
+        peak_fp16_tflops: 989.0,
+        peak_fp8_tflops: 1979.0,
+        peak_fp32_tflops: 67.0,
+        peak_bandwidth_gbs: 3350.0,
+        vram_gb: 80.0,
+        l2_cache_mb: 50.0,
+        crossover_fp16: 295.2,
+        crossover_fp8: 590.7,
+        crossover_fp32: 20.0,
+        base_clock_mhz: 1095,
+        kernel_launch_overhead_ns: 5000,
+        sync_overhead_ns: 2000,
+        pcie_bandwidth_gbps: 64.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 50 * 1024 * 1024,
+        l1_cache_kb: 256,
+        l1_bandwidth_gbs: 19200.0,
+        l2_bandwidth_gbs: 6000.0,
+        max_warps_per_sm: 64,
+        registers_per_sm: 65536,
+        num_sms: 132,
         empirical_p95_ratio: 1.25,
     },
     GpuSpec {
-        name: "H100-PCIe", sm_version: 90,
-        peak_fp16_tflops: 756.0, peak_fp8_tflops: 1513.0, peak_fp32_tflops: 51.0,
-        peak_bandwidth_gbs: 2039.0, vram_gb: 80.0, l2_cache_mb: 50.0,
-        crossover_fp16: 370.8, crossover_fp8: 741.9, crossover_fp32: 25.0,
-        base_clock_mhz: 1095, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
-        pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 50 * 1024 * 1024,
-        l1_cache_kb: 256, l1_bandwidth_gbs: 19200.0, l2_bandwidth_gbs: 6000.0,
-        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 114,
+        name: "H100-PCIe",
+        sm_version: 90,
+        peak_fp16_tflops: 756.0,
+        peak_fp8_tflops: 1513.0,
+        peak_fp32_tflops: 51.0,
+        peak_bandwidth_gbs: 2039.0,
+        vram_gb: 80.0,
+        l2_cache_mb: 50.0,
+        crossover_fp16: 370.8,
+        crossover_fp8: 741.9,
+        crossover_fp32: 25.0,
+        base_clock_mhz: 1095,
+        kernel_launch_overhead_ns: 5000,
+        sync_overhead_ns: 2000,
+        pcie_bandwidth_gbps: 32.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 50 * 1024 * 1024,
+        l1_cache_kb: 256,
+        l1_bandwidth_gbs: 19200.0,
+        l2_bandwidth_gbs: 6000.0,
+        max_warps_per_sm: 64,
+        registers_per_sm: 65536,
+        num_sms: 114,
         empirical_p95_ratio: 1.25,
     },
     GpuSpec {
-        name: "RTX-4090", sm_version: 89,
-        peak_fp16_tflops: 330.0, peak_fp8_tflops: 661.0, peak_fp32_tflops: 82.6,
-        peak_bandwidth_gbs: 1008.0, vram_gb: 24.0, l2_cache_mb: 72.0,
-        crossover_fp16: 327.4, crossover_fp8: 655.8, crossover_fp32: 81.9,
-        base_clock_mhz: 2235, kernel_launch_overhead_ns: 4000, sync_overhead_ns: 1500,
-        pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 72 * 1024 * 1024,
-        l1_cache_kb: 128, l1_bandwidth_gbs: 12800.0, l2_bandwidth_gbs: 5600.0,
-        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 128,
+        name: "RTX-4090",
+        sm_version: 89,
+        peak_fp16_tflops: 330.0,
+        peak_fp8_tflops: 661.0,
+        peak_fp32_tflops: 82.6,
+        peak_bandwidth_gbs: 1008.0,
+        vram_gb: 24.0,
+        l2_cache_mb: 72.0,
+        crossover_fp16: 327.4,
+        crossover_fp8: 655.8,
+        crossover_fp32: 81.9,
+        base_clock_mhz: 2235,
+        kernel_launch_overhead_ns: 4000,
+        sync_overhead_ns: 1500,
+        pcie_bandwidth_gbps: 32.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 72 * 1024 * 1024,
+        l1_cache_kb: 128,
+        l1_bandwidth_gbs: 12800.0,
+        l2_bandwidth_gbs: 5600.0,
+        max_warps_per_sm: 48,
+        registers_per_sm: 65536,
+        num_sms: 128,
         empirical_p95_ratio: 1.35,
     },
     GpuSpec {
-        name: "RTX-3090", sm_version: 86,
-        peak_fp16_tflops: 142.0, peak_fp8_tflops: 0.0, peak_fp32_tflops: 35.6,
-        peak_bandwidth_gbs: 936.2, vram_gb: 24.0, l2_cache_mb: 6.0,
-        crossover_fp16: 151.7, crossover_fp8: 0.0, crossover_fp32: 38.0,
-        base_clock_mhz: 1395, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
-        pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 6 * 1024 * 1024,
-        l1_cache_kb: 128, l1_bandwidth_gbs: 9600.0, l2_bandwidth_gbs: 2400.0,
-        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 82,
+        name: "RTX-3090",
+        sm_version: 86,
+        peak_fp16_tflops: 142.0,
+        peak_fp8_tflops: 0.0,
+        peak_fp32_tflops: 35.6,
+        peak_bandwidth_gbs: 936.2,
+        vram_gb: 24.0,
+        l2_cache_mb: 6.0,
+        crossover_fp16: 151.7,
+        crossover_fp8: 0.0,
+        crossover_fp32: 38.0,
+        base_clock_mhz: 1395,
+        kernel_launch_overhead_ns: 5000,
+        sync_overhead_ns: 2000,
+        pcie_bandwidth_gbps: 32.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 6 * 1024 * 1024,
+        l1_cache_kb: 128,
+        l1_bandwidth_gbs: 9600.0,
+        l2_bandwidth_gbs: 2400.0,
+        max_warps_per_sm: 48,
+        registers_per_sm: 65536,
+        num_sms: 82,
         empirical_p95_ratio: 1.35,
     },
     GpuSpec {
-        name: "L40S", sm_version: 89,
-        peak_fp16_tflops: 362.0, peak_fp8_tflops: 733.0, peak_fp32_tflops: 91.6,
-        peak_bandwidth_gbs: 864.0, vram_gb: 48.0, l2_cache_mb: 96.0,
-        crossover_fp16: 419.0, crossover_fp8: 848.4, crossover_fp32: 106.0,
-        base_clock_mhz: 1110, kernel_launch_overhead_ns: 5000, sync_overhead_ns: 2000,
-        pcie_bandwidth_gbps: 32.0, occupancy_worst_case: 0.5, l2_cache_bytes: 48 * 1024 * 1024,
-        l1_cache_kb: 128, l1_bandwidth_gbs: 12800.0, l2_bandwidth_gbs: 5600.0,
-        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 142,
+        name: "L40S",
+        sm_version: 89,
+        peak_fp16_tflops: 362.0,
+        peak_fp8_tflops: 733.0,
+        peak_fp32_tflops: 91.6,
+        peak_bandwidth_gbs: 864.0,
+        vram_gb: 48.0,
+        l2_cache_mb: 96.0,
+        crossover_fp16: 419.0,
+        crossover_fp8: 848.4,
+        crossover_fp32: 106.0,
+        base_clock_mhz: 1110,
+        kernel_launch_overhead_ns: 5000,
+        sync_overhead_ns: 2000,
+        pcie_bandwidth_gbps: 32.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 48 * 1024 * 1024,
+        l1_cache_kb: 128,
+        l1_bandwidth_gbs: 12800.0,
+        l2_bandwidth_gbs: 5600.0,
+        max_warps_per_sm: 48,
+        registers_per_sm: 65536,
+        num_sms: 142,
         empirical_p95_ratio: 1.30,
     },
     // NVIDIA Jetson AGX Orin
     GpuSpec {
-        name: "Orin", sm_version: 87,
-        peak_fp16_tflops: 170.0, peak_fp8_tflops: 170.0, peak_fp32_tflops: 5.3,
-        peak_bandwidth_gbs: 204.8, vram_gb: 64.0, l2_cache_mb: 4.0,
-        crossover_fp16: 830.0, crossover_fp8: 830.0, crossover_fp32: 25.9,
-        base_clock_mhz: 624, kernel_launch_overhead_ns: 8000, sync_overhead_ns: 4000,
-        pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.4, l2_cache_bytes: 4 * 1024 * 1024,
-        l1_cache_kb: 128, l1_bandwidth_gbs: 3200.0, l2_bandwidth_gbs: 800.0,
-        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 16,
+        name: "Orin",
+        sm_version: 87,
+        peak_fp16_tflops: 170.0,
+        peak_fp8_tflops: 170.0,
+        peak_fp32_tflops: 5.3,
+        peak_bandwidth_gbs: 204.8,
+        vram_gb: 64.0,
+        l2_cache_mb: 4.0,
+        crossover_fp16: 830.0,
+        crossover_fp8: 830.0,
+        crossover_fp32: 25.9,
+        base_clock_mhz: 624,
+        kernel_launch_overhead_ns: 8000,
+        sync_overhead_ns: 4000,
+        pcie_bandwidth_gbps: 0.0,
+        occupancy_worst_case: 0.4,
+        l2_cache_bytes: 4 * 1024 * 1024,
+        l1_cache_kb: 128,
+        l1_bandwidth_gbs: 3200.0,
+        l2_bandwidth_gbs: 800.0,
+        max_warps_per_sm: 48,
+        registers_per_sm: 65536,
+        num_sms: 16,
         empirical_p95_ratio: 1.40,
     },
     // NVIDIA Jetson Orin NX (smaller edge)
     GpuSpec {
-        name: "Orin-NX", sm_version: 87,
-        peak_fp16_tflops: 100.0, peak_fp8_tflops: 100.0, peak_fp32_tflops: 3.1,
-        peak_bandwidth_gbs: 102.4, vram_gb: 16.0, l2_cache_mb: 2.0,
-        crossover_fp16: 976.0, crossover_fp8: 976.0, crossover_fp32: 30.3,
-        base_clock_mhz: 624, kernel_launch_overhead_ns: 8000, sync_overhead_ns: 4000,
-        pcie_bandwidth_gbps: 0.0, occupancy_worst_case: 0.35, l2_cache_bytes: 2 * 1024 * 1024,
-        l1_cache_kb: 128, l1_bandwidth_gbs: 1600.0, l2_bandwidth_gbs: 400.0,
-        max_warps_per_sm: 48, registers_per_sm: 65536, num_sms: 8,
+        name: "Orin-NX",
+        sm_version: 87,
+        peak_fp16_tflops: 100.0,
+        peak_fp8_tflops: 100.0,
+        peak_fp32_tflops: 3.1,
+        peak_bandwidth_gbs: 102.4,
+        vram_gb: 16.0,
+        l2_cache_mb: 2.0,
+        crossover_fp16: 976.0,
+        crossover_fp8: 976.0,
+        crossover_fp32: 30.3,
+        base_clock_mhz: 624,
+        kernel_launch_overhead_ns: 8000,
+        sync_overhead_ns: 4000,
+        pcie_bandwidth_gbps: 0.0,
+        occupancy_worst_case: 0.35,
+        l2_cache_bytes: 2 * 1024 * 1024,
+        l1_cache_kb: 128,
+        l1_bandwidth_gbs: 1600.0,
+        l2_bandwidth_gbs: 400.0,
+        max_warps_per_sm: 48,
+        registers_per_sm: 65536,
+        num_sms: 8,
         empirical_p95_ratio: 1.40,
     },
     // NVIDIA B200 (Blackwell, sm_100) — MXFP8 per-block scaling + NVFP4
     GpuSpec {
-        name: "B200", sm_version: 100,
-        peak_fp16_tflops: 2250.0, peak_fp8_tflops: 4500.0, peak_fp32_tflops: 70.0,
-        peak_bandwidth_gbs: 8000.0, vram_gb: 192.0, l2_cache_mb: 128.0,
-        crossover_fp16: 281.3, crossover_fp8: 562.5, crossover_fp32: 8.75,
-        base_clock_mhz: 1800, kernel_launch_overhead_ns: 3000, sync_overhead_ns: 1200,
-        pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.6, l2_cache_bytes: 128 * 1024 * 1024,
-        l1_cache_kb: 256, l1_bandwidth_gbs: 25600.0, l2_bandwidth_gbs: 12000.0,
-        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 160,
+        name: "B200",
+        sm_version: 100,
+        peak_fp16_tflops: 2250.0,
+        peak_fp8_tflops: 4500.0,
+        peak_fp32_tflops: 70.0,
+        peak_bandwidth_gbs: 8000.0,
+        vram_gb: 192.0,
+        l2_cache_mb: 128.0,
+        crossover_fp16: 281.3,
+        crossover_fp8: 562.5,
+        crossover_fp32: 8.75,
+        base_clock_mhz: 1800,
+        kernel_launch_overhead_ns: 3000,
+        sync_overhead_ns: 1200,
+        pcie_bandwidth_gbps: 64.0,
+        occupancy_worst_case: 0.6,
+        l2_cache_bytes: 128 * 1024 * 1024,
+        l1_cache_kb: 256,
+        l1_bandwidth_gbs: 25600.0,
+        l2_bandwidth_gbs: 12000.0,
+        max_warps_per_sm: 64,
+        registers_per_sm: 65536,
+        num_sms: 160,
         empirical_p95_ratio: 1.20,
     },
     // NVIDIA B100 (Blackwell, sm_100) — MXFP8 + NVFP4 (PCIe variant)
     GpuSpec {
-        name: "B100", sm_version: 100,
-        peak_fp16_tflops: 1750.0, peak_fp8_tflops: 3500.0, peak_fp32_tflops: 56.0,
-        peak_bandwidth_gbs: 6400.0, vram_gb: 192.0, l2_cache_mb: 96.0,
-        crossover_fp16: 273.4, crossover_fp8: 546.9, crossover_fp32: 8.75,
-        base_clock_mhz: 1600, kernel_launch_overhead_ns: 3500, sync_overhead_ns: 1500,
-        pcie_bandwidth_gbps: 64.0, occupancy_worst_case: 0.55, l2_cache_bytes: 96 * 1024 * 1024,
-        l1_cache_kb: 256, l1_bandwidth_gbs: 20000.0, l2_bandwidth_gbs: 10000.0,
-        max_warps_per_sm: 64, registers_per_sm: 65536, num_sms: 128,
+        name: "B100",
+        sm_version: 100,
+        peak_fp16_tflops: 1750.0,
+        peak_fp8_tflops: 3500.0,
+        peak_fp32_tflops: 56.0,
+        peak_bandwidth_gbs: 6400.0,
+        vram_gb: 192.0,
+        l2_cache_mb: 96.0,
+        crossover_fp16: 273.4,
+        crossover_fp8: 546.9,
+        crossover_fp32: 8.75,
+        base_clock_mhz: 1600,
+        kernel_launch_overhead_ns: 3500,
+        sync_overhead_ns: 1500,
+        pcie_bandwidth_gbps: 64.0,
+        occupancy_worst_case: 0.55,
+        l2_cache_bytes: 96 * 1024 * 1024,
+        l1_cache_kb: 256,
+        l1_bandwidth_gbs: 20000.0,
+        l2_bandwidth_gbs: 10000.0,
+        max_warps_per_sm: 64,
+        registers_per_sm: 65536,
+        num_sms: 128,
         empirical_p95_ratio: 1.20,
     },
 ];
@@ -275,7 +464,10 @@ pub fn find_gpu(name: &str) -> Option<&'static GpuSpec> {
     let name_upper = name.to_uppercase().replace(' ', "-");
 
     // Exact match first
-    if let Some(gpu) = GPU_DATABASE.iter().find(|g| g.name.to_uppercase() == name_upper) {
+    if let Some(gpu) = GPU_DATABASE
+        .iter()
+        .find(|g| g.name.to_uppercase() == name_upper)
+    {
         return Some(gpu);
     }
 
@@ -288,7 +480,11 @@ pub fn find_gpu(name: &str) -> Option<&'static GpuSpec> {
     match matches.len() {
         0 => None,
         1 => Some(matches[0]),
-        _ => matches.iter().find(|g| g.name.contains("SXM")).copied().or(Some(matches[0])),
+        _ => matches
+            .iter()
+            .find(|g| g.name.contains("SXM"))
+            .copied()
+            .or(Some(matches[0])),
     }
 }
 
@@ -360,7 +556,9 @@ pub const FPGA_DATABASE: &[FpgaSpec] = &[
 /// Find an FPGA by device name. Case-insensitive exact match.
 pub fn find_fpga(name: &str) -> Option<&'static FpgaSpec> {
     let name_lower = name.to_lowercase();
-    FPGA_DATABASE.iter().find(|f| f.device_name.to_lowercase() == name_lower)
+    FPGA_DATABASE
+        .iter()
+        .find(|f| f.device_name.to_lowercase() == name_lower)
 }
 
 /// Hardware specifications for a CPU model (used for WCET analysis on CPU targets).
@@ -540,13 +738,22 @@ mod tests {
     #[test]
     fn test_fp8_mma_requires_sm90() {
         let h100 = find_gpu("H100-SXM").unwrap();
-        assert!(h100.supports_fp8_mma(), "H100 (sm_90) should support FP8 MMA");
+        assert!(
+            h100.supports_fp8_mma(),
+            "H100 (sm_90) should support FP8 MMA"
+        );
 
         let a100 = find_gpu("A100-SXM").unwrap();
-        assert!(!a100.supports_fp8_mma(), "A100 (sm_80) should NOT support FP8 MMA");
+        assert!(
+            !a100.supports_fp8_mma(),
+            "A100 (sm_80) should NOT support FP8 MMA"
+        );
 
         let rtx4090 = find_gpu("RTX-4090").unwrap();
-        assert!(!rtx4090.supports_fp8_mma(), "RTX-4090 (sm_89) should NOT support FP8 MMA");
+        assert!(
+            !rtx4090.supports_fp8_mma(),
+            "RTX-4090 (sm_89) should NOT support FP8 MMA"
+        );
     }
 
     #[test]
@@ -558,10 +765,16 @@ mod tests {
         assert!(a100.supports_fp16_mma(), "A100 should support FP16 MMA");
 
         let rtx3090 = find_gpu("RTX-3090").unwrap();
-        assert!(rtx3090.supports_fp16_mma(), "RTX-3090 (sm_86) should support FP16 MMA");
+        assert!(
+            rtx3090.supports_fp16_mma(),
+            "RTX-3090 (sm_86) should support FP16 MMA"
+        );
 
         let orin = find_gpu("Orin").unwrap();
-        assert!(orin.supports_fp16_mma(), "Orin (sm_87) should support FP16 MMA");
+        assert!(
+            orin.supports_fp16_mma(),
+            "Orin (sm_87) should support FP16 MMA"
+        );
     }
 
     #[test]
@@ -570,10 +783,16 @@ mod tests {
         assert!(h100.supports_wgmma(), "H100 (sm_90) should support wgmma");
 
         let a100 = find_gpu("A100-SXM").unwrap();
-        assert!(!a100.supports_wgmma(), "A100 (sm_80) should NOT support wgmma");
+        assert!(
+            !a100.supports_wgmma(),
+            "A100 (sm_80) should NOT support wgmma"
+        );
 
         let rtx4090 = find_gpu("RTX-4090").unwrap();
-        assert!(!rtx4090.supports_wgmma(), "RTX-4090 (sm_89) should NOT support wgmma");
+        assert!(
+            !rtx4090.supports_wgmma(),
+            "RTX-4090 (sm_89) should NOT support wgmma"
+        );
     }
 
     #[test]
@@ -593,7 +812,11 @@ mod tests {
     #[test]
     fn test_warp_group_size() {
         let h100 = find_gpu("H100-SXM").unwrap();
-        assert_eq!(h100.warp_group_size(), 128, "Hopper uses 128-thread warp groups");
+        assert_eq!(
+            h100.warp_group_size(),
+            128,
+            "Hopper uses 128-thread warp groups"
+        );
 
         let a100 = find_gpu("A100-SXM").unwrap();
         assert_eq!(a100.warp_group_size(), 32, "Ampere uses 32-thread warps");
@@ -643,7 +866,8 @@ mod tests {
             assert!(
                 gpu.empirical_p95_ratio >= 1.0,
                 "{} has p95 ratio < 1.0: {}",
-                gpu.name, gpu.empirical_p95_ratio
+                gpu.name,
+                gpu.empirical_p95_ratio
             );
         }
     }
@@ -660,22 +884,39 @@ mod tests {
         assert!(!a100.supports_tma(), "A100 (sm_80) should NOT support TMA");
 
         let rtx4090 = find_gpu("RTX-4090").unwrap();
-        assert!(!rtx4090.supports_tma(), "RTX-4090 (sm_89) should NOT support TMA");
+        assert!(
+            !rtx4090.supports_tma(),
+            "RTX-4090 (sm_89) should NOT support TMA"
+        );
     }
 
     #[test]
     fn test_fp8_wgmma_requires_sm90() {
         let h100 = find_gpu("H100-SXM").unwrap();
-        assert!(h100.supports_fp8_wgmma(), "H100 (sm_90) should support FP8 wgmma");
+        assert!(
+            h100.supports_fp8_wgmma(),
+            "H100 (sm_90) should support FP8 wgmma"
+        );
 
         let a100 = find_gpu("A100-SXM").unwrap();
-        assert!(!a100.supports_fp8_wgmma(), "A100 (sm_80) should NOT support FP8 wgmma");
+        assert!(
+            !a100.supports_fp8_wgmma(),
+            "A100 (sm_80) should NOT support FP8 wgmma"
+        );
     }
 
     #[test]
     fn test_hopper_ptx_target_is_sm90a() {
         let h100 = find_gpu("H100-SXM").unwrap();
-        assert_eq!(h100.ptx_target(), "sm_90a", "Hopper needs sm_90a for async features");
-        assert_eq!(h100.ptx_version(), "8.4", "Hopper needs PTX 8.4 for wgmma/TMA/setmaxnreg");
+        assert_eq!(
+            h100.ptx_target(),
+            "sm_90a",
+            "Hopper needs sm_90a for async features"
+        );
+        assert_eq!(
+            h100.ptx_version(),
+            "8.4",
+            "Hopper needs PTX 8.4 for wgmma/TMA/setmaxnreg"
+        );
     }
 }

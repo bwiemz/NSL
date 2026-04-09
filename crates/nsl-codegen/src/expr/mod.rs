@@ -9,12 +9,13 @@ use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
-use nsl_ast::expr::{Expr, ExprKind};
-use nsl_ast::operator::UnaryOp;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::types::is_float_type;
+use nsl_ast::expr::{Expr, ExprKind};
+use nsl_ast::operator::UnaryOp;
+use nsl_semantic::types::Type;
 
 impl Compiler<'_> {
     pub fn compile_expr(
@@ -45,7 +46,10 @@ impl Compiler<'_> {
                     // The actual nsl_tensor_free is emitted in free_linear_consumes()
                     // after the statement finishes using the value.
                     if let Some(ref lowering) = state.ownership.lowering {
-                        if lowering.should_free_at_consumption(sym) {
+                        if lowering.should_free_at_consumption(sym)
+                            && !state.param_symbols.contains(sym)
+                            && !state.non_owning_symbols.contains(sym)
+                        {
                             state.ownership.linear_consume_pending.push(val);
                         }
                     }
@@ -67,9 +71,7 @@ impl Compiler<'_> {
                     if let Some(tag) = self.lookup_enum_variant_tag(&name) {
                         Ok(builder.ins().iconst(cl_types::I64, tag))
                     } else {
-                        Err(CodegenError::new(format!(
-                            "undefined variable '{name}'"
-                        )))
+                        Err(CodegenError::new(format!("undefined variable '{name}'")))
                     }
                 }
             }
@@ -77,47 +79,46 @@ impl Compiler<'_> {
             ExprKind::BinaryOp { left, op, right } => {
                 self.compile_binary_op(builder, state, left, *op, right, expr)
             }
-            ExprKind::UnaryOp { op, operand } => {
-                self.compile_unary_op(builder, state, *op, operand)
-            }
-            ExprKind::Call { callee, args } => {
-                self.compile_call(builder, state, callee, args, expr)
-            }
+            ExprKind::UnaryOp { op, operand } => self.compile_unary_op(builder, state, *op, operand),
+            ExprKind::Call { callee, args } => self.compile_call(builder, state, callee, args, expr),
             ExprKind::MemberAccess { object, member } => {
                 self.compile_member_access(builder, state, object, *member, expr)
             }
-            ExprKind::ListLiteral(elements) => {
-                self.compile_list_literal(builder, state, elements)
-            }
+            ExprKind::ListLiteral(elements) => self.compile_list_literal(builder, state, elements),
             ExprKind::Subscript { object, index } => {
                 self.compile_subscript(builder, state, object, index)
             }
-            ExprKind::ListComp { element, generators } => {
-                self.compile_list_comp(builder, state, element, generators)
-            }
-            ExprKind::Lambda { params, body } => {
-                self.compile_lambda(builder, state, params, body)
-            }
-            ExprKind::BlockExpr(block) => {
-                self.compile_block_expr(builder, state, block)
-            }
+            ExprKind::ListComp {
+                element,
+                generators,
+            } => self.compile_list_comp(builder, state, element, generators),
+            ExprKind::Lambda { params, body } => self.compile_lambda(builder, state, params, body),
+            ExprKind::BlockExpr(block) => self.compile_block_expr(builder, state, block),
             ExprKind::TupleLiteral(elements) => {
                 self.compile_tuple_literal(builder, state, elements)
             }
-            ExprKind::DictLiteral(pairs) => {
-                self.compile_dict_literal(builder, state, pairs)
-            }
+            ExprKind::DictLiteral(pairs) => self.compile_dict_literal(builder, state, pairs),
             ExprKind::MatchExpr { subject, arms } => {
                 self.compile_match_expr(builder, state, subject, arms, expr)
             }
-            ExprKind::Range { start, end, inclusive } => {
-                self.compile_range_expr(builder, state, start.as_deref(), end.as_deref(), *inclusive)
-            }
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => self.compile_range_expr(
+                builder,
+                state,
+                start.as_deref(),
+                end.as_deref(),
+                *inclusive,
+            ),
             ExprKind::FString(parts) => self.compile_fstring(builder, state, parts),
             ExprKind::Paren(inner) => self.compile_expr(builder, state, inner),
-            ExprKind::IfExpr { condition, then_expr, else_expr } => {
-                self.compile_if_expr(builder, state, condition, then_expr, else_expr, expr)
-            }
+            ExprKind::IfExpr {
+                condition,
+                then_expr,
+                else_expr,
+            } => self.compile_if_expr(builder, state, condition, then_expr, else_expr, expr),
             ExprKind::Pipe { left, right } => {
                 let left_val = self.compile_expr(builder, state, left)?;
                 match &right.kind {
@@ -175,7 +176,9 @@ impl Compiler<'_> {
         let val = self.compile_expr(builder, state, operand)?;
         let ty = self.node_type(operand.id).clone();
         match op {
-            UnaryOp::Neg if ty.is_tensor() || (ty.is_indeterminate() && !state.flags.in_dtype_method) => {
+            UnaryOp::Neg
+                if ty.is_tensor() || (ty.is_indeterminate() && !state.flags.in_dtype_method) =>
+            {
                 self.compile_call_by_name(builder, "nsl_tensor_neg", &[val])
             }
             UnaryOp::Neg if is_float_type(&ty) || builder.func.dfg.value_type(val).is_float() => {
@@ -208,6 +211,78 @@ impl Compiler<'_> {
             }
         }
         false
+    }
+
+    fn track_tensor_temporary(state: &mut FuncState, value: Value) {
+        if !state.cleanup.tensor_temporaries.contains(&value) {
+            state.cleanup.tensor_temporaries.push(value);
+        }
+    }
+
+    fn expr_result_is_owned_temporary(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Only a narrow set of builtin tensor-producing calls need extra
+            // registration here. Broad call tracking interferes with training
+            // lowering because many calls either alias existing buffers or are
+            // already handled by normal statement ownership paths.
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(sym) = &callee.kind {
+                    let name = self.resolve_sym(*sym);
+                    return matches!(
+                        name,
+                        "exp"
+                            | "log"
+                            | "sqrt"
+                            | "abs"
+                            | "sign"
+                            | "neg"
+                            | "zeros"
+                            | "ones"
+                            | "full"
+                            | "rand"
+                            | "randn"
+                            | "arange"
+                            | "zeros_like"
+                            | "relu"
+                            | "gelu"
+                            | "silu"
+                            | "sigmoid"
+                            | "tensor_sin"
+                            | "tensor_cos"
+                            | "rotate_half"
+                            | "tanh"
+                            | "softmax"
+                            | "log_softmax"
+                    );
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Call-like expression lowering bypasses the per-op temporary registration
+    /// used by binary tensor ops. Track those owned tensor results here so
+    /// anonymous subexpressions participate in statement cleanup.
+    fn track_owned_tensor_expr_result(&self, state: &mut FuncState, expr: &Expr, value: Value) {
+        if !self.expr_result_is_owned_temporary(expr) {
+            return;
+        }
+        let ty = self.node_type(expr.id);
+        if ty.is_tensor() || matches!(ty, Type::Sparse { .. }) {
+            Self::track_tensor_temporary(state, value);
+        }
+    }
+
+    pub(crate) fn compile_nested_expr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        expr: &Expr,
+    ) -> Result<Value, CodegenError> {
+        let value = self.compile_expr(builder, state, expr)?;
+        self.track_owned_tensor_expr_result(state, expr, value);
+        Ok(value)
     }
 
     // ── Trace instrumentation (M45) ─────────────────────────────────
@@ -266,10 +341,9 @@ impl Compiler<'_> {
 
         if self.compile_options.trace_ops {
             // Emit: nsl_trace_record_op(op_type_id, input0, input1_or_0, result)
-            let op_id = builder.ins().iconst(
-                cl_types::I64,
-                self.trace_op_id(fn_name) as i64,
-            );
+            let op_id = builder
+                .ins()
+                .iconst(cl_types::I64, self.trace_op_id(fn_name) as i64);
             let in0 = if !args.is_empty() {
                 args[0]
             } else {
@@ -287,11 +361,7 @@ impl Compiler<'_> {
             )?;
 
             // M45: Pass NaN flag to warning function — it only prints when flag==1
-            self.compile_call_by_name(
-                builder,
-                "nsl_trace_nan_warning",
-                &[nan_flag, op_id],
-            )?;
+            self.compile_call_by_name(builder, "nsl_trace_nan_warning", &[nan_flag, op_id])?;
         }
 
         Ok(result)

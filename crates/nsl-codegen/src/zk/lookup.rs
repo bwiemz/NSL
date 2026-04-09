@@ -240,12 +240,7 @@ impl LookupRegistry {
     ///
     /// If the table already exists, `output_bits` is ignored and the cached
     /// table is returned unchanged.
-    pub fn get_or_create(
-        &mut self,
-        name: &str,
-        input_bits: u32,
-        output_bits: u32,
-    ) -> &LookupTable {
+    pub fn get_or_create(&mut self, name: &str, input_bits: u32, output_bits: u32) -> &LookupTable {
         self.tables
             .entry((name.to_string(), input_bits))
             .or_insert_with(|| precompute_table(name, input_bits, output_bits))
@@ -273,7 +268,11 @@ mod tests {
     #[test]
     fn relu_table_8bit() {
         let table = precompute_table("relu", 8, 8);
-        assert_eq!(table.entries.len(), 256, "8-bit table must have 256 entries");
+        assert_eq!(
+            table.entries.len(),
+            256,
+            "8-bit table must have 256 entries"
+        );
 
         // Index 128 corresponds to signed integer 128 - 256 = -128, but we
         // actually want to test a few specific signed values.
@@ -298,7 +297,11 @@ mod tests {
     #[test]
     fn gelu_table_8bit_zero_is_zero() {
         let table = precompute_table("gelu", 8, 8);
-        assert_eq!(table.entries.len(), 256, "8-bit table must have 256 entries");
+        assert_eq!(
+            table.entries.len(),
+            256,
+            "8-bit table must have 256 entries"
+        );
 
         // GELU(0) = 0 * 0.5 * (1 + erf(0)) = 0
         let (_, out_zero) = table.entries[0]; // index 0 = signed 0
@@ -308,7 +311,11 @@ mod tests {
     #[test]
     fn custom_table_from_closure() {
         let table = precompute_table_from_fn(|x: f64| x * x, 8, 8);
-        assert_eq!(table.entries.len(), 256, "8-bit table must have 256 entries");
+        assert_eq!(
+            table.entries.len(),
+            256,
+            "8-bit table must have 256 entries"
+        );
         assert_eq!(table.name, "<custom>");
 
         // x=0 -> x^2 = 0; quantised -> 0
@@ -321,7 +328,11 @@ mod tests {
         let mut reg = LookupRegistry::new();
         reg.get_or_create("gelu", 8, 8);
         reg.get_or_create("gelu", 8, 8);
-        assert_eq!(reg.tables.len(), 1, "same (name, bits) must not create a duplicate");
+        assert_eq!(
+            reg.tables.len(),
+            1,
+            "same (name, bits) must not create a duplicate"
+        );
     }
 
     #[test]
@@ -329,7 +340,11 @@ mod tests {
         let mut reg = LookupRegistry::new();
         reg.get_or_create("gelu", 8, 8);
         reg.get_or_create("gelu", 16, 16);
-        assert_eq!(reg.tables.len(), 2, "different input_bits must be stored separately");
+        assert_eq!(
+            reg.tables.len(),
+            2,
+            "different input_bits must be stored separately"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -361,7 +376,11 @@ mod tests {
         assert_eq!(out, FieldElement::from_u64(0), "log(0) returns 0 sentinel");
         // Signed index 255 -> x=-1, log(-1) should also return 0.
         let (_, out_neg) = table.entries[255];
-        assert_eq!(out_neg, FieldElement::from_u64(0), "log(-1) returns 0 sentinel");
+        assert_eq!(
+            out_neg,
+            FieldElement::from_u64(0),
+            "log(-1) returns 0 sentinel"
+        );
     }
 
     #[test]
@@ -376,10 +395,18 @@ mod tests {
         let table = precompute_table("rsqrt", 8, 8);
         // x=0 -> rsqrt(0) = 0
         let (_, out) = table.entries[0];
-        assert_eq!(out, FieldElement::from_u64(0), "rsqrt(0) returns 0 sentinel");
+        assert_eq!(
+            out,
+            FieldElement::from_u64(0),
+            "rsqrt(0) returns 0 sentinel"
+        );
         // x=-1 (index 255) -> rsqrt(-1) = 0
         let (_, out_neg) = table.entries[255];
-        assert_eq!(out_neg, FieldElement::from_u64(0), "rsqrt(-1) returns 0 sentinel");
+        assert_eq!(
+            out_neg,
+            FieldElement::from_u64(0),
+            "rsqrt(-1) returns 0 sentinel"
+        );
     }
 
     #[test]
@@ -458,7 +485,11 @@ mod tests {
 
         // x = -128 (index 128) -> abs(-128) = 128, clamped to 127 for 8-bit signed output
         let (_, out_neg128) = table.entries[128];
-        assert_eq!(out_neg128, FieldElement::from_u64(127), "abs(-128) clamped to 127");
+        assert_eq!(
+            out_neg128,
+            FieldElement::from_u64(127),
+            "abs(-128) clamped to 127"
+        );
 
         // x = 127 (index 127) -> abs(127) = 127
         let (_, out_127) = table.entries[127];

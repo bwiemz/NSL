@@ -4,9 +4,9 @@
 //! constant-folds tensor operations with known operands, and eliminates dead weights.
 //! Produces bespoke binaries optimized for a specific checkpoint.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
-use sha2::{Sha256, Digest};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WeightAwareConfig
@@ -196,22 +196,28 @@ impl WeightEntry {
     /// Returns None for floating-point weights that don't need scaling.
     pub fn compute_scale(&self) -> Option<f32> {
         let dtype_max = match self.dtype {
-            WeightDType::F8E4M3 => 448.0_f32,  // E4M3 max representable
+            WeightDType::F8E4M3 => 448.0_f32,   // E4M3 max representable
             WeightDType::F8E5M2 => 57344.0_f32, // E5M2 max representable
             WeightDType::I8 => 127.0_f32,
             WeightDType::I32 => return None, // integer weights, no scaling
-            _ => return None, // F16/BF16/F32/F64 don't need explicit scaling
+            _ => return None,                // F16/BF16/F32/F64 don't need explicit scaling
         };
         // Compute max absolute value
         let bw = self.dtype.byte_width();
         let mut max_abs: f64 = 0.0;
         for i in 0..self.num_elements {
             let offset = i * bw;
-            if offset + bw > self.data.len() { break; }
+            if offset + bw > self.data.len() {
+                break;
+            }
             let val = self.dtype.to_f64(&self.data[offset..offset + bw]).abs();
-            if val > max_abs { max_abs = val; }
+            if val > max_abs {
+                max_abs = val;
+            }
         }
-        if max_abs < 1e-12 { return Some(1.0); } // avoid division by zero
+        if max_abs < 1e-12 {
+            return Some(1.0);
+        } // avoid division by zero
         Some((max_abs / dtype_max as f64) as f32)
     }
 
@@ -416,19 +422,26 @@ impl WeightMap {
             };
 
             let shape: Vec<usize> = view.shape().to_vec();
-            let num_elements: usize = if shape.is_empty() { 1 } else { shape.iter().product() };
+            let num_elements: usize = if shape.is_empty() {
+                1
+            } else {
+                shape.iter().product()
+            };
             let data = view.data().to_vec();
             total_bytes += data.len() as u64;
 
-            entries.insert(name.clone(), WeightEntry {
-                name: name.clone(),
-                data,
-                shape,
-                dtype,
-                num_elements,
-                sparsity: None,
-                eliminated: false,
-            });
+            entries.insert(
+                name.clone(),
+                WeightEntry {
+                    name: name.clone(),
+                    data,
+                    shape,
+                    dtype,
+                    num_elements,
+                    sparsity: None,
+                    eliminated: false,
+                },
+            );
         }
 
         Ok(WeightMap {
@@ -456,7 +469,10 @@ impl WeightMap {
 
     /// SHA-256 hash as a hex string.
     pub fn hash_hex(&self) -> String {
-        self.file_hash.iter().map(|b| format!("{:02x}", b)).collect()
+        self.file_hash
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 
     /// Total number of parameters across all tensors.
@@ -563,11 +579,7 @@ impl<'a> ConstantFolder<'a> {
     /// Attempt to constant-fold a matmul: C = A @ B.
     /// If both A and B are known constants, compute C at compile time.
     /// If only one operand is known, return Partial.
-    pub fn fold_matmul(
-        &mut self,
-        lhs: &FoldResult,
-        rhs: &FoldResult,
-    ) -> FoldResult {
+    pub fn fold_matmul(&mut self, lhs: &FoldResult, rhs: &FoldResult) -> FoldResult {
         match (lhs, rhs) {
             (FoldResult::Constant(a), FoldResult::Constant(b)) => {
                 let c = self.compute_matmul(a, b);
@@ -581,22 +593,16 @@ impl<'a> ConstantFolder<'a> {
                     simplified: false,
                 }
             }
-            (FoldResult::Constant(_), FoldResult::Runtime) => {
-                FoldResult::Partial {
-                    known_operands: vec![0],
-                    simplified: false,
-                }
-            }
+            (FoldResult::Constant(_), FoldResult::Runtime) => FoldResult::Partial {
+                known_operands: vec![0],
+                simplified: false,
+            },
             _ => FoldResult::Runtime,
         }
     }
 
     /// Attempt to constant-fold element-wise addition: C = A + B.
-    pub fn fold_add(
-        &mut self,
-        lhs: &FoldResult,
-        rhs: &FoldResult,
-    ) -> FoldResult {
+    pub fn fold_add(&mut self, lhs: &FoldResult, rhs: &FoldResult) -> FoldResult {
         match (lhs, rhs) {
             (FoldResult::Constant(a), FoldResult::Constant(b)) => {
                 let c = self.compute_elementwise_add(a, b);
@@ -633,7 +639,11 @@ impl<'a> ConstantFolder<'a> {
         assert_eq!(b.shape.len(), 2, "compile-time matmul requires 2D tensors");
         let m = a.shape[0];
         let k = a.shape[1];
-        assert_eq!(k, b.shape[0], "matmul dimension mismatch: {} vs {}", k, b.shape[0]);
+        assert_eq!(
+            k, b.shape[0],
+            "matmul dimension mismatch: {} vs {}",
+            k, b.shape[0]
+        );
         let n = b.shape[1];
 
         let bw_a = a.dtype.byte_width();
@@ -646,11 +656,19 @@ impl<'a> ConstantFolder<'a> {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for p in 0..k {
-                    let a_val = a.dtype.to_f64(&a.data[(i * k + p) * bw_a..(i * k + p + 1) * bw_a]);
-                    let b_val = b.dtype.to_f64(&b.data[(p * n + j) * bw_b..(p * n + j + 1) * bw_b]);
+                    let a_val = a
+                        .dtype
+                        .to_f64(&a.data[(i * k + p) * bw_a..(i * k + p + 1) * bw_a]);
+                    let b_val = b
+                        .dtype
+                        .to_f64(&b.data[(p * n + j) * bw_b..(p * n + j + 1) * bw_b]);
                     sum += a_val * b_val;
                 }
-                write_f64_as_dtype(sum, a.dtype, &mut result[(i * n + j) * bw_out..(i * n + j + 1) * bw_out]);
+                write_f64_as_dtype(
+                    sum,
+                    a.dtype,
+                    &mut result[(i * n + j) * bw_out..(i * n + j + 1) * bw_out],
+                );
             }
         }
 
@@ -860,7 +878,10 @@ type AnalysisEntry = (String, Vec<u8>, Vec<usize>, WeightDType, usize);
 pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAwareConfig) {
     eprintln!();
     eprintln!("Weight Analysis Report for {}:", weight_map.source_path());
-    eprintln!("  Total parameters: {}", format_number(weight_map.total_parameters()));
+    eprintln!(
+        "  Total parameters: {}",
+        format_number(weight_map.total_parameters())
+    );
     eprintln!("  Total size: {}", format_bytes(weight_map.total_bytes()));
     eprintln!("  Weight file SHA-256: {}", weight_map.hash_hex());
     eprintln!("  Tensors: {}", weight_map.len());
@@ -872,10 +893,18 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
     let mut total_elements = 0usize;
 
     // Clone entry data for analysis to avoid mutating the original WeightMap
-    let mut analysis_entries: Vec<AnalysisEntry> =
-        weight_map.entries().map(|(name, entry)| {
-            (name.clone(), entry.data.clone(), entry.shape.clone(), entry.dtype, entry.num_elements)
-        }).collect();
+    let mut analysis_entries: Vec<AnalysisEntry> = weight_map
+        .entries()
+        .map(|(name, entry)| {
+            (
+                name.clone(),
+                entry.data.clone(),
+                entry.shape.clone(),
+                entry.dtype,
+                entry.num_elements,
+            )
+        })
+        .collect();
 
     eprintln!("  Per-tensor sparsity:");
     for (name, data, shape, dtype, num_elements) in &mut analysis_entries {
@@ -924,11 +953,25 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
 
     eprintln!();
     eprintln!("  Summary:");
-    eprintln!("    Global near-zero fraction: {:.1}%",
-        if total_elements > 0 { total_near_zero as f64 / total_elements as f64 * 100.0 } else { 0.0 });
-    eprintln!("    Sparse-eligible tensors: {}/{}", sparse_count, analysis_entries.len());
+    eprintln!(
+        "    Global near-zero fraction: {:.1}%",
+        if total_elements > 0 {
+            total_near_zero as f64 / total_elements as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    eprintln!(
+        "    Sparse-eligible tensors: {}/{}",
+        sparse_count,
+        analysis_entries.len()
+    );
     if config.dead_weight_elim {
-        eprintln!("    Dead weights eliminated: {} (threshold: {:e})", format_number(dead_count), config.dead_weight_threshold);
+        eprintln!(
+            "    Dead weights eliminated: {} (threshold: {:e})",
+            format_number(dead_count),
+            config.dead_weight_threshold
+        );
     }
     eprintln!();
 }
@@ -968,18 +1011,11 @@ mod tests {
     use std::io::Write;
 
     /// Helper: write a minimal safetensors file with one f32 tensor.
-    fn write_temp_safetensors(
-        name: &str,
-        shape: &[usize],
-        data_f32: &[f32],
-    ) -> tempfile::TempPath {
+    fn write_temp_safetensors(name: &str, shape: &[usize], data_f32: &[f32]) -> tempfile::TempPath {
         let bytes: Vec<u8> = data_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let view = safetensors::tensor::TensorView::new(
-            safetensors::Dtype::F32,
-            shape.to_vec(),
-            &bytes,
-        )
-        .unwrap();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.to_vec(), &bytes)
+                .unwrap();
         let mut map = StdHashMap::new();
         map.insert(name.to_string(), view);
         let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
@@ -990,9 +1026,7 @@ mod tests {
     }
 
     /// Helper: write a safetensors file with multiple f32 tensors.
-    fn write_temp_safetensors_multi(
-        tensors: &[(&str, &[usize], &[f32])],
-    ) -> tempfile::TempPath {
+    fn write_temp_safetensors_multi(tensors: &[(&str, &[usize], &[f32])]) -> tempfile::TempPath {
         let owned_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = tensors
             .iter()
             .map(|(name, shape, data)| {
@@ -1313,9 +1347,7 @@ mod tests {
     fn test_near_identity_detection() {
         // 3x3 identity matrix with small perturbation
         let data = vec![
-            1.001, 0.002, -0.001,
-            0.003, 0.999, 0.002,
-            -0.001, 0.001, 1.002,
+            1.001, 0.002, -0.001, 0.003, 0.999, 0.002, -0.001, 0.001, 1.002,
         ];
         let path = write_temp_safetensors("w", &[3, 3], &data);
         let wmap = WeightMap::load(path.as_ref()).unwrap();
@@ -1329,11 +1361,7 @@ mod tests {
     #[test]
     fn test_near_identity_rejection() {
         // 3x3 matrix far from identity
-        let data = vec![
-            1.0, 0.05, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-        ];
+        let data = vec![1.0, 0.05, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let path = write_temp_safetensors("w", &[3, 3], &data);
         let wmap = WeightMap::load(path.as_ref()).unwrap();
         let config = WeightAwareConfig::default();
@@ -1369,15 +1397,24 @@ mod tests {
 
     #[test]
     fn test_weight_dtype_from_safetensors_str() {
-        assert!(matches!(WeightDType::from_safetensors_str("F32"), Ok(WeightDType::F32)));
-        assert!(matches!(WeightDType::from_safetensors_str("F16"), Ok(WeightDType::F16)));
-        assert!(matches!(WeightDType::from_safetensors_str("BF16"), Ok(WeightDType::BF16)));
+        assert!(matches!(
+            WeightDType::from_safetensors_str("F32"),
+            Ok(WeightDType::F32)
+        ));
+        assert!(matches!(
+            WeightDType::from_safetensors_str("F16"),
+            Ok(WeightDType::F16)
+        ));
+        assert!(matches!(
+            WeightDType::from_safetensors_str("BF16"),
+            Ok(WeightDType::BF16)
+        ));
         assert!(WeightDType::from_safetensors_str("UNKNOWN").is_err());
     }
 
     #[test]
     fn test_write_f64_as_f32_roundtrip() {
-        let val = 3.14159f64;
+        let val = std::f64::consts::PI;
         let mut buf = [0u8; 4];
         write_f64_as_dtype(val, WeightDType::F32, &mut buf);
         let restored = WeightDType::F32.to_f64(&buf);

@@ -220,14 +220,8 @@ pub fn format_stats(stats: &CircuitStats, name: &str) -> String {
         "  Constraints:     {:>12}\n",
         stats.num_constraints
     ));
-    out.push_str(&format!(
-        "  Mul gates:       {:>12}\n",
-        stats.num_mul_gates
-    ));
-    out.push_str(&format!(
-        "  Add gates:       {:>12}\n",
-        stats.num_add_gates
-    ));
+    out.push_str(&format!("  Mul gates:       {:>12}\n", stats.num_mul_gates));
+    out.push_str(&format!("  Add gates:       {:>12}\n", stats.num_add_gates));
     out.push_str(&format!(
         "  Dot product:     {:>12}\n",
         stats.num_dot_product_gates
@@ -318,8 +312,16 @@ mod tests {
         let w2 = ir.alloc_wire("c");
         let w3 = ir.alloc_wire("d");
         let w4 = ir.alloc_wire("e");
-        ir.push(ZkInstruction::Mul { out: w2, a: w0, b: w1 });
-        ir.push(ZkInstruction::Add { out: w3, a: w0, b: w2 });
+        ir.push(ZkInstruction::Mul {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
+        ir.push(ZkInstruction::Add {
+            out: w3,
+            a: w0,
+            b: w2,
+        });
         ir.push(ZkInstruction::Lookup {
             out: w4,
             table: "relu".into(),
@@ -369,7 +371,11 @@ mod tests {
         let w4 = ir.alloc_wire("b");
         let scale = FieldElement::from_u64(1);
         let zp = FieldElement::from_u64(0);
-        ir.push(ZkInstruction::Mul { out: w2, a: w0, b: w1 });
+        ir.push(ZkInstruction::Mul {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
         ir.push(ZkInstruction::Lookup {
             out: w3,
             table: "relu".into(),
@@ -417,11 +423,18 @@ mod tests {
         let w0 = ir.alloc_wire("x");
         let w1 = ir.alloc_wire("y");
         let w2 = ir.alloc_wire("z");
-        ir.push(ZkInstruction::Add { out: w2, a: w0, b: w1 });
+        ir.push(ZkInstruction::Add {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
 
         let stats = compute_stats(&ir);
         assert_eq!(stats.num_add_gates, 1);
-        assert_eq!(stats.num_constraints, 0, "Add gates must not add constraints");
+        assert_eq!(
+            stats.num_constraints, 0,
+            "Add gates must not add constraints"
+        );
     }
 
     #[test]

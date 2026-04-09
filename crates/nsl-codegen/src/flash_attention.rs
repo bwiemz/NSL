@@ -138,10 +138,7 @@ pub fn synthesize_flash_attention_ptx(config: &FlashAttentionConfig) -> Vec<u8> 
 /// Generate PTX for the rope_cache_write elementwise kernel.
 ///
 /// Returns null-terminated PTX bytes.
-pub fn synthesize_rope_cache_write_ptx(
-    head_dim: i64,
-    rope_style: RopeStyle,
-) -> Vec<u8> {
+pub fn synthesize_rope_cache_write_ptx(head_dim: i64, rope_style: RopeStyle) -> Vec<u8> {
     let mut ptx = String::with_capacity(4096);
 
     emit_ptx_header(&mut ptx, 52); // RoPE cache write targets sm_52 minimum
@@ -183,19 +180,19 @@ pub fn shared_mem_bytes(config: &FlashAttentionConfig) -> u32 {
 
 fn emit_ptx_header(ptx: &mut String, gpu_sm: u32) {
     let version = if gpu_sm >= 90 { "8.0" } else { "7.0" };
-    let target = if gpu_sm >= 90 { "sm_90" }
-        else if gpu_sm >= 80 { "sm_80" }
-        else { "sm_52" };
+    let target = if gpu_sm >= 90 {
+        "sm_90"
+    } else if gpu_sm >= 80 {
+        "sm_80"
+    } else {
+        "sm_52"
+    };
     ptx.push_str(&format!(".version {version}\n"));
     ptx.push_str(&format!(".target {target}\n"));
     ptx.push_str(".address_size 64\n\n");
 }
 
-fn emit_flash_attention_entry(
-    ptx: &mut String,
-    kernel_name: &str,
-    config: &FlashAttentionConfig,
-) {
+fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &FlashAttentionConfig) {
     // Parameter declarations — ALWAYS declare ALL params regardless of variant flags.
     // The runtime wrapper always passes the full 21-arg set (unused params are null/zero).
     // Conditional params are simply ignored in the kernel body when the flag is off.
@@ -271,7 +268,7 @@ fn emit_register_declarations(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %tid_x, %bid_x, %bid_y;\n");
     ptx.push_str("    .reg .u64 %rd<64>;\n");
     ptx.push_str("    .reg .f32 %f<128>;\n");
-    ptx.push_str("    .reg .b16 %h<32>;\n");  // f16 registers for output conversion
+    ptx.push_str("    .reg .b16 %h<32>;\n"); // f16 registers for output conversion
     ptx.push_str("    .reg .pred %p<16>;\n");
     ptx.push_str("    .reg .u32 %r<32>;\n");
 
@@ -443,10 +440,7 @@ fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
         ));
 
         // Compute pair offset based on rope style
-        ptx.push_str(&format!(
-            "    // Paired offset: stride = {}\n",
-            stride_val
-        ));
+        ptx.push_str(&format!("    // Paired offset: stride = {}\n", stride_val));
         // offset_a = elem_idx, offset_b = elem_idx + stride (or elem_idx ^ 1 for adjacent)
         ptx.push_str("    shl.b64 %rd29, %rd22, 2;        // global byte offset\n");
         ptx.push_str("    add.u64 %rd30, %rd21, %rd29;    // q_addr = q_base + offset\n");
@@ -520,10 +514,7 @@ fn emit_accumulator_init(ptx: &mut String, config: &FlashAttentionConfig) {
         64 + num_oacc - 1
     ));
     for i in 0..num_oacc {
-        ptx.push_str(&format!(
-            "    mov.f32 %f{}, 0x00000000;\n",
-            64 + i
-        ));
+        ptx.push_str(&format!("    mov.f32 %f{}, 0x00000000;\n", 64 + i));
     }
 
     // Compute k_max (upper bound for KV tile loop)
@@ -575,7 +566,9 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    // One page table lookup per block_size tokens\n");
         // Paged K: look up physical block from block_table
         // logical_block = k_start / block_size
-        ptx.push_str("    div.u64 %rd36, %k_start, %rd11;  // logical_block = k_start / block_size\n");
+        ptx.push_str(
+            "    div.u64 %rd36, %k_start, %rd11;  // logical_block = k_start / block_size\n",
+        );
         // batch/head offset into block table
         ptx.push_str("    // block_table[batch_idx * heads + head_idx_kv, logical_block]\n");
         if config.gqa_group_size > 1 {
@@ -771,14 +764,8 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     // Use registers %f3..%f(3+num_s_per_thread-1) to hold S values for later phases
     // We emit a chain: if s_iter==0, store to %f3; if s_iter==1 store to %f4, etc.
     for i in 0..num_s_per_thread {
-        ptx.push_str(&format!(
-            "    setp.eq.u32 %p2, %r1, {};\n",
-            i
-        ));
-        ptx.push_str(&format!(
-            "    @%p2 mov.f32 %f{}, %f0;\n",
-            3 + i
-        ));
+        ptx.push_str(&format!("    setp.eq.u32 %p2, %r1, {};\n", i));
+        ptx.push_str(&format!("    @%p2 mov.f32 %f{}, %f0;\n", 3 + i));
     }
 
     ptx.push_str("    add.u32 %r1, %r1, 1;                  // s_iter++\n");
@@ -796,7 +783,8 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     for i in 0..num_s_per_thread {
         ptx.push_str(&format!(
             "    max.f32 %f0, %f0, %f{};              // max with S[{}]\n",
-            3 + i, i
+            3 + i,
+            i
         ));
     }
 
@@ -832,7 +820,8 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     for i in 0..num_oacc {
         ptx.push_str(&format!(
             "    mul.f32 %f{}, %f{}, %correction;\n",
-            64 + i, 64 + i
+            64 + i,
+            64 + i
         ));
     }
 
@@ -842,19 +831,15 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     for i in 0..num_s_per_thread {
         ptx.push_str(&format!(
             "    sub.f32 %f{}, %f{}, %new_max;\n",
-            3 + i, 3 + i
+            3 + i,
+            3 + i
         ));
-        ptx.push_str(&format!(
-            "    mul.f32 %f{}, %f{}, %log2e;\n",
-            3 + i, 3 + i
-        ));
-        ptx.push_str(&format!(
-            "    ex2.approx.f32 %f{}, %f{};\n",
-            3 + i, 3 + i
-        ));
+        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, %log2e;\n", 3 + i, 3 + i));
+        ptx.push_str(&format!("    ex2.approx.f32 %f{}, %f{};\n", 3 + i, 3 + i));
         ptx.push_str(&format!(
             "    add.f32 %f1, %f1, %f{};              // partial_sum += P[{}]\n",
-            3 + i, i
+            3 + i,
+            i
         ));
     }
 
@@ -907,10 +892,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     ));
     ptx.push_str("    st.shared.f32 [shmem + %rd50], %f0;\n");
     ptx.push_str("    add.u64 %rd47, %rd47, 128;             // elem_idx += blockDim.x\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u64 %p0, %rd47, {};\n",
-        total_k_elems
-    ));
+    ptx.push_str(&format!("    setp.lt.u64 %p0, %rd47, {};\n", total_k_elems));
     ptx.push_str("    @%p0 bra LOOP_V_LOAD;\n");
 
     ptx.push_str("    bar.sync 0;  // FENCE 3: V tile fully in SRAM\n");
@@ -966,26 +948,18 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     // We load from the S/P register using conditional moves
     ptx.push_str("    mov.f32 %f2, 0x00000000;               // default P = 0\n");
     for i in 0..num_s_per_thread {
-        ptx.push_str(&format!(
-            "    setp.eq.u32 %p2, %r12, {};\n",
-            i
-        ));
-        ptx.push_str(&format!(
-            "    @%p2 mov.f32 %f2, %f{};\n",
-            3 + i
-        ));
+        ptx.push_str(&format!("    setp.eq.u32 %p2, %r12, {};\n", i));
+        ptx.push_str(&format!("    @%p2 mov.f32 %f2, %f{};\n", 3 + i));
     }
 
     // O_acc[oacc_iter] += P * V
     // We need to index into %f64+oacc_iter — use conditional add pattern
     for i in 0..num_oacc {
-        ptx.push_str(&format!(
-            "    setp.eq.u32 %p3, %r8, {};\n",
-            i
-        ));
+        ptx.push_str(&format!("    setp.eq.u32 %p3, %r8, {};\n", i));
         ptx.push_str(&format!(
             "    @%p3 fma.rn.f32 %f{}, %f2, %f1, %f{};\n",
-            64 + i, 64 + i
+            64 + i,
+            64 + i
         ));
     }
 
@@ -1017,10 +991,7 @@ fn emit_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     // Multiply each O_acc register by 1/row_sum
     let num_oacc = (config.block_q * config.head_dim / 128) as usize;
     for i in 0..num_oacc {
-        ptx.push_str(&format!(
-            "    mul.f32 %f{}, %f{}, %f0;\n",
-            64 + i, 64 + i
-        ));
+        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, %f0;\n", 64 + i, 64 + i));
     }
 
     // ── Logsumexp auxiliary output ──────────────────────────────────
@@ -1089,7 +1060,8 @@ fn emit_output_store(ptx: &mut String, config: &FlashAttentionConfig) {
         // elem_idx = tid_x + i * 128
         ptx.push_str(&format!(
             "    cvt.rn.f16.f32 %h{}, %f{};              // f32 → f16\n",
-            h_reg, 64 + i
+            h_reg,
+            64 + i
         ));
         // Byte offset = (tid_x + i * 128) * 2
         ptx.push_str(&format!(
@@ -1104,18 +1076,11 @@ fn emit_output_store(ptx: &mut String, config: &FlashAttentionConfig) {
         ));
         ptx.push_str("    shl.b64 %rd52, %rd52, 1;              // * 2 (f16)\n");
         ptx.push_str("    add.u64 %rd52, %rd51, %rd52;          // out_base + offset\n");
-        ptx.push_str(&format!(
-            "    st.global.b16 [%rd52], %h{};\n",
-            h_reg
-        ));
+        ptx.push_str(&format!("    st.global.b16 [%rd52], %h{};\n", h_reg));
     }
 }
 
-fn emit_rope_cache_write_entry(
-    ptx: &mut String,
-    head_dim: i64,
-    rope_style: RopeStyle,
-) {
+fn emit_rope_cache_write_entry(ptx: &mut String, head_dim: i64, rope_style: RopeStyle) {
     ptx.push_str(".visible .entry nsl_rope_cache_write (\n");
     ptx.push_str("    .param .u64 k_projected_ptr,\n");
     ptx.push_str("    .param .u64 v_projected_ptr,\n");
@@ -1155,8 +1120,12 @@ fn emit_rope_cache_write_entry(
 
     ptx.push_str("    // 1. Load K element pair from k_projected into registers\n");
     ptx.push_str("    // 2. Load cos[pos], sin[pos] from frequency table → registers\n");
-    ptx.push_str("    // 3. Apply RoPE: k_rot_a = k_a*cos - k_b*sin; k_rot_b = k_a*sin + k_b*cos\n");
-    ptx.push_str("    // 4. Look up physical block via block_table[seq_id * max_blocks + logical_idx]\n");
+    ptx.push_str(
+        "    // 3. Apply RoPE: k_rot_a = k_a*cos - k_b*sin; k_rot_b = k_a*sin + k_b*cos\n",
+    );
+    ptx.push_str(
+        "    // 4. Look up physical block via block_table[seq_id * max_blocks + logical_idx]\n",
+    );
     ptx.push_str("    // 5. Write rotated K into paged K pool\n");
     ptx.push_str("    // 6. Write V directly into paged V pool (no rotation)\n");
 
@@ -1176,12 +1145,12 @@ fn emit_rope_cache_write_entry(
 /// Each destination register holds two f16 values packed into a 32-bit word.
 /// `src_f32` names are f32 register names (even count), `dst_b32` are .b32 output names (half count).
 #[allow(dead_code)]
-fn emit_f32_to_f16_pack(
-    ptx: &mut String,
-    src_f32: &[String],
-    dst_b32: &[String],
-) {
-    assert_eq!(src_f32.len(), dst_b32.len() * 2, "f16 pack: src must be 2x dst");
+fn emit_f32_to_f16_pack(ptx: &mut String, src_f32: &[String], dst_b32: &[String]) {
+    assert_eq!(
+        src_f32.len(),
+        dst_b32.len() * 2,
+        "f16 pack: src must be 2x dst"
+    );
     for i in 0..dst_b32.len() {
         let lo = &src_f32[i * 2];
         let hi = &src_f32[i * 2 + 1];
@@ -1269,10 +1238,10 @@ fn emit_load_b_fragment_smem(
 #[allow(dead_code)]
 fn emit_mma_instruction(
     ptx: &mut String,
-    d_regs: &[String; 4],   // D accumulator (f32 x4)
-    a_regs: &[String; 4],   // A fragment (.b32 x4)
-    b_regs: &[String; 2],   // B fragment (.b32 x2)
-    c_regs: &[String; 4],   // C accumulator (f32 x4)
+    d_regs: &[String; 4], // D accumulator (f32 x4)
+    a_regs: &[String; 4], // A fragment (.b32 x4)
+    b_regs: &[String; 2], // B fragment (.b32 x2)
+    c_regs: &[String; 4], // C accumulator (f32 x4)
 ) {
     ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
     ptx.push_str(&format!(
@@ -1283,10 +1252,7 @@ fn emit_mma_instruction(
         "        {{{}, {}, {}, {}}},\n",
         a_regs[0], a_regs[1], a_regs[2], a_regs[3]
     ));
-    ptx.push_str(&format!(
-        "        {{{}, {}}},\n",
-        b_regs[0], b_regs[1]
-    ));
+    ptx.push_str(&format!("        {{{}, {}}},\n", b_regs[0], b_regs[1]));
     ptx.push_str(&format!(
         "        {{{}, {}, {}, {}}};\n",
         c_regs[0], c_regs[1], c_regs[2], c_regs[3]
@@ -1324,9 +1290,7 @@ fn emit_qk_matmul_mma(
     // Zero S accumulators for current m-tile (n_tiles_s * 4 f32 registers)
     for nt in 0..n_tiles_s {
         for r in 0..4 {
-            ptx.push_str(&format!(
-                "    mov.f32 %acc_s_{}_{}, 0x00000000;\n", nt, r
-            ));
+            ptx.push_str(&format!("    mov.f32 %acc_s_{}_{}, 0x00000000;\n", nt, r));
         }
     }
 
@@ -1340,9 +1304,7 @@ fn emit_qk_matmul_mma(
     ptx.push_str("    // Load Q A-fragment (f32 from shmem, convert to f16)\n");
     for i in 0..4 {
         let k_pair = i * 4; // each .b32 holds a pair of f16 at k positions k_pair, k_pair+1
-        ptx.push_str(&format!(
-            "    // A-frag reg {}: k_pair={}\n", i, k_pair
-        ));
+        ptx.push_str(&format!("    // A-frag reg {}: k_pair={}\n", i, k_pair));
         // Compute shmem address: q_shmem[a_row * head_dim + k_iter * MMA_K + k_pair]
         ptx.push_str(&format!(
             "    mul.lo.u32 %mma_addr, %mma_a_row, {};  // a_row * head_dim * 4\n",
@@ -1364,22 +1326,18 @@ fn emit_qk_matmul_mma(
         ptx.push_str("    ld.shared.f32 %mma_f32_hi, [shmem + %mma_addr];\n");
         ptx.push_str("    cvt.rn.f16.f32 %mma_h0, %mma_f32_lo;\n");
         ptx.push_str("    cvt.rn.f16.f32 %mma_h1, %mma_f32_hi;\n");
-        ptx.push_str(&format!(
-            "    mov.b32 %aq_{}, {{%mma_h0, %mma_h1}};\n", i
-        ));
+        ptx.push_str(&format!("    mov.b32 %aq_{}, {{%mma_h0, %mma_h1}};\n", i));
     }
 
     // Load B-fragments from K^T shared memory for each n-tile
     for nt in 0..n_tiles_s {
-        ptx.push_str(&format!(
-            "    // K^T B-fragment for n_tile={}\n", nt
-        ));
+        ptx.push_str(&format!("    // K^T B-fragment for n_tile={}\n", nt));
         for bi in 0..2 {
             let k_pair = bi * 8; // b0 covers k=0..7, b1 covers k=8..15
-            // K in shmem at shmem_k_offset, stored as K[k_col][head_dim] row-major
-            // For K^T: we need K[k_col=nt*8+col, d=k_iter*16+k] transposed
-            // B-fragment wants col-major: B[k, n] where k is the MMA K-dim, n is the N-dim
-            // So we load K[nt*MMA_N + b_row, k_iter*MMA_K + k_pair] from shmem
+                                 // K in shmem at shmem_k_offset, stored as K[k_col][head_dim] row-major
+                                 // For K^T: we need K[k_col=nt*8+col, d=k_iter*16+k] transposed
+                                 // B-fragment wants col-major: B[k, n] where k is the MMA K-dim, n is the N-dim
+                                 // So we load K[nt*MMA_N + b_row, k_iter*MMA_K + k_pair] from shmem
             ptx.push_str(&format!(
                 "    mul.lo.u32 %mma_addr, %mma_b_row, {};  // b_row * head_dim * 4\n",
                 head_dim * 4
@@ -1408,7 +1366,8 @@ fn emit_qk_matmul_mma(
             ptx.push_str("    cvt.rn.f16.f32 %mma_h0, %mma_f32_lo;\n");
             ptx.push_str("    cvt.rn.f16.f32 %mma_h1, %mma_f32_hi;\n");
             ptx.push_str(&format!(
-                "    mov.b32 %bk_{}_{}, {{%mma_h0, %mma_h1}};\n", nt, bi
+                "    mov.b32 %bk_{}_{}, {{%mma_h0, %mma_h1}};\n",
+                nt, bi
             ));
         }
     }
@@ -1421,12 +1380,8 @@ fn emit_qk_matmul_mma(
         ptx.push_str(&format!(
             "        {{%acc_s_{nt}_0, %acc_s_{nt}_1, %acc_s_{nt}_2, %acc_s_{nt}_3}},\n"
         ));
-        ptx.push_str(
-            "        {%aq_0, %aq_1, %aq_2, %aq_3},\n"
-        );
-        ptx.push_str(&format!(
-            "        {{%bk_{nt}_0, %bk_{nt}_1}},\n"
-        ));
+        ptx.push_str("        {%aq_0, %aq_1, %aq_2, %aq_3},\n");
+        ptx.push_str(&format!("        {{%bk_{nt}_0, %bk_{nt}_1}},\n"));
         ptx.push_str(&format!(
             "        {{%acc_s_{nt}_0, %acc_s_{nt}_1, %acc_s_{nt}_2, %acc_s_{nt}_3}};\n"
         ));
@@ -1435,7 +1390,8 @@ fn emit_qk_matmul_mma(
     // Loop back over K
     ptx.push_str("    add.u32 %mma_k_iter, %mma_k_iter, 1;\n");
     ptx.push_str(&format!(
-        "    setp.lt.u32 %mma_pk, %mma_k_iter, {};\n", k_iters
+        "    setp.lt.u32 %mma_pk, %mma_k_iter, {};\n",
+        k_iters
     ));
     ptx.push_str("    @%mma_pk bra QK_MMA_K_LOOP;\n");
 
@@ -1459,18 +1415,14 @@ fn emit_qk_matmul_mma(
 ///
 /// Accumulates into O registers: O += P @ V for the current m-tile.
 #[allow(dead_code)]
-fn emit_pv_matmul_mma(
-    ptx: &mut String,
-    block_kv: usize,
-    head_dim: usize,
-    shmem_k_offset: usize,
-) {
+fn emit_pv_matmul_mma(ptx: &mut String, block_kv: usize, head_dim: usize, shmem_k_offset: usize) {
     let n_tiles_o = head_dim / MMA_N;
     let k_iters = block_kv / MMA_K; // k-dim for P@V is block_kv
 
     ptx.push_str("    // === P@V via MMA (m16n8k16) ===\n");
     ptx.push_str(&format!(
-        "    // n_tiles_o={}, k_iters={}\n", n_tiles_o, k_iters
+        "    // n_tiles_o={}, k_iters={}\n",
+        n_tiles_o, k_iters
     ));
 
     // K-dimension loop over block_kv
@@ -1489,14 +1441,12 @@ fn emit_pv_matmul_mma(
         // Use the S accumulator values directly: acc_s_{k_tile}_{reg}
         // k_tile index depends on k_iter: nt_base = k_iter * (MMA_K / MMA_N) = k_iter * 2
         // register i maps to specific positions in the MMA layout
-        ptx.push_str(&format!(
-            "    // A-frag P reg {} from S accumulators\n", i
-        ));
+        ptx.push_str(&format!("    // A-frag P reg {} from S accumulators\n", i));
         // For simplicity, read the S accumulator that maps to this fragment position
         // acc_s_{nt}_{r} where nt = k_iter*2 + (i/2), r = (i%2)*2 + laneid_mapping
         // This is approximate — actual mapping depends on MMA thread layout
         ptx.push_str(&format!(
-            "    mul.lo.u32 %mma_addr, %mma_k_iter, 2;\n"  // nt_base = k_iter * 2
+            "    mul.lo.u32 %mma_addr, %mma_k_iter, 2;\n" // nt_base = k_iter * 2
         ));
         let nt_offset = i / 2;
         let r_base = (i % 2) * 2;
@@ -1507,24 +1457,23 @@ fn emit_pv_matmul_mma(
         // Convert the two f32 S values to packed f16
         // Use dynamic register indexing via conditional moves
         ptx.push_str(&format!(
-            "    // Pack S acc values for A-frag position {}\n", i
+            "    // Pack S acc values for A-frag position {}\n",
+            i
         ));
         ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %mma_h0, %acc_s_scratch_{};\n", r_base
+            "    cvt.rn.f16.f32 %mma_h0, %acc_s_scratch_{};\n",
+            r_base
         ));
         ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %mma_h1, %acc_s_scratch_{};\n", r_base + 1
+            "    cvt.rn.f16.f32 %mma_h1, %acc_s_scratch_{};\n",
+            r_base + 1
         ));
-        ptx.push_str(&format!(
-            "    mov.b32 %ap_{}, {{%mma_h0, %mma_h1}};\n", i
-        ));
+        ptx.push_str(&format!("    mov.b32 %ap_{}, {{%mma_h0, %mma_h1}};\n", i));
     }
 
     // Load B-fragments from V shared memory for each output n-tile
     for nt in 0..n_tiles_o {
-        ptx.push_str(&format!(
-            "    // V B-fragment for n_tile={}\n", nt
-        ));
+        ptx.push_str(&format!("    // V B-fragment for n_tile={}\n", nt));
         for bi in 0..2 {
             let k_pair = bi * 8;
             // V[k_col, d] in shmem at shmem_k_offset, row-major
@@ -1551,7 +1500,8 @@ fn emit_pv_matmul_mma(
             ptx.push_str("    cvt.rn.f16.f32 %mma_h0, %mma_f32_lo;\n");
             ptx.push_str("    cvt.rn.f16.f32 %mma_h1, %mma_f32_hi;\n");
             ptx.push_str(&format!(
-                "    mov.b32 %bv_{}_{}, {{%mma_h0, %mma_h1}};\n", nt, bi
+                "    mov.b32 %bv_{}_{}, {{%mma_h0, %mma_h1}};\n",
+                nt, bi
             ));
         }
     }
@@ -1562,12 +1512,8 @@ fn emit_pv_matmul_mma(
         ptx.push_str(&format!(
             "        {{%acc_o_{nt}_0, %acc_o_{nt}_1, %acc_o_{nt}_2, %acc_o_{nt}_3}},\n"
         ));
-        ptx.push_str(
-            "        {%ap_0, %ap_1, %ap_2, %ap_3},\n"
-        );
-        ptx.push_str(&format!(
-            "        {{%bv_{nt}_0, %bv_{nt}_1}},\n"
-        ));
+        ptx.push_str("        {%ap_0, %ap_1, %ap_2, %ap_3},\n");
+        ptx.push_str(&format!("        {{%bv_{nt}_0, %bv_{nt}_1}},\n"));
         ptx.push_str(&format!(
             "        {{%acc_o_{nt}_0, %acc_o_{nt}_1, %acc_o_{nt}_2, %acc_o_{nt}_3}};\n"
         ));
@@ -1576,7 +1522,8 @@ fn emit_pv_matmul_mma(
     // Loop back over K
     ptx.push_str("    add.u32 %mma_k_iter, %mma_k_iter, 1;\n");
     ptx.push_str(&format!(
-        "    setp.lt.u32 %mma_pk, %mma_k_iter, {};\n", k_iters
+        "    setp.lt.u32 %mma_pk, %mma_k_iter, {};\n",
+        k_iters
     ));
     ptx.push_str("    @%mma_pk bra PV_MMA_K_LOOP;\n");
 }
@@ -1606,9 +1553,7 @@ fn emit_mma_qk_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
 
     // B-fragment registers for K^T (n_tiles_s * 2 .b32)
     for nt in 0..n_tiles_s {
-        ptx.push_str(&format!(
-            "    .reg .b32 %bk_{nt}_0, %bk_{nt}_1;\n"
-        ));
+        ptx.push_str(&format!("    .reg .b32 %bk_{nt}_0, %bk_{nt}_1;\n"));
     }
 
     // A-fragment registers for P (4 .b32)
@@ -1616,9 +1561,7 @@ fn emit_mma_qk_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
 
     // B-fragment registers for V (n_tiles_o * 2 .b32)
     for nt in 0..n_tiles_o {
-        ptx.push_str(&format!(
-            "    .reg .b32 %bv_{nt}_0, %bv_{nt}_1;\n"
-        ));
+        ptx.push_str(&format!("    .reg .b32 %bv_{nt}_0, %bv_{nt}_1;\n"));
     }
 
     // MMA temporaries
@@ -1681,11 +1624,7 @@ fn emit_smem_swizzle_store(ptx: &mut String) {
 ///   4. Compute P = exp(S - new_max), accumulate row_sum
 ///   5. Warp shuffle to compute per-row global sum
 #[allow(dead_code)]
-fn emit_mma_online_softmax(
-    ptx: &mut String,
-    block_kv: usize,
-    head_dim: usize,
-) {
+fn emit_mma_online_softmax(ptx: &mut String, block_kv: usize, head_dim: usize) {
     let n_tiles_s = block_kv / MMA_N;
     let n_tiles_o = head_dim / MMA_N;
 
@@ -1822,21 +1761,49 @@ fn emit_wgmma_smem_descriptor(
     //   [29:16] = leading dimension stride (in 16-byte units)
     //   [31:30] = reserved
     //   [63:32] = reserved
-    writeln!(ptx, "    // Build wgmma shared memory descriptor for {desc_reg}").unwrap();
+    writeln!(
+        ptx,
+        "    // Build wgmma shared memory descriptor for {desc_reg}"
+    )
+    .unwrap();
     writeln!(ptx, "    .reg .b64 %{desc_reg};").unwrap();
     writeln!(ptx, "    .reg .u32 %wgmma_desc_lo, %wgmma_desc_hi;").unwrap();
     // Base address: shift right 4 to get 16-byte units
-    writeln!(ptx, "    shr.u32 %wgmma_desc_lo, {smem_base_expr}, 4;  // base in 16B units").unwrap();
-    writeln!(ptx, "    and.b32 %wgmma_desc_lo, %wgmma_desc_lo, 0x3FFF;  // 14-bit base").unwrap();
+    writeln!(
+        ptx,
+        "    shr.u32 %wgmma_desc_lo, {smem_base_expr}, 4;  // base in 16B units"
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    and.b32 %wgmma_desc_lo, %wgmma_desc_lo, 0x3FFF;  // 14-bit base"
+    )
+    .unwrap();
     // Swizzle mode in bits [15:14]
-    writeln!(ptx, "    or.b32 %wgmma_desc_lo, %wgmma_desc_lo, {};  // swizzle mode",
-        swizzle_mode << 14).unwrap();
+    writeln!(
+        ptx,
+        "    or.b32 %wgmma_desc_lo, %wgmma_desc_lo, {};  // swizzle mode",
+        swizzle_mode << 14
+    )
+    .unwrap();
     // Leading dimension in 16-byte units, bits [29:16]
     let ld_16b = leading_dim_bytes / 16;
-    writeln!(ptx, "    or.b32 %wgmma_desc_lo, %wgmma_desc_lo, {};  // leading dim in 16B units",
-        (ld_16b as u32) << 16).unwrap();
-    writeln!(ptx, "    mov.u32 %wgmma_desc_hi, 0;  // reserved upper 32 bits").unwrap();
-    writeln!(ptx, "    mov.b64 %{desc_reg}, {{%wgmma_desc_lo, %wgmma_desc_hi}};").unwrap();
+    writeln!(
+        ptx,
+        "    or.b32 %wgmma_desc_lo, %wgmma_desc_lo, {};  // leading dim in 16B units",
+        (ld_16b as u32) << 16
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    mov.u32 %wgmma_desc_hi, 0;  // reserved upper 32 bits"
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    mov.b64 %{desc_reg}, {{%wgmma_desc_lo, %wgmma_desc_hi}};"
+    )
+    .unwrap();
 }
 
 /// Emit the Q@K^T matmul using wgmma.mma_async for Hopper (sm_90).
@@ -1858,7 +1825,11 @@ fn emit_qk_matmul_wgmma(
     let n_tiles = block_kv / WGMMA_N;
     let k_iters = head_dim / WGMMA_K_F16;
 
-    writeln!(ptx, "    // === Q@K^T via wgmma.mma_async (m64n64k16, sm_90) ===").unwrap();
+    writeln!(
+        ptx,
+        "    // === Q@K^T via wgmma.mma_async (m64n64k16, sm_90) ==="
+    )
+    .unwrap();
     writeln!(ptx, "    // 128-thread warp group, async execution").unwrap();
     writeln!(ptx, "    // n_tiles={n_tiles}, k_iters={k_iters}").unwrap();
 
@@ -1885,7 +1856,11 @@ fn emit_qk_matmul_wgmma(
     // Issue wgmma for each n-tile
     for nt in 0..n_tiles {
         // wgmma instruction (f16 inputs from shared memory, f32 accumulators)
-        writeln!(ptx, "    wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16").unwrap();
+        writeln!(
+            ptx,
+            "    wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16"
+        )
+        .unwrap();
         // Accumulators (32 per tile)
         let acc_list: Vec<String> = (0..32).map(|r| format!("%wg_acc_s_{nt}_{r}")).collect();
         writeln!(ptx, "        {{{}}},", acc_list.join(", ")).unwrap();
@@ -1900,7 +1875,11 @@ fn emit_qk_matmul_wgmma(
     // Commit the wgmma group (allows async execution)
     writeln!(ptx, "    wgmma.commit_group.sync.aligned;").unwrap();
     writeln!(ptx).unwrap();
-    writeln!(ptx, "    // --- Softmax scalar math can overlap here (async!) ---").unwrap();
+    writeln!(
+        ptx,
+        "    // --- Softmax scalar math can overlap here (async!) ---"
+    )
+    .unwrap();
     writeln!(ptx).unwrap();
 
     // Wait for wgmma to complete before consuming accumulators
@@ -1915,7 +1894,11 @@ fn emit_qk_matmul_wgmma(
     writeln!(ptx, "    // Scale S accumulators").unwrap();
     for nt in 0..n_tiles {
         for r in 0..32 {
-            writeln!(ptx, "    mul.f32 %wg_acc_s_{nt}_{r}, %wg_acc_s_{nt}_{r}, %scale;").unwrap();
+            writeln!(
+                ptx,
+                "    mul.f32 %wg_acc_s_{nt}_{r}, %wg_acc_s_{nt}_{r}, %scale;"
+            )
+            .unwrap();
         }
     }
 }
@@ -1936,8 +1919,16 @@ fn emit_pv_matmul_wgmma(
     let n_tiles = head_dim / WGMMA_N;
     let k_iters = block_kv / WGMMA_K_F16;
 
-    writeln!(ptx, "    // === P@V via wgmma.mma_async (m64n64k16, sm_90) ===").unwrap();
-    writeln!(ptx, "    // P staged to shared memory, V already in shared memory").unwrap();
+    writeln!(
+        ptx,
+        "    // === P@V via wgmma.mma_async (m64n64k16, sm_90) ==="
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    // P staged to shared memory, V already in shared memory"
+    )
+    .unwrap();
 
     // O accumulators (persist across KV-tile iterations)
     for nt in 0..n_tiles {
@@ -1951,7 +1942,11 @@ fn emit_pv_matmul_wgmma(
     writeln!(ptx, "PV_WGMMA_K_LOOP:").unwrap();
 
     for nt in 0..n_tiles {
-        writeln!(ptx, "    wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16").unwrap();
+        writeln!(
+            ptx,
+            "    wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16"
+        )
+        .unwrap();
         let acc_list: Vec<String> = (0..32).map(|r| format!("%wg_acc_o_{nt}_{r}")).collect();
         writeln!(ptx, "        {{{}}},", acc_list.join(", ")).unwrap();
         writeln!(ptx, "        [%wg_desc_p],").unwrap();
@@ -1978,11 +1973,23 @@ fn emit_wgmma_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
     writeln!(ptx, "    // wgmma descriptor registers").unwrap();
     writeln!(ptx, "    .reg .b64 %wg_desc_q;  // Q tile descriptor").unwrap();
     for nt in 0..n_tiles_s {
-        writeln!(ptx, "    .reg .b64 %wg_desc_kt_{nt};  // K^T tile {nt} descriptor").unwrap();
+        writeln!(
+            ptx,
+            "    .reg .b64 %wg_desc_kt_{nt};  // K^T tile {nt} descriptor"
+        )
+        .unwrap();
     }
-    writeln!(ptx, "    .reg .b64 %wg_desc_p;  // P tile descriptor (softmax output)").unwrap();
+    writeln!(
+        ptx,
+        "    .reg .b64 %wg_desc_p;  // P tile descriptor (softmax output)"
+    )
+    .unwrap();
     for nt in 0..n_tiles_o {
-        writeln!(ptx, "    .reg .b64 %wg_desc_v_{nt};  // V tile {nt} descriptor").unwrap();
+        writeln!(
+            ptx,
+            "    .reg .b64 %wg_desc_v_{nt};  // V tile {nt} descriptor"
+        )
+        .unwrap();
     }
 }
 
@@ -2002,10 +2009,16 @@ fn emit_mma_temp_registers(ptx: &mut String) {
     // A-fragment row mapping: row = (laneid % 4) * 2 + (laneid / 16)
     ptx.push_str("    and.b32 %mma_a_row, %mma_laneid, 3;    // laneid % 4\n");
     ptx.push_str("    shl.b32 %mma_a_row, %mma_a_row, 1;     // * 2\n");
-    ptx.push_str("    shr.u32 %mma_addr, %mma_laneid, 4;     // laneid / 16 (reuse mma_addr as temp)\n");
-    ptx.push_str("    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // row = (laneid%4)*2 + laneid/16\n");
+    ptx.push_str(
+        "    shr.u32 %mma_addr, %mma_laneid, 4;     // laneid / 16 (reuse mma_addr as temp)\n",
+    );
+    ptx.push_str(
+        "    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // row = (laneid%4)*2 + laneid/16\n",
+    );
     // B-fragment row mapping: same as A row for the k-dimension
-    ptx.push_str("    mov.u32 %mma_b_row, %mma_a_row;        // B row mapping matches A for k-dim\n");
+    ptx.push_str(
+        "    mov.u32 %mma_b_row, %mma_a_row;        // B row mapping matches A for k-dim\n",
+    );
 }
 
 #[cfg(test)]
@@ -2042,11 +2055,11 @@ mod tests {
 
     #[test]
     fn test_use_mma_path() {
-        assert!(!use_mma_path(52));  // Kepler
-        assert!(!use_mma_path(70));  // Volta (has wmma but not f16 mma.sync)
-        assert!(use_mma_path(80));   // Ampere
-        assert!(use_mma_path(89));   // Ada Lovelace
-        assert!(use_mma_path(90));   // Hopper
+        assert!(!use_mma_path(52)); // Kepler
+        assert!(!use_mma_path(70)); // Volta (has wmma but not f16 mma.sync)
+        assert!(use_mma_path(80)); // Ampere
+        assert!(use_mma_path(89)); // Ada Lovelace
+        assert!(use_mma_path(90)); // Hopper
     }
 
     // ── MMA PTX emission tests ─────────────────────────────────────
@@ -2054,15 +2067,35 @@ mod tests {
     #[test]
     fn test_f32_to_f16_pack_emission() {
         let mut ptx = String::new();
-        let src = vec!["f0".to_string(), "f1".to_string(), "f2".to_string(), "f3".to_string()];
+        let src = vec![
+            "f0".to_string(),
+            "f1".to_string(),
+            "f2".to_string(),
+            "f3".to_string(),
+        ];
         let dst = vec!["a0".to_string(), "a1".to_string()];
         emit_f32_to_f16_pack(&mut ptx, &src, &dst);
 
-        assert!(ptx.contains("cvt.rn.f16.f32 %mma_h0, %f0"), "first lo conversion");
-        assert!(ptx.contains("cvt.rn.f16.f32 %mma_h1, %f1"), "first hi conversion");
-        assert!(ptx.contains("mov.b32 %a0, {%mma_h0, %mma_h1}"), "first pack");
-        assert!(ptx.contains("cvt.rn.f16.f32 %mma_h0, %f2"), "second lo conversion");
-        assert!(ptx.contains("mov.b32 %a1, {%mma_h0, %mma_h1}"), "second pack");
+        assert!(
+            ptx.contains("cvt.rn.f16.f32 %mma_h0, %f0"),
+            "first lo conversion"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f16.f32 %mma_h1, %f1"),
+            "first hi conversion"
+        );
+        assert!(
+            ptx.contains("mov.b32 %a0, {%mma_h0, %mma_h1}"),
+            "first pack"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f16.f32 %mma_h0, %f2"),
+            "second lo conversion"
+        );
+        assert!(
+            ptx.contains("mov.b32 %a1, {%mma_h0, %mma_h1}"),
+            "second pack"
+        );
     }
 
     #[test]
@@ -2074,8 +2107,10 @@ mod tests {
         let c = ["c0".into(), "c1".into(), "c2".into(), "c3".into()];
         emit_mma_instruction(&mut ptx, &d, &a, &b, &c);
 
-        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
-            "must contain MMA instruction");
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "must contain MMA instruction"
+        );
         assert!(ptx.contains("{d0, d1, d2, d3}"), "D accumulator regs");
         assert!(ptx.contains("{a0, a1, a2, a3}"), "A fragment regs");
         assert!(ptx.contains("{b0, b1}"), "B fragment regs");
@@ -2089,8 +2124,14 @@ mod tests {
         let mut ptx = String::new();
         emit_wgmma_smem_descriptor(&mut ptx, "desc_q", "%smem_q_base", 128, 3);
 
-        assert!(ptx.contains("wgmma shared memory descriptor"), "comment present");
-        assert!(ptx.contains(".reg .b64 %desc_q"), "descriptor register declared");
+        assert!(
+            ptx.contains("wgmma shared memory descriptor"),
+            "comment present"
+        );
+        assert!(
+            ptx.contains(".reg .b64 %desc_q"),
+            "descriptor register declared"
+        );
         assert!(ptx.contains("shr.u32"), "base address shift");
         assert!(ptx.contains("0x3FFF"), "14-bit mask for base");
     }
@@ -2100,11 +2141,22 @@ mod tests {
         let mut ptx = String::new();
         emit_qk_matmul_wgmma(&mut ptx, 64, 64, 64, 64 * 64 * 4);
 
-        assert!(ptx.contains("wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16"),
-            "wgmma instruction present");
-        assert!(ptx.contains("wgmma.commit_group.sync.aligned"), "commit present");
-        assert!(ptx.contains("wgmma.wait_group.sync.aligned"), "wait present");
-        assert!(ptx.contains("Softmax scalar math can overlap"), "async overlap comment");
+        assert!(
+            ptx.contains("wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16"),
+            "wgmma instruction present"
+        );
+        assert!(
+            ptx.contains("wgmma.commit_group.sync.aligned"),
+            "commit present"
+        );
+        assert!(
+            ptx.contains("wgmma.wait_group.sync.aligned"),
+            "wait present"
+        );
+        assert!(
+            ptx.contains("Softmax scalar math can overlap"),
+            "async overlap comment"
+        );
         assert!(ptx.contains("QK_WGMMA_K_LOOP"), "K loop label");
         assert!(ptx.contains("%wg_acc_s_"), "S accumulator registers");
         assert!(ptx.contains("%wg_desc_q"), "Q descriptor");
@@ -2119,7 +2171,10 @@ mod tests {
         let mut ptx = String::new();
         emit_pv_matmul_wgmma(&mut ptx, 64, 64, 64 * 64 * 4);
 
-        assert!(ptx.contains("wgmma.mma_async.sync.aligned"), "wgmma present");
+        assert!(
+            ptx.contains("wgmma.mma_async.sync.aligned"),
+            "wgmma present"
+        );
         assert!(ptx.contains("%wg_acc_o_"), "O accumulator registers");
         assert!(ptx.contains("%wg_desc_p"), "P descriptor");
         assert!(ptx.contains("%wg_desc_v_"), "V descriptor");
@@ -2182,7 +2237,11 @@ mod tests {
         let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
         assert!(gpu.supports_wgmma(), "H100 supports wgmma");
         assert!(gpu.supports_fp16_mma(), "H100 also supports mma.sync");
-        assert_eq!(gpu.warp_group_size(), 128, "H100 uses 128-thread warp groups");
+        assert_eq!(
+            gpu.warp_group_size(),
+            128,
+            "H100 uses 128-thread warp groups"
+        );
         // Dispatch should prefer wgmma when available
         // (tested via FP8 compile_fp8_matmul in fp8.rs)
     }
@@ -2229,9 +2288,14 @@ mod tests {
         emit_qk_matmul_mma(&mut ptx, 64, 64, 64, 64 * 64 * 4);
 
         assert!(ptx.contains("Q@K^T via MMA"), "section comment");
-        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
-            "MMA instruction present");
-        assert!(ptx.contains("cvt.rn.f16.f32"), "f32->f16 conversion present");
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "MMA instruction present"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f16.f32"),
+            "f32->f16 conversion present"
+        );
         assert!(ptx.contains("%acc_s_"), "S accumulator registers used");
         assert!(ptx.contains("%aq_"), "A fragment registers used");
         assert!(ptx.contains("%bk_"), "B fragment registers used");
@@ -2249,12 +2313,21 @@ mod tests {
         let mut ptx = String::new();
         emit_mma_online_softmax(&mut ptx, 64, 64);
 
-        assert!(ptx.contains("Online softmax (MMA layout)"), "section comment");
+        assert!(
+            ptx.contains("Online softmax (MMA layout)"),
+            "section comment"
+        );
         // Row max reduction
-        assert!(ptx.contains("max.f32 %mma_local_max"), "local max computation");
+        assert!(
+            ptx.contains("max.f32 %mma_local_max"),
+            "local max computation"
+        );
         assert!(ptx.contains("shfl.sync.bfly.b32"), "warp shuffle present");
         // Correction factor
-        assert!(ptx.contains("ex2.approx.f32 %mma_correction"), "exp correction");
+        assert!(
+            ptx.contains("ex2.approx.f32 %mma_correction"),
+            "exp correction"
+        );
         // O rescaling
         assert!(ptx.contains("mul.f32 %acc_o_"), "O accumulator rescaling");
         // P = exp(S - max)
@@ -2286,8 +2359,14 @@ mod tests {
             if row > 0 {
                 // Not all banks should be identical
                 let bank_prev = (swizzle_smem_offset(row - 1, 0) / 4) % 32;
-                assert!(bank1 != bank_prev || bank2 != bank1,
-                    "three consecutive rows hit same bank: row={}, banks={},{},{}", row-1, bank_prev, bank1, bank2);
+                assert!(
+                    bank1 != bank_prev || bank2 != bank1,
+                    "three consecutive rows hit same bank: row={}, banks={},{},{}",
+                    row - 1,
+                    bank_prev,
+                    bank1,
+                    bank2
+                );
             }
         }
     }
@@ -2327,8 +2406,11 @@ mod tests {
         // Verify all key MMA components are present
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
         // Q@K^T: n_tiles_s=8, P@V: n_tiles_o=8 → 16 total
-        assert_eq!(mma_count, 16,
-            "expected 16 MMA instructions (8 Q@K^T + 8 P@V), got {}", mma_count);
+        assert_eq!(
+            mma_count, 16,
+            "expected 16 MMA instructions (8 Q@K^T + 8 P@V), got {}",
+            mma_count
+        );
 
         assert!(ptx.contains("cvt.rn.f16.f32"), "f32→f16 conversion");
         assert!(ptx.contains("shfl.sync.bfly"), "warp shuffles for softmax");
@@ -2344,8 +2426,10 @@ mod tests {
         emit_pv_matmul_mma(&mut ptx, 64, 64, 64 * 64 * 4);
 
         assert!(ptx.contains("P@V via MMA"), "section comment");
-        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
-            "MMA instruction present");
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "MMA instruction present"
+        );
         assert!(ptx.contains("%acc_o_"), "O accumulator registers used");
         assert!(ptx.contains("%ap_"), "P A-fragment registers used");
         assert!(ptx.contains("%bv_"), "V B-fragment registers used");
@@ -2376,10 +2460,19 @@ mod tests {
         let mut ptx = String::new();
         emit_mma_temp_registers(&mut ptx);
 
-        assert!(ptx.contains(".reg .f16 %mma_h0, %mma_h1"), "f16 temps declared");
-        assert!(ptx.contains(".reg .u32 %mma_a_row"), "A row register declared");
+        assert!(
+            ptx.contains(".reg .f16 %mma_h0, %mma_h1"),
+            "f16 temps declared"
+        );
+        assert!(
+            ptx.contains(".reg .u32 %mma_a_row"),
+            "A row register declared"
+        );
         assert!(ptx.contains("%mma_laneid"), "laneid register used");
-        assert!(ptx.contains("and.b32 %mma_laneid, %mma_laneid, 31"), "laneid = tid.x % 32");
+        assert!(
+            ptx.contains("and.b32 %mma_laneid, %mma_laneid, 31"),
+            "laneid = tid.x % 32"
+        );
     }
 
     // ── Existing tests ────────────────────────────────────────────────
@@ -2477,7 +2570,7 @@ mod tests {
             gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap(); // strip null
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap(); // strip null
         assert!(ptx_str.starts_with(".version 7.0\n"));
         assert!(ptx_str.contains(".target sm_80"));
         assert!(ptx_str.contains(&flash_attention_kernel_name(&config)));
@@ -2502,13 +2595,13 @@ mod tests {
             gpu_sm: 80,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
-        let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len()-1]).unwrap();
+        let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len() - 1]).unwrap();
         assert!(str_no.contains("Non-causal"));
         assert!(!str_no.contains("Zero-divergence"));
 
         config.causal = true;
         let ptx_causal = synthesize_flash_attention_ptx(&config);
-        let str_c = std::str::from_utf8(&ptx_causal[..ptx_causal.len()-1]).unwrap();
+        let str_c = std::str::from_utf8(&ptx_causal[..ptx_causal.len() - 1]).unwrap();
         assert!(str_c.contains("Zero-divergence"));
     }
 
@@ -2527,7 +2620,7 @@ mod tests {
             gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         assert!(ptx_str.contains("block_table_ptr"));
         assert!(ptx_str.contains("k_pool_ptr"));
         assert!(ptx_str.contains("v_pool_ptr"));
@@ -2548,7 +2641,7 @@ mod tests {
             gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         assert!(ptx_str.contains("cos_ptr"));
         assert!(ptx_str.contains("sin_ptr"));
         assert!(ptx_str.contains("half_split"));
@@ -2569,14 +2662,14 @@ mod tests {
             gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         assert!(ptx_str.contains("kv_head = q_head / 4"));
     }
 
     #[test]
     fn test_rope_cache_write_ptx() {
         let ptx = synthesize_rope_cache_write_ptx(128, RopeStyle::HalfSplit);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         assert!(ptx_str.contains("nsl_rope_cache_write"));
         assert!(ptx_str.contains("seq_ids_ptr"));
         assert!(ptx_str.contains("seq_lens_ptr"));
@@ -2586,7 +2679,7 @@ mod tests {
     #[test]
     fn test_rope_cache_write_adjacent() {
         let ptx = synthesize_rope_cache_write_ptx(128, RopeStyle::Adjacent);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         assert!(ptx_str.contains("adjacent"));
     }
 
@@ -2605,15 +2698,31 @@ mod tests {
             gpu_sm: 80,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
-        let ptx_str = std::str::from_utf8(&ptx[..ptx.len()-1]).unwrap();
+        let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
         // Verify tree mask params and DFS ancestor check are present
-        assert!(ptx_str.contains("dfs_enter_ptr"), "missing dfs_enter_ptr param");
-        assert!(ptx_str.contains("dfs_exit_ptr"), "missing dfs_exit_ptr param");
-        assert!(ptx_str.contains("num_tree_nodes"), "missing num_tree_nodes param");
-        assert!(ptx_str.contains("dfs_enter_base"), "missing DFS register load");
+        assert!(
+            ptx_str.contains("dfs_enter_ptr"),
+            "missing dfs_enter_ptr param"
+        );
+        assert!(
+            ptx_str.contains("dfs_exit_ptr"),
+            "missing dfs_exit_ptr param"
+        );
+        assert!(
+            ptx_str.contains("num_tree_nodes"),
+            "missing num_tree_nodes param"
+        );
+        assert!(
+            ptx_str.contains("dfs_enter_base"),
+            "missing DFS register load"
+        );
         assert!(ptx_str.contains("Tree mask"), "missing tree mask comment");
         // Verify tree_mask=true kernel name includes t1
         let name = flash_attention_kernel_name(&config);
-        assert!(name.contains("_t1_"), "kernel name should contain _t1_ for tree_mask=true, got {}", name);
+        assert!(
+            name.contains("_t1_"),
+            "kernel name should contain _t1_ for tree_mask=true, got {}",
+            name
+        );
     }
 }

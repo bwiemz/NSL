@@ -92,7 +92,14 @@ impl LivenessAnalyzer {
     }
 
     /// Record a tensor allocation with explicit saved-for-backward annotation.
-    pub fn record_alloc_ex(&mut self, name: &str, size_bytes: u64, size_kind: SizeKind, loc: &str, saved_for_backward: bool) {
+    pub fn record_alloc_ex(
+        &mut self,
+        name: &str,
+        size_bytes: u64,
+        size_kind: SizeKind,
+        loc: &str,
+        saved_for_backward: bool,
+    ) {
         let id = self.allocs.len() as TensorAllocId;
         self.allocs.push(TensorAlloc {
             id,
@@ -177,8 +184,7 @@ impl InterferenceGraph {
                 // Saved-for-backward tensors must never share a slab slot
                 // with any other tensor — their addresses are used as
                 // gradient map keys and must remain unique.
-                let force_interfere =
-                    allocs[i].saved_for_backward || allocs[j].saved_for_backward;
+                let force_interfere = allocs[i].saved_for_backward || allocs[j].saved_for_backward;
                 if force_interfere || intervals_overlap(&allocs[i], &allocs[j]) {
                     adj[i].insert(j as TensorAllocId);
                     adj[j].insert(i as TensorAllocId);
@@ -186,7 +192,10 @@ impl InterferenceGraph {
             }
         }
 
-        Self { adj, num_tensors: n }
+        Self {
+            adj,
+            num_tensors: n,
+        }
     }
 
     /// Check if two tensors interfere.
@@ -297,12 +306,18 @@ pub fn rematerialize(
 
     for info in op_infos {
         let idx = info.alloc_id as usize;
-        if idx >= allocs.len() { continue; }
+        if idx >= allocs.len() {
+            continue;
+        }
         let alloc = &allocs[idx];
-        if !alloc.is_plannable() { continue; }
+        if !alloc.is_plannable() {
+            continue;
+        }
 
         let live_range = alloc.death.saturating_sub(alloc.birth);
-        if live_range < 2 { continue; } // too short to benefit
+        if live_range < 2 {
+            continue;
+        } // too short to benefit
 
         // Check if all inputs are live at a potential recompute point
         // (simplified: check if inputs are live at the original death - 1)
@@ -327,7 +342,11 @@ pub fn rematerialize(
     }
 
     // Sort by score descending (best candidates first)
-    candidates.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Apply: shorten live ranges for accepted candidates
     for (idx, candidate) in &candidates {
@@ -574,10 +593,13 @@ pub fn compute_tensor_bytes(
                 let ub = *upper_bound as u64;
                 total_elems = total_elems.saturating_mul(ub);
                 let bytes = total_elems * dtype_byte_size(dtype);
-                return Some((bytes, SizeKind::Bounded {
-                    upper: bytes,
-                    symbolic_expr: format!("{:?}", shape),
-                }));
+                return Some((
+                    bytes,
+                    SizeKind::Bounded {
+                        upper: bytes,
+                        symbolic_expr: format!("{:?}", shape),
+                    },
+                ));
             }
             _ => return None, // Dynamic / Wildcard / Symbolic — can't plan
         }
@@ -595,7 +617,7 @@ fn dtype_byte_size(dtype: &nsl_semantic::types::DType) -> u64 {
         DType::Fp16 | DType::Bf16 | DType::Int16 => 2,
         DType::Int8 | DType::Uint8 | DType::Bool => 1,
         DType::Fp8E4m3 | DType::Fp8E5m2 => 1,
-        DType::Int4 => 1, // rounded up
+        DType::Int4 => 1,                       // rounded up
         DType::Custom(_) | DType::Unknown => 4, // default to f32 size for unknown dtypes
     }
 }
@@ -658,7 +680,9 @@ fn walk_stmt(
                         if let Some((shape, dtype, device)) = ty.as_tensor_parts() {
                             let is_gpu = matches!(device, nsl_semantic::types::Device::Cuda(_));
                             if is_gpu {
-                                if let Some((size_bytes, size_kind)) = compute_tensor_bytes(shape, dtype) {
+                                if let Some((size_bytes, size_kind)) =
+                                    compute_tensor_bytes(shape, dtype)
+                                {
                                     if size_bytes > 0 {
                                         let loc = format!("byte {}", stmt.span.start.0);
                                         analyzer.record_alloc(&name, size_bytes, size_kind, &loc);
@@ -682,7 +706,12 @@ fn walk_stmt(
             walk_expr_uses(value, type_map, interner, analyzer, name_to_id);
         }
 
-        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+        StmtKind::If {
+            condition,
+            then_block,
+            elif_clauses,
+            else_block,
+        } => {
             walk_expr_uses(condition, type_map, interner, analyzer, name_to_id);
             walk_stmts(&then_block.stmts, type_map, interner, analyzer, name_to_id);
             for (cond, block) in elif_clauses {
@@ -772,10 +801,21 @@ fn walk_expr_uses(
 
         ExprKind::BlockExpr(block) => {
             let mut local_name_to_id = name_to_id.clone();
-            walk_stmts(&block.stmts, type_map, interner, analyzer, &mut local_name_to_id);
+            walk_stmts(
+                &block.stmts,
+                type_map,
+                interner,
+                analyzer,
+                &mut local_name_to_id,
+            );
         }
 
-        ExprKind::IfExpr { condition, then_expr, else_expr, .. } => {
+        ExprKind::IfExpr {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
             walk_expr_uses(condition, type_map, interner, analyzer, name_to_id);
             walk_expr_uses(then_expr, type_map, interner, analyzer, name_to_id);
             walk_expr_uses(else_expr, type_map, interner, analyzer, name_to_id);
@@ -798,9 +838,14 @@ mod tests {
     #[test]
     fn test_plan_size_static() {
         let a = TensorAlloc {
-            id: 0, name: "x".into(), size_bytes: 1024,
-            birth: 0, death: 5, source_loc: "test:1".into(),
-            size_kind: SizeKind::Static(1024), saved_for_backward: false,
+            id: 0,
+            name: "x".into(),
+            size_bytes: 1024,
+            birth: 0,
+            death: 5,
+            source_loc: "test:1".into(),
+            size_kind: SizeKind::Static(1024),
+            saved_for_backward: false,
         };
         assert_eq!(a.plan_size(), Some(1024));
         assert!(a.is_plannable());
@@ -809,9 +854,17 @@ mod tests {
     #[test]
     fn test_plan_size_bounded() {
         let a = TensorAlloc {
-            id: 0, name: "x".into(), size_bytes: 4096,
-            birth: 0, death: 5, source_loc: "test:1".into(),
-            size_kind: SizeKind::Bounded { upper: 4096, symbolic_expr: "B*1024".into() }, saved_for_backward: false,
+            id: 0,
+            name: "x".into(),
+            size_bytes: 4096,
+            birth: 0,
+            death: 5,
+            source_loc: "test:1".into(),
+            size_kind: SizeKind::Bounded {
+                upper: 4096,
+                symbolic_expr: "B*1024".into(),
+            },
+            saved_for_backward: false,
         };
         assert_eq!(a.plan_size(), Some(4096));
         assert!(a.is_plannable());
@@ -820,9 +873,14 @@ mod tests {
     #[test]
     fn test_plan_size_dynamic() {
         let a = TensorAlloc {
-            id: 0, name: "x".into(), size_bytes: 0,
-            birth: 0, death: 5, source_loc: "test:1".into(),
-            size_kind: SizeKind::Dynamic, saved_for_backward: false,
+            id: 0,
+            name: "x".into(),
+            size_bytes: 0,
+            birth: 0,
+            death: 5,
+            source_loc: "test:1".into(),
+            size_kind: SizeKind::Dynamic,
+            saved_for_backward: false,
         };
         assert_eq!(a.plan_size(), None);
         assert!(!a.is_plannable());
@@ -907,9 +965,36 @@ mod tests {
 
     #[test]
     fn test_intervals_overlap() {
-        let a = TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false };
-        let b = TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false };
-        let c = TensorAlloc { id: 2, name: "c".into(), size_bytes: 150, birth: 6, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(150), saved_for_backward: false };
+        let a = TensorAlloc {
+            id: 0,
+            name: "a".into(),
+            size_bytes: 100,
+            birth: 0,
+            death: 5,
+            source_loc: "".into(),
+            size_kind: SizeKind::Static(100),
+            saved_for_backward: false,
+        };
+        let b = TensorAlloc {
+            id: 1,
+            name: "b".into(),
+            size_bytes: 200,
+            birth: 3,
+            death: 8,
+            source_loc: "".into(),
+            size_kind: SizeKind::Static(200),
+            saved_for_backward: false,
+        };
+        let c = TensorAlloc {
+            id: 2,
+            name: "c".into(),
+            size_bytes: 150,
+            birth: 6,
+            death: 10,
+            source_loc: "".into(),
+            size_kind: SizeKind::Static(150),
+            saved_for_backward: false,
+        };
 
         assert!(intervals_overlap(&a, &b));
         assert!(!intervals_overlap(&a, &c));
@@ -919,9 +1004,36 @@ mod tests {
     #[test]
     fn test_interference_graph_construction() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 150, birth: 6, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(150), saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "a".into(),
+                size_bytes: 100,
+                birth: 0,
+                death: 5,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(100),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "b".into(),
+                size_bytes: 200,
+                birth: 3,
+                death: 8,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(200),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 2,
+                name: "c".into(),
+                size_bytes: 150,
+                birth: 6,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(150),
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
 
@@ -932,17 +1044,62 @@ mod tests {
 
     #[test]
     fn test_interference_same_point_no_overlap() {
-        let a = TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 3, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false };
-        let b = TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 3, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false };
+        let a = TensorAlloc {
+            id: 0,
+            name: "a".into(),
+            size_bytes: 100,
+            birth: 0,
+            death: 3,
+            source_loc: "".into(),
+            size_kind: SizeKind::Static(100),
+            saved_for_backward: false,
+        };
+        let b = TensorAlloc {
+            id: 1,
+            name: "b".into(),
+            size_bytes: 200,
+            birth: 3,
+            death: 5,
+            source_loc: "".into(),
+            size_kind: SizeKind::Static(200),
+            saved_for_backward: false,
+        };
         assert!(!intervals_overlap(&a, &b));
     }
 
     #[test]
     fn test_interference_graph_skips_dynamic() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "static_a".into(), size_bytes: 100, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "dynamic_b".into(), size_bytes: 0, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Dynamic, saved_for_backward: false },
-            TensorAlloc { id: 2, name: "static_c".into(), size_bytes: 200, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "static_a".into(),
+                size_bytes: 100,
+                birth: 0,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(100),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "dynamic_b".into(),
+                size_bytes: 0,
+                birth: 0,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Dynamic,
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 2,
+                name: "static_c".into(),
+                size_bytes: 200,
+                birth: 0,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(200),
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
 
@@ -956,9 +1113,36 @@ mod tests {
     #[test]
     fn test_plan_slab_reuse() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 3, source_loc: "".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 2048, birth: 1, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(2048), saved_for_backward: false },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 512, birth: 4, death: 7, source_loc: "".into(), size_kind: SizeKind::Static(512), saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "a".into(),
+                size_bytes: 1024,
+                birth: 0,
+                death: 3,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(1024),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "b".into(),
+                size_bytes: 2048,
+                birth: 1,
+                death: 5,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(2048),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 2,
+                name: "c".into(),
+                size_bytes: 512,
+                birth: 4,
+                death: 7,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(512),
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -978,8 +1162,26 @@ mod tests {
     #[test]
     fn test_plan_slab_skips_dynamic() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "static_t".into(), size_bytes: 1024, birth: 0, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "dynamic_t".into(), size_bytes: 0, birth: 2, death: 4, source_loc: "".into(), size_kind: SizeKind::Dynamic, saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "static_t".into(),
+                size_bytes: 1024,
+                birth: 0,
+                death: 5,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(1024),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "dynamic_t".into(),
+                size_bytes: 0,
+                birth: 2,
+                death: 4,
+                source_loc: "".into(),
+                size_kind: SizeKind::Dynamic,
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -1001,9 +1203,36 @@ mod tests {
     #[test]
     fn test_plan_slab_all_overlap() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 100, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(100), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 200, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(200), saved_for_backward: false },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 300, birth: 0, death: 10, source_loc: "".into(), size_kind: SizeKind::Static(300), saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "a".into(),
+                size_bytes: 100,
+                birth: 0,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(100),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "b".into(),
+                size_bytes: 200,
+                birth: 0,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(200),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 2,
+                name: "c".into(),
+                size_bytes: 300,
+                birth: 0,
+                death: 10,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(300),
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -1015,9 +1244,36 @@ mod tests {
     #[test]
     fn test_plan_slab_sequential_full_reuse() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 2, source_loc: "".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "b".into(), size_bytes: 512, birth: 3, death: 5, source_loc: "".into(), size_kind: SizeKind::Static(512), saved_for_backward: false },
-            TensorAlloc { id: 2, name: "c".into(), size_bytes: 768, birth: 6, death: 8, source_loc: "".into(), size_kind: SizeKind::Static(768), saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "a".into(),
+                size_bytes: 1024,
+                birth: 0,
+                death: 2,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(1024),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "b".into(),
+                size_bytes: 512,
+                birth: 3,
+                death: 5,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(512),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 2,
+                name: "c".into(),
+                size_bytes: 768,
+                birth: 6,
+                death: 8,
+                source_loc: "".into(),
+                size_kind: SizeKind::Static(768),
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -1040,9 +1296,36 @@ mod tests {
     #[test]
     fn test_format_memory_report() {
         let allocs = vec![
-            TensorAlloc { id: 0, name: "weight_q".into(), size_bytes: 4096, birth: 0, death: 10, source_loc: "model.nsl:5".into(), size_kind: SizeKind::Static(4096), saved_for_backward: false },
-            TensorAlloc { id: 1, name: "hidden".into(), size_bytes: 2048, birth: 2, death: 6, source_loc: "model.nsl:8".into(), size_kind: SizeKind::Static(2048), saved_for_backward: false },
-            TensorAlloc { id: 2, name: "output".into(), size_bytes: 1024, birth: 7, death: 10, source_loc: "model.nsl:12".into(), size_kind: SizeKind::Static(1024), saved_for_backward: false },
+            TensorAlloc {
+                id: 0,
+                name: "weight_q".into(),
+                size_bytes: 4096,
+                birth: 0,
+                death: 10,
+                source_loc: "model.nsl:5".into(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 1,
+                name: "hidden".into(),
+                size_bytes: 2048,
+                birth: 2,
+                death: 6,
+                source_loc: "model.nsl:8".into(),
+                size_kind: SizeKind::Static(2048),
+                saved_for_backward: false,
+            },
+            TensorAlloc {
+                id: 2,
+                name: "output".into(),
+                size_bytes: 1024,
+                birth: 7,
+                death: 10,
+                source_loc: "model.nsl:12".into(),
+                size_kind: SizeKind::Static(1024),
+                saved_for_backward: false,
+            },
         ];
         let graph = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &graph);
@@ -1069,7 +1352,10 @@ mod tests {
         assert_eq!(parse_vram_budget("512MB"), Some(512 * 1024 * 1024));
         assert_eq!(parse_vram_budget("1024KB"), Some(1024 * 1024));
         assert_eq!(parse_vram_budget("100B"), Some(100));
-        assert_eq!(parse_vram_budget("1.5GB"), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert_eq!(
+            parse_vram_budget("1.5GB"),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
         assert_eq!(parse_vram_budget("0GB"), Some(0));
         assert_eq!(parse_vram_budget("garbage"), None);
         assert_eq!(parse_vram_budget(""), None);
@@ -1079,7 +1365,11 @@ mod tests {
     #[test]
     fn test_savings_fraction_zero_allocs() {
         let plan = SlabPlan {
-            slots: vec![], total_bytes: 0, assignments: HashMap::new(), naive_total: 0, padding_bytes: 0,
+            slots: vec![],
+            total_bytes: 0,
+            assignments: HashMap::new(),
+            naive_total: 0,
+            padding_bytes: 0,
         };
         assert_eq!(plan.savings_fraction(), 0.0);
     }
@@ -1087,7 +1377,11 @@ mod tests {
     #[test]
     fn test_check_vram_budget_passes() {
         let plan = SlabPlan {
-            slots: vec![], total_bytes: 1024, assignments: HashMap::new(), naive_total: 2048, padding_bytes: 0,
+            slots: vec![],
+            total_bytes: 1024,
+            assignments: HashMap::new(),
+            naive_total: 2048,
+            padding_bytes: 0,
         };
         assert!(check_vram_budget(&plan, 2048).is_none());
     }
@@ -1095,7 +1389,11 @@ mod tests {
     #[test]
     fn test_check_vram_budget_fails() {
         let plan = SlabPlan {
-            slots: vec![], total_bytes: 4096, assignments: HashMap::new(), naive_total: 4096, padding_bytes: 0,
+            slots: vec![],
+            total_bytes: 4096,
+            assignments: HashMap::new(),
+            naive_total: 4096,
+            padding_bytes: 0,
         };
         let err = check_vram_budget(&plan, 2048);
         assert!(err.is_some());
@@ -1113,16 +1411,34 @@ mod tests {
         // third has non-overlapping lifetime with both and should pick the smaller slot.
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "big".into(), size_bytes: 1000, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(1000), saved_for_backward: false,
+                id: 0,
+                name: "big".into(),
+                size_bytes: 1000,
+                birth: 0,
+                death: 5,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(1000),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "medium".into(), size_bytes: 600, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(600), saved_for_backward: false,
+                id: 1,
+                name: "medium".into(),
+                size_bytes: 600,
+                birth: 0,
+                death: 5,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(600),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 2, name: "fits_medium".into(), size_bytes: 580, birth: 6, death: 10,
-                source_loc: String::new(), size_kind: SizeKind::Static(580), saved_for_backward: false,
+                id: 2,
+                name: "fits_medium".into(),
+                size_bytes: 580,
+                birth: 6,
+                death: 10,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(580),
+                saved_for_backward: false,
             },
         ];
 
@@ -1133,8 +1449,10 @@ mod tests {
         // not tensor 0 (1000, waste=420)
         let (slot_t1, _) = plan.assignments[&1];
         let (slot_t2, _) = plan.assignments[&2];
-        assert_eq!(slot_t2, slot_t1,
-            "BFD should assign 580-byte tensor to 600-byte slot, not 1000-byte slot");
+        assert_eq!(
+            slot_t2, slot_t1,
+            "BFD should assign 580-byte tensor to 600-byte slot, not 1000-byte slot"
+        );
 
         // Only 2 slots needed (1000 + 600)
         assert_eq!(plan.slots.len(), 2);
@@ -1145,19 +1463,35 @@ mod tests {
         // Two tensors with non-overlapping lifetimes should share one slot
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "a".into(), size_bytes: 1024, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(1024), saved_for_backward: false,
+                id: 0,
+                name: "a".into(),
+                size_bytes: 1024,
+                birth: 0,
+                death: 5,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(1024),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "b".into(), size_bytes: 512, birth: 6, death: 10,
-                source_loc: String::new(), size_kind: SizeKind::Static(512), saved_for_backward: false,
+                id: 1,
+                name: "b".into(),
+                size_bytes: 512,
+                birth: 6,
+                death: 10,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(512),
+                saved_for_backward: false,
             },
         ];
 
         let ig = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &ig);
 
-        assert_eq!(plan.slots.len(), 1, "non-overlapping tensors should share 1 slot");
+        assert_eq!(
+            plan.slots.len(),
+            1,
+            "non-overlapping tensors should share 1 slot"
+        );
         assert_eq!(plan.total_bytes, 1024, "slot size = max(1024, 512)");
     }
 
@@ -1165,30 +1499,49 @@ mod tests {
     fn test_fragmentation_zero_for_aligned_sizes() {
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "aligned".into(), size_bytes: 256, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(256), saved_for_backward: false,
+                id: 0,
+                name: "aligned".into(),
+                size_bytes: 256,
+                birth: 0,
+                death: 5,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(256),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "aligned2".into(), size_bytes: 512, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(512), saved_for_backward: false,
+                id: 1,
+                name: "aligned2".into(),
+                size_bytes: 512,
+                birth: 0,
+                death: 5,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(512),
+                saved_for_backward: false,
             },
         ];
 
         let ig = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &ig);
 
-        assert_eq!(plan.padding_bytes, 0, "aligned sizes should have zero padding");
+        assert_eq!(
+            plan.padding_bytes, 0,
+            "aligned sizes should have zero padding"
+        );
         assert!((plan.fragmentation_ratio() - 0.0).abs() < 0.001);
     }
 
     #[test]
     fn test_fragmentation_nonzero_for_unaligned_sizes() {
-        let allocs = vec![
-            TensorAlloc {
-                id: 0, name: "unaligned".into(), size_bytes: 100, birth: 0, death: 5,
-                source_loc: String::new(), size_kind: SizeKind::Static(100), saved_for_backward: false,
-            },
-        ];
+        let allocs = vec![TensorAlloc {
+            id: 0,
+            name: "unaligned".into(),
+            size_bytes: 100,
+            birth: 0,
+            death: 5,
+            source_loc: String::new(),
+            size_kind: SizeKind::Static(100),
+            saved_for_backward: false,
+        }];
 
         let ig = InterferenceGraph::build(&allocs);
         let plan = plan_slab(&allocs, &ig);
@@ -1205,31 +1558,51 @@ mod tests {
         // Tensor produced by relu (cheap), large, long live range → good candidate
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "input".into(), size_bytes: 4096, birth: 0, death: 100,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
+                id: 0,
+                name: "input".into(),
+                size_bytes: 4096,
+                birth: 0,
+                death: 100,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "relu_out".into(), size_bytes: 4096, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
+                id: 1,
+                name: "relu_out".into(),
+                size_bytes: 4096,
+                birth: 5,
+                death: 95,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
             },
         ];
 
-        let op_infos = vec![
-            TensorOpInfo {
-                alloc_id: 1, op_name: "relu".into(),
-                input_alloc_ids: vec![0], dtype_bytes: 4,
-            },
-        ];
+        let op_infos = vec![TensorOpInfo {
+            alloc_id: 1,
+            op_name: "relu".into(),
+            input_alloc_ids: vec![0],
+            dtype_bytes: 4,
+        }];
 
-        let (modified, recomp_points) = rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
+        let (modified, recomp_points) =
+            rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
 
         // relu_out should be a remat candidate (cheap, large range)
-        assert!(!recomp_points.is_empty(), "should have at least one recomp point");
+        assert!(
+            !recomp_points.is_empty(),
+            "should have at least one recomp point"
+        );
         assert_eq!(recomp_points[0].original_alloc_id, 1);
 
         // Modified alloc should have shortened death
-        assert!(modified[1].death < allocs[1].death,
-            "death should be shortened: was {}, now {}", allocs[1].death, modified[1].death);
+        assert!(
+            modified[1].death < allocs[1].death,
+            "death should be shortened: was {}, now {}",
+            allocs[1].death,
+            modified[1].death
+        );
     }
 
     #[test]
@@ -1237,24 +1610,40 @@ mod tests {
         // matmul is expensive — should NOT be rematerialized
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "a".into(), size_bytes: 4096, birth: 0, death: 100,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
+                id: 0,
+                name: "a".into(),
+                size_bytes: 4096,
+                birth: 0,
+                death: 100,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "mm_out".into(), size_bytes: 4096, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
+                id: 1,
+                name: "mm_out".into(),
+                size_bytes: 4096,
+                birth: 5,
+                death: 95,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
             },
         ];
 
-        let op_infos = vec![
-            TensorOpInfo {
-                alloc_id: 1, op_name: "matmul".into(),
-                input_alloc_ids: vec![0], dtype_bytes: 4,
-            },
-        ];
+        let op_infos = vec![TensorOpInfo {
+            alloc_id: 1,
+            op_name: "matmul".into(),
+            input_alloc_ids: vec![0],
+            dtype_bytes: 4,
+        }];
 
-        let (_, recomp_points) = rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
-        assert!(recomp_points.is_empty(), "matmul should NOT be rematerialized");
+        let (_, recomp_points) =
+            rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
+        assert!(
+            recomp_points.is_empty(),
+            "matmul should NOT be rematerialized"
+        );
     }
 
     #[test]
@@ -1262,24 +1651,39 @@ mod tests {
         // reshape is free — always accepted regardless of score
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "src".into(), size_bytes: 100, birth: 0, death: 100,
-                source_loc: String::new(), size_kind: SizeKind::Static(100), saved_for_backward: false,
+                id: 0,
+                name: "src".into(),
+                size_bytes: 100,
+                birth: 0,
+                death: 100,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(100),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "reshaped".into(), size_bytes: 100, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(100), saved_for_backward: false,
+                id: 1,
+                name: "reshaped".into(),
+                size_bytes: 100,
+                birth: 5,
+                death: 95,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(100),
+                saved_for_backward: false,
             },
         ];
 
-        let op_infos = vec![
-            TensorOpInfo {
-                alloc_id: 1, op_name: "reshape".into(),
-                input_alloc_ids: vec![0], dtype_bytes: 4,
-            },
-        ];
+        let op_infos = vec![TensorOpInfo {
+            alloc_id: 1,
+            op_name: "reshape".into(),
+            input_alloc_ids: vec![0],
+            dtype_bytes: 4,
+        }];
 
         let (_, recomp_points) = rematerialize(&allocs, &op_infos, f64::MAX); // very high threshold
-        assert!(!recomp_points.is_empty(), "free ops should always be accepted");
+        assert!(
+            !recomp_points.is_empty(),
+            "free ops should always be accepted"
+        );
     }
 
     #[test]
@@ -1287,23 +1691,36 @@ mod tests {
         // Input dies before recompute point → cannot rematerialize
         let allocs = vec![
             TensorAlloc {
-                id: 0, name: "input".into(), size_bytes: 4096, birth: 0, death: 10,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
+                id: 0,
+                name: "input".into(),
+                size_bytes: 4096,
+                birth: 0,
+                death: 10,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
             },
             TensorAlloc {
-                id: 1, name: "relu_out".into(), size_bytes: 4096, birth: 5, death: 95,
-                source_loc: String::new(), size_kind: SizeKind::Static(4096), saved_for_backward: false,
+                id: 1,
+                name: "relu_out".into(),
+                size_bytes: 4096,
+                birth: 5,
+                death: 95,
+                source_loc: String::new(),
+                size_kind: SizeKind::Static(4096),
+                saved_for_backward: false,
             },
         ];
 
-        let op_infos = vec![
-            TensorOpInfo {
-                alloc_id: 1, op_name: "relu".into(),
-                input_alloc_ids: vec![0], dtype_bytes: 4,
-            },
-        ];
+        let op_infos = vec![TensorOpInfo {
+            alloc_id: 1,
+            op_name: "relu".into(),
+            input_alloc_ids: vec![0],
+            dtype_bytes: 4,
+        }];
 
-        let (_, recomp_points) = rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
+        let (_, recomp_points) =
+            rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
         // Input dies at 10 but recompute point is at 94 — cannot remat
         assert!(recomp_points.is_empty(), "cannot remat if inputs are dead");
     }

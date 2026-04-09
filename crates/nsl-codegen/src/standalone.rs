@@ -4,7 +4,9 @@
 /// separate object files that carry weight data independently of the compiled
 /// NSL program object.  Also contains `compile_standalone_main()` which generates
 /// the entry-point main() for standalone binaries (weight init + arg parser).
-use cranelift_codegen::ir::{types as cl_types, AbiParam, Function, InstBuilder, MemFlags, UserFuncName};
+use cranelift_codegen::ir::{
+    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, UserFuncName,
+};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
@@ -165,54 +167,42 @@ impl Compiler<'_> {
                     .module
                     .declare_data("__nsl_weights_data", Linkage::Import, false, false)
                     .map_err(|e| {
-                        CodegenError::new(format!(
-                            "failed to declare __nsl_weights_data: {e}"
-                        ))
+                        CodegenError::new(format!("failed to declare __nsl_weights_data: {e}"))
                     })?;
                 let size_gv_id = self
                     .module
                     .declare_data("__nsl_weights_size", Linkage::Import, false, false)
                     .map_err(|e| {
-                        CodegenError::new(format!(
-                            "failed to declare __nsl_weights_size: {e}"
-                        ))
+                        CodegenError::new(format!("failed to declare __nsl_weights_size: {e}"))
                     })?;
 
-                let data_gv = self
-                    .module
-                    .declare_data_in_func(data_gv_id, builder.func);
-                let size_gv = self
-                    .module
-                    .declare_data_in_func(size_gv_id, builder.func);
+                let data_gv = self.module.declare_data_in_func(data_gv_id, builder.func);
+                let size_gv = self.module.declare_data_in_func(size_gv_id, builder.func);
 
                 let data_ptr = builder.ins().symbol_value(cl_types::I64, data_gv);
                 let size_ptr = builder.ins().symbol_value(cl_types::I64, size_gv);
-                let size_val =
-                    builder
-                        .ins()
-                        .load(cl_types::I64, MemFlags::trusted(), size_ptr, 0);
+                let size_val = builder
+                    .ins()
+                    .load(cl_types::I64, MemFlags::trusted(), size_ptr, 0);
 
                 let embed_init_id = self.registry.runtime_fns["nsl_standalone_init_embedded"].0;
-                let embed_init_ref =
-                    self.module.declare_func_in_func(embed_init_id, builder.func);
-                builder
-                    .ins()
-                    .call(embed_init_ref, &[data_ptr, size_val]);
+                let embed_init_ref = self
+                    .module
+                    .declare_func_in_func(embed_init_id, builder.func);
+                builder.ins().call(embed_init_ref, &[data_ptr, size_val]);
             } else {
                 // Sidecar mode: pass the path string to the runtime
                 let sidecar_path = config.sidecar_path.clone();
                 let path_len = sidecar_path.len() as i64;
                 let path_data_id = self.intern_string(&sidecar_path)?;
-                let path_gv = self
-                    .module
-                    .declare_data_in_func(path_data_id, builder.func);
+                let path_gv = self.module.declare_data_in_func(path_data_id, builder.func);
                 let path_ptr = builder.ins().symbol_value(cl_types::I64, path_gv);
                 let path_len_val = builder.ins().iconst(cl_types::I64, path_len);
 
                 let sidecar_init_id = self.registry.runtime_fns["nsl_standalone_init_sidecar"].0;
-                let sidecar_init_ref =
-                    self.module
-                        .declare_func_in_func(sidecar_init_id, builder.func);
+                let sidecar_init_ref = self
+                    .module
+                    .declare_func_in_func(sidecar_init_id, builder.func);
                 builder
                     .ins()
                     .call(sidecar_init_ref, &[path_ptr, path_len_val]);
@@ -231,8 +221,7 @@ impl Compiler<'_> {
             if !crate::types::is_block_filled(&builder, current) {
                 // Finish standalone arg parser
                 let finish_id = self.registry.runtime_fns["nsl_standalone_args_finish"].0;
-                let finish_ref =
-                    self.module.declare_func_in_func(finish_id, builder.func);
+                let finish_ref = self.module.declare_func_in_func(finish_id, builder.func);
                 builder.ins().call(finish_ref, &[]);
 
                 // Stop and free any DataLoaders before implicit main() return

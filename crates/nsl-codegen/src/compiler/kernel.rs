@@ -18,7 +18,10 @@ impl Compiler<'_> {
                 StmtKind::KernelDef(kernel) => {
                     self.compile_single_kernel(kernel)?;
                 }
-                StmtKind::Decorated { decorators, stmt: inner } => {
+                StmtKind::Decorated {
+                    decorators,
+                    stmt: inner,
+                } => {
                     if let StmtKind::KernelDef(kernel) = &inner.kind {
                         let has_autotune = decorators.iter().any(|d| {
                             d.name.len() == 1
@@ -27,7 +30,9 @@ impl Compiler<'_> {
 
                         if has_autotune {
                             let params = self.extract_autotune_params(decorators)?;
-                            let kernel_name = self.interner.resolve(kernel.name.0)
+                            let kernel_name = self
+                                .interner
+                                .resolve(kernel.name.0)
                                 .unwrap_or("unknown")
                                 .to_string();
 
@@ -38,15 +43,16 @@ impl Compiler<'_> {
                                     kernel_name
                                 );
                                 let middle = crate::autotune::select_middle_values(&params);
-                                let const_map: HashMap<String, i64> =
-                                    middle.into_iter().collect();
+                                let const_map: HashMap<String, i64> = middle.into_iter().collect();
                                 self.compile_single_kernel_with_constants(kernel, &const_map)?;
                             } else {
                                 // M26: cost-model-based autotune variant selection
-                                let winning_constants = self.autotune_select_best(
-                                    &kernel_name, kernel, &params,
+                                let winning_constants =
+                                    self.autotune_select_best(&kernel_name, kernel, &params)?;
+                                self.compile_single_kernel_with_constants(
+                                    kernel,
+                                    &winning_constants,
                                 )?;
-                                self.compile_single_kernel_with_constants(kernel, &winning_constants)?;
                             }
                         } else {
                             self.compile_single_kernel(kernel)?;
@@ -71,7 +77,11 @@ impl Compiler<'_> {
         use crate::gpu_target::GpuTarget;
 
         let target = self.gpu_target();
-        let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+        let kernel_name = self
+            .interner
+            .resolve(kernel.name.0)
+            .unwrap_or("__kernel")
+            .to_string();
 
         let kernel_bytes = match target {
             GpuTarget::Cuda => {
@@ -129,47 +139,55 @@ impl Compiler<'_> {
 
         // Embed kernel code bytes in .rodata
         let data_label = format!("__nsl_kernel_{}_{}", target.name(), kernel_name);
-        let kernel_data_id = self.module
-            .declare_data(
-                &data_label,
-                cranelift_module::Linkage::Local,
-                false,
-                false,
-            )
-            .map_err(|e| CodegenError::new(format!(
-                "failed to declare kernel data for '{}' ({}): {e}", kernel_name, target.name()
-            )))?;
+        let kernel_data_id = self
+            .module
+            .declare_data(&data_label, cranelift_module::Linkage::Local, false, false)
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare kernel data for '{}' ({}): {e}",
+                    kernel_name,
+                    target.name()
+                ))
+            })?;
         let mut data_desc = cranelift_module::DataDescription::new();
         data_desc.define(kernel_bytes.into_boxed_slice());
         self.module
             .define_data(kernel_data_id, &data_desc)
-            .map_err(|e| CodegenError::new(format!(
-                "failed to define kernel data for '{}' ({}): {e}", kernel_name, target.name()
-            )))?;
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define kernel data for '{}' ({}): {e}",
+                    kernel_name,
+                    target.name()
+                ))
+            })?;
 
         // Embed kernel name (null-terminated) in .rodata
         let mut name_bytes = kernel_name.as_bytes().to_vec();
         name_bytes.push(0);
         let name_label = format!("__nsl_kernel_name_{}_{}", target.name(), kernel_name);
-        let name_data_id = self.module
-            .declare_data(
-                &name_label,
-                cranelift_module::Linkage::Local,
-                false,
-                false,
-            )
-            .map_err(|e| CodegenError::new(format!(
-                "failed to declare name data for kernel '{}': {e}", kernel_name
-            )))?;
+        let name_data_id = self
+            .module
+            .declare_data(&name_label, cranelift_module::Linkage::Local, false, false)
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare name data for kernel '{}': {e}",
+                    kernel_name
+                ))
+            })?;
         let mut name_desc = cranelift_module::DataDescription::new();
         name_desc.define(name_bytes.into_boxed_slice());
         self.module
             .define_data(name_data_id, &name_desc)
-            .map_err(|e| CodegenError::new(format!(
-                "failed to define name data for kernel '{}': {e}", kernel_name
-            )))?;
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define name data for kernel '{}': {e}",
+                    kernel_name
+                ))
+            })?;
 
-        self.kernels.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
+        self.kernels
+            .kernel_ptx_data
+            .insert(kernel_name, (kernel_data_id, name_data_id));
         Ok(())
     }
 
@@ -184,8 +202,7 @@ impl Compiler<'_> {
         let autotune_deco = decorators
             .iter()
             .find(|d| {
-                d.name.len() == 1
-                    && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
+                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
             })
             .ok_or_else(|| CodegenError::new("@autotune decorator not found".to_string()))?;
 
@@ -231,13 +248,19 @@ impl Compiler<'_> {
         use crate::gpu_target::GpuTarget;
 
         let target = self.gpu_target();
-        let kernel_name = self.interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+        let kernel_name = self
+            .interner
+            .resolve(kernel.name.0)
+            .unwrap_or("__kernel")
+            .to_string();
 
         let kernel_bytes = match target {
             GpuTarget::Cuda => {
                 // AST -> constant substitution -> PTX
                 crate::kernel::KernelCompiler::compile_with_constants(
-                    kernel, self.interner, constants,
+                    kernel,
+                    self.interner,
+                    constants,
                 )
             }
             _ => {
@@ -249,47 +272,55 @@ impl Compiler<'_> {
 
         // Embed kernel code bytes in .rodata (same as compile_single_kernel)
         let data_label = format!("__nsl_kernel_{}_{}", target.name(), kernel_name);
-        let kernel_data_id = self.module
-            .declare_data(
-                &data_label,
-                cranelift_module::Linkage::Local,
-                false,
-                false,
-            )
-            .map_err(|e| CodegenError::new(format!(
-                "failed to declare kernel data for '{}' ({}): {e}", kernel_name, target.name()
-            )))?;
+        let kernel_data_id = self
+            .module
+            .declare_data(&data_label, cranelift_module::Linkage::Local, false, false)
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare kernel data for '{}' ({}): {e}",
+                    kernel_name,
+                    target.name()
+                ))
+            })?;
         let mut data_desc = cranelift_module::DataDescription::new();
         data_desc.define(kernel_bytes.into_boxed_slice());
         self.module
             .define_data(kernel_data_id, &data_desc)
-            .map_err(|e| CodegenError::new(format!(
-                "failed to define kernel data for '{}' ({}): {e}", kernel_name, target.name()
-            )))?;
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define kernel data for '{}' ({}): {e}",
+                    kernel_name,
+                    target.name()
+                ))
+            })?;
 
         // Embed kernel name (null-terminated)
         let mut name_bytes = kernel_name.as_bytes().to_vec();
         name_bytes.push(0);
         let name_label = format!("__nsl_kernel_name_{}_{}", target.name(), kernel_name);
-        let name_data_id = self.module
-            .declare_data(
-                &name_label,
-                cranelift_module::Linkage::Local,
-                false,
-                false,
-            )
-            .map_err(|e| CodegenError::new(format!(
-                "failed to declare name data for kernel '{}': {e}", kernel_name
-            )))?;
+        let name_data_id = self
+            .module
+            .declare_data(&name_label, cranelift_module::Linkage::Local, false, false)
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare name data for kernel '{}': {e}",
+                    kernel_name
+                ))
+            })?;
         let mut name_desc = cranelift_module::DataDescription::new();
         name_desc.define(name_bytes.into_boxed_slice());
         self.module
             .define_data(name_data_id, &name_desc)
-            .map_err(|e| CodegenError::new(format!(
-                "failed to define name data for kernel '{}': {e}", kernel_name
-            )))?;
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define name data for kernel '{}': {e}",
+                    kernel_name
+                ))
+            })?;
 
-        self.kernels.kernel_ptx_data.insert(kernel_name, (kernel_data_id, name_data_id));
+        self.kernels
+            .kernel_ptx_data
+            .insert(kernel_name, (kernel_data_id, name_data_id));
         Ok(())
     }
 
@@ -323,9 +354,8 @@ impl Compiler<'_> {
         let interner = self.interner;
         let ptx_generator = |variant: &crate::autotune::Variant| -> Result<String, String> {
             let const_map: HashMap<String, i64> = variant.iter().cloned().collect();
-            let ptx_bytes = crate::kernel::KernelCompiler::compile_with_constants(
-                kernel, interner, &const_map,
-            );
+            let ptx_bytes =
+                crate::kernel::KernelCompiler::compile_with_constants(kernel, interner, &const_map);
             // Convert to string (PTX is null-terminated UTF-8)
             let ptx_str = String::from_utf8_lossy(&ptx_bytes).to_string();
             Ok(ptx_str)
@@ -347,14 +377,11 @@ impl Compiler<'_> {
             // Compute the "block factor" — product of all tuning param values.
             // Higher block factors generally mean fewer kernel launches and better
             // memory coalescing, so estimated time decreases.
-            let block_factor: f64 = variant
-                .iter()
-                .map(|(_, v)| *v as f64)
-                .product();
+            let block_factor: f64 = variant.iter().map(|(_, v)| *v as f64).product();
 
             // Scale elements by inverse of block factor (normalized to 128 baseline)
-            let effective_elements = (representative_elements as f64
-                * (128.0 / block_factor.max(1.0))) as u64;
+            let effective_elements =
+                (representative_elements as f64 * (128.0 / block_factor.max(1.0))) as u64;
 
             let (flops, bytes_read, bytes_written) =
                 crate::cost_model::elementwise_unary_cost(effective_elements, dtype_bytes);
@@ -540,8 +567,7 @@ impl Compiler<'_> {
         // default when @autotune is absent).
 
         let has_autotune = decorators.iter().any(|d| {
-            d.name.len() == 1
-                && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
+            d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
         });
 
         let default_head_dim: i64 = 64; // runtime extracts actual head_dim from tensor shape
@@ -568,9 +594,7 @@ impl Compiler<'_> {
             ];
 
             if self.compile_options.no_autotune {
-                eprintln!(
-                    "[nsl] autotune: --no-autotune, using middle values for flash_attention"
-                );
+                eprintln!("[nsl] autotune: --no-autotune, using middle values for flash_attention");
             }
 
             // Generate all (block_q, block_kv) combinations
@@ -578,8 +602,16 @@ impl Compiler<'_> {
 
             // Validate and synthesize PTX for each variant
             for variant in &variants {
-                let bq = variant.iter().find(|(n, _)| n == "block_q").map(|(_, v)| *v).unwrap_or(64);
-                let bkv = variant.iter().find(|(n, _)| n == "block_kv").map(|(_, v)| *v).unwrap_or(64);
+                let bq = variant
+                    .iter()
+                    .find(|(n, _)| n == "block_q")
+                    .map(|(_, v)| *v)
+                    .unwrap_or(64);
+                let bkv = variant
+                    .iter()
+                    .find(|(n, _)| n == "block_kv")
+                    .map(|(_, v)| *v)
+                    .unwrap_or(64);
 
                 let test_config = crate::flash_attention::FlashAttentionConfig {
                     block_q: bq,
@@ -590,7 +622,8 @@ impl Compiler<'_> {
                     rope_q,
                     rope_style,
                     gqa_group_size,
-                    tree_mask: false, gpu_sm: 80,
+                    tree_mask: false,
+                    gpu_sm: 80,
                 };
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
@@ -611,15 +644,25 @@ impl Compiler<'_> {
                 }
 
                 // Synthesize and embed PTX for this variant
-                let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&test_config);
-                let variant_kernel_name = crate::flash_attention::flash_attention_kernel_name(&test_config);
+                let ptx_bytes =
+                    crate::flash_attention::synthesize_flash_attention_ptx(&test_config);
+                let variant_kernel_name =
+                    crate::flash_attention::flash_attention_kernel_name(&test_config);
                 self.embed_flash_ptx(&variant_kernel_name, ptx_bytes)?;
             }
 
             // Select the middle values as the primary config (fallback / default dispatch)
             let fallback = crate::autotune::select_middle_values(&tune_params);
-            let primary_bq = fallback.iter().find(|(n, _)| n == "block_q").map(|(_, v)| *v).unwrap_or(64);
-            let primary_bkv = fallback.iter().find(|(n, _)| n == "block_kv").map(|(_, v)| *v).unwrap_or(64);
+            let primary_bq = fallback
+                .iter()
+                .find(|(n, _)| n == "block_q")
+                .map(|(_, v)| *v)
+                .unwrap_or(64);
+            let primary_bkv = fallback
+                .iter()
+                .find(|(n, _)| n == "block_kv")
+                .map(|(_, v)| *v)
+                .unwrap_or(64);
 
             let config = crate::flash_attention::FlashAttentionConfig {
                 block_q: primary_bq,
@@ -630,7 +673,8 @@ impl Compiler<'_> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
-                tree_mask: false, gpu_sm: 80,
+                tree_mask: false,
+                gpu_sm: 80,
             };
 
             let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
@@ -665,7 +709,8 @@ impl Compiler<'_> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
-                tree_mask: false, gpu_sm: 80,
+                tree_mask: false,
+                gpu_sm: 80,
             };
 
             let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);
@@ -792,8 +837,10 @@ impl Compiler<'_> {
                 ))
             })?;
 
-        self.kernels.kernel_ptx_data
-            .insert(format!("flash_{}", kernel_name), (ptx_data_id, name_data_id));
+        self.kernels.kernel_ptx_data.insert(
+            format!("flash_{}", kernel_name),
+            (ptx_data_id, name_data_id),
+        );
         Ok((ptx_data_id, name_data_id))
     }
 }

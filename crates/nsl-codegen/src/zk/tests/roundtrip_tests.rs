@@ -239,9 +239,9 @@ fn tier3_attention_softmax_roundtrip() {
                 dtype_bits: 8,
                 values: Some(vec![1, 1]),
             },
-            ZkOp::Transpose { input: 1 },         // K^T: [2, 1]
-            ZkOp::Matmul { a: 0, b: 2 },          // Q @ K^T: [1, 1]
-            ZkOp::Softmax { input: 3, dim: -1 },   // softmax: [1, 1]
+            ZkOp::Transpose { input: 1 },        // K^T: [2, 1]
+            ZkOp::Matmul { a: 0, b: 2 },         // Q @ K^T: [1, 1]
+            ZkOp::Softmax { input: 3, dim: -1 }, // softmax: [1, 1]
         ],
         output_idx: 4,
         input_indices: vec![0],
@@ -403,8 +403,10 @@ fn weight_private_mode_produces_valid_proof() {
         weight_indices: vec![1],
     };
 
-    let mut config = ZkConfig::default();
-    config.mode = ZkMode::WeightPrivate;
+    let config = ZkConfig {
+        mode: ZkMode::WeightPrivate,
+        ..ZkConfig::default()
+    };
 
     let ir = lower_dag_to_zkir(&dag, &config);
 
@@ -430,10 +432,9 @@ fn weight_private_mode_produces_valid_proof() {
     }
 
     let proof = prover.finalize().unwrap();
-    let valid = <FoldingProver<Mersenne31Field> as FoldingBackend<Mersenne31Field>>::verify(
-        &proof, &[],
-    )
-    .unwrap();
+    let valid =
+        <FoldingProver<Mersenne31Field> as FoldingBackend<Mersenne31Field>>::verify(&proof, &[])
+            .unwrap();
     assert!(valid, "WeightPrivate mode proof should verify");
 }
 
@@ -481,10 +482,9 @@ fn wrong_outputs_rejected() {
     let proof = prover.finalize().unwrap();
 
     // Valid proof should verify
-    let valid = <FoldingProver<Mersenne31Field> as FoldingBackend<Mersenne31Field>>::verify(
-        &proof, &[],
-    )
-    .unwrap();
+    let valid =
+        <FoldingProver<Mersenne31Field> as FoldingBackend<Mersenne31Field>>::verify(&proof, &[])
+            .unwrap();
     assert!(valid, "correct proof should verify");
 
     // Empty proof should be rejected
@@ -496,7 +496,8 @@ fn wrong_outputs_rejected() {
         public_outputs: vec![],
     };
     let result = <FoldingProver<Mersenne31Field> as FoldingBackend<Mersenne31Field>>::verify(
-        &fake_proof, &[],
+        &fake_proof,
+        &[],
     );
     assert!(result.is_err(), "empty proof should be rejected");
 }

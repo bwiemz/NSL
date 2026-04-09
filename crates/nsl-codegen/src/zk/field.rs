@@ -50,19 +50,53 @@ pub trait Field: Clone + std::fmt::Debug + PartialEq + Sized + Send + Sync {
 }
 
 impl Field for FieldElement {
-    #[inline] fn zero() -> Self { FieldElement::zero() }
-    #[inline] fn one() -> Self { FieldElement::one() }
-    #[inline] fn field_add(&self, other: &Self) -> Self { self.add(other) }
-    #[inline] fn field_sub(&self, other: &Self) -> Self { self.sub(other) }
-    #[inline] fn field_mul(&self, other: &Self) -> Self { self.mul(other) }
-    #[inline] fn field_inv(&self) -> Self { self.inv() }
-    #[inline] fn field_neg(&self) -> Self { FieldElement::zero().sub(self) }
-    #[inline] fn from_u64(val: u64) -> Self { FieldElement::from_u64(val) }
-    fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
-    fn from_bytes(bytes: &[u8]) -> Self { FieldElement::from_bytes(bytes) }
-    fn from_int8_signed(val: i8) -> Self { FieldElement::from_fixed_point(val as i64, 0) }
-    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self { FieldElement::from_fixed_point(val, frac_bits) }
-    fn field_name() -> &'static str { "BN254" }
+    #[inline]
+    fn zero() -> Self {
+        FieldElement::zero()
+    }
+    #[inline]
+    fn one() -> Self {
+        FieldElement::one()
+    }
+    #[inline]
+    fn field_add(&self, other: &Self) -> Self {
+        self.add(other)
+    }
+    #[inline]
+    fn field_sub(&self, other: &Self) -> Self {
+        self.sub(other)
+    }
+    #[inline]
+    fn field_mul(&self, other: &Self) -> Self {
+        self.mul(other)
+    }
+    #[inline]
+    fn field_inv(&self) -> Self {
+        self.inv()
+    }
+    #[inline]
+    fn field_neg(&self) -> Self {
+        FieldElement::zero().sub(self)
+    }
+    #[inline]
+    fn from_u64(val: u64) -> Self {
+        FieldElement::from_u64(val)
+    }
+    fn to_bytes_vec(&self) -> Vec<u8> {
+        self.to_bytes().to_vec()
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        FieldElement::from_bytes(bytes)
+    }
+    fn from_int8_signed(val: i8) -> Self {
+        FieldElement::from_fixed_point(val as i64, 0)
+    }
+    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self {
+        FieldElement::from_fixed_point(val, frac_bits)
+    }
+    fn field_name() -> &'static str {
+        "BN254"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +596,11 @@ mod tests {
         let diff = a.sub(&b);
         // diff + 4 should equal 0 (mod p)
         let sum = diff.add(&FieldElement::from_u64(4));
-        assert_eq!(sum, FieldElement::zero(), "3 - 7 + 4 should wrap to 0 mod p");
+        assert_eq!(
+            sum,
+            FieldElement::zero(),
+            "3 - 7 + 4 should wrap to 0 mod p"
+        );
     }
 
     #[test]
@@ -642,14 +680,17 @@ mod tests {
         // Just ensure Debug doesn't panic
         let a = FieldElement::from_u64(42);
         let s = format!("{a:?}");
-        assert!(s.contains("FieldElement"), "Debug should contain struct name");
+        assert!(
+            s.contains("FieldElement"),
+            "Debug should contain struct name"
+        );
     }
 
     #[test]
     fn field_copy_clone() {
         let a = FieldElement::from_u64(77);
         let b = a; // Copy
-        let c = a.clone(); // Clone
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
     }

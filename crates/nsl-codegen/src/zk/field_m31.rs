@@ -120,7 +120,10 @@ impl Mersenne31Field {
 
     /// Deserialize from 4 bytes (little-endian u32), reducing mod p.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        assert!(bytes.len() >= 4, "Mersenne31Field::from_bytes requires at least 4 bytes");
+        assert!(
+            bytes.len() >= 4,
+            "Mersenne31Field::from_bytes requires at least 4 bytes"
+        );
         let val = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         Self(reduce(val as u64))
     }
@@ -164,19 +167,53 @@ impl Mersenne31Field {
 }
 
 impl Field for Mersenne31Field {
-    #[inline] fn zero() -> Self { Mersenne31Field::zero() }
-    #[inline] fn one() -> Self { Mersenne31Field::one() }
-    #[inline] fn field_add(&self, other: &Self) -> Self { self.add(other) }
-    #[inline] fn field_sub(&self, other: &Self) -> Self { self.sub(other) }
-    #[inline] fn field_mul(&self, other: &Self) -> Self { self.mul(other) }
-    #[inline] fn field_inv(&self) -> Self { self.inv() }
-    #[inline] fn field_neg(&self) -> Self { self.neg() }
-    #[inline] fn from_u64(val: u64) -> Self { Mersenne31Field::from_u64(val) }
-    fn to_bytes_vec(&self) -> Vec<u8> { self.to_bytes().to_vec() }
-    fn from_bytes(bytes: &[u8]) -> Self { Mersenne31Field::from_bytes(bytes) }
-    fn from_int8_signed(val: i8) -> Self { Mersenne31Field::from_int8_signed(val) }
-    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self { Mersenne31Field::from_fixed_point(val, frac_bits) }
-    fn field_name() -> &'static str { "Mersenne31" }
+    #[inline]
+    fn zero() -> Self {
+        Mersenne31Field::zero()
+    }
+    #[inline]
+    fn one() -> Self {
+        Mersenne31Field::one()
+    }
+    #[inline]
+    fn field_add(&self, other: &Self) -> Self {
+        self.add(other)
+    }
+    #[inline]
+    fn field_sub(&self, other: &Self) -> Self {
+        self.sub(other)
+    }
+    #[inline]
+    fn field_mul(&self, other: &Self) -> Self {
+        self.mul(other)
+    }
+    #[inline]
+    fn field_inv(&self) -> Self {
+        self.inv()
+    }
+    #[inline]
+    fn field_neg(&self) -> Self {
+        self.neg()
+    }
+    #[inline]
+    fn from_u64(val: u64) -> Self {
+        Mersenne31Field::from_u64(val)
+    }
+    fn to_bytes_vec(&self) -> Vec<u8> {
+        self.to_bytes().to_vec()
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Mersenne31Field::from_bytes(bytes)
+    }
+    fn from_int8_signed(val: i8) -> Self {
+        Mersenne31Field::from_int8_signed(val)
+    }
+    fn from_fixed_point_val(val: i64, frac_bits: u32) -> Self {
+        Mersenne31Field::from_fixed_point(val, frac_bits)
+    }
+    fn field_name() -> &'static str {
+        "Mersenne31"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,18 +278,22 @@ mod tests {
     #[test]
     fn test_inv_identity() {
         // a * inv(a) == 1 for various values
-        for val in [1, 2, 3, 7, 42, 12345, 999999, P as u64 - 1] {
+        for val in [1, 2, 3, 7, 42, 12345, 999999, P - 1] {
             let a = Mersenne31Field::from_u64(val);
             let a_inv = a.inv();
             let product = a.mul(&a_inv);
-            assert_eq!(product.0, 1, "a={}, inv(a)={}, a*inv(a)={}", val, a_inv.0, product.0);
+            assert_eq!(
+                product.0, 1,
+                "a={}, inv(a)={}, a*inv(a)={}",
+                val, a_inv.0, product.0
+            );
         }
     }
 
     #[test]
     fn test_neg_identity() {
         // a + neg(a) == 0
-        for val in [0, 1, 2, 100, P as u64 - 1] {
+        for val in [0, 1, 2, 100, P - 1] {
             let a = Mersenne31Field::from_u64(val);
             let neg_a = a.neg();
             assert_eq!(a.add(&neg_a).0, 0, "a={}, -a={}", val, neg_a.0);

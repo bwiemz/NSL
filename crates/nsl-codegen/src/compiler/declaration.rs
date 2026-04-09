@@ -20,7 +20,8 @@ impl Compiler<'_> {
     // ── Pass 1: Declare functions ───────────────────────────────────
 
     pub fn declare_runtime_functions(&mut self) -> Result<(), CodegenError> {
-        self.registry.runtime_fns = crate::builtins::declare_runtime_functions(&mut self.module, self.call_conv)?;
+        self.registry.runtime_fns =
+            crate::builtins::declare_runtime_functions(&mut self.module, self.call_conv)?;
         Ok(())
     }
 
@@ -48,10 +49,15 @@ impl Compiler<'_> {
             let raw_name = self.resolve_sym(fn_def.name).to_string();
             let cranelift_name = mangle_name(&self.module_prefix, &raw_name);
             let sig = self.build_fn_signature(fn_def);
-            let func_id = self.module
+            let func_id = self
+                .module
                 .declare_function(&cranelift_name, linkage, &sig)
-                .map_err(|e| CodegenError::new(format!("failed to declare fn '{raw_name}': {e}")))?;
-            self.registry.functions.insert(raw_name.clone(), (func_id, sig));
+                .map_err(|e| {
+                    CodegenError::new(format!("failed to declare fn '{raw_name}': {e}"))
+                })?;
+            self.registry
+                .functions
+                .insert(raw_name.clone(), (func_id, sig));
 
             // Track decorated functions
             if let Some(decos) = decorators {
@@ -77,13 +83,17 @@ impl Compiler<'_> {
                                 if let Some(name_sym) = arg.name {
                                     let arg_name = self.resolve_sym(name_sym).to_string();
                                     if arg_name == "start_rule" {
-                                        if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                        if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                            &arg.value.kind
+                                        {
                                             start_rule = s.clone();
                                         }
                                     }
                                 } else {
                                     // Positional arg = grammar source / schema kind string
-                                    if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                                    if let nsl_ast::expr::ExprKind::StringLiteral(s) =
+                                        &arg.value.kind
+                                    {
                                         grammar_source = s.clone();
                                     }
                                 }
@@ -91,30 +101,49 @@ impl Compiler<'_> {
                         }
                         self.features.grammar_configs.insert(
                             raw_name.clone(),
-                            super::GrammarInfo { start_rule, grammar_source },
+                            super::GrammarInfo {
+                                start_rule,
+                                grammar_source,
+                            },
                         );
                     }
                 }
                 // M53: Extract @real_time and @wcet_budget constraints
-                if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                if let Some(rt) =
+                    crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym))
+                {
                     self.features.real_time_fns.insert(raw_name.clone(), rt);
                 }
-                if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                if let Some(wb) =
+                    crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym))
+                {
                     self.features.wcet_budget_fns.insert(raw_name.clone(), wb);
                 }
                 // M55: Extract @zk_proof from bare function decorators
-                if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                if let Some(mode) =
+                    crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym))
+                {
                     self.features.zk_proof_fns.insert(raw_name.clone(), mode);
                     // Store the FnDef AST for ZK compilation after normal codegen
-                    self.features.zk_fn_defs.insert(raw_name.clone(), fn_def.clone());
+                    self.features
+                        .zk_fn_defs
+                        .insert(raw_name.clone(), fn_def.clone());
                 }
                 // M55: Extract @zk_lookup from function decorators
-                if let Some((ib, ob)) = crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                    self.features.zk_lookup_fns.insert(raw_name.clone(), (ib, ob));
+                if let Some((ib, ob)) =
+                    crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym))
+                {
+                    self.features
+                        .zk_lookup_fns
+                        .insert(raw_name.clone(), (ib, ob));
                 }
                 // M39: Extract @vmap from function decorators
-                if let Some(vmap_config) = crate::vmap::extract_vmap_decorator(decos, &|sym| self.resolve_sym(sym)) {
-                    self.features.vmap_configs.insert(raw_name.clone(), vmap_config);
+                if let Some(vmap_config) =
+                    crate::vmap::extract_vmap_decorator(decos, &|sym| self.resolve_sym(sym))
+                {
+                    self.features
+                        .vmap_configs
+                        .insert(raw_name.clone(), vmap_config);
                 }
             }
         }
@@ -131,8 +160,13 @@ impl Compiler<'_> {
             })
             .collect();
 
-        let struct_names: Vec<String> = self.types.struct_layouts.keys()
-            .filter(|k| !model_name_set.contains(*k) && !self.models.imported_model_names.contains(*k))
+        let struct_names: Vec<String> = self
+            .types
+            .struct_layouts
+            .keys()
+            .filter(|k| {
+                !model_name_set.contains(*k) && !self.models.imported_model_names.contains(*k)
+            })
             .cloned()
             .collect();
         for sname in struct_names {
@@ -143,9 +177,12 @@ impl Compiler<'_> {
                 sig.params.push(AbiParam::new(field.cl_type));
             }
             sig.returns.push(AbiParam::new(pointer_type()));
-            let func_id = self.module
+            let func_id = self
+                .module
                 .declare_function(&format!("__nsl_struct_{sname}"), linkage, &sig)
-                .map_err(|e| CodegenError::new(format!("failed to declare struct ctor '{sname}': {e}")))?;
+                .map_err(|e| {
+                    CodegenError::new(format!("failed to declare struct ctor '{sname}': {e}"))
+                })?;
             self.registry.functions.insert(sname, (func_id, sig));
         }
 
@@ -153,7 +190,11 @@ impl Compiler<'_> {
         let model_defs: Vec<_> = stmts
             .iter()
             .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind { Some(md.clone()) } else { None }
+                if let StmtKind::ModelDef(md) = &s.kind {
+                    Some(md.clone())
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -176,10 +217,15 @@ impl Compiler<'_> {
             }
             ctor_sig.returns.push(AbiParam::new(pointer_type()));
             let ctor_name = format!("__nsl_model_{model_name}");
-            let ctor_id = self.module
+            let ctor_id = self
+                .module
                 .declare_function(&ctor_name, linkage, &ctor_sig)
-                .map_err(|e| CodegenError::new(format!("failed to declare model ctor '{model_name}': {e}")))?;
-            self.registry.functions.insert(model_name.clone(), (ctor_id, ctor_sig));
+                .map_err(|e| {
+                    CodegenError::new(format!("failed to declare model ctor '{model_name}': {e}"))
+                })?;
+            self.registry
+                .functions
+                .insert(model_name.clone(), (ctor_id, ctor_sig));
 
             // Methods
             let mut method_map = HashMap::new();
@@ -214,30 +260,49 @@ impl Compiler<'_> {
                             TypeExprKind::Named(sym) => {
                                 let name = self.resolve_sym(*sym);
                                 if name != "void" {
-                                    method_sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                                    method_sig
+                                        .returns
+                                        .push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
                                 }
                             }
-                            _ => { method_sig.returns.push(AbiParam::new(cl_types::I64)); }
+                            _ => {
+                                method_sig.returns.push(AbiParam::new(cl_types::I64));
+                            }
                         }
                     } else {
                         method_sig.returns.push(AbiParam::new(cl_types::I64));
                     }
 
-                    let method_id = self.module
+                    let method_id = self
+                        .module
                         .declare_function(&mangled, linkage, &method_sig)
-                        .map_err(|e| CodegenError::new(format!("failed to declare model method '{mangled}': {e}")))?;
-                    self.registry.functions.insert(mangled.clone(), (method_id, method_sig));
+                        .map_err(|e| {
+                            CodegenError::new(format!(
+                                "failed to declare model method '{mangled}': {e}"
+                            ))
+                        })?;
+                    self.registry
+                        .functions
+                        .insert(mangled.clone(), (method_id, method_sig));
 
                     // M53: Extract @real_time and @wcet_budget from model method decorators
                     if !decos.is_empty() {
-                        if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                        if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| {
+                            self.resolve_sym(sym)
+                        }) {
                             self.features.real_time_fns.insert(mangled.clone(), rt);
                         }
-                        if let Some(wb) = crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                        if let Some(wb) =
+                            crate::wcet::extract_wcet_budget_decorator(decos, &|sym| {
+                                self.resolve_sym(sym)
+                            })
+                        {
                             self.features.wcet_budget_fns.insert(mangled.clone(), wb);
                         }
                         // M55: Extract @zk_proof from model method decorators
-                        if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym)) {
+                        if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| {
+                            self.resolve_sym(sym)
+                        }) {
                             self.features.zk_proof_fns.insert(mangled.clone(), mode);
                         }
                     }
@@ -267,12 +332,15 @@ impl Compiler<'_> {
         // When a `model` statement is wrapped in `@zk_proof(...)`, register all
         // its methods in `zk_proof_fns` using the same mangled names used above.
         for stmt in stmts {
-            if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
+            if let StmtKind::Decorated {
+                decorators,
+                stmt: inner,
+            } = &stmt.kind
+            {
                 if let StmtKind::ModelDef(md) = &inner.kind {
-                    if let Some(mode) = crate::zk::extract_zk_proof_decorator(
-                        decorators,
-                        &|sym| self.resolve_sym(sym),
-                    ) {
+                    if let Some(mode) = crate::zk::extract_zk_proof_decorator(decorators, &|sym| {
+                        self.resolve_sym(sym)
+                    }) {
                         let model_name = self.resolve_sym(md.name).to_string();
                         for member in &md.members {
                             if let ModelMember::Method(fn_def, _) = member {
@@ -299,10 +367,15 @@ impl Compiler<'_> {
         imports: &[(String, String, Signature)],
     ) -> Result<(), CodegenError> {
         for (raw_name, mangled_name, sig) in imports {
-            let func_id = self.module
+            let func_id = self
+                .module
                 .declare_function(mangled_name, Linkage::Import, sig)
-                .map_err(|e| CodegenError::new(format!("failed to declare imported fn '{raw_name}': {e}")))?;
-            self.registry.functions.insert(raw_name.clone(), (func_id, sig.clone()));
+                .map_err(|e| {
+                    CodegenError::new(format!("failed to declare imported fn '{raw_name}': {e}"))
+                })?;
+            self.registry
+                .functions
+                .insert(raw_name.clone(), (func_id, sig.clone()));
         }
         Ok(())
     }
@@ -328,10 +401,13 @@ impl Compiler<'_> {
                 TypeExprKind::Named(sym) => {
                     let name = self.resolve_sym(*sym);
                     if name != "void" {
-                        sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                        sig.returns
+                            .push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
                     }
                 }
-                _ => { sig.returns.push(AbiParam::new(cl_types::I64)); }
+                _ => {
+                    sig.returns.push(AbiParam::new(cl_types::I64));
+                }
             }
         }
         sig
@@ -377,7 +453,9 @@ impl Compiler<'_> {
                         // Remaining params (skip "self")
                         for param in &fn_def.params {
                             let pname = self.resolve_sym(param.name).to_string();
-                            if pname == "self" { continue; }
+                            if pname == "self" {
+                                continue;
+                            }
                             let cl_type = if let Some(ref type_ann) = param.type_ann {
                                 match &type_ann.kind {
                                     TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
@@ -394,10 +472,14 @@ impl Compiler<'_> {
                                 TypeExprKind::Named(sym) => {
                                     let name = self.resolve_sym(*sym);
                                     if name != "void" {
-                                        method_sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                                        method_sig.returns.push(AbiParam::new(
+                                            self.resolve_type_name_to_cl(*sym),
+                                        ));
                                     }
                                 }
-                                _ => { method_sig.returns.push(AbiParam::new(cl_types::I64)); }
+                                _ => {
+                                    method_sig.returns.push(AbiParam::new(cl_types::I64));
+                                }
                             }
                         } else {
                             method_sig.returns.push(AbiParam::new(cl_types::I64));
@@ -474,7 +556,9 @@ impl Compiler<'_> {
                             for param in &method.params {
                                 let cl_type = if let Some(ref type_ann) = param.type_ann {
                                     match &type_ann.kind {
-                                        TypeExprKind::Named(sym) => self.resolve_type_name_to_cl(*sym),
+                                        TypeExprKind::Named(sym) => {
+                                            self.resolve_type_name_to_cl(*sym)
+                                        }
                                         _ => cl_types::I64,
                                     }
                                 } else {
@@ -487,21 +571,30 @@ impl Compiler<'_> {
                                     TypeExprKind::Named(sym) => {
                                         let rname = self.resolve_sym(*sym);
                                         if rname != "void" {
-                                            sig.returns.push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
+                                            sig.returns.push(AbiParam::new(
+                                                self.resolve_type_name_to_cl(*sym),
+                                            ));
                                         }
                                     }
-                                    _ => { sig.returns.push(AbiParam::new(cl_types::I64)); }
+                                    _ => {
+                                        sig.returns.push(AbiParam::new(cl_types::I64));
+                                    }
                                 }
                             }
                         }
                     }
 
-                    let func_id = self.module
+                    let func_id = self
+                        .module
                         .declare_function(&fn_name, Linkage::Export, &sig)
-                        .map_err(|e| CodegenError::new(format!(
-                            "failed to declare dtype method '{fn_name}': {e}"
-                        )))?;
-                    self.registry.functions.insert(fn_name.clone(), (func_id, sig.clone()));
+                        .map_err(|e| {
+                            CodegenError::new(format!(
+                                "failed to declare dtype method '{fn_name}': {e}"
+                            ))
+                        })?;
+                    self.registry
+                        .functions
+                        .insert(fn_name.clone(), (func_id, sig.clone()));
 
                     // Compile the method body
                     let mut ctx = Context::for_function(Function::with_name_signature(
@@ -526,13 +619,20 @@ impl Compiler<'_> {
                         //   Bitcast i64→f64 and declare the variable as F64.
                         // For element-wise unpack: CL param is i64, user expects i64. Direct bind.
                         // For block-wise: all params are i64 pointers/sizes. Direct bind.
-                        let is_elem_pack = !is_block_mode && method.kind == DatatypeMethodKind::Pack;
+                        let is_elem_pack =
+                            !is_block_mode && method.kind == DatatypeMethodKind::Pack;
                         for (i, param) in method.params.iter().enumerate() {
-                            if i >= sig.params.len() { break; }
+                            if i >= sig.params.len() {
+                                break;
+                            }
                             let param_val = builder.block_params(entry)[i];
                             if is_elem_pack && i == 0 {
                                 // Bitcast i64 → f64 for the value parameter
-                                let f64_val = builder.ins().bitcast(cl_types::F64, MemFlags::new(), param_val);
+                                let f64_val = builder.ins().bitcast(
+                                    cl_types::F64,
+                                    MemFlags::new(),
+                                    param_val,
+                                );
                                 let var = state.new_variable();
                                 builder.declare_var(var, cl_types::F64);
                                 builder.def_var(var, f64_val);
@@ -547,7 +647,8 @@ impl Compiler<'_> {
                         }
 
                         // Mark unpack methods so return statements bitcast f64→i64
-                        let is_elem_unpack = !is_block_mode && method.kind == DatatypeMethodKind::Unpack;
+                        let is_elem_unpack =
+                            !is_block_mode && method.kind == DatatypeMethodKind::Unpack;
                         state.flags.dtype_unpack_ret_bitcast = is_elem_unpack;
 
                         // Compile body statements
@@ -579,14 +680,19 @@ impl Compiler<'_> {
                     }
 
                     if self.dump_ir {
-                        eprintln!("--- IR: dtype method '{fn_name}' ---\n{}", ctx.func.display());
+                        eprintln!(
+                            "--- IR: dtype method '{fn_name}' ---\n{}",
+                            ctx.func.display()
+                        );
                     }
 
                     self.module
                         .define_function(func_id, &mut ctx)
-                        .map_err(|e| CodegenError::new(format!(
-                            "failed to define dtype method '{fn_name}': {e}"
-                        )))?;
+                        .map_err(|e| {
+                            CodegenError::new(format!(
+                                "failed to define dtype method '{fn_name}': {e}"
+                            ))
+                        })?;
                 }
 
                 // Intern the dtype name string for registration calls
@@ -630,12 +736,13 @@ impl Compiler<'_> {
                 } else {
                     builder.ins().iconst(cl_types::I64, 0)
                 };
-                let unpack_addr = if let Some((fid, _)) = self.registry.functions.get(&unpack_fn_name) {
-                    let fref = self.module.declare_func_in_func(*fid, builder.func);
-                    builder.ins().func_addr(cl_types::I64, fref)
-                } else {
-                    builder.ins().iconst(cl_types::I64, 0)
-                };
+                let unpack_addr =
+                    if let Some((fid, _)) = self.registry.functions.get(&unpack_fn_name) {
+                        let fref = self.module.declare_func_in_func(*fid, builder.func);
+                        builder.ins().func_addr(cl_types::I64, fref)
+                    } else {
+                        builder.ins().iconst(cl_types::I64, 0)
+                    };
 
                 // Get name data pointer and length
                 let name_data_id = self.string_pool[&dtype_name];
@@ -651,7 +758,19 @@ impl Compiler<'_> {
                 // Call nsl_register_custom_dtype(id, name_ptr, name_len, bit_width, block_size, packed_block_size, pack_fn, unpack_fn)
                 let reg_id = self.registry.runtime_fns["nsl_register_custom_dtype"].0;
                 let reg_ref = self.module.declare_func_in_func(reg_id, builder.func);
-                builder.ins().call(reg_ref, &[id_val, name_ptr, name_len, bw_val, bs_val, pbs_val, pack_addr, unpack_addr]);
+                builder.ins().call(
+                    reg_ref,
+                    &[
+                        id_val,
+                        name_ptr,
+                        name_len,
+                        bw_val,
+                        bs_val,
+                        pbs_val,
+                        pack_addr,
+                        unpack_addr,
+                    ],
+                );
             }
         }
 

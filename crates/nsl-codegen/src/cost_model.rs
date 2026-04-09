@@ -53,7 +53,11 @@ pub fn batched_matmul_cost(b: u64, m: u64, k: u64, n: u64, dtype_bytes: u64) -> 
 
 /// Elementwise unary (relu, exp, log, sqrt, sigmoid, tanh, neg, abs, sign).
 pub fn elementwise_unary_cost(num_elements: u64, dtype_bytes: u64) -> (u64, u64, u64) {
-    (num_elements, num_elements * dtype_bytes, num_elements * dtype_bytes)
+    (
+        num_elements,
+        num_elements * dtype_bytes,
+        num_elements * dtype_bytes,
+    )
 }
 
 /// Elementwise binary (add, sub, mul, div).
@@ -119,12 +123,20 @@ pub fn reduction_cost(total_elements: u64, dim_size: u64, dtype_bytes: u64) -> (
 
 /// Concatenation (pure memory copy, 0 FLOPs).
 pub fn concat_cost(total_elements: u64, dtype_bytes: u64) -> (u64, u64, u64) {
-    (0, total_elements * dtype_bytes, total_elements * dtype_bytes)
+    (
+        0,
+        total_elements * dtype_bytes,
+        total_elements * dtype_bytes,
+    )
 }
 
 /// Transpose (pure memory copy, 0 FLOPs).
 pub fn transpose_cost(total_elements: u64, dtype_bytes: u64) -> (u64, u64, u64) {
-    (0, total_elements * dtype_bytes, total_elements * dtype_bytes)
+    (
+        0,
+        total_elements * dtype_bytes,
+        total_elements * dtype_bytes,
+    )
 }
 
 /// FlashAttention [B, H, S, D] cost (IO-optimal tiled attention).
@@ -140,9 +152,17 @@ pub fn flash_attention_cost(b: u64, h: u64, s: u64, d: u64, dtype_bytes: u64) ->
 /// Conv2d [B, Cin, H, W] with kernel [Cout, Cin, Kh, Kw] cost.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_cost(
-    b: u64, cin: u64, h: u64, w: u64,
-    cout: u64, kh: u64, kw: u64,
-    stride_h: u64, stride_w: u64, pad_h: u64, pad_w: u64,
+    b: u64,
+    cin: u64,
+    h: u64,
+    w: u64,
+    cout: u64,
+    kh: u64,
+    kw: u64,
+    stride_h: u64,
+    stride_w: u64,
+    pad_h: u64,
+    pad_w: u64,
     dtype_bytes: u64,
 ) -> (u64, u64, u64) {
     let hout = (h + 2 * pad_h - kh) / stride_h + 1;
@@ -254,7 +274,11 @@ pub fn arithmetic_intensity(flops: u64, bytes_read: u64, bytes_written: u64) -> 
 /// below are memory-bound.
 pub fn compute_ridge_point(gpu: &GpuSpec, tier: MemoryTier, dtype_bytes: usize) -> f64 {
     let peak_tflops = gpu.peak_tflops(dtype_bytes);
-    let effective_peak = if peak_tflops == 0.0 { gpu.peak_fp32_tflops } else { peak_tflops };
+    let effective_peak = if peak_tflops == 0.0 {
+        gpu.peak_fp32_tflops
+    } else {
+        peak_tflops
+    };
     let bandwidth = tier.bandwidth_gbs(gpu);
     if bandwidth == 0.0 {
         return 0.0;
@@ -315,7 +339,9 @@ pub struct FusionOpInfo {
 /// Fused: only the first op reads inputs from HBM, only the last op writes
 /// output to HBM. All intermediates stay in registers (zero HBM traffic).
 pub fn estimate_fused_bytes(chain: &[FusionOpInfo]) -> u64 {
-    if chain.is_empty() { return 0; }
+    if chain.is_empty() {
+        return 0;
+    }
     let first_read = chain[0].bytes_read;
     let last_write = chain[chain.len() - 1].bytes_written;
     first_read + last_write
@@ -326,8 +352,13 @@ pub fn estimate_fused_bytes(chain: &[FusionOpInfo]) -> u64 {
 /// Returns a value in [0.0, 1.0] — 0.0 means no savings, 1.0 means all
 /// intermediate traffic eliminated.
 pub fn fusion_memory_savings(chain: &[FusionOpInfo]) -> f64 {
-    let unfused: u64 = chain.iter().map(|op| op.bytes_read + op.bytes_written).sum();
-    if unfused == 0 { return 0.0; }
+    let unfused: u64 = chain
+        .iter()
+        .map(|op| op.bytes_read + op.bytes_written)
+        .sum();
+    if unfused == 0 {
+        return 0.0;
+    }
     let fused = estimate_fused_bytes(chain);
     1.0 - (fused as f64 / unfused as f64)
 }
@@ -378,8 +409,11 @@ pub struct FusionOpDesc {
 pub fn estimate_fusion_benefit(ops: &[FusionOpDesc], threshold: f64) -> FusionBenefit {
     if ops.is_empty() {
         return FusionBenefit {
-            unfused_bytes: 0, fused_bytes: 0, total_flops: 0.0,
-            ai_improvement: 0.0, profitable: false,
+            unfused_bytes: 0,
+            fused_bytes: 0,
+            total_flops: 0.0,
+            ai_improvement: 0.0,
+            profitable: false,
         };
     }
 
@@ -387,8 +421,16 @@ pub fn estimate_fusion_benefit(ops: &[FusionOpDesc], threshold: f64) -> FusionBe
     let fused_bytes = ops[0].bytes_read + ops[ops.len() - 1].bytes_written;
     let total_flops: f64 = ops.iter().map(|op| op.flops).sum();
 
-    let unfused_ai = if unfused_bytes > 0 { total_flops / unfused_bytes as f64 } else { 0.0 };
-    let fused_ai = if fused_bytes > 0 { total_flops / fused_bytes as f64 } else { 0.0 };
+    let unfused_ai = if unfused_bytes > 0 {
+        total_flops / unfused_bytes as f64
+    } else {
+        0.0
+    };
+    let fused_ai = if fused_bytes > 0 {
+        total_flops / fused_bytes as f64
+    } else {
+        0.0
+    };
     let ai_improvement = if unfused_ai > 0.0 {
         (fused_ai - unfused_ai) / unfused_ai
     } else {
@@ -400,8 +442,11 @@ pub fn estimate_fusion_benefit(ops: &[FusionOpDesc], threshold: f64) -> FusionBe
     let profitable = total_flops == 0.0 || ai_improvement >= threshold;
 
     FusionBenefit {
-        unfused_bytes, fused_bytes, total_flops,
-        ai_improvement, profitable,
+        unfused_bytes,
+        fused_bytes,
+        total_flops,
+        ai_improvement,
+        profitable,
     }
 }
 
@@ -446,10 +491,10 @@ pub fn op_to_fusion_desc(op: &str, data_bytes: u64) -> FusionOpDesc {
         "add" | "sub" | "mul" | "neg" | "abs" | "sign" => (2, 0),
         "div" | "pow" => (2, 1),
         "relu" | "clamp" => (2, 0),
-        "sigmoid" | "tanh" => (2, 2),  // exp + temp for denominator
-        "silu" | "gelu" => (2, 3),      // sigmoid + x*sig or erf approx
+        "sigmoid" | "tanh" => (2, 2), // exp + temp for denominator
+        "silu" | "gelu" => (2, 3),    // sigmoid + x*sig or erf approx
         "exp" | "log" | "sqrt" => (2, 1),
-        "softmax" => (4, 4),            // max + sum + exp + output per row
+        "softmax" => (4, 4), // max + sum + exp + output per row
         "layernorm" | "rmsnorm" => (4, 4),
         "bias_add" | "scalar_mul" | "residual_add" => (2, 0),
         _ => (2, 2), // conservative default
@@ -478,17 +523,19 @@ pub fn max_epilogue_ops_for_gpu(gpu: &GpuSpec) -> usize {
 /// Returns true if fusion is both profitable (AI improvement ≥ threshold)
 /// and fits within the register budget.
 /// `force_fuse` overrides the profitability check (for @fuse annotation).
-pub fn should_fuse(
-    ops: &[FusionOpDesc],
-    force_fuse: bool,
-    max_regs: u32,
-) -> bool {
-    if ops.len() < 2 { return false; }
+pub fn should_fuse(ops: &[FusionOpDesc], force_fuse: bool, max_regs: u32) -> bool {
+    if ops.len() < 2 {
+        return false;
+    }
 
     let regs = estimate_register_pressure(ops, max_regs);
-    if regs.exceeded && !force_fuse { return false; }
+    if regs.exceeded && !force_fuse {
+        return false;
+    }
 
-    if force_fuse { return true; }
+    if force_fuse {
+        return true;
+    }
 
     let benefit = estimate_fusion_benefit(ops, FUSION_AI_THRESHOLD);
     benefit.profitable
@@ -525,17 +572,20 @@ pub struct RecomputeCost {
 /// Classify an operation's recomputation cost by name.
 pub fn classify_recompute(op_name: &str) -> RecomputeClass {
     match op_name {
-        "reshape" | "view" | "broadcast" | "transpose" | "unsqueeze" | "squeeze"
-        | "expand" | "contiguous" | "slice" => RecomputeClass::Free,
+        "reshape" | "view" | "broadcast" | "transpose" | "unsqueeze" | "squeeze" | "expand"
+        | "contiguous" | "slice" => RecomputeClass::Free,
 
-        "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "exp" | "log" | "sqrt"
-        | "abs" | "neg" | "sign" | "clamp" | "add" | "sub" | "mul" | "div"
-        | "add_scalar" | "mul_scalar" => RecomputeClass::Cheap,
+        "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "exp" | "log" | "sqrt" | "abs" | "neg"
+        | "sign" | "clamp" | "add" | "sub" | "mul" | "div" | "add_scalar" | "mul_scalar" => {
+            RecomputeClass::Cheap
+        }
 
-        "softmax" | "layernorm" | "rmsnorm" | "sum" | "mean" | "reduce_max" => RecomputeClass::Moderate,
+        "softmax" | "layernorm" | "rmsnorm" | "sum" | "mean" | "reduce_max" => {
+            RecomputeClass::Moderate
+        }
 
-        "matmul" | "batched_matmul" | "flash_attention" | "conv2d"
-        | "scatter" | "gather" | "sparse_matmul" => RecomputeClass::Expensive,
+        "matmul" | "batched_matmul" | "flash_attention" | "conv2d" | "scatter" | "gather"
+        | "sparse_matmul" => RecomputeClass::Expensive,
 
         _ => RecomputeClass::Expensive, // unknown → don't recompute
     }
@@ -554,7 +604,11 @@ pub fn recompute_cost(op_name: &str, output_elements: u64, dtype_bytes: u64) -> 
         RecomputeClass::Free => 0,
         _ => output_elements * dtype_bytes, // at least read input
     };
-    RecomputeCost { class, flops, bytes_read }
+    RecomputeCost {
+        class,
+        flops,
+        bytes_read,
+    }
 }
 
 /// Rematerialization candidate for the memory planner.
@@ -642,11 +696,7 @@ pub enum AccessPattern {
 ///
 /// When data fits in cache and is reused, the effective bandwidth is higher
 /// than raw HBM peak because subsequent accesses hit L1/L2 instead of HBM.
-pub fn effective_bandwidth_gbs(
-    data_bytes: u64,
-    pattern: AccessPattern,
-    gpu: &GpuSpec,
-) -> f64 {
+pub fn effective_bandwidth_gbs(data_bytes: u64, pattern: AccessPattern, gpu: &GpuSpec) -> f64 {
     match pattern {
         AccessPattern::Streaming => {
             // One-pass: use tier-based bandwidth from data size
@@ -684,8 +734,12 @@ pub fn effective_bandwidth_gbs(
 ///   A-tile reuse = N / tile_n (each A-tile is reused across N output columns)
 ///   B-tile reuse = M / tile_m (each B-tile is reused across M output rows)
 pub fn matmul_access_pattern(m: u64, n: u64, tile_m: u64, tile_n: u64) -> AccessPattern {
-    let reuse = ((n / tile_n.max(1)) as u32).max((m / tile_m.max(1)) as u32).max(1);
-    AccessPattern::Reuse { reuse_factor: reuse }
+    let reuse = ((n / tile_n.max(1)) as u32)
+        .max((m / tile_m.max(1)) as u32)
+        .max(1);
+    AccessPattern::Reuse {
+        reuse_factor: reuse,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -706,9 +760,9 @@ pub enum CostConfidence {
 /// Classify confidence for a named operation.
 pub fn op_confidence(op_name: &str) -> CostConfidence {
     match op_name {
-        "matmul" | "batched_matmul" | "softmax" | "layernorm" | "rmsnorm"
-        | "elementwise" | "relu" | "gelu" | "sigmoid" | "add" | "mul"
-        | "embedding" | "transpose" | "concat" | "reduction" => CostConfidence::High,
+        "matmul" | "batched_matmul" | "softmax" | "layernorm" | "rmsnorm" | "elementwise"
+        | "relu" | "gelu" | "sigmoid" | "add" | "mul" | "embedding" | "transpose" | "concat"
+        | "reduction" => CostConfidence::High,
         "flash_attention" | "conv2d" | "sparse_matmul" | "fused_chain" => CostConfidence::Medium,
         _ => CostConfidence::Low,
     }
@@ -727,7 +781,11 @@ pub fn estimate_time_us(
 ) -> f64 {
     let total_bytes = bytes_read + bytes_written;
     let peak = gpu.peak_tflops(dtype_bytes);
-    let effective_peak = if peak == 0.0 { gpu.peak_fp32_tflops } else { peak };
+    let effective_peak = if peak == 0.0 {
+        gpu.peak_fp32_tflops
+    } else {
+        peak
+    };
     if effective_peak == 0.0 {
         return 0.0;
     }
@@ -894,7 +952,12 @@ pub fn format_json_report(ops: &[OpCost], gpu: &GpuSpec, dtype_name: &str) -> St
 
     format!(
         r#"{{"target_gpu":"{}","dtype":"{}","total_flops":{},"total_bytes":{},"estimated_time_us":{:.0},"operations":[{}]}}"#,
-        gpu.name, dtype_name, total_flops, total_bytes, total_time, ops_json.join(","),
+        gpu.name,
+        dtype_name,
+        total_flops,
+        total_bytes,
+        total_time,
+        ops_json.join(","),
     )
 }
 
@@ -1027,7 +1090,10 @@ mod tests {
 
     #[test]
     fn test_classify_compute_bound() {
-        assert_eq!(classify_op(1366.0, 295.2), BoundClassification::ComputeBound);
+        assert_eq!(
+            classify_op(1366.0, 295.2),
+            BoundClassification::ComputeBound
+        );
     }
 
     #[test]
@@ -1071,11 +1137,17 @@ mod tests {
     #[test]
     fn test_format_chrome_trace() {
         let ops = vec![OpCost {
-            name: "matmul".into(), loc: "test:1".into(),
-            input_shapes: vec![], output_shape: "".into(),
-            flops: 1000, bytes_read: 100, bytes_written: 50,
-            arithmetic_intensity: 6.67, classification: BoundClassification::MemoryBound,
-            fused: false, estimated_time_us: 10.0,
+            name: "matmul".into(),
+            loc: "test:1".into(),
+            input_shapes: vec![],
+            output_shape: "".into(),
+            flops: 1000,
+            bytes_read: 100,
+            bytes_written: 50,
+            arithmetic_intensity: 6.67,
+            classification: BoundClassification::MemoryBound,
+            fused: false,
+            estimated_time_us: 10.0,
         }];
         let trace = format_chrome_trace(&ops);
         assert!(trace.contains("traceEvents"));
@@ -1087,11 +1159,17 @@ mod tests {
     fn test_format_json_report() {
         let gpu = gpu_specs::find_gpu("H100-SXM").unwrap();
         let ops = vec![OpCost {
-            name: "relu".into(), loc: "test:1".into(),
-            input_shapes: vec![], output_shape: "".into(),
-            flops: 1024, bytes_read: 2048, bytes_written: 2048,
-            arithmetic_intensity: 0.25, classification: BoundClassification::MemoryBound,
-            fused: false, estimated_time_us: 5.0,
+            name: "relu".into(),
+            loc: "test:1".into(),
+            input_shapes: vec![],
+            output_shape: "".into(),
+            flops: 1024,
+            bytes_read: 2048,
+            bytes_written: 2048,
+            arithmetic_intensity: 0.25,
+            classification: BoundClassification::MemoryBound,
+            fused: false,
+            estimated_time_us: 5.0,
         }];
         let json = format_json_report(&ops, gpu, "fp16");
         assert!(json.contains("H100-SXM"));
@@ -1103,11 +1181,17 @@ mod tests {
     fn test_format_perf_table() {
         let gpu = gpu_specs::find_gpu("A100-SXM").unwrap();
         let ops = vec![OpCost {
-            name: "matmul(x, W)".into(), loc: "model:5".into(),
-            input_shapes: vec![], output_shape: "".into(),
-            flops: 4_194_304, bytes_read: 81_920, bytes_written: 32_768,
-            arithmetic_intensity: 36.6, classification: BoundClassification::MemoryBound,
-            fused: false, estimated_time_us: 50.0,
+            name: "matmul(x, W)".into(),
+            loc: "model:5".into(),
+            input_shapes: vec![],
+            output_shape: "".into(),
+            flops: 4_194_304,
+            bytes_read: 81_920,
+            bytes_written: 32_768,
+            arithmetic_intensity: 36.6,
+            classification: BoundClassification::MemoryBound,
+            fused: false,
+            estimated_time_us: 50.0,
         }];
         let table = format_perf_table(&ops, gpu, "fp16");
         assert!(table.contains("Performance Analysis"));
@@ -1150,11 +1234,17 @@ mod tests {
 
         // 32 regs/thread, 256 threads/block: 65536/32 = 2048 threads = 64 warps = max
         let occ = estimate_occupancy(h100, 32, 256, 0);
-        assert!((occ - 1.0).abs() < 0.01, "Full occupancy with 32 regs: {occ}");
+        assert!(
+            (occ - 1.0).abs() < 0.01,
+            "Full occupancy with 32 regs: {occ}"
+        );
 
         // 128 regs/thread: 65536/128 = 512 threads = 16 warps, 16/64 = 0.25
         let occ = estimate_occupancy(h100, 128, 256, 0);
-        assert!((occ - 0.25).abs() < 0.01, "Quarter occupancy with 128 regs: {occ}");
+        assert!(
+            (occ - 0.25).abs() < 0.01,
+            "Quarter occupancy with 128 regs: {occ}"
+        );
     }
 
     #[test]
@@ -1164,7 +1254,10 @@ mod tests {
         // 48KB shared per block, 256KB L1 => 5 blocks fit
         // 5 blocks * (256 threads / 32) = 5 * 8 = 40 warps, capped at 64
         let occ = estimate_occupancy(h100, 32, 256, 48 * 1024);
-        assert!((occ - 40.0 / 64.0).abs() < 0.01, "Shared-mem limited: {occ}");
+        assert!(
+            (occ - 40.0 / 64.0).abs() < 0.01,
+            "Shared-mem limited: {occ}"
+        );
     }
 
     #[test]
@@ -1176,12 +1269,20 @@ mod tests {
         let ridge_hbm = compute_ridge_point(h100, MemoryTier::Hbm, 2);
 
         // L1 ridge < L2 ridge < HBM ridge (faster memory = easier to be compute-bound)
-        assert!(ridge_l1 < ridge_l2, "L1 ridge ({ridge_l1:.1}) < L2 ({ridge_l2:.1})");
-        assert!(ridge_l2 < ridge_hbm, "L2 ridge ({ridge_l2:.1}) < HBM ({ridge_hbm:.1})");
+        assert!(
+            ridge_l1 < ridge_l2,
+            "L1 ridge ({ridge_l1:.1}) < L2 ({ridge_l2:.1})"
+        );
+        assert!(
+            ridge_l2 < ridge_hbm,
+            "L2 ridge ({ridge_l2:.1}) < HBM ({ridge_hbm:.1})"
+        );
 
         // Sanity: HBM ridge should be in a reasonable range
-        assert!(ridge_hbm > 100.0 && ridge_hbm < 1000.0,
-            "HBM ridge {ridge_hbm:.1} should be 100-1000 FLOPs/byte");
+        assert!(
+            ridge_hbm > 100.0 && ridge_hbm < 1000.0,
+            "HBM ridge {ridge_hbm:.1} should be 100-1000 FLOPs/byte"
+        );
     }
 
     #[test]
@@ -1192,12 +1293,20 @@ mod tests {
         let (flops, br, bw) = matmul_cost(4096, 4096, 4096, 2);
         let (class, tier) = classify_op_multilevel(flops, br, bw, h100, 2);
         assert_eq!(tier, MemoryTier::Hbm, "large matmul should be HBM");
-        assert_eq!(class, BoundClassification::ComputeBound, "large matmul is compute-bound");
+        assert_eq!(
+            class,
+            BoundClassification::ComputeBound,
+            "large matmul is compute-bound"
+        );
 
         // Small elementwise: memory-bound on L1
         let (flops, br, bw) = elementwise_unary_cost(64 * 64, 2);
         let (class, _tier) = classify_op_multilevel(flops, br, bw, h100, 2);
-        assert_eq!(class, BoundClassification::MemoryBound, "small elementwise is memory-bound");
+        assert_eq!(
+            class,
+            BoundClassification::MemoryBound,
+            "small elementwise is memory-bound"
+        );
     }
 
     #[test]
@@ -1225,8 +1334,10 @@ mod tests {
         for &n in &sizes {
             let (flops, br, bw) = matmul_cost(n, n, n, 2);
             let time = estimate_time_us(flops, br, bw, h100, 2);
-            assert!(time > prev_time,
-                "Time should increase: n={n}, time={time:.4}, prev={prev_time:.4}");
+            assert!(
+                time > prev_time,
+                "Time should increase: n={n}, time={time:.4}, prev={prev_time:.4}"
+            );
             prev_time = time;
         }
     }
@@ -1237,12 +1348,21 @@ mod tests {
     fn test_fused_bytes_eliminates_intermediates() {
         // Chain: read 1024B → write 1024B → read 1024B → write 512B
         let chain = vec![
-            FusionOpInfo { bytes_read: 1024, bytes_written: 1024 },
-            FusionOpInfo { bytes_read: 1024, bytes_written: 512 },
+            FusionOpInfo {
+                bytes_read: 1024,
+                bytes_written: 1024,
+            },
+            FusionOpInfo {
+                bytes_read: 1024,
+                bytes_written: 512,
+            },
         ];
 
         let fused = estimate_fused_bytes(&chain);
-        let unfused: u64 = chain.iter().map(|op| op.bytes_read + op.bytes_written).sum();
+        let unfused: u64 = chain
+            .iter()
+            .map(|op| op.bytes_read + op.bytes_written)
+            .sum();
 
         // Fused: first read (1024) + last write (512) = 1536
         assert_eq!(fused, 1536);
@@ -1254,17 +1374,28 @@ mod tests {
     #[test]
     fn test_fusion_memory_savings() {
         let chain = vec![
-            FusionOpInfo { bytes_read: 4096, bytes_written: 4096 },
-            FusionOpInfo { bytes_read: 4096, bytes_written: 4096 },
-            FusionOpInfo { bytes_read: 4096, bytes_written: 4096 },
+            FusionOpInfo {
+                bytes_read: 4096,
+                bytes_written: 4096,
+            },
+            FusionOpInfo {
+                bytes_read: 4096,
+                bytes_written: 4096,
+            },
+            FusionOpInfo {
+                bytes_read: 4096,
+                bytes_written: 4096,
+            },
         ];
 
         let savings = fusion_memory_savings(&chain);
         // Unfused: 3 * (4096 + 4096) = 24576
         // Fused: 4096 + 4096 = 8192
         // Savings: 1 - 8192/24576 = 0.667
-        assert!((savings - 0.667).abs() < 0.01,
-            "3-op chain should save ~67%, got {savings:.3}");
+        assert!(
+            (savings - 0.667).abs() < 0.01,
+            "3-op chain should save ~67%, got {savings:.3}"
+        );
     }
 
     #[test]
@@ -1286,20 +1417,34 @@ mod tests {
     fn test_effective_bandwidth_reuse_in_l2() {
         let gpu = gpu_specs::find_gpu("H100-SXM").unwrap();
         // 10MB data with reuse — fits in L2 (50MB)
-        let bw = effective_bandwidth_gbs(10 * 1024 * 1024, AccessPattern::Reuse { reuse_factor: 4 }, gpu);
+        let bw = effective_bandwidth_gbs(
+            10 * 1024 * 1024,
+            AccessPattern::Reuse { reuse_factor: 4 },
+            gpu,
+        );
         // Should get L2 bandwidth (faster than HBM)
-        assert!(bw > gpu.peak_bandwidth_gbs,
-            "L2 BW ({bw}) should be > HBM BW ({})", gpu.peak_bandwidth_gbs);
+        assert!(
+            bw > gpu.peak_bandwidth_gbs,
+            "L2 BW ({bw}) should be > HBM BW ({})",
+            gpu.peak_bandwidth_gbs
+        );
     }
 
     #[test]
     fn test_effective_bandwidth_reuse_exceeds_cache() {
         let gpu = gpu_specs::find_gpu("H100-SXM").unwrap();
         // 200MB data with reuse — exceeds L2 (50MB)
-        let bw = effective_bandwidth_gbs(200 * 1024 * 1024, AccessPattern::Reuse { reuse_factor: 4 }, gpu);
+        let bw = effective_bandwidth_gbs(
+            200 * 1024 * 1024,
+            AccessPattern::Reuse { reuse_factor: 4 },
+            gpu,
+        );
         // Should be a blend of HBM + L2 (better than pure HBM)
-        assert!(bw > gpu.peak_bandwidth_gbs,
-            "Blended BW ({bw}) should be > pure HBM ({})", gpu.peak_bandwidth_gbs);
+        assert!(
+            bw > gpu.peak_bandwidth_gbs,
+            "Blended BW ({bw}) should be > pure HBM ({})",
+            gpu.peak_bandwidth_gbs
+        );
     }
 
     #[test]
@@ -1333,13 +1478,32 @@ mod tests {
         // Unfused: 8 + 4 + 4 + 4 = 20MB
         // Fused: 8 + 4 = 12MB (40% reduction)
         let ops = vec![
-            FusionOpDesc { flops: 1024.0 * 1024.0, bytes_read: 8 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
-            FusionOpDesc { flops: 1024.0 * 1024.0, bytes_read: 4 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
+            FusionOpDesc {
+                flops: 1024.0 * 1024.0,
+                bytes_read: 8 * 1024 * 1024,
+                bytes_written: 4 * 1024 * 1024,
+                output_regs: 1,
+                temp_regs: 0,
+            },
+            FusionOpDesc {
+                flops: 1024.0 * 1024.0,
+                bytes_read: 4 * 1024 * 1024,
+                bytes_written: 4 * 1024 * 1024,
+                output_regs: 1,
+                temp_regs: 0,
+            },
         ];
 
         let benefit = estimate_fusion_benefit(&ops, FUSION_AI_THRESHOLD);
-        assert!(benefit.profitable, "add+relu should be profitable (40% traffic reduction)");
-        assert!(benefit.ai_improvement > 0.3, "AI improvement should be >30%, got {:.2}", benefit.ai_improvement);
+        assert!(
+            benefit.profitable,
+            "add+relu should be profitable (40% traffic reduction)"
+        );
+        assert!(
+            benefit.ai_improvement > 0.3,
+            "AI improvement should be >30%, got {:.2}",
+            benefit.ai_improvement
+        );
         assert_eq!(benefit.fused_bytes, 12 * 1024 * 1024);
         assert_eq!(benefit.unfused_bytes, 20 * 1024 * 1024);
     }
@@ -1348,67 +1512,139 @@ mod tests {
     fn test_fusion_benefit_zero_flops_always_profitable() {
         // Two reshapes (0 FLOPs) — fusion is free
         let ops = vec![
-            FusionOpDesc { flops: 0.0, bytes_read: 4096, bytes_written: 4096, output_regs: 0, temp_regs: 0 },
-            FusionOpDesc { flops: 0.0, bytes_read: 4096, bytes_written: 4096, output_regs: 0, temp_regs: 0 },
+            FusionOpDesc {
+                flops: 0.0,
+                bytes_read: 4096,
+                bytes_written: 4096,
+                output_regs: 0,
+                temp_regs: 0,
+            },
+            FusionOpDesc {
+                flops: 0.0,
+                bytes_read: 4096,
+                bytes_written: 4096,
+                output_regs: 0,
+                temp_regs: 0,
+            },
         ];
 
         let benefit = estimate_fusion_benefit(&ops, FUSION_AI_THRESHOLD);
-        assert!(benefit.profitable, "zero-FLOP chains should always be profitable");
+        assert!(
+            benefit.profitable,
+            "zero-FLOP chains should always be profitable"
+        );
     }
 
     #[test]
     fn test_register_pressure_small_chain() {
         let ops = vec![
-            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 2, temp_regs: 1 },
-            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 2, temp_regs: 1 },
+            FusionOpDesc {
+                flops: 100.0,
+                bytes_read: 1000,
+                bytes_written: 1000,
+                output_regs: 2,
+                temp_regs: 1,
+            },
+            FusionOpDesc {
+                flops: 100.0,
+                bytes_read: 1000,
+                bytes_written: 1000,
+                output_regs: 2,
+                temp_regs: 1,
+            },
         ];
 
         let budget = estimate_register_pressure(&ops, MAX_FUSED_REGISTERS);
         assert!(!budget.exceeded, "2-op chain should fit in register budget");
-        assert!(budget.peak_regs <= 10, "peak should be small: {}", budget.peak_regs);
+        assert!(
+            budget.peak_regs <= 10,
+            "peak should be small: {}",
+            budget.peak_regs
+        );
     }
 
     #[test]
     fn test_register_pressure_exceeds_budget() {
         // 50 ops each using 5 output regs
-        let ops: Vec<FusionOpDesc> = (0..50).map(|_| {
-            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 5, temp_regs: 2 }
-        }).collect();
+        let ops: Vec<FusionOpDesc> = (0..50)
+            .map(|_| FusionOpDesc {
+                flops: 100.0,
+                bytes_read: 1000,
+                bytes_written: 1000,
+                output_regs: 5,
+                temp_regs: 2,
+            })
+            .collect();
 
         let budget = estimate_register_pressure(&ops, MAX_FUSED_REGISTERS);
-        assert!(budget.exceeded, "50-op chain with 5 regs each should exceed budget");
+        assert!(
+            budget.exceeded,
+            "50-op chain with 5 regs each should exceed budget"
+        );
     }
 
     #[test]
     fn test_should_fuse_combined() {
         let ops = vec![
-            FusionOpDesc { flops: 1e6, bytes_read: 4 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
-            FusionOpDesc { flops: 1e6, bytes_read: 4 * 1024 * 1024, bytes_written: 4 * 1024 * 1024, output_regs: 1, temp_regs: 0 },
+            FusionOpDesc {
+                flops: 1e6,
+                bytes_read: 4 * 1024 * 1024,
+                bytes_written: 4 * 1024 * 1024,
+                output_regs: 1,
+                temp_regs: 0,
+            },
+            FusionOpDesc {
+                flops: 1e6,
+                bytes_read: 4 * 1024 * 1024,
+                bytes_written: 4 * 1024 * 1024,
+                output_regs: 1,
+                temp_regs: 0,
+            },
         ];
 
-        assert!(should_fuse(&ops, false, MAX_FUSED_REGISTERS),
-            "2-op chain with good AI improvement should fuse");
+        assert!(
+            should_fuse(&ops, false, MAX_FUSED_REGISTERS),
+            "2-op chain with good AI improvement should fuse"
+        );
     }
 
     #[test]
     fn test_should_fuse_force_overrides() {
         // Single op — normally wouldn't fuse
-        let ops = vec![
-            FusionOpDesc { flops: 100.0, bytes_read: 1000, bytes_written: 1000, output_regs: 1, temp_regs: 0 },
-        ];
+        let ops = vec![FusionOpDesc {
+            flops: 100.0,
+            bytes_read: 1000,
+            bytes_written: 1000,
+            output_regs: 1,
+            temp_regs: 0,
+        }];
 
-        assert!(!should_fuse(&ops, false, MAX_FUSED_REGISTERS), "single op shouldn't fuse");
+        assert!(
+            !should_fuse(&ops, false, MAX_FUSED_REGISTERS),
+            "single op shouldn't fuse"
+        );
         // But @fuse still doesn't fuse a single op (need ≥2)
-        assert!(!should_fuse(&ops, true, MAX_FUSED_REGISTERS), "even @fuse needs ≥2 ops");
+        assert!(
+            !should_fuse(&ops, true, MAX_FUSED_REGISTERS),
+            "even @fuse needs ≥2 ops"
+        );
     }
 
     #[test]
     fn test_should_fuse_rejects_register_overload() {
-        let ops: Vec<FusionOpDesc> = (0..100).map(|_| {
-            FusionOpDesc { flops: 1e6, bytes_read: 1024, bytes_written: 1024, output_regs: 3, temp_regs: 1 }
-        }).collect();
+        let ops: Vec<FusionOpDesc> = (0..100)
+            .map(|_| FusionOpDesc {
+                flops: 1e6,
+                bytes_read: 1024,
+                bytes_written: 1024,
+                output_regs: 3,
+                temp_regs: 1,
+            })
+            .collect();
 
-        assert!(!should_fuse(&ops, false, MAX_FUSED_REGISTERS),
-            "100-op chain should exceed register budget");
+        assert!(
+            !should_fuse(&ops, false, MAX_FUSED_REGISTERS),
+            "100-op chain should exceed register budget"
+        );
     }
 }

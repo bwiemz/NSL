@@ -20,10 +20,16 @@ impl PatchEmbedConfig {
         }
         if !image_size.is_multiple_of(patch_size) {
             return Err(format!(
-                "image_size {} not divisible by patch_size {}", image_size, patch_size
+                "image_size {} not divisible by patch_size {}",
+                image_size, patch_size
             ));
         }
-        Ok(PatchEmbedConfig { image_size, patch_size, in_channels: 3, embed_dim })
+        Ok(PatchEmbedConfig {
+            image_size,
+            patch_size,
+            in_channels: 3,
+            embed_dim,
+        })
     }
 
     /// Number of patches: (image_size / patch_size)^2
@@ -52,12 +58,19 @@ pub struct MelConfig {
 
 impl MelConfig {
     pub fn new(n_fft: usize, hop_length: usize, n_mels: usize) -> Self {
-        MelConfig { n_fft, hop_length, n_mels, sample_rate: 16000 }
+        MelConfig {
+            n_fft,
+            hop_length,
+            n_mels,
+            sample_rate: 16000,
+        }
     }
 
     /// Compute output time frames for a given input sample count.
     pub fn time_frames(&self, num_samples: usize) -> usize {
-        if num_samples < self.n_fft { return 0; }
+        if num_samples < self.n_fft {
+            return 0;
+        }
         (num_samples - self.n_fft) / self.hop_length + 1
     }
 
@@ -93,7 +106,8 @@ pub fn build_mel_filterbank(config: &MelConfig) -> Vec<f64> {
         .collect();
 
     // Convert Hz points to FFT bin indices
-    let bin_indices: Vec<f64> = mel_points.iter()
+    let bin_indices: Vec<f64> = mel_points
+        .iter()
         .map(|&hz| hz * (config.n_fft as f64 + 1.0) / config.sample_rate as f64)
         .collect();
 
@@ -136,9 +150,15 @@ impl CrossAttentionConfig {
             return Err("num_heads must be > 0".into());
         }
         if !embed_dim.is_multiple_of(num_heads) {
-            return Err(format!("embed_dim {} not divisible by num_heads {}", embed_dim, num_heads));
+            return Err(format!(
+                "embed_dim {} not divisible by num_heads {}",
+                embed_dim, num_heads
+            ));
         }
-        Ok(CrossAttentionConfig { embed_dim, num_heads })
+        Ok(CrossAttentionConfig {
+            embed_dim,
+            num_heads,
+        })
     }
 
     pub fn head_dim(&self) -> usize {
@@ -153,9 +173,9 @@ impl CrossAttentionConfig {
 /// Input modality classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modality {
-    Vision,  // 4D: [B, C, H, W]
-    Audio,   // 2D float: [B, samples]
-    Text,    // 2D int: [B, seq] or 3D: [B, seq, hidden]
+    Vision, // 4D: [B, C, H, W]
+    Audio,  // 2D float: [B, samples]
+    Text,   // 2D int: [B, seq] or 3D: [B, seq, hidden]
 }
 
 impl Modality {
@@ -199,15 +219,15 @@ mod tests {
     #[test]
     fn patch_embed_config_invalid() {
         assert!(PatchEmbedConfig::new(224, 15, 768).is_err()); // not divisible
-        assert!(PatchEmbedConfig::new(224, 0, 768).is_err());  // zero patch
+        assert!(PatchEmbedConfig::new(224, 0, 768).is_err()); // zero patch
     }
 
     #[test]
     fn mel_config_time_frames() {
         let cfg = MelConfig::new(1024, 256, 80);
         assert_eq!(cfg.time_frames(16000), 59); // (16000-1024)/256 + 1
-        assert_eq!(cfg.time_frames(512), 0);    // too short
-        assert_eq!(cfg.freq_bins(), 513);        // 1024/2 + 1
+        assert_eq!(cfg.time_frames(512), 0); // too short
+        assert_eq!(cfg.freq_bins(), 513); // 1024/2 + 1
     }
 
     #[test]
@@ -248,7 +268,7 @@ mod tests {
     #[test]
     fn cross_attention_config_invalid() {
         assert!(CrossAttentionConfig::new(768, 13).is_err()); // not divisible
-        assert!(CrossAttentionConfig::new(768, 0).is_err());  // zero heads
+        assert!(CrossAttentionConfig::new(768, 0).is_err()); // zero heads
     }
 
     #[test]

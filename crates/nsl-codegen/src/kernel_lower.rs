@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use nsl_ast::block::KernelDef;
 use nsl_ast::expr::{Expr, ExprKind, SubscriptKind};
 use nsl_ast::operator::BinOp;
-use nsl_ast::stmt::{StmtKind, Block};
+use nsl_ast::stmt::{Block, StmtKind};
 use nsl_ast::types::TypeExprKind;
 use nsl_lexer::Interner;
 
@@ -111,10 +111,7 @@ fn dtype_str_to_kir(dtype: &str) -> KirType {
 /// Tensor/Param/Buffer parameters become `Ptr(element_type, Global)`.
 /// Named scalar types (int, float, etc.) become their scalar KIR type.
 /// Parameters without type annotations default to `Ptr(F32, Global)`.
-pub fn build_param_type_map(
-    kernel: &KernelDef,
-    interner: &Interner,
-) -> HashMap<String, KirType> {
+pub fn build_param_type_map(kernel: &KernelDef, interner: &Interner) -> HashMap<String, KirType> {
     let mut map = HashMap::new();
 
     for param in &kernel.params {
@@ -156,12 +153,11 @@ pub fn build_param_type_map(
 /// - `_target`: the GPU target (used for feature validation in future)
 ///
 /// Returns a `KernelIR` ready for backend lowering (e.g., `backend_ptx::lower_kir_to_ptx`).
-pub fn lower_kernel_to_ir(
-    kernel: &KernelDef,
-    interner: &Interner,
-    _target: GpuTarget,
-) -> KernelIR {
-    let name = interner.resolve(kernel.name.0).unwrap_or("__kernel").to_string();
+pub fn lower_kernel_to_ir(kernel: &KernelDef, interner: &Interner, _target: GpuTarget) -> KernelIR {
+    let name = interner
+        .resolve(kernel.name.0)
+        .unwrap_or("__kernel")
+        .to_string();
 
     // Build type map from AST type annotations
     let param_type_map = build_param_type_map(kernel, interner);
@@ -181,7 +177,9 @@ pub fn lower_kernel_to_ir(
             _ => AddressSpace::Local,
         };
 
-        let var_id = lowerer.builder.add_param(&pname, kir_type.clone(), address_space);
+        let var_id = lowerer
+            .builder
+            .add_param(&pname, kir_type.clone(), address_space);
         lowerer.var_map.insert(pname.clone(), var_id);
         lowerer.type_map.insert(pname, kir_type);
     }
@@ -223,7 +221,6 @@ impl KernelLowerer {
     fn var_type(&self, name: &str) -> KirType {
         self.type_map.get(name).cloned().unwrap_or(KirType::F32)
     }
-
 }
 
 /// Lower a block of statements.
@@ -281,18 +278,24 @@ fn lower_expr_typed(
     match &expr.kind {
         ExprKind::IntLiteral(val) => {
             let dst = lowerer.builder.new_typed_var(KirType::U32);
-            lowerer.builder.emit(KirOp::Const(dst, KirConst {
-                ty: KirType::U32,
-                value: ConstValue::U32(*val as u32),
-            }));
+            lowerer.builder.emit(KirOp::Const(
+                dst,
+                KirConst {
+                    ty: KirType::U32,
+                    value: ConstValue::U32(*val as u32),
+                },
+            ));
             (dst, KirType::U32)
         }
         ExprKind::FloatLiteral(val) => {
             let dst = lowerer.builder.new_typed_var(KirType::F32);
-            lowerer.builder.emit(KirOp::Const(dst, KirConst {
-                ty: KirType::F32,
-                value: ConstValue::F32(*val as f32),
-            }));
+            lowerer.builder.emit(KirOp::Const(
+                dst,
+                KirConst {
+                    ty: KirType::F32,
+                    value: ConstValue::F32(*val as f32),
+                },
+            ));
             (dst, KirType::F32)
         }
         ExprKind::Ident(sym) => {
@@ -335,14 +338,18 @@ fn lower_expr_typed(
             // Insert casts if needed
             let a = if a_ty != result_ty {
                 let cast_dst = lowerer.builder.new_typed_var(result_ty.clone());
-                lowerer.builder.emit(KirOp::Cast(cast_dst, a, result_ty.clone()));
+                lowerer
+                    .builder
+                    .emit(KirOp::Cast(cast_dst, a, result_ty.clone()));
                 cast_dst
             } else {
                 a
             };
             let b = if b_ty != result_ty {
                 let cast_dst = lowerer.builder.new_typed_var(result_ty.clone());
-                lowerer.builder.emit(KirOp::Cast(cast_dst, b, result_ty.clone()));
+                lowerer
+                    .builder
+                    .emit(KirOp::Cast(cast_dst, b, result_ty.clone()));
                 cast_dst
             } else {
                 b
@@ -413,12 +420,15 @@ fn lower_expr_typed(
 
             if let SubscriptKind::Index(idx_expr) = index.as_ref() {
                 let (offset, _) = lower_expr_typed(lowerer, idx_expr, interner);
-                let addr = lowerer.builder.new_typed_var(
-                    KirType::Ptr(Box::new(elem_ty.clone()), AddressSpace::Global),
-                );
+                let addr = lowerer.builder.new_typed_var(KirType::Ptr(
+                    Box::new(elem_ty.clone()),
+                    AddressSpace::Global,
+                ));
                 lowerer.builder.emit(KirOp::PtrOffset(addr, base, offset));
                 let val = lowerer.builder.new_typed_var(elem_ty.clone());
-                lowerer.builder.emit(KirOp::Load(val, addr, AddressSpace::Global));
+                lowerer
+                    .builder
+                    .emit(KirOp::Load(val, addr, AddressSpace::Global));
                 (val, elem_ty)
             } else {
                 // Unsupported subscript kind
@@ -455,15 +465,15 @@ fn lower_expr(lowerer: &mut KernelLowerer, expr: &Expr, interner: &Interner) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use string_interner::StringInterner;
     use nsl_ast::block::KernelDef;
     use nsl_ast::decl::Param;
+    use nsl_ast::expr::{Expr, ExprKind};
     use nsl_ast::pattern::{Pattern, PatternKind};
     use nsl_ast::stmt::{Block, Stmt, StmtKind};
-    use nsl_ast::expr::{Expr, ExprKind};
-    use nsl_ast::types::{TypeExpr, TypeExprKind, DimExpr};
+    use nsl_ast::types::{DimExpr, TypeExpr, TypeExprKind};
     use nsl_ast::NodeId;
     use nsl_errors::Span;
+    use string_interner::StringInterner;
 
     fn make_interner() -> Interner {
         StringInterner::new()
@@ -483,7 +493,10 @@ mod tests {
             name: name_sym,
             params: Vec::new(),
             return_type: None,
-            body: Block { stmts: Vec::new(), span: dummy_span() },
+            body: Block {
+                stmts: Vec::new(),
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         }
@@ -496,11 +509,26 @@ mod tests {
         KernelDef {
             name: name_sym,
             params: vec![
-                Param { name: p_a, type_ann: None, default: None, is_variadic: false, span: dummy_span() },
-                Param { name: p_b, type_ann: None, default: None, is_variadic: false, span: dummy_span() },
+                Param {
+                    name: p_a,
+                    type_ann: None,
+                    default: None,
+                    is_variadic: false,
+                    span: dummy_span(),
+                },
+                Param {
+                    name: p_b,
+                    type_ann: None,
+                    default: None,
+                    is_variadic: false,
+                    span: dummy_span(),
+                },
             ],
             return_type: None,
-            body: Block { stmts: Vec::new(), span: dummy_span() },
+            body: Block {
+                stmts: Vec::new(),
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         }
@@ -626,16 +654,28 @@ mod tests {
                 },
             ],
             return_type: None,
-            body: Block { stmts: Vec::new(), span: dummy_span() },
+            body: Block {
+                stmts: Vec::new(),
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
 
         let type_map = build_param_type_map(&kernel, &interner);
 
-        assert_eq!(type_map["a"], KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global));
-        assert_eq!(type_map["b"], KirType::Ptr(Box::new(KirType::I32), AddressSpace::Global));
-        assert_eq!(type_map["out"], KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global));
+        assert_eq!(
+            type_map["a"],
+            KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global)
+        );
+        assert_eq!(
+            type_map["b"],
+            KirType::Ptr(Box::new(KirType::I32), AddressSpace::Global)
+        );
+        assert_eq!(
+            type_map["out"],
+            KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global)
+        );
     }
 
     #[test]
@@ -646,17 +686,18 @@ mod tests {
 
         let kernel = KernelDef {
             name: name_sym,
-            params: vec![
-                Param {
-                    name: p_n,
-                    type_ann: Some(make_named_type_ann(&mut interner, "int")),
-                    default: None,
-                    is_variadic: false,
-                    span: dummy_span(),
-                },
-            ],
+            params: vec![Param {
+                name: p_n,
+                type_ann: Some(make_named_type_ann(&mut interner, "int")),
+                default: None,
+                is_variadic: false,
+                span: dummy_span(),
+            }],
             return_type: None,
-            body: Block { stmts: Vec::new(), span: dummy_span() },
+            body: Block {
+                stmts: Vec::new(),
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
@@ -672,8 +713,14 @@ mod tests {
         let type_map = build_param_type_map(&kernel, &interner);
 
         // No type annotation -> Ptr(F32, Global) default
-        assert_eq!(type_map["a"], KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
-        assert_eq!(type_map["b"], KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+        assert_eq!(
+            type_map["a"],
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
+        );
+        assert_eq!(
+            type_map["b"],
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -734,17 +781,17 @@ mod tests {
 
         let mut lowerer = KernelLowerer::new("test");
         // Set up type map: a and b are Ptr(F64, Global)
-        let a_var = lowerer.builder.new_typed_var(
-            KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global),
-        );
+        let a_var = lowerer
+            .builder
+            .new_typed_var(KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global));
         lowerer.var_map.insert("a".to_string(), a_var);
         lowerer.type_map.insert(
             "a".to_string(),
             KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global),
         );
-        let b_var = lowerer.builder.new_typed_var(
-            KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global),
-        );
+        let b_var = lowerer
+            .builder
+            .new_typed_var(KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global));
         lowerer.var_map.insert("b".to_string(), b_var);
         lowerer.type_map.insert(
             "b".to_string(),
@@ -760,7 +807,11 @@ mod tests {
         lowerer.builder.set_block(entry);
 
         let (_, result_ty) = lower_expr_typed(&mut lowerer, &add_expr, &interner);
-        assert_eq!(result_ty, KirType::F64, "a[idx]+b[idx] with F64 ptrs should produce F64");
+        assert_eq!(
+            result_ty,
+            KirType::F64,
+            "a[idx]+b[idx] with F64 ptrs should produce F64"
+        );
     }
 
     #[test]
@@ -815,17 +866,17 @@ mod tests {
         };
 
         let mut lowerer = KernelLowerer::new("test");
-        let a_var = lowerer.builder.new_typed_var(
-            KirType::Ptr(Box::new(KirType::I32), AddressSpace::Global),
-        );
+        let a_var = lowerer
+            .builder
+            .new_typed_var(KirType::Ptr(Box::new(KirType::I32), AddressSpace::Global));
         lowerer.var_map.insert("a".to_string(), a_var);
         lowerer.type_map.insert(
             "a".to_string(),
             KirType::Ptr(Box::new(KirType::I32), AddressSpace::Global),
         );
-        let b_var = lowerer.builder.new_typed_var(
-            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
-        );
+        let b_var = lowerer
+            .builder
+            .new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
         lowerer.var_map.insert("b".to_string(), b_var);
         lowerer.type_map.insert(
             "b".to_string(),
@@ -869,7 +920,10 @@ mod tests {
         assert_eq!(ir.params[0].name, "a");
         assert_eq!(ir.params[1].name, "b");
         // No type annotation -> default Ptr(F32, Global)
-        assert_eq!(ir.params[0].ty, KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+        assert_eq!(
+            ir.params[0].ty,
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
+        );
     }
 
     #[test]
@@ -898,15 +952,24 @@ mod tests {
                 },
             ],
             return_type: None,
-            body: Block { stmts: Vec::new(), span: dummy_span() },
+            body: Block {
+                stmts: Vec::new(),
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
 
         let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
 
-        assert_eq!(ir.params[0].ty, KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global));
-        assert_eq!(ir.params[1].ty, KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global));
+        assert_eq!(
+            ir.params[0].ty,
+            KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global)
+        );
+        assert_eq!(
+            ir.params[1].ty,
+            KirType::Ptr(Box::new(KirType::F64), AddressSpace::Global)
+        );
     }
 
     #[test]
@@ -955,7 +1018,10 @@ mod tests {
             name: name_sym,
             params: Vec::new(),
             return_type: None,
-            body: Block { stmts: vec![var_decl], span: dummy_span() },
+            body: Block {
+                stmts: vec![var_decl],
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
@@ -963,7 +1029,11 @@ mod tests {
         let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
 
         // Should have ops: Const(1.0), Const(2.0), Add
-        assert!(ir.op_count() >= 3, "expected at least 3 ops, got {}", ir.op_count());
+        assert!(
+            ir.op_count() >= 3,
+            "expected at least 3 ops, got {}",
+            ir.op_count()
+        );
     }
 
     #[test]
@@ -996,7 +1066,10 @@ mod tests {
             name: name_sym,
             params: Vec::new(),
             return_type: None,
-            body: Block { stmts: vec![expr_stmt], span: dummy_span() },
+            body: Block {
+                stmts: vec![expr_stmt],
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
@@ -1005,7 +1078,8 @@ mod tests {
 
         // sync_threads() should set SHARED_MEMORY feature
         assert!(
-            ir.required_features.contains(crate::gpu_target::FeatureSet::SHARED_MEMORY),
+            ir.required_features
+                .contains(crate::gpu_target::FeatureSet::SHARED_MEMORY),
             "sync_threads() should require SHARED_MEMORY feature"
         );
     }
@@ -1058,17 +1132,18 @@ mod tests {
 
         let kernel = KernelDef {
             name: name_sym,
-            params: vec![
-                Param {
-                    name: a_sym_param,
-                    type_ann: Some(make_tensor_type_ann(&mut interner, "f64")),
-                    default: None,
-                    is_variadic: false,
-                    span: dummy_span(),
-                },
-            ],
+            params: vec![Param {
+                name: a_sym_param,
+                type_ann: Some(make_tensor_type_ann(&mut interner, "f64")),
+                default: None,
+                is_variadic: false,
+                span: dummy_span(),
+            }],
             return_type: None,
-            body: Block { stmts: vec![var_decl], span: dummy_span() },
+            body: Block {
+                stmts: vec![var_decl],
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
@@ -1077,7 +1152,9 @@ mod tests {
 
         // The load from a[idx] should produce an F64 value.
         // Check that the loaded variable has F64 type in var_types.
-        let f64_vars: Vec<_> = ir.var_types.iter()
+        let f64_vars: Vec<_> = ir
+            .var_types
+            .iter()
             .filter(|(_, ty)| **ty == KirType::F64)
             .collect();
         assert!(
@@ -1220,7 +1297,10 @@ mod tests {
                 },
             ],
             return_type: None,
-            body: Block { stmts: vec![idx_decl, val_decl], span: dummy_span() },
+            body: Block {
+                stmts: vec![idx_decl, val_decl],
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };
@@ -1361,7 +1441,10 @@ mod tests {
                 },
             ],
             return_type: None,
-            body: Block { stmts: vec![idx_decl, val_decl], span: dummy_span() },
+            body: Block {
+                stmts: vec![idx_decl, val_decl],
+                span: dummy_span(),
+            },
             decorators: Vec::new(),
             span: dummy_span(),
         };

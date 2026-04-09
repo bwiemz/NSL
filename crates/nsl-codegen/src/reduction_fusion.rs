@@ -2,9 +2,9 @@
 //! with pre-optimized single-kernel implementations.
 //! Uses hand-written PTX templates (like FlashAttention), not the KernelCompiler.
 
-use std::collections::HashSet;
-use crate::fusion_graph::{FusionGraph, FusionOp, NodeId, FusedKernelId};
+use crate::fusion_graph::{FusedKernelId, FusionGraph, FusionOp, NodeId};
 use nsl_semantic::types::DType;
+use std::collections::HashSet;
 
 /// A matched reduction pattern in the fusion graph.
 #[derive(Debug, Clone)]
@@ -147,7 +147,9 @@ fn get_reduction_dim(graph: &FusionGraph, node_id: NodeId) -> Option<i64> {
 /// Naive: exp(x) / reduce_sum(exp(x))
 fn try_match_softmax(graph: &FusionGraph, div_node: NodeId) -> Option<ReductionMatch> {
     let div = &graph.nodes[div_node as usize];
-    if div.inputs.len() != 2 { return None; }
+    if div.inputs.len() != 2 {
+        return None;
+    }
 
     let numerator_id = div.inputs[0];
     let denominator_id = div.inputs[1];
@@ -258,33 +260,50 @@ fn try_match_layernorm(graph: &FusionGraph, candidate: NodeId) -> Option<Reducti
 
 /// Match the core layernorm pattern: (x - mean(x)) / sqrt(var(x) + eps)
 /// Returns (x_node, matched_node_ids, reduction_dim)
-fn try_match_layernorm_core(graph: &FusionGraph, div_id: NodeId) -> Option<(NodeId, Vec<NodeId>, i64)> {
+fn try_match_layernorm_core(
+    graph: &FusionGraph,
+    div_id: NodeId,
+) -> Option<(NodeId, Vec<NodeId>, i64)> {
     let div = &graph.nodes[div_id as usize];
-    if div.inputs.len() != 2 { return None; }
+    if div.inputs.len() != 2 {
+        return None;
+    }
 
     // LHS: sub(x, mean(x))
     let sub_id = div.inputs[0];
     let sub = &graph.nodes[sub_id as usize];
-    if !matches!(sub.op, FusionOp::Elementwise(ref s) if s == "sub") { return None; }
-    if sub.inputs.len() != 2 { return None; }
+    if !matches!(sub.op, FusionOp::Elementwise(ref s) if s == "sub") {
+        return None;
+    }
+    if sub.inputs.len() != 2 {
+        return None;
+    }
 
     let x_node = sub.inputs[0];
     let mean_id = sub.inputs[1];
     let mean = &graph.nodes[mean_id as usize];
-    if !matches!(mean.op, FusionOp::Reduction(ref s) if s == "mean") { return None; }
+    if !matches!(mean.op, FusionOp::Reduction(ref s) if s == "mean") {
+        return None;
+    }
 
     // RHS: sqrt(var(x) + eps) or sqrt(add(var(x), eps))
     let sqrt_id = div.inputs[1];
     let sqrt = &graph.nodes[sqrt_id as usize];
-    if !matches!(sqrt.op, FusionOp::Elementwise(ref s) if s == "sqrt") { return None; }
+    if !matches!(sqrt.op, FusionOp::Elementwise(ref s) if s == "sqrt") {
+        return None;
+    }
 
     let add_eps_id = sqrt.inputs[0];
     let add_eps = &graph.nodes[add_eps_id as usize];
-    if !matches!(add_eps.op, FusionOp::Elementwise(ref s) if s == "add") { return None; }
+    if !matches!(add_eps.op, FusionOp::Elementwise(ref s) if s == "add") {
+        return None;
+    }
 
     let var_id = add_eps.inputs[0];
     let var_node = &graph.nodes[var_id as usize];
-    if !matches!(var_node.op, FusionOp::Reduction(ref s) if s == "var") { return None; }
+    if !matches!(var_node.op, FusionOp::Reduction(ref s) if s == "var") {
+        return None;
+    }
 
     let reduction_dim = get_reduction_dim(graph, mean_id).unwrap_or(-1);
 
@@ -295,34 +314,50 @@ fn try_match_layernorm_core(graph: &FusionGraph, div_id: NodeId) -> Option<(Node
 /// Try to match rmsnorm: x / sqrt(mean(x^2) + eps) * gamma
 fn try_match_rmsnorm(graph: &FusionGraph, mul_node: NodeId) -> Option<ReductionMatch> {
     let mul = &graph.nodes[mul_node as usize];
-    if mul.inputs.len() != 2 { return None; }
+    if mul.inputs.len() != 2 {
+        return None;
+    }
 
     // One input should be div(x, sqrt(mean(x^2) + eps)), other is gamma
     let div_id = mul.inputs[0];
     let div = &graph.nodes[div_id as usize];
-    if !matches!(div.op, FusionOp::Elementwise(ref s) if s == "div") { return None; }
-    if div.inputs.len() != 2 { return None; }
+    if !matches!(div.op, FusionOp::Elementwise(ref s) if s == "div") {
+        return None;
+    }
+    if div.inputs.len() != 2 {
+        return None;
+    }
 
     let x_node = div.inputs[0];
 
     // sqrt(mean(x^2) + eps)
     let sqrt_id = div.inputs[1];
     let sqrt = &graph.nodes[sqrt_id as usize];
-    if !matches!(sqrt.op, FusionOp::Elementwise(ref s) if s == "sqrt") { return None; }
+    if !matches!(sqrt.op, FusionOp::Elementwise(ref s) if s == "sqrt") {
+        return None;
+    }
 
     let add_eps_id = sqrt.inputs[0];
     let add_eps = &graph.nodes[add_eps_id as usize];
-    if !matches!(add_eps.op, FusionOp::Elementwise(ref s) if s == "add") { return None; }
+    if !matches!(add_eps.op, FusionOp::Elementwise(ref s) if s == "add") {
+        return None;
+    }
 
     let mean_id = add_eps.inputs[0];
     let mean = &graph.nodes[mean_id as usize];
-    if !matches!(mean.op, FusionOp::Reduction(ref s) if s == "mean") { return None; }
+    if !matches!(mean.op, FusionOp::Reduction(ref s) if s == "mean") {
+        return None;
+    }
 
     // mean input should be x^2 = mul(x, x)
     let sq_id = mean.inputs[0];
     let sq = &graph.nodes[sq_id as usize];
-    if !matches!(sq.op, FusionOp::Elementwise(ref s) if s == "mul") { return None; }
-    if sq.inputs[0] != x_node || sq.inputs[1] != x_node { return None; }
+    if !matches!(sq.op, FusionOp::Elementwise(ref s) if s == "mul") {
+        return None;
+    }
+    if sq.inputs[0] != x_node || sq.inputs[1] != x_node {
+        return None;
+    }
 
     let reduction_dim = get_reduction_dim(graph, mean_id).unwrap_or(-1);
 
@@ -388,7 +423,7 @@ fn emit_welford_warp_reduce_v2(buf: &mut Vec<u8>) {
     buf.extend_from_slice(
         b"    .reg .f32 %wf_other_mean, %wf_other_m2;\n\
           .reg .u32 %wf_other_n, %wf_n_a;\n\
-          .reg .f32 %wf_delta, %wf_fn_a, %wf_fn_b, %wf_fn_c, %wf_dsq;\n"
+          .reg .f32 %wf_delta, %wf_fn_a, %wf_fn_b, %wf_fn_c, %wf_dsq;\n",
     );
 
     for offset in [16u32, 8, 4, 2, 1] {
@@ -535,8 +570,9 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
              .reg .u32 %r_lane;\n\
              .reg .u32 %r_warp;\n\
              .reg .b16 %h_out;\n\
-             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
-        , smem_bytes = n_warps * 4)
+             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n",
+            smem_bytes = n_warps * 4
+        )
         .as_bytes(),
     );
 
@@ -546,13 +582,13 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
           ld.param.u64 %rd1, [param_in];\n\
           ld.param.u32 %r0, [param_rows];\n\
           mov.u32 %r_tid, %tid.x;\n\
-          mov.u32 %r1, %ctaid.x;  // row index\n\n"
+          mov.u32 %r1, %ctaid.x;  // row index\n\n",
     );
 
     // Row bounds check
     buf.extend_from_slice(
         b"    setp.ge.u32 %p0, %r1, %r0;\n\
-          @%p0 ret;\n\n"
+          @%p0 ret;\n\n",
     );
 
     // Compute base pointers for this row
@@ -562,8 +598,9 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
              mul.wide.u32 %rd2, %r1, {row_bytes};\n\
              add.u64 %rd3, %rd1, %rd2;  // in row base\n\
              mul.wide.u32 %rd4, %r1, {row_bytes};\n\
-             add.u64 %rd5, %rd0, %rd4;  // out row base\n\n"
-        , row_bytes = hidden_dim * 4)
+             add.u64 %rd5, %rd0, %rd4;  // out row base\n\n",
+            row_bytes = hidden_dim * 4
+        )
         .as_bytes(),
     );
 
@@ -582,8 +619,10 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
                  add.u64 %rd7, %rd3, %rd6;\n\
                  @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
                  @!%p1 mov.f32 %f{fp}, 0fFF800000;\n\
-                 max.f32 %f0, %f0, %f{fp};\n"
-            , off = e * block_size, fp = e + 1)
+                 max.f32 %f0, %f0, %f{fp};\n",
+                off = e * block_size,
+                fp = e + 1
+            )
             .as_bytes(),
         );
     }
@@ -596,7 +635,7 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
         b"    // Broadcast max from thread 0 to all threads\n\
           mov.b32 %rs0, %f0;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
-          mov.b32 %f0, %rs1;\n\n"
+          mov.b32 %f0, %rs1;\n\n",
     );
 
     // ── Pass 1b: exp(x - max) and sum ────────────────────────────────────────
@@ -617,8 +656,10 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
                  sub.f32 %f{fp}, %f{fp}, %f0;\n\
                  mul.f32 %f{fp}, %f{fp}, %f17;\n\
                  ex2.approx.f32 %f{fp}, %f{fp};\n\
-                 add.f32 %f16, %f16, %f{fp};\n"
-            , off = e * block_size, fp = e + 1)
+                 add.f32 %f16, %f16, %f{fp};\n",
+                off = e * block_size,
+                fp = e + 1
+            )
             .as_bytes(),
         );
     }
@@ -630,7 +671,7 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
     buf.extend_from_slice(
         b"    mov.b32 %rs0, %f16;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
-          mov.b32 %f16, %rs1;\n"
+          mov.b32 %f16, %rs1;\n",
     );
     // 1/sum
     buf.extend_from_slice(b"    rcp.approx.f32 %f18, %f16;  // 1/sum\n\n");
@@ -653,8 +694,10 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
                  mul.f32 %f_res, %f{fp}, %f18;\n\
                  // compute output pointer\n\
                  mul.wide.u32 %rd6, %r2, 4;\n\
-                 add.u64 %rd7, %rd5, %rd6;\n"
-            , off = e * block_size, fp = e + 1)
+                 add.u64 %rd7, %rd5, %rd6;\n",
+                off = e * block_size,
+                fp = e + 1
+            )
             .as_bytes(),
         );
         // Predicated store
@@ -674,7 +717,12 @@ pub fn synthesize_fused_softmax_ptx(hidden_dim: u32, dtype: DType) -> Vec<u8> {
 /// combined_mean = (n_a * mean_a + n_b * mean_b) / (n_a + n_b)
 /// combined_M2 = M2_a + M2_b + delta^2 * n_a * n_b / (n_a + n_b)
 /// This handles uneven element counts (hidden_dim % block_size != 0) correctly.
-pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64, dtype: DType) -> Vec<u8> {
+pub fn synthesize_fused_layernorm_ptx(
+    hidden_dim: u32,
+    has_affine: bool,
+    eps: f64,
+    dtype: DType,
+) -> Vec<u8> {
     let block_size: u32 = 256.min(hidden_dim);
     let n_warps: u32 = block_size / 32;
     let elems_per_thread: u32 = hidden_dim.div_ceil(block_size);
@@ -716,32 +764,33 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
              .reg .u32 %r_lane;\n\
              .reg .u32 %r_warp;\n\
              .reg .b16 %h_out;\n\
-             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
-        , smem_bytes = n_warps * 12)  // 3 values per warp: mean + M2 + count
+             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n",
+            smem_bytes = n_warps * 12
+        ) // 3 values per warp: mean + M2 + count
         .as_bytes(),
     );
 
     // Load params
     buf.extend_from_slice(
         b"    ld.param.u64 %rd0, [param_out];\n\
-          ld.param.u64 %rd1, [param_in];\n"
+          ld.param.u64 %rd1, [param_in];\n",
     );
     if has_affine {
         buf.extend_from_slice(
             b"    ld.param.u64 %rd8, [param_gamma];\n\
-              ld.param.u64 %rd9, [param_beta];\n"
+              ld.param.u64 %rd9, [param_beta];\n",
         );
     }
     buf.extend_from_slice(
         b"    ld.param.u32 %r0, [param_rows];\n\
           mov.u32 %r_tid, %tid.x;\n\
-          mov.u32 %r1, %ctaid.x;\n\n"
+          mov.u32 %r1, %ctaid.x;\n\n",
     );
 
     // Row bounds check
     buf.extend_from_slice(
         b"    setp.ge.u32 %p0, %r1, %r0;\n\
-          @%p0 ret;\n\n"
+          @%p0 ret;\n\n",
     );
 
     // Row base pointers
@@ -750,8 +799,9 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
             "    mul.wide.u32 %rd2, %r1, {row_bytes};\n\
              add.u64 %rd3, %rd1, %rd2;\n\
              mul.wide.u32 %rd4, %r1, {row_bytes};\n\
-             add.u64 %rd5, %rd0, %rd4;\n\n"
-        , row_bytes = hidden_dim * 4)
+             add.u64 %rd5, %rd0, %rd4;\n\n",
+            row_bytes = hidden_dim * 4
+        )
         .as_bytes(),
     );
 
@@ -804,7 +854,7 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
     buf.extend_from_slice(
         b"    mov.b32 %rs0, %f0;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
-          mov.b32 %f0, %rs1;\n"
+          mov.b32 %f0, %rs1;\n",
     );
 
     // Compute variance = M2 / N (using the combined count, not hardcoded hidden_dim)
@@ -812,17 +862,19 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
     buf.extend_from_slice(
         b"    mov.b32 %rs0, %f1;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
-          mov.b32 %f1, %rs1;\n"
+          mov.b32 %f1, %rs1;\n",
     );
     // var = M2 / hidden_dim (hidden_dim is the total element count — always correct)
     buf.extend_from_slice(
-        format!("    mul.f32 %f1, %f1, 0f{inv_n:08X};  // var = M2/N\n", inv_n = (1.0f32 / hidden_dim as f32).to_bits())
+        format!(
+            "    mul.f32 %f1, %f1, 0f{inv_n:08X};  // var = M2/N\n",
+            inv_n = (1.0f32 / hidden_dim as f32).to_bits()
+        )
         .as_bytes(),
     );
     // var + eps
     buf.extend_from_slice(
-        format!("    add.f32 %f1, %f1, 0f{eps_bits:08X};  // var + eps\n")
-        .as_bytes(),
+        format!("    add.f32 %f1, %f1, 0f{eps_bits:08X};  // var + eps\n").as_bytes(),
     );
     // 1/sqrt(var+eps)
     buf.extend_from_slice(b"    rsqrt.approx.f32 %f2, %f1;  // 1/sqrt(var+eps)\n\n");
@@ -839,8 +891,10 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
                  @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
                  // normalized = (x - mean) * rsqrt\n\
                  @%p1 sub.f32 %f{fp}, %f{fp}, %f0;\n\
-                 @%p1 mul.f32 %f{fp}, %f{fp}, %f2;\n"
-            , off = e * block_size, fp = e + 2)
+                 @%p1 mul.f32 %f{fp}, %f{fp}, %f2;\n",
+                off = e * block_size,
+                fp = e + 2
+            )
             .as_bytes(),
         );
         if has_affine {
@@ -852,8 +906,9 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
                      add.u64 %rd11, %rd9, %rd6;\n\
                      @%p1 ld.global.f32 %f29, [%rd11];\n\
                      @%p1 mul.f32 %f{fp}, %f{fp}, %f28;\n\
-                     @%p1 add.f32 %f{fp}, %f{fp}, %f29;\n"
-                , fp = e + 2)
+                     @%p1 add.f32 %f{fp}, %f{fp}, %f29;\n",
+                    fp = e + 2
+                )
                 .as_bytes(),
             );
         }
@@ -862,8 +917,9 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
                 "    mov.f32 %f_res, %f{fp};\n\
                  mul.wide.u32 %rd6, %r3, 4;\n\
                  add.u64 %rd7, %rd5, %rd6;\n\
-                 @%p1 "
-            , fp = e + 2)
+                 @%p1 ",
+                fp = e + 2
+            )
             .as_bytes(),
         );
         emit_store_with_dtype(&mut buf, dtype, "%rd7");
@@ -877,7 +933,12 @@ pub fn synthesize_fused_layernorm_ptx(hidden_dim: u32, has_affine: bool, eps: f6
 /// Synthesize a fused RMSNorm PTX kernel.
 /// Single-pass: accumulate x^2, reduce, rsqrt, normalize, optional gamma scale.
 /// Returns null-terminated PTX bytes.
-pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64, dtype: DType) -> Vec<u8> {
+pub fn synthesize_fused_rmsnorm_ptx(
+    hidden_dim: u32,
+    has_affine: bool,
+    eps: f64,
+    dtype: DType,
+) -> Vec<u8> {
     let block_size: u32 = 256.min(hidden_dim);
     let n_warps: u32 = block_size / 32;
     let elems_per_thread: u32 = hidden_dim.div_ceil(block_size);
@@ -919,15 +980,16 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
              .reg .u32 %r_lane;\n\
              .reg .u32 %r_warp;\n\
              .reg .b16 %h_out;\n\
-             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n"
-        , smem_bytes = n_warps * 4)
+             .shared .align 4 .b8 %smem[{smem_bytes}];\n\n",
+            smem_bytes = n_warps * 4
+        )
         .as_bytes(),
     );
 
     // Load params
     buf.extend_from_slice(
         b"    ld.param.u64 %rd0, [param_out];\n\
-          ld.param.u64 %rd1, [param_in];\n"
+          ld.param.u64 %rd1, [param_in];\n",
     );
     if has_affine {
         buf.extend_from_slice(b"    ld.param.u64 %rd8, [param_gamma];\n");
@@ -935,13 +997,13 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
     buf.extend_from_slice(
         b"    ld.param.u32 %r0, [param_rows];\n\
           mov.u32 %r_tid, %tid.x;\n\
-          mov.u32 %r1, %ctaid.x;\n\n"
+          mov.u32 %r1, %ctaid.x;\n\n",
     );
 
     // Row bounds check
     buf.extend_from_slice(
         b"    setp.ge.u32 %p0, %r1, %r0;\n\
-          @%p0 ret;\n\n"
+          @%p0 ret;\n\n",
     );
 
     // Row base pointers
@@ -950,8 +1012,9 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
             "    mul.wide.u32 %rd2, %r1, {row_bytes};\n\
              add.u64 %rd3, %rd1, %rd2;\n\
              mul.wide.u32 %rd4, %r1, {row_bytes};\n\
-             add.u64 %rd5, %rd0, %rd4;\n\n"
-        , row_bytes = hidden_dim * 4)
+             add.u64 %rd5, %rd0, %rd4;\n\n",
+            row_bytes = hidden_dim * 4
+        )
         .as_bytes(),
     );
 
@@ -969,8 +1032,11 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
                  @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
                  @!%p1 mov.f32 %f{fp}, 0f00000000;\n\
                  mul.f32 %f{sq}, %f{fp}, %f{fp};\n\
-                 add.f32 %f0, %f0, %f{sq};\n"
-            , off = e * block_size, fp = e + 1, sq = e + elems_per_thread + 1)
+                 add.f32 %f0, %f0, %f{sq};\n",
+                off = e * block_size,
+                fp = e + 1,
+                sq = e + elems_per_thread + 1
+            )
             .as_bytes(),
         );
     }
@@ -982,18 +1048,20 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
     buf.extend_from_slice(
         b"    mov.b32 %rs0, %f0;\n\
           shfl.sync.idx.b32 %rs1, %rs0, 0, 31, 0xFFFFFFFF;\n\
-          mov.b32 %f0, %rs1;\n"
+          mov.b32 %f0, %rs1;\n",
     );
 
     // mean_sq = sum_sq / hidden_dim
     buf.extend_from_slice(
-        format!("    mul.f32 %f0, %f0, 0f{inv_n:08X};  // mean_sq = sum_sq / N\n", inv_n = (1.0f32 / hidden_dim as f32).to_bits())
+        format!(
+            "    mul.f32 %f0, %f0, 0f{inv_n:08X};  // mean_sq = sum_sq / N\n",
+            inv_n = (1.0f32 / hidden_dim as f32).to_bits()
+        )
         .as_bytes(),
     );
     // mean_sq + eps
     buf.extend_from_slice(
-        format!("    add.f32 %f0, %f0, 0f{eps_bits:08X};  // mean_sq + eps\n")
-        .as_bytes(),
+        format!("    add.f32 %f0, %f0, 0f{eps_bits:08X};  // mean_sq + eps\n").as_bytes(),
     );
     // 1/sqrt(mean_sq + eps)
     buf.extend_from_slice(b"    rsqrt.approx.f32 %f16, %f0;  // 1/sqrt(mean_sq+eps)\n\n");
@@ -1008,8 +1076,10 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
                  mul.wide.u32 %rd6, %r2, 4;\n\
                  add.u64 %rd7, %rd3, %rd6;\n\
                  @%p1 ld.global.f32 %f{fp}, [%rd7];\n\
-                 @%p1 mul.f32 %f{fp}, %f{fp}, %f16;\n"
-            , off = e * block_size, fp = e + 1)
+                 @%p1 mul.f32 %f{fp}, %f{fp}, %f16;\n",
+                off = e * block_size,
+                fp = e + 1
+            )
             .as_bytes(),
         );
         if has_affine {
@@ -1018,8 +1088,9 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
                     "                 // scale by gamma\n\
                      add.u64 %rd9, %rd8, %rd6;\n\
                      @%p1 ld.global.f32 %f28, [%rd9];\n\
-                     @%p1 mul.f32 %f{fp}, %f{fp}, %f28;\n"
-                , fp = e + 1)
+                     @%p1 mul.f32 %f{fp}, %f{fp}, %f28;\n",
+                    fp = e + 1
+                )
                 .as_bytes(),
             );
         }
@@ -1028,8 +1099,9 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
                 "    mov.f32 %f_res, %f{fp};\n\
                  mul.wide.u32 %rd6, %r2, 4;\n\
                  add.u64 %rd7, %rd5, %rd6;\n\
-                 @%p1 "
-            , fp = e + 1)
+                 @%p1 ",
+                fp = e + 1
+            )
             .as_bytes(),
         );
         emit_store_with_dtype(&mut buf, dtype, "%rd7");
@@ -1041,7 +1113,11 @@ pub fn synthesize_fused_rmsnorm_ptx(hidden_dim: u32, has_affine: bool, eps: f64,
 }
 
 /// Mark all nodes in detected reduction matches as fused.
-pub fn apply_reduction_fusion(graph: &mut FusionGraph, matches: &[ReductionMatch], base_kernel_id: FusedKernelId) {
+pub fn apply_reduction_fusion(
+    graph: &mut FusionGraph,
+    matches: &[ReductionMatch],
+    base_kernel_id: FusedKernelId,
+) {
     for (i, m) in matches.iter().enumerate() {
         let kid = base_kernel_id + i as FusedKernelId;
         for &node_id in &m.all_matched_nodes {
@@ -1065,7 +1141,11 @@ mod tests {
         let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![sub]);
         let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
         g.set_type_info(rsum, vec![1024], DType::F32);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![exp, rsum],
+        );
         g.mark_graph_output(div);
         g.build_consumers();
         (g, div)
@@ -1078,7 +1158,11 @@ mod tests {
         let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![x]);
         let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
         g.set_type_info(rsum, vec![1024], DType::F32);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![exp, rsum],
+        );
         g.mark_graph_output(div);
         g.build_consumers();
         (g, div)
@@ -1116,12 +1200,19 @@ mod tests {
         let eps = g.add_named_node("eps".into(), FusionOp::Input, vec![]);
         let add_eps = g.add_node(FusionOp::Elementwise("add".into()), vec![var, eps]);
         let sqrt = g.add_node(FusionOp::Elementwise("sqrt".into()), vec![add_eps]);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![sub, sqrt]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![sub, sqrt],
+        );
         g.mark_graph_output(div);
         g.build_consumers();
 
         let matches = detect_reduction_patterns(&g);
-        let ln_matches: Vec<_> = matches.iter().filter(|m| m.pattern == "layernorm").collect();
+        let ln_matches: Vec<_> = matches
+            .iter()
+            .filter(|m| m.pattern == "layernorm")
+            .collect();
         assert_eq!(ln_matches.len(), 1);
     }
 
@@ -1143,7 +1234,11 @@ mod tests {
         let eps = g.add_named_node("eps".into(), FusionOp::Input, vec![]);
         let add_eps = g.add_node(FusionOp::Elementwise("add".into()), vec![var_mean, eps]);
         let sqrt = g.add_node(FusionOp::Elementwise("sqrt".into()), vec![add_eps]);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![sub, sqrt]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![sub, sqrt],
+        );
         g.mark_graph_output(div);
         g.build_consumers();
 
@@ -1170,14 +1265,25 @@ mod tests {
         let eps = g.add_named_node("eps".into(), FusionOp::Input, vec![]);
         let add_eps = g.add_node(FusionOp::Elementwise("add".into()), vec![var, eps]);
         let sqrt = g.add_node(FusionOp::Elementwise("sqrt".into()), vec![add_eps]);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![sub, sqrt]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![sub, sqrt],
+        );
         g.mark_graph_output(div);
         // External consumer of mean (outside the layernorm subgraph)
-        let _external = g.add_named_node("leak".into(), FusionOp::Elementwise("relu".into()), vec![mean]);
+        let _external = g.add_named_node(
+            "leak".into(),
+            FusionOp::Elementwise("relu".into()),
+            vec![mean],
+        );
         g.build_consumers();
 
         let matches = detect_reduction_patterns(&g);
-        let ln_matches: Vec<_> = matches.iter().filter(|m| m.pattern == "layernorm").collect();
+        let ln_matches: Vec<_> = matches
+            .iter()
+            .filter(|m| m.pattern == "layernorm")
+            .collect();
         assert_eq!(ln_matches.len(), 0); // rejected due to external consumer on mean
     }
 
@@ -1208,7 +1314,11 @@ mod tests {
         let add_eps = g.add_node(FusionOp::Elementwise("add".into()), vec![mean, eps]);
         let sqrt = g.add_node(FusionOp::Elementwise("sqrt".into()), vec![add_eps]);
         let div = g.add_node(FusionOp::Elementwise("div".into()), vec![x, sqrt]);
-        let out = g.add_named_node("out".into(), FusionOp::Elementwise("mul".into()), vec![div, gamma]);
+        let out = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("mul".into()),
+            vec![div, gamma],
+        );
         g.mark_graph_output(out);
         g.build_consumers();
 
@@ -1265,8 +1375,10 @@ mod tests {
 
         assert!(ptx_str.contains(".entry fused_layernorm_768"));
         // Welford merge uses butterfly shuffles for (mean, M2, count) triples
-        assert!(ptx_str.contains("shfl.sync.bfly.b32"),
-            "layernorm should use Welford bfly shuffles");
+        assert!(
+            ptx_str.contains("shfl.sync.bfly.b32"),
+            "layernorm should use Welford bfly shuffles"
+        );
         assert!(ptx_str.contains("bar.sync"));
         // Affine: gamma * normalized + beta
         assert!(ptx_str.contains("param_gamma"));
@@ -1310,13 +1422,15 @@ mod tests {
                 if j < prev.len() && j > i {
                     let (mean_a, m2_a, n_a) = prev[i];
                     let (mean_b, m2_b, n_b) = prev[j];
-                    if n_b == 0 { continue; }
+                    if n_b == 0 {
+                        continue;
+                    }
                     let delta = mean_b - mean_a;
                     let combined_n = n_a + n_b;
-                    let combined_mean = (n_a as f32 * mean_a + n_b as f32 * mean_b)
-                        / combined_n as f32;
-                    let combined_m2 = m2_a + m2_b
-                        + delta * delta * n_a as f32 * n_b as f32 / combined_n as f32;
+                    let combined_mean =
+                        (n_a as f32 * mean_a + n_b as f32 * mean_b) / combined_n as f32;
+                    let combined_m2 =
+                        m2_a + m2_b + delta * delta * n_a as f32 * n_b as f32 / combined_n as f32;
                     vals[i] = (combined_mean, combined_m2, combined_n);
                 }
             }
@@ -1351,18 +1465,24 @@ mod tests {
         // hidden_dim=100, block_size=32: threads get 3 or 4 elements
         let data: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
         let ref_mean = data.iter().sum::<f32>() / data.len() as f32;
-        let ref_var = data.iter()
-            .map(|x| (x - ref_mean).powi(2))
-            .sum::<f32>() / data.len() as f32;
+        let ref_var = data.iter().map(|x| (x - ref_mean).powi(2)).sum::<f32>() / data.len() as f32;
 
         let partials = compute_partials(&data, 32);
         let (sim_mean, sim_m2, sim_n) = welford_tree_reduce(&partials);
         let sim_var = sim_m2 / sim_n as f32;
 
-        assert!((sim_mean - ref_mean).abs() < 1e-5,
-            "mean: got {}, expected {}", sim_mean, ref_mean);
-        assert!((sim_var - ref_var).abs() < 1e-4,
-            "var: got {}, expected {}", sim_var, ref_var);
+        assert!(
+            (sim_mean - ref_mean).abs() < 1e-5,
+            "mean: got {}, expected {}",
+            sim_mean,
+            ref_mean
+        );
+        assert!(
+            (sim_var - ref_var).abs() < 1e-4,
+            "var: got {}, expected {}",
+            sim_var,
+            ref_var
+        );
     }
 
     #[test]
@@ -1370,19 +1490,28 @@ mod tests {
         for hidden_dim in [1, 32, 33, 100, 1023, 1024, 4096, 4097] {
             let data: Vec<f32> = (0..hidden_dim).map(|i| (i as f32) * 0.01 - 5.0).collect();
             let ref_mean = data.iter().sum::<f32>() / data.len() as f32;
-            let ref_var = data.iter()
-                .map(|x| (x - ref_mean).powi(2))
-                .sum::<f32>() / data.len() as f32;
+            let ref_var =
+                data.iter().map(|x| (x - ref_mean).powi(2)).sum::<f32>() / data.len() as f32;
 
             let block_size = 32.min(hidden_dim);
             let partials = compute_partials(&data, block_size);
             let (sim_mean, sim_m2, sim_n) = welford_tree_reduce(&partials);
             let sim_var = sim_m2 / sim_n as f32;
 
-            assert!((sim_mean - ref_mean).abs() < 1e-3,
-                "hidden_dim={}: mean got {}, expected {}", hidden_dim, sim_mean, ref_mean);
-            assert!((sim_var - ref_var).abs() < 1e-2,
-                "hidden_dim={}: var got {}, expected {}", hidden_dim, sim_var, ref_var);
+            assert!(
+                (sim_mean - ref_mean).abs() < 1e-3,
+                "hidden_dim={}: mean got {}, expected {}",
+                hidden_dim,
+                sim_mean,
+                ref_mean
+            );
+            assert!(
+                (sim_var - ref_var).abs() < 1e-2,
+                "hidden_dim={}: var got {}, expected {}",
+                hidden_dim,
+                sim_var,
+                ref_var
+            );
         }
     }
 
@@ -1410,9 +1539,7 @@ mod tests {
 
         let data: Vec<f32> = (0..100).map(|i| i as f32 * 0.1).collect();
         let ref_mean = data.iter().sum::<f32>() / data.len() as f32;
-        let ref_var = data.iter()
-            .map(|x| (x - ref_mean).powi(2))
-            .sum::<f32>() / data.len() as f32;
+        let ref_var = data.iter().map(|x| (x - ref_mean).powi(2)).sum::<f32>() / data.len() as f32;
 
         let partials = compute_partials(&data, 32);
         let (broken_mean, broken_m2, _broken_n) = welford_broken_reduce(&partials);
@@ -1422,7 +1549,11 @@ mod tests {
         let mean_err = (broken_mean - ref_mean).abs();
         let var_err = (broken_var - ref_var).abs();
         // At least one of mean or variance should be significantly off
-        assert!(mean_err > 0.01 || var_err > 0.01,
-            "Expected broken merge to be inaccurate, got mean_err={}, var_err={}", mean_err, var_err);
+        assert!(
+            mean_err > 0.01 || var_err > 0.01,
+            "Expected broken merge to be inaccurate, got mean_err={}, var_err={}",
+            mean_err,
+            var_err
+        );
     }
 }

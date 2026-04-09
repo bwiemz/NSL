@@ -1,20 +1,28 @@
 //! Epilogue fusion: detect and fuse elementwise tails onto matmul kernels.
 //! Matmul + bias + activation → single kernel with in-register epilogue.
 
-use crate::fusion_graph::{FusionGraph, FusionOp, NodeId, FusedKernelId};
+use crate::fusion_graph::{FusedKernelId, FusionGraph, FusionOp, NodeId};
 use nsl_semantic::types::DType;
 
 /// A single epilogue operation to apply after the matmul accumulation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EpilogueOp {
-    BiasAdd { bias_node: NodeId, broadcast_dim: usize },
+    BiasAdd {
+        bias_node: NodeId,
+        broadcast_dim: usize,
+    },
     Activation(String),
     /// Multiply every accumulator element by a compile-time constant scalar.
-    ScalarMul { scalar: f32 },
+    ScalarMul {
+        scalar: f32,
+    },
     /// Clamp every accumulator element to [min, max].
     /// Infinite bounds (f32::NEG_INFINITY / f32::INFINITY) are skipped so that
     /// a one-sided clamp only emits one instruction.
-    Clamp { min: f32, max: f32 },
+    Clamp {
+        min: f32,
+        max: f32,
+    },
 }
 
 /// Matmul variant for epilogue fusion dispatch.
@@ -42,8 +50,7 @@ pub struct EpilogueChain {
 fn is_epilogue_eligible(op_name: &str) -> bool {
     matches!(
         op_name,
-        "add" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh"
-            | "mul" | "clamp"
+        "add" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "mul" | "clamp"
     )
 }
 
@@ -227,7 +234,11 @@ fn resolve_broadcast_dim(graph: &FusionGraph, matmul_id: NodeId, bias_id: NodeId
 }
 
 /// Mark all nodes in detected chains as fused, assigning FusedKernelId.
-pub fn apply_epilogue_fusion(graph: &mut FusionGraph, chains: &[EpilogueChain], base_kernel_id: FusedKernelId) {
+pub fn apply_epilogue_fusion(
+    graph: &mut FusionGraph,
+    chains: &[EpilogueChain],
+    base_kernel_id: FusedKernelId,
+) {
     for (i, chain) in chains.iter().enumerate() {
         let kid = base_kernel_id + i as FusedKernelId;
         // Mark matmul node
@@ -282,8 +293,8 @@ pub fn synthesize_epilogue_ptx(
 
     ptx.push_str(&format!(".visible .entry {}(\n", name));
     ptx.push_str("    .param .u64 param_out,\n");
-    ptx.push_str("    .param .u64 param_acc,\n");    // accumulator (matmul output)
-    ptx.push_str("    .param .u64 param_bias,\n");   // bias vector (if needed)
+    ptx.push_str("    .param .u64 param_acc,\n"); // accumulator (matmul output)
+    ptx.push_str("    .param .u64 param_bias,\n"); // bias vector (if needed)
     ptx.push_str("    .param .u64 param_M,\n");
     ptx.push_str("    .param .u64 param_N\n");
     ptx.push_str(") {\n");
@@ -378,53 +389,146 @@ pub fn synthesize_epilogue_ptx(
                         // GELU approx: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
                         // sqrt(2/pi) = 0.7978845608 -> 0f3F4C422A
                         ptx.push_str("    // GELU epilogue (tanh approximation)\n");
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, %f{};\n", out_reg, acc_reg, acc_reg)); // x^2
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, %f{};\n", out_reg, out_reg, acc_reg)); // x^3
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3D372713;\n", out_reg, out_reg)); // 0.044715 * x^3
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, %f{};\n", out_reg, acc_reg, out_reg)); // x + 0.044715*x^3
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3F4C422A;\n", out_reg, out_reg)); // sqrt(2/pi) * (...)
-                        // tanh via exp: tanh(x) = 2*sigmoid(2x) - 1
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, %f{};\n", out_reg, out_reg, out_reg)); // 2x
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, acc_reg, acc_reg
+                        )); // x^2
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, out_reg, acc_reg
+                        )); // x^3
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3D372713;\n",
+                            out_reg, out_reg
+                        )); // 0.044715 * x^3
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, acc_reg, out_reg
+                        )); // x + 0.044715*x^3
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3F4C422A;\n",
+                            out_reg, out_reg
+                        )); // sqrt(2/pi) * (...)
+                            // tanh via exp: tanh(x) = 2*sigmoid(2x) - 1
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, out_reg, out_reg
+                        )); // 2x
                         ptx.push_str(&format!("    neg.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n", out_reg, out_reg)); // log2(e)
-                        ptx.push_str(&format!("    ex2.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg)); // 1+exp(-2x)
-                        ptx.push_str(&format!("    rcp.approx.f32 %f{}, %f{};\n", out_reg, out_reg)); // sigmoid(2x)
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, %f{};\n", out_reg, out_reg, out_reg)); // 2*sigmoid
-                        ptx.push_str(&format!("    sub.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg)); // tanh
-                        // (1 + tanh) * 0.5 * x
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg)); // 1+tanh
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3F000000;\n", out_reg, out_reg)); // *0.5
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, %f{};\n", out_reg, out_reg, acc_reg)); // *x
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n",
+                            out_reg, out_reg
+                        )); // log2(e)
+                        ptx.push_str(&format!(
+                            "    ex2.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        )); // 1+exp(-2x)
+                        ptx.push_str(&format!(
+                            "    rcp.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        )); // sigmoid(2x)
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, out_reg, out_reg
+                        )); // 2*sigmoid
+                        ptx.push_str(&format!(
+                            "    sub.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        )); // tanh
+                            // (1 + tanh) * 0.5 * x
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        )); // 1+tanh
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3F000000;\n",
+                            out_reg, out_reg
+                        )); // *0.5
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, out_reg, acc_reg
+                        )); // *x
                     }
                     "silu" => {
                         // SiLU = x * sigmoid(x)
                         ptx.push_str("    // SiLU epilogue\n");
                         ptx.push_str(&format!("    neg.f32 %f{}, %f{};\n", out_reg, acc_reg));
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    ex2.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    rcp.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, %f{};\n", out_reg, acc_reg, out_reg));
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    ex2.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    rcp.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, acc_reg, out_reg
+                        ));
                     }
                     "sigmoid" => {
                         ptx.push_str("    // Sigmoid epilogue\n");
                         ptx.push_str(&format!("    neg.f32 %f{}, %f{};\n", out_reg, acc_reg));
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    ex2.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    rcp.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    ex2.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    rcp.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
                     }
                     "tanh" => {
                         ptx.push_str("    // Tanh epilogue\n");
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, %f{};\n", out_reg, acc_reg, acc_reg));
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, acc_reg, acc_reg
+                        ));
                         ptx.push_str(&format!("    neg.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    ex2.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    rcp.approx.f32 %f{}, %f{};\n", out_reg, out_reg));
-                        ptx.push_str(&format!("    add.f32 %f{}, %f{}, %f{};\n", out_reg, out_reg, out_reg));
-                        ptx.push_str(&format!("    sub.f32 %f{}, %f{}, 0f3F800000;\n", out_reg, out_reg));
+                        ptx.push_str(&format!(
+                            "    mul.f32 %f{}, %f{}, 0f3FB8AA3B;\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    ex2.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    rcp.approx.f32 %f{}, %f{};\n",
+                            out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    add.f32 %f{}, %f{}, %f{};\n",
+                            out_reg, out_reg, out_reg
+                        ));
+                        ptx.push_str(&format!(
+                            "    sub.f32 %f{}, %f{}, 0f3F800000;\n",
+                            out_reg, out_reg
+                        ));
                     }
                     _ => {
                         // Unknown activation — pass through
@@ -476,24 +580,15 @@ pub fn synthesize_epilogue_ptx(
     // Dtype downcast (f32 -> output dtype) and store
     match output_dtype {
         DType::Fp16 | DType::Bf16 => {
-            ptx.push_str(&format!(
-                "\n    cvt.rn.f16.f32 %h0, %f{};\n",
-                acc_reg
-            ));
+            ptx.push_str(&format!("\n    cvt.rn.f16.f32 %h0, %f{};\n", acc_reg));
             ptx.push_str("    st.global.b16 [%rd4], %h0;\n");
         }
         DType::F32 => {
-            ptx.push_str(&format!(
-                "\n    st.global.f32 [%rd4], %f{};\n",
-                acc_reg
-            ));
+            ptx.push_str(&format!("\n    st.global.f32 [%rd4], %f{};\n", acc_reg));
         }
         _ => {
             // Default: store as f32
-            ptx.push_str(&format!(
-                "\n    st.global.f32 [%rd4], %f{};\n",
-                acc_reg
-            ));
+            ptx.push_str(&format!("\n    st.global.f32 [%rd4], %f{};\n", acc_reg));
         }
     }
 
@@ -519,7 +614,11 @@ mod tests {
         let bias = g.add_named_node("bias".into(), FusionOp::Input, vec![]);
         let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
         let add = g.add_node(FusionOp::Elementwise("add".into()), vec![mm, bias]);
-        let relu = g.add_named_node("out".into(), FusionOp::Elementwise("relu".into()), vec![add]);
+        let relu = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("relu".into()),
+            vec![add],
+        );
         g.mark_graph_output(relu);
 
         // Set shapes for broadcast resolution
@@ -541,7 +640,13 @@ mod tests {
         let chain = &chains[0];
         assert_eq!(chain.matmul_node, 3); // mm node
         assert_eq!(chain.epilogue_ops.len(), 2);
-        assert!(matches!(&chain.epilogue_ops[0], EpilogueOp::BiasAdd { broadcast_dim: 0, .. }));
+        assert!(matches!(
+            &chain.epilogue_ops[0],
+            EpilogueOp::BiasAdd {
+                broadcast_dim: 0,
+                ..
+            }
+        ));
         assert_eq!(chain.epilogue_ops[1], EpilogueOp::Activation("relu".into()));
         assert_eq!(chain.eliminated_nodes.len(), 2); // add + relu
     }
@@ -655,7 +760,10 @@ mod tests {
         let ptx = synthesize_epilogue_ptx(
             "fused_matmul_bias_relu",
             &[
-                EpilogueOp::BiasAdd { bias_node: 0, broadcast_dim: 0 },
+                EpilogueOp::BiasAdd {
+                    bias_node: 0,
+                    broadcast_dim: 0,
+                },
                 EpilogueOp::Activation("relu".into()),
             ],
             DType::Fp16,
@@ -668,7 +776,7 @@ mod tests {
         // Must do epilogue in f32
         assert!(ptx_str.contains("add.f32"));
         assert!(ptx_str.contains("max.f32")); // relu
-        // Must downcast to f16 at the end
+                                              // Must downcast to f16 at the end
         assert!(ptx_str.contains("cvt.rn.f16.f32"));
         // Must store to global
         assert!(ptx_str.contains("st.global"));
@@ -678,9 +786,10 @@ mod tests {
     fn test_synthesize_epilogue_ptx_no_mma() {
         let ptx = synthesize_epilogue_ptx(
             "fused_matmul_bias",
-            &[
-                EpilogueOp::BiasAdd { bias_node: 0, broadcast_dim: 0 },
-            ],
+            &[EpilogueOp::BiasAdd {
+                bias_node: 0,
+                broadcast_dim: 0,
+            }],
             DType::F32,
             false, // no MMA — linear mapping
         );
@@ -740,10 +849,19 @@ mod tests {
     #[test]
     fn test_format_f32_literal_round_trip() {
         // Whatever value we encode, its bits must survive the round-trip.
-        let values = [std::f32::consts::PI, 0.1_f32, -123.456_f32, f32::MAX, f32::MIN_POSITIVE];
+        let values = [
+            std::f32::consts::PI,
+            0.1_f32,
+            -123.456_f32,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+        ];
         for v in values {
             let encoded = format_f32_literal(v);
-            assert!(encoded.starts_with("0F"), "missing 0F prefix for {v}: {encoded}");
+            assert!(
+                encoded.starts_with("0F"),
+                "missing 0F prefix for {v}: {encoded}"
+            );
             let hex = &encoded[2..];
             let bits = u32::from_str_radix(hex, 16).expect("valid hex");
             let decoded = f32::from_bits(bits);
@@ -766,13 +884,28 @@ mod tests {
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
 
         // Must emit a mul.f32 with the accumulator register.
-        assert!(ptx_str.contains("mul.f32"), "expected mul.f32 in:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("mul.f32"),
+            "expected mul.f32 in:\n{}",
+            ptx_str
+        );
         // Must reference the named scalar register.
-        assert!(ptx_str.contains("%epilogue_scalar"), "expected %epilogue_scalar in:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("%epilogue_scalar"),
+            "expected %epilogue_scalar in:\n{}",
+            ptx_str
+        );
         // The scalar 2.0f32 (0x40000000) must appear as a PTX literal.
-        assert!(ptx_str.contains("0F40000000"), "expected 2.0 hex literal in:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("0F40000000"),
+            "expected 2.0 hex literal in:\n{}",
+            ptx_str
+        );
         // Must NOT contain max.f32 (that would be clamp, not scalar mul).
-        assert!(!ptx_str.contains("max.f32"), "unexpected max.f32 in scalar-mul epilogue");
+        assert!(
+            !ptx_str.contains("max.f32"),
+            "unexpected max.f32 in scalar-mul epilogue"
+        );
     }
 
     #[test]
@@ -787,27 +920,46 @@ mod tests {
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
 
         assert!(ptx_str.contains("mul.f32"));
-        assert!(ptx_str.contains("0FBF000000"), "expected -0.5 hex in:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("0FBF000000"),
+            "expected -0.5 hex in:\n{}",
+            ptx_str
+        );
     }
 
     #[test]
     fn test_epilogue_clamp_emits_max_and_min() {
         let ptx = synthesize_epilogue_ptx(
             "fused_clamp",
-            &[EpilogueOp::Clamp { min: 0.0_f32, max: 6.0_f32 }],
+            &[EpilogueOp::Clamp {
+                min: 0.0_f32,
+                max: 6.0_f32,
+            }],
             DType::F32,
             false,
         );
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
 
         // Both instructions must appear for a two-sided clamp.
-        assert!(ptx_str.contains("max.f32"), "expected max.f32 in:\n{}", ptx_str);
-        assert!(ptx_str.contains("min.f32"), "expected min.f32 in:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("max.f32"),
+            "expected max.f32 in:\n{}",
+            ptx_str
+        );
+        assert!(
+            ptx_str.contains("min.f32"),
+            "expected min.f32 in:\n{}",
+            ptx_str
+        );
         // Named clamp registers must appear.
         assert!(ptx_str.contains("%epilogue_clamp_min"));
         assert!(ptx_str.contains("%epilogue_clamp_max"));
         // 6.0f32 is 0x40C00000
-        assert!(ptx_str.contains("0F40C00000"), "expected 6.0 hex in:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("0F40C00000"),
+            "expected 6.0 hex in:\n{}",
+            ptx_str
+        );
     }
 
     #[test]
@@ -815,7 +967,10 @@ mod tests {
         // max = +inf -> only max.f32 (clamp-from-below), no min.f32
         let ptx = synthesize_epilogue_ptx(
             "fused_clamp_relu",
-            &[EpilogueOp::Clamp { min: 0.0_f32, max: f32::INFINITY }],
+            &[EpilogueOp::Clamp {
+                min: 0.0_f32,
+                max: f32::INFINITY,
+            }],
             DType::F32,
             false,
         );
@@ -823,7 +978,10 @@ mod tests {
 
         assert!(ptx_str.contains("max.f32"), "expected max.f32");
         // min.f32 must NOT appear when max is infinite.
-        assert!(!ptx_str.contains("min.f32"), "unexpected min.f32 for one-sided clamp");
+        assert!(
+            !ptx_str.contains("min.f32"),
+            "unexpected min.f32 for one-sided clamp"
+        );
     }
 
     #[test]
@@ -831,14 +989,20 @@ mod tests {
         // min = -inf -> only min.f32 (clamp-from-above), no max.f32
         let ptx = synthesize_epilogue_ptx(
             "fused_clamp_cap",
-            &[EpilogueOp::Clamp { min: f32::NEG_INFINITY, max: 1.0_f32 }],
+            &[EpilogueOp::Clamp {
+                min: f32::NEG_INFINITY,
+                max: 1.0_f32,
+            }],
             DType::F32,
             false,
         );
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
 
         assert!(ptx_str.contains("min.f32"), "expected min.f32");
-        assert!(!ptx_str.contains("max.f32"), "unexpected max.f32 for one-sided clamp");
+        assert!(
+            !ptx_str.contains("max.f32"),
+            "unexpected max.f32 for one-sided clamp"
+        );
     }
 
     #[test]
@@ -849,7 +1013,10 @@ mod tests {
             &[
                 EpilogueOp::Activation("relu".into()),
                 EpilogueOp::ScalarMul { scalar: 0.5_f32 },
-                EpilogueOp::Clamp { min: 0.0_f32, max: 1.0_f32 },
+                EpilogueOp::Clamp {
+                    min: 0.0_f32,
+                    max: 1.0_f32,
+                },
             ],
             DType::F32,
             false,
@@ -863,7 +1030,9 @@ mod tests {
 
         // Ordering: relu comment before scalarmul comment before clamp comment.
         let relu_pos = ptx_str.find("ReLU").expect("ReLU comment missing");
-        let smul_pos = ptx_str.find("ScalarMul").expect("ScalarMul comment missing");
+        let smul_pos = ptx_str
+            .find("ScalarMul")
+            .expect("ScalarMul comment missing");
         let clamp_pos = ptx_str.find("Clamp").expect("Clamp comment missing");
         assert!(relu_pos < smul_pos, "ReLU must precede ScalarMul");
         assert!(smul_pos < clamp_pos, "ScalarMul must precede Clamp");
@@ -875,13 +1044,16 @@ mod tests {
         // We check that the generated PTX uses the correct f32 encoding for
         // each immediate, which guarantees the arithmetic is right when run on
         // actual hardware.
-        let scalar = 3.0_f32;  // 0x40400000
+        let scalar = 3.0_f32; // 0x40400000
         let clamp_max = 8.0_f32; // 0x41000000
         let ptx = synthesize_epilogue_ptx(
             "fused_numerical",
             &[
                 EpilogueOp::ScalarMul { scalar },
-                EpilogueOp::Clamp { min: 0.0_f32, max: clamp_max },
+                EpilogueOp::Clamp {
+                    min: 0.0_f32,
+                    max: clamp_max,
+                },
             ],
             DType::F32,
             false,
@@ -912,8 +1084,14 @@ mod tests {
         let chains = detect_epilogue_chains(&g);
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].epilogue_ops.len(), 2);
-        assert_eq!(chains[0].epilogue_ops[0], EpilogueOp::ScalarMul { scalar: 0.5_f32 });
-        assert_eq!(chains[0].epilogue_ops[1], EpilogueOp::Activation("relu".into()));
+        assert_eq!(
+            chains[0].epilogue_ops[0],
+            EpilogueOp::ScalarMul { scalar: 0.5_f32 }
+        );
+        assert_eq!(
+            chains[0].epilogue_ops[1],
+            EpilogueOp::Activation("relu".into())
+        );
     }
 
     #[test]
@@ -924,7 +1102,10 @@ mod tests {
         let b = g.add_node(FusionOp::Input, vec![]);
         let dynamic_scalar = g.add_node(FusionOp::Input, vec![]); // no const_value
         let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
-        let mul = g.add_node(FusionOp::Elementwise("mul".into()), vec![mm, dynamic_scalar]);
+        let mul = g.add_node(
+            FusionOp::Elementwise("mul".into()),
+            vec![mm, dynamic_scalar],
+        );
         g.mark_graph_output(mul);
         g.build_consumers();
 
@@ -941,14 +1122,23 @@ mod tests {
         let min_node = g.add_const_node(0.0_f32);
         let max_node = g.add_const_node(6.0_f32);
         let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
-        let clamp = g.add_node(FusionOp::Elementwise("clamp".into()), vec![mm, min_node, max_node]);
+        let clamp = g.add_node(
+            FusionOp::Elementwise("clamp".into()),
+            vec![mm, min_node, max_node],
+        );
         g.mark_graph_output(clamp);
         g.build_consumers();
 
         let chains = detect_epilogue_chains(&g);
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].epilogue_ops.len(), 1);
-        assert_eq!(chains[0].epilogue_ops[0], EpilogueOp::Clamp { min: 0.0_f32, max: 6.0_f32 });
+        assert_eq!(
+            chains[0].epilogue_ops[0],
+            EpilogueOp::Clamp {
+                min: 0.0_f32,
+                max: 6.0_f32
+            }
+        );
     }
 
     #[test]
@@ -960,7 +1150,10 @@ mod tests {
         let min_node = g.add_node(FusionOp::Input, vec![]); // dynamic, no const_value
         let max_node = g.add_const_node(6.0_f32);
         let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
-        let clamp = g.add_node(FusionOp::Elementwise("clamp".into()), vec![mm, min_node, max_node]);
+        let clamp = g.add_node(
+            FusionOp::Elementwise("clamp".into()),
+            vec![mm, min_node, max_node],
+        );
         g.mark_graph_output(clamp);
         g.build_consumers();
 

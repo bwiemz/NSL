@@ -47,8 +47,14 @@ pub struct KirBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum KirType {
-    U32, I32, U64, I64,
-    F16, Bf16, F32, F64,
+    U32,
+    I32,
+    U64,
+    I64,
+    F16,
+    Bf16,
+    F32,
+    F64,
     Bool,
     Ptr(Box<KirType>, AddressSpace),
     Vec(Box<KirType>, u32),
@@ -116,7 +122,7 @@ pub enum KirOp {
     Sub(VarId, VarId, VarId),
     Mul(VarId, VarId, VarId),
     Div(VarId, VarId, VarId),
-    Fma(VarId, VarId, VarId, VarId),  // dst = a * b + c
+    Fma(VarId, VarId, VarId, VarId), // dst = a * b + c
     Neg(VarId, VarId),
     Abs(VarId, VarId),
 
@@ -127,14 +133,14 @@ pub enum KirOp {
     Sin(VarId, VarId),
     Cos(VarId, VarId),
     Tanh(VarId, VarId),
-    Pow(VarId, VarId, VarId),  // dst = base^exp
+    Pow(VarId, VarId, VarId), // dst = base^exp
 
     // Type conversion
     Cast(VarId, VarId, KirType),
 
     // Memory
     Load(VarId, VarId, AddressSpace),
-    Store(VarId, VarId, AddressSpace),  // *ptr = val
+    Store(VarId, VarId, AddressSpace), // *ptr = val
     AtomicAdd(VarId, VarId, AddressSpace),
 
     // Thread indexing (dst, dim: 0=x, 1=y, 2=z)
@@ -142,11 +148,11 @@ pub enum KirOp {
     BlockIdx(VarId, u8),
     BlockDim(VarId, u8),
     GridDim(VarId, u8),
-    GlobalId(VarId, u8),  // blockIdx*blockDim + threadIdx
+    GlobalId(VarId, u8), // blockIdx*blockDim + threadIdx
 
     // Synchronization
     Barrier,
-    WarpShuffle(VarId, VarId, VarId),  // dst = shuffle_down(val, offset)
+    WarpShuffle(VarId, VarId, VarId), // dst = shuffle_down(val, offset)
 
     // Comparison (dst, a, b, op)
     Cmp(VarId, VarId, VarId, CmpOp),
@@ -157,7 +163,7 @@ pub enum KirOp {
     Const(VarId, KirConst),
 
     // Pointer arithmetic
-    PtrOffset(VarId, VarId, VarId),  // dst = base + offset * sizeof(pointee)
+    PtrOffset(VarId, VarId, VarId), // dst = base + offset * sizeof(pointee)
 
     // Shared memory fence
     SharedMemFence,
@@ -171,7 +177,14 @@ pub enum KirTerminator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge }
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 
 #[derive(Debug, Clone)]
 pub struct KirConst {
@@ -181,8 +194,12 @@ pub struct KirConst {
 
 #[derive(Debug, Clone)]
 pub enum ConstValue {
-    U32(u32), I32(i32), U64(u64), I64(i64),
-    F32(f32), F64(f64),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
     Bool(bool),
 }
 
@@ -239,13 +256,22 @@ impl KirBuilder {
     pub fn add_param(&mut self, name: &str, ty: KirType, address_space: AddressSpace) -> VarId {
         let id = self.new_var();
         self.var_types.insert(id, ty.clone());
-        self.params.push(KirParam { id, name: name.to_string(), ty, address_space });
+        self.params.push(KirParam {
+            id,
+            name: name.to_string(),
+            ty,
+            address_space,
+        });
         id
     }
 
     pub fn new_block(&mut self) -> BlockId {
         let id = self.blocks.len() as BlockId;
-        self.blocks.push(KirBlock { id, ops: Vec::new(), terminator: None });
+        self.blocks.push(KirBlock {
+            id,
+            ops: Vec::new(),
+            terminator: None,
+        });
         id
     }
 
@@ -321,9 +347,21 @@ mod tests {
 
     fn build_simple_add_kernel() -> KernelIR {
         let mut b = KirBuilder::new("test_add");
-        let a_ptr = b.add_param("a", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
-        let b_ptr = b.add_param("b", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
-        let out_ptr = b.add_param("out", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
+        let a_ptr = b.add_param(
+            "a",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let b_ptr = b.add_param(
+            "b",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let out_ptr = b.add_param(
+            "out",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
         let len = b.add_param("len", KirType::U32, AddressSpace::Local);
 
         let entry = b.new_block();
@@ -415,7 +453,10 @@ mod tests {
         assert_eq!(KirType::F64.size_bytes(), 8);
         assert_eq!(KirType::F16.size_bytes(), 2);
         assert_eq!(KirType::U32.size_bytes(), 4);
-        assert_eq!(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global).size_bytes(), 8);
+        assert_eq!(
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global).size_bytes(),
+            8
+        );
     }
 
     #[test]
@@ -424,6 +465,9 @@ mod tests {
         assert_eq!(KirType::U32.ptx_type(), "u32");
         assert_eq!(KirType::F32.ptx_reg_prefix(), "%f");
         assert_eq!(KirType::U32.ptx_reg_prefix(), "%r");
-        assert_eq!(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global).ptx_reg_prefix(), "%rd");
+        assert_eq!(
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global).ptx_reg_prefix(),
+            "%rd"
+        );
     }
 }

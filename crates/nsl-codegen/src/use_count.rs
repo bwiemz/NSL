@@ -5,10 +5,10 @@
 //! exactly once after definition are "single-use" — the codegen can
 //! emit in-place op variants and skip clones for these.
 
-use std::collections::HashMap;
 use nsl_ast::expr::{Expr, ExprKind, SubscriptKind};
 use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::Symbol;
+use std::collections::HashMap;
 
 /// Per-function variable use counts, computed before codegen.
 #[derive(Debug, Default)]
@@ -42,7 +42,9 @@ pub fn analyze_use_counts(body: &Block) -> UseCountMap {
 
 fn count_stmt(counts: &mut HashMap<Symbol, u32>, stmt: &Stmt) {
     match &stmt.kind {
-        StmtKind::VarDecl { value: Some(expr), .. } => {
+        StmtKind::VarDecl {
+            value: Some(expr), ..
+        } => {
             count_expr(counts, expr);
         }
         StmtKind::VarDecl { value: None, .. } => {}
@@ -55,7 +57,12 @@ fn count_stmt(counts: &mut HashMap<Symbol, u32>, stmt: &Stmt) {
             count_expr(counts, expr);
         }
         StmtKind::Return(None) | StmtKind::Yield(None) => {}
-        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+        StmtKind::If {
+            condition,
+            then_block,
+            elif_clauses,
+            else_block,
+        } => {
             count_expr(counts, condition);
             count_block(counts, then_block);
             for (cond, block) in elif_clauses {
@@ -66,7 +73,9 @@ fn count_stmt(counts: &mut HashMap<Symbol, u32>, stmt: &Stmt) {
                 count_block(counts, block);
             }
         }
-        StmtKind::While { condition, body, .. } => {
+        StmtKind::While {
+            condition, body, ..
+        } => {
             count_expr(counts, condition);
             count_block(counts, body);
         }
@@ -89,8 +98,11 @@ fn count_stmt(counts: &mut HashMap<Symbol, u32>, stmt: &Stmt) {
         }
         StmtKind::Break | StmtKind::Continue => {}
         // Skip nested defs — they have their own use-count analysis
-        StmtKind::FnDef(_) | StmtKind::ModelDef(_) | StmtKind::StructDef(_)
-        | StmtKind::EnumDef(_) | StmtKind::TraitDef(_) => {}
+        StmtKind::FnDef(_)
+        | StmtKind::ModelDef(_)
+        | StmtKind::StructDef(_)
+        | StmtKind::EnumDef(_)
+        | StmtKind::TraitDef(_) => {}
         // Skip imports
         StmtKind::Import(_) | StmtKind::FromImport(_) => {}
         // Decorated: count uses in the inner statement
@@ -127,18 +139,30 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
             match index.as_ref() {
                 SubscriptKind::Index(e) => count_expr(counts, e),
                 SubscriptKind::Slice { lower, upper, step } => {
-                    if let Some(e) = lower { count_expr(counts, e); }
-                    if let Some(e) = upper { count_expr(counts, e); }
-                    if let Some(e) = step { count_expr(counts, e); }
+                    if let Some(e) = lower {
+                        count_expr(counts, e);
+                    }
+                    if let Some(e) = upper {
+                        count_expr(counts, e);
+                    }
+                    if let Some(e) = step {
+                        count_expr(counts, e);
+                    }
                 }
                 SubscriptKind::MultiDim(dims) => {
                     for d in dims {
                         match d {
                             SubscriptKind::Index(e) => count_expr(counts, e),
                             SubscriptKind::Slice { lower, upper, step } => {
-                                if let Some(e) = lower { count_expr(counts, e); }
-                                if let Some(e) = upper { count_expr(counts, e); }
-                                if let Some(e) = step { count_expr(counts, e); }
+                                if let Some(e) = lower {
+                                    count_expr(counts, e);
+                                }
+                                if let Some(e) = upper {
+                                    count_expr(counts, e);
+                                }
+                                if let Some(e) = step {
+                                    count_expr(counts, e);
+                                }
                             }
                             _ => {}
                         }
@@ -148,10 +172,15 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
         }
         ExprKind::Call { callee, args } => {
             count_expr(counts, callee);
-            for arg in args { count_expr(counts, &arg.value); }
+            for arg in args {
+                count_expr(counts, &arg.value);
+            }
         }
         ExprKind::Lambda { body, .. } => count_expr(counts, body),
-        ExprKind::ListComp { element, generators } => {
+        ExprKind::ListComp {
+            element,
+            generators,
+        } => {
             count_expr(counts, element);
             for gen in generators {
                 count_expr(counts, &gen.iterable);
@@ -160,7 +189,11 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
                 }
             }
         }
-        ExprKind::IfExpr { condition, then_expr, else_expr } => {
+        ExprKind::IfExpr {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
             count_expr(counts, condition);
             count_expr(counts, then_expr);
             count_expr(counts, else_expr);
@@ -169,7 +202,9 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
             count_block(counts, block);
         }
         ExprKind::ListLiteral(elems) | ExprKind::TupleLiteral(elems) => {
-            for e in elems { count_expr(counts, e); }
+            for e in elems {
+                count_expr(counts, e);
+            }
         }
         ExprKind::DictLiteral(pairs) => {
             for (k, v) in pairs {
@@ -185,11 +220,19 @@ fn count_expr(counts: &mut HashMap<Symbol, u32>, expr: &Expr) {
             }
         }
         // Literals and SelfRef don't reference bindings
-        ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_) | ExprKind::StringLiteral(_)
-        | ExprKind::BoolLiteral(_) | ExprKind::NoneLiteral | ExprKind::SelfRef => {}
+        ExprKind::IntLiteral(_)
+        | ExprKind::FloatLiteral(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::BoolLiteral(_)
+        | ExprKind::NoneLiteral
+        | ExprKind::SelfRef => {}
         ExprKind::Range { start, end, .. } => {
-            if let Some(e) = start { count_expr(counts, e); }
-            if let Some(e) = end { count_expr(counts, e); }
+            if let Some(e) = start {
+                count_expr(counts, e);
+            }
+            if let Some(e) = end {
+                count_expr(counts, e);
+            }
         }
         ExprKind::Paren(e) | ExprKind::Await(e) => count_expr(counts, e),
         ExprKind::MatchExpr { subject, arms } => {
@@ -216,15 +259,26 @@ mod tests {
     }
 
     fn ident_expr(s: Symbol) -> Expr {
-        Expr { id: nsl_ast::NodeId(0), kind: ExprKind::Ident(s), span: Span::DUMMY }
+        Expr {
+            id: nsl_ast::NodeId(0),
+            kind: ExprKind::Ident(s),
+            span: Span::DUMMY,
+        }
     }
 
     fn expr_stmt(e: Expr) -> Stmt {
-        Stmt { id: nsl_ast::NodeId(0), kind: StmtKind::Expr(e), span: Span::DUMMY }
+        Stmt {
+            id: nsl_ast::NodeId(0),
+            kind: StmtKind::Expr(e),
+            span: Span::DUMMY,
+        }
     }
 
     fn block(stmts: Vec<Stmt>) -> Block {
-        Block { span: Span::DUMMY, stmts }
+        Block {
+            span: Span::DUMMY,
+            stmts,
+        }
     }
 
     #[test]

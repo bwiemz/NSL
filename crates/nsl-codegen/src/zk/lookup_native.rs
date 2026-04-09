@@ -66,7 +66,10 @@ impl LookupNativeGate {
     /// Look up an output value for a given input.
     /// Returns None if the input is not in the table.
     pub fn lookup(&self, input: u64) -> Option<u64> {
-        self.entries.iter().find(|(i, _)| *i == input).map(|(_, o)| *o)
+        self.entries
+            .iter()
+            .find(|(i, _)| *i == input)
+            .map(|(_, o)| *o)
     }
 }
 
@@ -133,10 +136,7 @@ impl LookupMultiplicities {
 ///
 /// This is half of the Lasso/Jolt lookup argument. The verifier checks this
 /// against the table-side sum (weighted by multiplicities).
-pub fn log_derivative_trace_sum<F: Field>(
-    trace_values: &[F],
-    beta: &F,
-) -> F {
+pub fn log_derivative_trace_sum<F: Field>(trace_values: &[F], beta: &F) -> F {
     let mut sum = F::zero();
     for val in trace_values {
         // 1 / (beta - val)
@@ -219,7 +219,10 @@ mod tests {
         let trace_sum = log_derivative_trace_sum(&trace, &beta);
         let table_sum = log_derivative_table_sum(&table, &mult, &beta);
 
-        assert_eq!(trace_sum, table_sum, "log-derivative sums must match for valid lookup");
+        assert_eq!(
+            trace_sum, table_sum,
+            "log-derivative sums must match for valid lookup"
+        );
     }
 
     #[test]

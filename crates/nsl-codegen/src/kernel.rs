@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use nsl_ast::block::KernelDef;
-use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::expr::{Expr, ExprKind, SubscriptKind};
 use nsl_ast::operator::BinOp;
+use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_lexer::Interner;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -83,7 +83,9 @@ impl KernelCompiler {
         constants: &HashMap<String, i64>,
     ) {
         match &mut stmt.kind {
-            StmtKind::VarDecl { value: Some(expr), .. } => {
+            StmtKind::VarDecl {
+                value: Some(expr), ..
+            } => {
                 Self::substitute_expr_constants(expr, interner, constants);
             }
             StmtKind::Expr(expr) => {
@@ -93,7 +95,12 @@ impl KernelCompiler {
                 Self::substitute_expr_constants(target, interner, constants);
                 Self::substitute_expr_constants(value, interner, constants);
             }
-            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
                 Self::substitute_expr_constants(condition, interner, constants);
                 Self::substitute_block_constants(then_block, interner, constants);
                 for (elif_cond, elif_block) in elif_clauses {
@@ -264,8 +271,19 @@ impl KernelCompiler {
             StmtKind::Assign { target, value, .. } => {
                 self.compile_assign(target, value, interner);
             }
-            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
-                self.compile_if(condition, then_block, elif_clauses, else_block.as_ref(), interner);
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
+                self.compile_if(
+                    condition,
+                    then_block,
+                    elif_clauses,
+                    else_block.as_ref(),
+                    interner,
+                );
             }
             _ => {} // Skip unsupported statements silently
         }
@@ -308,7 +326,10 @@ impl KernelCompiler {
                             let r_gid = self.alloc_u32();
                             self.emit(&format!("    mov.u32 {}, %ctaid.x;\n", r_bix));
                             self.emit(&format!("    mov.u32 {}, %ntid.x;\n", r_bdx));
-                            self.emit(&format!("    mul.lo.u32 {}, {}, {};\n", r_gid, r_bix, r_bdx));
+                            self.emit(&format!(
+                                "    mul.lo.u32 {}, {}, {};\n",
+                                r_gid, r_bix, r_bdx
+                            ));
                             self.emit(&format!("    mov.u32 {}, %tid.x;\n", r_tid));
                             self.emit(&format!("    add.u32 {}, {}, {};\n", r_gid, r_gid, r_tid));
                             let rd = self.alloc_u64();
@@ -322,9 +343,15 @@ impl KernelCompiler {
                             let r_gidy = self.alloc_u32();
                             self.emit(&format!("    mov.u32 {}, %ctaid.y;\n", r_biy));
                             self.emit(&format!("    mov.u32 {}, %ntid.y;\n", r_bdy));
-                            self.emit(&format!("    mul.lo.u32 {}, {}, {};\n", r_gidy, r_biy, r_bdy));
+                            self.emit(&format!(
+                                "    mul.lo.u32 {}, {}, {};\n",
+                                r_gidy, r_biy, r_bdy
+                            ));
                             self.emit(&format!("    mov.u32 {}, %tid.y;\n", r_tidy));
-                            self.emit(&format!("    add.u32 {}, {}, {};\n", r_gidy, r_gidy, r_tidy));
+                            self.emit(&format!(
+                                "    add.u32 {}, {}, {};\n",
+                                r_gidy, r_gidy, r_tidy
+                            ));
                             let rd = self.alloc_u64();
                             self.emit(&format!("    cvt.u64.u32 {}, {};\n", rd, r_gidy));
                             (rd, RegKind::U64)
@@ -376,7 +403,10 @@ impl KernelCompiler {
                             let offset = self.alloc_u64();
                             self.emit(&format!("    shl.b64 {}, {}, 2;\n", offset, idx_reg));
                             let addr = self.alloc_u64();
-                            self.emit(&format!("    add.u64 {}, {}, {};\n", addr, base_reg, offset));
+                            self.emit(&format!(
+                                "    add.u64 {}, {}, {};\n",
+                                addr, base_reg, offset
+                            ));
                             let fs = self.alloc_f32();
                             self.emit(&format!("    ld.global.f32 {}, [{}];\n", fs, addr));
                             return (fs, RegKind::F32);
@@ -415,7 +445,10 @@ impl KernelCompiler {
                                 BinOp::Div => "div.approx.f32",
                                 _ => unreachable!(),
                             };
-                            self.emit(&format!("    {} {}, {}, {};\n", op_str, result, l_f32, r_f32));
+                            self.emit(&format!(
+                                "    {} {}, {}, {};\n",
+                                op_str, result, l_f32, r_f32
+                            ));
                             (result, RegKind::F32)
                         } else {
                             let result = self.alloc_u64();
@@ -426,7 +459,10 @@ impl KernelCompiler {
                                 BinOp::Div => "div.s64",
                                 _ => unreachable!(),
                             };
-                            self.emit(&format!("    {} {}, {}, {};\n", op_str, result, l_reg, r_reg));
+                            self.emit(&format!(
+                                "    {} {}, {}, {};\n",
+                                op_str, result, l_reg, r_reg
+                            ));
                             (result, RegKind::U64)
                         }
                     }
@@ -499,7 +535,10 @@ impl KernelCompiler {
                         let offset = self.alloc_u64();
                         self.emit(&format!("    shl.b64 {}, {}, 2;\n", offset, idx_reg));
                         let addr = self.alloc_u64();
-                        self.emit(&format!("    add.u64 {}, {}, {};\n", addr, base_reg, offset));
+                        self.emit(&format!(
+                            "    add.u64 {}, {}, {};\n",
+                            addr, base_reg, offset
+                        ));
                         self.emit(&format!("    st.global.f32 [{}], {};\n", addr, val_f32));
                     }
                 }

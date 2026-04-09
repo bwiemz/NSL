@@ -49,7 +49,11 @@ pub fn select_middle_values(params: &TuningParams) -> Variant {
     params
         .iter()
         .map(|(name, values)| {
-            assert!(!values.is_empty(), "autotune param '{}' has empty value list", name);
+            assert!(
+                !values.is_empty(),
+                "autotune param '{}' has empty value list",
+                name
+            );
             let mid_idx = values.len() / 2;
             (name.clone(), values[mid_idx])
         })
@@ -180,7 +184,10 @@ pub fn find_best_variant(
     // 8. Write to cache
     let autotune_result = AutotuneResult {
         winner: winner.clone(),
-        all_timings: results.iter().map(|r| (r.variant.clone(), r.median_ms)).collect(),
+        all_timings: results
+            .iter()
+            .map(|r| (r.variant.clone(), r.median_ms))
+            .collect(),
         device_name: String::new(), // filled by runtime if available
         compute_capability: String::new(),
         sm_count: 0,
@@ -286,7 +293,10 @@ pub fn find_best_variant_cost_model(
     // 8. Write to cache
     let autotune_result = AutotuneResult {
         winner: winner.clone(),
-        all_timings: results.iter().map(|r| (r.variant.clone(), r.median_ms)).collect(),
+        all_timings: results
+            .iter()
+            .map(|r| (r.variant.clone(), r.median_ms))
+            .collect(),
         device_name: "cost_model".to_string(),
         compute_capability: String::new(),
         sm_count: 0,
@@ -299,15 +309,23 @@ pub fn find_best_variant_cost_model(
 /// Print a formatted benchmark report table to stderr.
 pub fn print_benchmark_report(kernel_name: &str, results: &[BenchmarkResult]) {
     eprintln!("\n=== Autotune Report: {kernel_name} ===");
-    eprintln!("{:<40} {:>10} {:>10} {:>10}", "Variant", "Median", "Min", "Max");
+    eprintln!(
+        "{:<40} {:>10} {:>10} {:>10}",
+        "Variant", "Median", "Min", "Max"
+    );
     eprintln!("{:-<72}", "");
     for r in results {
-        let params_str: String = r.variant
+        let params_str: String = r
+            .variant
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let marker = if r.variant == results[0].variant { " <-- winner" } else { "" };
+        let marker = if r.variant == results[0].variant {
+            " <-- winner"
+        } else {
+            ""
+        };
         eprintln!(
             "{:<40} {:>9.3}ms {:>9.3}ms {:>9.3}ms{}",
             params_str, r.median_ms, r.min_ms, r.max_ms, marker
@@ -473,20 +491,60 @@ mod tests {
     fn test_ast_hash_deterministic_and_sensitive() {
         let params = vec![("block_size".to_string(), vec![64, 128])];
 
-        let hash1 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], "GPU0", "8.6", 84);
-        let hash2 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], "GPU0", "8.6", 84);
+        let hash1 = hash_kernel_ast(
+            "my_kernel",
+            b"body_v1",
+            &params,
+            &[vec![256]],
+            "GPU0",
+            "8.6",
+            84,
+        );
+        let hash2 = hash_kernel_ast(
+            "my_kernel",
+            b"body_v1",
+            &params,
+            &[vec![256]],
+            "GPU0",
+            "8.6",
+            84,
+        );
         assert_eq!(hash1, hash2, "identical inputs must produce the same hash");
 
         // Different AST body
-        let hash3 = hash_kernel_ast("my_kernel", b"body_v2", &params, &[vec![256]], "GPU0", "8.6", 84);
+        let hash3 = hash_kernel_ast(
+            "my_kernel",
+            b"body_v2",
+            &params,
+            &[vec![256]],
+            "GPU0",
+            "8.6",
+            84,
+        );
         assert_ne!(hash1, hash3, "different AST body must change hash");
 
         // Different input shapes
-        let hash4 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![512]], "GPU0", "8.6", 84);
+        let hash4 = hash_kernel_ast(
+            "my_kernel",
+            b"body_v1",
+            &params,
+            &[vec![512]],
+            "GPU0",
+            "8.6",
+            84,
+        );
         assert_ne!(hash1, hash4, "different input shapes must change hash");
 
         // Different device
-        let hash5 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], "GPU1", "8.9", 128);
+        let hash5 = hash_kernel_ast(
+            "my_kernel",
+            b"body_v1",
+            &params,
+            &[vec![256]],
+            "GPU1",
+            "8.9",
+            128,
+        );
         assert_ne!(hash1, hash5, "different device must change hash");
     }
 
@@ -581,30 +639,29 @@ mod tests {
     #[test]
     fn test_find_best_variant_with_mock_benchmark() {
         // Mock benchmark: pretend block_size=128 is fastest
-        let params = vec![
-            ("block_size".to_string(), vec![64, 128, 256]),
-        ];
+        let params = vec![("block_size".to_string(), vec![64, 128, 256])];
 
         let ptx_gen = |variant: &Variant| -> Result<String, String> {
             Ok(format!("// PTX for {:?}", variant))
         };
 
-        let benchmark = |_ptx: &str, _name: &str, variant: &Variant| -> Result<BenchmarkResult, String> {
-            let block_size = variant[0].1;
-            // Simulate: 128 is fastest, 64 medium, 256 slowest
-            let median = match block_size {
-                64 => 1.5,
-                128 => 0.8,
-                256 => 2.1,
-                _ => 10.0,
+        let benchmark =
+            |_ptx: &str, _name: &str, variant: &Variant| -> Result<BenchmarkResult, String> {
+                let block_size = variant[0].1;
+                // Simulate: 128 is fastest, 64 medium, 256 slowest
+                let median = match block_size {
+                    64 => 1.5,
+                    128 => 0.8,
+                    256 => 2.1,
+                    _ => 10.0,
+                };
+                Ok(BenchmarkResult {
+                    variant: variant.clone(),
+                    median_ms: median,
+                    min_ms: median * 0.9,
+                    max_ms: median * 1.1,
+                })
             };
-            Ok(BenchmarkResult {
-                variant: variant.clone(),
-                median_ms: median,
-                min_ms: median * 0.9,
-                max_ms: median * 1.1,
-            })
-        };
 
         // Use a unique cache hash to avoid collisions
         let hash = "test_mock_bench_001";
@@ -612,16 +669,14 @@ mod tests {
         let path = cache_dir().join(format!("test_kernel_{}.json", hash));
         std::fs::remove_file(&path).ok();
 
-        let winner = find_best_variant(
-            "test_kernel",
-            &params,
-            hash,
-            &ptx_gen,
-            &benchmark,
-        ).expect("should find a winner");
+        let winner = find_best_variant("test_kernel", &params, hash, &ptx_gen, &benchmark)
+            .expect("should find a winner");
 
-        assert_eq!(winner, vec![("block_size".to_string(), 128)],
-            "block_size=128 should win (lowest median)");
+        assert_eq!(
+            winner,
+            vec![("block_size".to_string(), 128)],
+            "block_size=128 should win (lowest median)"
+        );
 
         // Clean up
         std::fs::remove_file(&path).ok();
@@ -648,9 +703,8 @@ mod tests {
             panic!("should not be called — cache hit");
         };
 
-        let winner = find_best_variant(
-            "cached_kernel", &params, hash, &ptx_gen, &benchmark,
-        ).expect("cache hit should succeed");
+        let winner = find_best_variant("cached_kernel", &params, hash, &ptx_gen, &benchmark)
+            .expect("cache hit should succeed");
 
         assert_eq!(winner, vec![("tile_k".to_string(), 32)]);
 
@@ -673,9 +727,8 @@ mod tests {
             panic!("should not be called — PTX gen fails");
         };
 
-        let winner = find_best_variant(
-            "fail_kernel", &params, hash, &ptx_gen, &benchmark,
-        ).expect("should fall back to median");
+        let winner = find_best_variant("fail_kernel", &params, hash, &ptx_gen, &benchmark)
+            .expect("should fall back to median");
 
         // Median of [1,2,3] is index 1 => value 2
         assert_eq!(winner, vec![("x".to_string(), 2)]);
@@ -690,9 +743,7 @@ mod tests {
         let path = cache_dir().join(format!("timeout_kernel_{}.json", hash));
         std::fs::remove_file(&path).ok();
 
-        let ptx_gen = |_: &Variant| -> Result<String, String> {
-            Ok("// ptx".to_string())
-        };
+        let ptx_gen = |_: &Variant| -> Result<String, String> { Ok("// ptx".to_string()) };
         let benchmark = |_: &str, _: &str, variant: &Variant| -> Result<BenchmarkResult, String> {
             let size = variant[0].1;
             let median = if size == 1 { 10000.0 } else { 0.5 }; // size=1 is too slow
@@ -704,12 +755,14 @@ mod tests {
             })
         };
 
-        let winner = find_best_variant(
-            "timeout_kernel", &params, hash, &ptx_gen, &benchmark,
-        ).expect("should pick fast variant");
+        let winner = find_best_variant("timeout_kernel", &params, hash, &ptx_gen, &benchmark)
+            .expect("should pick fast variant");
 
-        assert_eq!(winner, vec![("size".to_string(), 2)],
-            "should skip the 10-second variant and pick size=2");
+        assert_eq!(
+            winner,
+            vec![("size".to_string(), 2)],
+            "should skip the 10-second variant and pick size=2"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -741,9 +794,7 @@ mod tests {
     fn test_cost_model_picks_largest_block_factor() {
         // The cost estimator returns lower cost for larger block factors,
         // so block_size=256 should win.
-        let params = vec![
-            ("block_size".to_string(), vec![64, 128, 256]),
-        ];
+        let params = vec![("block_size".to_string(), vec![64, 128, 256])];
 
         let ptx_gen = |variant: &Variant| -> Result<String, String> {
             Ok(format!("// PTX for {:?}", variant))
@@ -760,12 +811,15 @@ mod tests {
         let path = cache_dir().join(format!("cost_kernel_{}.json", hash));
         std::fs::remove_file(&path).ok();
 
-        let winner = find_best_variant_cost_model(
-            "cost_kernel", &params, hash, false, &ptx_gen, &cost_est,
-        ).expect("should find a winner");
+        let winner =
+            find_best_variant_cost_model("cost_kernel", &params, hash, false, &ptx_gen, &cost_est)
+                .expect("should find a winner");
 
-        assert_eq!(winner, vec![("block_size".to_string(), 256)],
-            "block_size=256 should win (lowest cost estimate)");
+        assert_eq!(
+            winner,
+            vec![("block_size".to_string(), 256)],
+            "block_size=256 should win (lowest cost estimate)"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -785,9 +839,8 @@ mod tests {
         };
         write_cache(hash, "fresh_kernel", &result);
 
-        let ptx_gen = |variant: &Variant| -> Result<String, String> {
-            Ok(format!("// PTX {:?}", variant))
-        };
+        let ptx_gen =
+            |variant: &Variant| -> Result<String, String> { Ok(format!("// PTX {:?}", variant)) };
 
         // Cost model says x=3 is the best
         let cost_est = |variant: &Variant| -> Result<f64, String> {
@@ -796,15 +849,15 @@ mod tests {
         };
 
         // Without fresh: should return cached winner (x=1)
-        let cached_winner = find_best_variant_cost_model(
-            "fresh_kernel", &params, hash, false, &ptx_gen, &cost_est,
-        ).expect("cache hit");
+        let cached_winner =
+            find_best_variant_cost_model("fresh_kernel", &params, hash, false, &ptx_gen, &cost_est)
+                .expect("cache hit");
         assert_eq!(cached_winner, vec![("x".to_string(), 1)]);
 
         // With fresh=true: should re-evaluate and pick x=3
-        let fresh_winner = find_best_variant_cost_model(
-            "fresh_kernel", &params, hash, true, &ptx_gen, &cost_est,
-        ).expect("fresh evaluation");
+        let fresh_winner =
+            find_best_variant_cost_model("fresh_kernel", &params, hash, true, &ptx_gen, &cost_est)
+                .expect("fresh evaluation");
         assert_eq!(fresh_winner, vec![("x".to_string(), 3)]);
 
         // Clean up
@@ -835,9 +888,9 @@ mod tests {
         let path = cache_dir().join(format!("skip_kernel_{}.json", hash));
         std::fs::remove_file(&path).ok();
 
-        let winner = find_best_variant_cost_model(
-            "skip_kernel", &params, hash, false, &ptx_gen, &cost_est,
-        ).expect("should skip size=32 and pick from 64,128");
+        let winner =
+            find_best_variant_cost_model("skip_kernel", &params, hash, false, &ptx_gen, &cost_est)
+                .expect("should skip size=32 and pick from 64,128");
 
         // size=128 wins (1000/128 < 1000/64)
         assert_eq!(winner, vec![("size".to_string(), 128)]);
@@ -852,16 +905,20 @@ mod tests {
         let path = cache_dir().join(format!("allfail_kernel_{}.json", hash));
         std::fs::remove_file(&path).ok();
 
-        let ptx_gen = |_: &Variant| -> Result<String, String> {
-            Err("all fail".to_string())
-        };
+        let ptx_gen = |_: &Variant| -> Result<String, String> { Err("all fail".to_string()) };
         let cost_est = |_: &Variant| -> Result<f64, String> {
             panic!("should not be called if PTX gen fails");
         };
 
         let winner = find_best_variant_cost_model(
-            "allfail_kernel", &params, hash, false, &ptx_gen, &cost_est,
-        ).expect("should fall back to median");
+            "allfail_kernel",
+            &params,
+            hash,
+            false,
+            &ptx_gen,
+            &cost_est,
+        )
+        .expect("should fall back to median");
 
         // Median of [10,20,30] => index 1 => 20
         assert_eq!(winner, vec![("y".to_string(), 20)]);
@@ -892,8 +949,14 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let winner = find_best_variant_cost_model(
-            "twopar_kernel", &params, hash, false, &ptx_gen, &cost_est,
-        ).expect("should find winner");
+            "twopar_kernel",
+            &params,
+            hash,
+            false,
+            &ptx_gen,
+            &cost_est,
+        )
+        .expect("should find winner");
 
         assert_eq!(
             winner,

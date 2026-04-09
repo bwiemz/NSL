@@ -115,7 +115,10 @@ pub fn extract_speculative_decorator<'a>(
             let method = match method_str.as_str() {
                 "eagle2" => SpeculativeMethod::Eagle2,
                 "lookahead" => SpeculativeMethod::Lookahead,
-                "medusa" => { medusa = true; SpeculativeMethod::Medusa }
+                "medusa" => {
+                    medusa = true;
+                    SpeculativeMethod::Medusa
+                }
                 _ if medusa => SpeculativeMethod::Medusa,
                 _ => SpeculativeMethod::Draft,
             };
@@ -176,7 +179,10 @@ pub fn extract_medusa_decorator<'a>(
             }
 
             if num_heads > 0 {
-                return Some(MedusaInfo { num_heads, tree_width });
+                return Some(MedusaInfo {
+                    num_heads,
+                    tree_width,
+                });
             }
         }
     }

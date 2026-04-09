@@ -15,9 +15,9 @@
 //! [`LookupTable`]s registered in the [`ZkIR`] and referenced by name in
 //! [`ZkInstruction::Lookup`].
 
-use std::collections::HashMap;
 use super::field::FieldElement;
 use super::lookup::LookupTable;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Wire
@@ -72,14 +72,23 @@ pub enum ZkInstruction {
     /// Backends that support custom gates (e.g. Halo2) can lower this
     /// directly; others expand it into a sequence of Mul + Add instructions.
     /// `a` and `b` must have the same length.
-    DotProduct { out: Wire, a: Vec<Wire>, b: Vec<Wire> },
+    DotProduct {
+        out: Wire,
+        a: Vec<Wire>,
+        b: Vec<Wire>,
+    },
 
     /// Fixed-point multiplication with rescaling.
     ///
     /// Computes `out = (a * b) >> frac_bits` in the field, modelling
     /// quantized integer matrix-multiply semantics. The right-shift is
     /// implemented as a field inverse of `2^frac_bits`.
-    FixedMul { out: Wire, a: Wire, b: Wire, frac_bits: u32 },
+    FixedMul {
+        out: Wire,
+        a: Wire,
+        b: Wire,
+        frac_bits: u32,
+    },
 
     /// Lookup table evaluation.
     ///
@@ -246,7 +255,11 @@ mod tests {
         let w0 = ir.alloc_wire("input_a");
         let w1 = ir.alloc_wire("input_b");
         let w2 = ir.alloc_wire("output");
-        ir.push(ZkInstruction::Mul { out: w2, a: w0, b: w1 });
+        ir.push(ZkInstruction::Mul {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
         ir.set_public_inputs(vec![w0, w1]);
         ir.set_public_outputs(vec![w2]);
         assert_eq!(ir.num_wires, 3);
@@ -293,7 +306,10 @@ mod tests {
     fn alloc_wire_empty_name_not_stored() {
         let mut ir = ZkIR::new("test_anonymous");
         let w = ir.alloc_wire("");
-        assert!(!ir.wire_names.contains_key(&w), "empty name should not be stored");
+        assert!(
+            !ir.wire_names.contains_key(&w),
+            "empty name should not be stored"
+        );
     }
 
     #[test]
@@ -303,8 +319,16 @@ mod tests {
         let w1 = ir.alloc_wire("b");
         let w2 = ir.alloc_wire("c");
         let w3 = ir.alloc_wire("d");
-        ir.push(ZkInstruction::Add { out: w2, a: w0, b: w1 });
-        ir.push(ZkInstruction::Mul { out: w3, a: w0, b: w2 });
+        ir.push(ZkInstruction::Add {
+            out: w2,
+            a: w0,
+            b: w1,
+        });
+        ir.push(ZkInstruction::Mul {
+            out: w3,
+            a: w0,
+            b: w2,
+        });
         assert_eq!(ir.instructions.len(), 2);
         // Verify ordering: first instruction is Add, second is Mul.
         assert!(matches!(ir.instructions[0], ZkInstruction::Add { .. }));
@@ -340,7 +364,10 @@ mod tests {
         // Key is (name, input_bits), so there should still be only 1 entry.
         assert_eq!(ir.lookup_tables.len(), 1);
         let tbl = ir.lookup_tables.get(&("relu".into(), 8)).unwrap();
-        assert_eq!(tbl.output_bits, 16, "table should be replaced by second registration");
+        assert_eq!(
+            tbl.output_bits, 16,
+            "table should be replaced by second registration"
+        );
     }
 
     #[test]

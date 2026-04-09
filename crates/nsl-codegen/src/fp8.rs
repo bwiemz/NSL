@@ -71,7 +71,11 @@ pub fn extract_fp8_compute_decorator<'a>(
                     }
                 }
             }
-            return Some(Fp8ComputeInfo { calibrate, scaling, block_size });
+            return Some(Fp8ComputeInfo {
+                calibrate,
+                scaling,
+                block_size,
+            });
         }
     }
     None
@@ -106,7 +110,10 @@ pub fn extract_fp4_compute_decorator<'a>(
                     }
                 }
             }
-            return Some(Fp4ComputeInfo { block_size, hadamard });
+            return Some(Fp4ComputeInfo {
+                block_size,
+                hadamard,
+            });
         }
     }
     None
@@ -213,11 +220,33 @@ pub fn emit_fp8_matmul_ptx(k: usize, format: Fp8Format) -> String {
     // Kernel entry
     let fmt = format.ptx_str();
     writeln!(ptx, ".visible .entry {}(", format.kernel_name()).unwrap();
-    writeln!(ptx, "    .param .u64 param_a,        // A matrix ({}, row-major)", fmt).unwrap();
-    writeln!(ptx, "    .param .u64 param_b,        // B matrix ({}, col-major)", fmt).unwrap();
-    writeln!(ptx, "    .param .u64 param_c,        // C matrix (f32, row-major)").unwrap();
-    writeln!(ptx, "    .param .f32 param_scale_a,  // per-tensor scale for A").unwrap();
-    writeln!(ptx, "    .param .f32 param_scale_b,  // per-tensor scale for B").unwrap();
+    writeln!(
+        ptx,
+        "    .param .u64 param_a,        // A matrix ({}, row-major)",
+        fmt
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    .param .u64 param_b,        // B matrix ({}, col-major)",
+        fmt
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    .param .u64 param_c,        // C matrix (f32, row-major)"
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    .param .f32 param_scale_a,  // per-tensor scale for A"
+    )
+    .unwrap();
+    writeln!(
+        ptx,
+        "    .param .f32 param_scale_b,  // per-tensor scale for B"
+    )
+    .unwrap();
     writeln!(ptx, "    .param .u32 param_m,").unwrap();
     writeln!(ptx, "    .param .u32 param_n,").unwrap();
     writeln!(ptx, "    .param .u32 param_k").unwrap();
@@ -231,7 +260,12 @@ pub fn emit_fp8_matmul_ptx(k: usize, format: Fp8Format) -> String {
     writeln!(ptx, "    .reg .u32 %k_iter;").unwrap();
     writeln!(ptx, "    .reg .pred %pk;").unwrap();
     // MMA fragment registers
-    writeln!(ptx, "    // A-fragment: 4 .b32 (each holds 4 {} = 4 bytes)", fmt).unwrap();
+    writeln!(
+        ptx,
+        "    // A-fragment: 4 .b32 (each holds 4 {} = 4 bytes)",
+        fmt
+    )
+    .unwrap();
     writeln!(ptx, "    .reg .b32 %a0, %a1, %a2, %a3;").unwrap();
     writeln!(ptx, "    // B-fragment: 2 .b32").unwrap();
     writeln!(ptx, "    .reg .b32 %b0, %b1;").unwrap();
@@ -264,7 +298,11 @@ pub fn emit_fp8_matmul_ptx(k: usize, format: Fp8Format) -> String {
 
     // Compute base addresses for this thread block's tile
     // A tile: row = bid_y * 16, starting at A + row * K
-    writeln!(ptx, "    // A base: A + bid_y * 16 * K (bytes, since fp8 = 1 byte)").unwrap();
+    writeln!(
+        ptx,
+        "    // A base: A + bid_y * 16 * K (bytes, since fp8 = 1 byte)"
+    )
+    .unwrap();
     writeln!(ptx, "    mul.lo.u32 %off, %bid_y, {};", FP8_MMA_M).unwrap();
     writeln!(ptx, "    mul.lo.u32 %off, %off, %K;").unwrap();
     writeln!(ptx, "    cvt.u64.u32 %addr_a, %off;").unwrap();
@@ -299,14 +337,23 @@ pub fn emit_fp8_matmul_ptx(k: usize, format: Fp8Format) -> String {
     writeln!(ptx, "    ld.global.b32 %b1, [%addr_b + 4];").unwrap();
 
     // Issue FP8 MMA
-    writeln!(ptx, "    mma.sync.aligned.m16n8k32.row.col.f32.{fmt}.{fmt}.f32").unwrap();
+    writeln!(
+        ptx,
+        "    mma.sync.aligned.m16n8k32.row.col.f32.{fmt}.{fmt}.f32"
+    )
+    .unwrap();
     writeln!(ptx, "        {{%acc0, %acc1, %acc2, %acc3}},").unwrap();
     writeln!(ptx, "        {{%a0, %a1, %a2, %a3}},").unwrap();
     writeln!(ptx, "        {{%b0, %b1}},").unwrap();
     writeln!(ptx, "        {{%acc0, %acc1, %acc2, %acc3}};").unwrap();
 
     // Advance pointers by K=32 bytes (32 fp8 elements = 32 bytes)
-    writeln!(ptx, "    add.u64 %addr_a, %addr_a, {};  // 32 fp8 elements", FP8_MMA_K).unwrap();
+    writeln!(
+        ptx,
+        "    add.u64 %addr_a, %addr_a, {};  // 32 fp8 elements",
+        FP8_MMA_K
+    )
+    .unwrap();
     writeln!(ptx, "    add.u64 %addr_b, %addr_b, {};", FP8_MMA_K).unwrap();
 
     // Loop
@@ -389,8 +436,18 @@ pub fn emit_fp8_matmul_ptx_wgmma(k: usize) -> String {
     // Shared memory descriptors
     writeln!(ptx, "    .reg .b64 %desc_a, %desc_b;").unwrap();
     // Shared memory for staging A and B tiles
-    writeln!(ptx, "    .shared .align 128 .b8 smem_a[{}];", 64 * FP8_WGMMA_K).unwrap();  // m64 * k32
-    writeln!(ptx, "    .shared .align 128 .b8 smem_b[{}];", 64 * FP8_WGMMA_K).unwrap();  // n64 * k32
+    writeln!(
+        ptx,
+        "    .shared .align 128 .b8 smem_a[{}];",
+        64 * FP8_WGMMA_K
+    )
+    .unwrap(); // m64 * k32
+    writeln!(
+        ptx,
+        "    .shared .align 128 .b8 smem_b[{}];",
+        64 * FP8_WGMMA_K
+    )
+    .unwrap(); // n64 * k32
 
     // Load parameters
     writeln!(ptx, "    ld.param.u64 %ra, [param_a];").unwrap();
@@ -414,11 +471,19 @@ pub fn emit_fp8_matmul_ptx_wgmma(k: usize) -> String {
     writeln!(ptx, "FP8_WGMMA_K_LOOP:").unwrap();
 
     // Cooperative load A and B tiles from global to shared memory
-    writeln!(ptx, "    // Cooperative load A/B tiles to shared memory (128 threads)").unwrap();
+    writeln!(
+        ptx,
+        "    // Cooperative load A/B tiles to shared memory (128 threads)"
+    )
+    .unwrap();
     writeln!(ptx, "    bar.sync 0;").unwrap();
 
     // Issue wgmma with FP8 e4m3 inputs
-    writeln!(ptx, "    wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3").unwrap();
+    writeln!(
+        ptx,
+        "    wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3"
+    )
+    .unwrap();
     let acc_list: Vec<String> = (0..32).map(|r| format!("%acc{r}")).collect();
     writeln!(ptx, "        {{{}}},", acc_list.join(", ")).unwrap();
     writeln!(ptx, "        [%desc_a],").unwrap();
@@ -475,22 +540,35 @@ mod tests {
         assert!(ptx.contains("param_scale_b"), "scale_b parameter");
 
         // FP8 MMA instruction
-        assert!(ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"),
-            "E4M3 MMA instruction");
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"),
+            "E4M3 MMA instruction"
+        );
 
         // Fragment registers
-        assert!(ptx.contains(".reg .b32 %a0, %a1, %a2, %a3"), "A-fragment regs");
+        assert!(
+            ptx.contains(".reg .b32 %a0, %a1, %a2, %a3"),
+            "A-fragment regs"
+        );
         assert!(ptx.contains(".reg .b32 %b0, %b1"), "B-fragment regs");
-        assert!(ptx.contains(".reg .f32 %acc0, %acc1, %acc2, %acc3"), "accumulator regs");
+        assert!(
+            ptx.contains(".reg .f32 %acc0, %acc1, %acc2, %acc3"),
+            "accumulator regs"
+        );
 
         // K-loop
         assert!(ptx.contains("FP8_K_LOOP"), "K-dimension loop");
         let k_iters = 128 / 32; // 4
-        assert!(ptx.contains(&format!("setp.lt.u32 %pk, %k_iter, {}", k_iters)),
-            "K loop bound = K/32");
+        assert!(
+            ptx.contains(&format!("setp.lt.u32 %pk, %k_iter, {}", k_iters)),
+            "K loop bound = K/32"
+        );
 
         // Post-MMA scale
-        assert!(ptx.contains("mul.f32 %acc0, %acc0, %scale"), "scale application");
+        assert!(
+            ptx.contains("mul.f32 %acc0, %acc0, %scale"),
+            "scale application"
+        );
 
         // Store
         assert!(ptx.contains("st.global.f32"), "output store");
@@ -501,16 +579,24 @@ mod tests {
         let ptx = emit_fp8_matmul_ptx(128, Fp8Format::E5M2);
 
         // E5M2 kernel name
-        assert!(ptx.contains("nsl_fp8_matmul_e5m2_kernel"), "E5M2 kernel name");
+        assert!(
+            ptx.contains("nsl_fp8_matmul_e5m2_kernel"),
+            "E5M2 kernel name"
+        );
 
         // E5M2 MMA instruction
-        assert!(ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32"),
-            "E5M2 MMA instruction");
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32"),
+            "E5M2 MMA instruction"
+        );
         // Must NOT contain e4m3
         assert!(!ptx.contains("e4m3"), "E5M2 PTX must not contain e4m3");
 
         // Same geometry: scale, K-loop, store
-        assert!(ptx.contains("mul.f32 %acc0, %acc0, %scale"), "scale application");
+        assert!(
+            ptx.contains("mul.f32 %acc0, %acc0, %scale"),
+            "scale application"
+        );
         assert!(ptx.contains("FP8_K_LOOP"), "K-dimension loop");
         assert!(ptx.contains("st.global.f32"), "f32 output store");
     }
@@ -528,8 +614,10 @@ mod tests {
         let result = compile_fp8_matmul(h100, 128, Fp8Format::E4M3);
         match result {
             Fp8MatmulStrategy::WgmmaKernel { ptx } => {
-                assert!(ptx.contains("wgmma.mma_async.sync.aligned.m64n64k32"),
-                    "H100 should get FP8 wgmma kernel");
+                assert!(
+                    ptx.contains("wgmma.mma_async.sync.aligned.m64n64k32"),
+                    "H100 should get FP8 wgmma kernel"
+                );
                 assert!(ptx.contains(".target sm_90"));
                 assert!(ptx.contains("wgmma.commit_group"), "async commit");
                 assert!(ptx.contains("wgmma.wait_group"), "async wait");
@@ -546,15 +634,26 @@ mod tests {
 
         assert!(ptx.contains(".version 8.0"));
         assert!(ptx.contains(".target sm_90"));
-        assert!(ptx.contains("nsl_fp8_matmul_wgmma_kernel"), "wgmma kernel name");
-        assert!(ptx.contains("wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3"),
-            "FP8 wgmma instruction");
+        assert!(
+            ptx.contains("nsl_fp8_matmul_wgmma_kernel"),
+            "wgmma kernel name"
+        );
+        assert!(
+            ptx.contains("wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3"),
+            "FP8 wgmma instruction"
+        );
         assert!(ptx.contains("wgmma.commit_group.sync.aligned"));
         assert!(ptx.contains("wgmma.wait_group.sync.aligned"));
-        assert!(ptx.contains(".shared .align 128"), "128-byte aligned shared memory");
+        assert!(
+            ptx.contains(".shared .align 128"),
+            "128-byte aligned shared memory"
+        );
 
         // 32 accumulators per thread
-        assert!(ptx.contains("%acc31"), "should have 32 accumulator registers");
+        assert!(
+            ptx.contains("%acc31"),
+            "should have 32 accumulator registers"
+        );
 
         // K loop
         let k_iters = 128 / 32;
@@ -579,15 +678,19 @@ mod tests {
     fn test_compile_fp8_matmul_sm80_falls_back() {
         let a100 = crate::gpu_specs::find_gpu("A100-SXM").unwrap();
         let result = compile_fp8_matmul(a100, 128, Fp8Format::E4M3);
-        assert!(matches!(result, Fp8MatmulStrategy::RuntimeFallback),
-            "A100 (sm_80) should fall back to runtime");
+        assert!(
+            matches!(result, Fp8MatmulStrategy::RuntimeFallback),
+            "A100 (sm_80) should fall back to runtime"
+        );
     }
 
     #[test]
     fn test_compile_fp8_matmul_k_not_aligned_falls_back() {
         let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
         let result = compile_fp8_matmul(h100, 100, Fp8Format::E4M3); // 100 not divisible by 32
-        assert!(matches!(result, Fp8MatmulStrategy::RuntimeFallback),
-            "K=100 not aligned to MMA_K=32, should fall back");
+        assert!(
+            matches!(result, Fp8MatmulStrategy::RuntimeFallback),
+            "K=100 not aligned to MMA_K=32, should fall back"
+        );
     }
 }

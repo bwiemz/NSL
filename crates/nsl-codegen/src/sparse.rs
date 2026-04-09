@@ -19,7 +19,7 @@ pub enum KernelSelection {
     PtxBsrSpmm,
     PtxCsrSpmv,
     PtxCooSpmv,
-    PtxMmaSp,           // Ampere 2:4 structured sparsity
+    PtxMmaSp, // Ampere 2:4 structured sparsity
     CpuCsrSpmm,
     CpuGenericSpmm,
     CpuGenericSpmv,
@@ -57,12 +57,17 @@ pub fn select_sparse_kernel(op: SparseOp, format: u8, device: u8) -> KernelSelec
 /// Sparsity-preserving output type rules.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SparseOutputType {
-    Sparse(u8),   // result is sparse with given format ID
-    Dense,        // result is dense
+    Sparse(u8), // result is sparse with given format ID
+    Dense,      // result is dense
 }
 
 /// Determine output sparsity for an operation.
-pub fn infer_sparse_output(op: &str, lhs_sparse: bool, rhs_sparse: bool, lhs_fmt: u8) -> SparseOutputType {
+pub fn infer_sparse_output(
+    op: &str,
+    lhs_sparse: bool,
+    rhs_sparse: bool,
+    lhs_fmt: u8,
+) -> SparseOutputType {
     match (op, lhs_sparse, rhs_sparse) {
         ("add" | "sub", true, true) => SparseOutputType::Sparse(lhs_fmt),
         ("mul_scalar" | "div_scalar", true, false) => SparseOutputType::Sparse(lhs_fmt),
@@ -113,7 +118,13 @@ impl<'a> SparseCostModel<'a> {
     }
 
     /// Estimate cost of a sparse matrix-vector/matrix multiply in the given format.
-    pub fn estimate(&self, format: SparseFormat, m: usize, n: usize, nnz: usize) -> SparseCostEstimate {
+    pub fn estimate(
+        &self,
+        format: SparseFormat,
+        m: usize,
+        n: usize,
+        nnz: usize,
+    ) -> SparseCostEstimate {
         let (flops, memory_bytes) = match format {
             SparseFormat::Coo => {
                 // COO SpMV: 2 * nnz FLOPs (mul + add per nonzero)
@@ -148,8 +159,16 @@ impl<'a> SparseCostModel<'a> {
         let bandwidth_bytes_per_us = self.gpu.peak_bandwidth_gbs * 1e3;
         let peak_flops_per_us = self.gpu.peak_fp32_tflops * 1e6;
 
-        let compute_time = if peak_flops_per_us > 0.0 { flops / peak_flops_per_us } else { 0.0 };
-        let memory_time = if bandwidth_bytes_per_us > 0.0 { memory_bytes as f64 / bandwidth_bytes_per_us } else { 0.0 };
+        let compute_time = if peak_flops_per_us > 0.0 {
+            flops / peak_flops_per_us
+        } else {
+            0.0
+        };
+        let memory_time = if bandwidth_bytes_per_us > 0.0 {
+            memory_bytes as f64 / bandwidth_bytes_per_us
+        } else {
+            0.0
+        };
 
         SparseCostEstimate {
             format,
@@ -177,7 +196,11 @@ pub fn select_optimal_format(m: usize, n: usize, nnz: usize, gpu: &GpuSpec) -> S
         return SparseFormat::Dense;
     }
 
-    let density = if total > 0 { nnz as f64 / total as f64 } else { 1.0 };
+    let density = if total > 0 {
+        nnz as f64 / total as f64
+    } else {
+        1.0
+    };
 
     // High density: dense fallback
     if density > 0.5 {
@@ -279,12 +302,10 @@ impl MergeLattice {
     /// Build lattice for element-wise multiplication (intersection).
     pub fn intersection() -> Self {
         MergeLattice {
-            points: vec![
-                MergeLatticePoint {
-                    iterators: [true, true],
-                    expression: MergeExpr::Both,
-                },
-            ],
+            points: vec![MergeLatticePoint {
+                iterators: [true, true],
+                expression: MergeExpr::Both,
+            }],
             merge_op: MergeOp::Intersection,
         }
     }
@@ -324,7 +345,7 @@ impl IterationGraph {
                 IterLevel {
                     dimension: 1,
                     format: LevelFormat::Dense, // inner: dense vector access
-                    merge_with: vec![1], // co-iterate with vector
+                    merge_with: vec![1],        // co-iterate with vector
                 },
             ],
         }
@@ -370,10 +391,10 @@ impl IterationGraph {
 /// Sparse FLOP estimation for the cost model.
 pub fn estimate_sparse_flops(op: SparseOp, nnz: usize, n: usize, nnz_b: usize) -> f64 {
     match op {
-        SparseOp::MatVec => 2.0 * nnz as f64,           // one mul + one add per nz
+        SparseOp::MatVec => 2.0 * nnz as f64, // one mul + one add per nz
         SparseOp::MatMul => 2.0 * nnz as f64 * n as f64, // SpMM: per-column
-        SparseOp::Add => (nnz + nnz_b) as f64,            // merge cost
-        SparseOp::ScalarMul => nnz as f64,                // one mul per nz
+        SparseOp::Add => (nnz + nnz_b) as f64, // merge cost
+        SparseOp::ScalarMul => nnz as f64,    // one mul per nz
         SparseOp::StructuredMatMul => nnz as f64 * n as f64,
     }
 }
@@ -431,7 +452,11 @@ pub fn build_iteration_graph_from_expr(expr: &TensorExpr) -> IterationGraph {
             // Outer loop: iterate A's row dimension (level 0)
             // Inner loop: iterate A's column dimension (level 1), merge with B's row dimension
             let row_fmt = left.levels.first().copied().unwrap_or(LevelFormat::Dense);
-            let col_fmt = left.levels.get(1).copied().unwrap_or(LevelFormat::Compressed);
+            let col_fmt = left
+                .levels
+                .get(1)
+                .copied()
+                .unwrap_or(LevelFormat::Compressed);
 
             IterationGraph {
                 levels: vec![
@@ -457,11 +482,12 @@ pub fn build_iteration_graph_from_expr(expr: &TensorExpr) -> IterationGraph {
                 .map(|(dim, &fmt)| {
                     let right_fmt = right.levels.get(dim).copied().unwrap_or(LevelFormat::Dense);
                     // For union merge, use the more compressed format
-                    let merged_fmt = if fmt == LevelFormat::Compressed || right_fmt == LevelFormat::Compressed {
-                        LevelFormat::Compressed
-                    } else {
-                        fmt
-                    };
+                    let merged_fmt =
+                        if fmt == LevelFormat::Compressed || right_fmt == LevelFormat::Compressed {
+                            LevelFormat::Compressed
+                        } else {
+                            fmt
+                        };
                     IterLevel {
                         dimension: dim,
                         format: merged_fmt,
@@ -480,11 +506,12 @@ pub fn build_iteration_graph_from_expr(expr: &TensorExpr) -> IterationGraph {
                 .map(|(dim, &fmt)| {
                     let right_fmt = right.levels.get(dim).copied().unwrap_or(LevelFormat::Dense);
                     // For intersection, use compressed if either is compressed
-                    let merged_fmt = if fmt == LevelFormat::Compressed || right_fmt == LevelFormat::Compressed {
-                        LevelFormat::Compressed
-                    } else {
-                        fmt
-                    };
+                    let merged_fmt =
+                        if fmt == LevelFormat::Compressed || right_fmt == LevelFormat::Compressed {
+                            LevelFormat::Compressed
+                        } else {
+                            fmt
+                        };
                     IterLevel {
                         dimension: dim,
                         format: merged_fmt,
@@ -513,20 +540,18 @@ pub fn build_merge_lattice_from_expr(expr: &TensorExpr) -> MergeLattice {
 ///
 /// This replaces manual kernel selection — users write standard math (`C = A @ B`)
 /// and the compiler selects the best kernel from the annotated formats.
-pub fn select_kernel_from_layout(
-    expr: &TensorExpr,
-    device: u8,
-) -> KernelSelection {
+pub fn select_kernel_from_layout(expr: &TensorExpr, device: u8) -> KernelSelection {
     match expr {
         TensorExpr::Matmul { left, .. } => {
             // Determine format ID from left operand's layout
             let format_id = layout_to_format_id(&left.levels);
-            let op = if left.levels.len() <= 1 || left.levels.iter().all(|l| *l == LevelFormat::Dense) {
-                // Dense — shouldn't use sparse kernel
-                return KernelSelection::Fallback;
-            } else {
-                SparseOp::MatMul
-            };
+            let op =
+                if left.levels.len() <= 1 || left.levels.iter().all(|l| *l == LevelFormat::Dense) {
+                    // Dense — shouldn't use sparse kernel
+                    return KernelSelection::Fallback;
+                } else {
+                    SparseOp::MatMul
+                };
             select_sparse_kernel(op, format_id, device)
         }
         TensorExpr::Add { left, .. } => {
@@ -543,8 +568,8 @@ pub fn select_kernel_from_layout(
 /// Map a level format list to the M50 format ID (0=COO, 1=CSR, 2=CSC, 3=BSR).
 fn layout_to_format_id(levels: &[LevelFormat]) -> u8 {
     match levels {
-        [LevelFormat::Dense, LevelFormat::Compressed] => 1,      // CSR
-        [LevelFormat::Compressed, LevelFormat::Dense] => 2,      // CSC
+        [LevelFormat::Dense, LevelFormat::Compressed] => 1, // CSR
+        [LevelFormat::Compressed, LevelFormat::Dense] => 2, // CSC
         [LevelFormat::CompressedNonUnique, LevelFormat::Singleton] => 0, // COO
         [LevelFormat::Dense, LevelFormat::Compressed, LevelFormat::Dense, LevelFormat::Dense] => 3, // BSR
         _ => 1, // default to CSR for unknown layouts
@@ -566,7 +591,7 @@ pub fn needs_format_conversion(
     let current_id = layout_to_format_id(current_levels);
 
     let preferred_id = match expr {
-        TensorExpr::Matmul { .. } => 1,  // CSR preferred for SpMM
+        TensorExpr::Matmul { .. } => 1,       // CSR preferred for SpMM
         TensorExpr::Add { .. } => current_id, // keep current for add (sorted merge)
         TensorExpr::Mul { .. } => current_id, // keep current for mul
     };
@@ -715,9 +740,12 @@ mod tests {
         let csr = model.estimate(SparseFormat::Csr, m, n, nnz);
 
         // CSR compresses row indices into row_ptr (m+1 entries vs nnz entries)
-        assert!(csr.memory_bytes < coo.memory_bytes,
+        assert!(
+            csr.memory_bytes < coo.memory_bytes,
             "CSR ({} bytes) should use less memory than COO ({} bytes)",
-            csr.memory_bytes, coo.memory_bytes);
+            csr.memory_bytes,
+            coo.memory_bytes
+        );
     }
 
     #[test]
@@ -731,30 +759,42 @@ mod tests {
         let csr = model.estimate(SparseFormat::Csr, m, n, nnz);
         let dense = model.estimate(SparseFormat::Dense, m, n, nnz);
 
-        assert!(dense.memory_bytes > csr.memory_bytes,
+        assert!(
+            dense.memory_bytes > csr.memory_bytes,
             "Dense ({} bytes) should use more memory than CSR ({} bytes) at 0.1% density",
-            dense.memory_bytes, csr.memory_bytes);
+            dense.memory_bytes,
+            csr.memory_bytes
+        );
     }
 
     #[test]
     fn test_select_format_very_sparse() {
         let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
         // density = 500 / (10000*10000) = 0.000005 → COO
-        assert_eq!(select_optimal_format(10000, 10000, 500, gpu), SparseFormat::Coo);
+        assert_eq!(
+            select_optimal_format(10000, 10000, 500, gpu),
+            SparseFormat::Coo
+        );
     }
 
     #[test]
     fn test_select_format_moderate_sparse() {
         let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
         // density = 5M / 100M = 0.05 → CSR (medium density, general purpose)
-        assert_eq!(select_optimal_format(10000, 10000, 5_000_000, gpu), SparseFormat::Csr);
+        assert_eq!(
+            select_optimal_format(10000, 10000, 5_000_000, gpu),
+            SparseFormat::Csr
+        );
     }
 
     #[test]
     fn test_select_format_dense_fallback() {
         let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
         // density = 60M / 100M = 0.6 → Dense
-        assert_eq!(select_optimal_format(10000, 10000, 60_000_000, gpu), SparseFormat::Dense);
+        assert_eq!(
+            select_optimal_format(10000, 10000, 60_000_000, gpu),
+            SparseFormat::Dense
+        );
     }
 
     #[test]
@@ -780,7 +820,10 @@ mod tests {
     #[test]
     fn test_select_format_fully_dense() {
         let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
-        assert_eq!(select_optimal_format(1000, 1000, 1_000_000, gpu), SparseFormat::Dense);
+        assert_eq!(
+            select_optimal_format(1000, 1000, 1_000_000, gpu),
+            SparseFormat::Dense
+        );
     }
 
     // ── Merge lattice tests ──────────────────────────────────────
@@ -815,7 +858,10 @@ mod tests {
     #[test]
     fn sparse_flop_estimation() {
         assert_eq!(estimate_sparse_flops(SparseOp::MatVec, 1000, 1, 0), 2000.0);
-        assert_eq!(estimate_sparse_flops(SparseOp::MatMul, 1000, 64, 0), 128000.0);
+        assert_eq!(
+            estimate_sparse_flops(SparseOp::MatMul, 1000, 64, 0),
+            128000.0
+        );
         assert_eq!(estimate_sparse_flops(SparseOp::Add, 500, 0, 300), 800.0);
     }
 
@@ -899,9 +945,15 @@ mod tests {
             right: dense_access(&["k", "j"]),
         };
         // GPU
-        assert_eq!(select_kernel_from_layout(&expr, 1), KernelSelection::PtxCsrSpmm);
+        assert_eq!(
+            select_kernel_from_layout(&expr, 1),
+            KernelSelection::PtxCsrSpmm
+        );
         // CPU
-        assert_eq!(select_kernel_from_layout(&expr, 0), KernelSelection::CpuCsrSpmm);
+        assert_eq!(
+            select_kernel_from_layout(&expr, 0),
+            KernelSelection::CpuCsrSpmm
+        );
     }
 
     #[test]
@@ -915,7 +967,10 @@ mod tests {
             left: coo_access,
             right: dense_access(&["k", "j"]),
         };
-        assert_eq!(select_kernel_from_layout(&expr, 1), KernelSelection::PtxCooSpmm);
+        assert_eq!(
+            select_kernel_from_layout(&expr, 1),
+            KernelSelection::PtxCooSpmm
+        );
     }
 
     #[test]
@@ -925,7 +980,10 @@ mod tests {
             left: dense_access(&["i", "k"]),
             right: dense_access(&["k", "j"]),
         };
-        assert_eq!(select_kernel_from_layout(&expr, 1), KernelSelection::Fallback);
+        assert_eq!(
+            select_kernel_from_layout(&expr, 1),
+            KernelSelection::Fallback
+        );
     }
 
     #[test]
@@ -975,8 +1033,17 @@ mod tests {
 
     #[test]
     fn layout_to_format_id_mapping() {
-        assert_eq!(layout_to_format_id(&[LevelFormat::Dense, LevelFormat::Compressed]), 1); // CSR
-        assert_eq!(layout_to_format_id(&[LevelFormat::Compressed, LevelFormat::Dense]), 2); // CSC
-        assert_eq!(layout_to_format_id(&[LevelFormat::CompressedNonUnique, LevelFormat::Singleton]), 0); // COO
+        assert_eq!(
+            layout_to_format_id(&[LevelFormat::Dense, LevelFormat::Compressed]),
+            1
+        ); // CSR
+        assert_eq!(
+            layout_to_format_id(&[LevelFormat::Compressed, LevelFormat::Dense]),
+            2
+        ); // CSC
+        assert_eq!(
+            layout_to_format_id(&[LevelFormat::CompressedNonUnique, LevelFormat::Singleton]),
+            0
+        ); // COO
     }
 }

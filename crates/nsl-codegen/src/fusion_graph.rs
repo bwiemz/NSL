@@ -1,8 +1,8 @@
 //! Expression DAG for graph-level fusion analysis.
 //! Builds a consumer-counting DAG via ANF linearization of function bodies.
 
-use std::collections::HashMap;
 use nsl_semantic::types::DType;
+use std::collections::HashMap;
 
 pub type NodeId = u32;
 pub type FusedKernelId = u32;
@@ -16,7 +16,7 @@ pub enum FusionOp {
     Reduction(String),
     View(String),
     FlashAttention,
-    MoEDispatch,   // M32: fusion barrier — never fuse into or out of
+    MoEDispatch, // M32: fusion barrier — never fuse into or out of
     Other,
 }
 
@@ -180,20 +180,15 @@ impl FusionGraph {
 pub fn classify_op(name: &str) -> FusionOp {
     match name {
         "matmul" => FusionOp::Matmul,
-        "add" | "sub" | "mul" | "div" | "pow" | "neg" | "abs"
-        | "relu" | "gelu" | "silu" | "sigmoid" | "tanh"
-        | "exp" | "log" | "sqrt" | "sign" | "clamp" => {
+        "add" | "sub" | "mul" | "div" | "pow" | "neg" | "abs" | "relu" | "gelu" | "silu"
+        | "sigmoid" | "tanh" | "exp" | "log" | "sqrt" | "sign" | "clamp" => {
             FusionOp::Elementwise(name.to_string())
         }
         "sum" | "mean" | "reduce_max" | "reduce_min" | "var" => {
             FusionOp::Reduction(name.to_string())
         }
-        "softmax" | "layernorm" | "rmsnorm" => {
-            FusionOp::Reduction(name.to_string())
-        }
-        "transpose" | "reshape" | "broadcast" | "expand" => {
-            FusionOp::View(name.to_string())
-        }
+        "softmax" | "layernorm" | "rmsnorm" => FusionOp::Reduction(name.to_string()),
+        "transpose" | "reshape" | "broadcast" | "expand" => FusionOp::View(name.to_string()),
         "scaled_dot_product_attention" => FusionOp::FlashAttention,
         _ => FusionOp::Other,
     }
@@ -212,7 +207,11 @@ mod tests {
         let c = g.add_named_node("C".into(), FusionOp::Input, vec![]);
         let mm = g.add_node(FusionOp::Matmul, vec![a, b]);
         let add = g.add_node(FusionOp::Elementwise("add".into()), vec![mm, c]);
-        let relu = g.add_named_node("out".into(), FusionOp::Elementwise("relu".into()), vec![add]);
+        let relu = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("relu".into()),
+            vec![add],
+        );
         g.mark_graph_output(relu);
         g.build_consumers();
 
@@ -297,9 +296,15 @@ mod tests {
         assert_eq!(classify_op("relu"), FusionOp::Elementwise("relu".into()));
         assert_eq!(classify_op("gelu"), FusionOp::Elementwise("gelu".into()));
         assert_eq!(classify_op("sum"), FusionOp::Reduction("sum".into()));
-        assert_eq!(classify_op("softmax"), FusionOp::Reduction("softmax".into()));
+        assert_eq!(
+            classify_op("softmax"),
+            FusionOp::Reduction("softmax".into())
+        );
         assert_eq!(classify_op("transpose"), FusionOp::View("transpose".into()));
-        assert_eq!(classify_op("scaled_dot_product_attention"), FusionOp::FlashAttention);
+        assert_eq!(
+            classify_op("scaled_dot_product_attention"),
+            FusionOp::FlashAttention
+        );
         assert_eq!(classify_op("some_unknown"), FusionOp::Other);
     }
 
@@ -334,7 +339,7 @@ mod tests {
         // Softmax pattern should be claimed by reduction pass,
         // preventing the elementwise pass from stealing exp/div nodes.
         use crate::epilogue_fusion::detect_epilogue_chains;
-        use crate::reduction_fusion::{detect_reduction_patterns, apply_reduction_fusion};
+        use crate::reduction_fusion::{apply_reduction_fusion, detect_reduction_patterns};
 
         let mut g = FusionGraph::new();
         let x = g.add_named_node("x".into(), FusionOp::Input, vec![]);
@@ -344,7 +349,11 @@ mod tests {
         let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![sub]);
         let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
         g.set_type_info(rsum, vec![1024], DType::F32);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![exp, rsum],
+        );
         g.mark_graph_output(div);
         g.build_consumers();
 
@@ -371,7 +380,7 @@ mod tests {
         // The chain stops at relu (2 consumers: rmax + sub), but relu is still
         // added as an Activation epilogue op before the consumer check halts iteration.
         use crate::epilogue_fusion::detect_epilogue_chains;
-        use crate::reduction_fusion::{detect_reduction_patterns, apply_reduction_fusion};
+        use crate::reduction_fusion::{apply_reduction_fusion, detect_reduction_patterns};
 
         let mut g = FusionGraph::new();
         // Matmul + relu path
@@ -388,7 +397,11 @@ mod tests {
         let exp = g.add_node(FusionOp::Elementwise("exp".into()), vec![sub]);
         let rsum = g.add_node(FusionOp::Reduction("reduce_sum".into()), vec![exp]);
         g.set_type_info(rsum, vec![1024], DType::F32);
-        let div = g.add_named_node("out".into(), FusionOp::Elementwise("div".into()), vec![exp, rsum]);
+        let div = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("div".into()),
+            vec![exp, rsum],
+        );
         g.mark_graph_output(div);
         g.build_consumers();
 
@@ -412,8 +425,8 @@ mod tests {
     fn test_full_pipeline_transformer_block() {
         // Simulates a transformer attention block:
         // matmul(Q, K^T) -> softmax -> matmul(attn, V) -> bias + relu
-        use crate::epilogue_fusion::{detect_epilogue_chains, apply_epilogue_fusion};
-        use crate::reduction_fusion::{detect_reduction_patterns, apply_reduction_fusion};
+        use crate::epilogue_fusion::{apply_epilogue_fusion, detect_epilogue_chains};
+        use crate::reduction_fusion::{apply_reduction_fusion, detect_reduction_patterns};
 
         let mut g = FusionGraph::new();
         let q = g.add_named_node("Q".into(), FusionOp::Input, vec![]);
@@ -441,13 +454,20 @@ mod tests {
 
         // bias + relu
         let add = g.add_node(FusionOp::Elementwise("add".into()), vec![av, bias]);
-        let relu = g.add_named_node("out".into(), FusionOp::Elementwise("relu".into()), vec![add]);
+        let relu = g.add_named_node(
+            "out".into(),
+            FusionOp::Elementwise("relu".into()),
+            vec![add],
+        );
         g.mark_graph_output(relu);
         g.build_consumers();
 
         // Pass 1: Reduction fusion
         let red_matches = detect_reduction_patterns(&g);
-        let softmax_count = red_matches.iter().filter(|m| m.pattern == "softmax").count();
+        let softmax_count = red_matches
+            .iter()
+            .filter(|m| m.pattern == "softmax")
+            .count();
         assert_eq!(softmax_count, 1);
         apply_reduction_fusion(&mut g, &red_matches, 0);
 

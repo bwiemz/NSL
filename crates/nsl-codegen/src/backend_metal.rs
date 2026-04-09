@@ -32,7 +32,12 @@ pub fn lower_kir_to_msl(ir: &KernelIR) -> Vec<u8> {
         };
         let is_ptr = matches!(param.ty, KirType::Ptr(_, _));
         if is_ptr {
-            write!(msl, "    {} {}* {} [[buffer({})]]", attr, msl_type, param.name, i).unwrap();
+            write!(
+                msl,
+                "    {} {}* {} [[buffer({})]]",
+                attr, msl_type, param.name, i
+            )
+            .unwrap();
         } else {
             write!(msl, "    {} {} [[buffer({})]]", msl_type, param.name, i).unwrap();
         }
@@ -90,7 +95,10 @@ fn lower_op_to_msl(op: &KirOp) -> String {
         KirOp::Tanh(dst, a) => format!("auto v{} = tanh(v{});", dst, a),
         KirOp::ThreadId(dst, _) => format!("auto v{} = tid;", dst),
         KirOp::BlockIdx(dst, _) => format!("auto v{} = block_id;", dst),
-        KirOp::GlobalId(dst, _) => format!("auto v{} = tid;  // Metal: global ID is thread_position_in_grid", dst),
+        KirOp::GlobalId(dst, _) => format!(
+            "auto v{} = tid;  // Metal: global ID is thread_position_in_grid",
+            dst
+        ),
         KirOp::Barrier => "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string(),
         KirOp::Load(dst, ptr, _) => format!("auto v{} = *(v{});", dst, ptr),
         KirOp::Store(ptr, val, _) => format!("*(v{}) = v{};", ptr, val),

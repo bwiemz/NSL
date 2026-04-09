@@ -30,9 +30,15 @@ pub enum BarrierReason {
     DimensionMismatch,
     UnsupportedOp,
     /// Fusion rejected because register pressure exceeds budget.
-    RegisterPressure { peak_regs: u32, max_regs: u32 },
+    RegisterPressure {
+        peak_regs: u32,
+        max_regs: u32,
+    },
     /// Epilogue chain truncated at this op count.
-    EpilogueTruncated { kept: usize, total: usize },
+    EpilogueTruncated {
+        kept: usize,
+        total: usize,
+    },
 }
 
 impl fmt::Display for BarrierReason {
@@ -44,10 +50,13 @@ impl fmt::Display for BarrierReason {
             Self::NoFuseAnnotation => write!(f, "@no_fuse annotation"),
             Self::DimensionMismatch => write!(f, "dimension mismatch"),
             Self::UnsupportedOp => write!(f, "unsupported op"),
-            Self::RegisterPressure { peak_regs, max_regs } =>
-                write!(f, "register pressure ({peak_regs}/{max_regs} regs)"),
-            Self::EpilogueTruncated { kept, total } =>
-                write!(f, "epilogue truncated ({kept}/{total} ops kept)"),
+            Self::RegisterPressure {
+                peak_regs,
+                max_regs,
+            } => write!(f, "register pressure ({peak_regs}/{max_regs} regs)"),
+            Self::EpilogueTruncated { kept, total } => {
+                write!(f, "epilogue truncated ({kept}/{total} ops kept)")
+            }
         }
     }
 }
@@ -98,10 +107,18 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
     }
 
     for func_name in &functions {
-        let func_events: Vec<_> = events.iter().filter(|e| &e.function_name == func_name).collect();
-        let func_barriers: Vec<_> = barriers.iter().filter(|b| &b.function_name == func_name).collect();
+        let func_events: Vec<_> = events
+            .iter()
+            .filter(|e| &e.function_name == func_name)
+            .collect();
+        let func_barriers: Vec<_> = barriers
+            .iter()
+            .filter(|b| &b.function_name == func_name)
+            .collect();
 
-        let loc = func_events.first().map(|e| e.location.as_str())
+        let loc = func_events
+            .first()
+            .map(|e| e.location.as_str())
             .or_else(|| func_barriers.first().map(|b| b.location.as_str()))
             .unwrap_or("unknown");
         eprintln!("  {} ({}):", func_name, loc);
@@ -113,7 +130,11 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
                 e.strategy
             );
             let reg_info = if e.estimated_regs > 0 {
-                format!(", regs={}, occupancy={:.0}%", e.estimated_regs, e.estimated_occupancy * 100.0)
+                format!(
+                    ", regs={}, occupancy={:.0}%",
+                    e.estimated_regs,
+                    e.estimated_occupancy * 100.0
+                )
             } else {
                 String::new()
             };
@@ -128,8 +149,7 @@ pub fn print_fusion_report(events: &[FusionEvent], barriers: &[FusionBarrierEven
         for b in &func_barriers {
             eprintln!(
                 "    {} -> not fused ({} barrier)",
-                b.node_description,
-                b.reason
+                b.node_description, b.reason
             );
         }
     }
@@ -157,8 +177,14 @@ mod tests {
 
     #[test]
     fn test_barrier_reason_display() {
-        assert_eq!(format!("{}", BarrierReason::MultiConsumer), "multi-consumer");
-        assert_eq!(format!("{}", BarrierReason::NoFuseAnnotation), "@no_fuse annotation");
+        assert_eq!(
+            format!("{}", BarrierReason::MultiConsumer),
+            "multi-consumer"
+        );
+        assert_eq!(
+            format!("{}", BarrierReason::NoFuseAnnotation),
+            "@no_fuse annotation"
+        );
     }
 
     #[test]

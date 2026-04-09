@@ -19,8 +19,8 @@ use cranelift_codegen::ir::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceAdParamDiagnosticKind {
-    TrainableTensor,
-    IgnoredConfigTensor,
+    Trainable,
+    IgnoredConfig,
     IgnoredNonTensor,
 }
 
@@ -35,9 +35,9 @@ fn classify_source_ad_param_name(
 ) -> SourceAdParamDiagnosticKind {
     if tensor_param_paths.contains(param_name) {
         if is_trainable_param_leaf_name(param_name) {
-            SourceAdParamDiagnosticKind::TrainableTensor
+            SourceAdParamDiagnosticKind::Trainable
         } else {
-            SourceAdParamDiagnosticKind::IgnoredConfigTensor
+            SourceAdParamDiagnosticKind::IgnoredConfig
         }
     } else {
         SourceAdParamDiagnosticKind::IgnoredNonTensor
@@ -45,6 +45,176 @@ fn classify_source_ad_param_name(
 }
 
 impl Compiler<'_> {
+    fn collect_pattern_bound_symbols(
+        &self,
+        pattern: &nsl_ast::pattern::Pattern,
+        targets: &mut std::collections::HashSet<nsl_ast::Symbol>,
+    ) {
+        match &pattern.kind {
+            PatternKind::Ident(sym) => {
+                targets.insert(*sym);
+            }
+            PatternKind::Tuple(items)
+            | PatternKind::List(items)
+            | PatternKind::Or(items)
+            | PatternKind::Constructor { args: items, .. } => {
+                for item in items {
+                    self.collect_pattern_bound_symbols(item, targets);
+                }
+            }
+            PatternKind::Struct { fields, rest } => {
+                for field in fields {
+                    if let Some(pattern) = &field.pattern {
+                        self.collect_pattern_bound_symbols(pattern, targets);
+                    } else {
+                        targets.insert(field.name);
+                    }
+                }
+                if let Some(rest_sym) = rest {
+                    targets.insert(*rest_sym);
+                }
+            }
+            PatternKind::Guarded { pattern, .. } | PatternKind::Typed { pattern, .. } => {
+                self.collect_pattern_bound_symbols(pattern, targets);
+            }
+            PatternKind::Rest(Some(sym)) => {
+                targets.insert(*sym);
+            }
+            PatternKind::Wildcard
+            | PatternKind::Literal(_)
+            | PatternKind::Rest(None) => {}
+        }
+    }
+
+    fn collect_assignment_targets_from_block(
+        &self,
+        block: &nsl_ast::stmt::Block,
+        targets: &mut std::collections::HashSet<nsl_ast::Symbol>,
+    ) {
+        for stmt in &block.stmts {
+            self.collect_assignment_targets_from_stmt(stmt, targets);
+        }
+    }
+
+    fn collect_assignment_targets_from_stmt(
+        &self,
+        stmt: &Stmt,
+        targets: &mut std::collections::HashSet<nsl_ast::Symbol>,
+    ) {
+        match &stmt.kind {
+            StmtKind::VarDecl { pattern, .. } => {
+                self.collect_pattern_bound_symbols(pattern, targets);
+            }
+            StmtKind::Assign { target, .. } => {
+                if let ExprKind::Ident(sym) = &target.kind {
+                    targets.insert(*sym);
+                }
+            }
+            StmtKind::If {
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
+                self.collect_assignment_targets_from_block(then_block, targets);
+                for (_, block) in elif_clauses {
+                    self.collect_assignment_targets_from_block(block, targets);
+                }
+                if let Some(block) = else_block {
+                    self.collect_assignment_targets_from_block(block, targets);
+                }
+            }
+            StmtKind::For { pattern, body, .. } => {
+                self.collect_pattern_bound_symbols(pattern, targets);
+                self.collect_assignment_targets_from_block(body, targets);
+            }
+            StmtKind::While { body, .. } => {
+                self.collect_assignment_targets_from_block(body, targets);
+            }
+            StmtKind::WhileLet { pattern, body, .. } => {
+                self.collect_pattern_bound_symbols(pattern, targets);
+                self.collect_assignment_targets_from_block(body, targets);
+            }
+            StmtKind::Match { arms, .. } => {
+                for arm in arms {
+                    self.collect_assignment_targets_from_block(&arm.body, targets);
+                }
+            }
+            StmtKind::Decorated { stmt, .. } => {
+                self.collect_assignment_targets_from_stmt(stmt, targets);
+            }
+            _ => {}
+        }
+    }
+
+    fn materialize_non_owning_aliases_before_if(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        then_block: &nsl_ast::stmt::Block,
+        elif_clauses: &[(nsl_ast::expr::Expr, nsl_ast::stmt::Block)],
+        else_block: &Option<nsl_ast::stmt::Block>,
+    ) -> Result<(), CodegenError> {
+        let mut assigned_symbols = std::collections::HashSet::new();
+        self.collect_assignment_targets_from_block(then_block, &mut assigned_symbols);
+        for (_, block) in elif_clauses {
+            self.collect_assignment_targets_from_block(block, &mut assigned_symbols);
+        }
+        if let Some(block) = else_block {
+            self.collect_assignment_targets_from_block(block, &mut assigned_symbols);
+        }
+
+        let materialize: Vec<_> = assigned_symbols
+            .into_iter()
+            .filter(|sym| state.non_owning_symbols.contains(sym))
+            .filter_map(|sym| {
+                let is_tensor = state
+                    .variable_types
+                    .get(&sym)
+                    .map(|ty| ty.is_tensor())
+                    .unwrap_or(false);
+                if !is_tensor {
+                    return None;
+                }
+                state.variables.get(&sym).and_then(|(var, cl_type)| {
+                    (*cl_type == cl_types::I64).then_some((sym, *var))
+                })
+            })
+            .collect();
+
+        for (sym, var) in materialize {
+            let current_val = builder.use_var(var);
+            let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[current_val])?;
+            builder.def_var(var, cloned);
+            state.non_owning_symbols.remove(&sym);
+        }
+
+        Ok(())
+    }
+
+    fn update_non_owning_binding(
+        &self,
+        state: &mut FuncState,
+        target_sym: nsl_ast::Symbol,
+        value: Option<&nsl_ast::expr::Expr>,
+    ) {
+        let Some(expr) = value else {
+            state.non_owning_symbols.remove(&target_sym);
+            return;
+        };
+
+        if let ExprKind::Ident(source_sym) = &expr.kind {
+            if state.param_symbols.contains(source_sym)
+                || state.non_owning_symbols.contains(source_sym)
+            {
+                state.non_owning_symbols.insert(target_sym);
+                return;
+            }
+        }
+
+        state.non_owning_symbols.remove(&target_sym);
+    }
+
     /// M36: Try to compile a tensor creation as a slab-managed allocation.
     /// Returns Ok(Some(value)) if the variable is slab-planned and the RHS is a
     /// tensor creation (zeros, ones, etc.). Returns Ok(None) to fall through to normal codegen.
@@ -462,6 +632,7 @@ impl Compiler<'_> {
                                 .current_block
                                 .map(|b| !is_block_filled(builder, b))
                                 .unwrap_or(true)
+                                && !state.non_owning_symbols.contains(&sym)
                             {
                                 let old_val = builder.use_var(*var);
                                 let sem_ty = state.variable_types.get(&sym);
@@ -500,6 +671,7 @@ impl Compiler<'_> {
                         } else {
                             state.dataloader_symbols.remove(&sym);
                         }
+                        self.update_non_owning_binding(state, sym, value.as_ref());
 
                         // M50: Track sparse tensor variables for end-to-end dispatch.
                         // Check if the RHS is a call to a sparse function or has Type::Sparse.
@@ -975,24 +1147,23 @@ impl Compiler<'_> {
                     }
                 };
                 // Free old tensor value before reassignment to prevent memory leak
-                if matches!(op, AssignOp::Assign) {
-                    if state
+                if matches!(op, AssignOp::Assign)
+                    && state
                         .current_block
                         .map(|b| !is_block_filled(builder, b))
                         .unwrap_or(true)
-                    {
-                        let old_val = builder.use_var(var);
-                        let sem_ty = state.variable_types.get(sym);
-                        if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
-                            let _ =
-                                self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
-                        } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
-                            let _ = self.compile_call_by_name(
-                                builder,
-                                "nsl_tensor_free_if_valid",
-                                &[old_val],
-                            );
-                        }
+                    && !state.non_owning_symbols.contains(sym)
+                {
+                    let old_val = builder.use_var(var);
+                    let sem_ty = state.variable_types.get(sym);
+                    if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
+                        let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
+                    } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
+                        let _ = self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_free_if_valid",
+                            &[old_val],
+                        );
                     }
                 }
                 builder.def_var(var, final_val);
@@ -1002,6 +1173,7 @@ impl Compiler<'_> {
                     } else {
                         state.dataloader_symbols.remove(sym);
                     }
+                    self.update_non_owning_binding(state, *sym, Some(value));
                 }
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));
@@ -1365,6 +1537,13 @@ impl Compiler<'_> {
         elif_clauses: &[(nsl_ast::expr::Expr, nsl_ast::stmt::Block)],
         else_block: &Option<nsl_ast::stmt::Block>,
     ) -> Result<(), CodegenError> {
+        self.materialize_non_owning_aliases_before_if(
+            builder,
+            state,
+            then_block,
+            elif_clauses,
+            else_block,
+        )?;
         let merge_block = builder.create_block();
         state.flags.conditional_depth += 1;
         let cond_val = self.compile_expr(builder, state, condition);
@@ -2913,9 +3092,11 @@ impl Compiler<'_> {
                 // Second pass: map Input ops by name (catches inputs not in symbol_var_map)
                 for op in &extractor.wengert_list().ops {
                     if let crate::wengert::PrimalOp::Input(name) = &op.op {
-                        if !primal_vars.contains_key(&op.result) {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            primal_vars.entry(op.result)
+                        {
                             if let Some(&val) = state_vars_by_name.get(name) {
-                                primal_vars.insert(op.result, val);
+                                entry.insert(val);
                             }
                         }
                     }
@@ -2928,10 +3109,9 @@ impl Compiler<'_> {
                 //
                 // Also add the step parameter (batch) which is stored separately
                 if let Some(&step_vid) = extractor.symbol_var_map().get(&step_param_sym) {
-                    if !primal_vars.contains_key(&step_vid) {
-                        let batch_val = builder.use_var(step_param_var);
-                        primal_vars.insert(step_vid, batch_val);
-                    }
+                    primal_vars
+                        .entry(step_vid)
+                        .or_insert_with(|| builder.use_var(step_param_var));
                 }
                 // Resolve model parameter VarIds by traversing nested struct layouts.
                 // Compound names like "m.blocks.0.attn.wq" are split into path
@@ -3176,10 +3356,10 @@ impl Compiler<'_> {
                 let mut grad_skipped_no_lowered = 0usize;
                 for (param_name, vid) in extractor.named_param_var_ids() {
                     match classify_source_ad_param_name(param_name, &tensor_param_paths) {
-                        SourceAdParamDiagnosticKind::TrainableTensor => {
+                        SourceAdParamDiagnosticKind::Trainable => {
                             seen_trainable_tensor_params.insert(param_name.clone());
                         }
-                        SourceAdParamDiagnosticKind::IgnoredConfigTensor => {
+                        SourceAdParamDiagnosticKind::IgnoredConfig => {
                             grad_ignored_config_tensor += 1;
                             continue;
                         }
@@ -5577,15 +5757,15 @@ mod tests {
 
         assert_eq!(
             classify_source_ad_param_name("m.blocks.0.attn.wq", &tensor_paths),
-            SourceAdParamDiagnosticKind::TrainableTensor,
+            SourceAdParamDiagnosticKind::Trainable,
         );
         assert_eq!(
             classify_source_ad_param_name("m.blocks.0.attn._dropout_p", &tensor_paths),
-            SourceAdParamDiagnosticKind::IgnoredConfigTensor,
+            SourceAdParamDiagnosticKind::IgnoredConfig,
         );
         assert_eq!(
             classify_source_ad_param_name("m.blocks.0.attn.rope.inv_freq", &tensor_paths),
-            SourceAdParamDiagnosticKind::IgnoredConfigTensor,
+            SourceAdParamDiagnosticKind::IgnoredConfig,
         );
         assert_eq!(
             classify_source_ad_param_name("m.blocks.0.attn_norm.eps", &tensor_paths),

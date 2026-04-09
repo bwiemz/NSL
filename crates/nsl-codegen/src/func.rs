@@ -54,6 +54,7 @@ impl Compiler<'_> {
                 builder.declare_var(var, cl_type);
                 builder.def_var(var, param_val);
                 state.variables.insert(param.name, (var, cl_type));
+                state.param_symbols.insert(param.name);
             }
 
             // M28: emit runtime assertions for symbolic/bounded dimensions
@@ -176,6 +177,7 @@ impl Compiler<'_> {
                         fn_def.params.iter().map(|p| p.name).collect();
                     let locals: Vec<_> = state.variables.iter()
                         .filter(|(sym, _)| !param_syms.contains(sym))
+                        .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
                         .filter_map(|(_, (var, cl_type))| {
                             // Only I64 values can be tensor pointers
                             if *cl_type == cl_types::I64 {

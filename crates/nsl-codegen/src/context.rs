@@ -149,6 +149,8 @@ impl Default for CodegenFlags {
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {
     pub variables: HashMap<Symbol, (Variable, cl_types::Type)>,
+    pub param_symbols: HashSet<Symbol>,
+    pub non_owning_symbols: HashSet<Symbol>,
     pub dataloader_symbols: HashSet<Symbol>,
     pub borrowed_batch_symbols: HashSet<Symbol>,
     pub var_counter: usize,
@@ -189,6 +191,8 @@ impl FuncState {
     pub fn new() -> Self {
         FuncState {
             variables: HashMap::new(),
+            param_symbols: HashSet::new(),
+            non_owning_symbols: HashSet::new(),
             dataloader_symbols: HashSet::new(),
             borrowed_batch_symbols: HashSet::new(),
             var_counter: 0,

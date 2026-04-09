@@ -20,7 +20,11 @@ impl Compiler<'_> {
             .filter_map(|s| match &s.kind {
                 StmtKind::FnDef(fn_def) => Some(fn_def.clone()),
                 StmtKind::Decorated { stmt, .. } => {
-                    if let StmtKind::FnDef(fn_def) = &stmt.kind { Some(fn_def.clone()) } else { None }
+                    if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                        Some(fn_def.clone())
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             })
@@ -32,10 +36,19 @@ impl Compiler<'_> {
 
         #[allow(clippy::type_complexity)]
         let layouts: Vec<(String, Vec<(cl_types::Type, usize)>, usize)> = self
-            .types.struct_layouts.iter()
-            .filter(|(name, _)| !self.models.model_methods.contains_key(*name) && !self.models.imported_model_names.contains(*name))
+            .types
+            .struct_layouts
+            .iter()
+            .filter(|(name, _)| {
+                !self.models.model_methods.contains_key(*name)
+                    && !self.models.imported_model_names.contains(*name)
+            })
             .map(|(name, layout)| {
-                let fields: Vec<_> = layout.fields.iter().map(|f| (f.cl_type, f.offset)).collect();
+                let fields: Vec<_> = layout
+                    .fields
+                    .iter()
+                    .map(|f| (f.cl_type, f.offset))
+                    .collect();
                 (name.clone(), fields, layout.total_size)
             })
             .collect();
@@ -48,7 +61,11 @@ impl Compiler<'_> {
         let model_defs: Vec<_> = stmts
             .iter()
             .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind { Some(md.clone()) } else { None }
+                if let StmtKind::ModelDef(md) = &s.kind {
+                    Some(md.clone())
+                } else {
+                    None
+                }
             })
             .collect();
         for md in &model_defs {
@@ -117,12 +134,18 @@ impl Compiler<'_> {
         }
 
         if self.dump_ir {
-            eprintln!("--- IR: lambda '{}' ---\n{}", lambda.name, ctx.func.display());
+            eprintln!(
+                "--- IR: lambda '{}' ---\n{}",
+                lambda.name,
+                ctx.func.display()
+            );
         }
 
         self.module
             .define_function(lambda.func_id, &mut ctx)
-            .map_err(|e| CodegenError::new(format!("failed to define lambda '{}': {e}", lambda.name)))?;
+            .map_err(|e| {
+                CodegenError::new(format!("failed to define lambda '{}': {e}", lambda.name))
+            })?;
         Ok(())
     }
 
@@ -154,7 +177,9 @@ impl Compiler<'_> {
 
             for (i, (_cl_type, offset)) in fields.iter().enumerate() {
                 let param_val = builder.block_params(entry)[i];
-                builder.ins().store(MemFlags::trusted(), param_val, ptr, *offset as i32);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), param_val, ptr, *offset as i32);
             }
 
             builder.ins().return_(&[ptr]);
@@ -165,8 +190,11 @@ impl Compiler<'_> {
             eprintln!("--- IR: struct ctor '{name}' ---\n{}", ctx.func.display());
         }
 
-        self.module.define_function(func_id, &mut ctx)
-            .map_err(|e| CodegenError::new(format!("failed to define struct ctor '{name}': {e}")))?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                CodegenError::new(format!("failed to define struct ctor '{name}': {e}"))
+            })?;
         Ok(())
     }
 
@@ -220,16 +248,30 @@ impl Compiler<'_> {
 
             // Initialize fields
             if let Some(ref layout) = layout {
-                let field_info: Vec<_> = layout.fields.iter().map(|f| (f.name.clone(), f.cl_type, f.offset)).collect();
+                let field_info: Vec<_> = layout
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.cl_type, f.offset))
+                    .collect();
                 let members_clone: Vec<_> = md.members.clone();
                 for member in &members_clone {
-                    if let ModelMember::LayerDecl { name, init, type_ann, .. } = member {
+                    if let ModelMember::LayerDecl {
+                        name,
+                        init,
+                        type_ann,
+                        ..
+                    } = member
+                    {
                         let field_name = self.resolve_sym(*name).to_string();
 
                         // Check if this is a FixedArray field → generate init loop
-                        if let nsl_ast::types::TypeExprKind::FixedArray { size, .. } = &type_ann.kind {
+                        if let nsl_ast::types::TypeExprKind::FixedArray { size, .. } =
+                            &type_ann.kind
+                        {
                             let arr_size = *size;
-                            if let Some((_fname, _cl_type, field_offset)) = field_info.iter().find(|(n, _, _)| *n == field_name) {
+                            if let Some((_fname, _cl_type, field_offset)) =
+                                field_info.iter().find(|(n, _, _)| *n == field_name)
+                            {
                                 let field_offset = *field_offset;
                                 if let Some(init_expr) = init {
                                     let init_expr_clone = init_expr.clone();
@@ -249,18 +291,27 @@ impl Compiler<'_> {
                                     state.current_block = Some(loop_header);
                                     let counter = builder.use_var(counter_var);
                                     let limit = builder.ins().iconst(cl_types::I64, arr_size);
-                                    let cond = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedLessThan, counter, limit);
+                                    let cond = builder.ins().icmp(
+                                        cranelift_codegen::ir::condcodes::IntCC::SignedLessThan,
+                                        counter,
+                                        limit,
+                                    );
                                     builder.ins().brif(cond, loop_body, &[], loop_exit, &[]);
 
                                     builder.switch_to_block(loop_body);
                                     builder.seal_block(loop_body);
                                     state.current_block = Some(loop_body);
 
-                                    let init_val = self.compile_expr(&mut builder, &mut state, &init_expr_clone)?;
+                                    let init_val = self.compile_expr(
+                                        &mut builder,
+                                        &mut state,
+                                        &init_expr_clone,
+                                    )?;
                                     let counter = builder.use_var(counter_var);
                                     let eight = builder.ins().iconst(cl_types::I64, 8);
                                     let elem_byte_offset = builder.ins().imul(counter, eight);
-                                    let base_off = builder.ins().iconst(cl_types::I64, field_offset as i64);
+                                    let base_off =
+                                        builder.ins().iconst(cl_types::I64, field_offset as i64);
                                     let total_off = builder.ins().iadd(base_off, elem_byte_offset);
                                     let addr = builder.ins().iadd(ptr, total_off);
                                     builder.ins().store(MemFlags::trusted(), init_val, addr, 0);
@@ -280,10 +331,14 @@ impl Compiler<'_> {
                             continue;
                         }
 
-                        if let Some((_fname, cl_type, offset)) = field_info.iter().find(|(n, _, _)| *n == field_name) {
+                        if let Some((_fname, cl_type, offset)) =
+                            field_info.iter().find(|(n, _, _)| *n == field_name)
+                        {
                             if let Some(init_expr) = init {
                                 let val = self.compile_expr(&mut builder, &mut state, init_expr)?;
-                                builder.ins().store(MemFlags::trusted(), val, ptr, *offset as i32);
+                                builder
+                                    .ins()
+                                    .store(MemFlags::trusted(), val, ptr, *offset as i32);
                             } else {
                                 // Store zero for uninitialized fields
                                 let zero = if cl_type.is_float() {
@@ -291,7 +346,9 @@ impl Compiler<'_> {
                                 } else {
                                     builder.ins().iconst(*cl_type, 0)
                                 };
-                                builder.ins().store(MemFlags::trusted(), zero, ptr, *offset as i32);
+                                builder
+                                    .ins()
+                                    .store(MemFlags::trusted(), zero, ptr, *offset as i32);
                             }
                         }
                     }
@@ -299,7 +356,9 @@ impl Compiler<'_> {
             }
 
             // M25: Initialize paged KV cache if model has @paged_kv
-            if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) = self.models.paged_kv_configs.get(&model_name) {
+            if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) =
+                self.models.paged_kv_configs.get(&model_name)
+            {
                 let init_id = self.registry.runtime_fns["nsl_kv_cache_init"].0;
                 let init_ref = self.module.declare_func_in_func(init_id, builder.func);
                 let nb = builder.ins().iconst(cl_types::I64, num_blocks);
@@ -326,7 +385,9 @@ impl Compiler<'_> {
                 let cs = builder.ins().iconst(cl_types::I64, compress_scheme);
                 let cw = builder.ins().iconst(cl_types::I64, compress_window);
                 let ck = builder.ins().iconst(cl_types::I64, compress_sinks);
-                let call = builder.ins().call(init_ref, &[nb, bs, nh, hd, nl, cs, cw, ck]);
+                let call = builder
+                    .ins()
+                    .call(init_ref, &[nb, bs, nh, hd, nl, cs, cw, ck]);
                 // Store the handle — for now just discard it (the handle is returned by init)
                 let _handle = builder.inst_results(call)[0];
             }
@@ -336,11 +397,17 @@ impl Compiler<'_> {
         }
 
         if self.dump_ir {
-            eprintln!("--- IR: model ctor '{model_name}' ---\n{}", ctx.func.display());
+            eprintln!(
+                "--- IR: model ctor '{model_name}' ---\n{}",
+                ctx.func.display()
+            );
         }
 
-        self.module.define_function(func_id, &mut ctx)
-            .map_err(|e| CodegenError::new(format!("failed to define model ctor '{model_name}': {e}")))?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                CodegenError::new(format!("failed to define model ctor '{model_name}': {e}"))
+            })?;
         Ok(())
     }
 
@@ -348,7 +415,11 @@ impl Compiler<'_> {
         let model_defs: Vec<_> = stmts
             .iter()
             .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind { Some(md.clone()) } else { None }
+                if let StmtKind::ModelDef(md) = &s.kind {
+                    Some(md.clone())
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -358,8 +429,13 @@ impl Compiler<'_> {
                 if let ModelMember::Method(fn_def, decos) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
-                    let (func_id, sig) = self.registry.functions.get(&mangled)
-                        .ok_or_else(|| CodegenError::new(format!("model method '{}' not registered", mangled)))?
+                    let (func_id, sig) = self
+                        .registry
+                        .functions
+                        .get(&mangled)
+                        .ok_or_else(|| {
+                            CodegenError::new(format!("model method '{}' not registered", mangled))
+                        })?
                         .clone();
 
                     let mut ctx = Context::for_function(Function::with_name_signature(
@@ -379,8 +455,9 @@ impl Compiler<'_> {
                         state.current_block = Some(entry);
 
                         // @fp8_compute on model method: use FP8 training matmul
-                        if decos.iter().any(|d| d.name.len() == 1 && self.resolve_sym(d.name[0]) == "fp8_compute")
-                            || self.features.fp8_compute_fns.contains(&method_name)
+                        if decos.iter().any(|d| {
+                            d.name.len() == 1 && self.resolve_sym(d.name[0]) == "fp8_compute"
+                        }) || self.features.fp8_compute_fns.contains(&method_name)
                             || self.features.fp8_compute_fns.contains(&mangled)
                         {
                             state.flags.is_fp8_compute = true;
@@ -399,7 +476,9 @@ impl Compiler<'_> {
                         // First Cranelift param is self (pointer)
                         let self_val = builder.block_params(entry)[0];
                         // Find the "self" symbol from the AST params
-                        let self_sym = fn_def.params.iter()
+                        let self_sym = fn_def
+                            .params
+                            .iter()
                             .find(|p| self.resolve_sym(p.name) == "self")
                             .map(|p| p.name)
                             .unwrap_or_else(|| fn_def.params[0].name);
@@ -455,11 +534,19 @@ impl Compiler<'_> {
                     }
 
                     if self.dump_ir {
-                        eprintln!("--- IR: model method '{mangled}' ---\n{}", ctx.func.display());
+                        eprintln!(
+                            "--- IR: model method '{mangled}' ---\n{}",
+                            ctx.func.display()
+                        );
                     }
 
-                    self.module.define_function(func_id, &mut ctx)
-                        .map_err(|e| CodegenError::new(format!("failed to define model method '{mangled}': {e}")))?;
+                    self.module
+                        .define_function(func_id, &mut ctx)
+                        .map_err(|e| {
+                            CodegenError::new(format!(
+                                "failed to define model method '{mangled}': {e}"
+                            ))
+                        })?;
                 }
             }
         }

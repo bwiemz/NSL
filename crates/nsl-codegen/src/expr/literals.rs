@@ -152,9 +152,10 @@ impl Compiler<'_> {
                 ("nsl_int_to_str", builder.ins().sextend(cl_types::I64, val))
             }
             Type::Float | Type::F64 => ("nsl_float_to_str", val),
-            Type::F32 => {
-                ("nsl_float_to_str", builder.ins().fpromote(cl_types::F64, val))
-            }
+            Type::F32 => (
+                "nsl_float_to_str",
+                builder.ins().fpromote(cl_types::F64, val),
+            ),
             Type::Bool => ("nsl_bool_to_str", val),
             Type::Str => return Ok(val),
             _ => ("nsl_int_to_str", val),
@@ -204,7 +205,9 @@ impl Compiler<'_> {
         generators: &[nsl_ast::expr::CompGenerator],
     ) -> Result<Value, CodegenError> {
         if generators.is_empty() {
-            return Err(CodegenError::new("list comprehension needs at least one generator"));
+            return Err(CodegenError::new(
+                "list comprehension needs at least one generator",
+            ));
         }
         // Create a new list
         let new_id = self.registry.runtime_fns["nsl_list_new"].0;
@@ -216,7 +219,11 @@ impl Compiler<'_> {
         let gen = &generators[0];
         let sym = match &gen.pattern.kind {
             PatternKind::Ident(sym) => *sym,
-            _ => return Err(CodegenError::new("only simple ident patterns in list comprehensions")),
+            _ => {
+                return Err(CodegenError::new(
+                    "only simple ident patterns in list comprehensions",
+                ))
+            }
         };
 
         let iter_val = self.compile_expr(builder, state, &gen.iterable)?;
@@ -274,7 +281,9 @@ impl Compiler<'_> {
             for cond_expr in &gen.conditions {
                 let cond_val = self.compile_expr(builder, state, cond_expr)?;
                 let next_check = builder.create_block();
-                builder.ins().brif(cond_val, next_check, &[], increment_block, &[]);
+                builder
+                    .ins()
+                    .brif(cond_val, next_check, &[], increment_block, &[]);
                 builder.switch_to_block(next_check);
                 builder.seal_block(next_check);
                 state.current_block = Some(next_check);
@@ -337,7 +346,8 @@ impl Compiler<'_> {
 
             match &arm.pattern.kind {
                 PatternKind::Wildcard => {
-                    let arm_val = self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
+                    let arm_val =
+                        self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
                     builder.ins().jump(merge_block, &[arm_val]);
                     break;
                 }
@@ -353,20 +363,24 @@ impl Compiler<'_> {
                         builder.switch_to_block(arm_block);
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
-                        let arm_val = self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
+                        let arm_val =
+                            self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
                         builder.ins().jump(merge_block, &[arm_val]);
 
                         builder.switch_to_block(next_block);
                         builder.seal_block(next_block);
                         state.current_block = Some(next_block);
-                        if is_last { needs_default_block = true; }
+                        if is_last {
+                            needs_default_block = true;
+                        }
                     } else {
                         // Binding: bind subject to variable
                         let var = state.new_variable();
                         builder.declare_var(var, cl_types::I64);
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
-                        let arm_val = self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
+                        let arm_val =
+                            self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
                         builder.ins().jump(merge_block, &[arm_val]);
                         break;
                     }
@@ -386,13 +400,16 @@ impl Compiler<'_> {
                     builder.switch_to_block(arm_block);
                     builder.seal_block(arm_block);
                     state.current_block = Some(arm_block);
-                    let arm_val = self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
+                    let arm_val =
+                        self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
                     builder.ins().jump(merge_block, &[arm_val]);
 
                     builder.switch_to_block(next_block);
                     builder.seal_block(next_block);
                     state.current_block = Some(next_block);
-                    if is_last { needs_default_block = true; }
+                    if is_last {
+                        needs_default_block = true;
+                    }
                 }
                 PatternKind::Constructor { path, .. } => {
                     let variant_name = self.resolve_sym(*path.last().unwrap()).to_string();
@@ -406,15 +423,20 @@ impl Compiler<'_> {
                         builder.switch_to_block(arm_block);
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
-                        let arm_val = self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
+                        let arm_val =
+                            self.compile_match_arm_value(builder, state, &arm.body, result_type)?;
                         builder.ins().jump(merge_block, &[arm_val]);
 
                         builder.switch_to_block(next_block);
                         builder.seal_block(next_block);
                         state.current_block = Some(next_block);
-                        if is_last { needs_default_block = true; }
+                        if is_last {
+                            needs_default_block = true;
+                        }
                     } else {
-                        return Err(CodegenError::new(format!("unknown variant '{variant_name}' in match expr")));
+                        return Err(CodegenError::new(format!(
+                            "unknown variant '{variant_name}' in match expr"
+                        )));
                     }
                 }
                 _ => return Err(CodegenError::new("unsupported pattern in match expression")),
@@ -463,9 +485,7 @@ impl Compiler<'_> {
         // The last statement should be an expression producing the arm's value
         let last = &body.stmts[body.stmts.len() - 1];
         match &last.kind {
-            nsl_ast::stmt::StmtKind::Expr(expr) => {
-                self.compile_expr(builder, state, expr)
-            }
+            nsl_ast::stmt::StmtKind::Expr(expr) => self.compile_expr(builder, state, expr),
             _ => {
                 self.compile_stmt(builder, state, last)?;
                 let zero = if result_type.is_float() {

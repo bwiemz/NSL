@@ -357,7 +357,7 @@ pub struct Compiler<'a> {
 /// Quantization configuration for a model.
 #[derive(Debug, Clone)]
 pub struct QuantConfig {
-    pub dtype: String,     // "awq4", "gptq4", "gptq8"
+    pub dtype: String, // "awq4", "gptq4", "gptq8"
     pub group_size: i64,
 }
 
@@ -387,7 +387,11 @@ pub(crate) fn mangle_name(prefix: &str, name: &str) -> String {
 }
 
 impl<'a> Compiler<'a> {
-    pub fn new(interner: &'a Interner, type_map: &'a TypeMap, options: &crate::CompileOptions) -> Result<Self, CodegenError> {
+    pub fn new(
+        interner: &'a Interner,
+        type_map: &'a TypeMap,
+        options: &crate::CompileOptions,
+    ) -> Result<Self, CodegenError> {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("opt_level", "speed")
@@ -444,12 +448,9 @@ impl<'a> Compiler<'a> {
             }
         };
 
-        let builder = ObjectBuilder::new(
-            isa,
-            "nsl_module",
-            cranelift_module::default_libcall_names(),
-        )
-        .map_err(|e| CodegenError::new(format!("failed to create object builder: {e}")))?;
+        let builder =
+            ObjectBuilder::new(isa, "nsl_module", cranelift_module::default_libcall_names())
+                .map_err(|e| CodegenError::new(format!("failed to create object builder: {e}")))?;
 
         let module = ObjectModule::new(builder);
 
@@ -494,7 +495,11 @@ impl<'a> Compiler<'a> {
     /// M42: Look up the first KV compression policy for a specific model layer.
     /// Key format: `"ModelName.layer_name"` (matches collection.rs insertion key).
     /// Returns `None` when no `@kv_compress` decorator was found for that layer.
-    pub fn kv_compress_for_layer(&self, model_name: &str, layer_name: &str) -> Option<&KvCompressPolicy> {
+    pub fn kv_compress_for_layer(
+        &self,
+        model_name: &str,
+        layer_name: &str,
+    ) -> Option<&KvCompressPolicy> {
         let key = format!("{}.{}", model_name, layer_name);
         self.features
             .kv_compress_policies
@@ -552,7 +557,9 @@ impl<'a> Compiler<'a> {
                 StmtKind::Expr(expr) => {
                     self.validate_fusible_expr(expr)?;
                 }
-                StmtKind::VarDecl { value: Some(expr), .. } => {
+                StmtKind::VarDecl {
+                    value: Some(expr), ..
+                } => {
                     self.validate_fusible_expr(expr)?;
                 }
                 StmtKind::ModelDef(_) => {
@@ -619,7 +626,8 @@ impl<'a> Compiler<'a> {
             return Ok(data_id);
         }
         let name = format!(".str.{}", self.string_pool.len());
-        let data_id = self.module
+        let data_id = self
+            .module
             .declare_data(&name, cranelift_module::Linkage::Local, false, false)
             .map_err(|e| CodegenError::new(format!("failed to declare string data: {e}")))?;
 
@@ -628,7 +636,8 @@ impl<'a> Compiler<'a> {
 
         let mut desc = DataDescription::new();
         desc.define(bytes.into_boxed_slice());
-        self.module.define_data(data_id, &desc)
+        self.module
+            .define_data(data_id, &desc)
             .map_err(|e| CodegenError::new(format!("failed to define string data: {e}")))?;
 
         self.string_pool.insert(s.to_string(), data_id);
@@ -642,8 +651,8 @@ impl<'a> Compiler<'a> {
     /// checks the computed WCET against the declared bound, and optionally emits
     /// certificate JSON and/or DO-178C compliance reports.
     pub fn run_wcet_analysis(&mut self) -> Result<(), CodegenError> {
+        use crate::gpu_specs::{find_fpga, find_gpu};
         use crate::wcet::*;
-        use crate::gpu_specs::{find_gpu, find_fpga};
 
         if self.features.real_time_fns.is_empty() {
             return Ok(());
@@ -655,7 +664,10 @@ impl<'a> Compiler<'a> {
         // Build the WcetTarget based on CLI flags
         let target = match target_kind {
             "fpga" => {
-                let fpga_name = self.compile_options.fpga_device.as_deref()
+                let fpga_name = self
+                    .compile_options
+                    .fpga_device
+                    .as_deref()
                     .unwrap_or("xcvu440");
                 let fpga = find_fpga(fpga_name).ok_or_else(|| {
                     CodegenError::new(format!(
@@ -671,12 +683,16 @@ impl<'a> Compiler<'a> {
             "groq" => {
                 return Err(CodegenError::new(
                     "Groq LPU WCET not yet supported (ISA not public). \
-                     Use --wcet-target gpu or --wcet-target fpga.".to_string()
+                     Use --wcet-target gpu or --wcet-target fpga."
+                        .to_string(),
                 ));
             }
             _ => {
                 // Default: GPU statistical
-                let gpu_name = self.compile_options.wcet_gpu.as_deref()
+                let gpu_name = self
+                    .compile_options
+                    .wcet_gpu
+                    .as_deref()
                     .unwrap_or("A100-SXM");
                 let _ = find_gpu(gpu_name).ok_or_else(|| {
                     CodegenError::new(format!(
@@ -684,7 +700,9 @@ impl<'a> Compiler<'a> {
                         gpu_name
                     ))
                 })?;
-                WcetTarget::Gpu { device_name: gpu_name.to_string() }
+                WcetTarget::Gpu {
+                    device_name: gpu_name.to_string(),
+                }
             }
         };
 
@@ -759,8 +777,7 @@ impl<'a> Compiler<'a> {
             };
 
             if !bound_satisfied {
-                let suggestions =
-                    generate_suggestions(&ops, constraint.max_latency_ms, final_ms);
+                let suggestions = generate_suggestions(&ops, constraint.max_latency_ms, final_ms);
                 let violation = WcetViolation {
                     function: fn_name.clone(),
                     declared_bound_ms: constraint.max_latency_ms,
@@ -777,13 +794,8 @@ impl<'a> Compiler<'a> {
 
             // Emit certificate if requested
             if let Some(ref cert_path) = self.compile_options.wcet_report_path {
-                let cert = build_certificate(
-                    &func_wcet,
-                    &no_heap,
-                    &static_cf,
-                    "source.nsl",
-                    &target,
-                );
+                let cert =
+                    build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
                 emit_certificate(&cert, cert_path).map_err(|e| {
                     CodegenError::new(format!("WCET certificate write failed: {}", e))
                 })?;
@@ -792,16 +804,10 @@ impl<'a> Compiler<'a> {
 
             // Emit DO-178C report if requested (guarded: FPGA only)
             if let Some(ref do178c_path) = self.compile_options.do178c_report {
-                let cert = build_certificate(
-                    &func_wcet,
-                    &no_heap,
-                    &static_cf,
-                    "source.nsl",
-                    &target,
-                );
-                emit_do178c_report(&cert, do178c_path).map_err(|e| {
-                    CodegenError::new(format!("DO-178C report: {}", e))
-                })?;
+                let cert =
+                    build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
+                emit_do178c_report(&cert, do178c_path)
+                    .map_err(|e| CodegenError::new(format!("DO-178C report: {}", e)))?;
             }
 
             self.features.wcet_results.push(func_wcet);
@@ -814,20 +820,31 @@ impl<'a> Compiler<'a> {
     /// The symbol `__nsl_weight_hash` contains 32 bytes of the SHA-256 hash.
     pub fn embed_weight_hash(&mut self) -> Result<(), CodegenError> {
         if let Some(ref integrity) = self.features.weight_integrity {
-            let data_id = self.module
-                .declare_data("__nsl_weight_hash", cranelift_module::Linkage::Export, false, false)
-                .map_err(|e| CodegenError::new(format!("failed to declare weight hash data: {e}")))?;
+            let data_id = self
+                .module
+                .declare_data(
+                    "__nsl_weight_hash",
+                    cranelift_module::Linkage::Export,
+                    false,
+                    false,
+                )
+                .map_err(|e| {
+                    CodegenError::new(format!("failed to declare weight hash data: {e}"))
+                })?;
 
             let mut desc = DataDescription::new();
             desc.define(integrity.compile_hash.to_vec().into_boxed_slice());
-            self.module.define_data(data_id, &desc)
-                .map_err(|e| CodegenError::new(format!("failed to define weight hash data: {e}")))?;
+            self.module.define_data(data_id, &desc).map_err(|e| {
+                CodegenError::new(format!("failed to define weight hash data: {e}"))
+            })?;
         }
         Ok(())
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {
         let product = self.module.finish();
-        product.emit().map_err(|e| CodegenError::new(format!("failed to emit object: {e}")))
+        product
+            .emit()
+            .map_err(|e| CodegenError::new(format!("failed to emit object: {e}")))
     }
 }

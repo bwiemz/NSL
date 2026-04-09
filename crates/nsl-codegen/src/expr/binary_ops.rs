@@ -42,13 +42,15 @@ impl Compiler<'_> {
             return Ok(builder.inst_results(call)[0]);
         }
 
-        let mut lhs = self.compile_expr(builder, state, left)?;
-        let mut rhs = self.compile_expr(builder, state, right)?;
+        let mut lhs = self.compile_nested_expr(builder, state, left)?;
+        let mut rhs = self.compile_nested_expr(builder, state, right)?;
         let left_type = self.node_type(left.id).clone();
         let right_type = self.node_type(right.id).clone();
 
         // String concatenation with +
-        if matches!(op, BinOp::Add) && (matches!(left_type, Type::Str) || matches!(right_type, Type::Str)) {
+        if matches!(op, BinOp::Add)
+            && (matches!(left_type, Type::Str) || matches!(right_type, Type::Str))
+        {
             // Convert non-string operand to string if needed
             if !matches!(left_type, Type::Str) {
                 lhs = self.value_to_string(builder, lhs, &left_type)?;
@@ -63,7 +65,9 @@ impl Compiler<'_> {
         }
 
         // String repeat with *
-        if matches!(op, BinOp::Mul) && (matches!(left_type, Type::Str) || matches!(right_type, Type::Str)) {
+        if matches!(op, BinOp::Mul)
+            && (matches!(left_type, Type::Str) || matches!(right_type, Type::Str))
+        {
             let (str_val, int_val) = if matches!(left_type, Type::Str) {
                 (lhs, rhs)
             } else {
@@ -82,13 +86,16 @@ impl Compiler<'_> {
         //  - Both operands are indeterminate (likely from .to(device) or other runtime returns)
         // Exception: inside datatype method bodies, indeterminate types are always scalars
         //   (the semantic checker does not descend into method bodies).
-        let both_indeterminate = left_type.is_indeterminate() && right_type.is_indeterminate()
+        let both_indeterminate = left_type.is_indeterminate()
+            && right_type.is_indeterminate()
             && !state.flags.in_dtype_method;
         let left_is_tensor = left_type.is_tensor()
-            || (left_type.is_indeterminate() && !state.flags.in_dtype_method
+            || (left_type.is_indeterminate()
+                && !state.flags.in_dtype_method
                 && (matches!(op, BinOp::MatMul) || right_type.is_tensor() || both_indeterminate));
         let right_is_tensor = right_type.is_tensor()
-            || (right_type.is_indeterminate() && !state.flags.in_dtype_method
+            || (right_type.is_indeterminate()
+                && !state.flags.in_dtype_method
                 && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
         if left_is_tensor || right_is_tensor {
             // M50: Extract sparse flags for sparse operation dispatch.
@@ -110,9 +117,13 @@ impl Compiler<'_> {
             // refcount ops are unnecessary — the compiler guarantees exclusive access.
             // Skipping retain/release lets the runtime see refcount==1 and take the
             // in-place fast path.
-            let protect_lhs = left_is_tensor && !left_is_sparse && matches!(left.kind, nsl_ast::expr::ExprKind::Ident(_))
+            let protect_lhs = left_is_tensor
+                && !left_is_sparse
+                && matches!(left.kind, nsl_ast::expr::ExprKind::Ident(_))
                 && !Self::should_elide_refcount_for_ident(state, left);
-            let protect_rhs = right_is_tensor && !right_is_sparse && matches!(right.kind, nsl_ast::expr::ExprKind::Ident(_))
+            let protect_rhs = right_is_tensor
+                && !right_is_sparse
+                && matches!(right.kind, nsl_ast::expr::ExprKind::Ident(_))
                 && !Self::should_elide_refcount_for_ident(state, right);
 
             if protect_lhs {
@@ -121,13 +132,24 @@ impl Compiler<'_> {
             if protect_rhs {
                 self.compile_call_by_name(builder, "nsl_tensor_retain", &[rhs])?;
             }
-            let result = self.compile_tensor_binary_op(builder, state, lhs, rhs, op, left_is_tensor, right_is_tensor, left_is_sparse, right_is_sparse)?;
+            let result = self.compile_tensor_binary_op(
+                builder,
+                state,
+                lhs,
+                rhs,
+                op,
+                left_is_tensor,
+                right_is_tensor,
+                left_is_sparse,
+                right_is_sparse,
+            )?;
             if protect_lhs {
                 self.compile_call_by_name(builder, "nsl_tensor_release", &[lhs])?;
             }
             if protect_rhs {
                 self.compile_call_by_name(builder, "nsl_tensor_release", &[rhs])?;
             }
+
             return Ok(result);
         }
 
@@ -249,8 +271,12 @@ impl Compiler<'_> {
             BinOp::Gt => Ok(builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs)),
             BinOp::LtEq if is_float => Ok(builder.ins().fcmp(FloatCC::LessThanOrEqual, lhs, rhs)),
             BinOp::LtEq => Ok(builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs)),
-            BinOp::GtEq if is_float => Ok(builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs, rhs)),
-            BinOp::GtEq => Ok(builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs)),
+            BinOp::GtEq if is_float => {
+                Ok(builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs, rhs))
+            }
+            BinOp::GtEq => Ok(builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs)),
 
             BinOp::BitAnd => Ok(builder.ins().band(lhs, rhs)),
             BinOp::BitOr => Ok(builder.ins().bor(lhs, rhs)),
@@ -311,7 +337,9 @@ impl Compiler<'_> {
 
         builder.switch_to_block(trap_block);
         builder.seal_block(trap_block);
-        builder.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+        builder
+            .ins()
+            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
 
         builder.switch_to_block(ok_block);
         builder.seal_block(ok_block);
@@ -326,7 +354,11 @@ impl Compiler<'_> {
         rhs: Value,
         is_float: bool,
     ) -> Result<Value, CodegenError> {
-        let rt_fn = if is_float { "nsl_pow_float" } else { "nsl_pow_int" };
+        let rt_fn = if is_float {
+            "nsl_pow_float"
+        } else {
+            "nsl_pow_int"
+        };
         let func_id = self.registry.runtime_fns[rt_fn].0;
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         let call = builder.ins().call(func_ref, &[lhs, rhs]);

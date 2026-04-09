@@ -22,7 +22,8 @@ pub struct FusedKernel {
 pub fn is_fusible_op(name: &str) -> bool {
     matches!(
         name,
-        "add" | "sub"
+        "add"
+            | "sub"
             | "mul"
             | "div"
             | "pow"
@@ -90,7 +91,8 @@ pub fn try_synthesize_fused_checked(
 
     // Profitability gate: check register pressure and AI improvement
     if data_bytes > 0 && !force {
-        let descs: Vec<crate::cost_model::FusionOpDesc> = op_chain.iter()
+        let descs: Vec<crate::cost_model::FusionOpDesc> = op_chain
+            .iter()
             .map(|op| crate::cost_model::op_to_fusion_desc(op, data_bytes))
             .collect();
         if !crate::cost_model::should_fuse(&descs, false, crate::cost_model::MAX_FUSED_REGISTERS) {
@@ -123,7 +125,12 @@ pub fn synthesize_fused_ptx(name: &str, ops: &[&str], num_inputs: usize) -> Vec<
     synthesize_fused_ptx_sm(name, ops, num_inputs, 52)
 }
 
-pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_sm: u32) -> Vec<u8> {
+pub fn synthesize_fused_ptx_sm(
+    name: &str,
+    ops: &[&str],
+    num_inputs: usize,
+    gpu_sm: u32,
+) -> Vec<u8> {
     // log2(e) = 1.4426950408889634 -> IEEE 754 f32: 0x3FB8AA3B
     const LOG2_E_HEX: &str = "0f3FB8AA3B";
     // ln(2) = 0.6931471805599453 -> IEEE 754 f32: 0x3F317218
@@ -224,18 +231,12 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
             }
             "pow" => {
                 let lhs = if op_idx == 0 { 0 } else { result_reg };
-                ptx.push_str(&format!(
-                    "    lg2.f32 %f{}, %f{};\n",
-                    out_reg, lhs
-                ));
+                ptx.push_str(&format!("    lg2.f32 %f{}, %f{};\n", out_reg, lhs));
                 ptx.push_str(&format!(
                     "    mul.f32 %f{}, %f{}, %f{};\n",
                     out_reg, out_reg, rhs
                 ));
-                ptx.push_str(&format!(
-                    "    ex2.f32 %f{}, %f{};\n",
-                    out_reg, out_reg
-                ));
+                ptx.push_str(&format!("    ex2.f32 %f{}, %f{};\n", out_reg, out_reg));
             }
             "relu" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
@@ -260,22 +261,12 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     "    mul.f32 %f{}, %f{}, %f{};\n",
                     out_reg, src, out_reg
                 ));
-                ptx.push_str(&format!(
-                    "    ex2.f32 %f{}, %f{};\n",
-                    out_reg, out_reg
-                ));
+                ptx.push_str(&format!("    ex2.f32 %f{}, %f{};\n", out_reg, out_reg));
             }
             "log" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
-                ptx.push_str(&format!(
-                    "    lg2.f32 %f{}, %f{};\n",
-                    out_reg, src
-                ));
-                ptx.push_str(&format!(
-                    "    mov.f32 %f{}, {};\n",
-                    out_reg + 1,
-                    LN_2_HEX
-                ));
+                ptx.push_str(&format!("    lg2.f32 %f{}, %f{};\n", out_reg, src));
+                ptx.push_str(&format!("    mov.f32 %f{}, {};\n", out_reg + 1, LN_2_HEX));
                 ptx.push_str(&format!(
                     "    mul.f32 %f{}, %f{}, %f{};\n",
                     out_reg,
@@ -285,10 +276,7 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
             }
             "sqrt" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
-                ptx.push_str(&format!(
-                    "    sqrt.rn.f32 %f{}, %f{};\n",
-                    out_reg, src
-                ));
+                ptx.push_str(&format!("    sqrt.rn.f32 %f{}, %f{};\n", out_reg, src));
             }
             "clamp" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
@@ -308,29 +296,19 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
             "sigmoid" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
                 ptx.push_str(&format!("    neg.f32 %f{}, %f{};\n", out_reg, src));
-                ptx.push_str(&format!(
-                    "    mov.f32 %f{}, {};\n",
-                    out_reg + 1,
-                    LOG2_E_HEX
-                ));
+                ptx.push_str(&format!("    mov.f32 %f{}, {};\n", out_reg + 1, LOG2_E_HEX));
                 ptx.push_str(&format!(
                     "    mul.f32 %f{}, %f{}, %f{};\n",
                     out_reg,
                     out_reg,
                     out_reg + 1
                 ));
-                ptx.push_str(&format!(
-                    "    ex2.f32 %f{}, %f{};\n",
-                    out_reg, out_reg
-                ));
+                ptx.push_str(&format!("    ex2.f32 %f{}, %f{};\n", out_reg, out_reg));
                 ptx.push_str(&format!(
                     "    add.f32 %f{}, %f{}, 0f3F800000;\n",
                     out_reg, out_reg
                 ));
-                ptx.push_str(&format!(
-                    "    rcp.rn.f32 %f{}, %f{};\n",
-                    out_reg, out_reg
-                ));
+                ptx.push_str(&format!("    rcp.rn.f32 %f{}, %f{};\n", out_reg, out_reg));
             }
             "tanh" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
@@ -339,29 +317,19 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
                     out_reg, src, src
                 ));
                 ptx.push_str(&format!("    neg.f32 %f{}, %f{};\n", out_reg, out_reg));
-                ptx.push_str(&format!(
-                    "    mov.f32 %f{}, {};\n",
-                    out_reg + 1,
-                    LOG2_E_HEX
-                ));
+                ptx.push_str(&format!("    mov.f32 %f{}, {};\n", out_reg + 1, LOG2_E_HEX));
                 ptx.push_str(&format!(
                     "    mul.f32 %f{}, %f{}, %f{};\n",
                     out_reg,
                     out_reg,
                     out_reg + 1
                 ));
-                ptx.push_str(&format!(
-                    "    ex2.f32 %f{}, %f{};\n",
-                    out_reg, out_reg
-                ));
+                ptx.push_str(&format!("    ex2.f32 %f{}, %f{};\n", out_reg, out_reg));
                 ptx.push_str(&format!(
                     "    add.f32 %f{}, %f{}, 0f3F800000;\n",
                     out_reg, out_reg
                 ));
-                ptx.push_str(&format!(
-                    "    rcp.rn.f32 %f{}, %f{};\n",
-                    out_reg, out_reg
-                ));
+                ptx.push_str(&format!("    rcp.rn.f32 %f{}, %f{};\n", out_reg, out_reg));
                 ptx.push_str(&format!(
                     "    add.f32 %f{}, %f{}, %f{};\n",
                     out_reg, out_reg, out_reg
@@ -373,14 +341,8 @@ pub fn synthesize_fused_ptx_sm(name: &str, ops: &[&str], num_inputs: usize, gpu_
             }
             "sign" => {
                 let src = if op_idx == 0 { 0 } else { result_reg };
-                ptx.push_str(&format!(
-                    "    setp.gt.f32 %p1, %f{}, 0f00000000;\n",
-                    src
-                ));
-                ptx.push_str(&format!(
-                    "    setp.lt.f32 %p2, %f{}, 0f00000000;\n",
-                    src
-                ));
+                ptx.push_str(&format!("    setp.gt.f32 %p1, %f{}, 0f00000000;\n", src));
+                ptx.push_str(&format!("    setp.lt.f32 %p2, %f{}, 0f00000000;\n", src));
                 ptx.push_str(&format!(
                     "    selp.f32 %f{}, 0f3F800000, 0f00000000, %p1;\n",
                     out_reg
@@ -474,7 +436,10 @@ fn collect_fusible_ops<'a, F>(
             collect_fusible_ops(right, ops, inputs, resolve_name);
             ops.push(op_name.to_string());
         }
-        ExprKind::UnaryOp { op: UnaryOp::Neg, operand } => {
+        ExprKind::UnaryOp {
+            op: UnaryOp::Neg,
+            operand,
+        } => {
             collect_fusible_ops(operand, ops, inputs, resolve_name);
             ops.push("neg".to_string());
         }
@@ -619,24 +584,46 @@ mod tests {
         let sym_b = Symbol(interner.get_or_intern("b"));
         let sym_relu = Symbol(interner.get_or_intern("relu"));
 
-        let x = Expr { kind: ExprKind::Ident(sym_x), span: Span::dummy(), id: NodeId::dummy() };
-        let b = Expr { kind: ExprKind::Ident(sym_b), span: Span::dummy(), id: NodeId::dummy() };
-        let add = Expr {
-            kind: ExprKind::BinaryOp { left: Box::new(x), op: BinOp::Add, right: Box::new(b) },
+        let x = Expr {
+            kind: ExprKind::Ident(sym_x),
             span: Span::dummy(),
             id: NodeId::dummy(),
         };
-        let relu_name = Expr { kind: ExprKind::Ident(sym_relu), span: Span::dummy(), id: NodeId::dummy() };
-        let relu_arg = Arg { name: None, value: add, span: Span::dummy() };
+        let b = Expr {
+            kind: ExprKind::Ident(sym_b),
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let add = Expr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(x),
+                op: BinOp::Add,
+                right: Box::new(b),
+            },
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let relu_name = Expr {
+            kind: ExprKind::Ident(sym_relu),
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let relu_arg = Arg {
+            name: None,
+            value: add,
+            span: Span::dummy(),
+        };
         let relu_call = Expr {
-            kind: ExprKind::Call { callee: Box::new(relu_name), args: vec![relu_arg] },
+            kind: ExprKind::Call {
+                callee: Box::new(relu_name),
+                args: vec![relu_arg],
+            },
             span: Span::dummy(),
             id: NodeId::dummy(),
         };
 
-        let resolve = |sym: Symbol| -> Option<String> {
-            interner.resolve(sym.0).map(|s| s.to_string())
-        };
+        let resolve =
+            |sym: Symbol| -> Option<String> { interner.resolve(sym.0).map(|s| s.to_string()) };
 
         let result = analyze_fusible_chain(&relu_call, &resolve);
         assert!(result.is_some());
@@ -663,10 +650,16 @@ mod tests {
         let ptx = synthesize_fused_ptx("fused_add_sub", &["add", "sub"], 3);
         let ptx_str = String::from_utf8(ptx).unwrap();
 
-        assert!(ptx_str.contains("add.f32 %f3, %f0, %f1"),
-            "add should use %f0 + %f1, got:\n{}", ptx_str);
-        assert!(ptx_str.contains("sub.f32 %f4, %f3, %f2"),
-            "sub should use result - %f2, got:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("add.f32 %f3, %f0, %f1"),
+            "add should use %f0 + %f1, got:\n{}",
+            ptx_str
+        );
+        assert!(
+            ptx_str.contains("sub.f32 %f4, %f3, %f2"),
+            "sub should use result - %f2, got:\n{}",
+            ptx_str
+        );
     }
 
     #[test]
@@ -676,14 +669,23 @@ mod tests {
         let ptx_str = String::from_utf8(ptx).unwrap();
 
         // add: %f4 = %f0 + %f1
-        assert!(ptx_str.contains("add.f32 %f4, %f0, %f1"),
-            "first add should use %f0 + %f1, got:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("add.f32 %f4, %f0, %f1"),
+            "first add should use %f0 + %f1, got:\n{}",
+            ptx_str
+        );
         // mul: %f5 = %f4 * %f2
-        assert!(ptx_str.contains("mul.f32 %f5, %f4, %f2"),
-            "mul should use result * %f2, got:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("mul.f32 %f5, %f4, %f2"),
+            "mul should use result * %f2, got:\n{}",
+            ptx_str
+        );
         // add: %f6 = %f5 + %f3
-        assert!(ptx_str.contains("add.f32 %f6, %f5, %f3"),
-            "second add should use result + %f3, got:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("add.f32 %f6, %f5, %f3"),
+            "second add should use result + %f3, got:\n{}",
+            ptx_str
+        );
     }
 
     #[test]
@@ -694,10 +696,16 @@ mod tests {
         let ptx = synthesize_fused_ptx("fused_add_relu", &["add", "relu"], 2);
         let ptx_str = String::from_utf8(ptx).unwrap();
 
-        assert!(ptx_str.contains("add.f32 %f2, %f0, %f1"),
-            "add should use %f0 + %f1, got:\n{}", ptx_str);
-        assert!(ptx_str.contains("max.f32 %f3, %f2, %f3"),
-            "relu should use previous result, got:\n{}", ptx_str);
+        assert!(
+            ptx_str.contains("add.f32 %f2, %f0, %f1"),
+            "add should use %f0 + %f1, got:\n{}",
+            ptx_str
+        );
+        assert!(
+            ptx_str.contains("max.f32 %f3, %f2, %f3"),
+            "relu should use previous result, got:\n{}",
+            ptx_str
+        );
     }
 
     #[test]
@@ -710,18 +718,32 @@ mod tests {
         let sym_x = Symbol(interner.get_or_intern("x"));
         let sym_relu = Symbol(interner.get_or_intern("relu"));
 
-        let x = Expr { kind: ExprKind::Ident(sym_x), span: Span::dummy(), id: NodeId::dummy() };
-        let relu_name = Expr { kind: ExprKind::Ident(sym_relu), span: Span::dummy(), id: NodeId::dummy() };
-        let relu_arg = Arg { name: None, value: x, span: Span::dummy() };
+        let x = Expr {
+            kind: ExprKind::Ident(sym_x),
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let relu_name = Expr {
+            kind: ExprKind::Ident(sym_relu),
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let relu_arg = Arg {
+            name: None,
+            value: x,
+            span: Span::dummy(),
+        };
         let relu_call = Expr {
-            kind: ExprKind::Call { callee: Box::new(relu_name), args: vec![relu_arg] },
+            kind: ExprKind::Call {
+                callee: Box::new(relu_name),
+                args: vec![relu_arg],
+            },
             span: Span::dummy(),
             id: NodeId::dummy(),
         };
 
-        let resolve = |sym: Symbol| -> Option<String> {
-            interner.resolve(sym.0).map(|s| s.to_string())
-        };
+        let resolve =
+            |sym: Symbol| -> Option<String> { interner.resolve(sym.0).map(|s| s.to_string()) };
 
         let result = analyze_fusible_chain(&relu_call, &resolve);
         assert!(result.is_none());

@@ -742,7 +742,7 @@ impl<'a> WengertExtractor<'a> {
 
     fn extract_transpose_dims(args: &[nsl_ast::expr::Arg]) -> Option<(usize, usize)> {
         let dim0 = args
-            .get(0)
+            .first()
             .and_then(|arg| Self::extract_int_literal(&arg.value))?;
         let dim1 = args
             .get(1)
@@ -1133,10 +1133,7 @@ impl<'a> WengertExtractor<'a> {
                                         // Pre-extract args in CALLER's context before switching to callee's context.
                                         // This is critical: args like `self.attn_norm.forward(x)` use `self` referring
                                         // to the caller's model (TransformerBlock), not the callee (GQA).
-                                        let extracted = match self.pre_extract_args(&fn_def, args) {
-                                            Some(e) => e,
-                                            None => return None,
-                                        };
+                                        let extracted = self.pre_extract_args(&fn_def, args)?;
                                         let saved_self = self.self_context.clone();
                                         self.self_context = Some(compound_prefix);
                                         let result = self.inline_method_body(&fn_def, extracted);
@@ -1160,10 +1157,7 @@ impl<'a> WengertExtractor<'a> {
                                     .cloned();
                                 if let Some(fn_def) = fn_def {
                                     // Pre-extract args in caller's context
-                                    let extracted = match self.pre_extract_args(&fn_def, args) {
-                                        Some(e) => e,
-                                        None => return None,
-                                    };
+                                    let extracted = self.pre_extract_args(&fn_def, args)?;
                                     let saved_self = self.self_context.clone();
                                     self.self_context = Some(ctx);
                                     let result = self.inline_method_body(&fn_def, extracted);
@@ -1310,12 +1304,12 @@ impl<'a> WengertExtractor<'a> {
                         let dim = args
                             .get(1)
                             .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::IntLiteral(v) => Some(*v),
                                 ExprKind::UnaryOp {
                                     op: AstUnaryOp::Neg,
                                     operand,
                                 } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    ExprKind::IntLiteral(v) => Some(-*v),
                                     _ => None,
                                 },
                                 _ => None,
@@ -1327,12 +1321,12 @@ impl<'a> WengertExtractor<'a> {
                         let dim = args
                             .get(1)
                             .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::IntLiteral(v) => Some(*v),
                                 ExprKind::UnaryOp {
                                     op: AstUnaryOp::Neg,
                                     operand,
                                 } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    ExprKind::IntLiteral(v) => Some(-*v),
                                     _ => None,
                                 },
                                 _ => None,
@@ -1372,12 +1366,12 @@ impl<'a> WengertExtractor<'a> {
                         let dim = args
                             .get(1)
                             .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::IntLiteral(v) => Some(*v),
                                 ExprKind::UnaryOp {
                                     op: AstUnaryOp::Neg,
                                     operand,
                                 } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    ExprKind::IntLiteral(v) => Some(-*v),
                                     _ => None,
                                 },
                                 _ => None,
@@ -1413,12 +1407,12 @@ impl<'a> WengertExtractor<'a> {
                         let dim = args
                             .last()
                             .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v as i64),
+                                ExprKind::IntLiteral(v) => Some(*v),
                                 ExprKind::UnaryOp {
                                     op: AstUnaryOp::Neg,
                                     operand,
                                 } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-(*v as i64)),
+                                    ExprKind::IntLiteral(v) => Some(-*v),
                                     _ => None,
                                 },
                                 _ => None,

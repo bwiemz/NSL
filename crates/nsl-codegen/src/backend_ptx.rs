@@ -20,7 +20,12 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
 
     // Shared memory declaration
     if ir.shared_mem_bytes > 0 {
-        writeln!(ptx, ".shared .align 4 .b8 shared_mem[{}];", ir.shared_mem_bytes).unwrap();
+        writeln!(
+            ptx,
+            ".shared .align 4 .b8 shared_mem[{}];",
+            ir.shared_mem_bytes
+        )
+        .unwrap();
         writeln!(ptx).unwrap();
     }
 
@@ -54,7 +59,9 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     }
     // Also count vars that appear in ops but may not be in var_types
     // (e.g., untyped vars from new_var() -- default to u32)
-    let max_var = ir.blocks.iter()
+    let max_var = ir
+        .blocks
+        .iter()
         .flat_map(|b| b.ops.iter())
         .flat_map(extract_var_ids)
         .max()
@@ -69,34 +76,76 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
     let h_count = *reg_counts.get("%h").unwrap_or(&0);
     let p_count = total_vars; // predicates
 
-    if r_count > 0 { writeln!(ptx, "    .reg .u32 %r<{}>;", r_count).unwrap(); }
-    if rd_count > 0 { writeln!(ptx, "    .reg .u64 %rd<{}>;", rd_count).unwrap(); }
-    if f_count > 0 { writeln!(ptx, "    .reg .f32 %f<{}>;", f_count).unwrap(); }
-    if fd_count > 0 { writeln!(ptx, "    .reg .f64 %fd<{}>;", fd_count).unwrap(); }
-    if h_count > 0 { writeln!(ptx, "    .reg .f16 %h<{}>;", h_count).unwrap(); }
-    if p_count > 0 { writeln!(ptx, "    .reg .pred %p<{}>;", p_count).unwrap(); }
+    if r_count > 0 {
+        writeln!(ptx, "    .reg .u32 %r<{}>;", r_count).unwrap();
+    }
+    if rd_count > 0 {
+        writeln!(ptx, "    .reg .u64 %rd<{}>;", rd_count).unwrap();
+    }
+    if f_count > 0 {
+        writeln!(ptx, "    .reg .f32 %f<{}>;", f_count).unwrap();
+    }
+    if fd_count > 0 {
+        writeln!(ptx, "    .reg .f64 %fd<{}>;", fd_count).unwrap();
+    }
+    if h_count > 0 {
+        writeln!(ptx, "    .reg .f16 %h<{}>;", h_count).unwrap();
+    }
+    if p_count > 0 {
+        writeln!(ptx, "    .reg .pred %p<{}>;", p_count).unwrap();
+    }
     writeln!(ptx).unwrap();
 
     // Load parameters into registers
     for param in &ir.params {
         match &param.ty {
             KirType::Ptr(_, _) => {
-                writeln!(ptx, "    ld.param.u64 %rd{}, [param_{}];", param.id, param.name).unwrap();
+                writeln!(
+                    ptx,
+                    "    ld.param.u64 %rd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
             }
             KirType::U32 => {
-                writeln!(ptx, "    ld.param.u32 %r{}, [param_{}];", param.id, param.name).unwrap();
+                writeln!(
+                    ptx,
+                    "    ld.param.u32 %r{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
             }
             KirType::I32 => {
-                writeln!(ptx, "    ld.param.s32 %r{}, [param_{}];", param.id, param.name).unwrap();
+                writeln!(
+                    ptx,
+                    "    ld.param.s32 %r{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
             }
             KirType::F32 => {
-                writeln!(ptx, "    ld.param.f32 %f{}, [param_{}];", param.id, param.name).unwrap();
+                writeln!(
+                    ptx,
+                    "    ld.param.f32 %f{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
             }
             KirType::F64 => {
-                writeln!(ptx, "    ld.param.f64 %fd{}, [param_{}];", param.id, param.name).unwrap();
+                writeln!(
+                    ptx,
+                    "    ld.param.f64 %fd{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
             }
             _ => {
-                writeln!(ptx, "    ld.param.u32 %r{}, [param_{}];", param.id, param.name).unwrap();
+                writeln!(
+                    ptx,
+                    "    ld.param.u32 %r{}, [param_{}];",
+                    param.id, param.name
+                )
+                .unwrap();
             }
         }
     }
@@ -126,27 +175,52 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Add(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
-            writeln!(ptx, "    add.{} {}{}, {}{}, {}{};", ty, prefix, dst, prefix, a, prefix, b).unwrap();
+            writeln!(
+                ptx,
+                "    add.{} {}{}, {}{}, {}{};",
+                ty, prefix, dst, prefix, a, prefix, b
+            )
+            .unwrap();
         }
         KirOp::Sub(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
-            writeln!(ptx, "    sub.{} {}{}, {}{}, {}{};", ty, prefix, dst, prefix, a, prefix, b).unwrap();
+            writeln!(
+                ptx,
+                "    sub.{} {}{}, {}{}, {}{};",
+                ty, prefix, dst, prefix, a, prefix, b
+            )
+            .unwrap();
         }
         KirOp::Mul(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
-            writeln!(ptx, "    mul.lo.{} {}{}, {}{}, {}{};", ty, prefix, dst, prefix, a, prefix, b).unwrap();
+            writeln!(
+                ptx,
+                "    mul.lo.{} {}{}, {}{}, {}{};",
+                ty, prefix, dst, prefix, a, prefix, b
+            )
+            .unwrap();
         }
         KirOp::Div(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
-            writeln!(ptx, "    div.{} {}{}, {}{}, {}{};", ty, prefix, dst, prefix, a, prefix, b).unwrap();
+            writeln!(
+                ptx,
+                "    div.{} {}{}, {}{}, {}{};",
+                ty, prefix, dst, prefix, a, prefix, b
+            )
+            .unwrap();
         }
         KirOp::Fma(dst, a, b, c) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
-            writeln!(ptx, "    fma.rn.{} {}{}, {}{}, {}{}, {}{};", ty, prefix, dst, prefix, a, prefix, b, prefix, c).unwrap();
+            writeln!(
+                ptx,
+                "    fma.rn.{} {}{}, {}{}, {}{}, {}{};",
+                ty, prefix, dst, prefix, a, prefix, b, prefix, c
+            )
+            .unwrap();
         }
         KirOp::Neg(dst, src) => {
             let ty = var_ptx_type(ir, *dst, *src);
@@ -161,23 +235,48 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Sqrt(dst, src) => {
             let ty = var_ptx_type(ir, *dst, *src);
             let prefix = var_reg_prefix(ir, *dst, *src);
-            writeln!(ptx, "    sqrt.rn.{} {}{}, {}{};", ty, prefix, dst, prefix, src).unwrap();
+            writeln!(
+                ptx,
+                "    sqrt.rn.{} {}{}, {}{};",
+                ty, prefix, dst, prefix, src
+            )
+            .unwrap();
         }
         KirOp::Exp(dst, src) => {
             let prefix = var_reg_prefix(ir, *dst, *src);
-            writeln!(ptx, "    ex2.approx.f32 {}{}, {}{};", prefix, dst, prefix, src).unwrap();
+            writeln!(
+                ptx,
+                "    ex2.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, src
+            )
+            .unwrap();
         }
         KirOp::Log(dst, src) => {
             let prefix = var_reg_prefix(ir, *dst, *src);
-            writeln!(ptx, "    lg2.approx.f32 {}{}, {}{};", prefix, dst, prefix, src).unwrap();
+            writeln!(
+                ptx,
+                "    lg2.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, src
+            )
+            .unwrap();
         }
         KirOp::Sin(dst, src) => {
             let prefix = var_reg_prefix(ir, *dst, *src);
-            writeln!(ptx, "    sin.approx.f32 {}{}, {}{};", prefix, dst, prefix, src).unwrap();
+            writeln!(
+                ptx,
+                "    sin.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, src
+            )
+            .unwrap();
         }
         KirOp::Cos(dst, src) => {
             let prefix = var_reg_prefix(ir, *dst, *src);
-            writeln!(ptx, "    cos.approx.f32 {}{}, {}{};", prefix, dst, prefix, src).unwrap();
+            writeln!(
+                ptx,
+                "    cos.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, src
+            )
+            .unwrap();
         }
         KirOp::Tanh(dst, _src) => {
             // PTX has no native tanh; emitted as a sequence, but for KIR we emit a placeholder call
@@ -189,37 +288,72 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Pow(dst, base, exp) => {
             let prefix = var_reg_prefix(ir, *dst, *base);
             // pow(a, b) = exp2(b * log2(a))
-            writeln!(ptx, "    lg2.approx.f32 {}{}, {}{};", prefix, dst, prefix, base).unwrap();
-            writeln!(ptx, "    mul.f32 {}{}, {}{}, {}{};", prefix, dst, prefix, dst, prefix, exp).unwrap();
-            writeln!(ptx, "    ex2.approx.f32 {}{}, {}{};", prefix, dst, prefix, dst).unwrap();
+            writeln!(
+                ptx,
+                "    lg2.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, base
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    mul.f32 {}{}, {}{}, {}{};",
+                prefix, dst, prefix, dst, prefix, exp
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    ex2.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, dst
+            )
+            .unwrap();
         }
         KirOp::Cast(dst, src, target_ty) => {
             let src_ty = var_ptx_type(ir, *src, *src);
             let dst_ty = target_ty.ptx_type();
             let src_prefix = var_reg_prefix(ir, *src, *src);
             let dst_prefix = target_ty.ptx_reg_prefix();
-            writeln!(ptx, "    cvt.{}.{} {}{}, {}{};", dst_ty, src_ty, dst_prefix, dst, src_prefix, src).unwrap();
+            writeln!(
+                ptx,
+                "    cvt.{}.{} {}{}, {}{};",
+                dst_ty, src_ty, dst_prefix, dst, src_prefix, src
+            )
+            .unwrap();
         }
         KirOp::Load(dst, ptr, addr_space) => {
             let space = address_space_str(*addr_space);
             let ty = var_ptx_type(ir, *dst, *dst);
             let dst_prefix = var_reg_prefix(ir, *dst, *dst);
             let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
-            writeln!(ptx, "    ld.{}.{} {}{}, [{}{}];", space, ty, dst_prefix, dst, ptr_prefix, ptr).unwrap();
+            writeln!(
+                ptx,
+                "    ld.{}.{} {}{}, [{}{}];",
+                space, ty, dst_prefix, dst, ptr_prefix, ptr
+            )
+            .unwrap();
         }
         KirOp::Store(ptr, val, addr_space) => {
             let space = address_space_str(*addr_space);
             let ty = var_ptx_type(ir, *val, *val);
             let val_prefix = var_reg_prefix(ir, *val, *val);
             let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
-            writeln!(ptx, "    st.{}.{} [{}{}], {}{};", space, ty, ptr_prefix, ptr, val_prefix, val).unwrap();
+            writeln!(
+                ptx,
+                "    st.{}.{} [{}{}], {}{};",
+                space, ty, ptr_prefix, ptr, val_prefix, val
+            )
+            .unwrap();
         }
         KirOp::AtomicAdd(ptr, val, addr_space) => {
             let space = address_space_str(*addr_space);
             let ty = var_ptx_type(ir, *val, *val);
             let val_prefix = var_reg_prefix(ir, *val, *val);
             let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
-            writeln!(ptx, "    atom.{}.add.{} {}{}, [{}{}], {}{};", space, ty, val_prefix, val, ptr_prefix, ptr, val_prefix, val).unwrap();
+            writeln!(
+                ptx,
+                "    atom.{}.add.{} {}{}, [{}{}], {}{};",
+                space, ty, val_prefix, val, ptr_prefix, ptr, val_prefix, val
+            )
+            .unwrap();
         }
         KirOp::ThreadId(dst, dim) => {
             let dim_name = dim_char(*dim);
@@ -254,8 +388,12 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         }
         KirOp::WarpShuffle(dst, val, offset) => {
             let prefix = var_reg_prefix(ir, *dst, *val);
-            writeln!(ptx, "    shfl.sync.down.b32 {}{}, {}{}, %r{}, 0x1f, 0xffffffff;",
-                prefix, dst, prefix, val, offset).unwrap();
+            writeln!(
+                ptx,
+                "    shfl.sync.down.b32 {}{}, {}{}, %r{}, 0x1f, 0xffffffff;",
+                prefix, dst, prefix, val, offset
+            )
+            .unwrap();
         }
         KirOp::Cmp(dst, a, b, cmp_op) => {
             let ty = var_ptx_type(ir, *a, *a);
@@ -268,23 +406,41 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
                 CmpOp::Gt => "gt",
                 CmpOp::Ge => "ge",
             };
-            writeln!(ptx, "    setp.{}.{} %p{}, {}{}, {}{};", op_str, ty, dst, prefix, a, prefix, b).unwrap();
+            writeln!(
+                ptx,
+                "    setp.{}.{} %p{}, {}{}, {}{};",
+                op_str, ty, dst, prefix, a, prefix, b
+            )
+            .unwrap();
         }
         KirOp::Select(dst, cond, true_val, false_val) => {
             let prefix = var_reg_prefix(ir, *dst, *true_val);
-            writeln!(ptx, "    selp.b32 {}{}, {}{}, {}{}, %p{};", prefix, dst, prefix, true_val, prefix, false_val, cond).unwrap();
+            writeln!(
+                ptx,
+                "    selp.b32 {}{}, {}{}, {}{}, %p{};",
+                prefix, dst, prefix, true_val, prefix, false_val, cond
+            )
+            .unwrap();
         }
-        KirOp::Const(dst, konst) => {
-            match &konst.value {
-                ConstValue::U32(v) => writeln!(ptx, "    mov.u32 %r{}, {};", dst, v).unwrap(),
-                ConstValue::I32(v) => writeln!(ptx, "    mov.s32 %r{}, {};", dst, v).unwrap(),
-                ConstValue::U64(v) => writeln!(ptx, "    mov.u64 %rd{}, {};", dst, v).unwrap(),
-                ConstValue::I64(v) => writeln!(ptx, "    mov.s64 %rd{}, {};", dst, v).unwrap(),
-                ConstValue::F32(v) => writeln!(ptx, "    mov.f32 %f{}, 0f{:08X};", dst, v.to_bits()).unwrap(),
-                ConstValue::F64(v) => writeln!(ptx, "    mov.f64 %fd{}, 0d{:016X};", dst, v.to_bits()).unwrap(),
-                ConstValue::Bool(v) => writeln!(ptx, "    setp.eq.u32 %p{}, 1, {};", dst, if *v { 1 } else { 0 }).unwrap(),
+        KirOp::Const(dst, konst) => match &konst.value {
+            ConstValue::U32(v) => writeln!(ptx, "    mov.u32 %r{}, {};", dst, v).unwrap(),
+            ConstValue::I32(v) => writeln!(ptx, "    mov.s32 %r{}, {};", dst, v).unwrap(),
+            ConstValue::U64(v) => writeln!(ptx, "    mov.u64 %rd{}, {};", dst, v).unwrap(),
+            ConstValue::I64(v) => writeln!(ptx, "    mov.s64 %rd{}, {};", dst, v).unwrap(),
+            ConstValue::F32(v) => {
+                writeln!(ptx, "    mov.f32 %f{}, 0f{:08X};", dst, v.to_bits()).unwrap()
             }
-        }
+            ConstValue::F64(v) => {
+                writeln!(ptx, "    mov.f64 %fd{}, 0d{:016X};", dst, v.to_bits()).unwrap()
+            }
+            ConstValue::Bool(v) => writeln!(
+                ptx,
+                "    setp.eq.u32 %p{}, 1, {};",
+                dst,
+                if *v { 1 } else { 0 }
+            )
+            .unwrap(),
+        },
         KirOp::PtrOffset(dst, base, offset) => {
             // dst = base + offset * sizeof(pointee)
             // Widen offset to 64-bit, multiply by element size, add to base pointer
@@ -297,7 +453,12 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             };
             writeln!(ptx, "    cvt.u64.u32 %rd{}, %r{};", dst, offset).unwrap();
             if pointee_size > 1 {
-                writeln!(ptx, "    mul.lo.u64 %rd{}, %rd{}, {};", dst, dst, pointee_size).unwrap();
+                writeln!(
+                    ptx,
+                    "    mul.lo.u64 %rd{}, %rd{}, {};",
+                    dst, dst, pointee_size
+                )
+                .unwrap();
             }
             writeln!(ptx, "    add.u64 %rd{}, %rd{}, %rd{};", dst, base, dst).unwrap();
         }
@@ -365,16 +526,27 @@ fn dim_char(dim: u8) -> char {
 /// Extract all VarIds referenced by a KirOp.
 fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
     match op {
-        KirOp::Add(d, a, b) | KirOp::Sub(d, a, b) | KirOp::Mul(d, a, b)
-        | KirOp::Div(d, a, b) | KirOp::Pow(d, a, b) => vec![*d, *a, *b],
+        KirOp::Add(d, a, b)
+        | KirOp::Sub(d, a, b)
+        | KirOp::Mul(d, a, b)
+        | KirOp::Div(d, a, b)
+        | KirOp::Pow(d, a, b) => vec![*d, *a, *b],
         KirOp::Fma(d, a, b, c) | KirOp::Select(d, a, b, c) => vec![*d, *a, *b, *c],
-        KirOp::Neg(d, s) | KirOp::Abs(d, s) | KirOp::Sqrt(d, s)
-        | KirOp::Exp(d, s) | KirOp::Log(d, s) | KirOp::Sin(d, s)
-        | KirOp::Cos(d, s) | KirOp::Tanh(d, s) => vec![*d, *s],
+        KirOp::Neg(d, s)
+        | KirOp::Abs(d, s)
+        | KirOp::Sqrt(d, s)
+        | KirOp::Exp(d, s)
+        | KirOp::Log(d, s)
+        | KirOp::Sin(d, s)
+        | KirOp::Cos(d, s)
+        | KirOp::Tanh(d, s) => vec![*d, *s],
         KirOp::Cast(d, s, _) => vec![*d, *s],
         KirOp::Load(d, p, _) | KirOp::Store(d, p, _) | KirOp::AtomicAdd(d, p, _) => vec![*d, *p],
-        KirOp::ThreadId(d, _) | KirOp::BlockIdx(d, _) | KirOp::BlockDim(d, _)
-        | KirOp::GridDim(d, _) | KirOp::GlobalId(d, _) => vec![*d],
+        KirOp::ThreadId(d, _)
+        | KirOp::BlockIdx(d, _)
+        | KirOp::BlockDim(d, _)
+        | KirOp::GridDim(d, _)
+        | KirOp::GlobalId(d, _) => vec![*d],
         KirOp::Barrier | KirOp::SharedMemFence => vec![],
         KirOp::WarpShuffle(d, v, o) => vec![*d, *v, *o],
         KirOp::Cmp(d, a, b, _) | KirOp::PtrOffset(d, a, b) => vec![*d, *a, *b],
@@ -403,9 +575,21 @@ mod tests {
 
     fn build_simple_add_kernel() -> KernelIR {
         let mut b = KirBuilder::new("test_add");
-        let a_ptr = b.add_param("a", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
-        let b_ptr = b.add_param("b", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
-        let out_ptr = b.add_param("out", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
+        let a_ptr = b.add_param(
+            "a",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let b_ptr = b.add_param(
+            "b",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let out_ptr = b.add_param(
+            "out",
+            KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
         let len = b.add_param("len", KirType::U32, AddressSpace::Local);
 
         let entry = b.new_block();
@@ -473,7 +657,10 @@ mod tests {
 
         assert!(ptx.contains("mul.lo.u32"), "GlobalId must use mul.lo.u32");
         assert!(ptx.contains("add.u32"), "GlobalId must use add.u32");
-        assert!(!ptx.contains("mad.lo.u32"), "GlobalId must NOT use mad.lo.u32 (INVALID_PTX on ISA 7.0)");
+        assert!(
+            !ptx.contains("mad.lo.u32"),
+            "GlobalId must NOT use mad.lo.u32 (INVALID_PTX on ISA 7.0)"
+        );
     }
 
     #[test]
@@ -500,7 +687,11 @@ mod tests {
         let ir = b.finalize();
 
         let ptx_bytes = lower_kir_to_ptx(&ir);
-        assert_eq!(*ptx_bytes.last().unwrap(), 0u8, "PTX output must be null-terminated");
+        assert_eq!(
+            *ptx_bytes.last().unwrap(),
+            0u8,
+            "PTX output must be null-terminated"
+        );
     }
 
     #[test]

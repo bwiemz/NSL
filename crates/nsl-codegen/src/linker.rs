@@ -463,7 +463,10 @@ pub fn link_shared(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), Code
     }
 }
 
+// These tests stay adjacent to the runtime-library discovery helpers they exercise.
+// Keeping the module here preserves that context without changing linker behavior.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

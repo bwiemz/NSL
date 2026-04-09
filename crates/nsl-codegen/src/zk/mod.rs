@@ -4,27 +4,27 @@
 //! It compiles NSL model forward passes into arithmetic circuits over the
 //! BN254 scalar field, enabling verifiable ML inference without revealing weights.
 
+pub mod air;
+pub mod backend;
 pub mod field;
 pub mod field_m31;
-pub mod lookup;
+pub mod folding;
 pub mod ir;
-pub mod backend;
+pub mod lookup;
+pub mod lookup_native;
 pub mod lower;
 pub mod plonky3;
 pub mod stats;
 pub mod witness;
-pub mod air;
-pub mod lookup_native;
-pub mod folding;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use nsl_ast::decl::Decorator;
 use nsl_ast::expr::ExprKind;
 use nsl_ast::operator::BinOp;
 use nsl_ast::Symbol;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Result type for top-level ZK compilation
@@ -160,7 +160,13 @@ pub fn compile_zk(
         match crate::weight_aware::WeightMap::load(weights_path) {
             Ok(mut wmap) => {
                 for op in &mut dag.ops {
-                    if let lower::ZkOp::Weight { name, values, dtype_bits, .. } = op {
+                    if let lower::ZkOp::Weight {
+                        name,
+                        values,
+                        dtype_bits,
+                        ..
+                    } = op
+                    {
                         if let Some(entry) = wmap.get_mut(name) {
                             let bw = entry.dtype.byte_width();
                             let vals: Vec<i64> = (0..entry.num_elements)
@@ -180,14 +186,21 @@ pub fn compile_zk(
                 }
             }
             Err(e) => {
-                eprintln!("[nsl] ZK: warning: failed to load weights from '{}': {} — using zero witness", weights_path.display(), e);
+                eprintln!(
+                    "[nsl] ZK: warning: failed to load weights from '{}': {} — using zero witness",
+                    weights_path.display(),
+                    e
+                );
             }
         }
     }
 
     // M55d: Auto-select M31 field for INT8 quantized models (10x faster proving)
-    let effective_config = if lower::is_int8_model(&dag) && config.field != backend::ZkField::BN254 {
-        eprintln!("[nsl] M55d: detected INT8 model — auto-selecting Mersenne-31 field for fast proving");
+    let effective_config = if lower::is_int8_model(&dag) && config.field != backend::ZkField::BN254
+    {
+        eprintln!(
+            "[nsl] M55d: detected INT8 model — auto-selecting Mersenne-31 field for fast proving"
+        );
         let mut cfg = config.clone();
         cfg.field = backend::ZkField::Mersenne31;
         cfg
@@ -223,7 +236,10 @@ struct ZkDagBuilder<'a> {
 }
 
 impl<'a> ZkDagBuilder<'a> {
-    fn new(type_map: &'a nsl_semantic::checker::TypeMap, interner: &'a nsl_lexer::Interner) -> Self {
+    fn new(
+        type_map: &'a nsl_semantic::checker::TypeMap,
+        interner: &'a nsl_lexer::Interner,
+    ) -> Self {
         Self {
             ops: Vec::new(),
             name_to_idx: HashMap::new(),
@@ -247,13 +263,17 @@ impl<'a> ZkDagBuilder<'a> {
     fn extract_shape(&self, node_id: nsl_ast::NodeId) -> Vec<usize> {
         if let Some(ty) = self.type_map.get(&node_id) {
             if let Some((shape, _, _)) = ty.as_tensor_parts() {
-                return shape.dims.iter().filter_map(|d| {
-                    if let nsl_semantic::types::Dim::Concrete(n) = d {
-                        Some(*n as usize)
-                    } else {
-                        None
-                    }
-                }).collect();
+                return shape
+                    .dims
+                    .iter()
+                    .filter_map(|d| {
+                        if let nsl_semantic::types::Dim::Concrete(n) = d {
+                            Some(*n as usize)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
             }
         }
         vec![1] // fallback: scalar
@@ -307,9 +327,12 @@ impl<'a> ZkDagBuilder<'a> {
                         // a - b = a + (-1 * b) — approximate as Add for ZK
                         lower::ZkOp::Add { a, b }
                     }
-                    _ => return Err(backend::ZkError::CompilationError(
-                        format!("unsupported binary op in ZK: {:?}", op)
-                    )),
+                    _ => {
+                        return Err(backend::ZkError::CompilationError(format!(
+                            "unsupported binary op in ZK: {:?}",
+                            op
+                        )))
+                    }
                 };
                 Ok(self.push(zk_op))
             }
@@ -317,9 +340,11 @@ impl<'a> ZkDagBuilder<'a> {
             ExprKind::Call { callee, args } => {
                 let func_name = match &callee.kind {
                     ExprKind::Ident(sym) => self.resolve_sym(*sym).to_string(),
-                    _ => return Err(backend::ZkError::CompilationError(
-                        "ZK: only named function calls are supported".into()
-                    )),
+                    _ => {
+                        return Err(backend::ZkError::CompilationError(
+                            "ZK: only named function calls are supported".into(),
+                        ))
+                    }
                 };
 
                 match func_name.as_str() {
@@ -352,7 +377,9 @@ impl<'a> ZkDagBuilder<'a> {
                         let dim = if args.len() > 1 {
                             // TODO: extract dim from second arg
                             -1
-                        } else { -1 };
+                        } else {
+                            -1
+                        };
                         Ok(self.push(lower::ZkOp::Softmax { input, dim }))
                     }
                     "transpose" => {
@@ -362,9 +389,10 @@ impl<'a> ZkDagBuilder<'a> {
                     _ => {
                         // Unknown function — try to lower args and treat as pass-through
                         if args.is_empty() {
-                            return Err(backend::ZkError::CompilationError(
-                                format!("ZK: unsupported function '{}'", func_name)
-                            ));
+                            return Err(backend::ZkError::CompilationError(format!(
+                                "ZK: unsupported function '{}'",
+                                func_name
+                            )));
                         }
                         // Fallback: return the first argument (pass-through)
                         self.lower_expr(&args[0].value)
@@ -406,7 +434,7 @@ impl<'a> ZkDagBuilder<'a> {
             _ => {
                 // Unsupported expression — return error with context
                 Err(backend::ZkError::CompilationError(
-                    "ZK: unsupported expression kind in @zk_proof function".to_string()
+                    "ZK: unsupported expression kind in @zk_proof function".to_string(),
                 ))
             }
         }
@@ -424,9 +452,14 @@ pub fn ast_to_zkdag(
     // Step 1: Emit Input ops for function parameters
     let mut input_indices = Vec::new();
     for param in &fn_def.params {
-        let name = interner.resolve(param.name.0).unwrap_or("input").to_string();
+        let name = interner
+            .resolve(param.name.0)
+            .unwrap_or("input")
+            .to_string();
         // Skip 'self' parameter
-        if name == "self" { continue; }
+        if name == "self" {
+            continue;
+        }
         // Try to get shape from parameter type annotation
         let shape = vec![1]; // default — will be refined from actual type during lowering
         let bits = 32u32; // default
@@ -464,9 +497,16 @@ pub fn ast_to_zkdag(
     }
 
     // Collect weight indices
-    let weight_indices: Vec<usize> = builder.ops.iter().enumerate()
+    let weight_indices: Vec<usize> = builder
+        .ops
+        .iter()
+        .enumerate()
         .filter_map(|(i, op)| {
-            if matches!(op, lower::ZkOp::Weight { .. }) { Some(i) } else { None }
+            if matches!(op, lower::ZkOp::Weight { .. }) {
+                Some(i)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -487,7 +527,9 @@ pub fn compile_zk_from_dag(
     config: &backend::ZkConfig,
 ) -> Result<backend::ZkProof, backend::ZkError> {
     match config.field {
-        backend::ZkField::Mersenne31 => compile_zk_folding::<field_m31::Mersenne31Field>(dag, config),
+        backend::ZkField::Mersenne31 => {
+            compile_zk_folding::<field_m31::Mersenne31Field>(dag, config)
+        }
         backend::ZkField::BN254 => compile_zk_folding::<field::FieldElement>(dag, config),
     }
 }

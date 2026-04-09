@@ -38,7 +38,8 @@ pub fn compile(
 
                 // Run dead weight elimination
                 if options.weight_config.dead_weight_elim {
-                    let eliminator = crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+                    let eliminator =
+                        crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
                     let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
                     for name in &names {
                         if let Some(entry) = wmap.get_mut(name) {
@@ -49,7 +50,10 @@ pub fn compile(
 
                 // Weight analysis report (when --weight-analysis is set)
                 if options.weight_analysis {
-                    crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+                    crate::weight_aware::print_weight_analysis_report(
+                        &wmap,
+                        &options.weight_config,
+                    );
                 }
 
                 // M52d: Compute and store quantization scales for FP8/INT8 weights
@@ -81,9 +85,10 @@ pub fn compile(
                 compiler.features.weight_map = Some(wmap);
             }
             Err(e) => {
-                return Err(crate::error::CodegenError::new(
-                    format!("failed to load weights: {}", e)
-                ));
+                return Err(crate::error::CodegenError::new(format!(
+                    "failed to load weights: {}",
+                    e
+                )));
             }
         }
     }
@@ -111,7 +116,11 @@ pub fn compile(
         use crate::memory_planner::*;
         let allocs = analyze_ast_liveness(&ast.stmts, type_map, interner);
         if !allocs.is_empty() {
-            let plannable: Vec<_> = allocs.iter().filter(|a| a.is_plannable()).cloned().collect();
+            let plannable: Vec<_> = allocs
+                .iter()
+                .filter(|a| a.is_plannable())
+                .cloned()
+                .collect();
             if !plannable.is_empty() {
                 let graph = InterferenceGraph::build(&plannable);
                 let plan = plan_slab(&plannable, &graph);
@@ -130,7 +139,10 @@ pub fn compile(
                 // Build name → offset map for codegen
                 for alloc in &plannable {
                     if let Some(&(_slot_id, offset)) = plan.assignments.get(&alloc.id) {
-                        compiler.memory.slab_name_offsets.insert(alloc.name.clone(), offset);
+                        compiler
+                            .memory
+                            .slab_name_offsets
+                            .insert(alloc.name.clone(), offset);
                     }
                 }
                 compiler.memory.slab_plan = Some(plan);
@@ -167,7 +179,14 @@ pub fn compile_with_zk_info(
     type_map: &TypeMap,
     dump_ir: bool,
     options: &crate::CompileOptions,
-) -> Result<(Vec<u8>, HashMap<String, crate::zk::backend::ZkMode>, Vec<(String, crate::zk::ZkCompileResult)>), CodegenError> {
+) -> Result<
+    (
+        Vec<u8>,
+        HashMap<String, crate::zk::backend::ZkMode>,
+        Vec<(String, crate::zk::ZkCompileResult)>,
+    ),
+    CodegenError,
+> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
 
     // M52: Load weights if --weights was provided
@@ -195,7 +214,10 @@ pub fn compile_with_zk_info(
                     }
                 }
                 if options.weight_analysis {
-                    crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+                    crate::weight_aware::print_weight_analysis_report(
+                        &wmap,
+                        &options.weight_config,
+                    );
                 }
                 eprintln!(
                     "[nsl] loaded {} weights from {} (SHA-256: {})",
@@ -267,7 +289,10 @@ pub fn compile_with_zk_info(
                     "halo2" => crate::zk::backend::ZkBackendType::Halo2,
                     "folding" | "nova" | "" => crate::zk::backend::ZkBackendType::Folding,
                     other => {
-                        eprintln!("[nsl] warning: unknown ZK backend '{}', using folding", other);
+                        eprintln!(
+                            "[nsl] warning: unknown ZK backend '{}', using folding",
+                            other
+                        );
                         crate::zk::backend::ZkBackendType::Folding
                     }
                 };
@@ -276,7 +301,10 @@ pub fn compile_with_zk_info(
                     "bn254" | "bn256" => crate::zk::backend::ZkField::BN254,
                     "mersenne31" | "m31" | "" => crate::zk::backend::ZkField::Mersenne31,
                     other => {
-                        eprintln!("[nsl] warning: unknown ZK field '{}', using Mersenne31", other);
+                        eprintln!(
+                            "[nsl] warning: unknown ZK field '{}', using Mersenne31",
+                            other
+                        );
                         crate::zk::backend::ZkField::Mersenne31
                     }
                 };
@@ -398,7 +426,17 @@ pub fn compile_module(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    compile_module_with_imports(ast, interner, type_map, module_prefix, &[], HashMap::new(), HashSet::new(), dump_ir, options)
+    compile_module_with_imports(
+        ast,
+        interner,
+        type_map,
+        module_prefix,
+        &[],
+        HashMap::new(),
+        HashSet::new(),
+        dump_ir,
+        options,
+    )
 }
 
 /// Compile a library module with imported symbols from its own dependencies.
@@ -494,10 +532,18 @@ pub fn compile_entry(
     // (e.g., RMSNorm.forward, GroupedQueryAttention.forward from stdlib).
     // Local models (from collect_models above) take precedence over imports.
     for (model_name, methods) in imported_model_method_bodies {
-        compiler.models.model_method_bodies.entry(model_name).or_insert(methods);
+        compiler
+            .models
+            .model_method_bodies
+            .entry(model_name)
+            .or_insert(methods);
     }
     for (model_name, fields) in imported_model_field_types {
-        compiler.models.model_field_types.entry(model_name).or_insert(fields);
+        compiler
+            .models
+            .model_field_types
+            .entry(model_name)
+            .or_insert(fields);
     }
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
@@ -519,7 +565,10 @@ pub fn compile_entry(
     }
     // M31: Print fusion report if enabled
     if compiler.fusion.report_enabled {
-        crate::fusion_report::print_fusion_report(&compiler.fusion.events, &compiler.fusion.barriers);
+        crate::fusion_report::print_fusion_report(
+            &compiler.fusion.events,
+            &compiler.fusion.barriers,
+        );
     }
     compiler.finalize()
 }

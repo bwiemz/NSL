@@ -24,11 +24,17 @@ impl Compiler<'_> {
                 }
                 !matches!(
                     s.kind,
-                    StmtKind::FnDef(_) | StmtKind::StructDef(_) | StmtKind::ModelDef(_)
-                        | StmtKind::EnumDef(_) | StmtKind::TraitDef(_)
-                        | StmtKind::Import(_) | StmtKind::FromImport(_)
-                        | StmtKind::DatasetDef(_) | StmtKind::TokenizerDef(_)
-                        | StmtKind::KernelDef(_) | StmtKind::DatatypeDef(_)
+                    StmtKind::FnDef(_)
+                        | StmtKind::StructDef(_)
+                        | StmtKind::ModelDef(_)
+                        | StmtKind::EnumDef(_)
+                        | StmtKind::TraitDef(_)
+                        | StmtKind::Import(_)
+                        | StmtKind::FromImport(_)
+                        | StmtKind::DatasetDef(_)
+                        | StmtKind::TokenizerDef(_)
+                        | StmtKind::KernelDef(_)
+                        | StmtKind::DatatypeDef(_)
                 )
             })
             .cloned()
@@ -40,11 +46,12 @@ impl Compiler<'_> {
 
         let mut sig = self.module.make_signature();
         sig.call_conv = self.call_conv;
-        sig.params.push(AbiParam::new(cl_types::I32));  // argc
-        sig.params.push(AbiParam::new(cl_types::I64));  // argv
+        sig.params.push(AbiParam::new(cl_types::I32)); // argc
+        sig.params.push(AbiParam::new(cl_types::I64)); // argv
         sig.returns.push(AbiParam::new(cl_types::I32));
 
-        let main_id = self.module
+        let main_id = self
+            .module
             .declare_function("main", Linkage::Export, &sig)
             .map_err(|e| CodegenError::new(format!("failed to declare main: {e}")))?;
 
@@ -97,15 +104,20 @@ impl Compiler<'_> {
             let slab_ptr_var = if let Some(ref plan) = self.memory.slab_plan {
                 if plan.total_bytes > 0 {
                     let total = builder.ins().iconst(cl_types::I64, plan.total_bytes as i64);
-                    let slab_ptr = self.compile_call_by_name(&mut builder, "nsl_gpu_slab_init", &[total])?;
+                    let slab_ptr =
+                        self.compile_call_by_name(&mut builder, "nsl_gpu_slab_init", &[total])?;
                     // Store slab_ptr in a variable for slab_offset calls
                     let var = state.new_variable();
                     builder.declare_var(var, cl_types::I64);
                     builder.def_var(var, slab_ptr);
                     state.slab_ptr_var = Some(var);
                     Some(var)
-                } else { None }
-            } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             for stmt in &top_level {
                 self.compile_stmt(&mut builder, &mut state, stmt)?;
@@ -130,7 +142,8 @@ impl Compiler<'_> {
             eprintln!("--- IR: main ---\n{}", ctx.func.display());
         }
 
-        self.module.define_function(main_id, &mut ctx)
+        self.module
+            .define_function(main_id, &mut ctx)
             .map_err(|e| CodegenError::new(format!("failed to define main: {e}")))?;
         Ok(())
     }
@@ -156,7 +169,8 @@ impl Compiler<'_> {
         sig.params.push(AbiParam::new(cl_types::I64)); // argv
         sig.returns.push(AbiParam::new(cl_types::I32));
 
-        let main_id = self.module
+        let main_id = self
+            .module
             .declare_function("main", Linkage::Export, &sig)
             .map_err(|e| CodegenError::new(format!("failed to declare main: {e}")))?;
 
@@ -195,12 +209,18 @@ impl Compiler<'_> {
 
             // Check argc >= 3 (program, --run, test_name)
             let three = builder.ins().iconst(cl_types::I64, 3);
-            let has_args = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual, args_len, three);
+            let has_args = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+                args_len,
+                three,
+            );
 
             let dispatch_block = builder.create_block();
             let exit_one_block = builder.create_block();
 
-            builder.ins().brif(has_args, dispatch_block, &[], exit_one_block, &[]);
+            builder
+                .ins()
+                .brif(has_args, dispatch_block, &[], exit_one_block, &[]);
 
             // exit(1) block — no --run flag
             builder.switch_to_block(exit_one_block);
@@ -230,12 +250,18 @@ impl Compiler<'_> {
             let eq_call = builder.ins().call(eq_ref, &[arg1, run_ptr]);
             let is_run = builder.inst_results(eq_call)[0];
             let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
-            let run_check = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, is_run, zero_i64);
+            let run_check = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+                is_run,
+                zero_i64,
+            );
 
             let name_check_block = builder.create_block();
             let exit_one_block2 = builder.create_block();
 
-            builder.ins().brif(run_check, name_check_block, &[], exit_one_block2, &[]);
+            builder
+                .ins()
+                .brif(run_check, name_check_block, &[], exit_one_block2, &[]);
 
             builder.switch_to_block(exit_one_block2);
             builder.seal_block(exit_one_block2);
@@ -269,9 +295,15 @@ impl Compiler<'_> {
                 let eq_call2 = builder.ins().call(eq_ref2, &[arg2, name_ptr]);
                 let is_match = builder.inst_results(eq_call2)[0];
                 let zero2 = builder.ins().iconst(cl_types::I64, 0);
-                let match_check = builder.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, is_match, zero2);
+                let match_check = builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+                    is_match,
+                    zero2,
+                );
 
-                builder.ins().brif(match_check, match_block, &[], next_block, &[]);
+                builder
+                    .ins()
+                    .brif(match_check, match_block, &[], next_block, &[]);
 
                 // Match block: call the test function and return 0
                 builder.switch_to_block(match_block);
@@ -302,7 +334,8 @@ impl Compiler<'_> {
             eprintln!("--- IR: main (test dispatch) ---\n{}", ctx.func.display());
         }
 
-        self.module.define_function(main_id, &mut ctx)
+        self.module
+            .define_function(main_id, &mut ctx)
             .map_err(|e| CodegenError::new(format!("failed to define test main: {e}")))?;
         Ok(())
     }
@@ -332,10 +365,7 @@ impl Compiler<'_> {
             if let Some(fn_def) = fn_def {
                 let name = self.resolve_sym(fn_def.name).to_string();
                 if let Some(config) = self.features.vmap_configs.get(&name).cloned() {
-                    let mut transformer = crate::vmap::VmapTransformer::new(
-                        self.interner,
-                        &config,
-                    );
+                    let mut transformer = crate::vmap::VmapTransformer::new(self.interner, &config);
                     match transformer.transform(fn_def) {
                         Ok(result) => {
                             results.push(result);
@@ -368,14 +398,17 @@ impl Compiler<'_> {
             if let Some((_, sig)) = self.registry.functions.get(original_name) {
                 let sig_clone = sig.clone();
                 let mangled = super::mangle_name(&self.module_prefix, batched_name);
-                match self.module.declare_function(
-                    &mangled,
-                    Linkage::Local,
-                    &sig_clone,
-                ) {
+                match self
+                    .module
+                    .declare_function(&mangled, Linkage::Local, &sig_clone)
+                {
                     Ok(func_id) => {
-                        self.registry.functions.insert(batched_name.clone(), (func_id, sig_clone));
-                        self.vmap.batched_fn_names.insert(original_name.to_string(), batched_name.clone());
+                        self.registry
+                            .functions
+                            .insert(batched_name.clone(), (func_id, sig_clone));
+                        self.vmap
+                            .batched_fn_names
+                            .insert(original_name.to_string(), batched_name.clone());
                     }
                     Err(e) => {
                         eprintln!("[nsl] vmap: failed to declare '{}': {}", batched_name, e);
@@ -397,7 +430,10 @@ impl Compiler<'_> {
     /// `self.registry.functions`), compiles the batched FnDef body via
     /// `compile_fn_def_named`. Failures are non-fatal — the original function
     /// still works via dispatch fallback.
-    pub fn compile_batched_functions(&mut self, results: &[crate::vmap::VmapResult]) -> Result<(), CodegenError> {
+    pub fn compile_batched_functions(
+        &mut self,
+        results: &[crate::vmap::VmapResult],
+    ) -> Result<(), CodegenError> {
         for result in results {
             let batched_name = &result.batched_name;
             // Only compile if the function was successfully declared during registration

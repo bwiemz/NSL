@@ -4,9 +4,7 @@
 //! Converts JSON Schema objects and BNF grammar strings into the unified
 //! `Grammar` representation used by the grammar compiler pipeline.
 
-use crate::grammar_compiler::{
-    Alternative, CharRange, Grammar, GrammarElement, RepeatMode, Rule,
-};
+use crate::grammar_compiler::{Alternative, CharRange, Grammar, GrammarElement, RepeatMode, Rule};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -88,7 +86,8 @@ fn convert_schema_value(
         return convert_one_of(one_of, rules, prefix);
     }
 
-    let ty = schema.get("type")
+    let ty = schema
+        .get("type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| GrammarError::MissingField("type".into()))?;
 
@@ -122,10 +121,7 @@ fn integer_element() -> GrammarElement {
             Box::new(GrammarElement::Literal("-".into())),
             RepeatMode::Optional,
         ),
-        GrammarElement::Repeat(
-            Box::new(digit),
-            RepeatMode::OneOrMore,
-        ),
+        GrammarElement::Repeat(Box::new(digit), RepeatMode::OneOrMore),
     ])
 }
 
@@ -134,18 +130,12 @@ fn number_element() -> GrammarElement {
     let digit = GrammarElement::CharClass(vec![CharRange { lo: b'0', hi: b'9' }]);
     let decimal_part = GrammarElement::Sequence(vec![
         GrammarElement::Literal(".".into()),
-        GrammarElement::Repeat(
-            Box::new(digit.clone()),
-            RepeatMode::OneOrMore,
-        ),
+        GrammarElement::Repeat(Box::new(digit.clone()), RepeatMode::OneOrMore),
     ]);
 
     GrammarElement::Sequence(vec![
         integer_element(),
-        GrammarElement::Repeat(
-            Box::new(decimal_part),
-            RepeatMode::Optional,
-        ),
+        GrammarElement::Repeat(Box::new(decimal_part), RepeatMode::Optional),
     ])
 }
 
@@ -156,46 +146,41 @@ fn number_element() -> GrammarElement {
 fn string_element() -> GrammarElement {
     // Characters allowed inside a JSON string (simplified: any printable ASCII except " and \)
     let string_char = GrammarElement::CharClass(vec![
-        CharRange { lo: 0x20, hi: 0x21 },  // space through !
-        CharRange { lo: 0x23, hi: 0x5B },  // # through [
-        CharRange { lo: 0x5D, hi: 0x7E },  // ] through ~
+        CharRange { lo: 0x20, hi: 0x21 }, // space through !
+        CharRange { lo: 0x23, hi: 0x5B }, // # through [
+        CharRange { lo: 0x5D, hi: 0x7E }, // ] through ~
     ]);
 
     GrammarElement::Sequence(vec![
         GrammarElement::Literal("\"".into()),
-        GrammarElement::Repeat(
-            Box::new(string_char),
-            RepeatMode::ZeroOrMore,
-        ),
+        GrammarElement::Repeat(Box::new(string_char), RepeatMode::ZeroOrMore),
         GrammarElement::Literal("\"".into()),
     ])
 }
 
 /// Convert a JSON Schema `enum` to a choice between literal values.
 fn convert_enum(enum_values: &serde_json::Value) -> Result<GrammarElement, GrammarError> {
-    let arr = enum_values.as_array()
+    let arr = enum_values
+        .as_array()
         .ok_or_else(|| GrammarError::InvalidSchema("enum must be an array".into()))?;
 
     if arr.is_empty() {
-        return Err(GrammarError::InvalidSchema("enum must have at least one value".into()));
+        return Err(GrammarError::InvalidSchema(
+            "enum must have at least one value".into(),
+        ));
     }
 
-    let choices: Vec<GrammarElement> = arr.iter()
+    let choices: Vec<GrammarElement> = arr
+        .iter()
         .map(|v| {
             match v {
                 serde_json::Value::String(s) => {
                     // Enum string values are emitted as JSON strings with quotes
                     GrammarElement::Literal(format!("\"{}\"", s))
                 }
-                serde_json::Value::Number(n) => {
-                    GrammarElement::Literal(n.to_string())
-                }
-                serde_json::Value::Bool(b) => {
-                    GrammarElement::Literal(b.to_string())
-                }
-                serde_json::Value::Null => {
-                    GrammarElement::Literal("null".into())
-                }
+                serde_json::Value::Number(n) => GrammarElement::Literal(n.to_string()),
+                serde_json::Value::Bool(b) => GrammarElement::Literal(b.to_string()),
+                serde_json::Value::Null => GrammarElement::Literal("null".into()),
                 _ => GrammarElement::Literal(v.to_string()),
             }
         })
@@ -210,7 +195,8 @@ fn convert_one_of(
     rules: &mut Vec<Rule>,
     prefix: &str,
 ) -> Result<GrammarElement, GrammarError> {
-    let arr = one_of.as_array()
+    let arr = one_of
+        .as_array()
         .ok_or_else(|| GrammarError::InvalidSchema("oneOf must be an array".into()))?;
 
     let mut choices = Vec::new();
@@ -261,19 +247,13 @@ fn convert_array(
 
     let items_list = GrammarElement::Sequence(vec![
         item_element,
-        GrammarElement::Repeat(
-            Box::new(comma_item),
-            RepeatMode::ZeroOrMore,
-        ),
+        GrammarElement::Repeat(Box::new(comma_item), RepeatMode::ZeroOrMore),
     ]);
 
     Ok(GrammarElement::Sequence(vec![
         GrammarElement::Literal("[".into()),
         ws.clone(),
-        GrammarElement::Repeat(
-            Box::new(items_list),
-            RepeatMode::Optional,
-        ),
+        GrammarElement::Repeat(Box::new(items_list), RepeatMode::Optional),
         ws,
         GrammarElement::Literal("]".into()),
     ]))
@@ -287,8 +267,7 @@ fn convert_object(
     rules: &mut Vec<Rule>,
     prefix: &str,
 ) -> Result<GrammarElement, GrammarError> {
-    let properties = schema.get("properties")
-        .and_then(|v| v.as_object());
+    let properties = schema.get("properties").and_then(|v| v.as_object());
 
     let ws = GrammarElement::Repeat(
         Box::new(GrammarElement::Literal(" ".into())),
@@ -373,10 +352,9 @@ pub fn parse_bnf_grammar(text: &str) -> Result<Grammar, GrammarError> {
             continue;
         }
 
-        let (name, body) = line.split_once(':')
-            .ok_or_else(|| GrammarError::BnfParseError(
-                format!("expected 'rule_name: body', got: {line}")
-            ))?;
+        let (name, body) = line.split_once(':').ok_or_else(|| {
+            GrammarError::BnfParseError(format!("expected 'rule_name: body', got: {line}"))
+        })?;
 
         let name = name.trim().to_string();
         let body = body.trim();
@@ -387,20 +365,14 @@ pub fn parse_bnf_grammar(text: &str) -> Result<Grammar, GrammarError> {
 
         let alternatives = parse_bnf_alternatives(body)?;
 
-        rules.push(Rule {
-            name,
-            alternatives,
-        });
+        rules.push(Rule { name, alternatives });
     }
 
     if rules.is_empty() {
         return Err(GrammarError::BnfParseError("empty grammar".into()));
     }
 
-    Ok(Grammar {
-        rules,
-        start_rule,
-    })
+    Ok(Grammar { rules, start_rule })
 }
 
 /// Parse BNF alternatives separated by `|`.
@@ -474,9 +446,11 @@ fn parse_bnf_elements(text: &str) -> Result<Vec<GrammarElement>, GrammarError> {
                 match chars.next() {
                     Some('"') => break,
                     Some(c) => literal.push(c),
-                    None => return Err(GrammarError::BnfParseError(
-                        "unterminated string literal".into()
-                    )),
+                    None => {
+                        return Err(GrammarError::BnfParseError(
+                            "unterminated string literal".into(),
+                        ))
+                    }
                 }
             }
             elements.push(GrammarElement::Literal(literal));

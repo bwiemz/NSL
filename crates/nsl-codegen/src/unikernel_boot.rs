@@ -107,7 +107,7 @@ impl BootStub {
         // Header length (will be filled after all tags)
         let header_len_offset = self.code.len();
         self.emit_u32(0); // placeholder
-        // Checksum (will be filled)
+                          // Checksum (will be filled)
         let checksum_offset = self.code.len();
         self.emit_u32(0); // placeholder
 
@@ -121,9 +121,9 @@ impl BootStub {
             .copy_from_slice(&header_len.to_le_bytes());
 
         // Fill checksum: -(magic + arch + header_len) mod 2^32
-        let checksum = (-(MULTIBOOT2_MAGIC as i64 + MULTIBOOT2_ARCH_I386 as i64 + header_len as i64)) as u32;
-        self.code[checksum_offset..checksum_offset + 4]
-            .copy_from_slice(&checksum.to_le_bytes());
+        let checksum =
+            (-(MULTIBOOT2_MAGIC as i64 + MULTIBOOT2_ARCH_I386 as i64 + header_len as i64)) as u32;
+        self.code[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
     }
 
     fn emit_linux_boot_header(&mut self) {
@@ -164,7 +164,7 @@ impl BootStub {
         self.emit_bytes(&[0xB8]); // MOV EAX, imm32
         let pml4_fixup = self.code.len();
         self.emit_u32(0); // placeholder — patched to PML4 address
-        // mov cr3, eax
+                          // mov cr3, eax
         self.emit_bytes(&[0x0F, 0x22, 0xD8]); // MOV CR3, EAX
 
         // Enable PAE (Physical Address Extension) — required for long mode
@@ -268,7 +268,7 @@ impl BootStub {
         self.labels.push(("pml4", pml4_offset));
         // Entry 0: Present + Writable + points to PDPT (address will be patched)
         self.emit_u64(0x03); // flags only, base patched later
-        // Remaining 511 entries = 0
+                             // Remaining 511 entries = 0
         for _ in 1..512 {
             self.emit_u64(0);
         }
@@ -358,7 +358,7 @@ impl BootStub {
         self.emit_bytes(&[0x48, 0xB8]); // MOV RAX, imm64
         self.labels.push(("fixup_kmain", self.code.len()));
         self.emit_u64(0); // placeholder for kmain address
-        // call rax
+                          // call rax
         self.emit_bytes(&[0xFF, 0xD0]);
 
         // If kmain returns, halt
@@ -454,7 +454,10 @@ impl UnikernelImageBuilder {
     }
 
     /// Write the linker script to a file and return the path.
-    pub fn write_linker_script(&self, dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    pub fn write_linker_script(
+        &self,
+        dir: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
         let path = dir.join("unikernel.ld");
         std::fs::write(&path, &self.linker_script)?;
         Ok(path)
@@ -502,11 +505,16 @@ mod tests {
 
         // Header length (at offset 8)
         let header_len = u32::from_le_bytes(stub.code[8..12].try_into().unwrap());
-        assert!(header_len > 0 && header_len <= 256, "header_len={}", header_len);
+        assert!(
+            header_len > 0 && header_len <= 256,
+            "header_len={}",
+            header_len
+        );
 
         // Checksum: magic + arch + len + checksum == 0 (mod 2^32)
         let checksum = u32::from_le_bytes(stub.code[12..16].try_into().unwrap());
-        let sum = MULTIBOOT2_MAGIC.wrapping_add(MULTIBOOT2_ARCH_I386)
+        let sum = MULTIBOOT2_MAGIC
+            .wrapping_add(MULTIBOOT2_ARCH_I386)
             .wrapping_add(header_len)
             .wrapping_add(checksum);
         assert_eq!(sum, 0, "Multiboot2 checksum failed: sum={}", sum);
@@ -521,7 +529,10 @@ mod tests {
         let stub = generate_boot_stub(&config);
 
         // First two bytes should be JMP SHORT (0xEB)
-        assert_eq!(stub.code[0], 0xEB, "Linux boot header should start with JMP SHORT");
+        assert_eq!(
+            stub.code[0], 0xEB,
+            "Linux boot header should start with JMP SHORT"
+        );
         assert!(stub.size() > 64, "stub too small: {}", stub.size());
     }
 
@@ -566,9 +577,12 @@ mod tests {
         assert!(stub.labels.iter().any(|(name, _)| *name == "halt_loop"));
 
         // Find halt loop and verify it contains HLT (0xF4)
-        let halt_offset = stub.labels.iter()
+        let halt_offset = stub
+            .labels
+            .iter()
             .find(|(name, _)| *name == "halt_loop")
-            .unwrap().1;
+            .unwrap()
+            .1;
         // CLI (0xFA) followed by HLT (0xF4)
         assert_eq!(stub.code[halt_offset], 0xFA, "expected CLI before HLT");
         assert_eq!(stub.code[halt_offset + 1], 0xF4, "expected HLT instruction");
@@ -638,18 +652,29 @@ mod tests {
         let config = UnikernelConfig::default();
         let stub = generate_boot_stub(&config);
 
-        let pdpt_offset = stub.labels.iter()
+        let pdpt_offset = stub
+            .labels
+            .iter()
             .find(|(name, _)| *name == "pdpt")
-            .unwrap().1;
+            .unwrap()
+            .1;
 
         // First 4 PDPT entries should map 0-4GB (1GB pages)
         for i in 0..4u64 {
             let entry_offset = pdpt_offset + (i as usize) * 8;
             let entry = u64::from_le_bytes(
-                stub.code[entry_offset..entry_offset + 8].try_into().unwrap()
+                stub.code[entry_offset..entry_offset + 8]
+                    .try_into()
+                    .unwrap(),
             );
             // Check Present + RW + PS bits
-            assert_eq!(entry & 0x83, 0x83, "PDPT[{}] missing flags: {:#x}", i, entry);
+            assert_eq!(
+                entry & 0x83,
+                0x83,
+                "PDPT[{}] missing flags: {:#x}",
+                i,
+                entry
+            );
             // Check base address (i * 1GB)
             let base = entry & !0xFFF;
             assert_eq!(base, i << 30, "PDPT[{}] wrong base: {:#x}", i, base);
@@ -658,7 +683,9 @@ mod tests {
         // Entry 4 should be zero (unmapped)
         let entry4_offset = pdpt_offset + 4 * 8;
         let entry4 = u64::from_le_bytes(
-            stub.code[entry4_offset..entry4_offset + 8].try_into().unwrap()
+            stub.code[entry4_offset..entry4_offset + 8]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(entry4, 0);
     }

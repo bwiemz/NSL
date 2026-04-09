@@ -48,13 +48,22 @@ mod tests {
 
     #[test]
     fn deterministic_variant_for_atomic_ops() {
-        assert_eq!(select_kernel("reduce_sum", true), KernelVariant::DeterministicSortReduce);
-        assert_eq!(select_kernel("scatter_add", true), KernelVariant::DeterministicSortAccumulate);
+        assert_eq!(
+            select_kernel("reduce_sum", true),
+            KernelVariant::DeterministicSortReduce
+        );
+        assert_eq!(
+            select_kernel("scatter_add", true),
+            KernelVariant::DeterministicSortAccumulate
+        );
     }
 
     #[test]
     fn deterministic_variant_for_cublas() {
-        assert_eq!(select_kernel("matmul", true), KernelVariant::DeterministicCublas);
+        assert_eq!(
+            select_kernel("matmul", true),
+            KernelVariant::DeterministicCublas
+        );
     }
 
     #[test]

@@ -85,9 +85,7 @@ impl<F: Field> Accumulator<F> {
             cross_term = cross_term.field_add(&a.field_mul(b));
         }
         let r_squared = challenge.field_mul(challenge);
-        let error_term = self
-            .error_term
-            .field_add(&r_squared.field_mul(&cross_term));
+        let error_term = self.error_term.field_add(&r_squared.field_mul(&cross_term));
 
         Ok(Self {
             instance,
@@ -141,14 +139,10 @@ mod tests {
 
     #[test]
     fn test_fold_error_term_grows() {
-        let acc = Accumulator::<Mersenne31Field>::initial(
-            vec![Mersenne31Field::from_u64(5)],
-            vec![],
-        );
-        let new = Accumulator::<Mersenne31Field>::initial(
-            vec![Mersenne31Field::from_u64(7)],
-            vec![],
-        );
+        let acc =
+            Accumulator::<Mersenne31Field>::initial(vec![Mersenne31Field::from_u64(5)], vec![]);
+        let new =
+            Accumulator::<Mersenne31Field>::initial(vec![Mersenne31Field::from_u64(7)], vec![]);
         let challenge = Mersenne31Field::from_u64(2);
 
         let folded = acc.fold(&new, &challenge).unwrap();

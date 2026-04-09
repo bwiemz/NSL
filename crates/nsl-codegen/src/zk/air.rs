@@ -41,7 +41,13 @@ impl<F: Field> AIRTrace<F> {
     /// # Panics
     /// Panics if `row.len() != self.width`.
     pub fn push_row(&mut self, row: Vec<F>) {
-        assert_eq!(row.len(), self.width, "row width mismatch: expected {}, got {}", self.width, row.len());
+        assert_eq!(
+            row.len(),
+            self.width,
+            "row width mismatch: expected {}, got {}",
+            self.width,
+            row.len()
+        );
         self.rows.push(row);
     }
 

@@ -376,7 +376,7 @@ impl Compiler<'_> {
             if args.len() != 1 {
                 return Err(CodegenError::new("floor() takes exactly 1 argument"));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let arg_type = self.node_type(args[0].value.id).clone();
             let float_val = if is_float_type(&arg_type) {
                 if matches!(arg_type, Type::F32) {
@@ -692,7 +692,7 @@ impl Compiler<'_> {
                     "{func_name}() takes exactly 1 argument"
                 )));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             // FBIP Phase 2: emit inplace variant when arg is single-use
             let rt_name = self.fbip_select_variant(state, &args[0].value, &func_name);
             return self.compile_traced_call(builder, &rt_name, &[val]);
@@ -706,7 +706,7 @@ impl Compiler<'_> {
                     "{func_name}() takes exactly 1 argument"
                 )));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             // FBIP Phase 2: emit inplace variant when arg is single-use
             let rt_name = self.fbip_select_variant(state, &args[0].value, &func_name);
             return self.compile_traced_call(builder, &rt_name, &[val]);
@@ -720,7 +720,7 @@ impl Compiler<'_> {
                     "{func_name}() takes exactly 1 argument"
                 )));
             }
-            let val = self.compile_expr(builder, state, &args[0].value)?;
+            let val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let rt_name = format!("nsl_{func_name}");
             return self.compile_traced_call(builder, &rt_name, &[val]);
         }
@@ -747,7 +747,7 @@ impl Compiler<'_> {
                     "softmax() takes exactly 2 arguments (tensor, dim)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_traced_call(builder, "nsl_tensor_softmax", &[tensor_val, dim_val]);
         }
@@ -758,7 +758,7 @@ impl Compiler<'_> {
                     "log_softmax() takes exactly 2 arguments (tensor, dim)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_traced_call(
                 builder,
@@ -772,7 +772,7 @@ impl Compiler<'_> {
                     "clamp() takes exactly 3 arguments (tensor, min, max)",
                 ));
             }
-            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let min_val = self.compile_expr(builder, state, &args[1].value)?;
             let max_val = self.compile_expr(builder, state, &args[2].value)?;
             // Ensure min/max are f64
@@ -1908,17 +1908,15 @@ impl Compiler<'_> {
                         "DataLoader(): labels must be a tensor, got {}",
                         nsl_semantic::types::display_type(&labels_ty)
                     )));
-                } else {
-                    if let (Some(data_numel), Some(labels_numel)) = (
-                        static_tensor_numel(&data_ty),
-                        static_tensor_numel(&labels_ty),
-                    ) {
-                        if data_numel != labels_numel {
-                            return Err(CodegenError::new(format!(
-                                "DataLoader(): data and labels must have the same number of elements ({} vs {})",
-                                data_numel, labels_numel
-                            )));
-                        }
+                } else if let (Some(data_numel), Some(labels_numel)) = (
+                    static_tensor_numel(&data_ty),
+                    static_tensor_numel(&labels_ty),
+                ) {
+                    if data_numel != labels_numel {
+                        return Err(CodegenError::new(format!(
+                            "DataLoader(): data and labels must have the same number of elements ({} vs {})",
+                            data_numel, labels_numel
+                        )));
                     }
                 }
             }

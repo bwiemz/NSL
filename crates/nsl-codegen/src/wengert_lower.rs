@@ -1163,11 +1163,12 @@ mod tests {
     #[test]
     fn test_lower_constant_leaf() {
         // Verify that Constant variant is matched as a leaf (no input resolution).
-        let op = make_op(0, 1, PrimalOp::Constant(3.14), vec![]);
+        let value = std::f64::consts::PI;
+        let op = make_op(0, 1, PrimalOp::Constant(value), vec![]);
         // Without a real compiler/builder we can't call lower_single_op,
         // but we can verify the op structure is correct.
         assert!(op.inputs.is_empty());
-        assert!(matches!(op.op, PrimalOp::Constant(v) if (v - 3.14).abs() < 1e-10));
+        assert!(matches!(op.op, PrimalOp::Constant(v) if (v - value).abs() < 1e-10));
     }
 
     #[test]
