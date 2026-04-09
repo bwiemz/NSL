@@ -3421,10 +3421,12 @@ impl Compiler<'_> {
                     builder.seal_block(scan_match);
                     let old_grad =
                         self.compile_call_by_name(builder, "nsl_list_get", &[grads, si])?;
+                    // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let summed_grad = self.compile_call_by_name(
                         builder,
                         "nsl_tensor_add",
-                        &[old_grad, grad_val],
+                        &[old_grad, grad_val, flags_zero],
                     )?;
                     let match_count = builder.use_var(scan_match_count_var);
                     let match_one = builder.ins().iconst(cl_types::I64, 1);

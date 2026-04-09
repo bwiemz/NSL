@@ -315,7 +315,9 @@ fn lower_single_op(
             } else {
                 let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
                 let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                let result = call(compiler, builder, "nsl_tensor_add", &[a, b])?;
+                // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
+                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                let result = call(compiler, builder, "nsl_tensor_add", &[a, b, flags_zero])?;
                 free_tensor_if_owned(compiler, builder, a, free_a)?;
                 free_tensor_if_owned(compiler, builder, b, free_b)?;
                 Ok(result)
@@ -808,7 +810,9 @@ fn lower_single_op(
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
                 let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim_neg2])?;
                 let mask = call(compiler, builder, "nsl_tensor_causal_mask", &[seq_len])?;
-                let masked = call(compiler, builder, "nsl_tensor_add", &[scaled, mask])?;
+                // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
+                let flags_zero_add = builder.ins().iconst(cl_types::I8, 0);
+                let masked = call(compiler, builder, "nsl_tensor_add", &[scaled, mask, flags_zero_add])?;
                 free_tensor_value(compiler, builder, mask)?;
                 masked
             } else {

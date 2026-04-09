@@ -1203,7 +1203,11 @@ impl Compiler<'_> {
                     self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
                 let mask =
                     self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
-                self.compile_traced_call(builder, "nsl_tensor_add", &[scaled, mask])?
+                {
+                    // ELTLS (FBIP-3): nsl_tensor_add takes flags=0 here.
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                    self.compile_traced_call(builder, "nsl_tensor_add", &[scaled, mask, flags_zero])?
+                }
             } else {
                 scaled
             };

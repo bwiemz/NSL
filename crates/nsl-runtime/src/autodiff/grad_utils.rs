@@ -25,7 +25,7 @@ pub(crate) fn accumulate_grad(grads: &mut HashMap<i64, i64>, key: i64, grad_tens
         let old = *existing;
         // Pause recording to avoid taping gradient computation ops
         TAPE.with(|t| t.borrow_mut().pause_depth += 1);
-        let summed = tensor_add(old, grad_tensor);
+        let summed = tensor_add(old, grad_tensor, 0);
         TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
         tensor_free(old);
         tensor_free(grad_tensor);

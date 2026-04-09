@@ -26,7 +26,10 @@ fn reconcile_device(a: i64, b: i64) -> (i64, bool) {
 }
 
 #[no_mangle]
-pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
+pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
+    use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
+    let relinq_a = relinquish_a(flags);
+    let relinq_b = relinquish_b(flags);
     let (b, b_transferred) = reconcile_device(a, b);
     {
         let ta = unsafe { &*(a as *const NslTensor) };
@@ -34,26 +37,42 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
-                if ta.can_mutate_inplace_gpu() && ta.shape_eq(tb) {
+                if (relinq_a || ta.can_mutate_inplace_gpu()) && ta.shape_eq(tb) {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
-                    if b_transferred { nsl_tensor_free(b); }
+                    // FBIP-3: caller relinquished B — free the original B (not the transferred alias).
+                    // If b was transferred, that copy is also caller-owned and must be freed.
+                    if relinq_b {
+                        nsl_tensor_free(b);
+                    } else if b_transferred {
+                        nsl_tensor_free(b);
+                    }
                     return a;
                 }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
-                if b_transferred { nsl_tensor_free(b); }
+                // Out-of-place GPU fallback: honor caller relinquish flags.
+                if relinq_a {
+                    nsl_tensor_free(a);
+                }
+                if relinq_b {
+                    nsl_tensor_free(b);
+                } else if b_transferred {
+                    nsl_tensor_free(b);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: reuse left operand when uniquely owned + same shape (no broadcast, CPU)
+    // FBIP: reuse left operand when uniquely owned + same shape (no broadcast, CPU).
+    // FBIP-3: the relinquish flag is the caller's promise that no other holder exists,
+    // so the in-place path is safe even if the refcount heuristic would normally reject it.
     {
         let ta = unsafe { &mut *(a as *mut NslTensor) };
         let tb = unsafe { &*(b as *const NslTensor) };
-        if ta.can_mutate_inplace() && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
+        if (relinq_a || ta.can_mutate_inplace()) && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
             if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
@@ -66,7 +85,13 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
             }
             ta.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
-            if b_transferred { nsl_tensor_free(b); }
+            // FBIP-3 double-free-safe: even on the in-place-on-A branch, if B was
+            // relinquished it must still be freed here (the critical bug being prevented).
+            if relinq_b {
+                nsl_tensor_free(b);
+            } else if b_transferred {
+                nsl_tensor_free(b);
+            }
             return a;
         }
     }
@@ -88,7 +113,15 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64) -> i64 {
         let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
         crate::trace::record_op(crate::trace::OpType::Add, vec![a, b], result, shape, rt.dtype, vec![]);
     }
-    if b_transferred { nsl_tensor_free(b); }
+    // FBIP-3: out-of-place fallback — honor caller relinquish flags.
+    if relinq_a {
+        nsl_tensor_free(a);
+    }
+    if relinq_b {
+        nsl_tensor_free(b);
+    } else if b_transferred {
+        nsl_tensor_free(b);
+    }
     result
 }
 
@@ -848,4 +881,66 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64) -> i64 {
     }
     if b_transferred { nsl_tensor_free(b_ptr); }
     result
+}
+
+#[cfg(test)]
+mod fbip_add_tests {
+    use super::*;
+    use crate::tensor::fbip_flags::{RELINQUISH_A, RELINQUISH_B};
+
+    /// Helper: create a 1-D f64 tensor (CPU, dtype=0, contiguous, refcount=1).
+    fn make_tensor_f64(data: &[f64]) -> i64 {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, data.len() as i64);
+        let ptr = crate::tensor::creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = *v };
+        }
+        ptr
+    }
+
+    fn read_f64(ptr: i64, idx: usize) -> f64 {
+        let t = unsafe { &*(ptr as *const NslTensor) };
+        unsafe { *(t.data as *const f64).add(idx) }
+    }
+
+    /// flags=0 — both operands untouched, fresh output.
+    #[test]
+    fn add_flags_zero_leaves_inputs_alive() {
+        // Bump refcount on A so the legacy heuristic cannot take its in-place path;
+        // this guarantees the out-of-place path runs and we can observe that A and B
+        // are still valid after the call.
+        let a = make_tensor_f64(&[2.0, 3.0, 4.0]);
+        let b = make_tensor_f64(&[1.0, 1.0, 1.0]);
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        let out = nsl_tensor_add(a, b, 0);
+        assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
+        assert_ne!(out, b, "flags=0 must not reuse B");
+        assert_eq!(read_f64(a, 0), 2.0);
+        assert_eq!(read_f64(b, 0), 1.0);
+        assert_eq!(read_f64(out, 0), 3.0);
+        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(a);
+        nsl_tensor_free(b);
+        nsl_tensor_free(out);
+    }
+
+    /// flags=0x03 — both relinquished, in-place on A, B must still be freed.
+    /// This test verifies that the call returns A (in-place path taken) and that
+    /// the process does not crash from a double-free of B when the runtime
+    /// relinquishes it.
+    #[test]
+    fn add_flags_both_relinquish_inplace_on_a_frees_b() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        let b = make_tensor_f64(&[1.0, 2.0]);
+        let out = nsl_tensor_add(a, b, RELINQUISH_A | RELINQUISH_B);
+        // In-place on A: returned pointer equals A.
+        assert_eq!(out, a, "in-place on A should return A's pointer");
+        // A now holds the result [11.0, 22.0].
+        assert_eq!(read_f64(out, 0), 11.0);
+        assert_eq!(read_f64(out, 1), 22.0);
+        // B has been freed by the runtime. Do not touch it.
+        nsl_tensor_free(out); // out == a
+    }
 }

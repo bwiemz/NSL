@@ -738,7 +738,14 @@ impl Compiler<'_> {
             // M52b: Annotate sparsity hints for partial folds
             self.annotate_sparsity_hints(state, lhs, rhs, op);
 
-            let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs])?;
+            // ELTLS (FBIP-3): nsl_tensor_add now takes a flags byte as its third arg.
+            // Until Task 3 extends sub/mul/div/matmul, only the add case passes a flags=0.
+            let result = if rt_name == "nsl_tensor_add" {
+                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero])?
+            } else {
+                self.compile_traced_call(builder, rt_name, &[lhs, rhs])?
+            };
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else if left_is_tensor {
@@ -1928,10 +1935,12 @@ impl Compiler<'_> {
                     } else {
                         (rhs, false)
                     };
+                    // ELTLS (FBIP-3): nsl_tensor_add takes flags=0 here.
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let result = self.compile_traced_call(
                         builder,
                         "nsl_tensor_add",
-                        &[dense_lhs, dense_rhs],
+                        &[dense_lhs, dense_rhs, flags_zero],
                     )?;
                     if free_lhs {
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;

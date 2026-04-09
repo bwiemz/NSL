@@ -4268,7 +4268,7 @@ DONE:
         let b_gpu = nsl_tensor_to_device(b_cpu, 1);
 
         // Add on GPU
-        let c_gpu = nsl_tensor_add(a_gpu, b_gpu);
+        let c_gpu = nsl_tensor_add(a_gpu, b_gpu, 0);
 
         // Sync and transfer back
         unsafe { cudarc::driver::sys::cuCtxSynchronize(); }

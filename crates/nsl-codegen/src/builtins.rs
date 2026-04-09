@@ -219,7 +219,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor arithmetic (elementwise)
     (
         "nsl_tensor_add",
-        &[types::I64, types::I64],
+        &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
     (

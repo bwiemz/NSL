@@ -3436,7 +3436,7 @@ mod tests {
         let a_t = nsl_tensor_transpose(a, 0, 1);
         let b_t = nsl_tensor_transpose(b, 0, 1);
 
-        let result = nsl_tensor_add(a_t, b_t);
+        let result = nsl_tensor_add(a_t, b_t, 0);
         let r = NslTensor::from_ptr(result);
 
         // Transposed [[1,4],[2,5],[3,6]] + 10 = [[11,14],[12,15],[13,16]]
@@ -3639,7 +3639,7 @@ mod tests {
     fn test_fbip_add_inplace() {
         let a = make_f64_tensor(&[1.0, 2.0, 3.0]);
         let b = make_f64_tensor(&[10.0, 20.0, 30.0]);
-        let result = arithmetic::nsl_tensor_add(a, b);
+        let result = arithmetic::nsl_tensor_add(a, b, 0);
         assert_eq!(result, a, "add should reuse left operand when shapes match and refcount==1");
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
@@ -3654,7 +3654,7 @@ mod tests {
         let a = make_f64_tensor(&[1.0, 2.0]);
         let b = make_f64_tensor(&[10.0, 20.0]);
         NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
-        let result = arithmetic::nsl_tensor_add(a, b);
+        let result = arithmetic::nsl_tensor_add(a, b, 0);
         assert_ne!(result, a, "add should allocate new tensor when left has refcount>1");
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
