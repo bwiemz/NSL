@@ -620,37 +620,16 @@ impl Compiler<'_> {
                             cl_types::I64
                         };
 
-                        if let Some((var, _)) = state.variables.get(&sym) {
+                        if let Some((var, _)) = state.variables.get(&sym).copied() {
                             if state.dataloader_symbols.contains(&sym) {
                                 return Err(CodegenError::new(format!(
                                     "redeclaring DataLoader handle '{}' is unsupported; use a fresh symbol instead",
                                     self.resolve_sym(sym)
                                 )));
                             }
-                            // Free old tensor value before reassignment to prevent memory leak
-                            if state
-                                .current_block
-                                .map(|b| !is_block_filled(builder, b))
-                                .unwrap_or(true)
-                                && !state.non_owning_symbols.contains(&sym)
-                            {
-                                let old_val = builder.use_var(*var);
-                                let sem_ty = state.variable_types.get(&sym);
-                                if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
-                                    let _ = self.compile_call_by_name(
-                                        builder,
-                                        "nsl_tensor_free",
-                                        &[old_val],
-                                    );
-                                } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
-                                    let _ = self.compile_call_by_name(
-                                        builder,
-                                        "nsl_tensor_free_if_valid",
-                                        &[old_val],
-                                    );
-                                }
-                            }
-                            builder.def_var(*var, init_val);
+                            // ELTLS §6.5: unified slot clear before rebind.
+                            self.eltls_clear_old_slot(builder, state, sym);
+                            builder.def_var(var, init_val);
                         } else {
                             let var = state.new_variable();
                             builder.declare_var(var, cl_type);
@@ -815,6 +794,47 @@ impl Compiler<'_> {
                         ));
                     }
                     let mut val = self.compile_expr(builder, state, e)?;
+                    // ELTLS §6.5: consult return-value ownership and emit the
+                    // correct transfer/retain path for tensor-typed returns.
+                    // Require Cranelift value to be I64 AND semantic type to be
+                    // a real tensor (NOT indeterminate — BYOD dtype method
+                    // returns have Unknown semantic type but are scalars).
+                    // Also skip inside dtype methods entirely.
+                    let ret_ty = self.node_type(e.id).clone();
+                    let val_is_ptr = builder.func.dfg.value_type(val) == cl_types::I64;
+                    if val_is_ptr && ret_ty.is_tensor() && !state.flags.in_dtype_method {
+                        use crate::ownership_expr::Ownership;
+                        match self.get_ownership(state, val) {
+                            Ownership::Owned => {
+                                self.consume_ownership(state, val);
+                            }
+                            Ownership::BorrowedFromVar(_) | Ownership::BorrowedWeight => {
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_retain",
+                                    &[val],
+                                );
+                            }
+                            Ownership::TapeHeld => {
+                                eprintln!(
+                                    "ELTLS warning: returning TapeHeld tensor — semantic error"
+                                );
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_retain",
+                                    &[val],
+                                );
+                            }
+                            Ownership::Unknown => {
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_retain",
+                                    &[val],
+                                );
+                                self.note_unknown_fallback(state, val);
+                            }
+                        }
+                    }
                     // Free intermediate tensor temporaries before returning (keep return value)
                     self.free_tensor_temporaries(builder, state, Some(val));
                     // M38b: Free linear tensors consumed during the return expression
@@ -1146,24 +1166,50 @@ impl Compiler<'_> {
                         }
                     }
                 };
-                // Free old tensor value before reassignment to prevent memory leak
-                if matches!(op, AssignOp::Assign)
-                    && state
-                        .current_block
-                        .map(|b| !is_block_filled(builder, b))
-                        .unwrap_or(true)
-                    && !state.non_owning_symbols.contains(sym)
-                {
-                    let old_val = builder.use_var(var);
-                    let sem_ty = state.variable_types.get(sym);
-                    if sem_ty.map(|t| t.is_tensor()).unwrap_or(false) {
-                        let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[old_val]);
-                    } else if sem_ty.map(|t| t.is_indeterminate()).unwrap_or(false) {
-                        let _ = self.compile_call_by_name(
-                            builder,
-                            "nsl_tensor_free_if_valid",
-                            &[old_val],
-                        );
+                // ELTLS §6.5: clear the old tensor slot before overwriting.
+                // Only for plain Assign — compound ops consume `old` in-place
+                // as an arithmetic input, not as a storage slot.
+                if matches!(op, AssignOp::Assign) {
+                    self.eltls_clear_old_slot(builder, state, *sym);
+                }
+
+                // ELTLS §6.5: consult RHS ownership for Assign and emit the
+                // correct transfer/retain path for tensor-typed values.
+                // Require the Cranelift value to be I64 AND semantic type to
+                // be a real tensor (NOT indeterminate). Also skip inside
+                // dtype methods where slot contents may be scalars.
+                if matches!(op, AssignOp::Assign) {
+                    let rhs_ty = self.node_type(value.id).clone();
+                    let val_is_ptr = builder.func.dfg.value_type(final_val) == cl_types::I64;
+                    if val_is_ptr && rhs_ty.is_tensor() && !state.flags.in_dtype_method {
+                        use crate::ownership_expr::Ownership;
+                        match self.get_ownership(state, final_val) {
+                            Ownership::Owned => {
+                                self.consume_ownership(state, final_val);
+                            }
+                            Ownership::BorrowedFromVar(_) | Ownership::BorrowedWeight => {
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_retain",
+                                    &[final_val],
+                                );
+                            }
+                            Ownership::TapeHeld => {
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_retain",
+                                    &[final_val],
+                                );
+                            }
+                            Ownership::Unknown => {
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_retain",
+                                    &[final_val],
+                                );
+                                self.note_unknown_fallback(state, final_val);
+                            }
+                        }
                     }
                 }
                 builder.def_var(var, final_val);
@@ -1390,6 +1436,80 @@ impl Compiler<'_> {
             }
         }
         Ok(())
+    }
+
+    /// ELTLS (spec §6.5): clear a tensor-typed variable's old value before
+    /// reassignment. Emits nsl_tensor_free on the old pointer and purges all
+    /// tracking queues (new AND legacy). Skipped for initial let bindings
+    /// (symbol not yet in state.variables), parameters, non-owning symbols,
+    /// borrowed batch handles, and non-tensor variables.
+    ///
+    /// Deliberately does NOT touch tape_held — if the old value had an active
+    /// tape lease, the nsl_tensor_free here just decrements the variable-slot
+    /// refcount and the tape's retained lease keeps the storage alive until
+    /// free_tape_held_tensors runs at tape-region exit.
+    pub(crate) fn eltls_clear_old_slot(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        sym: nsl_ast::Symbol,
+    ) {
+        // Dtype method bodies run on scalar-valued slots — do NOT emit
+        // tensor frees on them, even if the slot type says indeterminate.
+        if state.flags.in_dtype_method {
+            return;
+        }
+        // Only act on reassignments: the symbol must already exist.
+        let Some((var, cl_type)) = state.variables.get(&sym).copied() else {
+            return; // initial let — slot uninitialized, use_var would be UB
+        };
+        if cl_type != cl_types::I64 {
+            return; // non-tensor variable
+        }
+        if state.param_symbols.contains(&sym) {
+            return; // parameter — caller owns it
+        }
+        if state.non_owning_symbols.contains(&sym) {
+            return; // view or borrow alias
+        }
+        if state.borrowed_batch_symbols.contains(&sym) {
+            return; // DataLoader batch handle — freed by loader teardown
+        }
+        if state.dataloader_symbols.contains(&sym) {
+            return; // DataLoader handle itself
+        }
+        // Additional semantic filter: only emit free if the variable's type is
+        // actually a tensor or indeterminate. Values stored in I64 slots that
+        // are integers, booleans, lists, or dicts should NOT be freed via
+        // nsl_tensor_free. Missing sem_ty → skip (matches prior legacy
+        // VarDecl/Assign behaviour, which only emitted frees when the
+        // recorded type was tensor/indeterminate).
+        let sem_ty = match state.variable_types.get(&sym) {
+            Some(ty) if ty.is_tensor() || ty.is_indeterminate() => ty.clone(),
+            _ => return,
+        };
+        // Don't emit frees into a filled block.
+        if let Some(block) = state.current_block {
+            if is_block_filled(builder, block) {
+                return;
+            }
+        }
+        // Read the old value and free it. Use strict free only for known
+        // tensor-typed slots; indeterminate slots fall back to _if_valid
+        // which probes the magic field and tolerates null/garbage.
+        let old_val = builder.use_var(var);
+        let free_fn = if sem_ty.is_tensor() {
+            "nsl_tensor_free"
+        } else {
+            "nsl_tensor_free_if_valid"
+        };
+        let _ = self.compile_call_by_name(builder, free_fn, &[old_val]);
+        // Purge tracking queues so the statement/function cleanup paths don't
+        // try to free this value again.
+        state.cleanup.expr_ownership.remove(&old_val);
+        state.cleanup.owned_temporaries.retain(|&v| v != old_val);
+        state.cleanup.tensor_temporaries.retain(|&v| v != old_val);
+        // DO NOT touch state.cleanup.tape_held — see doc comment above.
     }
 
     /// Free intermediate tensor temporaries accumulated during expression compilation.
