@@ -16,3 +16,31 @@ docs/plans/
 models/coder-rl/data/sft_tokens.bin
 models/coder-rl/data/sft_labels.bin
 models/coder-rl/data/tokenizer/
+models/coder-rl/checkpoints/
+
+# Coder-50m generated data
+models/coder50m/data/*.bin
+models/coder50m/data/tokenizer/
+
+# Compiled NSL build artifacts (regenerated from .nsl sources)
+*.exp
+*.lib
+*.nslm
+
+# Model binaries (regenerated from training)
+*.onnx
+*.safetensors
+
+# Log files (per-run, never versioned)
+*.log
+
+# Python bytecode
+__pycache__/
+
+# Research PDFs (large binaries, external references)
+docs/research/*.pdf
+
+# Claude Code / MCP plugin state
+.claude/
+.dist/
+.playwright-mcp/
