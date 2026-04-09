@@ -14,6 +14,37 @@ use crate::error::CodegenError;
 use crate::types::is_float_type;
 
 impl Compiler<'_> {
+    /// ELTLS: compute the FBIP-3 flag byte for a tensor binary op from operand
+    /// ownership. Returns a Cranelift I8 constant Value. In a future task
+    /// only operands with `Ownership::Owned` will have their relinquish bit
+    /// set — `BorrowedFromVar`, `BorrowedWeight`, `TapeHeld`, and `Unknown`
+    /// will all leave the bit clear.
+    ///
+    /// Currently returns 0 unconditionally. The reason is that the autodiff
+    /// tape is GLOBAL runtime state — when a train/grad block runs, the
+    /// tape is live across every function call transitively reachable from
+    /// the step body, including model methods (forward_train etc.). Those
+    /// methods are compiled as independent Cranelift functions with
+    /// `in_tape_region = false`; the codegen has no per-function knowledge
+    /// of whether a callee may execute while a tape is active.
+    ///
+    /// Relinquishing an operand inside such a callee violates the tape's
+    /// invariant (the tape holds a raw pointer to input data). Until we
+    /// have an interprocedural analysis that propagates "may run under
+    /// tape" through the call graph, we conservatively emit flags=0
+    /// everywhere. The signature plumbing, consume_ownership bookkeeping,
+    /// and phi-merge coordination all land in this task so later commits
+    /// can flip the switch with a one-line change.
+    fn compute_fbip_flags(
+        &self,
+        builder: &mut FunctionBuilder,
+        _state: &FuncState,
+        _lhs: Value,
+        _rhs: Value,
+    ) -> Value {
+        builder.ins().iconst(cl_types::I8, 0)
+    }
+
     pub(crate) fn compile_binary_op(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -107,24 +138,53 @@ impl Compiler<'_> {
             let right_is_sparse = matches!(right_type, Type::Sparse { .. })
                 || matches!(&right.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.ownership.sparse_vars.contains(sym));
 
-            // ELTLS commit 3: the defensive retain/release dance around tensor
-            // binary ops has been removed. It was needed when the runtime's
-            // in-place gate fell back to a `can_mutate_inplace()` refcount
-            // heuristic that would trigger on refcount==1 regardless of
-            // flag-byte intent. The runtime now honors `flags=0` strictly —
-            // in-place only happens when the caller passes RELINQUISH_A.
-            // Task 13 will wire real ownership-derived flag bytes here.
+            // ELTLS commit 5 (Task 13): plumb the FBIP-3 flag byte from
+            // `compute_fbip_flags` through `compile_tensor_binary_op` so
+            // future tasks can flip on relinquish behavior without
+            // touching the dispatch signatures.
+            //
+            // Capture the PRE-call ownership state: if the flag byte ever
+            // becomes non-zero and the runtime consumes an operand, we
+            // must call `consume_ownership` to drop tracking before
+            // `set_ownership_from_op` promotes the operand to TapeHeld.
+            // Reading ownership post-call would see TapeHeld and miss the
+            // consume.
+            //
+            // Currently `compute_fbip_flags` returns 0 unconditionally
+            // (see its doc comment for the tape-crossing-function-boundary
+            // rationale), so `consume_ownership` below is a dead branch
+            // until the switch is flipped.
+            use crate::ownership_expr::Ownership;
+            let lhs_was_owned =
+                matches!(self.get_ownership(state, lhs), Ownership::Owned);
+            let rhs_was_owned =
+                matches!(self.get_ownership(state, rhs), Ownership::Owned);
+            let flags = self.compute_fbip_flags(builder, state, lhs, rhs);
             let result = self.compile_tensor_binary_op(
                 builder,
                 state,
                 lhs,
                 rhs,
+                flags,
                 op,
                 left_is_tensor,
                 right_is_tensor,
                 left_is_sparse,
                 right_is_sparse,
             )?;
+
+            // Match `compute_fbip_flags`'s current policy: no operands
+            // are relinquished, so no consume_ownership calls fire. When
+            // the policy is refined this block activates automatically.
+            let _relinquish_active = false;
+            if _relinquish_active {
+                if lhs_was_owned {
+                    self.consume_ownership(state, lhs);
+                }
+                if rhs_was_owned {
+                    self.consume_ownership(state, rhs);
+                }
+            }
 
             return Ok(result);
         }

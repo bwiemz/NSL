@@ -154,4 +154,33 @@ impl<'a> Compiler<'a> {
     pub fn note_unknown_fallback(&self, state: &mut FuncState, _val: ir::Value) {
         state.cleanup.unknown_ownership_count += 1;
     }
+
+    /// ELTLS: purge ownership entries for branch-local Values at a
+    /// branch-exit point. The phi-merge result takes over ownership of
+    /// any surviving tensor; the arm values themselves are unreachable
+    /// from the merge block (SSA dominance), so they must be dropped
+    /// from `owned_temporaries` / `expr_ownership` to prevent
+    /// statement-level cleanup from emitting frees on dead Values.
+    ///
+    /// Callers must snapshot `owned_temporaries.len()` before the
+    /// branch compiles and pass that snapshot as `base_len`. The
+    /// legacy `tensor_temporaries` queue is drained separately by the
+    /// existing per-branch truncate + explicit free loop.
+    pub fn purge_branch_local_ownership(
+        &self,
+        state: &mut FuncState,
+        base_len: usize,
+    ) {
+        if state.cleanup.owned_temporaries.len() <= base_len {
+            return;
+        }
+        let drained: Vec<_> = state
+            .cleanup
+            .owned_temporaries
+            .drain(base_len..)
+            .collect();
+        for v in drained {
+            state.cleanup.expr_ownership.remove(&v);
+        }
+    }
 }

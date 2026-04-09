@@ -72,6 +72,12 @@ impl Compiler<'_> {
         let mut reaching_loader_var_sets: Vec<Vec<Value>> = Vec::new();
         let temp_base_len = state.cleanup.tensor_temporaries.len();
         let linear_base_len = state.ownership.linear_consume_pending.len();
+        // ELTLS: snapshot the new ownership queue so branch-local Owned
+        // entries can be purged at branch-exit. The phi-merge result
+        // takes over ownership; arm-local SSA values are unreachable
+        // from the merge block and must not survive in
+        // `owned_temporaries` where statement cleanup would see them.
+        let owned_base_len = state.cleanup.owned_temporaries.len();
 
         let result_sem_ty = self.node_type(full_expr.id).clone();
         let result_type = nsl_type_to_cl(&result_sem_ty);
@@ -93,6 +99,7 @@ impl Compiler<'_> {
             .ownership
             .linear_consume_pending
             .truncate(linear_base_len);
+        self.purge_branch_local_ownership(state, owned_base_len);
         state.flags.conditional_depth += 1;
         let then_val = self.compile_expr(builder, state, then_expr);
         state.flags.conditional_depth -= 1;
@@ -136,6 +143,9 @@ impl Compiler<'_> {
                 .ownership
                 .linear_consume_pending
                 .truncate(linear_base_len);
+            // ELTLS: purge branch-local ownership entries. The phi result
+            // at the merge block will be re-registered as Owned separately.
+            self.purge_branch_local_ownership(state, owned_base_len);
 
             reaching_loader_sets.push(state.dataloader_symbols.clone());
             reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
@@ -146,6 +156,8 @@ impl Compiler<'_> {
                 .ownership
                 .linear_consume_pending
                 .truncate(linear_base_len);
+            // ELTLS: purge branch-local ownership entries (divergent path).
+            self.purge_branch_local_ownership(state, owned_base_len);
         }
 
         builder.switch_to_block(else_block);
@@ -161,6 +173,8 @@ impl Compiler<'_> {
             .ownership
             .linear_consume_pending
             .truncate(linear_base_len);
+        // ELTLS: reset the new ownership queue to the pre-branch snapshot.
+        self.purge_branch_local_ownership(state, owned_base_len);
         state.flags.conditional_depth += 1;
         let else_val = self.compile_expr(builder, state, else_expr);
         state.flags.conditional_depth -= 1;
@@ -204,6 +218,8 @@ impl Compiler<'_> {
                 .ownership
                 .linear_consume_pending
                 .truncate(linear_base_len);
+            // ELTLS: purge branch-local ownership entries.
+            self.purge_branch_local_ownership(state, owned_base_len);
 
             reaching_loader_sets.push(state.dataloader_symbols.clone());
             reaching_loader_var_sets.push(state.cleanup.dataloader_vars.clone());
@@ -214,6 +230,8 @@ impl Compiler<'_> {
                 .ownership
                 .linear_consume_pending
                 .truncate(linear_base_len);
+            // ELTLS: purge branch-local ownership entries (divergent path).
+            self.purge_branch_local_ownership(state, owned_base_len);
         }
 
         state.variables = incoming_variables.clone();
@@ -686,6 +704,7 @@ impl Compiler<'_> {
         state: &mut FuncState,
         lhs: Value,
         rhs: Value,
+        flags: Value,
         op: BinOp,
         left_is_tensor: bool,
         right_is_tensor: bool,
@@ -766,8 +785,10 @@ impl Compiler<'_> {
 
             // ELTLS (FBIP-3): all tensor-tensor ops (add/sub/mul/div/matmul) take a
             // flags byte as their third arg, including nsl_fp8_matmul_training.
-            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-            let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero])?;
+            // `flags` is computed by the caller from operand ownership; Owned
+            // operands have their relinquish bit set so the runtime can take
+            // the in-place path.
+            let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags])?;
             // ELTLS: route through set_ownership_from_op so DataRequired
             // ops inside a tape region promote the result AND inputs to
             // TapeHeld (wired by Task 15). Outside a tape region this
@@ -803,21 +824,25 @@ impl Compiler<'_> {
                 rhs_for_scalar
             };
             let _ = scale_fused; // logged in try_fuse_weight_scale
-            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            // ELTLS: for tensor-scalar ops the scalar Value isn't an I64
+            // pointer so its ownership query returns Unknown → bit clear.
+            // The tensor operand is `lhs` (ARG A), which matches the
+            // caller's lhs, so the caller's `flags` can be passed through
+            // directly.
             let (result, rt_name): (Value, &'static str) = match op {
                 BinOp::Add => (
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar, flags_zero])?,
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar, flags])?,
                     "nsl_tensor_add_scalar",
                 ),
                 BinOp::Mul => (
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar, flags_zero])?,
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar, flags])?,
                     "nsl_tensor_mul_scalar",
                 ),
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
                     (
-                        self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg, flags_zero])?,
+                        self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg, flags])?,
                         "nsl_tensor_add_scalar",
                     )
                 }
@@ -826,7 +851,7 @@ impl Compiler<'_> {
                     let one = builder.ins().f64const(1.0);
                     let inv = builder.ins().fdiv(one, scalar);
                     (
-                        self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv, flags_zero])?,
+                        self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv, flags])?,
                         "nsl_tensor_mul_scalar",
                     )
                 }
@@ -856,24 +881,37 @@ impl Compiler<'_> {
             } else {
                 builder.ins().fcvt_from_sint(cl_types::F64, lhs)
             };
-            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            // ELTLS: `nsl_tensor_*_scalar` takes the tensor as ARG A, not
+            // ARG B, so we must remap the caller's flag: the caller's
+            // RELINQUISH_B bit for `rhs` would become RELINQUISH_A for
+            // the callee. Since `compute_fbip_flags` currently returns 0
+            // unconditionally (tape-crossing-boundary guard; see its
+            // doc comment), pass 0 here too. The remap will become
+            // `(caller_flags & 0x02) >> 1` when the policy is refined.
+            let remapped_flags = builder.ins().iconst(cl_types::I8, 0);
+            let _ = flags; // not used until remap is active
             let (result, rt_name): (Value, &'static str) = match op {
                 BinOp::Add => (
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar, flags_zero])?,
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar, remapped_flags])?,
                     "nsl_tensor_add_scalar",
                 ),
                 BinOp::Mul => (
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar, flags_zero])?,
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar, remapped_flags])?,
                     "nsl_tensor_mul_scalar",
                 ),
                 BinOp::Sub => {
-                    // scalar - tensor = neg(tensor) + scalar
+                    // scalar - tensor = neg(tensor) + scalar.
+                    // neg_tensor is a fresh intermediate NOT tracked in
+                    // ownership; it is explicitly freed after the call.
+                    // Pass flags=0 to avoid a double-free with the manual
+                    // nsl_tensor_free below.
                     let neg_tensor =
                         self.compile_call_by_name(builder, "nsl_tensor_neg", &[rhs])?;
+                    let neg_flags = builder.ins().iconst(cl_types::I8, 0);
                     let result = self.compile_call_by_name(
                         builder,
                         "nsl_tensor_add_scalar",
-                        &[neg_tensor, scalar, flags_zero],
+                        &[neg_tensor, scalar, neg_flags],
                     )?;
                     // Free the intermediate neg_tensor (consumed by add_scalar)
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[neg_tensor])?;
