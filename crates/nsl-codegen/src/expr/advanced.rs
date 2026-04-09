@@ -14,6 +14,7 @@ use nsl_semantic::types::Type;
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::ownership_expr::Ownership;
 use crate::types::{is_block_filled, nsl_type_to_cl, pointer_type};
 
 impl Compiler<'_> {
@@ -258,6 +259,13 @@ impl Compiler<'_> {
             // tensor that wasn't explicitly tracked (e.g. the other branch
             // diverged), ensure the merged value is still freed at scope exit.
             state.cleanup.tensor_temporaries.push(merged_result);
+        }
+        // ELTLS: register tensor-typed phi-merge result as Owned. The
+        // merge_block param is a fresh Cranelift Value distinct from either
+        // branch's result, so tracking it here does not double-register
+        // arm values. Phase 1 is instrumentation only.
+        if result_sem_ty.is_tensor() || result_sem_ty.is_indeterminate() {
+            self.set_ownership(builder, state, merged_result, Ownership::Owned);
         }
         Ok(merged_result)
     }
@@ -701,12 +709,23 @@ impl Compiler<'_> {
             // M52b: Try constant folding if both operands are known weights
             if let Some(folded) = self.try_weight_fold(builder, state, lhs, rhs, op)? {
                 state.cleanup.tensor_temporaries.push(folded);
+                // ELTLS: folded tensor is a fresh allocation from
+                // nsl_tensor_from_static (see try_weight_fold). It's
+                // allocated as `owns_data=0` in the runtime but we still
+                // track it as Owned from the codegen's perspective —
+                // tensor_temporaries already frees it at scope exit.
+                self.set_ownership(builder, state, folded, Ownership::Owned);
                 return Ok(folded);
             }
 
             // M52b: Identity layer elimination — if one operand is a near-identity weight, skip the matmul
             if op == BinOp::MatMul {
                 if let Some(pass_through) = self.try_identity_elim(state, lhs, rhs) {
+                    // ELTLS: try_identity_elim returns one of the existing
+                    // operands unchanged — no new ownership entry is needed
+                    // because the operand retains its previously-registered
+                    // state (BorrowedWeight for the weight or whatever the
+                    // other operand was).
                     return Ok(pass_through);
                 }
             }
@@ -715,6 +734,13 @@ impl Compiler<'_> {
             if op == BinOp::MatMul && !state.flags.is_fp8_compute {
                 if let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)? {
                     state.cleanup.tensor_temporaries.push(sparse_result);
+                    // ELTLS: nsl_sparse_matmul returns a fresh owned tensor.
+                    self.set_ownership(
+                        builder,
+                        state,
+                        sparse_result,
+                        Ownership::Owned,
+                    );
                     return Ok(sparse_result);
                 }
             }
@@ -742,6 +768,21 @@ impl Compiler<'_> {
             // flags byte as their third arg, including nsl_fp8_matmul_training.
             let flags_zero = builder.ins().iconst(cl_types::I8, 0);
             let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero])?;
+            // ELTLS: route through set_ownership_from_op so DataRequired
+            // ops inside a tape region promote the result AND inputs to
+            // TapeHeld (wired by Task 15). Outside a tape region this
+            // behaves like set_ownership(result, Owned).
+            self.set_ownership_from_op(
+                builder,
+                state,
+                result,
+                &[lhs, rhs],
+                Ownership::Owned,
+                rt_name,
+            );
+            // Keep the legacy push during rollout — Task 13's
+            // consume_ownership will remove consumed operands from both
+            // queues when consumers are wired.
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else if left_is_tensor {
@@ -763,23 +804,31 @@ impl Compiler<'_> {
             };
             let _ = scale_fused; // logged in try_fuse_weight_scale
             let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-            let result = match op {
-                BinOp::Add => {
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar, flags_zero])?
-                }
-                BinOp::Mul => {
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar, flags_zero])?
-                }
+            let (result, rt_name): (Value, &'static str) = match op {
+                BinOp::Add => (
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar, flags_zero])?,
+                    "nsl_tensor_add_scalar",
+                ),
+                BinOp::Mul => (
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar, flags_zero])?,
+                    "nsl_tensor_mul_scalar",
+                ),
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg, flags_zero])?
+                    (
+                        self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg, flags_zero])?,
+                        "nsl_tensor_add_scalar",
+                    )
                 }
                 BinOp::Div => {
                     // tensor / scalar = tensor * (1/scalar)
                     let one = builder.ins().f64const(1.0);
                     let inv = builder.ins().fdiv(one, scalar);
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv, flags_zero])?
+                    (
+                        self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv, flags_zero])?,
+                        "nsl_tensor_mul_scalar",
+                    )
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
@@ -787,6 +836,16 @@ impl Compiler<'_> {
                     )))
                 }
             };
+            // ELTLS: only the tensor operand (lhs) is tracked for
+            // ownership; the scalar value is not a tensor pointer.
+            self.set_ownership_from_op(
+                builder,
+                state,
+                result,
+                &[lhs],
+                Ownership::Owned,
+                rt_name,
+            );
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else {
@@ -798,13 +857,15 @@ impl Compiler<'_> {
                 builder.ins().fcvt_from_sint(cl_types::F64, lhs)
             };
             let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-            let result = match op {
-                BinOp::Add => {
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar, flags_zero])?
-                }
-                BinOp::Mul => {
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar, flags_zero])?
-                }
+            let (result, rt_name): (Value, &'static str) = match op {
+                BinOp::Add => (
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar, flags_zero])?,
+                    "nsl_tensor_add_scalar",
+                ),
+                BinOp::Mul => (
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar, flags_zero])?,
+                    "nsl_tensor_mul_scalar",
+                ),
                 BinOp::Sub => {
                     // scalar - tensor = neg(tensor) + scalar
                     let neg_tensor =
@@ -816,7 +877,7 @@ impl Compiler<'_> {
                     )?;
                     // Free the intermediate neg_tensor (consumed by add_scalar)
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[neg_tensor])?;
-                    result
+                    (result, "nsl_tensor_add_scalar")
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
@@ -824,6 +885,16 @@ impl Compiler<'_> {
                     )))
                 }
             };
+            // ELTLS: only the tensor operand (rhs) is tracked; the scalar
+            // is not a tensor pointer.
+            self.set_ownership_from_op(
+                builder,
+                state,
+                result,
+                &[rhs],
+                Ownership::Owned,
+                rt_name,
+            );
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         }
@@ -2027,6 +2098,10 @@ impl Compiler<'_> {
             }
         };
         state.cleanup.tensor_temporaries.push(result);
+        // ELTLS: compile_sparse_binary_op always produces a fresh owned
+        // tensor result (either from an nsl_sparse_* op or an
+        // nsl_tensor_* op on converted-dense inputs).
+        self.set_ownership(builder, state, result, Ownership::Owned);
         Ok(result)
     }
 
