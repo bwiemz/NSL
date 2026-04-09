@@ -34,6 +34,12 @@ use crate::memory::{checked_alloc, checked_alloc_zeroed, checked_free};
 static FBIP_REUSE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FBIP_ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// ELTLS instrumentation: counts how many times `nsl_tensor_free_if_valid`
+/// actually freed a valid tensor. Goal: zero for training hot path after
+/// full ELTLS rollout — proves no tensor escaped producer-site tracking.
+static NSL_DEBUG_EPILOG_FREE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 pub(crate) fn fbip_record_reuse() {
     FBIP_REUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1064,7 +1070,23 @@ pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
     let magic = unsafe { *(ptr as *const u32) };
     if magic == TENSOR_MAGIC {
         nsl_tensor_free(ptr);
+        NSL_DEBUG_EPILOG_FREE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// ELTLS instrumentation: read the total number of actual frees performed by
+/// `nsl_tensor_free_if_valid`. A non-zero value indicates tensors escaping
+/// producer-site ownership tracking and being cleaned up by the runtime epilog
+/// sweep — the value should trend to zero as ELTLS rollout completes.
+#[no_mangle]
+pub extern "C" fn nsl_debug_epilog_free_count() -> u64 {
+    NSL_DEBUG_EPILOG_FREE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ELTLS instrumentation: reset the epilog free counter to zero.
+#[no_mangle]
+pub extern "C" fn nsl_debug_epilog_free_reset() {
+    NSL_DEBUG_EPILOG_FREE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Safe version of nsl_tensor_clone that returns the original i64 when the input
@@ -3978,4 +4000,42 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = step; }
+}
+
+#[cfg(test)]
+mod epilog_counter_tests {
+    use super::*;
+
+    /// Helper: create a 1-D f64 tensor (CPU, dtype=0, contiguous, refcount=1).
+    fn make_tensor_f64(data: &[f64]) -> i64 {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, data.len() as i64);
+        let ptr = crate::tensor::creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = *v };
+        }
+        ptr
+    }
+
+    #[test]
+    fn counter_starts_at_zero_after_reset() {
+        nsl_debug_epilog_free_reset();
+        assert_eq!(nsl_debug_epilog_free_count(), 0);
+    }
+
+    #[test]
+    fn counter_increments_on_valid_free() {
+        nsl_debug_epilog_free_reset();
+        let t = make_tensor_f64(&[1.0, 2.0, 3.0]);
+        nsl_tensor_free_if_valid(t);
+        assert_eq!(nsl_debug_epilog_free_count(), 1);
+    }
+
+    #[test]
+    fn counter_unchanged_on_null_ptr() {
+        nsl_debug_epilog_free_reset();
+        nsl_tensor_free_if_valid(0);
+        assert_eq!(nsl_debug_epilog_free_count(), 0);
+    }
 }
