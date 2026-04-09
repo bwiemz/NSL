@@ -217,10 +217,15 @@ pub extern "C" fn nsl_fp8_matmul(
 pub extern "C" fn nsl_fp8_matmul_training(
     a_ptr: i64,
     b_ptr: i64,
+    flags: u8,
 ) -> i64 {
     use crate::autodiff;
+    use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     use crate::tensor::NslTensor;
     use std::sync::atomic::Ordering;
+
+    let relinq_a = relinquish_a(flags);
+    let relinq_b = relinquish_b(flags);
 
     let is_recording = autodiff::is_recording();
 
@@ -230,6 +235,9 @@ pub extern "C" fn nsl_fp8_matmul_training(
         autodiff::TAPE.with(|t| t.borrow_mut().pause_depth += 1);
     }
 
+    // Do NOT forward the relinquish flags into nsl_tensor_matmul: we still
+    // need to read shapes/refcounts from a_ptr/b_ptr for tape recording
+    // below. We free A/B ourselves at the end.
     let result = crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr, 0);
 
     if is_recording {
@@ -269,6 +277,11 @@ pub extern "C" fn nsl_fp8_matmul_training(
         });
     }
 
+    // FBIP-3: fp8 matmul has no in-place path; the flag only enables eager
+    // freeing of A and B after the matmul (and after tape recording has
+    // consumed their metadata).
+    if relinq_a { crate::tensor::nsl_tensor_free(a_ptr); }
+    if relinq_b { crate::tensor::nsl_tensor_free(b_ptr); }
     result
 }
 

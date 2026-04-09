@@ -1291,7 +1291,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     (
         "nsl_fp8_matmul_training",
-        &[types::I64, types::I64],
+        &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
     (

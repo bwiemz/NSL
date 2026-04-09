@@ -739,14 +739,9 @@ impl Compiler<'_> {
             self.annotate_sparsity_hints(state, lhs, rhs, op);
 
             // ELTLS (FBIP-3): all tensor-tensor ops (add/sub/mul/div/matmul) take a
-            // flags byte as their third arg. nsl_fp8_matmul_training keeps the legacy
-            // 2-arg signature.
-            let result = if rt_name == "nsl_fp8_matmul_training" {
-                self.compile_traced_call(builder, rt_name, &[lhs, rhs])?
-            } else {
-                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero])?
-            };
+            // flags byte as their third arg, including nsl_fp8_matmul_training.
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            let result = self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero])?;
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else if left_is_tensor {
