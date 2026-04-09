@@ -1,0 +1,9 @@
+let data = randn([4])
+
+let value = if true:
+    let loader = DataLoader(data, batch_size=2)
+    1
+else:
+    0
+
+print(value)

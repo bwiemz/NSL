@@ -1,0 +1,6 @@
+let f = if true:
+    |x| x
+else:
+    |x| x + 1
+
+print(f(1))

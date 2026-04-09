@@ -1,0 +1,6 @@
+fn choose(x: Tensor < [1], f64 >) -> Tensor < [1], f64 >:
+    let y = if true:
+        x
+    else:
+        x
+    return y

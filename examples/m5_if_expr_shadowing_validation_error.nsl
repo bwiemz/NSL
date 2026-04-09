@@ -1,0 +1,9 @@
+let x = 1
+
+let y = if true:
+    let x = 2
+    x
+else:
+    x
+
+print(y)

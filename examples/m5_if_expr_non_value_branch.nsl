@@ -1,0 +1,6 @@
+let value = if true:
+    let tmp = 1
+else:
+    1
+
+print(value)

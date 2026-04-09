@@ -1,0 +1,8 @@
+let x = ones([2])
+
+if true:
+    x
+else:
+    zeros([2])
+
+print(x)
