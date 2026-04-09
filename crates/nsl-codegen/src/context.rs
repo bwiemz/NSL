@@ -3,6 +3,8 @@ use cranelift_frontend::Variable;
 use nsl_ast::Symbol;
 use std::collections::{HashMap, HashSet};
 
+use crate::ownership_expr::Ownership;
+
 /// Per-function loop tracking for break/continue.
 pub struct LoopContext {
     /// Block to jump to on `continue`. For while loops this is the header (condition check).
@@ -47,6 +49,28 @@ pub struct TensorCleanupState {
     /// Suppresses codegen-level tensor_temporaries cleanup to avoid double-free
     /// with scope_end (which handles all cleanup at end of each iteration).
     pub in_scoped_loop: bool,
+
+    /// ELTLS (spec §4.2): per-Value ownership state. Populated by producer
+    /// sites in compile_*. Missing entries are treated as Ownership::Unknown
+    /// (strict fallback).
+    pub expr_ownership: HashMap<ir::Value, Ownership>,
+
+    /// ELTLS: deterministic list of Values currently in the Owned state.
+    /// Iterated at statement boundaries in insertion order for stable,
+    /// test-friendly cleanup.
+    ///
+    /// Invariant: for every v in owned_temporaries,
+    ///   expr_ownership[v] == Ownership::Owned.
+    /// Promotion to TapeHeld removes from this Vec.
+    /// Consumption by a linear-last-use FFI removes from this Vec.
+    pub owned_temporaries: Vec<ir::Value>,
+
+    /// ELTLS: Values in TapeHeld state, freed at tape-region exit.
+    pub tape_held: Vec<ir::Value>,
+
+    /// ELTLS: per-function counter of consumer sites that hit Unknown.
+    /// Goal: zero for hot-path functions after full rollout.
+    pub unknown_ownership_count: usize,
 }
 
 impl TensorCleanupState {
@@ -57,6 +81,10 @@ impl TensorCleanupState {
             temp_scope_stack: Vec::new(),
             active_batch_vars: Vec::new(),
             in_scoped_loop: false,
+            expr_ownership: HashMap::new(),
+            owned_temporaries: Vec::new(),
+            tape_held: Vec::new(),
+            unknown_ownership_count: 0,
         }
     }
 }
