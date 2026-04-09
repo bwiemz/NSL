@@ -30,6 +30,11 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
     let relinq_b = relinquish_b(flags);
+    // Capture caller's original B pointer BEFORE reconcile_device shadows `b`.
+    // When reconcile_device performs a cross-device transfer it returns a
+    // fresh runtime-owned allocation; the caller's original `b` still needs
+    // to be freed if they relinquished it. See ELTLS commit 1b.1 fix.
+    let b_orig = b;
     let (b, b_transferred) = reconcile_device(a, b);
     {
         let ta = unsafe { &*(a as *const NslTensor) };
@@ -41,11 +46,14 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
-                    // FBIP-3: caller relinquished B — free the original B (not the transferred alias).
-                    // If b was transferred, that copy is also caller-owned and must be freed.
+                    // FBIP-3: free caller's original B if relinquished.
+                    // Free the runtime-owned reconciled copy if we created one.
+                    // When b_transferred=false, b == b_orig, so relinq_b already
+                    // freed it and the b_transferred branch is a no-op.
                     if relinq_b {
-                        nsl_tensor_free(b);
-                    } else if b_transferred {
+                        nsl_tensor_free(b_orig);
+                    }
+                    if b_transferred {
                         nsl_tensor_free(b);
                     }
                     return a;
@@ -56,8 +64,9 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                     nsl_tensor_free(a);
                 }
                 if relinq_b {
-                    nsl_tensor_free(b);
-                } else if b_transferred {
+                    nsl_tensor_free(b_orig);
+                }
+                if b_transferred {
                     nsl_tensor_free(b);
                 }
                 return result;
@@ -86,10 +95,12 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
             ta.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
             // FBIP-3 double-free-safe: even on the in-place-on-A branch, if B was
-            // relinquished it must still be freed here (the critical bug being prevented).
+            // relinquished the caller's original must still be freed (the critical
+            // bug being prevented). Runtime-owned reconciled copy freed separately.
             if relinq_b {
-                nsl_tensor_free(b);
-            } else if b_transferred {
+                nsl_tensor_free(b_orig);
+            }
+            if b_transferred {
                 nsl_tensor_free(b);
             }
             return a;
@@ -118,8 +129,9 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
         nsl_tensor_free(a);
     }
     if relinq_b {
-        nsl_tensor_free(b);
-    } else if b_transferred {
+        nsl_tensor_free(b_orig);
+    }
+    if b_transferred {
         nsl_tensor_free(b);
     }
     result
@@ -943,4 +955,20 @@ mod fbip_add_tests {
         // B has been freed by the runtime. Do not touch it.
         nsl_tensor_free(out); // out == a
     }
+
+    // TODO(eltls): add a regression test for the cross-device RELINQUISH_B path
+    // (caller's CPU B reconciled to GPU alongside a GPU A). The bug fixed in
+    // ELTLS commit 1b.1 was that `reconcile_device` shadows `b` with a fresh
+    // runtime-owned copy, so the original free logic leaked the caller's
+    // original B. A proper test requires either:
+    //   (a) a per-tensor free counter in the runtime (analogous to the
+    //       existing GPU_TENSOR_LIVE tracker, but for CPU tensors too), OR
+    //   (b) the thread-local `memory::stats` CPU counters wired into tensor
+    //       Box allocations (currently they only track checked_alloc/free
+    //       of data buffers, not the NslTensor struct box itself).
+    // Until one of those is available, observing "was the caller's original
+    // pointer freed" requires reading the poisoned magic field of freed
+    // memory, which is undefined behavior (the Box is dropped right after
+    // the magic poison write). The fix is verified by code review and by
+    // the fact that the GPU leak surfaces visibly in training workloads.
 }
