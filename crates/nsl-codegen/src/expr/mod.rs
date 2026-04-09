@@ -201,6 +201,11 @@ impl Compiler<'_> {
     /// Check if a tensor Ident expression should skip refcount ops (retain/release).
     /// Returns true when the binding is linear under ownership lowering, meaning the
     /// compiler has proven single-ownership — no refcount bumps needed.
+    ///
+    /// ELTLS commit 3: the sole caller (the retain/release dance in binary_ops)
+    /// has been deleted. Task 13 will revive this helper to drive the relinquish
+    /// flag bytes on tensor binary FFIs.
+    #[allow(dead_code)]
     pub(crate) fn should_elide_refcount_for_ident(
         state: &FuncState,
         expr: &nsl_ast::expr::Expr,

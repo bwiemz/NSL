@@ -107,31 +107,13 @@ impl Compiler<'_> {
             let right_is_sparse = matches!(right_type, Type::Sparse { .. })
                 || matches!(&right.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.ownership.sparse_vars.contains(sym));
 
-            // FBIP safety: protect tensor operands from runtime in-place mutation
-            // when they come from named variables (Ident). The runtime FBIP check
-            // uses refcount==1, but the codegen can't guarantee refcount reflects
-            // all live aliases. Retain before the call, release after.
-            // This is always safe: worst case we skip one FBIP opportunity.
-            //
-            // M38b: When ownership lowering proves a binding is linear (single owner),
-            // refcount ops are unnecessary — the compiler guarantees exclusive access.
-            // Skipping retain/release lets the runtime see refcount==1 and take the
-            // in-place fast path.
-            let protect_lhs = left_is_tensor
-                && !left_is_sparse
-                && matches!(left.kind, nsl_ast::expr::ExprKind::Ident(_))
-                && !Self::should_elide_refcount_for_ident(state, left);
-            let protect_rhs = right_is_tensor
-                && !right_is_sparse
-                && matches!(right.kind, nsl_ast::expr::ExprKind::Ident(_))
-                && !Self::should_elide_refcount_for_ident(state, right);
-
-            if protect_lhs {
-                self.compile_call_by_name(builder, "nsl_tensor_retain", &[lhs])?;
-            }
-            if protect_rhs {
-                self.compile_call_by_name(builder, "nsl_tensor_retain", &[rhs])?;
-            }
+            // ELTLS commit 3: the defensive retain/release dance around tensor
+            // binary ops has been removed. It was needed when the runtime's
+            // in-place gate fell back to a `can_mutate_inplace()` refcount
+            // heuristic that would trigger on refcount==1 regardless of
+            // flag-byte intent. The runtime now honors `flags=0` strictly —
+            // in-place only happens when the caller passes RELINQUISH_A.
+            // Task 13 will wire real ownership-derived flag bytes here.
             let result = self.compile_tensor_binary_op(
                 builder,
                 state,
@@ -143,12 +125,6 @@ impl Compiler<'_> {
                 left_is_sparse,
                 right_is_sparse,
             )?;
-            if protect_lhs {
-                self.compile_call_by_name(builder, "nsl_tensor_release", &[lhs])?;
-            }
-            if protect_rhs {
-                self.compile_call_by_name(builder, "nsl_tensor_release", &[rhs])?;
-            }
 
             return Ok(result);
         }
