@@ -34,10 +34,12 @@ pub enum Ownership {
     /// Explicit ignorance state. Producer failed to register ownership
     /// OR the value came from a codegen path not yet migrated to ELTLS.
     /// Consumers MUST take the conservative slow path:
+    ///
     ///   - want to mutate → emit `nsl_tensor_clone` first
     ///   - want to store → emit `nsl_tensor_retain`
     ///   - at statement cleanup → leave alone; the epilog sweep will
     ///     free it via `nsl_tensor_free_if_valid`
+    ///
     /// Every Unknown hit at a consumer increments
     /// `state.cleanup.unknown_ownership_count` for rollout measurement.
     Unknown,

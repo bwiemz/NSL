@@ -142,7 +142,7 @@ impl<'a> Compiler<'a> {
     /// values (spec §4.3 consume_ownership notes + §9.1 Commit 5 tests).
     pub fn consume_ownership(&self, state: &mut FuncState, val: ir::Value) {
         debug_assert!(
-            !state.cleanup.tape_held.iter().any(|&v| v == val),
+            !state.cleanup.tape_held.contains(&val),
             "ELTLS: consume_ownership called on TapeHeld value {val:?}"
         );
         state.cleanup.expr_ownership.remove(&val);
