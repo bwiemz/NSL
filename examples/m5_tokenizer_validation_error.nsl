@@ -1,0 +1,5 @@
+tokenizer bad_tokenizer(algorithm=bpe, vocab_size=128):
+    padding:
+        side = center
+
+print("unreachable")

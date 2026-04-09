@@ -1,0 +1,5 @@
+dataset bad_data("demo"):
+    source = "data.bin"
+    unexpected = 1
+
+print("unreachable")

@@ -1,0 +1,21 @@
+let tokens = full([32], 1.0)
+let loader = DataLoader(tokens, batch_size=1, seq_len=8, shuffle=false, drop_last=true)
+
+let step = 0
+let total_tokens = 0
+let running_loss = 0.0
+
+for batch in loader:
+    let _ids = batch.input_ids
+    total_tokens = total_tokens + 8
+    running_loss = running_loss * 0.5 + 1.0
+    if step == 0:
+        running_loss = 1.0
+
+    step = step + 1
+    if step >= 2:
+        break
+
+print(step)
+print(total_tokens)
+print(running_loss)

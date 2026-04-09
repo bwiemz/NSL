@@ -1,0 +1,12 @@
+struct Box<T: Comparable<T>>:
+    value: T
+
+trait Named<T: Display>:
+    fn name(self) -> str:
+        return "named"
+
+trait Display:
+    fn render(self) -> str
+
+trait Comparable<T>:
+    fn eq(self, other: T) -> bool

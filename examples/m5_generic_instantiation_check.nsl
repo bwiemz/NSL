@@ -1,0 +1,39 @@
+struct Box<T>:
+    value: T
+
+struct Pair<A, B>:
+    first: A
+    second: B
+
+struct Wrapper<T>:
+    inner: Box<T>
+
+model Holder<T>:
+    value: T
+
+    fn get(self) -> T:
+        return self.value
+
+model Mapper<K, V>:
+    entry: Pair<K, V>
+
+    fn value(self) -> V:
+        return self.entry.second
+
+struct Deep<T>:
+    item: Pair<Box<T>, Holder<T>>
+
+fn read_value(wrapper: Wrapper<int>) -> int:
+    return wrapper.inner.value
+
+fn read_pair(pair: Pair<int, str>) -> str:
+    return pair.second
+
+fn read_holder(holder: Holder<int>) -> int:
+    return holder.get()
+
+fn read_mapper(mapper: Mapper<int, str>) -> str:
+    return mapper.value()
+
+fn read_deep(deep: Deep<int>) -> int:
+    return deep.item.second.get()

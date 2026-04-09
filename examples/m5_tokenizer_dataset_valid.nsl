@@ -1,0 +1,26 @@
+tokenizer demo_tokenizer(algorithm=bpe, vocab_size=1024):
+    special_tokens:
+        pad = "<pad>"
+        eos = "<eos>"
+
+    normalize: nfkc, lowercase
+    pre_tokenize: whitespace, byte_fallback
+
+    padding:
+        side = left
+        pad_to = longest
+
+    truncation:
+        max_length = 128
+        strategy = longest_first
+
+dataset train_data("demo"):
+    source = "data.bin"
+    format = binary
+    sequence_length = 128
+    packing = true
+    pack_separator = 0
+    shuffle = false
+    max_samples = 100
+
+print("ok")

@@ -1,0 +1,5 @@
+struct Box<T>:
+    value: T
+
+fn bad(box: Box<int, str>) -> int:
+    return 0

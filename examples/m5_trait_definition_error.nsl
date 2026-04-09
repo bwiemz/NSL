@@ -1,0 +1,2 @@
+struct Bad<T: int>:
+    value: T
