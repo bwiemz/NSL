@@ -1,0 +1,89 @@
+# models/coder50m/pretrain_safe.nsl
+# Conservative pretraining test: batch=2, seq=512 to validate stability
+# before scaling up to batch=4, seq=1024
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+print("Initializing model...")
+let m = NSLCoder()
+print("Model created, transferring to GPU...")
+m.to(cuda)
+print("Model on GPU")
+print("================================================================")
+print("  NSL-Coder-50M Pretraining (GPU) — SAFE CONFIG")
+print("  48.8M params | batch=2, seq=512 | RTX 5070 Ti")
+print("================================================================")
+
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+
+let step = 0
+let total_tokens = 0
+let running_loss = 0.0
+let run_start = clock()
+let step_start = clock()
+let max_steps = 50
+
+print("")
+print("step | loss     | avg_loss | tok/s    | ms/step  | total_tok")
+print("-----|----------|----------|----------|----------|----------")
+
+for batch in loader:
+    let input_ids = batch.input_ids.to(cuda)
+    let labels = batch.labels
+
+    let logits = m.forward_train(input_ids, false)
+
+    let logits_cpu = logits.to(cpu)
+    let ls = logits_cpu.shape
+    let flat_logits = logits_cpu.reshape([ls[0] * ls[1], ls[2]])
+    let flat_labels = labels.reshape([ls[0] * ls[1]])
+    let loss = cross_entropy(flat_logits, flat_labels)
+    let loss_val = loss.item()
+
+    total_tokens = total_tokens + 1024
+    running_loss = running_loss * 0.99 + loss_val * 0.01
+    if step == 0:
+        running_loss = loss_val
+
+    if step % 5 == 0:
+        let now = clock()
+        let elapsed = now - run_start
+        let tok_per_sec = 0.0
+        if elapsed > 0.0:
+            tok_per_sec = float(total_tokens) / elapsed
+        let step_ms = 0.0
+        if step > 0:
+            step_ms = (now - step_start) * 1000.0 / 5.0
+        else:
+            step_ms = (now - step_start) * 1000.0
+
+        print(step)
+        print(loss_val)
+        print(running_loss)
+        print(tok_per_sec)
+        print(step_ms)
+        print(total_tokens)
+        print("")
+        step_start = clock()
+
+    step = step + 1
+    if step >= max_steps:
+        break
+
+let total_time = clock() - run_start
+print("================================================================")
+print("  Safe Config Test Complete")
+print("================================================================")
+print("Steps:")
+print(step)
+print("Total tokens:")
+print(total_tokens)
+print("Total time (s):")
+print(total_time)
+print("Avg tokens/sec:")
+if total_time > 0.0:
+    print(float(total_tokens) / total_time)
+print("Final loss:")
+print(running_loss)

@@ -1,0 +1,22 @@
+# Test DataLoader + forward pass without train block
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+print("Model created")
+
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+print("Data loaded")
+
+let loader = DataLoader(tokens, batch_size=1, seq_len=16, shuffle=false, drop_last=true)
+print("DataLoader created")
+
+for batch in loader:
+    print("Got batch")
+    let ids = batch.input_ids
+    print("Got input_ids")
+    let logits = m.forward_train(ids, false)
+    print("Forward done")
+    break
+
+print("Test complete")

@@ -1,0 +1,10 @@
+from model import NSLCoder
+print("init...")
+let m = NSLCoder()
+print("to gpu...")
+m.to(cuda)
+print("input...")
+let x = full([1, 1024], 1.0).to(cuda)
+print("embedding...")
+let emb = embedding_lookup(m.embed, x.reshape([1024]))
+print("embedding done")

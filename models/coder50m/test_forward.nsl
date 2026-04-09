@@ -1,0 +1,13 @@
+# Minimal forward pass test — isolate the crash
+from model import NSLCoder
+
+let m = NSLCoder()
+print("Model created")
+
+# Create fake input: 16 token IDs
+let input_ids = zeros([16])
+print("Input created")
+
+let logits = m.forward(input_ids)
+print("Forward pass complete")
+print(logits.shape)

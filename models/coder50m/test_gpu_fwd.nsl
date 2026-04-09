@@ -1,0 +1,24 @@
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+let m = NSLCoder()
+m.to(cuda)
+print("Starting step 0...")
+let t0 = clock()
+let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=128, shuffle=false, drop_last=true)
+for batch in loader:
+    let ids = batch.input_ids.to(cuda)
+    let labels = batch.labels
+    let logits = m.forward_train(ids, false)
+    let logits_cpu = logits.to(cpu)
+    let ls = logits_cpu.shape
+    let flat_logits = logits_cpu.reshape([ls[0] * ls[1], ls[2]])
+    let flat_labels = labels.reshape([ls[0] * ls[1]])
+    let loss = cross_entropy(flat_logits, flat_labels)
+    let t1 = clock()
+    print("Step 0 complete!")
+    print("Loss:")
+    print(loss.item())
+    print("Time (s):")
+    print(t1 - t0)
+    break

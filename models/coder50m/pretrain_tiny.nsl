@@ -1,0 +1,27 @@
+# Minimal train block test — CPU only, tiny model, to verify train block works
+from nsl.nn.losses import cross_entropy
+
+model TinyModel:
+    w: Tensor = randn([16, 8]) * full([1], 0.02)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = TinyModel()
+let x = randn([4, 16])
+let y = randn([4, 8])
+
+from nsl.nn.losses import mse_loss
+
+print("Starting tiny train test...")
+train(model=m, epochs=3):
+    optimizer: AdamW(lr=0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_epoch(epoch, loss):
+            print(epoch)
+            print(loss)
+
+print("Tiny train test complete!")

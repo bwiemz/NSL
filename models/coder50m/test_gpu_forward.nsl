@@ -1,0 +1,11 @@
+from model import NSLCoder
+print("Creating model...")
+let m = NSLCoder()
+print("Model created")
+m.to(cuda)
+print("On GPU")
+let x = full([1, 1024], 1.0).to(cuda)
+print("Input ready")
+let out = m.forward_train(x, false)
+print("Forward complete")
+print(out.ndim)

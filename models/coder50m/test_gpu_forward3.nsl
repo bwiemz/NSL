@@ -1,0 +1,9 @@
+from model import NSLCoder
+print("init")
+let m = NSLCoder()
+m.to(cuda)
+print("gpu ok")
+let ids = full([1, 1024], 1.0).to(cuda)
+print("calling forward_train...")
+let out = m.forward_train(ids, false)
+print("DONE")
