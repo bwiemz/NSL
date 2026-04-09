@@ -25,6 +25,32 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     if std::env::var("NSL_PROFILE_KERNELS").is_ok() {
         crate::kernel_profiler::nsl_kernel_profiler_start();
     }
+
+    // ELTLS instrumentation: print GPU memory report at program exit when
+    // NSL_GPU_MEM_REPORT env var is set. Piggybacks on the C `atexit`
+    // function (available on both glibc and MSVCRT/UCRT) so the report
+    // fires after the compiled Cranelift `main` returns.
+    if std::env::var("NSL_GPU_MEM_REPORT").is_ok() {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_gpu_mem_report_atexit);
+        }
+    }
+}
+
+extern "C" fn nsl_gpu_mem_report_atexit() {
+    let epilog_frees = crate::tensor::nsl_debug_epilog_free_count();
+    eprintln!("--- GPU memory report ---");
+    eprintln!("epilog_frees_total: {epilog_frees}");
+    #[cfg(feature = "cuda")]
+    {
+        // Print live caching-allocator block summary (step=0 so it prints).
+        crate::tensor::nsl_debug_gpu_alloc_summary(0);
+        // Print driver + allocator stats (step=0 so it prints).
+        crate::tensor::nsl_debug_gpu_mem(0);
+    }
 }
 
 #[no_mangle]

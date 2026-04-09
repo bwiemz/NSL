@@ -199,6 +199,12 @@ enum Cli {
         #[arg(long)]
         cuda_sync: bool,
 
+        /// ELTLS instrumentation: print a GPU memory report at end of run.
+        /// Prints epilog_frees_total plus (with --features cuda) the
+        /// live caching-allocator block summary and driver/allocator stats.
+        #[arg(long)]
+        gpu_mem_report: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -833,6 +839,7 @@ fn main() {
             wcet_target,
             fpga_device,
             cuda_sync,
+            gpu_mem_report,
         } => {
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
@@ -1034,6 +1041,9 @@ fn main() {
                     if cuda_sync {
                         cmd.env("NSL_CUDA_SYNC", "1");
                     }
+                    if gpu_mem_report {
+                        cmd.env("NSL_GPU_MEM_REPORT", "1");
+                    }
 
                     // Pass through program args
                     if !args.is_empty() {
@@ -1080,7 +1090,7 @@ fn main() {
                     std::process::exit(1);
                 }
             } else {
-                run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, &compile_opts);
+                run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, gpu_mem_report, &compile_opts);
             }
         }
         Cli::Test { file, filter } => {
@@ -2217,7 +2227,7 @@ fn run_build_multi(file: &std::path::Path, output: Option<PathBuf>, emit_obj: bo
     }
 }
 
-fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool, cuda_sync: bool, options: &nsl_codegen::CompileOptions) {
+fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool, cuda_sync: bool, gpu_mem_report: bool, options: &nsl_codegen::CompileOptions) {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
@@ -2249,6 +2259,11 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
     }
     if cuda_sync {
         cmd.env("NSL_CUDA_SYNC", "1");
+    }
+    if gpu_mem_report {
+        // ELTLS: instructs the runtime (via atexit hook in nsl_args_init)
+        // to print the GPU memory report after the compiled main returns.
+        cmd.env("NSL_GPU_MEM_REPORT", "1");
     }
     let status = cmd
         .status()
@@ -2734,7 +2749,7 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
             // The NSL file should contain an export_model() function (or similar)
             // that calls to_onnx() internally. We just compile and run it.
             println!("Exporting ONNX from {}", file.display());
-            run_run(file, &[], false, false, false, false, &nsl_codegen::CompileOptions::default());
+            run_run(file, &[], false, false, false, false, false, &nsl_codegen::CompileOptions::default());
         }
         "safetensors" => {
             if ext != "nslm" {
