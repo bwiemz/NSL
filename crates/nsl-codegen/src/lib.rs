@@ -34,6 +34,7 @@ pub mod moe;
 pub mod moe_kernels;
 pub mod multimodal;
 pub mod ownership;
+pub mod ownership_expr;
 pub mod pipeline;
 pub mod reduction_fusion;
 pub mod serve;
