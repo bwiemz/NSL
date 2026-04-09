@@ -4,6 +4,7 @@ mod entry_points;
 mod functions;
 mod kernel;
 mod main_entry;
+mod ownership_api;
 
 use std::collections::{HashMap, HashSet};
 
