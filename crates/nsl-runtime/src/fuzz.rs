@@ -343,7 +343,7 @@ impl FuzzState {
             FuzzOp::ScalarMul { idx, scalar } => {
                 let ptr = self.live[idx];
                 let shape = self.shapes[idx].clone();
-                let result = nsl_tensor_mul_scalar(ptr, scalar);
+                let result = nsl_tensor_mul_scalar(ptr, scalar, 0);
                 self.register(result, shape);
             }
 

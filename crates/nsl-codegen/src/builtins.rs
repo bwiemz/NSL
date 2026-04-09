@@ -241,12 +241,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor scalar ops
     (
         "nsl_tensor_add_scalar",
-        &[types::I64, types::F64],
+        &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
     (
         "nsl_tensor_mul_scalar",
-        &[types::I64, types::F64],
+        &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
     // Tensor matmul

@@ -1199,7 +1199,7 @@ impl Compiler<'_> {
             let matmul_flags0 = builder.ins().iconst(cl_types::I8, 0);
             let scores = self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t, matmul_flags0])?;
             let scaled =
-                self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
+                self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val, matmul_flags0])?;
 
             let masked = if causal {
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);

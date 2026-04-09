@@ -918,7 +918,7 @@ mod tests {
         // Forward fn: loss = weight * 3
         let fwd: ForwardFn = Box::new(move |weights: &[i64], _inputs: &[i64]| {
             let w = weights[0];
-            let out = crate::tensor::nsl_tensor_mul_scalar(w, 3.0_f64);
+            let out = crate::tensor::nsl_tensor_mul_scalar(w, 3.0_f64, 0);
             vec![out]
         });
 

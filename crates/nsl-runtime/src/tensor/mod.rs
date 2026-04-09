@@ -3723,7 +3723,7 @@ mod tests {
     #[test]
     fn test_fbip_add_scalar_inplace() {
         let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
-        let result = arithmetic::nsl_tensor_add_scalar(ptr, 10.0);
+        let result = arithmetic::nsl_tensor_add_scalar(ptr, 10.0, 0);
         assert_eq!(result, ptr);
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
@@ -3735,7 +3735,7 @@ mod tests {
     #[test]
     fn test_fbip_mul_scalar_inplace() {
         let ptr = make_f64_tensor(&[2.0, 3.0, 4.0]);
-        let result = arithmetic::nsl_tensor_mul_scalar(ptr, 5.0);
+        let result = arithmetic::nsl_tensor_mul_scalar(ptr, 5.0, 0);
         assert_eq!(result, ptr);
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();

@@ -478,29 +478,33 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
 // === Scalar-tensor ops ===
 
 #[no_mangle]
-pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
+pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
+    use crate::tensor::fbip_flags::relinquish_a;
+    let relinq_a = relinquish_a(flags);
     {
         let ta = unsafe { &*(a_ptr as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                if ta.can_mutate_inplace_gpu() {
+                if relinq_a || ta.can_mutate_inplace_gpu() {
                     crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                if relinq_a { nsl_tensor_free(a_ptr); }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned (CPU).
+    // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
     // Skip for dtype=4 (i32) — needs type conversion to float, can't mutate in-place.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if t.dtype != 4 && t.can_mutate_inplace() {
+        if t.dtype != 4 && (relinq_a || t.can_mutate_inplace()) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -564,32 +568,37 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64) -> i64 {
     if autodiff::is_recording() {
         autodiff::maybe_record(autodiff::TapeOp::AddScalar { a: a_ptr, out: result });
     }
+    if relinq_a { nsl_tensor_free(a_ptr); }
     result
 }
 
 #[no_mangle]
-pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
+pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
+    use crate::tensor::fbip_flags::relinquish_a;
+    let relinq_a = relinquish_a(flags);
     {
         let ta = unsafe { &*(a_ptr as *const NslTensor) };
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                if ta.can_mutate_inplace_gpu() {
+                if relinq_a || ta.can_mutate_inplace_gpu() {
                     crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                return crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                if relinq_a { nsl_tensor_free(a_ptr); }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned (CPU)
+    // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if t.can_mutate_inplace() {
+        if relinq_a || t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -646,6 +655,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64) -> i64 {
             out: result,
         });
     }
+    if relinq_a { nsl_tensor_free(a_ptr); }
     result
 }
 
@@ -1142,6 +1152,59 @@ mod fbip_add_tests {
         assert_eq!(read_f64(out, 3), 50.0);
         // A and B have been freed by the runtime — do not touch them.
         nsl_tensor_free(out);
+    }
+
+    // === Task 4: scalar variants FBIP-3 flag tests ===
+
+    #[test]
+    fn add_scalar_flags_zero_leaves_input_alive() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        // Bump refcount to force out-of-place path
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        let out = nsl_tensor_add_scalar(a, 5.0, 0);
+        assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
+        assert_eq!(read_f64(a, 0), 10.0);
+        assert_eq!(read_f64(a, 1), 20.0);
+        assert_eq!(read_f64(out, 0), 15.0);
+        assert_eq!(read_f64(out, 1), 25.0);
+        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(a);
+        nsl_tensor_free(out);
+    }
+
+    #[test]
+    fn add_scalar_flags_relinquish_a_inplace() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        let out = nsl_tensor_add_scalar(a, 5.0, RELINQUISH_A);
+        assert_eq!(out, a, "in-place on A should return A");
+        assert_eq!(read_f64(out, 0), 15.0);
+        assert_eq!(read_f64(out, 1), 25.0);
+        nsl_tensor_free(out); // == a
+    }
+
+    #[test]
+    fn mul_scalar_flags_zero_leaves_input_alive() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        let out = nsl_tensor_mul_scalar(a, 5.0, 0);
+        assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
+        assert_eq!(read_f64(a, 0), 10.0);
+        assert_eq!(read_f64(a, 1), 20.0);
+        assert_eq!(read_f64(out, 0), 50.0);
+        assert_eq!(read_f64(out, 1), 100.0);
+        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        nsl_tensor_free(a);
+        nsl_tensor_free(out);
+    }
+
+    #[test]
+    fn mul_scalar_flags_relinquish_a_inplace() {
+        let a = make_tensor_f64(&[10.0, 20.0]);
+        let out = nsl_tensor_mul_scalar(a, 5.0, RELINQUISH_A);
+        assert_eq!(out, a, "in-place on A should return A");
+        assert_eq!(read_f64(out, 0), 50.0);
+        assert_eq!(read_f64(out, 1), 100.0);
+        nsl_tensor_free(out); // == a
     }
 
     // TODO(eltls): add a regression test for the cross-device RELINQUISH_B path

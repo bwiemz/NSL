@@ -767,23 +767,24 @@ impl Compiler<'_> {
                 rhs_for_scalar
             };
             let _ = scale_fused; // logged in try_fuse_weight_scale
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
             let result = match op {
                 BinOp::Add => {
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar])?
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar, flags_zero])?
                 }
                 BinOp::Mul => {
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar])?
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar, flags_zero])?
                 }
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg])?
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg, flags_zero])?
                 }
                 BinOp::Div => {
                     // tensor / scalar = tensor * (1/scalar)
                     let one = builder.ins().f64const(1.0);
                     let inv = builder.ins().fdiv(one, scalar);
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv])?
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv, flags_zero])?
                 }
                 _ => {
                     return Err(CodegenError::new(format!(
@@ -801,12 +802,13 @@ impl Compiler<'_> {
             } else {
                 builder.ins().fcvt_from_sint(cl_types::F64, lhs)
             };
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
             let result = match op {
                 BinOp::Add => {
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar])?
+                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar, flags_zero])?
                 }
                 BinOp::Mul => {
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar])?
+                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar, flags_zero])?
                 }
                 BinOp::Sub => {
                     // scalar - tensor = neg(tensor) + scalar
@@ -815,7 +817,7 @@ impl Compiler<'_> {
                     let result = self.compile_call_by_name(
                         builder,
                         "nsl_tensor_add_scalar",
-                        &[neg_tensor, scalar],
+                        &[neg_tensor, scalar, flags_zero],
                     )?;
                     // Free the intermediate neg_tensor (consumed by add_scalar)
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[neg_tensor])?;

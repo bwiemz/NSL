@@ -703,11 +703,12 @@ fn lower_single_op(
             let one_f = builder.ins().f64const(1.0);
             let zero_f = builder.ins().f64const(0.0);
             let eps_f = builder.ins().f64const(1e-8);
+            let wl_flags0_addsc1 = builder.ins().iconst(cl_types::I8, 0);
             let targets_plus_one = call(
                 compiler,
                 builder,
                 "nsl_tensor_add_scalar",
-                &[inputs[1], one_f],
+                &[inputs[1], one_f, wl_flags0_addsc1],
             )?;
             let valid_mask = call(
                 compiler,
@@ -719,11 +720,12 @@ fn lower_single_op(
             let flags0_nll = builder.ins().iconst(cl_types::I8, 0);
             let masked_nll = call(compiler, builder, "nsl_tensor_mul", &[nll, valid_mask, flags0_nll])?;
             let num_valid = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+            let wl_flags0_addsc2 = builder.ins().iconst(cl_types::I8, 0);
             let num_valid_eps = call(
                 compiler,
                 builder,
                 "nsl_tensor_add_scalar",
-                &[num_valid, eps_f],
+                &[num_valid, eps_f, wl_flags0_addsc2],
             )?;
             let total = call(compiler, builder, "nsl_tensor_sum", &[masked_nll])?;
             // ELTLS (FBIP-3): nsl_tensor_div takes a flags byte.
@@ -818,11 +820,12 @@ fn lower_single_op(
             let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t, attn_flags0_qk])?;
             // scaled = scores * scale
             let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
+            let wl_flags0_mulsc = builder.ins().iconst(cl_types::I8, 0);
             let scaled = call(
                 compiler,
                 builder,
                 "nsl_tensor_mul_scalar",
-                &[scores, scale_item],
+                &[scores, scale_item, wl_flags0_mulsc],
             )?;
             free_tensor_if_owned(compiler, builder, scale, free_scale)?;
 

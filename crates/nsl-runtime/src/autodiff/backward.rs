@@ -1110,7 +1110,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
             TapeOp::MulScalar { a, scalar, out } => {
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);
-                    let scaled = tensor_mul_scalar(g_clone, *scalar);
+                    let scaled = tensor_mul_scalar(g_clone, *scalar, 0);
                     tensor_free(g_clone);
                     accumulate_grad(&mut grad_map, *a, scaled);
                 }
@@ -1136,7 +1136,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         let scalar_val = tensor_item(g);
                         let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
                         let ones = ones_from_shape(input_shape, g_dtype);
-                        let grad_a = tensor_mul_scalar(ones, scalar_val);
+                        let grad_a = tensor_mul_scalar(ones, scalar_val, 0);
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
@@ -1153,13 +1153,13 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         let scalar_val = tensor_item(g);
                         let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
                         let ones = ones_from_shape(input_shape, g_dtype);
-                        let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64));
+                        let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64), 0);
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
                         // Dimensional reduction: broadcast then scale
                         let expanded = broadcast_grad_along_dim(g, input_shape, *dim as usize);
-                        let grad_a = tensor_mul_scalar(expanded, 1.0 / (*num_elements as f64));
+                        let grad_a = tensor_mul_scalar(expanded, 1.0 / (*num_elements as f64), 0);
                         tensor_free(expanded);
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     }
@@ -1200,7 +1200,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 // d/da(sqrt(a)) = 1 / (2 * sqrt(a)) = 1 / (2 * saved_out)
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);
-                    let two_sqrt = tensor_mul_scalar(*saved_out, 2.0);
+                    let two_sqrt = tensor_mul_scalar(*saved_out, 2.0, 0);
                     let grad_a = tensor_div(g_clone, two_sqrt, 0);
                     tensor_free(g_clone);
                     tensor_free(two_sqrt);
