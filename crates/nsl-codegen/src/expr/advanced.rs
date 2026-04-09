@@ -738,13 +738,14 @@ impl Compiler<'_> {
             // M52b: Annotate sparsity hints for partial folds
             self.annotate_sparsity_hints(state, lhs, rhs, op);
 
-            // ELTLS (FBIP-3): nsl_tensor_add now takes a flags byte as its third arg.
-            // Until Task 3 extends sub/mul/div/matmul, only the add case passes a flags=0.
-            let result = if rt_name == "nsl_tensor_add" {
+            // ELTLS (FBIP-3): all tensor-tensor ops (add/sub/mul/div/matmul) take a
+            // flags byte as their third arg. nsl_fp8_matmul_training keeps the legacy
+            // 2-arg signature.
+            let result = if rt_name == "nsl_fp8_matmul_training" {
+                self.compile_traced_call(builder, rt_name, &[lhs, rhs])?
+            } else {
                 let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                 self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero])?
-            } else {
-                self.compile_traced_call(builder, rt_name, &[lhs, rhs])?
             };
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
@@ -1893,8 +1894,9 @@ impl Compiler<'_> {
                     // (SpMM expects sparse on the left; transposing CSR is non-trivial)
                     let dense_rhs =
                         self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let result =
-                        self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs])?;
+                        self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs, flags_zero])?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
                     result
                 } else {
@@ -1903,10 +1905,11 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?;
                     let dense_rhs =
                         self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let result = self.compile_traced_call(
                         builder,
                         "nsl_tensor_matmul",
-                        &[dense_lhs, dense_rhs],
+                        &[dense_lhs, dense_rhs, flags_zero],
                     )?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
@@ -1973,10 +1976,11 @@ impl Compiler<'_> {
                     } else {
                         (rhs, false)
                     };
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let result = self.compile_traced_call(
                         builder,
                         "nsl_tensor_mul",
-                        &[dense_lhs, dense_rhs],
+                        &[dense_lhs, dense_rhs, flags_zero],
                     )?;
                     if free_lhs {
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
@@ -2014,7 +2018,8 @@ impl Compiler<'_> {
                         )))
                     }
                 };
-                let result = self.compile_traced_call(builder, rt_name, &[dense_lhs, dense_rhs])?;
+                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                let result = self.compile_traced_call(builder, rt_name, &[dense_lhs, dense_rhs, flags_zero])?;
                 if free_lhs {
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
                 }

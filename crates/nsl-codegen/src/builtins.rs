@@ -224,17 +224,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     (
         "nsl_tensor_sub",
-        &[types::I64, types::I64],
+        &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
     (
         "nsl_tensor_mul",
-        &[types::I64, types::I64],
+        &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
     (
         "nsl_tensor_div",
-        &[types::I64, types::I64],
+        &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
     ("nsl_tensor_neg", &[types::I64], Some(types::I64)),
@@ -252,7 +252,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Tensor matmul
     (
         "nsl_tensor_matmul",
-        &[types::I64, types::I64],
+        &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
     // Tensor reductions (return scalar tensor ptr, not f64)

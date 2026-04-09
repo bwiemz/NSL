@@ -3669,7 +3669,7 @@ mod tests {
     fn test_fbip_mul_inplace() {
         let a = make_f64_tensor(&[2.0, 3.0, 4.0]);
         let b = make_f64_tensor(&[10.0, 10.0, 10.0]);
-        let result = arithmetic::nsl_tensor_mul(a, b);
+        let result = arithmetic::nsl_tensor_mul(a, b, 0);
         assert_eq!(result, a);
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
@@ -3683,7 +3683,7 @@ mod tests {
     fn test_fbip_div_inplace() {
         let a = make_f64_tensor(&[10.0, 20.0, 30.0]);
         let b = make_f64_tensor(&[2.0, 4.0, 5.0]);
-        let result = arithmetic::nsl_tensor_div(a, b);
+        let result = arithmetic::nsl_tensor_div(a, b, 0);
         assert_eq!(result, a);
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
@@ -3697,7 +3697,7 @@ mod tests {
     fn test_fbip_sub_inplace() {
         let a = make_f64_tensor(&[10.0, 20.0]);
         let b = make_f64_tensor(&[3.0, 7.0]);
-        let result = arithmetic::nsl_tensor_sub(a, b);
+        let result = arithmetic::nsl_tensor_sub(a, b, 0);
         assert_eq!(result, a);
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();

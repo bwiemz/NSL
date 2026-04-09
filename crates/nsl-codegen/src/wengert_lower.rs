@@ -337,7 +337,9 @@ fn lower_single_op(
             } else {
                 let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
                 let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                let result = call(compiler, builder, "nsl_tensor_sub", &[a, b])?;
+                // ELTLS (FBIP-3): nsl_tensor_sub takes a flags byte.
+                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                let result = call(compiler, builder, "nsl_tensor_sub", &[a, b, flags_zero])?;
                 free_tensor_if_owned(compiler, builder, a, free_a)?;
                 free_tensor_if_owned(compiler, builder, b, free_b)?;
                 Ok(result)
@@ -357,7 +359,9 @@ fn lower_single_op(
             } else {
                 let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
                 let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                let result = call(compiler, builder, "nsl_tensor_mul", &[a, b])?;
+                // ELTLS (FBIP-3): nsl_tensor_mul takes a flags byte.
+                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                let result = call(compiler, builder, "nsl_tensor_mul", &[a, b, flags_zero])?;
                 free_tensor_if_owned(compiler, builder, a, free_a)?;
                 free_tensor_if_owned(compiler, builder, b, free_b)?;
                 Ok(result)
@@ -377,7 +381,9 @@ fn lower_single_op(
             } else {
                 let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
                 let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
-                let result = call(compiler, builder, "nsl_tensor_div", &[a, b])?;
+                // ELTLS (FBIP-3): nsl_tensor_div takes a flags byte.
+                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                let result = call(compiler, builder, "nsl_tensor_div", &[a, b, flags_zero])?;
                 free_tensor_if_owned(compiler, builder, a, free_a)?;
                 free_tensor_if_owned(compiler, builder, b, free_b)?;
                 Ok(result)
@@ -385,12 +391,16 @@ fn lower_single_op(
         }
 
         // === Linear algebra (4 ops) ===
-        PrimalOp::Matmul => call(
-            compiler,
-            builder,
-            "nsl_tensor_matmul",
-            &[inputs[0], inputs[1]],
-        ),
+        PrimalOp::Matmul => {
+            // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            call(
+                compiler,
+                builder,
+                "nsl_tensor_matmul",
+                &[inputs[0], inputs[1], flags_zero],
+            )
+        }
         PrimalOp::Transpose { dim0, dim1 } => {
             let d0 = builder.ins().iconst(cl_types::I64, *dim0 as i64);
             let d1 = builder.ins().iconst(cl_types::I64, *dim1 as i64);
@@ -705,7 +715,9 @@ fn lower_single_op(
                 "nsl_tensor_clamp",
                 &[targets_plus_one, zero_f, one_f],
             )?;
-            let masked_nll = call(compiler, builder, "nsl_tensor_mul", &[nll, valid_mask])?;
+            // ELTLS (FBIP-3): nsl_tensor_mul takes a flags byte.
+            let flags0_nll = builder.ins().iconst(cl_types::I8, 0);
+            let masked_nll = call(compiler, builder, "nsl_tensor_mul", &[nll, valid_mask, flags0_nll])?;
             let num_valid = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
             let num_valid_eps = call(
                 compiler,
@@ -714,7 +726,9 @@ fn lower_single_op(
                 &[num_valid, eps_f],
             )?;
             let total = call(compiler, builder, "nsl_tensor_sum", &[masked_nll])?;
-            let result = call(compiler, builder, "nsl_tensor_div", &[total, num_valid_eps])?;
+            // ELTLS (FBIP-3): nsl_tensor_div takes a flags byte.
+            let flags0_div = builder.ins().iconst(cl_types::I8, 0);
+            let result = call(compiler, builder, "nsl_tensor_div", &[total, num_valid_eps, flags0_div])?;
             for temp in [
                 safe_targets,
                 log_probs,
@@ -733,8 +747,11 @@ fn lower_single_op(
         }
         PrimalOp::MSELoss => {
             // mse_loss(pred, target) = mean((pred - target)^2)
-            let diff = call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1]])?;
-            let sq = call(compiler, builder, "nsl_tensor_mul", &[diff, diff])?;
+            // ELTLS (FBIP-3): tensor-tensor ops take a flags byte.
+            let mse_flags0_sub = builder.ins().iconst(cl_types::I8, 0);
+            let diff = call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1], mse_flags0_sub])?;
+            let mse_flags0_mul = builder.ins().iconst(cl_types::I8, 0);
+            let sq = call(compiler, builder, "nsl_tensor_mul", &[diff, diff, mse_flags0_mul])?;
             let d = builder.ins().iconst(cl_types::I64, -1);
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             let result = call(compiler, builder, "nsl_tensor_mean_dim", &[sq, d, keepdim])?;
@@ -744,7 +761,9 @@ fn lower_single_op(
         }
         PrimalOp::L1Loss => {
             // l1_loss(pred, target) = mean(|pred - target|)
-            let diff = call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1]])?;
+            // ELTLS (FBIP-3): nsl_tensor_sub takes a flags byte.
+            let l1_flags0 = builder.ins().iconst(cl_types::I8, 0);
+            let diff = call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1], l1_flags0])?;
             let abs_diff = call(compiler, builder, "nsl_tensor_abs", &[diff])?;
             let d = builder.ins().iconst(cl_types::I64, -1);
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
@@ -794,7 +813,9 @@ fn lower_single_op(
                 &[k, dim_m2, dim_m1],
             )?;
             // scores = Q @ K_T
-            let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t])?;
+            // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
+            let attn_flags0_qk = builder.ins().iconst(cl_types::I8, 0);
+            let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t, attn_flags0_qk])?;
             // scaled = scores * scale
             let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
             let scaled = call(
@@ -822,7 +843,9 @@ fn lower_single_op(
             // attn_weights = softmax(masked, -1)
             let attn_weights = call(compiler, builder, "nsl_tensor_softmax", &[masked, dim_m1])?;
             // output = attn_weights @ V
-            let result = call(compiler, builder, "nsl_tensor_matmul", &[attn_weights, v])?;
+            // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
+            let attn_flags0_av = builder.ins().iconst(cl_types::I8, 0);
+            let result = call(compiler, builder, "nsl_tensor_matmul", &[attn_weights, v, attn_flags0_av])?;
             free_tensor_value(compiler, builder, k_t)?;
             free_tensor_value(compiler, builder, scores)?;
             if *causal {

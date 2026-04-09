@@ -576,7 +576,7 @@ pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
     let deq_ptr = nsl_qtensor_dequantize(qw_ptr);
 
     // Perform matmul: x @ deq
-    let result_ptr = crate::tensor::nsl_tensor_matmul(x_ptr, deq_ptr);
+    let result_ptr = crate::tensor::nsl_tensor_matmul(x_ptr, deq_ptr, 0);
 
     // Free the temporary dequantized tensor
     crate::tensor::nsl_tensor_free(deq_ptr);

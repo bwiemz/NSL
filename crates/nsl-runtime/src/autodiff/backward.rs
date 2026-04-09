@@ -1024,8 +1024,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     // d/da(a*b) = g * b, d/db(a*b) = g * a
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
-                    let grad_a_full = tensor_mul(g_clone1, *saved_b);
-                    let grad_b_full = tensor_mul(g_clone2, *saved_a);
+                    let grad_a_full = tensor_mul(g_clone1, *saved_b, 0);
+                    let grad_b_full = tensor_mul(g_clone2, *saved_a, 0);
                     // Eagerly free saved tensors
                     tensor_free(*saved_a);
                     tensor_free(*saved_b);
@@ -1047,7 +1047,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let g_clone2 = tensor_clone(g);
 
                     // d/da(a/b) = g / b
-                    let grad_a_full = tensor_div(g_clone1, *saved_b);
+                    let grad_a_full = tensor_div(g_clone1, *saved_b, 0);
                     tensor_free(g_clone1);
                     let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
                     if grad_a != grad_a_full { tensor_free(grad_a_full); }
@@ -1056,18 +1056,18 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     // d/db(a/b) = -g * a / b^2
                     let neg_g = tensor_neg(g_clone2);
                     tensor_free(g_clone2);
-                    let neg_ga = tensor_mul(neg_g, *saved_a);
+                    let neg_ga = tensor_mul(neg_g, *saved_a, 0);
                     // Clone one operand to avoid aliasing: tensor_mul(b, b)
                     // with FBIP would mutate b in-place while reading it,
                     // causing a data race on GPU.
                     let b_clone = tensor_clone(*saved_b);
-                    let b_sq = tensor_mul(b_clone, *saved_b);
+                    let b_sq = tensor_mul(b_clone, *saved_b, 0);
                     // Eagerly free saved tensors after last use
                     tensor_free(*saved_a);
                     tensor_free(*saved_b);
                     *saved_a = 0;
                     *saved_b = 0;
-                    let grad_b_full = tensor_div(neg_ga, b_sq);
+                    let grad_b_full = tensor_div(neg_ga, b_sq, 0);
                     tensor_free(neg_g);
                     tensor_free(neg_ga);
                     tensor_free(b_sq);
@@ -1089,8 +1089,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     *saved_b = 0;
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
-                    let grad_a = tensor_matmul(g_clone1, b_t);
-                    let grad_b = tensor_matmul(a_t, g_clone2);
+                    let grad_a = tensor_matmul(g_clone1, b_t, 0);
+                    let grad_b = tensor_matmul(a_t, g_clone2, 0);
                     tensor_free(g_clone1);
                     tensor_free(g_clone2);
                     tensor_free(b_t);
@@ -1182,7 +1182,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 // d/da(exp(a)) = exp(a) = saved_out
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);
-                    let grad_a = tensor_mul(g_clone, *saved_out);
+                    let grad_a = tensor_mul(g_clone, *saved_out, 0);
                     tensor_free(g_clone);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
@@ -1191,7 +1191,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 // d/da(log(a)) = 1/a
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);
-                    let grad_a = tensor_div(g_clone, *saved_a);
+                    let grad_a = tensor_div(g_clone, *saved_a, 0);
                     tensor_free(g_clone);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
@@ -1201,7 +1201,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);
                     let two_sqrt = tensor_mul_scalar(*saved_out, 2.0);
-                    let grad_a = tensor_div(g_clone, two_sqrt);
+                    let grad_a = tensor_div(g_clone, two_sqrt, 0);
                     tensor_free(g_clone);
                     tensor_free(two_sqrt);
                     accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1212,7 +1212,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);
                     let sign = tensor_sign(*saved_a);
-                    let grad_a = tensor_mul(g_clone, sign);
+                    let grad_a = tensor_mul(g_clone, sign, 0);
                     tensor_free(g_clone);
                     tensor_free(sign);
                     accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1250,7 +1250,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 // d/dx sin(x) = cos(x) * grad_out
                 if let Some(&g) = grad_map.get(out) {
                     let cos_a = tensor_cos(*saved_a);
-                    let ga = tensor_mul(g, cos_a);
+                    let ga = tensor_mul(g, cos_a, 0);
                     tensor_free(cos_a);
                     // Eagerly free saved tensor
                     tensor_free(*saved_a);
@@ -1264,7 +1264,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let sin_a = tensor_sin(*saved_a);
                     let neg_sin = tensor_neg(sin_a);
                     tensor_free(sin_a);
-                    let ga = tensor_mul(g, neg_sin);
+                    let ga = tensor_mul(g, neg_sin, 0);
                     tensor_free(neg_sin);
                     // Eagerly free saved tensor
                     tensor_free(*saved_a);

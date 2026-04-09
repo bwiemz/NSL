@@ -131,7 +131,9 @@ impl Compiler<'_> {
             }
             let lhs = self.compile_expr(builder, state, &args[0].value)?;
             let rhs = self.compile_expr(builder, state, &args[1].value)?;
-            return self.compile_traced_call(builder, rt_name, &[lhs, rhs]);
+            // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            return self.compile_traced_call(builder, rt_name, &[lhs, rhs, flags_zero]);
         }
 
         // Check if this is a kernel call (compiled GPU kernel)
@@ -1193,7 +1195,9 @@ impl Compiler<'_> {
                 "nsl_tensor_transpose",
                 &[k_val, dim_m2, dim_m1],
             )?;
-            let scores = self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t])?;
+            // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
+            let matmul_flags0 = builder.ins().iconst(cl_types::I8, 0);
+            let scores = self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t, matmul_flags0])?;
             let scaled =
                 self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val])?;
 
@@ -1215,7 +1219,9 @@ impl Compiler<'_> {
             let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let attn_weights =
                 self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
-            return self.compile_traced_call(builder, "nsl_tensor_matmul", &[attn_weights, v_val]);
+            // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
+            let final_matmul_flags0 = builder.ins().iconst(cl_types::I8, 0);
+            return self.compile_traced_call(builder, "nsl_tensor_matmul", &[attn_weights, v_val, final_matmul_flags0]);
         }
 
         // sum/mean with dim args -- overload: sum(tensor) or sum(tensor, dim, keepdim)

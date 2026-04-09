@@ -322,7 +322,7 @@ impl FuzzState {
                 let shape_list = Self::make_shape_list(&shape);
                 let b = nsl_tensor_ones(shape_list);
                 nsl_list_free(shape_list);
-                let result = nsl_tensor_mul(ptr, b);
+                let result = nsl_tensor_mul(ptr, b, 0);
                 nsl_tensor_free(b);
                 self.register(result, shape);
             }
@@ -334,7 +334,7 @@ impl FuzzState {
                 let rhs_list = Self::make_shape_list(&rhs_shape);
                 let rhs = nsl_tensor_ones(rhs_list);
                 nsl_list_free(rhs_list);
-                let result = nsl_tensor_matmul(ptr, rhs);
+                let result = nsl_tensor_matmul(ptr, rhs, 0);
                 nsl_tensor_free(rhs);
                 let mut out_shape = shape[..shape.len() - 1].to_vec();
                 out_shape.push(n);

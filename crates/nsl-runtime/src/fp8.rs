@@ -204,7 +204,7 @@ pub extern "C" fn nsl_fp8_matmul(
     _scale_b: f64,
 ) -> i64 {
     // On CPU, tensors are already dequantized f32. Delegate to standard matmul.
-    crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr)
+    crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr, 0)
 }
 
 /// FP8 matmul for training: performs the matmul and records TapeOp::Fp8MatMul
@@ -230,7 +230,7 @@ pub extern "C" fn nsl_fp8_matmul_training(
         autodiff::TAPE.with(|t| t.borrow_mut().pause_depth += 1);
     }
 
-    let result = crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr);
+    let result = crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr, 0);
 
     if is_recording {
         // Resume recording
@@ -328,7 +328,7 @@ pub fn fp8_matmul_e5m2_backward(
     let b_e5m2 = nsl_fp8_cast(b_ptr, FP8_FORMAT_E5M2, scale_b as f64);
 
     // Perform matmul on E5M2-quantized tensors (CPU: already dequantized f32)
-    let result = crate::tensor::nsl_tensor_matmul(a_e5m2, b_e5m2);
+    let result = crate::tensor::nsl_tensor_matmul(a_e5m2, b_e5m2, 0);
 
     // Free intermediate quantized tensors
     crate::tensor::nsl_tensor_free(a_e5m2);
