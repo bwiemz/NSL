@@ -49,8 +49,8 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
             out_shape_vec[i] = da;
         } else {
             eprintln!(
-                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})",
-                i, da, db
+                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})\n  full a_shape={:?}\n  full b_shape={:?}",
+                i, da, db, a_shape, b_shape
             );
             std::process::abort();
         }
@@ -161,8 +161,8 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
             out_shape_vec[i] = da;
         } else {
             eprintln!(
-                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})",
-                i, da, db
+                "nsl: tensor shape mismatch in elementwise op (dim {}: {} vs {})\n  full a_shape={:?}\n  full b_shape={:?}",
+                i, da, db, a_shape, b_shape
             );
             std::process::abort();
         }

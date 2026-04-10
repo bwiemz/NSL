@@ -513,7 +513,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 // Because the mask is a constant, the gradient w.r.t. the
                 // scaled input is identity (and the mask itself receives no
                 // gradient — it's not even an input_var[1] for differentiation).
-                "contiguous" | "cos" | "sin" | "causal_mask_add" => {
+                "contiguous" | "cos" | "sin" | "causal_mask_add" | "sum_keepdim_last" | "mean_keepdim_last" => {
                     if op.inputs.is_empty() {
                         vec![]
                     } else {

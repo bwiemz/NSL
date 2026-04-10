@@ -422,7 +422,24 @@ fn lower_single_op(
 
         // === Reductions (4 ops) ===
         PrimalOp::Sum { dim } => {
-            let d = builder.ins().iconst(cl_types::I64, dim.unwrap_or(-1));
+            // CRITICAL: nsl_tensor_sum_dim treats dim=-1 as "global sum" (all
+            // dimensions), NOT "last dim". Source-AD's SoftmaxBackward emits
+            // Sum { dim: Some(-1) } meaning "last dim". We must resolve
+            // negative dims at lowering time using the input tensor's ndim
+            // so the runtime sees a non-negative dimension index.
+            // dim == None means global sum (pass -1 to the runtime).
+            let d = match dim {
+                None => builder.ins().iconst(cl_types::I64, -1_i64),
+                Some(d) if *d < 0 => {
+                    // Negative dim: resolve via ndim at runtime.
+                    // ndim_val = nsl_tensor_ndim(input)  → i64
+                    // actual_dim = ndim_val + d           → e.g. ndim + (-1) = last dim
+                    let ndim_val = call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
+                    let offset = builder.ins().iconst(cl_types::I64, *d);
+                    builder.ins().iadd(ndim_val, offset)
+                }
+                Some(d) => builder.ins().iconst(cl_types::I64, *d),
+            };
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             // M46b: Route to deterministic sort-based reduction when --deterministic is active.
             if compiler.compile_options.deterministic {
@@ -442,7 +459,16 @@ fn lower_single_op(
             }
         }
         PrimalOp::Mean { dim } => {
-            let d = builder.ins().iconst(cl_types::I64, dim.unwrap_or(-1));
+            // Same negative-dim resolution as Sum (see comment above).
+            let d = match dim {
+                None => builder.ins().iconst(cl_types::I64, -1_i64),
+                Some(d) if *d < 0 => {
+                    let ndim_val = call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
+                    let offset = builder.ins().iconst(cl_types::I64, *d);
+                    builder.ins().iadd(ndim_val, offset)
+                }
+                Some(d) => builder.ins().iconst(cl_types::I64, *d),
+            };
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             // M46b: Route to deterministic sort-based reduction when --deterministic is active.
             if compiler.compile_options.deterministic {
@@ -1017,6 +1043,43 @@ fn lower_single_op(
                         builder,
                         "nsl_tensor_reduce_to_shape",
                         &[inputs[0], inputs[1]],
+                    )
+                }
+                "mean_keepdim_last" => {
+                    // Mean along the LAST dimension with keepdim=true.
+                    // Used by LayerNorm/RMSNorm backward to compute
+                    // mean/variance reductions that broadcast correctly.
+                    let ndim_val =
+                        call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
+                    let one = builder.ins().iconst(cl_types::I64, 1);
+                    let last_dim = builder.ins().isub(ndim_val, one);
+                    let keepdim = builder.ins().iconst(cl_types::I64, 1);
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_mean_dim",
+                        &[inputs[0], last_dim, keepdim],
+                    )
+                }
+                "sum_keepdim_last" => {
+                    // Sum along the LAST dimension with keepdim=true.
+                    // Used by Softmax/LogSoftmax backward to reduce
+                    // dot(grad, softmax_output) along the softmax axis
+                    // while preserving the trailing dim as size-1 for
+                    // broadcasting against the un-reduced gradient.
+                    //
+                    // Resolves "last dim" at runtime via nsl_tensor_ndim
+                    // to avoid the dim=-1 → global-sum ambiguity.
+                    let ndim_val =
+                        call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
+                    let one = builder.ins().iconst(cl_types::I64, 1);
+                    let last_dim = builder.ins().isub(ndim_val, one);
+                    let keepdim = builder.ins().iconst(cl_types::I64, 1);
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_sum_dim",
+                        &[inputs[0], last_dim, keepdim],
                     )
                 }
                 "causal_mask_add" => {

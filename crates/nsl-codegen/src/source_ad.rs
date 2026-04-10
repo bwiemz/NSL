@@ -302,24 +302,30 @@ impl AdjointGenerator {
             }
 
             // --- Softmax backward: s * (grad - dot(grad, s)) where s = softmax output ---
-            // The Sum{dim:-1} reduces the last dimension, so we must Broadcast
-            // back to the full shape before subtracting from the un-reduced grad.
+            // The sum along the last dimension (the softmax axis) is emitted
+            // as sum_keepdim_last which resolves at lowering time to
+            // nsl_tensor_sum_dim(input, ndim-1, keepdim=1). Using keepdim=1
+            // preserves the trailing dimension as size-1, so the subsequent
+            // Sub broadcasts naturally (e.g. [B,nh,S,1] against [B,nh,S,S]).
             AdjointExpr::SoftmaxBackward(y_bar, y) => {
                 let dot = self.emit_op(PrimalOp::Mul, vec![y_bar, y]);
-                let dot_sum = self.emit_op(PrimalOp::Sum { dim: Some(-1) }, vec![dot]);
-                let dot_sum_bc = self.emit_op(PrimalOp::Broadcast, vec![dot_sum]);
-                let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum_bc]);
+                let dot_sum = self.emit_op(
+                    PrimalOp::Passthrough("sum_keepdim_last".into()),
+                    vec![dot],
+                );
+                let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum]);
                 self.emit_op(PrimalOp::Mul, vec![y, diff])
             }
 
             // --- LogSoftmax backward: grad - exp(y) * sum(grad) ---
-            // The Sum{dim:-1} reduces the last dimension, so we must Broadcast
-            // back to the full shape before multiplying with exp(y).
+            // Same sum_keepdim_last pattern as softmax backward.
             AdjointExpr::LogSoftmaxBackward(y_bar, y) => {
                 let exp_y = self.emit_op(PrimalOp::Exp, vec![y]);
-                let grad_sum = self.emit_op(PrimalOp::Sum { dim: Some(-1) }, vec![y_bar]);
-                let grad_sum_bc = self.emit_op(PrimalOp::Broadcast, vec![grad_sum]);
-                let correction = self.emit_op(PrimalOp::Mul, vec![exp_y, grad_sum_bc]);
+                let grad_sum = self.emit_op(
+                    PrimalOp::Passthrough("sum_keepdim_last".into()),
+                    vec![y_bar],
+                );
+                let correction = self.emit_op(PrimalOp::Mul, vec![exp_y, grad_sum]);
                 self.emit_op(PrimalOp::Sub, vec![y_bar, correction])
             }
 
@@ -328,29 +334,28 @@ impl AdjointGenerator {
             // Every Mean{dim} reduction MUST be followed by Broadcast before use in
             // Sub/Mul with full-shape tensors to avoid shape mismatch.
             AdjointExpr::LayerNormBackward(y_bar, x, _mean_unused, _rstd_unused, eps_val) => {
-                // Recompute mean and rstd from input (standard approach, matches PyTorch)
-                let mean = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x]);
-                let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
-                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
+                // Recompute mean and rstd from input (standard approach, matches PyTorch).
+                // All mean_keepdim_last calls reduce the last dim with keepdim=1,
+                // so the result broadcasts naturally against the full-shape tensors
+                // (e.g. [B,S,1] against [B,S,D]). No Broadcast op needed.
+                let mean = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x]);
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
-                let var = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![x_sq]);
+                let var = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x_sq]);
                 let eps = self.emit_constant(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
                 let one = self.emit_constant(1.0);
                 let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
-                let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
-                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
                 // Compute gradient corrections
-                let mean_grad = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![y_bar]);
-                let mean_grad_bc = self.emit_op(PrimalOp::Broadcast, vec![mean_grad]);
+                let mean_grad = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![y_bar]);
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                let mean_gxh = self.emit_op(PrimalOp::Mean { dim: Some(-1) }, vec![grad_x_hat]);
-                let mean_gxh_bc = self.emit_op(PrimalOp::Broadcast, vec![mean_gxh]);
-                let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh_bc]);
-                let t1 = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad_bc]);
+                let mean_gxh = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![grad_x_hat]);
+                let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh]);
+                let t1 = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad]);
                 let t2 = self.emit_op(PrimalOp::Sub, vec![t1, correction]);
-                self.emit_op(PrimalOp::Mul, vec![t2, rstd_bc])
+                self.emit_op(PrimalOp::Mul, vec![t2, rstd])
             }
 
             // --- BatchNorm backward: same structure as LayerNorm but over batch dim (dim=0) ---
@@ -387,18 +392,35 @@ impl AdjointGenerator {
             // Recomputes x_hat = (x - mean) / std from input to get the correct
             // normalized values (NOT the output, which is gamma * x_hat + beta).
             AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim, weight) => {
-                let mean = self.emit_op(PrimalOp::Mean { dim: Some(dim) }, vec![x]);
-                let mean_bc = self.emit_op(PrimalOp::Broadcast, vec![mean]);
-                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_bc]);
+                // When dim == -1 (LayerNorm/RMSNorm), use keepdim variants for
+                // correct broadcasting. When dim == 0 (BatchNorm), the standard
+                // Mean + Broadcast(clone) pattern works because reducing dim=0
+                // of [B,D] gives [D] which broadcasts as [1,D] → [B,D].
+                let (mean_op, use_broadcast) = if dim == -1 {
+                    (PrimalOp::Passthrough("mean_keepdim_last".into()), false)
+                } else {
+                    (PrimalOp::Mean { dim: Some(dim) }, true)
+                };
+                let mean = self.emit_op(mean_op.clone(), vec![x]);
+                let mean_val = if use_broadcast {
+                    self.emit_op(PrimalOp::Broadcast, vec![mean])
+                } else {
+                    mean
+                };
+                let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_val]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
-                let var = self.emit_op(PrimalOp::Mean { dim: Some(dim) }, vec![x_sq]);
+                let var = self.emit_op(mean_op, vec![x_sq]);
                 let eps = self.emit_constant(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
                 let one = self.emit_constant(1.0);
                 let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
-                let rstd_bc = self.emit_op(PrimalOp::Broadcast, vec![rstd]);
-                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_bc]);
+                let rstd_val = if use_broadcast {
+                    self.emit_op(PrimalOp::Broadcast, vec![rstd])
+                } else {
+                    rstd
+                };
+                let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd_val]);
                 // dgamma = reduce_to_shape(grad * x_hat, weight)
                 // The weight has shape [last_dim], so we sum over all dims except the last.
                 // Using reduce_to_shape handles arbitrary input ndim.
