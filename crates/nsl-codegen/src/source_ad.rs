@@ -1416,9 +1416,132 @@ impl<'a> WengertExtractor<'a> {
                             .unwrap_or(0);
                         PrimalOp::Gather { dim }
                     }
-                    // Attention
+                    // Attention — DECOMPOSE into primitive ops so the standard
+                    // source-AD chain rule handles backward automatically. The
+                    // fused PrimalOp::ScaledDotProductAttention path lowers to
+                    // a FlashAttentionBackwardExtract stub in wengert_lower that
+                    // just clones y_bar for all three components (dQ, dK, dV),
+                    // silently producing wrong gradients every layer and
+                    // preventing the model from ever learning attention.
+                    //
+                    // Call signature: scaled_dot_product_attention(q, k, v, scale, causal)
+                    // Forward:
+                    //   k_t    = transpose(k, -2, -1)
+                    //   scores = q @ k_t
+                    //   scaled = scores * scale
+                    //   masked = causal ? scaled + causal_mask : scaled
+                    //   attn   = softmax(masked, -1)
+                    //   out    = attn @ v
+                    //
+                    // Every primitive below has a correct backward AD rule
+                    // (Matmul, Transpose, Mul, Softmax, Add), so the chain
+                    // rule produces the right dQ/dK/dV automatically.
                     "scaled_dot_product_attention" => {
-                        PrimalOp::ScaledDotProductAttention { causal: true }
+                        if input_vars.len() < 3 {
+                            return None;
+                        }
+                        let q_var = input_vars[0];
+                        let k_var = input_vars[1];
+                        let v_var = input_vars[2];
+                        // Scale is optional (default 1.0). If absent, skip Mul.
+                        let scale_var = input_vars.get(3).copied();
+                        // Causal flag: check whether input_vars[4] resolves to
+                        // Constant(1.0) (the extracted form of BoolLiteral(true)).
+                        // Default to causal=true to match the prior behavior
+                        // when the arg is missing or non-literal.
+                        let causal = input_vars.get(4).is_none_or(|&cv| {
+                            self.list.ops.iter().any(|op| {
+                                op.result == cv
+                                    && matches!(op.op, PrimalOp::Constant(c) if c != 0.0)
+                            }) || !self.list.ops.iter().any(|op| op.result == cv)
+                        });
+
+                        // 1. k_t = transpose(k, -2, -1).
+                        //    The sentinel (usize::MAX-1, usize::MAX) is recognized
+                        //    by wengert_lower as "last two dims" via wraparound.
+                        let k_t = self.alloc_var();
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: k_t,
+                            op: PrimalOp::Transpose {
+                                dim0: usize::MAX - 1,
+                                dim1: usize::MAX,
+                            },
+                            inputs: vec![k_var],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+
+                        // 2. scores = q @ k_t
+                        let scores = self.alloc_var();
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: scores,
+                            op: PrimalOp::Matmul,
+                            inputs: vec![q_var, k_t],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+
+                        // 3. scaled = scores * scale (if scale given)
+                        let scaled = if let Some(scale) = scale_var {
+                            let s = self.alloc_var();
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result: s,
+                                op: PrimalOp::Mul,
+                                inputs: vec![scores, scale],
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                            s
+                        } else {
+                            scores
+                        };
+
+                        // 4. masked = scaled + causal_mask (if causal).
+                        //    Emitted as Passthrough("causal_mask_add") that
+                        //    takes [scaled, q] — q carries the shape for the
+                        //    mask; the op is non-differentiable so grad flows
+                        //    straight through to `scaled` as identity.
+                        let masked = if causal {
+                            let m = self.alloc_var();
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result: m,
+                                op: PrimalOp::Passthrough("causal_mask_add".into()),
+                                inputs: vec![scaled, q_var],
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                            m
+                        } else {
+                            scaled
+                        };
+
+                        // 5. attn = softmax(masked, -1)
+                        let attn = self.alloc_var();
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: attn,
+                            op: PrimalOp::Softmax { dim: -1 },
+                            inputs: vec![masked],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+
+                        // 6. out = attn @ v
+                        let out = self.alloc_var();
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result: out,
+                            op: PrimalOp::Matmul,
+                            inputs: vec![attn, v_var],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+
+                        return Some(out);
                     }
                     // Transpose (default: swap last two dims)
                     "transpose" => {

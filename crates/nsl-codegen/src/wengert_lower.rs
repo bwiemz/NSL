@@ -1019,6 +1019,31 @@ fn lower_single_op(
                         &[inputs[0], inputs[1]],
                     )
                 }
+                "causal_mask_add" => {
+                    // SDPA decomposition: add a causal mask to the scaled
+                    // scores tensor. inputs = [scaled, q]. The mask size comes
+                    // from q.shape[-2]. The mask itself is a compile-time
+                    // constant from the AD rules' perspective — gradient flows
+                    // through `scaled` as identity and does NOT flow back into
+                    // the mask (which is synthesized here at lowering time).
+                    let scaled = inputs[0];
+                    let q = inputs[1];
+                    let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
+                    let seq_len =
+                        call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim_neg2])?;
+                    let mask =
+                        call(compiler, builder, "nsl_tensor_causal_mask", &[seq_len])?;
+                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                    let result = call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_add",
+                        &[scaled, mask, flags_zero],
+                    )?;
+                    // Free the mask — it's owned by this op and no longer needed.
+                    let _ = call(compiler, builder, "nsl_tensor_free", &[mask])?;
+                    Ok(result)
+                }
                 _ if name.starts_with("dict_get:") => {
                     // inputs = [dict_ptr]
                     // Dict field access: batch.input_ids -> nsl_dict_get_str(batch, "input_ids")

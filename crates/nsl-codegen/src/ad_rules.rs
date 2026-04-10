@@ -507,7 +507,13 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 // are only ever called on frozen RoPE inv_freq tables, never
                 // on trainable parameters, so the identity rule is harmless.
                 // If you ever apply cos/sin to a trainable tensor, FIX THIS.
-                "contiguous" | "cos" | "sin" => {
+                //
+                // causal_mask_add is emitted by the SDPA extractor decomposition
+                // and adds a CONSTANT causal mask to the scaled scores tensor.
+                // Because the mask is a constant, the gradient w.r.t. the
+                // scaled input is identity (and the mask itself receives no
+                // gradient — it's not even an input_var[1] for differentiation).
+                "contiguous" | "cos" | "sin" | "causal_mask_add" => {
                     if op.inputs.is_empty() {
                         vec![]
                     } else {
