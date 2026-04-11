@@ -9,6 +9,7 @@ mod ownership_api;
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::types as cl_types;
+use cranelift_codegen::ir::Value;
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_module::{DataDescription, DataId, FuncId, Module};
@@ -38,6 +39,10 @@ pub struct FlashAttentionCompileContext {
     pub ptx_data_id: DataId,
     pub name_data_id: DataId,
     pub config: crate::flash_attention::FlashAttentionConfig,
+    // Backward PTX data IDs (Phase 1 D-correction, Phase 2 main dQ/dK/dV)
+    pub bwd_phase1_data_id: Option<DataId>,
+    pub bwd_phase2_data_id: Option<DataId>,
+    pub bwd_config: Option<crate::flash_attention::FlashAttentionBackwardConfig>,
 }
 
 /// A lambda body to be compiled after the current function.
@@ -353,6 +358,15 @@ pub struct Compiler<'a> {
     /// All feature-specific decorator state extracted into a single sub-struct.
     /// Access via `self.features.field_name`.
     pub features: FeatureConfigs,
+
+    // ── FlashAttention backward side-channel ────────────────────────
+    /// Maps the Cranelift Value of a forward SDPA output to (out_val, lse_val)
+    /// so the backward lowering can retrieve the logsumexp buffer.
+    pub flash_attn_aux: HashMap<Value, (Value, Value)>,
+    /// Caches the backward [dQ, dK, dV] NslList Value for a given forward output,
+    /// so only the first component (dQ) triggers the backward call and dK/dV
+    /// extract from the cached list.
+    pub flash_attn_bwd_cache: HashMap<Value, Value>,
 }
 
 /// Quantization configuration for a model.
@@ -474,6 +488,8 @@ impl<'a> Compiler<'a> {
             memory: MemoryPlanState::new(),
             vmap: VmapState::new(),
             features: FeatureConfigs::new(options),
+            flash_attn_aux: HashMap::new(),
+            flash_attn_bwd_cache: HashMap::new(),
         })
     }
 

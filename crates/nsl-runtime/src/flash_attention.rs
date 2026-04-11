@@ -551,13 +551,172 @@ pub fn flash_attention_backward_cpu(
     }
 }
 
+/// GQA-aware backward: Q has `heads` heads, K/V have `kv_heads` heads.
+/// Each group of `gqa_groups` Q heads shares one KV head.
+/// dQ has shape [batch, heads, seq, head_dim].
+/// dK, dV have shape [batch, kv_heads, seq, head_dim].
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_backward_cpu_gqa(
+    q: &[f32], k: &[f32], v: &[f32],
+    out: &[f32], logsumexp: &[f32], dout: &[f32],
+    dq: &mut [f32], dk: &mut [f32], dv: &mut [f32],
+    batch: usize, heads: usize, kv_heads: usize, seq_len: usize, head_dim: usize,
+    scale: f32, causal: bool, gqa_groups: usize,
+) {
+    // Q/dQ/out/dout strides: [batch, heads, seq_len, head_dim]
+    let q_bh_stride = heads * seq_len * head_dim;
+    let q_h_stride = seq_len * head_dim;
+    // K/V/dK/dV strides: [batch, kv_heads, seq_len, head_dim]
+    let kv_bh_stride = kv_heads * seq_len * head_dim;
+    let kv_h_stride = seq_len * head_dim;
+    let s_stride = head_dim;
+
+    let lse_bh_stride = heads * seq_len;
+    let lse_h_stride = seq_len;
+
+    for b_idx in 0..batch {
+        for h_idx in 0..heads {
+            let kv_h_idx = h_idx / gqa_groups;
+            let q_base = b_idx * q_bh_stride + h_idx * q_h_stride;
+            let kv_base = b_idx * kv_bh_stride + kv_h_idx * kv_h_stride;
+            let lse_base = b_idx * lse_bh_stride + h_idx * lse_h_stride;
+
+            // Phase 1: D[i] = rowsum(dO[i] * O[i])
+            let mut d_corr = vec![0.0f32; seq_len];
+            for (i, d_corr_i) in d_corr.iter_mut().enumerate() {
+                let row = q_base + i * s_stride;
+                let mut sum = 0.0f32;
+                for d_idx in 0..head_dim {
+                    sum += dout[row + d_idx] * out[row + d_idx];
+                }
+                *d_corr_i = sum;
+            }
+
+            // Phase 2: dQ, dK, dV
+            for i in 0..seq_len {
+                let qi = q_base + i * s_stride;
+                let lse_i = logsumexp[lse_base + i];
+
+                let j_max = if causal { i + 1 } else { seq_len };
+                for j in 0..j_max {
+                    let kj = kv_base + j * s_stride;
+                    let vj = kv_base + j * s_stride;
+
+                    // S[i,j] = Q[i] . K[j] * scale
+                    let mut s_val = 0.0f32;
+                    for d_idx in 0..head_dim {
+                        s_val += q[qi + d_idx] * k[kj + d_idx];
+                    }
+                    s_val *= scale;
+
+                    // P[i,j] = exp(S[i,j] - L[i])
+                    let p_val = (s_val - lse_i).exp();
+
+                    // dV[j] += p * dO[i]
+                    for d_idx in 0..head_dim {
+                        dv[kj + d_idx] += p_val * dout[qi + d_idx];
+                    }
+
+                    // dp = dO[i] . V[j]
+                    let mut dp_val = 0.0f32;
+                    for d_idx in 0..head_dim {
+                        dp_val += dout[qi + d_idx] * v[vj + d_idx];
+                    }
+
+                    // dS = P * (dP - D[i])
+                    let ds_val = p_val * (dp_val - d_corr[i]);
+
+                    // dQ[i] += dS * K[j] * scale
+                    // dK[j] += dS * Q[i] * scale
+                    for d_idx in 0..head_dim {
+                        dq[qi + d_idx] += ds_val * k[kj + d_idx] * scale;
+                        dk[kj + d_idx] += ds_val * q[qi + d_idx] * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// FFI entry point for FlashAttention backward pass (CPU reference).
+/// Auto-compute logsumexp from Q, K when the forward didn't save it.
+///
+/// lse[b,h,i] = log(sum_j(exp(Q[b,h,i,:] . K[b,h,j,:] * scale)))
+/// with optional causal masking (j <= i).
+/// Auto-compute logsumexp with GQA support.
+///
+/// Q has `heads` heads, K has `kv_heads` heads. Each Q head group maps to one KV head.
+/// lse[b,h,i] = log(sum_j(exp(Q[b,h,i,:] . K[b,h//gqa_groups,j,:] * scale)))
+#[allow(clippy::too_many_arguments)]
+fn compute_logsumexp_gqa(
+    q: &[f32], k: &[f32],
+    batch: usize, heads: usize, kv_heads: usize, seq_len: usize, head_dim: usize,
+    scale: f32, causal: bool,
+) -> Vec<f32> {
+    let q_bh_stride = heads * seq_len * head_dim;
+    let q_h_stride = seq_len * head_dim;
+    let k_bh_stride = kv_heads * seq_len * head_dim;
+    let k_h_stride = seq_len * head_dim;
+    let s_stride = head_dim;
+    let lse_bh_stride = heads * seq_len;
+    let lse_h_stride = seq_len;
+    let gqa_groups = if kv_heads > 0 { heads / kv_heads } else { 1 };
+
+    let total_lse = batch * heads * seq_len;
+    let mut lse = vec![0.0f32; total_lse];
+
+    for b_idx in 0..batch {
+        for h_idx in 0..heads {
+            let kv_h_idx = h_idx / gqa_groups;
+            let q_base_bh = b_idx * q_bh_stride + h_idx * q_h_stride;
+            let k_base_bh = b_idx * k_bh_stride + kv_h_idx * k_h_stride;
+            let lse_base = b_idx * lse_bh_stride + h_idx * lse_h_stride;
+
+            for i in 0..seq_len {
+                let q_row = q_base_bh + i * s_stride;
+                let j_max = if causal { i + 1 } else { seq_len };
+
+                // Numerically stable logsumexp: max + log(sum(exp(x - max)))
+                let mut max_val = f32::NEG_INFINITY;
+                for j in 0..j_max {
+                    let k_row = k_base_bh + j * s_stride;
+                    let mut dot = 0.0f32;
+                    for d_idx in 0..head_dim {
+                        dot += q[q_row + d_idx] * k[k_row + d_idx];
+                    }
+                    let score = dot * scale;
+                    if score > max_val {
+                        max_val = score;
+                    }
+                }
+
+                let mut sum_exp = 0.0f32;
+                for j in 0..j_max {
+                    let k_row = k_base_bh + j * s_stride;
+                    let mut dot = 0.0f32;
+                    for d_idx in 0..head_dim {
+                        dot += q[q_row + d_idx] * k[k_row + d_idx];
+                    }
+                    let score = dot * scale;
+                    sum_exp += (score - max_val).exp();
+                }
+
+                lse[lse_base + i] = max_val + sum_exp.ln();
+            }
+        }
+    }
+
+    lse
+}
+
 ///
 /// Allocates dQ, dK, dV tensors, runs the CPU backward, and returns them
 /// as a tuple of three tensor pointers packed into an NslList.
 ///
 /// This is called from the backward dispatch in autodiff/backward.rs.
 /// GPU PTX backward can be added as a follow-up optimization.
+///
+/// When `logsumexp_ptr == 0`, the logsumexp is auto-computed from Q, K, scale.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_backward(
     dout_ptr: i64,
@@ -583,52 +742,106 @@ pub extern "C" fn nsl_flash_attention_backward(
         }
     }
 
-    let total_qkv = b * h * s * d;
-    let total_lse = b * h * s;
-
-    // Read input tensors as f32 slices
+    // Read input tensors
     let dout_t = NslTensor::from_ptr(dout_ptr);
     let q_t = NslTensor::from_ptr(q_ptr);
     let k_t = NslTensor::from_ptr(k_ptr);
     let v_t = NslTensor::from_ptr(v_ptr);
     let out_t = NslTensor::from_ptr(out_ptr);
-    let lse_t = NslTensor::from_ptr(logsumexp_ptr);
 
-    // Helper to read tensor data as f32 slice (handles both f32 and f64 dtypes)
+    // Detect GQA: K/V may have fewer heads than Q.
+    // Read actual KV head count from K's shape (dim 1).
+    let kv_h = if k_t.ndim >= 2 {
+        unsafe { *k_t.shape.add(1) as usize }
+    } else {
+        h
+    };
+
+    let total_qkv = b * h * s * d;
+    let total_kv = b * kv_h * s * d;
+    let total_lse = b * h * s;
+
+    // Helper to read tensor data as f32 slice (handles both f32 and f64 dtypes).
+    // Handles GPU tensors by transferring data to CPU via cudaMemcpy.
     fn read_f32_data(t: &NslTensor, len: usize) -> Vec<f32> {
+        let is_gpu = t.device > 0;
+
         if t.dtype == 1 {
-            // f32
-            (0..len).map(|i| unsafe { *t.data_f32().add(i) }).collect()
+            // f32 tensor
+            let mut buf = vec![0.0f32; len];
+            if is_gpu {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::inner::memcpy_dtoh(
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        t.data as *const std::ffi::c_void,
+                        len * 4,
+                    );
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    eprintln!("[flash-bwd] WARNING: GPU tensor but CUDA not enabled");
+                }
+            } else {
+                for i in 0..len {
+                    buf[i] = unsafe { *t.data_f32().add(i) };
+                }
+            }
+            buf
         } else {
             // f64 -> f32
-            (0..len).map(|i| unsafe { *t.data_f64().add(i) as f32 }).collect()
+            if is_gpu {
+                // GPU f64 tensors: transfer as f64, then convert
+                let mut f64_buf = vec![0.0f64; len];
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::inner::memcpy_dtoh(
+                        f64_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        t.data as *const std::ffi::c_void,
+                        len * 8,
+                    );
+                }
+                f64_buf.iter().map(|&v| v as f32).collect()
+            } else {
+                (0..len).map(|i| unsafe { *t.data_f64().add(i) as f32 }).collect()
+            }
         }
     }
 
     let dout_data = read_f32_data(dout_t, total_qkv);
     let q_data = read_f32_data(q_t, total_qkv);
-    let k_data = read_f32_data(k_t, total_qkv);
-    let v_data = read_f32_data(v_t, total_qkv);
+    let k_data = read_f32_data(k_t, total_kv);
+    let v_data = read_f32_data(v_t, total_kv);
     let out_data = read_f32_data(out_t, total_qkv);
-    let lse_data = read_f32_data(lse_t, total_lse);
+
+    // Read or auto-compute logsumexp.
+    // When logsumexp_ptr == 0, the forward was decomposed (not fused FlashAttention)
+    // and no logsumexp buffer was saved. Compute it from Q, K, scale, causal.
+    let gqa_groups = if kv_h > 0 { h / kv_h } else { 1 };
+    let lse_data = if logsumexp_ptr != 0 {
+        let lse_t = NslTensor::from_ptr(logsumexp_ptr);
+        read_f32_data(lse_t, total_lse)
+    } else {
+        compute_logsumexp_gqa(&q_data, &k_data, b, h, kv_h, s, d, scale, is_causal)
+    };
 
     // Allocate gradient buffers (zero-initialized)
+    // dQ has Q's shape [batch, heads, seq, head_dim]
+    // dK, dV have KV's shape [batch, kv_heads, seq, head_dim]
     let mut dq_data = vec![0.0f32; total_qkv];
-    let mut dk_data = vec![0.0f32; total_qkv];
-    let mut dv_data = vec![0.0f32; total_qkv];
+    let mut dk_data = vec![0.0f32; total_kv];
+    let mut dv_data = vec![0.0f32; total_kv];
 
-    // Run the CPU backward
-    flash_attention_backward_cpu(
+    // Run the CPU backward with GQA support
+    flash_attention_backward_cpu_gqa(
         &q_data, &k_data, &v_data,
         &out_data, &lse_data, &dout_data,
         &mut dq_data, &mut dk_data, &mut dv_data,
-        b, h, s, d,
-        scale, is_causal,
+        b, h, kv_h, s, d,
+        scale, is_causal, gqa_groups,
     );
 
-    // Create output tensors (f32 dtype, matching Q shape)
-    let shape = [batch, heads, seq_len, head_dim];
-
+    // Create output tensors (f32 dtype, matching Q shape for dQ, KV shape for dK/dV)
     fn make_tensor(data: &[f32], shape: &[i64]) -> i64 {
         let ndim = shape.len() as i64;
         let total = data.len();
@@ -656,9 +869,19 @@ pub extern "C" fn nsl_flash_attention_backward(
         Box::into_raw(t) as i64
     }
 
-    let dq_ptr = make_tensor(&dq_data, &shape);
-    let dk_ptr = make_tensor(&dk_data, &shape);
-    let dv_ptr = make_tensor(&dv_data, &shape);
+    let q_shape = [batch, heads, seq_len, head_dim];
+    let kv_shape = [batch, kv_h as i64, seq_len, head_dim];
+    let mut dq_ptr = make_tensor(&dq_data, &q_shape);
+    let mut dk_ptr = make_tensor(&dk_data, &kv_shape);
+    let mut dv_ptr = make_tensor(&dv_data, &kv_shape);
+
+    // If inputs were on GPU, transfer gradient tensors to GPU to match device
+    let input_device = q_t.device;
+    if input_device > 0 {
+        dq_ptr = crate::tensor::nsl_tensor_to_device(dq_ptr, input_device as i64);
+        dk_ptr = crate::tensor::nsl_tensor_to_device(dk_ptr, input_device as i64);
+        dv_ptr = crate::tensor::nsl_tensor_to_device(dv_ptr, input_device as i64);
+    }
 
     // Pack into an NslList [dq, dk, dv]
     let list = crate::list::nsl_list_new();
