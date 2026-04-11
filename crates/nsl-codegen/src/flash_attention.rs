@@ -2058,9 +2058,16 @@ pub fn backward_shared_mem_bytes(config: &FlashAttentionBackwardConfig) -> u32 {
     let dk_local = tile_bytes(config.block_kv, hd_padded);
     let dv_local = tile_bytes(config.block_kv, hd_padded);
     let s_tile = tile_bytes(config.block_q, config.block_kv);
+    // dP tile: workspace for MMA dP = dO@V^T results (needed alongside P in S_tile for dS computation)
+    let dp_tile = if use_mma_path(config.gpu_sm) {
+        tile_bytes(config.block_q, config.block_kv)
+    } else {
+        0
+    };
     let d_vec = config.block_q * 4;
     let l_vec = config.block_q * 4;
-    (q_tile + k_tile + v_tile + do_tile + dk_local + dv_local + s_tile + d_vec + l_vec) as u32
+    (q_tile + k_tile + v_tile + do_tile + dk_local + dv_local + s_tile + dp_tile + d_vec + l_vec)
+        as u32
 }
 
 /// Synthesize PTX for the FlashAttention-2 backward pass.
@@ -2913,12 +2920,14 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
 }
 
 /// MMA register declarations for the backward kernel (sm_80+).
-/// Declares accumulators and fragment registers for S = Q@K^T and dP = dO@V^T.
+/// Declares accumulators and fragment registers for all 5 backward matmuls:
+///   S = Q@K^T, dP = dO@V^T, dV += P^T@dO, dQ += dS@K, dK += dS^T@Q
 fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
-    let n_tiles_s = config.block_kv as usize / MMA_N; // S: [block_q, block_kv]
+    let n_tiles_s = config.block_kv as usize / MMA_N; // S/dP: [block_q, block_kv]
+    let n_tiles_hd = config.head_dim as usize / MMA_N; // dV/dQ/dK: [*, head_dim]
     let k_iters_qk = config.head_dim as usize / MMA_K;
 
-    ptx.push_str("    // === MMA registers for backward (S and dP matmuls) ===\n");
+    ptx.push_str("    // === MMA registers for backward (all 5 matmuls) ===\n");
 
     // S accumulators: one m-tile at a time, n_tiles_s n-tiles
     for nt in 0..n_tiles_s {
@@ -2931,6 +2940,13 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
     for nt in 0..n_tiles_s {
         ptx.push_str(&format!(
             "    .reg .f32 %bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3;\n"
+        ));
+    }
+
+    // Generic accumulators for dV/dQ/dK — reused sequentially (n_tiles_hd n-tiles)
+    for nt in 0..n_tiles_hd {
+        ptx.push_str(&format!(
+            "    .reg .f32 %bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3;\n"
         ));
     }
 
@@ -2950,8 +2966,15 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
         ptx.push_str(&format!("    .reg .b32 %bwd_bv_{nt}_0, %bwd_bv_{nt}_1;\n"));
     }
 
-    // MMA temporaries (reuse names from forward for the actual PTX ops — they're
-    // the same registers, just used in a different context)
+    // Generic A-fragment (4 .b32) — reused for transposed loads (P^T, dS^T) and dS
+    ptx.push_str("    .reg .b32 %bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3;\n");
+
+    // Generic B-fragment for head_dim output tiles (n_tiles_hd * 2 .b32)
+    for nt in 0..n_tiles_hd {
+        ptx.push_str(&format!("    .reg .b32 %bwd_bg_{nt}_0, %bwd_bg_{nt}_1;\n"));
+    }
+
+    // MMA temporaries
     ptx.push_str("    .reg .f16 %bwd_mma_h0, %bwd_mma_h1;     // f32->f16 conversion temps\n");
     ptx.push_str("    .reg .u32 %bwd_mma_addr;                  // shared memory address temp\n");
     ptx.push_str("    .reg .u32 %bwd_mma_k_iter;                // K-dimension loop counter\n");
@@ -2965,6 +2988,9 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
     ptx.push_str("    .reg .u32 %bwd_mma_store_row;             // row for storing MMA results\n");
     ptx.push_str("    .reg .u32 %bwd_mma_store_col;             // col for storing MMA results\n");
     ptx.push_str("    .reg .u32 %bwd_mma_store_addr;            // shmem addr for MMA result store\n");
+    // Additional temps for transposed loads and global atomics
+    ptx.push_str("    .reg .u32 %bwd_mma_addr2;                 // second address temp\n");
+    ptx.push_str("    .reg .u64 %bwd_mma_gaddr;                 // global address for atomicAdd\n");
 
     // Compute laneid and fragment row mappings
     ptx.push_str("    mov.u32 %bwd_mma_laneid, %tid.x;\n");
@@ -2976,17 +3002,26 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
     ptx.push_str("    add.u32 %bwd_mma_a_row, %bwd_mma_a_row, %bwd_mma_addr;  // (laneid%4)*2 + laneid/16\n");
     // B-fragment row mapping matches A for the k-dimension
     ptx.push_str("    mov.u32 %bwd_mma_b_row, %bwd_mma_a_row;\n");
+    // Store col = (laneid/4) % 4 — precomputed for MMA result store
+    ptx.push_str("    shr.u32 %bwd_mma_store_col, %bwd_mma_laneid, 2;   // laneid / 4\n");
+    ptx.push_str("    and.b32 %bwd_mma_store_col, %bwd_mma_store_col, 3; // (laneid/4) % 4 = col0\n");
 
     ptx.push_str(&format!(
-        "    // n_tiles_s={}, k_iters_qk={}\n\n",
-        n_tiles_s, k_iters_qk
+        "    // n_tiles_s={}, n_tiles_hd={}, k_iters_qk={}\n\n",
+        n_tiles_s, n_tiles_hd, k_iters_qk
     ));
 }
 
-/// Emit the inner Q-tile loop using MMA tensor cores for S and dP matmuls (sm_80+).
+/// Emit the inner Q-tile loop using MMA tensor cores for all matmuls (sm_80+).
 ///
-/// Steps 3a (S = Q@K^T) and 3d (dP = dO@V^T) use `mma.sync.aligned.m16n8k16`.
-/// Steps 3b, 3c, 3e, 3f, 3g remain scalar, reading from S_tile shared memory.
+/// All 5 matmuls use `mma.sync.aligned.m16n8k16`:
+///   3a: S = Q@K^T * scale
+///   3d: dP = dO@V^T
+///   3c: dV += P^T@dO
+///   3f: dQ += dS@K * scale (atomicAdd to global)
+///   3g: dK += dS^T@Q * scale (atomicAdd to dK_local shmem)
+///
+/// Steps 3b (softmax) and 3e (dS = P*(dP-D)) remain scalar elementwise.
 fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_bytes = config.block_kv * hd_padded * 4;
@@ -2996,16 +3031,26 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     let dk_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4;
     let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
     let s_shmem_offset = dv_shmem_offset + config.block_kv * hd_padded * 4;
-    let d_shmem_offset = s_shmem_offset + config.block_q * config.block_kv * 4;
+    let dp_shmem_offset = s_shmem_offset + config.block_q * config.block_kv * 4;
+    let d_shmem_offset = dp_shmem_offset + config.block_q * config.block_kv * 4;
     let l_shmem_offset = d_shmem_offset + config.block_q * 4;
 
-    let n_tiles_s = config.block_kv as usize / MMA_N;
-    let k_iters = config.head_dim as usize / MMA_K;
-    let m_tiles = config.block_q as usize / MMA_M;
-    let _head_dim = config.head_dim as usize;
+    let block_q_u = config.block_q as usize;
+    let block_kv_u = config.block_kv as usize;
+    let head_dim_u = config.head_dim as usize;
+    let n_tiles_s = block_kv_u / MMA_N;
+    let n_tiles_hd = head_dim_u / MMA_N;
+    let k_iters_hd = head_dim_u / MMA_K; // k-iters for S/dP (reduction over head_dim)
+    let k_iters_q = block_q_u / MMA_K; // k-iters for dV/dK (reduction over block_q)
+    let k_iters_kv = block_kv_u / MMA_K; // k-iters for dQ (reduction over block_kv)
+    let m_tiles_q = block_q_u / MMA_M; // m-tiles for S/dP/dQ (rows = block_q)
+    let m_tiles_kv = block_kv_u / MMA_M; // m-tiles for dV/dK (rows = block_kv)
     let hd_padded_u = hd_padded as usize;
 
-    ptx.push_str("    // === Inner Q-tile loop (MMA path for S and dP) ===\n");
+    // Helper: V tile starts right after K tile
+    let v_shmem_offset = k_tile_bytes;
+
+    ptx.push_str("    // === Inner Q-tile loop (full MMA path for all matmuls) ===\n");
 
     // i_block loop: for causal, start at j_block; otherwise start at 0
     if config.causal {
@@ -3024,7 +3069,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         config.block_q
     ));
 
-    // Load Q[i_block] into shmem[q_shmem_offset..] — same as scalar path
+    // Load Q[i_block] into shmem[q_shmem_offset..]
     ptx.push_str(&format!(
         "    // Load Q[i_block] into shmem[{}..]\n",
         q_shmem_offset
@@ -3147,22 +3192,22 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("BWD_MAIN_LOAD_DL_DONE:\n");
     ptx.push_str("    bar.sync 0;  // Q, dO, D, L loaded\n\n");
 
-    // ── MMA Step 3a: S = Q @ K^T * scale ──
-    // Compute the full S_tile [block_q, block_kv] via MMA and store to shmem.
-    // Loop over m-tiles; for each m-tile, compute all n-tiles of S.
+    // ══════════════════════════════════════════════════════════════════
+    // MMA Step 3a: S = Q @ K^T * scale  →  S_tile shmem
+    // Shape: [block_q, head_dim] @ [head_dim, block_kv] → [block_q, block_kv]
+    // ══════════════════════════════════════════════════════════════════
     ptx.push_str("    // === MMA Step 3a: S = Q @ K^T * scale ===\n");
     ptx.push_str(&format!(
-        "    // m_tiles={}, n_tiles_s={}, k_iters={}\n",
-        m_tiles, n_tiles_s, k_iters
+        "    // m_tiles={}, n_tiles_s={}, k_iters_hd={}\n",
+        m_tiles_q, n_tiles_s, k_iters_hd
     ));
 
-    // m-tile loop
     ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
     ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
     ptx.push_str("BWD_MAIN_MMA_S_M_LOOP:\n");
     ptx.push_str(&format!(
         "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
-        m_tiles
+        m_tiles_q
     ));
     ptx.push_str("    @%p0 bra BWD_MAIN_MMA_S_M_DONE;\n\n");
 
@@ -3176,84 +3221,25 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         }
     }
 
-    // K-dimension loop
+    // K-dimension loop (over head_dim)
     ptx.push_str("    mov.u32 %bwd_mma_k_iter, 0;\n");
     ptx.push_str("BWD_MAIN_MMA_S_K_LOOP:\n");
 
-    // Load A-fragment from Q shmem: Q[m_tile*16 + a_row, k_iter*16 + k_pair]
-    ptx.push_str("    // Load Q A-fragment (f32 from shmem, convert to f16)\n");
-    for i in 0..4 {
-        let k_pair = i * 4;
-        ptx.push_str(&format!(
-            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_a_row, {};  // a_row * hd_padded * 4\n",
-            hd_padded_u * 4
-        ));
-        ptx.push_str(&format!(
-            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
-            MMA_K * 4
-        ));
-        ptx.push_str(&format!(
-            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
-            k_pair * 4
-        ));
-        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, %bwd_mma_m_byte_off;  // + m_tile offset\n");
-        ptx.push_str(&format!(
-            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + Q shmem base\n",
-            q_shmem_offset
-        ));
-        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
-        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
-        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
-        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
-        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
-        ptx.push_str(&format!(
-            "    mov.b32 %bwd_aq_{}, {{%bwd_mma_h0, %bwd_mma_h1}};\n",
-            i
-        ));
-    }
+    // Load A-fragment from Q shmem
+    emit_load_a_fragment_row_major(
+        ptx,
+        "%bwd_aq",
+        q_shmem_offset as usize,
+        hd_padded_u,
+        "%bwd_mma_m_byte_off",
+    );
 
-    // Load B-fragments from K shmem for each n-tile
-    // K is stored as K[nj, d] at shmem[0..] with hd_padded stride
-    // For K^T: B[k, n] where k=MMA K-dim, n=MMA N-dim
-    // Load K[nt*MMA_N + b_row, k_iter*MMA_K + k_pair]
+    // Load B-fragments from K shmem for each n-tile (K stored as [block_kv, hd_padded])
     for nt in 0..n_tiles_s {
-        ptx.push_str(&format!(
-            "    // K^T B-fragment for n_tile={}\n",
-            nt
-        ));
-        for bi in 0..2 {
-            let k_pair = bi * 8;
-            ptx.push_str(&format!(
-                "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_b_row, {};  // b_row * hd_padded * 4\n",
-                hd_padded_u * 4
-            ));
-            ptx.push_str(&format!(
-                "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
-                MMA_K * 4
-            ));
-            ptx.push_str(&format!(
-                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
-                k_pair * 4
-            ));
-            // n_tile offset: nt * MMA_N * hd_padded * 4
-            ptx.push_str(&format!(
-                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + n_tile * MMA_N * hd_padded * 4\n",
-                nt * MMA_N * hd_padded_u * 4
-            ));
-            // K is at shmem[0..] (no offset needed)
-            ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
-            ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
-            ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
-            ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
-            ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
-            ptx.push_str(&format!(
-                "    mov.b32 %bwd_bk_{}_{}, {{%bwd_mma_h0, %bwd_mma_h1}};\n",
-                nt, bi
-            ));
-        }
+        emit_load_b_fragment_row_major(ptx, &format!("%bwd_bk_{nt}"), 0, hd_padded_u, nt);
     }
 
-    // Issue MMA for each n-tile: S_acc += Q_frag @ K^T_frag
+    // Issue MMA for each n-tile
     for nt in 0..n_tiles_s {
         ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
         ptx.push_str(&format!(
@@ -3266,133 +3252,22 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         ));
     }
 
-    // Loop back over K
     ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
     ptx.push_str(&format!(
         "    setp.lt.u32 %bwd_mma_pk, %bwd_mma_k_iter, {};\n",
-        k_iters
+        k_iters_hd
     ));
     ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_S_K_LOOP;\n\n");
 
-    // Scale S by 1/sqrt(head_dim) and store to S_tile shmem
-    // MMA m16n8k16 result layout per thread: 4 f32 values covering 2 rows x 2 cols
-    // Thread t within warp holds:
-    //   row0 = m_tile*16 + (t%4)*2 + (t/16)      → acc[0], acc[1] at col = (t%8)/4 * ... (complex)
-    //   row1 = row0 + 8                            → acc[2], acc[3]
-    // For MMA m16n8k16: acc[0] = (row0, col0), acc[1] = (row0, col1),
-    //                    acc[2] = (row0+8, col0), acc[3] = (row0+8, col1)
-    // where col0 = (laneid / 4) % 2 * 1 ... actually:
-    //   col_base = nt * MMA_N
-    //   col_in_tile = (laneid / 4) % 2 * 4 + ... hmm
-    //
-    // Simplified: store all MMA results to S_tile in shmem using the standard MMA output mapping.
-    // row_in_m_tile = (laneid % 4) * 2 + (laneid / 16)      (0-based, same as a_row)
-    // col_in_n_tile for acc[0]: (laneid / 4) % 2 * 4 + 0    — but actually for m16n8:
-    //   Each thread has 2 columns: col0 = (laneid % 8) / 4 * 4, col1 = col0 + 1?
-    //
-    // Actually for mma.sync m16n8k16:
-    //   D[i]: i=0 → (row, col), i=1 → (row, col+1), i=2 → (row+8, col), i=3 → (row+8, col+1)
-    //   where row = (laneid % 4) * 2 + (laneid / 16)  [0-based within 16-row tile]
-    //         col = (laneid / 4) % 2 * 2              [0-based within 8-col tile]
-    //   Wait, n=8 means columns 0..7. With 32 threads, each thread covers 2 rows * 2 cols = 4 values.
-    //   Actually: col_base = ((laneid % 8) / 4) * 4  ... no.
-    //
-    //   Per NVIDIA PTX docs for m16n8k16 f32 output:
-    //   Thread (groupID, threadID_in_group) where groupID = laneid/4, threadID_in_group = laneid%4
-    //   row = threadID_in_group * 2 + (groupID / 4)  — for the first group of 8 rows
-    //   col = groupID % 4  — but n=8, so this can't be right for 4 values per thread
-    //
-    // Let me use the standard approach: store each acc value with computed row/col.
-    // For m16n8k16 D accumulator (4 x f32 per thread):
-    //   acc[0] → row = (laneid%4)*2 + (laneid/16),         col = ((laneid/4)%2) * 4
-    //   acc[1] → row = (laneid%4)*2 + (laneid/16),         col = ((laneid/4)%2) * 4 + 1
-    //   acc[2] → row = (laneid%4)*2 + (laneid/16) + 8,     col = ((laneid/4)%2) * 4
-    //   acc[3] → row = (laneid%4)*2 + (laneid/16) + 8,     col = ((laneid/4)%2) * 4 + 1
-    //
-    // Hmm, that only covers col 0,1,4,5 across all threads — not 0..7.
-    // Let me reconsider. With 32 threads covering 16*8 = 128 values, each thread has 4 values.
-    // groupID (0..7) = laneid / 4, threadID_in_group (0..3) = laneid % 4
-    // For f32 result of m16n8k16:
-    //   D[0] → row = threadID_in_group * 2 + (groupID >= 4 ? 1 : 0), col = groupID % 4
-    //   Wait no. Let me just use the CUDA PTX guide mapping directly.
-    //
-    // From PTX ISA 8.x: m16n8k16.f32.f16.f16.f32
-    //   Each thread produces 4 .f32 values in fragment D.
-    //   groupID = %laneid >> 2            (0..7)
-    //   threadID_in_group = %laneid & 3   (0..3)
-    //
-    //   D[0] → (2*threadID_in_group + (groupID >> 2),     (groupID & 3) + 0)
-    //   D[1] → (2*threadID_in_group + (groupID >> 2),     (groupID & 3) + 4)
-    //   D[2] → (2*threadID_in_group + (groupID >> 2) + 8, (groupID & 3) + 0)
-    //   D[3] → (2*threadID_in_group + (groupID >> 2) + 8, (groupID & 3) + 4)
-    //
-    // So: row0 = 2*(laneid%4) + (laneid/4)/4 = 2*(laneid%4) + laneid/16
-    //     col0 = (laneid/4) % 4
-    //     row1 = row0 + 8
-    //     col1 = col0 + 4
-    //
-    // D[0] at (row0, col0), D[1] at (row0, col0+4), D[2] at (row0+8, col0), D[3] at (row0+8, col0+4)
-    // This covers cols 0..3 and 4..7 — total 8 cols. Good!
-
-    ptx.push_str("    // Scale S and store MMA results to S_tile shmem\n");
-    // Compute store row and col from laneid
-    // %bwd_mma_a_row already = (laneid%4)*2 + laneid/16  → this is row0
-    // col0 = (laneid/4) % 4
-    ptx.push_str("    shr.u32 %bwd_mma_store_col, %bwd_mma_laneid, 2;   // laneid / 4\n");
-    ptx.push_str("    and.b32 %bwd_mma_store_col, %bwd_mma_store_col, 3; // (laneid/4) % 4 = col0\n");
-
-    for nt in 0..n_tiles_s {
-        for r in 0..4 {
-            // Scale
-            ptx.push_str(&format!(
-                "    mul.f32 %bwd_acc_s_{}_{}, %bwd_acc_s_{}_{}, %scale;\n",
-                nt, r, nt, r
-            ));
-            // Compute row and col for this accumulator value
-            let row_offset = if r >= 2 { 8 } else { 0 };
-            let col_offset = if r % 2 == 1 { 4 } else { 0 };
-            // row = m_tile*16 + a_row + row_offset
-            // col = nt*8 + col0 + col_offset
-            // S_tile shmem addr = s_shmem_offset + (row * block_kv + col) * 4
-            ptx.push_str(&format!(
-                "    // Store S acc[{}] for n_tile={}: row_off={}, col_off={}\n",
-                r, nt, row_offset, col_offset
-            ));
-            // row = m_tile*16 + a_row + row_offset
-            ptx.push_str(&format!(
-                "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
-                MMA_M
-            ));
-            ptx.push_str(&format!(
-                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_a_row;\n"
-            ));
-            if row_offset > 0 {
-                ptx.push_str(&format!(
-                    "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {};\n",
-                    row_offset
-                ));
-            }
-            // addr = s_shmem_offset + (row * block_kv + nt*8 + col0 + col_offset) * 4
-            ptx.push_str(&format!(
-                "    mul.lo.u32 %bwd_mma_store_addr, %bwd_mma_store_row, {};\n",
-                config.block_kv
-            ));
-            ptx.push_str(&format!(
-                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + nt*MMA_N + col_offset\n",
-                nt * MMA_N + col_offset
-            ));
-            ptx.push_str("    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, %bwd_mma_store_col;  // + col0\n");
-            ptx.push_str("    shl.b32 %bwd_mma_store_addr, %bwd_mma_store_addr, 2;  // * 4\n");
-            ptx.push_str(&format!(
-                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + S_tile shmem base\n",
-                s_shmem_offset
-            ));
-            ptx.push_str(&format!(
-                "    st.shared.f32 [shmem + %bwd_mma_store_addr], %bwd_acc_s_{}_{};  // S[row][col]\n",
-                nt, r
-            ));
-        }
-    }
+    // Scale and store S to S_tile shmem
+    emit_scale_and_store_mma_tile(
+        ptx,
+        "%bwd_acc_s",
+        n_tiles_s,
+        s_shmem_offset as usize,
+        block_kv_u,
+        true, // apply scale
+    );
 
     // Advance m-tile
     ptx.push_str(&format!(
@@ -3404,16 +3279,18 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("BWD_MAIN_MMA_S_M_DONE:\n");
     ptx.push_str("    bar.sync 0;  // S_tile fully computed via MMA\n\n");
 
-    // ── Scalar steps 3b, 3c read S from shmem ──
-    // Each thread handles one Q row (mi = tid), iterates over nj
-    ptx.push_str("    // === Scalar steps 3b-3g using S_tile from MMA ===\n");
+    // ══════════════════════════════════════════════════════════════════
+    // Scalar Step 3b: P = exp(S - L), with causal mask → overwrite S_tile with P
+    // Each thread handles one row (mi = tid), iterates over columns
+    // ══════════════════════════════════════════════════════════════════
+    ptx.push_str("    // === Scalar Step 3b: P = exp(S - L) ===\n");
     ptx.push_str(&format!(
         "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
         config.block_q
     ));
-    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_SCALAR_DONE;\n\n");
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_P_DONE;\n\n");
 
-    // Load D[mi] and L[mi] from shmem
+    // Load D[mi] and L[mi]
     ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
     ptx.push_str(&format!(
         "    add.u64 %rd27, %rd26, {};\n",
@@ -3424,215 +3301,1050 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "    add.u64 %rd27, %rd26, {};\n",
         l_shmem_offset
     ));
-    ptx.push_str("    ld.shared.f32 %f_l_val, [shmem + %rd27];  // L[mi] (logsumexp)\n\n");
+    ptx.push_str("    ld.shared.f32 %f_l_val, [shmem + %rd27];  // L[mi]\n\n");
 
     // global_i = q_start + mi
     ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
 
-    // Inner loop over nj
     ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
-    ptx.push_str("BWD_MAIN_MMA_NJ_LOOP:\n");
+    ptx.push_str("BWD_MAIN_MMA_P_NJ:\n");
     ptx.push_str(&format!(
         "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
         config.block_kv
     ));
-    ptx.push_str("    @%p1 bra BWD_MAIN_MMA_NJ_DONE;\n\n");
+    ptx.push_str("    @%p1 bra BWD_MAIN_MMA_P_NJ_DONE;\n\n");
 
-    // global_j = kv_start + nj
-    ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n\n");
-
-    // Step 3a (MMA): Read S[mi][nj] from S_tile shmem (already computed by MMA above)
-    ptx.push_str("    // Step 3a (MMA): Read S[mi][nj] from S_tile shmem\n");
+    // Read S[mi][nj]
     ptx.push_str(&format!(
         "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
         config.block_kv
     ));
-    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;  // + nj\n");
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;\n");
     ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
     ptx.push_str(&format!(
-        "    add.u64 %rd35, %rd35, {};  // + S_tile shmem offset\n",
+        "    add.u64 %rd35, %rd35, {};\n",
         s_shmem_offset
     ));
-    ptx.push_str("    ld.shared.f32 %f_s, [shmem + %rd35];  // S[mi][nj] (already scaled)\n\n");
+    ptx.push_str("    ld.shared.f32 %f_s, [shmem + %rd35];\n");
 
-    // Step 3b: P = exp(S - L), with causal mask
-    ptx.push_str("    // Step 3b: P = exp(S - L), causal mask\n");
+    // Causal mask
     if config.causal {
-        ptx.push_str("    // Causal: P = 0 if global_i < global_j\n");
+        ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n");
         ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
-        ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // set S = -inf so exp = 0\n");
+        ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // -inf\n");
     }
-    ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;  // S - L\n");
-    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;   // * log2(e)\n");
-    ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;      // P = exp(S - L)\n");
+
+    // P = exp(S - L)
+    ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;\n");
+    ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;\n");
     if config.causal {
         ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
     }
-    ptx.push('\n');
 
-    // Store P[mi][nj] into S_tile for step 3c (overwrite S with P — the attention weight)
-    ptx.push_str("    // Store P[mi][nj] into S_tile in shmem (overwrite S)\n");
+    // Overwrite S_tile with P
+    ptx.push_str("    st.shared.f32 [shmem + %rd35], %f_p;\n");
+    ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_P_NJ;\n");
+    ptx.push_str("BWD_MAIN_MMA_P_NJ_DONE:\n\n");
+
+    ptx.push_str("BWD_MAIN_MMA_P_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // P stored in S_tile\n\n");
+
+    // ══════════════════════════════════════════════════════════════════
+    // MMA Step 3d: dP = dO @ V^T → dP_tile shmem
+    // Shape: [block_q, head_dim] @ [head_dim, block_kv] → [block_q, block_kv]
+    // Same shape as S; A = dO, B = V (transposed via col-major B-fragment read)
+    // ══════════════════════════════════════════════════════════════════
+    ptx.push_str("    // === MMA Step 3d: dP = dO @ V^T ===\n");
+
+    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
+    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DP_M_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
+        m_tiles_q
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DP_M_DONE;\n\n");
+
+    // Zero dP accumulators
+    for nt in 0..n_tiles_s {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mov.f32 %bwd_acc_dp_{}_{}, 0x00000000;\n",
+                nt, r
+            ));
+        }
+    }
+
+    // K-dimension loop (over head_dim)
+    ptx.push_str("    mov.u32 %bwd_mma_k_iter, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DP_K_LOOP:\n");
+
+    // A-fragment from dO shmem
+    emit_load_a_fragment_row_major(
+        ptx,
+        "%bwd_ado",
+        do_shmem_offset as usize,
+        hd_padded_u,
+        "%bwd_mma_m_byte_off",
+    );
+
+    // B-fragments from V shmem (V stored as [block_kv, hd_padded], same layout as K)
+    for nt in 0..n_tiles_s {
+        emit_load_b_fragment_row_major(
+            ptx,
+            &format!("%bwd_bv_{nt}"),
+            v_shmem_offset as usize,
+            hd_padded_u,
+            nt,
+        );
+    }
+
+    // Issue MMA: dP_acc += dO_frag @ V^T_frag
+    for nt in 0..n_tiles_s {
+        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3}},\n"
+        ));
+        ptx.push_str("        {%bwd_ado_0, %bwd_ado_1, %bwd_ado_2, %bwd_ado_3},\n");
+        ptx.push_str(&format!("        {{%bwd_bv_{nt}_0, %bwd_bv_{nt}_1}},\n"));
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3}};\n"
+        ));
+    }
+
+    ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %bwd_mma_pk, %bwd_mma_k_iter, {};\n",
+        k_iters_hd
+    ));
+    ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DP_K_LOOP;\n\n");
+
+    // Store dP to dP_tile shmem (no scaling needed)
+    emit_scale_and_store_mma_tile(
+        ptx,
+        "%bwd_acc_dp",
+        n_tiles_s,
+        dp_shmem_offset as usize,
+        block_kv_u,
+        false, // no scale
+    );
+
+    // Advance m-tile
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
+        MMA_M * hd_padded_u * 4
+    ));
+    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DP_M_LOOP;\n");
+    ptx.push_str("BWD_MAIN_MMA_DP_M_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // dP_tile fully computed via MMA\n\n");
+
+    // ══════════════════════════════════════════════════════════════════
+    // MMA Step 3c: dV += P^T @ dO → accumulate to dV_local shmem
+    // Shape: [block_kv, block_q] @ [block_q, head_dim] → [block_kv, head_dim]
+    // A = P^T (transposed read from S_tile[block_q, block_kv])
+    // B = dO (row-major [block_q, hd_padded])
+    // ══════════════════════════════════════════════════════════════════
+    ptx.push_str("    // === MMA Step 3c: dV += P^T @ dO ===\n");
+    ptx.push_str(&format!(
+        "    // m_tiles_kv={}, n_tiles_hd={}, k_iters_q={}\n",
+        m_tiles_kv, n_tiles_hd, k_iters_q
+    ));
+
+    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
+    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DV_M_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
+        m_tiles_kv
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DV_M_DONE;\n\n");
+
+    // Zero accumulators
+    for nt in 0..n_tiles_hd {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mov.f32 %bwd_acc_g_{}_{}, 0x00000000;\n",
+                nt, r
+            ));
+        }
+    }
+
+    // K-dimension loop (over block_q, reduction dimension)
+    ptx.push_str("    mov.u32 %bwd_mma_k_iter, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DV_K_LOOP:\n");
+
+    // A-fragment from P^T: load transposed from S_tile[block_q, block_kv]
+    // P^T[kv_row, q_col] = S_tile[q_col * block_kv + kv_row]
+    // m_tile indexes rows of P^T = rows of KV dimension
+    // k_iter indexes columns of P^T = rows of Q dimension
+    emit_load_a_fragment_transposed(
+        ptx,
+        "%bwd_ag",
+        s_shmem_offset as usize,
+        block_kv_u, // col stride of source matrix (S_tile row width)
+    );
+
+    // B-fragments from dO shmem [block_q, hd_padded]
+    // k_iter indexes rows of dO (Q dimension)
+    for nt in 0..n_tiles_hd {
+        emit_load_b_fragment_row_major_k_is_q(
+            ptx,
+            &format!("%bwd_bg_{nt}"),
+            do_shmem_offset as usize,
+            hd_padded_u,
+            nt,
+        );
+    }
+
+    // Issue MMA: dV_acc += P^T_frag @ dO_frag
+    for nt in 0..n_tiles_hd {
+        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
+        ));
+        ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
+        ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
+        ));
+    }
+
+    ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %bwd_mma_pk, %bwd_mma_k_iter, {};\n",
+        k_iters_q
+    ));
+    ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DV_K_LOOP;\n\n");
+
+    // Accumulate dV results to dV_local shmem via atom.shared.add.f32
+    emit_accumulate_mma_to_shmem(
+        ptx,
+        "%bwd_acc_g",
+        n_tiles_hd,
+        dv_shmem_offset as usize,
+        hd_padded_u,
+    );
+
+    // Advance m-tile (row stride for dV_local is hd_padded)
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
+        MMA_M * hd_padded_u * 4
+    ));
+    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DV_M_LOOP;\n");
+    ptx.push_str("BWD_MAIN_MMA_DV_M_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // dV accumulation done\n\n");
+
+    // ══════════════════════════════════════════════════════════════════
+    // Scalar Step 3e: dS = P * (dP - D) → overwrite S_tile with dS
+    // Now P is in S_tile and dP is in dP_tile
+    // ══════════════════════════════════════════════════════════════════
+    ptx.push_str("    // === Scalar Step 3e: dS = P * (dP - D) ===\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DS_DONE;\n\n");
+
+    // Reload D[mi]
+    ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd26, {};\n",
+        d_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_d_val, [shmem + %rd27];\n\n");
+
+    ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
+    ptx.push_str("BWD_MAIN_MMA_DS_NJ:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_MMA_DS_NJ_DONE;\n\n");
+
+    // S_tile addr for [mi][nj]
     ptx.push_str(&format!(
         "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
         config.block_kv
     ));
-    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;  // + nj\n");
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;\n");
     ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+
+    // Read P[mi][nj] from S_tile
     ptx.push_str(&format!(
-        "    add.u64 %rd35, %rd35, {};  // + S_tile shmem offset\n",
+        "    add.u64 %rd36, %rd35, {};  // S_tile offset\n",
         s_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd35], %f_p;\n\n");
+    ptx.push_str("    ld.shared.f32 %f_p, [shmem + %rd36];\n");
 
-    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]  (scalar, same as before)
-    ptx.push_str("    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]\n");
-    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_MMA_DV_ACCUM:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DV_ACCUM_DONE;\n");
+    // Read dP[mi][nj] from dP_tile
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
-        hd_padded
+        "    add.u64 %rd37, %rd35, {};  // dP_tile offset\n",
+        dp_shmem_offset
     ));
-    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd35, %rd35, {};\n",
-        do_shmem_offset
-    ));
-    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];  // dO[mi][d]\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd36, %rd36, {};\n",
-        dv_shmem_offset
-    ));
-    ptx.push_str("    mul.f32 %f_tmp, %f_p, %f_val;     // P * dO[d]\n");
-    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd36], %f_tmp;  // dV[nj][d] += P * dO[d]\n");
-    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_DV_ACCUM;\n");
-    ptx.push_str("BWD_MAIN_MMA_DV_ACCUM_DONE:\n\n");
+    ptx.push_str("    ld.shared.f32 %f_dp, [shmem + %rd37];\n");
 
-    // Step 3d (MMA): dP[mi][nj] = dO[mi,:] . V[nj,:] — but we compute the full tile via MMA
-    // For the scalar fallback within the MMA path, we still compute dP per-element here.
-    // The MMA for dP will be done in a separate tile loop below.
-    // For now: scalar dP dot product (same as scalar path)
-    ptx.push_str("    // Step 3d: dP[mi][nj] = dO[mi,:] . V[nj,:] (scalar in MMA path)\n");
-    ptx.push_str("    mov.f32 %f_sum, 0f00000000;\n");
-    ptx.push_str("    mov.u64 %rd34, 0;\n");
-    ptx.push_str("BWD_MAIN_MMA_DP_DOT:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DP_DOT_DONE;\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd35, %rd35, {};\n",
-        do_shmem_offset
-    ));
-    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd36, %rd36, {};  // V tile shmem offset\n",
-        k_tile_bytes
-    ));
-    ptx.push_str("    ld.shared.f32 %f_tmp, [shmem + %rd36];\n");
-    ptx.push_str("    fma.rn.f32 %f_sum, %f_val, %f_tmp, %f_sum;\n");
-    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_DP_DOT;\n");
-    ptx.push_str("BWD_MAIN_MMA_DP_DOT_DONE:\n");
-    ptx.push_str("    mov.f32 %f_dp, %f_sum;  // dP[mi][nj]\n\n");
+    // dS = P * (dP - D)
+    ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;\n");
+    ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
 
-    // Step 3e: dS = P * (dP - D)
-    ptx.push_str("    // Step 3e: dS[mi][nj] = P[mi][nj] * (dP[mi][nj] - D[mi])\n");
-    ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;  // dP - D\n");
-    ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;       // P * (dP - D)\n\n");
+    // Overwrite S_tile with dS (reuse same location)
+    ptx.push_str("    st.shared.f32 [shmem + %rd36], %f_ds;\n");
+    ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DS_NJ;\n");
+    ptx.push_str("BWD_MAIN_MMA_DS_NJ_DONE:\n\n");
 
-    // Step 3f: dQ[global_i][d] += dS * K[nj][d] * scale (atomicAdd to global)
-    ptx.push_str("    // Step 3f: dQ[global_i][d] += dS * K[nj][d] * scale (atomicAdd)\n");
-    ptx.push_str("    mul.lo.u64 %rd35, %rd31, %rd10;  // global_i * head_dim\n");
-    ptx.push_str("    add.u64 %rd35, %rd15, %rd35;\n");
-    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
-    ptx.push_str("    add.u64 %rd35, %rd4, %rd35;  // dq_global_base for this row\n");
-    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_MMA_DQ_ACCUM:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DQ_ACCUM_DONE;\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
-    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];  // K[nj][d]\n");
-    ptx.push_str("    mul.f32 %f_tmp, %f_ds, %f_val;   // dS * K[d]\n");
-    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %scale;   // * scale\n");
-    ptx.push_str("    shl.b64 %rd37, %rd34, 2;\n");
-    ptx.push_str("    add.u64 %rd37, %rd35, %rd37;  // dQ_addr = dq_base + d*4\n");
-    ptx.push_str("    atom.global.add.f32 %f_val, [%rd37], %f_tmp;\n");
-    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_DQ_ACCUM;\n");
-    ptx.push_str("BWD_MAIN_MMA_DQ_ACCUM_DONE:\n\n");
+    ptx.push_str("BWD_MAIN_MMA_DS_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // dS stored in S_tile\n\n");
 
-    // Step 3g: dK_local[nj][d] += dS * Q[mi][d] * scale
-    ptx.push_str("    // Step 3g: dK_local[nj][d] += dS * Q[mi][d] * scale\n");
-    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
-    ptx.push_str("BWD_MAIN_MMA_DK_ACCUM:\n");
-    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
-    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DK_ACCUM_DONE;\n");
+    // ══════════════════════════════════════════════════════════════════
+    // MMA Step 3f: dQ += dS @ K * scale → atomicAdd to global dQ
+    // Shape: [block_q, block_kv] @ [block_kv, head_dim] → [block_q, head_dim]
+    // A = dS (row-major from S_tile[block_q, block_kv])
+    // B = K (row-major [block_kv, hd_padded])
+    // ══════════════════════════════════════════════════════════════════
+    ptx.push_str("    // === MMA Step 3f: dQ += dS @ K * scale ===\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd11, {};  // mi * hd_padded\n",
-        hd_padded
+        "    // m_tiles_q={}, n_tiles_hd={}, k_iters_kv={}\n",
+        m_tiles_q, n_tiles_hd, k_iters_kv
     ));
-    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd36, %rd36, {};\n",
-        q_shmem_offset
-    ));
-    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];  // Q[mi][d]\n");
-    ptx.push_str("    mul.f32 %f_tmp, %f_ds, %f_val;   // dS * Q[d]\n");
-    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %scale;   // * scale\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd37, %rd32, {};  // nj * hd_padded\n",
-        hd_padded
-    ));
-    ptx.push_str("    add.u64 %rd37, %rd37, %rd34;\n");
-    ptx.push_str("    shl.b64 %rd37, %rd37, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd37, %rd37, {};\n",
-        dk_shmem_offset
-    ));
-    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd37], %f_tmp;  // dK[nj][d] += dS * Q[d] * scale\n");
-    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_DK_ACCUM;\n");
-    ptx.push_str("BWD_MAIN_MMA_DK_ACCUM_DONE:\n\n");
 
-    // End of nj loop
-    ptx.push_str("    add.u64 %rd32, %rd32, 1;  // nj++\n");
-    ptx.push_str("    bra BWD_MAIN_MMA_NJ_LOOP;\n");
-    ptx.push_str("BWD_MAIN_MMA_NJ_DONE:\n\n");
+    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
+    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DQ_M_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
+        m_tiles_q
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DQ_M_DONE;\n\n");
 
-    ptx.push_str("BWD_MAIN_MMA_SCALAR_DONE:\n");
+    // Zero accumulators
+    for nt in 0..n_tiles_hd {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mov.f32 %bwd_acc_g_{}_{}, 0x00000000;\n",
+                nt, r
+            ));
+        }
+    }
+
+    // K-dimension loop (over block_kv, reduction)
+    ptx.push_str("    mov.u32 %bwd_mma_k_iter, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DQ_K_LOOP:\n");
+
+    // A-fragment from dS (stored in S_tile [block_q, block_kv], row-major)
+    // row stride = block_kv (not hd_padded!)
+    emit_load_a_fragment_s_tile(
+        ptx,
+        "%bwd_ag",
+        s_shmem_offset as usize,
+        block_kv_u,
+    );
+
+    // B-fragments from K shmem [block_kv, hd_padded]
+    // k_iter indexes rows of K (KV dimension = reduction)
+    for nt in 0..n_tiles_hd {
+        emit_load_b_fragment_row_major_k_is_q(
+            ptx,
+            &format!("%bwd_bg_{nt}"),
+            0, // K at shmem[0..]
+            hd_padded_u,
+            nt,
+        );
+    }
+
+    // Issue MMA: dQ_acc += dS_frag @ K_frag
+    for nt in 0..n_tiles_hd {
+        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
+        ));
+        ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
+        ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
+        ));
+    }
+
+    ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %bwd_mma_pk, %bwd_mma_k_iter, {};\n",
+        k_iters_kv
+    ));
+    ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DQ_K_LOOP;\n\n");
+
+    // Scale and atomicAdd dQ results to global dQ
+    // dQ[global_q_row, d] += acc * scale
+    // global_q_row = q_start + m_tile*16 + thread_row
+    emit_atomicadd_mma_to_global_dq(
+        ptx,
+        "%bwd_acc_g",
+        n_tiles_hd,
+        config,
+    );
+
+    // Advance m-tile (row stride for S_tile A-fragment is block_kv, but m_byte_off
+    // tracks the Q/dO m-tile offset which uses hd_padded stride — we need a separate
+    // offset for S_tile. Use m_tile counter directly in the helper.)
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * block_kv * 4 (S_tile row stride)\n",
+        MMA_M * block_kv_u * 4
+    ));
+    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DQ_M_LOOP;\n");
+    ptx.push_str("BWD_MAIN_MMA_DQ_M_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // dQ accumulation done\n\n");
+
+    // ══════════════════════════════════════════════════════════════════
+    // MMA Step 3g: dK += dS^T @ Q * scale → accumulate to dK_local shmem
+    // Shape: [block_kv, block_q] @ [block_q, head_dim] → [block_kv, head_dim]
+    // A = dS^T (transposed read from S_tile[block_q, block_kv])
+    // B = Q (row-major [block_q, hd_padded])
+    // ══════════════════════════════════════════════════════════════════
+    ptx.push_str("    // === MMA Step 3g: dK += dS^T @ Q * scale ===\n");
+    ptx.push_str(&format!(
+        "    // m_tiles_kv={}, n_tiles_hd={}, k_iters_q={}\n",
+        m_tiles_kv, n_tiles_hd, k_iters_q
+    ));
+
+    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
+    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DK_M_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
+        m_tiles_kv
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_DK_M_DONE;\n\n");
+
+    // Zero accumulators
+    for nt in 0..n_tiles_hd {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mov.f32 %bwd_acc_g_{}_{}, 0x00000000;\n",
+                nt, r
+            ));
+        }
+    }
+
+    // K-dimension loop (over block_q, reduction)
+    ptx.push_str("    mov.u32 %bwd_mma_k_iter, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DK_K_LOOP:\n");
+
+    // A-fragment from dS^T: transposed from S_tile[block_q, block_kv]
+    // Same transpose pattern as P^T in step 3c
+    emit_load_a_fragment_transposed(
+        ptx,
+        "%bwd_ag",
+        s_shmem_offset as usize,
+        block_kv_u,
+    );
+
+    // B-fragments from Q shmem [block_q, hd_padded]
+    for nt in 0..n_tiles_hd {
+        emit_load_b_fragment_row_major_k_is_q(
+            ptx,
+            &format!("%bwd_bg_{nt}"),
+            q_shmem_offset as usize,
+            hd_padded_u,
+            nt,
+        );
+    }
+
+    // Issue MMA: dK_acc += dS^T_frag @ Q_frag
+    for nt in 0..n_tiles_hd {
+        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}},\n"
+        ));
+        ptx.push_str("        {%bwd_ag_0, %bwd_ag_1, %bwd_ag_2, %bwd_ag_3},\n");
+        ptx.push_str(&format!("        {{%bwd_bg_{nt}_0, %bwd_bg_{nt}_1}},\n"));
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_g_{nt}_0, %bwd_acc_g_{nt}_1, %bwd_acc_g_{nt}_2, %bwd_acc_g_{nt}_3}};\n"
+        ));
+    }
+
+    ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %bwd_mma_pk, %bwd_mma_k_iter, {};\n",
+        k_iters_q
+    ));
+    ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_DK_K_LOOP;\n\n");
+
+    // Scale and accumulate dK results to dK_local shmem via atom.shared.add.f32
+    emit_accumulate_mma_to_shmem_scaled(
+        ptx,
+        "%bwd_acc_g",
+        n_tiles_hd,
+        dk_shmem_offset as usize,
+        hd_padded_u,
+    );
+
+    // Advance m-tile
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
+        MMA_M * hd_padded_u * 4
+    ));
+    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DK_M_LOOP;\n");
+    ptx.push_str("BWD_MAIN_MMA_DK_M_DONE:\n");
     ptx.push_str("BWD_MAIN_STEPS_DONE:\n");
-    ptx.push_str("    bar.sync 0;  // all threads done with steps 3a-3g (MMA path)\n\n");
+    ptx.push_str("    bar.sync 0;  // all steps 3a-3g done (MMA path)\n\n");
 
     // Advance i_block
     ptx.push_str("    add.u64 %rd24, %rd24, 1;  // i_block++\n");
     ptx.push_str("    bra BWD_MAIN_Q_LOOP;\n");
     ptx.push_str("BWD_MAIN_Q_LOOP_END:\n\n");
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// MMA fragment load / store helpers for backward kernel
+// ────────────────────────────────────────────────────────────────────────
+
+/// Load A-fragment from a row-major tile in shmem.
+/// The tile is stored as f32 and converted to f16 on load.
+/// `frag_prefix`: e.g. "%bwd_aq" → registers %bwd_aq_0..3
+/// `shmem_base`: byte offset of the tile in shmem
+/// `row_stride_elems`: row stride in elements (e.g. hd_padded)
+/// `m_byte_off_reg`: register holding m_tile * MMA_M * row_stride * 4
+fn emit_load_a_fragment_row_major(
+    ptx: &mut String,
+    frag_prefix: &str,
+    shmem_base: usize,
+    row_stride_elems: usize,
+    m_byte_off_reg: &str,
+) {
+    ptx.push_str(&format!(
+        "    // Load A-fragment (row-major) from shmem[{}..]\n",
+        shmem_base
+    ));
+    for i in 0..4 {
+        let k_pair = i * 4; // byte offset within the k-dimension: i*2 elements * 4 bytes (f32)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_a_row, {};  // a_row * row_stride * 4\n",
+            row_stride_elems * 4
+        ));
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
+            MMA_K * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
+            k_pair * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + m_tile byte offset\n",
+            m_byte_off_reg
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + shmem base\n",
+            shmem_base
+        ));
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+        ptx.push_str(&format!(
+            "    mov.b32 {frag_prefix}_{i}, {{%bwd_mma_h0, %bwd_mma_h1}};\n"
+        ));
+    }
+}
+
+/// Load A-fragment from S_tile (row-major [block_q, block_kv]) where the row stride
+/// is block_kv (not hd_padded). Used for dS in step 3f.
+fn emit_load_a_fragment_s_tile(
+    ptx: &mut String,
+    frag_prefix: &str,
+    shmem_base: usize,
+    row_stride_elems: usize, // block_kv
+) {
+    ptx.push_str(&format!(
+        "    // Load A-fragment from S_tile (row stride={}) at shmem[{}..]\n",
+        row_stride_elems, shmem_base
+    ));
+    for i in 0..4 {
+        let k_pair = i * 4;
+        // row address: a_row * row_stride * 4 + m_byte_off (which is m_tile * MMA_M * row_stride * 4)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_a_row, {};  // a_row * row_stride * 4\n",
+            row_stride_elems * 4
+        ));
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
+            MMA_K * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
+            k_pair * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + m_tile byte offset\n",
+            "%bwd_mma_m_byte_off"
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + shmem base\n",
+            shmem_base
+        ));
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+        ptx.push_str(&format!(
+            "    mov.b32 {frag_prefix}_{i}, {{%bwd_mma_h0, %bwd_mma_h1}};\n"
+        ));
+    }
+}
+
+/// Load A-fragment from a TRANSPOSED matrix stored in S_tile shmem.
+///
+/// Source matrix: S_tile[block_q, block_kv] stored row-major.
+/// We want A^T[kv_row, q_col] = S_tile[q_col, kv_row].
+///
+/// m_tile indexes rows of A^T (= columns of S_tile = KV dimension)
+/// k_iter indexes cols of A^T (= rows of S_tile = Q dimension)
+///
+/// For A-fragment, thread needs:
+///   row_in_tile = a_row (from laneid mapping)
+///   actual_m_row = m_tile*16 + a_row
+///   For register i, k values are at k_iter*16 + k_pair (k_pair = i*4, i*4+1)
+///
+/// S_tile address for A^T[actual_m_row, k_val]:
+///   = S_tile[k_val][actual_m_row]
+///   = shmem_base + (k_val * col_stride + actual_m_row) * 4
+///
+/// `col_stride`: block_kv (S_tile row width)
+fn emit_load_a_fragment_transposed(
+    ptx: &mut String,
+    frag_prefix: &str,
+    shmem_base: usize,
+    col_stride: usize, // block_kv
+) {
+    ptx.push_str(&format!(
+        "    // Load A-fragment TRANSPOSED from S_tile at shmem[{}..] (col_stride={})\n",
+        shmem_base, col_stride
+    ));
+    // Compute actual_m_row = m_tile*16 + a_row
+    // m_byte_off encodes m_tile * MMA_M * something — but for transposed reads,
+    // we just need m_tile*16 + a_row as the column index into S_tile
+    // So we compute: m_col = m_tile * 16 + a_row
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %bwd_mma_addr2, %bwd_mma_m_tile, {};  // m_tile * MMA_M\n",
+        MMA_M
+    ));
+    ptx.push_str("    add.u32 %bwd_mma_addr2, %bwd_mma_addr2, %bwd_mma_a_row;  // + a_row = m_col\n");
+
+    for i in 0..4 {
+        let k_pair = i * 4; // within MMA_K=16, register i covers elements [k_pair, k_pair+1]
+        // For each pair of k-values (2 consecutive):
+        //   k_val_lo = k_iter * 16 + k_pair
+        //   k_val_hi = k_iter * 16 + k_pair + 1
+        // addr_lo = shmem_base + (k_val_lo * col_stride + m_col) * 4
+        // addr_hi = shmem_base + (k_val_hi * col_stride + m_col) * 4
+
+        // k_val_lo = k_iter * 16 + k_pair
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {};  // k_iter * MMA_K\n",
+            MMA_K
+        ));
+        if k_pair > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair\n",
+                k_pair
+            ));
+        }
+        // addr = (k_val * col_stride + m_col) * 4 + shmem_base
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // k_val * col_stride\n",
+            col_stride
+        ));
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, %bwd_mma_addr2;  // + m_col\n");
+        ptx.push_str("    shl.b32 %bwd_mma_addr, %bwd_mma_addr, 2;  // * 4\n");
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + shmem base\n",
+            shmem_base
+        ));
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+
+        // k_val_hi: stride by col_stride * 4 bytes
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + col_stride * 4 (next row)\n",
+            col_stride * 4
+        ));
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+        ptx.push_str(&format!(
+            "    mov.b32 {frag_prefix}_{i}, {{%bwd_mma_h0, %bwd_mma_h1}};\n"
+        ));
+    }
+}
+
+/// Load B-fragment from a row-major tile where the B-operand's row dimension is indexed
+/// by b_row (from laneid mapping) and the k-iteration indexes rows of the source tile.
+///
+/// Used for K/V tiles stored as [block_kv, hd_padded] where the k-dimension iterates over
+/// the head_dim (columns) and n-tiles index different row groups.
+///
+/// This is the standard B-fragment load from the forward kernel.
+fn emit_load_b_fragment_row_major(
+    ptx: &mut String,
+    frag_name: &str,
+    shmem_base: usize,
+    row_stride_elems: usize,
+    n_tile: usize,
+) {
+    ptx.push_str(&format!(
+        "    // B-fragment for n_tile={} from shmem[{}..]\n",
+        n_tile, shmem_base
+    ));
+    for bi in 0..2 {
+        let k_pair = bi * 8;
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_b_row, {};  // b_row * row_stride * 4\n",
+            row_stride_elems * 4
+        ));
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
+            MMA_K * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
+            k_pair * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + n_tile * MMA_N * row_stride * 4\n",
+            n_tile * MMA_N * row_stride_elems * 4
+        ));
+        if shmem_base > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + shmem base\n",
+                shmem_base
+            ));
+        }
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+        ptx.push_str(&format!(
+            "    mov.b32 {frag_name}_{bi}, {{%bwd_mma_h0, %bwd_mma_h1}};\n"
+        ));
+    }
+}
+
+/// Load B-fragment from a row-major tile where k_iter indexes ROWS of the source
+/// (used for dV/dK/dQ where the reduction dimension is block_q or block_kv and
+/// the output columns come from head_dim).
+///
+/// Source tile: [reduction_dim, hd_padded]
+/// B-fragment for n_tile nt covers columns [nt*8 .. nt*8+8)
+/// k_iter covers rows [k_iter*16 .. k_iter*16+16)
+/// b_row maps to the thread's row within the 16-row k-tile
+///
+/// Unlike the standard B load, here the k_iter multiplies by row_stride (not column stride)
+/// because we're iterating over rows of the source tile.
+fn emit_load_b_fragment_row_major_k_is_q(
+    ptx: &mut String,
+    frag_name: &str,
+    shmem_base: usize,
+    row_stride_elems: usize,
+    n_tile: usize,
+) {
+    ptx.push_str(&format!(
+        "    // B-fragment (k=row) for n_tile={} from shmem[{}..]\n",
+        n_tile, shmem_base
+    ));
+    for bi in 0..2 {
+        let k_row_offset = bi * 8; // b_row offset within the 16-row tile: 0 or 8
+        // row = k_iter * 16 + b_row + k_row_offset
+        // col = n_tile * 8 + (element within pair: 0, 1)
+        // addr = (row * row_stride + col) * 4 + shmem_base
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, 0;  // k_iter * MMA_K * row_stride * 4\n",
+            MMA_K * row_stride_elems * 4
+        ));
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_b_row, {}, %bwd_mma_addr;  // + b_row * row_stride * 4\n",
+            row_stride_elems * 4
+        ));
+        if k_row_offset > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_row_offset * row_stride * 4\n",
+                k_row_offset * row_stride_elems * 4
+            ));
+        }
+        // Column offset: n_tile * MMA_N * 4 (bytes)
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + n_tile * MMA_N * 4\n",
+            n_tile * MMA_N * 4
+        ));
+        if shmem_base > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + shmem base\n",
+                shmem_base
+            ));
+        }
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+        ptx.push_str(&format!(
+            "    mov.b32 {frag_name}_{bi}, {{%bwd_mma_h0, %bwd_mma_h1}};\n"
+        ));
+    }
+}
+
+/// Store MMA accumulator tile results to shared memory.
+/// Optionally applies the %scale factor before storing.
+fn emit_scale_and_store_mma_tile(
+    ptx: &mut String,
+    acc_prefix: &str,
+    n_tiles: usize,
+    shmem_base: usize,
+    row_width: usize, // number of columns in the output tile (e.g. block_kv)
+    apply_scale: bool,
+) {
+    ptx.push_str("    // Store MMA accumulator results to shmem\n");
+
+    for nt in 0..n_tiles {
+        for r in 0..4 {
+            if apply_scale {
+                ptx.push_str(&format!(
+                    "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %scale;\n"
+                ));
+            }
+            let row_offset = if r >= 2 { 8 } else { 0 };
+            let col_offset = if r % 2 == 1 { 4 } else { 0 };
+            // row = m_tile*16 + a_row + row_offset
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                MMA_M
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_a_row;\n",
+            );
+            if row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {};\n",
+                    row_offset
+                ));
+            }
+            // addr = shmem_base + (row * row_width + nt*8 + col0 + col_offset) * 4
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_addr, %bwd_mma_store_row, {};\n",
+                row_width
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + nt*MMA_N + col_offset\n",
+                nt * MMA_N + col_offset
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, %bwd_mma_store_col;\n",
+            );
+            ptx.push_str("    shl.b32 %bwd_mma_store_addr, %bwd_mma_store_addr, 2;\n");
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
+                shmem_base
+            ));
+            ptx.push_str(&format!(
+                "    st.shared.f32 [shmem + %bwd_mma_store_addr], {acc_prefix}_{nt}_{r};\n"
+            ));
+        }
+    }
+}
+
+/// Accumulate MMA results to shared memory via atom.shared.add.f32 (no scaling).
+/// Used for dV += P^T @ dO.
+fn emit_accumulate_mma_to_shmem(
+    ptx: &mut String,
+    acc_prefix: &str,
+    n_tiles: usize,
+    shmem_base: usize,
+    row_stride_elems: usize, // hd_padded
+) {
+    ptx.push_str("    // Accumulate MMA results to shmem via atomicAdd\n");
+
+    for nt in 0..n_tiles {
+        for r in 0..4 {
+            let row_offset = if r >= 2 { 8 } else { 0 };
+            let col_offset = if r % 2 == 1 { 4 } else { 0 };
+            // row = m_tile*16 + a_row + row_offset
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                MMA_M
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_a_row;\n",
+            );
+            if row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {};\n",
+                    row_offset
+                ));
+            }
+            // col = nt*8 + col0 + col_offset
+            // addr = shmem_base + (row * row_stride + col) * 4
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_addr, %bwd_mma_store_row, {};\n",
+                row_stride_elems
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + nt*MMA_N + col_offset\n",
+                nt * MMA_N + col_offset
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, %bwd_mma_store_col;\n",
+            );
+            ptx.push_str("    shl.b32 %bwd_mma_store_addr, %bwd_mma_store_addr, 2;\n");
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
+                shmem_base
+            ));
+            ptx.push_str(&format!(
+                "    atom.shared.add.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_store_addr], {acc_prefix}_{nt}_{r};\n"
+            ));
+        }
+    }
+}
+
+/// Accumulate MMA results to shared memory via atom.shared.add.f32 WITH scale factor.
+/// Used for dK += dS^T @ Q * scale.
+fn emit_accumulate_mma_to_shmem_scaled(
+    ptx: &mut String,
+    acc_prefix: &str,
+    n_tiles: usize,
+    shmem_base: usize,
+    row_stride_elems: usize,
+) {
+    ptx.push_str("    // Accumulate MMA results to shmem via atomicAdd (with scale)\n");
+
+    for nt in 0..n_tiles {
+        for r in 0..4 {
+            // Scale first
+            ptx.push_str(&format!(
+                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %scale;\n"
+            ));
+            let row_offset = if r >= 2 { 8 } else { 0 };
+            let col_offset = if r % 2 == 1 { 4 } else { 0 };
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                MMA_M
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_a_row;\n",
+            );
+            if row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {};\n",
+                    row_offset
+                ));
+            }
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_addr, %bwd_mma_store_row, {};\n",
+                row_stride_elems
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + nt*MMA_N + col_offset\n",
+                nt * MMA_N + col_offset
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, %bwd_mma_store_col;\n",
+            );
+            ptx.push_str("    shl.b32 %bwd_mma_store_addr, %bwd_mma_store_addr, 2;\n");
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
+                shmem_base
+            ));
+            ptx.push_str(&format!(
+                "    atom.shared.add.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_store_addr], {acc_prefix}_{nt}_{r};\n"
+            ));
+        }
+    }
+}
+
+/// Emit atomicAdd of MMA dQ results to global dQ memory (with scale).
+/// dQ[global_q_row, d] += acc * scale
+/// global_q_row = q_start + m_tile*16 + thread_row
+fn emit_atomicadd_mma_to_global_dq(
+    ptx: &mut String,
+    acc_prefix: &str,
+    n_tiles: usize,
+    config: &FlashAttentionBackwardConfig,
+) {
+    ptx.push_str("    // AtomicAdd MMA dQ results to global dQ (with scale)\n");
+
+    for nt in 0..n_tiles {
+        for r in 0..4 {
+            // Scale
+            ptx.push_str(&format!(
+                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %scale;\n"
+            ));
+            let row_offset: usize = if r >= 2 { 8 } else { 0 };
+            let col_offset: usize = if r % 2 == 1 { 4 } else { 0 };
+
+            // global_q_row = q_start + m_tile*16 + a_row + row_offset
+            // We compute the 64-bit global address:
+            // dQ_addr = dq_ptr + (bh_elem_offset + global_q_row * head_dim + col) * 4
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                MMA_M
+            ));
+            ptx.push_str(
+                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_a_row;\n",
+            );
+            if row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {};\n",
+                    row_offset
+                ));
+            }
+            // Convert to u64 and add q_start (%rd25)
+            ptx.push_str(
+                "    cvt.u64.u32 %bwd_mma_gaddr, %bwd_mma_store_row;  // row as u64\n",
+            );
+            ptx.push_str(
+                "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd25;   // + q_start\n",
+            );
+            // global_q_row * head_dim
+            ptx.push_str(
+                "    mul.lo.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd10;  // * head_dim\n",
+            );
+            // + bh_elem_offset (%rd15)
+            ptx.push_str(
+                "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd15;\n",
+            );
+            // + col (nt*8 + col0 + col_offset)
+            ptx.push_str(&format!(
+                "    cvt.u64.u32 %rd35, %bwd_mma_store_col;  // col0 as u64\n"
+            ));
+            ptx.push_str(&format!(
+                "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, {};  // + nt*MMA_N + col_offset\n",
+                nt * MMA_N + col_offset
+            ));
+            ptx.push_str(
+                "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd35;  // + col0\n",
+            );
+            // * 4 bytes
+            ptx.push_str(
+                "    shl.b64 %bwd_mma_gaddr, %bwd_mma_gaddr, 2;\n",
+            );
+            // + dq_ptr (%rd4)
+            ptx.push_str(
+                "    add.u64 %bwd_mma_gaddr, %bwd_mma_gaddr, %rd4;  // + dq_ptr\n",
+            );
+            ptx.push_str(&format!(
+                "    atom.global.add.f32 %bwd_mma_f32_lo, [%bwd_mma_gaddr], {acc_prefix}_{nt}_{r};\n"
+            ));
+        }
+    }
+
+    let _ = config; // config used for documentation/future extensions
 }
 
 /// Store dK_local and dV_local from shared memory to global dK/dV arrays.
@@ -4735,15 +5447,16 @@ mod tests {
 
     #[test]
     fn test_bwd_main_mma_tile_count() {
-        // Verify correct number of MMA instructions for block_kv=64
+        // Verify correct number of MMA instructions for block_kv=64, head_dim=64
+        // 5 matmuls: S, dP (n_tiles_s=8 each), dV, dQ, dK (n_tiles_hd=8 each)
+        // Total = 5 * 8 = 40
         let cfg = bwd_config(false);
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
-        // n_tiles_s = 64/8 = 8 MMA instructions per m-tile per K iteration
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
         assert_eq!(
-            mma_count, 8,
-            "expected 8 MMA instructions (one per n-tile), got {}",
+            mma_count, 40,
+            "expected 40 MMA instructions (5 matmuls * 8 n-tiles), got {}",
             mma_count
         );
     }
