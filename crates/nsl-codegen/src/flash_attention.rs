@@ -2021,6 +2021,159 @@ fn emit_mma_temp_registers(ptx: &mut String) {
     );
 }
 
+// ── FlashAttention-2 Backward Pass ───────────────────────────────────────
+
+/// Configuration for a FlashAttention backward PTX kernel variant.
+#[derive(Clone, Debug)]
+pub struct FlashAttentionBackwardConfig {
+    pub block_q: i64,
+    pub block_kv: i64,
+    pub head_dim: i64,
+    pub causal: bool,
+    pub gpu_sm: u32,
+}
+
+/// Kernel name for the Phase 1 D-correction vector kernel.
+pub fn flash_attention_bwd_d_kernel_name(config: &FlashAttentionBackwardConfig) -> String {
+    format!("flash_attn_bwd_d_c{}_q{}", config.causal as u8, config.block_q)
+}
+
+/// Kernel name for the Phase 2 main backward kernel (dQ/dK/dV).
+pub fn flash_attention_bwd_main_kernel_name(config: &FlashAttentionBackwardConfig) -> String {
+    format!(
+        "flash_attn_bwd_main_c{}_q{}_kv{}",
+        config.causal as u8, config.block_q, config.block_kv
+    )
+}
+
+/// Compute shared memory bytes needed by the Phase 2 backward kernel.
+pub fn backward_shared_mem_bytes(config: &FlashAttentionBackwardConfig) -> u32 {
+    let pad = 4i64;
+    let hd_padded = config.head_dim + pad;
+    let tile_bytes = |rows: i64, cols: i64| -> i64 { rows * cols * 4 };
+    let q_tile = tile_bytes(config.block_q, hd_padded);
+    let k_tile = tile_bytes(config.block_kv, hd_padded);
+    let v_tile = tile_bytes(config.block_kv, hd_padded);
+    let do_tile = tile_bytes(config.block_q, hd_padded);
+    let dk_local = tile_bytes(config.block_kv, hd_padded);
+    let dv_local = tile_bytes(config.block_kv, hd_padded);
+    let s_tile = tile_bytes(config.block_q, config.block_kv);
+    let d_vec = config.block_q * 4;
+    let l_vec = config.block_q * 4;
+    (q_tile + k_tile + v_tile + do_tile + dk_local + dv_local + s_tile + d_vec + l_vec) as u32
+}
+
+/// Synthesize PTX for the FlashAttention-2 backward pass.
+///
+/// Returns a tuple of two null-terminated PTX byte vectors:
+///   - `.0` — Phase 1: D-correction vector kernel
+///   - `.1` — Phase 2: main dQ/dK/dV kernel (placeholder for now)
+pub fn synthesize_flash_attention_backward_ptx(
+    config: &FlashAttentionBackwardConfig,
+) -> (Vec<u8>, Vec<u8>) {
+    // Phase 1: D-correction vector
+    let mut ptx1 = String::with_capacity(2048);
+    emit_ptx_header(&mut ptx1, config.gpu_sm);
+    emit_flash_attention_bwd_d(&mut ptx1, config);
+    ptx1.push('\0');
+
+    // Phase 2: placeholder for Task 2
+    let ptx2 = vec![0u8]; // null-terminated empty
+
+    (ptx1.into_bytes(), ptx2)
+}
+
+/// Emit the Phase 1 D-correction vector kernel.
+///
+/// Computes `D[bh, i] = sum_d( dO[bh, i, d] * O[bh, i, d] )` for each position i.
+/// Grid: `(B*nh, ceil(S/block_q), 1)` with `block_q` threads per block.
+fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let kernel_name = flash_attention_bwd_d_kernel_name(config);
+
+    // Entry point and parameters
+    ptx.push_str(&format!(".visible .entry {} (\n", kernel_name));
+    ptx.push_str("    .param .u64 dout_ptr,\n");
+    ptx.push_str("    .param .u64 out_ptr,\n");
+    ptx.push_str("    .param .u64 d_ptr,\n");
+    ptx.push_str("    .param .u64 seq_len,\n");
+    ptx.push_str("    .param .u64 head_dim\n");
+    ptx.push_str(")\n");
+    ptx.push_str("{\n");
+
+    // Register declarations
+    ptx.push_str("    .reg .u32 %r<10>;\n");
+    ptx.push_str("    .reg .u64 %rd<20>;\n");
+    ptx.push_str("    .reg .f32 %f<4>;\n");
+    ptx.push_str("    .reg .pred %p<3>;\n\n");
+
+    // Load parameters
+    ptx.push_str("    ld.param.u64 %rd1, [dout_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd2, [out_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd3, [d_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd4, [seq_len];\n");
+    ptx.push_str("    ld.param.u64 %rd5, [head_dim];\n\n");
+
+    // Compute bh = blockIdx.x
+    ptx.push_str("    // bh = blockIdx.x\n");
+    ptx.push_str("    mov.u32 %r1, %ctaid.x;\n");
+    ptx.push_str("    cvt.u64.u32 %rd6, %r1;\n\n");
+
+    // Compute pos = blockIdx.y * blockDim.x + threadIdx.x
+    ptx.push_str("    // pos = blockIdx.y * blockDim.x + threadIdx.x\n");
+    ptx.push_str("    mov.u32 %r2, %ctaid.y;\n");
+    ptx.push_str("    mov.u32 %r3, %ntid.x;\n");
+    ptx.push_str("    mul.lo.u32 %r4, %r2, %r3;\n");
+    ptx.push_str("    mov.u32 %r5, %tid.x;\n");
+    ptx.push_str("    add.u32 %r4, %r4, %r5;\n");
+    ptx.push_str("    cvt.u64.u32 %rd7, %r4;\n\n");
+
+    // Bounds check: if pos >= seq_len, skip
+    ptx.push_str("    // Bounds check\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd7, %rd4;\n");
+    ptx.push_str(&format!("    @%p1 bra {}_DONE;\n\n", kernel_name));
+
+    // base = (bh * seq_len + pos) * head_dim, byte offset = base * 4
+    ptx.push_str("    // base = (bh * seq_len + pos) * head_dim\n");
+    ptx.push_str("    mul.lo.u64 %rd8, %rd6, %rd4;\n");  // bh * seq_len
+    ptx.push_str("    add.u64 %rd8, %rd8, %rd7;\n");      // + pos
+    ptx.push_str("    mul.lo.u64 %rd8, %rd8, %rd5;\n");   // * head_dim
+    ptx.push_str("    shl.b64 %rd8, %rd8, 2;\n\n");       // * 4 (sizeof f32)
+
+    // Compute dout_base and out_base pointers
+    ptx.push_str("    // dout_base, out_base pointers\n");
+    ptx.push_str("    add.u64 %rd9, %rd1, %rd8;\n");
+    ptx.push_str("    add.u64 %rd10, %rd2, %rd8;\n\n");
+
+    // Dot product loop: sum = sum_d(dO[base+d] * O[base+d])
+    ptx.push_str("    // Dot product across head_dim\n");
+    ptx.push_str("    mov.f32 %f1, 0f00000000;\n");        // sum = 0.0
+    ptx.push_str("    mov.u64 %rd11, 0;\n");               // d = 0
+    ptx.push_str(&format!("{}_LOOP:\n", kernel_name));
+    ptx.push_str("    setp.ge.u64 %p2, %rd11, %rd5;\n");
+    ptx.push_str(&format!("    @%p2 bra {}_STORE;\n", kernel_name));
+    ptx.push_str("    shl.b64 %rd12, %rd11, 2;\n");        // d * 4
+    ptx.push_str("    add.u64 %rd13, %rd9, %rd12;\n");
+    ptx.push_str("    add.u64 %rd14, %rd10, %rd12;\n");
+    ptx.push_str("    ld.global.f32 %f2, [%rd13];\n");
+    ptx.push_str("    ld.global.f32 %f3, [%rd14];\n");
+    ptx.push_str("    fma.rn.f32 %f1, %f2, %f3, %f1;\n"); // sum += dout * out
+    ptx.push_str("    add.u64 %rd11, %rd11, 1;\n");
+    ptx.push_str(&format!("    bra {}_LOOP;\n\n", kernel_name));
+
+    // Store D[bh * seq_len + pos]
+    ptx.push_str(&format!("{}_STORE:\n", kernel_name));
+    ptx.push_str("    // D[bh * seq_len + pos] = sum\n");
+    ptx.push_str("    mul.lo.u64 %rd15, %rd6, %rd4;\n");  // bh * seq_len
+    ptx.push_str("    add.u64 %rd15, %rd15, %rd7;\n");     // + pos
+    ptx.push_str("    shl.b64 %rd15, %rd15, 2;\n");        // * 4
+    ptx.push_str("    add.u64 %rd15, %rd3, %rd15;\n");
+    ptx.push_str("    st.global.f32 [%rd15], %f1;\n\n");
+
+    ptx.push_str(&format!("{}_DONE:\n", kernel_name));
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
