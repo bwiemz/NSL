@@ -900,6 +900,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // FlashAttention-2 backward (M27 backward pass)
+    // Returns NslList [dQ, dK, dV]. When logsumexp_ptr == 0, auto-computes lse.
+    (
+        "nsl_flash_attention_backward",
+        &[
+            types::I64, // dout
+            types::I64, types::I64, types::I64, // q, k, v
+            types::I64, // out (forward output)
+            types::I64, // logsumexp (0 = auto-compute)
+            types::I64, // scale_bits (f32 as i64)
+            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
+            types::I64, // causal
+        ],
+        Some(types::I64),
+    ),
     // M42b: Quantized FlashAttention (KV-cache in INT8/FP8)
     (
         "nsl_flash_attention_quantized",

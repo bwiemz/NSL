@@ -882,13 +882,83 @@ fn lower_single_op(
             }
             free_tensor_value(compiler, builder, masked)?;
             free_tensor_value(compiler, builder, attn_weights)?;
+
+            // Store the forward output in the side-channel for the backward.
+            // The logsumexp is NOT pre-computed here; the backward runtime
+            // auto-computes it when logsumexp_ptr == 0.
+            // We store (result, null) where null signals "no pre-computed lse".
+            let null_lse = builder.ins().iconst(cl_types::I64, 0);
+            compiler.flash_attn_aux.insert(result, (result, null_lse));
+
             Ok(result)
         }
-        PrimalOp::FlashAttentionBackwardExtract { .. } => {
-            // Fused attention backward component extraction.
-            // Approximate: clone the input tensor (the full backward will be
-            // decomposed by ad_rules into simpler ops).
-            call(compiler, builder, "nsl_tensor_clone", &[inputs[0]])
+        PrimalOp::FlashAttentionBackwardExtract { causal, component } => {
+            // Fused attention backward: call nsl_flash_attention_backward to get
+            // [dQ, dK, dV] as an NslList, then extract the requested component.
+            //
+            // inputs: [dout, q, k, v, fwd_out]
+            // The first component (0 = dQ) triggers the backward call and caches
+            // the result list. Subsequent components (1 = dK, 2 = dV) extract from
+            // the cached list. The last component (2 = dV) frees the list.
+            let dout = inputs[0];
+            let q = inputs[1];
+            let k = inputs[2];
+            let v = inputs[3];
+            let fwd_out = inputs[4];
+
+            // Look up or compute the backward [dQ, dK, dV] list
+            let list_val = if let Some(&cached) = compiler.flash_attn_bwd_cache.get(&fwd_out) {
+                cached
+            } else {
+                // Extract scale from Q's head_dim: scale = 1/sqrt(head_dim)
+                let dim3 = builder.ins().iconst(cl_types::I64, 3);
+                let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
+                // Convert head_dim (i64) to f64, compute 1/sqrt, reinterpret as f32 bits
+                let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, head_dim);
+                let hd_sqrt = builder.ins().sqrt(hd_f64);
+                let one_f64 = builder.ins().f64const(1.0);
+                let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
+                // Convert to f32 then reinterpret as i32 bits for scale_bits param
+                let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
+                let scale_bits_i32 = builder.ins().bitcast(cl_types::I32, cranelift_codegen::ir::MemFlags::new(), scale_f32);
+                let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
+
+                // Extract batch, heads, seq_len, head_dim from Q shape
+                let dim0 = builder.ins().iconst(cl_types::I64, 0);
+                let dim1 = builder.ins().iconst(cl_types::I64, 1);
+                let dim2 = builder.ins().iconst(cl_types::I64, 2);
+                let batch = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim0])?;
+                let heads = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim1])?;
+                let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim2])?;
+
+                // Logsumexp: pass 0 to signal "auto-compute in the runtime"
+                let lse_null = builder.ins().iconst(cl_types::I64, 0);
+
+                let causal_val = builder.ins().iconst(cl_types::I64, if *causal { 1 } else { 0 });
+
+                let list = call(
+                    compiler,
+                    builder,
+                    "nsl_flash_attention_backward",
+                    &[dout, q, k, v, fwd_out, lse_null,
+                      scale_bits, batch, heads, seq_len, head_dim,
+                      causal_val],
+                )?;
+                compiler.flash_attn_bwd_cache.insert(fwd_out, list);
+                list
+            };
+
+            // Extract the requested component
+            let idx = builder.ins().iconst(cl_types::I64, *component as i64);
+            let result = call(compiler, builder, "nsl_list_get", &[list_val, idx])?;
+
+            // Free the list after the last component (dV, component=2) is extracted
+            if *component == 2 {
+                let _ = call(compiler, builder, "nsl_list_free", &[list_val])?;
+                compiler.flash_attn_bwd_cache.remove(&fwd_out);
+            }
+
+            Ok(result)
         }
         PrimalOp::RoPE { .. } => {
             // No dedicated nsl_tensor_rope FFI exists; clone as identity for now.
@@ -1082,31 +1152,9 @@ fn lower_single_op(
                         &[inputs[0], last_dim, keepdim],
                     )
                 }
-                "causal_mask_add" => {
-                    // SDPA decomposition: add a causal mask to the scaled
-                    // scores tensor. inputs = [scaled, q]. The mask size comes
-                    // from q.shape[-2]. The mask itself is a compile-time
-                    // constant from the AD rules' perspective — gradient flows
-                    // through `scaled` as identity and does NOT flow back into
-                    // the mask (which is synthesized here at lowering time).
-                    let scaled = inputs[0];
-                    let q = inputs[1];
-                    let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
-                    let seq_len =
-                        call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim_neg2])?;
-                    let mask =
-                        call(compiler, builder, "nsl_tensor_causal_mask", &[seq_len])?;
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = call(
-                        compiler,
-                        builder,
-                        "nsl_tensor_add",
-                        &[scaled, mask, flags_zero],
-                    )?;
-                    // Free the mask — it's owned by this op and no longer needed.
-                    let _ = call(compiler, builder, "nsl_tensor_free", &[mask])?;
-                    Ok(result)
-                }
+                // "causal_mask_add" was used by the decomposed SDPA path
+                // (commit e8d5a76) and has been removed in favor of the fused
+                // ScaledDotProductAttention + FlashAttentionBackwardExtract path.
                 _ if name.starts_with("dict_get:") => {
                     // inputs = [dict_ptr]
                     // Dict field access: batch.input_ids -> nsl_dict_get_str(batch, "input_ids")

@@ -693,10 +693,26 @@ impl Compiler<'_> {
                     ))
                 })?;
 
+            // Embed backward PTX alongside forward
+            let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
+                block_q: config.block_q,
+                block_kv: config.block_kv,
+                head_dim: config.head_dim,
+                causal: config.causal,
+                gpu_sm: config.gpu_sm,
+            };
+            let (bwd_p1, bwd_p2) =
+                crate::flash_attention::synthesize_flash_attention_backward_ptx(&bwd_config);
+            let bwd_p1_id = self.embed_raw_data("__nsl_flash_bwd_p1", bwd_p1)?;
+            let bwd_p2_id = self.embed_raw_data("__nsl_flash_bwd_p2", bwd_p2)?;
+
             Ok(Some(FlashAttentionCompileContext {
                 ptx_data_id,
                 name_data_id,
                 config,
+                bwd_phase1_data_id: Some(bwd_p1_id),
+                bwd_phase2_data_id: Some(bwd_p2_id),
+                bwd_config: Some(bwd_config),
             }))
         } else {
             // No @autotune — single-config path (original behaviour)
@@ -770,12 +786,42 @@ impl Compiler<'_> {
                     ))
                 })?;
 
+            // Embed backward PTX alongside forward
+            let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
+                block_q: config.block_q,
+                block_kv: config.block_kv,
+                head_dim: config.head_dim,
+                causal: config.causal,
+                gpu_sm: config.gpu_sm,
+            };
+            let (bwd_p1, bwd_p2) =
+                crate::flash_attention::synthesize_flash_attention_backward_ptx(&bwd_config);
+            let bwd_p1_id = self.embed_raw_data("__nsl_flash_bwd_p1", bwd_p1)?;
+            let bwd_p2_id = self.embed_raw_data("__nsl_flash_bwd_p2", bwd_p2)?;
+
             Ok(Some(FlashAttentionCompileContext {
                 ptx_data_id,
                 name_data_id,
                 config,
+                bwd_phase1_data_id: Some(bwd_p1_id),
+                bwd_phase2_data_id: Some(bwd_p2_id),
+                bwd_config: Some(bwd_config),
             }))
         }
+    }
+
+    /// Embed raw bytes in .rodata and return the DataId.
+    fn embed_raw_data(&mut self, label: &str, data: Vec<u8>) -> Result<DataId, CodegenError> {
+        let data_id = self
+            .module
+            .declare_data(label, cranelift_module::Linkage::Local, false, false)
+            .map_err(|e| CodegenError::new(format!("failed to declare data '{}': {e}", label)))?;
+        let mut desc = DataDescription::new();
+        desc.define(data.into_boxed_slice());
+        self.module
+            .define_data(data_id, &desc)
+            .map_err(|e| CodegenError::new(format!("failed to define data '{}': {e}", label)))?;
+        Ok(data_id)
     }
 
     /// Embed a FlashAttention PTX variant in .rodata and record its DataIds

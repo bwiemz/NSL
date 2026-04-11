@@ -93,12 +93,12 @@ pub enum AdjointExpr {
     L1Backward(VarId, VarId, VarId),
 
     // Attention backward — per-component (Q, K, V) for correct causal masking
-    /// Attention backward for Q: args: (grad, Q, K, V, causal)
-    AttentionBackwardQ(VarId, VarId, VarId, VarId, bool),
-    /// Attention backward for K: args: (grad, Q, K, V, causal)
-    AttentionBackwardK(VarId, VarId, VarId, VarId, bool),
-    /// Attention backward for V: args: (grad, Q, K, V, causal)
-    AttentionBackwardV(VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for Q: args: (grad, Q, K, V, fwd_result, causal)
+    AttentionBackwardQ(VarId, VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for K: args: (grad, Q, K, V, fwd_result, causal)
+    AttentionBackwardK(VarId, VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for V: args: (grad, Q, K, V, fwd_result, causal)
+    AttentionBackwardV(VarId, VarId, VarId, VarId, VarId, bool),
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
     /// rotate_half backward: -rotate_half(grad).
@@ -459,22 +459,24 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
 
         // --- Attention ---
         PrimalOp::ScaledDotProductAttention { causal } => {
-            // Q, K, V are inputs[0..3]
+            // Q, K, V are inputs[0..3]; fwd_result is the forward output VarId
+            // needed by the backward lowering to look up the logsumexp buffer.
             let q = op.inputs[0];
             let k = op.inputs[1];
             let v = op.inputs[2];
+            let fwd_result = op.result;
             vec![
                 InputAdjoint {
                     input_var: q,
-                    expr: AdjointExpr::AttentionBackwardQ(output_bar, q, k, v, *causal),
+                    expr: AdjointExpr::AttentionBackwardQ(output_bar, q, k, v, fwd_result, *causal),
                 },
                 InputAdjoint {
                     input_var: k,
-                    expr: AdjointExpr::AttentionBackwardK(output_bar, q, k, v, *causal),
+                    expr: AdjointExpr::AttentionBackwardK(output_bar, q, k, v, fwd_result, *causal),
                 },
                 InputAdjoint {
                     input_var: v,
-                    expr: AdjointExpr::AttentionBackwardV(output_bar, q, k, v, *causal),
+                    expr: AdjointExpr::AttentionBackwardV(output_bar, q, k, v, fwd_result, *causal),
                 },
             ]
         }
@@ -507,13 +509,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 // are only ever called on frozen RoPE inv_freq tables, never
                 // on trainable parameters, so the identity rule is harmless.
                 // If you ever apply cos/sin to a trainable tensor, FIX THIS.
-                //
-                // causal_mask_add is emitted by the SDPA extractor decomposition
-                // and adds a CONSTANT causal mask to the scaled scores tensor.
-                // Because the mask is a constant, the gradient w.r.t. the
-                // scaled input is identity (and the mask itself receives no
-                // gradient — it's not even an input_var[1] for differentiation).
-                "contiguous" | "cos" | "sin" | "causal_mask_add" | "sum_keepdim_last" | "mean_keepdim_last" => {
+                "contiguous" | "cos" | "sin" | "sum_keepdim_last" | "mean_keepdim_last" => {
                     if op.inputs.is_empty() {
                         vec![]
                     } else {
@@ -1141,15 +1137,15 @@ mod tests {
         );
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, true)
+            AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, 3, true)
         ));
         assert!(matches!(
             adj[1].expr,
-            AdjointExpr::AttentionBackwardK(100, 0, 1, 2, true)
+            AdjointExpr::AttentionBackwardK(100, 0, 1, 2, 3, true)
         ));
         assert!(matches!(
             adj[2].expr,
-            AdjointExpr::AttentionBackwardV(100, 0, 1, 2, true)
+            AdjointExpr::AttentionBackwardV(100, 0, 1, 2, 3, true)
         ));
         assert_eq!(
             saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: true }),
