@@ -2251,7 +2251,8 @@ fn emit_bwd_main_registers(ptx: &mut String, _config: &FlashAttentionBackwardCon
     ptx.push_str("    .reg .f32 %f_val;\n");
     ptx.push_str("    .reg .f32 %f_d_val;\n");
     ptx.push_str("    .reg .f32 %f_l_val;\n");
-    ptx.push_str("    .reg .f32 %f_tmp;\n\n");
+    ptx.push_str("    .reg .f32 %f_tmp;\n");
+    ptx.push_str("    .reg .f32 %f_discard;  // sink for atom.shared.add.f32 return value\n\n");
 }
 
 /// Load kernel parameters into registers.
@@ -2766,11 +2767,14 @@ fn emit_bwd_main_q_tile_loop(ptx: &mut String, config: &FlashAttentionBackwardCo
         "    add.u64 %rd36, %rd36, {};\n",
         dv_shmem_offset
     ));
-    // Atomic add to shared memory (multiple threads accumulate to same dV row)
+    // Atomic add to shared memory — multiple threads (different mi values)
+    // accumulate to the same dV[nj][d] slot concurrently. Without atomics,
+    // the read-modify-write would race and produce wrong gradients.
+    // atom.shared.add.f32 requires sm_60+ (Pascal); our scalar path targets
+    // sm_52 minimum but correctness on sm_52 would need a bar.sync restructure.
+    // For the target hardware (RTX 5070 Ti, sm_120) this is optimal.
     ptx.push_str("    mul.f32 %f_tmp, %f_p, %f_val;     // P * dO[d]\n");
-    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];\n");
-    ptx.push_str("    add.f32 %f_val, %f_val, %f_tmp;\n");
-    ptx.push_str("    st.shared.f32 [shmem + %rd36], %f_val;  // dV[nj][d] += P * dO[d]\n");
+    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd36], %f_tmp;  // dV[nj][d] += P * dO[d]\n");
     ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
     ptx.push_str("    bra BWD_MAIN_DV_ACCUM;\n");
     ptx.push_str("BWD_MAIN_DV_ACCUM_DONE:\n\n");
@@ -2879,10 +2883,9 @@ fn emit_bwd_main_q_tile_loop(ptx: &mut String, config: &FlashAttentionBackwardCo
         "    add.u64 %rd37, %rd37, {};\n",
         dk_shmem_offset
     ));
-    // Read-modify-write (same thread may accumulate across Q tiles via nj loop)
-    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd37];\n");
-    ptx.push_str("    add.f32 %f_val, %f_val, %f_tmp;\n");
-    ptx.push_str("    st.shared.f32 [shmem + %rd37], %f_val;  // dK[nj][d] += dS * Q[d] * scale\n");
+    // Atomic add to shared memory — same race condition as dV: multiple
+    // threads (different mi) accumulate to the same dK[nj][d] slot.
+    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd37], %f_tmp;  // dK[nj][d] += dS * Q[d] * scale\n");
     ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
     ptx.push_str("    bra BWD_MAIN_DK_ACCUM;\n");
     ptx.push_str("BWD_MAIN_DK_ACCUM_DONE:\n\n");
