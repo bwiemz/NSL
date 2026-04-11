@@ -2221,11 +2221,18 @@ fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwa
     ));
 
     emit_bwd_main_registers(ptx, config);
+    if use_mma_path(config.gpu_sm) {
+        emit_bwd_mma_registers(ptx, config);
+    }
     emit_bwd_main_param_loads(ptx, config);
     emit_bwd_main_index_computation(ptx, config);
     emit_bwd_main_load_kv_tiles(ptx, config);
     emit_bwd_main_init_dk_dv(ptx, config);
-    emit_bwd_main_q_tile_loop(ptx, config);
+    if use_mma_path(config.gpu_sm) {
+        emit_bwd_main_q_tile_loop_mma(ptx, config);
+    } else {
+        emit_bwd_main_q_tile_loop_scalar(ptx, config);
+    }
     emit_bwd_main_store_dk_dv(ptx, config);
 
     ptx.push_str("    ret;\n");
@@ -2473,8 +2480,9 @@ fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCon
     ptx.push_str("    bar.sync 0;  // dK/dV zeroed\n\n");
 }
 
-/// Emit the inner Q-tile loop and all 7 computation steps (3a-3g).
-fn emit_bwd_main_q_tile_loop(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+/// Emit the inner Q-tile loop using scalar FMA path (sm_52+).
+/// All 7 computation steps (3a-3g) use per-thread scalar dot products.
+fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_bytes = config.block_kv * hd_padded * 4;
     let v_tile_bytes = config.block_kv * hd_padded * 4;
@@ -2897,6 +2905,729 @@ fn emit_bwd_main_q_tile_loop(ptx: &mut String, config: &FlashAttentionBackwardCo
 
     ptx.push_str("BWD_MAIN_STEPS_DONE:\n");
     ptx.push_str("    bar.sync 0;  // all threads done with steps 3a-3g\n\n");
+
+    // Advance i_block
+    ptx.push_str("    add.u64 %rd24, %rd24, 1;  // i_block++\n");
+    ptx.push_str("    bra BWD_MAIN_Q_LOOP;\n");
+    ptx.push_str("BWD_MAIN_Q_LOOP_END:\n\n");
+}
+
+/// MMA register declarations for the backward kernel (sm_80+).
+/// Declares accumulators and fragment registers for S = Q@K^T and dP = dO@V^T.
+fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let n_tiles_s = config.block_kv as usize / MMA_N; // S: [block_q, block_kv]
+    let k_iters_qk = config.head_dim as usize / MMA_K;
+
+    ptx.push_str("    // === MMA registers for backward (S and dP matmuls) ===\n");
+
+    // S accumulators: one m-tile at a time, n_tiles_s n-tiles
+    for nt in 0..n_tiles_s {
+        ptx.push_str(&format!(
+            "    .reg .f32 %bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3;\n"
+        ));
+    }
+
+    // dP accumulators: same shape as S
+    for nt in 0..n_tiles_s {
+        ptx.push_str(&format!(
+            "    .reg .f32 %bwd_acc_dp_{nt}_0, %bwd_acc_dp_{nt}_1, %bwd_acc_dp_{nt}_2, %bwd_acc_dp_{nt}_3;\n"
+        ));
+    }
+
+    // A-fragment registers for Q (4 .b32) — used in S = Q@K^T
+    ptx.push_str("    .reg .b32 %bwd_aq_0, %bwd_aq_1, %bwd_aq_2, %bwd_aq_3;\n");
+
+    // B-fragment registers for K^T (n_tiles_s * 2 .b32) — used in S = Q@K^T
+    for nt in 0..n_tiles_s {
+        ptx.push_str(&format!("    .reg .b32 %bwd_bk_{nt}_0, %bwd_bk_{nt}_1;\n"));
+    }
+
+    // A-fragment registers for dO (4 .b32) — used in dP = dO@V^T
+    ptx.push_str("    .reg .b32 %bwd_ado_0, %bwd_ado_1, %bwd_ado_2, %bwd_ado_3;\n");
+
+    // B-fragment registers for V^T (n_tiles_s * 2 .b32) — used in dP = dO@V^T
+    for nt in 0..n_tiles_s {
+        ptx.push_str(&format!("    .reg .b32 %bwd_bv_{nt}_0, %bwd_bv_{nt}_1;\n"));
+    }
+
+    // MMA temporaries (reuse names from forward for the actual PTX ops — they're
+    // the same registers, just used in a different context)
+    ptx.push_str("    .reg .f16 %bwd_mma_h0, %bwd_mma_h1;     // f32->f16 conversion temps\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_addr;                  // shared memory address temp\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_k_iter;                // K-dimension loop counter\n");
+    ptx.push_str("    .reg .pred %bwd_mma_pk;                   // K-loop predicate\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_laneid;                // warp lane ID\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_a_row;                 // A-fragment row\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_b_row;                 // B-fragment row\n");
+    ptx.push_str("    .reg .f32 %bwd_mma_f32_lo, %bwd_mma_f32_hi;  // shmem load temps\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_m_tile;                // m-tile loop counter\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_m_byte_off;            // m-tile byte offset\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_store_row;             // row for storing MMA results\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_store_col;             // col for storing MMA results\n");
+    ptx.push_str("    .reg .u32 %bwd_mma_store_addr;            // shmem addr for MMA result store\n");
+
+    // Compute laneid and fragment row mappings
+    ptx.push_str("    mov.u32 %bwd_mma_laneid, %tid.x;\n");
+    ptx.push_str("    and.b32 %bwd_mma_laneid, %bwd_mma_laneid, 31;  // laneid = tid.x % 32\n");
+    // A-fragment row: row = (laneid % 4) * 2 + (laneid / 16)
+    ptx.push_str("    and.b32 %bwd_mma_a_row, %bwd_mma_laneid, 3;    // laneid % 4\n");
+    ptx.push_str("    shl.b32 %bwd_mma_a_row, %bwd_mma_a_row, 1;     // * 2\n");
+    ptx.push_str("    shr.u32 %bwd_mma_addr, %bwd_mma_laneid, 4;     // laneid / 16\n");
+    ptx.push_str("    add.u32 %bwd_mma_a_row, %bwd_mma_a_row, %bwd_mma_addr;  // (laneid%4)*2 + laneid/16\n");
+    // B-fragment row mapping matches A for the k-dimension
+    ptx.push_str("    mov.u32 %bwd_mma_b_row, %bwd_mma_a_row;\n");
+
+    ptx.push_str(&format!(
+        "    // n_tiles_s={}, k_iters_qk={}\n\n",
+        n_tiles_s, k_iters_qk
+    ));
+}
+
+/// Emit the inner Q-tile loop using MMA tensor cores for S and dP matmuls (sm_80+).
+///
+/// Steps 3a (S = Q@K^T) and 3d (dP = dO@V^T) use `mma.sync.aligned.m16n8k16`.
+/// Steps 3b, 3c, 3e, 3f, 3g remain scalar, reading from S_tile shared memory.
+fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let hd_padded = config.head_dim + BWD_PAD;
+    let k_tile_bytes = config.block_kv * hd_padded * 4;
+    let v_tile_bytes = config.block_kv * hd_padded * 4;
+    let q_shmem_offset = k_tile_bytes + v_tile_bytes;
+    let do_shmem_offset = q_shmem_offset + config.block_q * hd_padded * 4;
+    let dk_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4;
+    let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
+    let s_shmem_offset = dv_shmem_offset + config.block_kv * hd_padded * 4;
+    let d_shmem_offset = s_shmem_offset + config.block_q * config.block_kv * 4;
+    let l_shmem_offset = d_shmem_offset + config.block_q * 4;
+
+    let n_tiles_s = config.block_kv as usize / MMA_N;
+    let k_iters = config.head_dim as usize / MMA_K;
+    let m_tiles = config.block_q as usize / MMA_M;
+    let _head_dim = config.head_dim as usize;
+    let hd_padded_u = hd_padded as usize;
+
+    ptx.push_str("    // === Inner Q-tile loop (MMA path for S and dP) ===\n");
+
+    // i_block loop: for causal, start at j_block; otherwise start at 0
+    if config.causal {
+        ptx.push_str("    mov.u64 %rd24, %rd13;  // i_block = j_block (causal)\n");
+    } else {
+        ptx.push_str("    mov.u64 %rd24, 0;  // i_block = 0 (non-causal)\n");
+    }
+
+    ptx.push_str("BWD_MAIN_Q_LOOP:\n");
+    ptx.push_str("    setp.ge.u64 %p0, %rd24, %rd17;  // i_block >= num_q_tiles?\n");
+    ptx.push_str("    @%p0 bra BWD_MAIN_Q_LOOP_END;\n\n");
+
+    // q_start = i_block * block_q
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd25, %rd24, {};  // q_start = i_block * block_q\n",
+        config.block_q
+    ));
+
+    // Load Q[i_block] into shmem[q_shmem_offset..] — same as scalar path
+    ptx.push_str(&format!(
+        "    // Load Q[i_block] into shmem[{}..]\n",
+        q_shmem_offset
+    ));
+    ptx.push_str("    mul.lo.u64 %rd26, %rd25, %rd10;  // q_start * head_dim\n");
+    ptx.push_str("    add.u64 %rd26, %rd15, %rd26;\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
+    ptx.push_str("    add.u64 %rd26, %rd1, %rd26;  // q_global_base\n");
+
+    ptx.push_str("    mov.u64 %rd27, %rd11;  // mi = tid\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_Q_DONE;\n");
+    ptx.push_str("    mov.u64 %rd28, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q_D:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_Q_D_DONE;\n");
+    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
+    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
+    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd30, %rd27, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd30, %rd30, {};\n",
+        q_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_LOAD_Q;\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q_DONE:\n\n");
+
+    // Load dO[i_block] into shmem[do_shmem_offset..]
+    ptx.push_str(&format!(
+        "    // Load dO[i_block] into shmem[{}..]\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    mul.lo.u64 %rd26, %rd25, %rd10;\n");
+    ptx.push_str("    add.u64 %rd26, %rd15, %rd26;\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
+    ptx.push_str("    add.u64 %rd26, %rd0, %rd26;  // dO_global_base\n");
+
+    ptx.push_str("    mov.u64 %rd27, %rd11;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DO_DONE;\n");
+    ptx.push_str("    mov.u64 %rd28, 0;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO_D:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_DO_D_DONE;\n");
+    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
+    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
+    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd30, %rd27, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd30, %rd30, {};\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_LOAD_DO;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO_DONE:\n\n");
+
+    // Load D[i_block] and L[i_block] vectors into shmem
+    ptx.push_str("    // Load D[i_block] and L[i_block] into shmem\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd11, {};  // tid >= block_q?\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DL_DONE;\n");
+    ptx.push_str("    add.u64 %rd26, %rd16, %rd25;  // bh_seq_offset + q_start\n");
+    ptx.push_str("    add.u64 %rd26, %rd26, %rd11;  // + tid\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
+    ptx.push_str("    add.u64 %rd27, %rd7, %rd26;   // d_ptr + offset\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
+    ptx.push_str("    shl.b64 %rd28, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd28, %rd28, {};  // + D_vec shmem offset\n",
+        d_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    ptx.push_str("    add.u64 %rd27, %rd8, %rd26;   // lse_ptr + offset\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
+    ptx.push_str("    shl.b64 %rd28, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd28, %rd28, {};  // + L_vec shmem offset\n",
+        l_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DL_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // Q, dO, D, L loaded\n\n");
+
+    // ── MMA Step 3a: S = Q @ K^T * scale ──
+    // Compute the full S_tile [block_q, block_kv] via MMA and store to shmem.
+    // Loop over m-tiles; for each m-tile, compute all n-tiles of S.
+    ptx.push_str("    // === MMA Step 3a: S = Q @ K^T * scale ===\n");
+    ptx.push_str(&format!(
+        "    // m_tiles={}, n_tiles_s={}, k_iters={}\n",
+        m_tiles, n_tiles_s, k_iters
+    ));
+
+    // m-tile loop
+    ptx.push_str("    mov.u32 %bwd_mma_m_tile, 0;\n");
+    ptx.push_str("    mov.u32 %bwd_mma_m_byte_off, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_S_M_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p0, %bwd_mma_m_tile, {};\n",
+        m_tiles
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_S_M_DONE;\n\n");
+
+    // Zero S accumulators
+    for nt in 0..n_tiles_s {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mov.f32 %bwd_acc_s_{}_{}, 0x00000000;\n",
+                nt, r
+            ));
+        }
+    }
+
+    // K-dimension loop
+    ptx.push_str("    mov.u32 %bwd_mma_k_iter, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_S_K_LOOP:\n");
+
+    // Load A-fragment from Q shmem: Q[m_tile*16 + a_row, k_iter*16 + k_pair]
+    ptx.push_str("    // Load Q A-fragment (f32 from shmem, convert to f16)\n");
+    for i in 0..4 {
+        let k_pair = i * 4;
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_a_row, {};  // a_row * hd_padded * 4\n",
+            hd_padded_u * 4
+        ));
+        ptx.push_str(&format!(
+            "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
+            MMA_K * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
+            k_pair * 4
+        ));
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, %bwd_mma_m_byte_off;  // + m_tile offset\n");
+        ptx.push_str(&format!(
+            "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + Q shmem base\n",
+            q_shmem_offset
+        ));
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
+        ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+        ptx.push_str(&format!(
+            "    mov.b32 %bwd_aq_{}, {{%bwd_mma_h0, %bwd_mma_h1}};\n",
+            i
+        ));
+    }
+
+    // Load B-fragments from K shmem for each n-tile
+    // K is stored as K[nj, d] at shmem[0..] with hd_padded stride
+    // For K^T: B[k, n] where k=MMA K-dim, n=MMA N-dim
+    // Load K[nt*MMA_N + b_row, k_iter*MMA_K + k_pair]
+    for nt in 0..n_tiles_s {
+        ptx.push_str(&format!(
+            "    // K^T B-fragment for n_tile={}\n",
+            nt
+        ));
+        for bi in 0..2 {
+            let k_pair = bi * 8;
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_addr, %bwd_mma_b_row, {};  // b_row * hd_padded * 4\n",
+                hd_padded_u * 4
+            ));
+            ptx.push_str(&format!(
+                "    mad.lo.u32 %bwd_mma_addr, %bwd_mma_k_iter, {}, %bwd_mma_addr;  // + k_iter * MMA_K * 4\n",
+                MMA_K * 4
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + k_pair * 4\n",
+                k_pair * 4
+            ));
+            // n_tile offset: nt * MMA_N * hd_padded * 4
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_addr, %bwd_mma_addr, {};  // + n_tile * MMA_N * hd_padded * 4\n",
+                nt * MMA_N * hd_padded_u * 4
+            ));
+            // K is at shmem[0..] (no offset needed)
+            ptx.push_str("    ld.shared.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_addr];\n");
+            ptx.push_str("    add.u32 %bwd_mma_addr, %bwd_mma_addr, 4;\n");
+            ptx.push_str("    ld.shared.f32 %bwd_mma_f32_hi, [shmem + %bwd_mma_addr];\n");
+            ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h0, %bwd_mma_f32_lo;\n");
+            ptx.push_str("    cvt.rn.f16.f32 %bwd_mma_h1, %bwd_mma_f32_hi;\n");
+            ptx.push_str(&format!(
+                "    mov.b32 %bwd_bk_{}_{}, {{%bwd_mma_h0, %bwd_mma_h1}};\n",
+                nt, bi
+            ));
+        }
+    }
+
+    // Issue MMA for each n-tile: S_acc += Q_frag @ K^T_frag
+    for nt in 0..n_tiles_s {
+        ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3}},\n"
+        ));
+        ptx.push_str("        {%bwd_aq_0, %bwd_aq_1, %bwd_aq_2, %bwd_aq_3},\n");
+        ptx.push_str(&format!("        {{%bwd_bk_{nt}_0, %bwd_bk_{nt}_1}},\n"));
+        ptx.push_str(&format!(
+            "        {{%bwd_acc_s_{nt}_0, %bwd_acc_s_{nt}_1, %bwd_acc_s_{nt}_2, %bwd_acc_s_{nt}_3}};\n"
+        ));
+    }
+
+    // Loop back over K
+    ptx.push_str("    add.u32 %bwd_mma_k_iter, %bwd_mma_k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %bwd_mma_pk, %bwd_mma_k_iter, {};\n",
+        k_iters
+    ));
+    ptx.push_str("    @%bwd_mma_pk bra BWD_MAIN_MMA_S_K_LOOP;\n\n");
+
+    // Scale S by 1/sqrt(head_dim) and store to S_tile shmem
+    // MMA m16n8k16 result layout per thread: 4 f32 values covering 2 rows x 2 cols
+    // Thread t within warp holds:
+    //   row0 = m_tile*16 + (t%4)*2 + (t/16)      → acc[0], acc[1] at col = (t%8)/4 * ... (complex)
+    //   row1 = row0 + 8                            → acc[2], acc[3]
+    // For MMA m16n8k16: acc[0] = (row0, col0), acc[1] = (row0, col1),
+    //                    acc[2] = (row0+8, col0), acc[3] = (row0+8, col1)
+    // where col0 = (laneid / 4) % 2 * 1 ... actually:
+    //   col_base = nt * MMA_N
+    //   col_in_tile = (laneid / 4) % 2 * 4 + ... hmm
+    //
+    // Simplified: store all MMA results to S_tile in shmem using the standard MMA output mapping.
+    // row_in_m_tile = (laneid % 4) * 2 + (laneid / 16)      (0-based, same as a_row)
+    // col_in_n_tile for acc[0]: (laneid / 4) % 2 * 4 + 0    — but actually for m16n8:
+    //   Each thread has 2 columns: col0 = (laneid % 8) / 4 * 4, col1 = col0 + 1?
+    //
+    // Actually for mma.sync m16n8k16:
+    //   D[i]: i=0 → (row, col), i=1 → (row, col+1), i=2 → (row+8, col), i=3 → (row+8, col+1)
+    //   where row = (laneid % 4) * 2 + (laneid / 16)  [0-based within 16-row tile]
+    //         col = (laneid / 4) % 2 * 2              [0-based within 8-col tile]
+    //   Wait, n=8 means columns 0..7. With 32 threads, each thread covers 2 rows * 2 cols = 4 values.
+    //   Actually: col_base = ((laneid % 8) / 4) * 4  ... no.
+    //
+    //   Per NVIDIA PTX docs for m16n8k16 f32 output:
+    //   Thread (groupID, threadID_in_group) where groupID = laneid/4, threadID_in_group = laneid%4
+    //   row = threadID_in_group * 2 + (groupID / 4)  — for the first group of 8 rows
+    //   col = groupID % 4  — but n=8, so this can't be right for 4 values per thread
+    //
+    // Let me use the standard approach: store each acc value with computed row/col.
+    // For m16n8k16 D accumulator (4 x f32 per thread):
+    //   acc[0] → row = (laneid%4)*2 + (laneid/16),         col = ((laneid/4)%2) * 4
+    //   acc[1] → row = (laneid%4)*2 + (laneid/16),         col = ((laneid/4)%2) * 4 + 1
+    //   acc[2] → row = (laneid%4)*2 + (laneid/16) + 8,     col = ((laneid/4)%2) * 4
+    //   acc[3] → row = (laneid%4)*2 + (laneid/16) + 8,     col = ((laneid/4)%2) * 4 + 1
+    //
+    // Hmm, that only covers col 0,1,4,5 across all threads — not 0..7.
+    // Let me reconsider. With 32 threads covering 16*8 = 128 values, each thread has 4 values.
+    // groupID (0..7) = laneid / 4, threadID_in_group (0..3) = laneid % 4
+    // For f32 result of m16n8k16:
+    //   D[0] → row = threadID_in_group * 2 + (groupID >= 4 ? 1 : 0), col = groupID % 4
+    //   Wait no. Let me just use the CUDA PTX guide mapping directly.
+    //
+    // From PTX ISA 8.x: m16n8k16.f32.f16.f16.f32
+    //   Each thread produces 4 .f32 values in fragment D.
+    //   groupID = %laneid >> 2            (0..7)
+    //   threadID_in_group = %laneid & 3   (0..3)
+    //
+    //   D[0] → (2*threadID_in_group + (groupID >> 2),     (groupID & 3) + 0)
+    //   D[1] → (2*threadID_in_group + (groupID >> 2),     (groupID & 3) + 4)
+    //   D[2] → (2*threadID_in_group + (groupID >> 2) + 8, (groupID & 3) + 0)
+    //   D[3] → (2*threadID_in_group + (groupID >> 2) + 8, (groupID & 3) + 4)
+    //
+    // So: row0 = 2*(laneid%4) + (laneid/4)/4 = 2*(laneid%4) + laneid/16
+    //     col0 = (laneid/4) % 4
+    //     row1 = row0 + 8
+    //     col1 = col0 + 4
+    //
+    // D[0] at (row0, col0), D[1] at (row0, col0+4), D[2] at (row0+8, col0), D[3] at (row0+8, col0+4)
+    // This covers cols 0..3 and 4..7 — total 8 cols. Good!
+
+    ptx.push_str("    // Scale S and store MMA results to S_tile shmem\n");
+    // Compute store row and col from laneid
+    // %bwd_mma_a_row already = (laneid%4)*2 + laneid/16  → this is row0
+    // col0 = (laneid/4) % 4
+    ptx.push_str("    shr.u32 %bwd_mma_store_col, %bwd_mma_laneid, 2;   // laneid / 4\n");
+    ptx.push_str("    and.b32 %bwd_mma_store_col, %bwd_mma_store_col, 3; // (laneid/4) % 4 = col0\n");
+
+    for nt in 0..n_tiles_s {
+        for r in 0..4 {
+            // Scale
+            ptx.push_str(&format!(
+                "    mul.f32 %bwd_acc_s_{}_{}, %bwd_acc_s_{}_{}, %scale;\n",
+                nt, r, nt, r
+            ));
+            // Compute row and col for this accumulator value
+            let row_offset = if r >= 2 { 8 } else { 0 };
+            let col_offset = if r % 2 == 1 { 4 } else { 0 };
+            // row = m_tile*16 + a_row + row_offset
+            // col = nt*8 + col0 + col_offset
+            // S_tile shmem addr = s_shmem_offset + (row * block_kv + col) * 4
+            ptx.push_str(&format!(
+                "    // Store S acc[{}] for n_tile={}: row_off={}, col_off={}\n",
+                r, nt, row_offset, col_offset
+            ));
+            // row = m_tile*16 + a_row + row_offset
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_row, %bwd_mma_m_tile, {};\n",
+                MMA_M
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, %bwd_mma_a_row;\n"
+            ));
+            if row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %bwd_mma_store_row, %bwd_mma_store_row, {};\n",
+                    row_offset
+                ));
+            }
+            // addr = s_shmem_offset + (row * block_kv + nt*8 + col0 + col_offset) * 4
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %bwd_mma_store_addr, %bwd_mma_store_row, {};\n",
+                config.block_kv
+            ));
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + nt*MMA_N + col_offset\n",
+                nt * MMA_N + col_offset
+            ));
+            ptx.push_str("    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, %bwd_mma_store_col;  // + col0\n");
+            ptx.push_str("    shl.b32 %bwd_mma_store_addr, %bwd_mma_store_addr, 2;  // * 4\n");
+            ptx.push_str(&format!(
+                "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};  // + S_tile shmem base\n",
+                s_shmem_offset
+            ));
+            ptx.push_str(&format!(
+                "    st.shared.f32 [shmem + %bwd_mma_store_addr], %bwd_acc_s_{}_{};  // S[row][col]\n",
+                nt, r
+            ));
+        }
+    }
+
+    // Advance m-tile
+    ptx.push_str(&format!(
+        "    add.u32 %bwd_mma_m_byte_off, %bwd_mma_m_byte_off, {};  // += MMA_M * hd_padded * 4\n",
+        MMA_M * hd_padded_u * 4
+    ));
+    ptx.push_str("    add.u32 %bwd_mma_m_tile, %bwd_mma_m_tile, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_S_M_LOOP;\n");
+    ptx.push_str("BWD_MAIN_MMA_S_M_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // S_tile fully computed via MMA\n\n");
+
+    // ── Scalar steps 3b, 3c read S from shmem ──
+    // Each thread handles one Q row (mi = tid), iterates over nj
+    ptx.push_str("    // === Scalar steps 3b-3g using S_tile from MMA ===\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_MMA_SCALAR_DONE;\n\n");
+
+    // Load D[mi] and L[mi] from shmem
+    ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd26, {};\n",
+        d_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_d_val, [shmem + %rd27];  // D[mi]\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd26, {};\n",
+        l_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_l_val, [shmem + %rd27];  // L[mi] (logsumexp)\n\n");
+
+    // global_i = q_start + mi
+    ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
+
+    // Inner loop over nj
+    ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
+    ptx.push_str("BWD_MAIN_MMA_NJ_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_MMA_NJ_DONE;\n\n");
+
+    // global_j = kv_start + nj
+    ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n\n");
+
+    // Step 3a (MMA): Read S[mi][nj] from S_tile shmem (already computed by MMA above)
+    ptx.push_str("    // Step 3a (MMA): Read S[mi][nj] from S_tile shmem\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
+        config.block_kv
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;  // + nj\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};  // + S_tile shmem offset\n",
+        s_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_s, [shmem + %rd35];  // S[mi][nj] (already scaled)\n\n");
+
+    // Step 3b: P = exp(S - L), with causal mask
+    ptx.push_str("    // Step 3b: P = exp(S - L), causal mask\n");
+    if config.causal {
+        ptx.push_str("    // Causal: P = 0 if global_i < global_j\n");
+        ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
+        ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // set S = -inf so exp = 0\n");
+    }
+    ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;  // S - L\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;   // * log2(e)\n");
+    ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;      // P = exp(S - L)\n");
+    if config.causal {
+        ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
+    }
+    ptx.push('\n');
+
+    // Store P[mi][nj] into S_tile for step 3c (overwrite S with P — the attention weight)
+    ptx.push_str("    // Store P[mi][nj] into S_tile in shmem (overwrite S)\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
+        config.block_kv
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;  // + nj\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};  // + S_tile shmem offset\n",
+        s_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd35], %f_p;\n\n");
+
+    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]  (scalar, same as before)
+    ptx.push_str("    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_MMA_DV_ACCUM:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DV_ACCUM_DONE;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];  // dO[mi][d]\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd36, %rd36, {};\n",
+        dv_shmem_offset
+    ));
+    ptx.push_str("    mul.f32 %f_tmp, %f_p, %f_val;     // P * dO[d]\n");
+    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd36], %f_tmp;  // dV[nj][d] += P * dO[d]\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DV_ACCUM;\n");
+    ptx.push_str("BWD_MAIN_MMA_DV_ACCUM_DONE:\n\n");
+
+    // Step 3d (MMA): dP[mi][nj] = dO[mi,:] . V[nj,:] — but we compute the full tile via MMA
+    // For the scalar fallback within the MMA path, we still compute dP per-element here.
+    // The MMA for dP will be done in a separate tile loop below.
+    // For now: scalar dP dot product (same as scalar path)
+    ptx.push_str("    // Step 3d: dP[mi][nj] = dO[mi,:] . V[nj,:] (scalar in MMA path)\n");
+    ptx.push_str("    mov.f32 %f_sum, 0f00000000;\n");
+    ptx.push_str("    mov.u64 %rd34, 0;\n");
+    ptx.push_str("BWD_MAIN_MMA_DP_DOT:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DP_DOT_DONE;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd36, %rd36, {};  // V tile shmem offset\n",
+        k_tile_bytes
+    ));
+    ptx.push_str("    ld.shared.f32 %f_tmp, [shmem + %rd36];\n");
+    ptx.push_str("    fma.rn.f32 %f_sum, %f_val, %f_tmp, %f_sum;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DP_DOT;\n");
+    ptx.push_str("BWD_MAIN_MMA_DP_DOT_DONE:\n");
+    ptx.push_str("    mov.f32 %f_dp, %f_sum;  // dP[mi][nj]\n\n");
+
+    // Step 3e: dS = P * (dP - D)
+    ptx.push_str("    // Step 3e: dS[mi][nj] = P[mi][nj] * (dP[mi][nj] - D[mi])\n");
+    ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;  // dP - D\n");
+    ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;       // P * (dP - D)\n\n");
+
+    // Step 3f: dQ[global_i][d] += dS * K[nj][d] * scale (atomicAdd to global)
+    ptx.push_str("    // Step 3f: dQ[global_i][d] += dS * K[nj][d] * scale (atomicAdd)\n");
+    ptx.push_str("    mul.lo.u64 %rd35, %rd31, %rd10;  // global_i * head_dim\n");
+    ptx.push_str("    add.u64 %rd35, %rd15, %rd35;\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str("    add.u64 %rd35, %rd4, %rd35;  // dq_global_base for this row\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_MMA_DQ_ACCUM:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DQ_ACCUM_DONE;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];  // K[nj][d]\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_ds, %f_val;   // dS * K[d]\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %scale;   // * scale\n");
+    ptx.push_str("    shl.b64 %rd37, %rd34, 2;\n");
+    ptx.push_str("    add.u64 %rd37, %rd35, %rd37;  // dQ_addr = dq_base + d*4\n");
+    ptx.push_str("    atom.global.add.f32 %f_val, [%rd37], %f_tmp;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DQ_ACCUM;\n");
+    ptx.push_str("BWD_MAIN_MMA_DQ_ACCUM_DONE:\n\n");
+
+    // Step 3g: dK_local[nj][d] += dS * Q[mi][d] * scale
+    ptx.push_str("    // Step 3g: dK_local[nj][d] += dS * Q[mi][d] * scale\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_MMA_DK_ACCUM:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_MMA_DK_ACCUM_DONE;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd36, %rd36, {};\n",
+        q_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];  // Q[mi][d]\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_ds, %f_val;   // dS * Q[d]\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %scale;   // * scale\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd37, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd37, %rd37, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd37, %rd37, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd37, %rd37, {};\n",
+        dk_shmem_offset
+    ));
+    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd37], %f_tmp;  // dK[nj][d] += dS * Q[d] * scale\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_DK_ACCUM;\n");
+    ptx.push_str("BWD_MAIN_MMA_DK_ACCUM_DONE:\n\n");
+
+    // End of nj loop
+    ptx.push_str("    add.u64 %rd32, %rd32, 1;  // nj++\n");
+    ptx.push_str("    bra BWD_MAIN_MMA_NJ_LOOP;\n");
+    ptx.push_str("BWD_MAIN_MMA_NJ_DONE:\n\n");
+
+    ptx.push_str("BWD_MAIN_MMA_SCALAR_DONE:\n");
+    ptx.push_str("BWD_MAIN_STEPS_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // all threads done with steps 3a-3g (MMA path)\n\n");
 
     // Advance i_block
     ptx.push_str("    add.u64 %rd24, %rd24, 1;  // i_block++\n");
@@ -3896,6 +4627,124 @@ mod tests {
             *ptx2_bytes.last().unwrap(),
             0,
             "PTX must be null-terminated"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_mma_path_sm80() {
+        let cfg = FlashAttentionBackwardConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal: false,
+            gpu_sm: 80,
+        };
+        assert!(use_mma_path(cfg.gpu_sm), "sm_80 should use MMA path");
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+
+        // MMA path indicators
+        assert!(
+            ptx.contains("MMA Step 3a"),
+            "MMA Step 3a comment (S = Q@K^T)"
+        );
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "MMA instruction present in backward kernel"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f16.f32"),
+            "f32->f16 conversion for MMA fragments"
+        );
+        assert!(
+            ptx.contains("%bwd_acc_s_"),
+            "backward S accumulator registers"
+        );
+        assert!(
+            ptx.contains("%bwd_aq_"),
+            "backward A-fragment registers for Q"
+        );
+        assert!(
+            ptx.contains("%bwd_bk_"),
+            "backward B-fragment registers for K"
+        );
+        assert!(
+            ptx.contains("BWD_MAIN_MMA_S_K_LOOP"),
+            "MMA K-dimension loop label"
+        );
+        // MMA results stored to S_tile shmem
+        assert!(
+            ptx.contains("S_tile fully computed via MMA"),
+            "S_tile store barrier comment"
+        );
+        // All 7 steps still present
+        assert!(ptx.contains("Step 3a"), "step 3a");
+        assert!(ptx.contains("Step 3b"), "step 3b");
+        assert!(ptx.contains("Step 3c"), "step 3c");
+        assert!(ptx.contains("Step 3d"), "step 3d");
+        assert!(ptx.contains("Step 3e"), "step 3e");
+        assert!(ptx.contains("Step 3f"), "step 3f");
+        assert!(ptx.contains("Step 3g"), "step 3g");
+        // MMA path should NOT contain the scalar S dot product loop
+        assert!(
+            !ptx.contains("BWD_MAIN_S_DOT:"),
+            "scalar S dot loop should NOT be in MMA path"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_scalar_path_sm52() {
+        let cfg = FlashAttentionBackwardConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal: false,
+            gpu_sm: 52,
+        };
+        assert!(!use_mma_path(cfg.gpu_sm), "sm_52 should NOT use MMA path");
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+
+        // Scalar path indicators
+        assert!(
+            ptx.contains("BWD_MAIN_S_DOT:"),
+            "scalar S dot product loop"
+        );
+        assert!(
+            ptx.contains("BWD_MAIN_DP_DOT:"),
+            "scalar dP dot product loop"
+        );
+        // Should NOT contain MMA instructions
+        assert!(
+            !ptx.contains("mma.sync.aligned"),
+            "no MMA instructions in scalar path"
+        );
+        assert!(
+            !ptx.contains("%bwd_acc_s_"),
+            "no MMA accumulator registers in scalar path"
+        );
+        // All 7 steps still present
+        assert!(ptx.contains("Step 3a"), "step 3a");
+        assert!(ptx.contains("Step 3b"), "step 3b");
+        assert!(ptx.contains("Step 3c"), "step 3c");
+        assert!(ptx.contains("Step 3d"), "step 3d");
+        assert!(ptx.contains("Step 3e"), "step 3e");
+        assert!(ptx.contains("Step 3f"), "step 3f");
+        assert!(ptx.contains("Step 3g"), "step 3g");
+    }
+
+    #[test]
+    fn test_bwd_main_mma_tile_count() {
+        // Verify correct number of MMA instructions for block_kv=64
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        // n_tiles_s = 64/8 = 8 MMA instructions per m-tile per K iteration
+        let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
+        assert_eq!(
+            mma_count, 8,
+            "expected 8 MMA instructions (one per n-tile), got {}",
+            mma_count
         );
     }
 
