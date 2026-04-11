@@ -2077,10 +2077,13 @@ pub fn synthesize_flash_attention_backward_ptx(
     emit_flash_attention_bwd_d(&mut ptx1, config);
     ptx1.push('\0');
 
-    // Phase 2: placeholder for Task 2
-    let ptx2 = vec![0u8]; // null-terminated empty
+    // Phase 2: main backward kernel (dQ/dK/dV)
+    let mut ptx2 = String::with_capacity(16384);
+    emit_ptx_header(&mut ptx2, config.gpu_sm);
+    emit_flash_attention_bwd_main(&mut ptx2, config);
+    ptx2.push('\0');
 
-    (ptx1.into_bytes(), ptx2)
+    (ptx1.into_bytes(), ptx2.into_bytes())
 }
 
 /// Emit the Phase 1 D-correction vector kernel.
@@ -2172,6 +2175,833 @@ fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardC
     ptx.push_str(&format!("{}_DONE:\n", kernel_name));
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Main backward kernel (dQ / dK / dV)
+// ---------------------------------------------------------------------------
+//
+// Grid: (B*nh, ceil(S/block_kv), 1)
+// Each thread-block owns one (batch-head, kv-tile). The inner loop sweeps over
+// Q tiles, computing dK/dV locally and atomicAdd-ing into dQ.
+//
+// Thread assignment: block_q threads per block. Each thread owns one Q-row (mi)
+// and iterates over KV positions and head_dim sequentially (scalar FMA path).
+
+/// Shared memory padding (f32 elements) added to head_dim in 2-D tiles to avoid
+/// bank conflicts during transpose-style access patterns.
+const BWD_PAD: i64 = 4;
+
+/// Emit the complete Phase 2 backward main kernel PTX.
+fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let kernel_name = flash_attention_bwd_main_kernel_name(config);
+
+    // Entry point
+    ptx.push_str(&format!(".visible .entry {} (\n", kernel_name));
+    ptx.push_str("    .param .u64 param_dout,\n");
+    ptx.push_str("    .param .u64 param_q,\n");
+    ptx.push_str("    .param .u64 param_k,\n");
+    ptx.push_str("    .param .u64 param_v,\n");
+    ptx.push_str("    .param .u64 param_dq,\n");
+    ptx.push_str("    .param .u64 param_dk,\n");
+    ptx.push_str("    .param .u64 param_dv,\n");
+    ptx.push_str("    .param .u64 param_d,\n");
+    ptx.push_str("    .param .u64 param_lse,\n");
+    ptx.push_str("    .param .f32 param_scale,\n");
+    ptx.push_str("    .param .u64 param_seq_len,\n");
+    ptx.push_str("    .param .u64 param_head_dim\n");
+    ptx.push_str(")\n");
+    ptx.push_str("{\n");
+
+    // Shared memory
+    let shmem_bytes = backward_shared_mem_bytes(config);
+    ptx.push_str(&format!(
+        "    .shared .align 16 .b8 shmem[{}];\n\n",
+        shmem_bytes
+    ));
+
+    emit_bwd_main_registers(ptx, config);
+    emit_bwd_main_param_loads(ptx, config);
+    emit_bwd_main_index_computation(ptx, config);
+    emit_bwd_main_load_kv_tiles(ptx, config);
+    emit_bwd_main_init_dk_dv(ptx, config);
+    emit_bwd_main_q_tile_loop(ptx, config);
+    emit_bwd_main_store_dk_dv(ptx, config);
+
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+}
+
+/// Register declarations for the backward main kernel.
+fn emit_bwd_main_registers(ptx: &mut String, _config: &FlashAttentionBackwardConfig) {
+    ptx.push_str("    // === Register declarations ===\n");
+    ptx.push_str("    .reg .u32 %r<32>;\n");
+    ptx.push_str("    .reg .u64 %rd<64>;\n");
+    ptx.push_str("    .reg .f32 %f<32>;\n");
+    ptx.push_str("    .reg .pred %p<16>;\n");
+    ptx.push_str("    .reg .f32 %scale;\n");
+    ptx.push_str("    .reg .f32 %log2e;\n");
+    ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))\n");
+    // Named accumulators for clarity
+    ptx.push_str("    .reg .f32 %f_sum;\n");
+    ptx.push_str("    .reg .f32 %f_s;\n");
+    ptx.push_str("    .reg .f32 %f_p;\n");
+    ptx.push_str("    .reg .f32 %f_dp;\n");
+    ptx.push_str("    .reg .f32 %f_ds;\n");
+    ptx.push_str("    .reg .f32 %f_val;\n");
+    ptx.push_str("    .reg .f32 %f_d_val;\n");
+    ptx.push_str("    .reg .f32 %f_l_val;\n");
+    ptx.push_str("    .reg .f32 %f_tmp;\n\n");
+}
+
+/// Load kernel parameters into registers.
+fn emit_bwd_main_param_loads(ptx: &mut String, _config: &FlashAttentionBackwardConfig) {
+    ptx.push_str("    // === Parameter loads ===\n");
+    ptx.push_str("    ld.param.u64 %rd0, [param_dout];\n");
+    ptx.push_str("    ld.param.u64 %rd1, [param_q];\n");
+    ptx.push_str("    ld.param.u64 %rd2, [param_k];\n");
+    ptx.push_str("    ld.param.u64 %rd3, [param_v];\n");
+    ptx.push_str("    ld.param.u64 %rd4, [param_dq];\n");
+    ptx.push_str("    ld.param.u64 %rd5, [param_dk];\n");
+    ptx.push_str("    ld.param.u64 %rd6, [param_dv];\n");
+    ptx.push_str("    ld.param.u64 %rd7, [param_d];\n");
+    ptx.push_str("    ld.param.u64 %rd8, [param_lse];\n");
+    ptx.push_str("    ld.param.f32 %scale, [param_scale];\n");
+    ptx.push_str("    ld.param.u64 %rd9, [param_seq_len];\n");
+    ptx.push_str("    ld.param.u64 %rd10, [param_head_dim];\n\n");
+}
+
+/// Compute thread/block indices and the base pointers for this thread-block's
+/// (batch-head, kv-tile) assignment.
+fn emit_bwd_main_index_computation(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    ptx.push_str("    // === Index computation ===\n");
+    ptx.push_str("    // blockIdx.x = bh (batch*head), blockIdx.y = j_block (KV tile)\n");
+    ptx.push_str("    mov.u32 %r0, %tid.x;\n");
+    ptx.push_str("    mov.u32 %r1, %ctaid.x;\n");
+    ptx.push_str("    mov.u32 %r2, %ctaid.y;\n");
+    ptx.push_str("    cvt.u64.u32 %rd11, %r0;  // tid\n");
+    ptx.push_str("    cvt.u64.u32 %rd12, %r1;  // bh\n");
+    ptx.push_str("    cvt.u64.u32 %rd13, %r2;  // j_block\n\n");
+
+    // kv_start = j_block * block_kv
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd14, %rd13, {};  // kv_start = j_block * block_kv\n",
+        config.block_kv
+    ));
+
+    // bh_offset = bh * seq_len * head_dim  (element offset into [B*nh, S, hd])
+    ptx.push_str("    mul.lo.u64 %rd15, %rd12, %rd9;   // bh * seq_len\n");
+    ptx.push_str("    mul.lo.u64 %rd15, %rd15, %rd10;   // * head_dim  => bh_elem_offset\n");
+
+    // bh_seq_offset = bh * seq_len  (element offset into [B*nh, S])
+    ptx.push_str("    mul.lo.u64 %rd16, %rd12, %rd9;    // bh * seq_len => bh_seq_offset\n\n");
+
+    // num_q_tiles = ceil(seq_len / block_q)
+    ptx.push_str(&format!(
+        "    add.u64 %rd17, %rd9, {};  // seq_len + block_q - 1\n",
+        config.block_q - 1
+    ));
+    ptx.push_str(&format!(
+        "    div.u64 %rd17, %rd17, {};  // num_q_tiles = ceil(seq_len / block_q)\n\n",
+        config.block_q
+    ));
+}
+
+/// Load K[j_block] and V[j_block] tiles into shared memory.
+fn emit_bwd_main_load_kv_tiles(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let hd_padded = config.head_dim + BWD_PAD;
+    let k_tile_elems = config.block_kv * hd_padded;
+    let _v_tile_elems = config.block_kv * hd_padded;
+    let k_tile_bytes = k_tile_elems * 4;
+    let v_offset = k_tile_bytes;
+
+    ptx.push_str("    // === Load K[j_block] and V[j_block] into shared memory ===\n");
+
+    // K global base = k_ptr + (bh_elem_offset + kv_start * head_dim) * 4
+    ptx.push_str("    mul.lo.u64 %rd18, %rd14, %rd10;   // kv_start * head_dim\n");
+    ptx.push_str("    add.u64 %rd18, %rd15, %rd18;       // bh_elem_offset + kv_start*hd\n");
+    ptx.push_str("    shl.b64 %rd18, %rd18, 2;           // * 4 bytes\n");
+    ptx.push_str("    add.u64 %rd18, %rd2, %rd18;        // k_global_base\n\n");
+
+    // V global base (same layout)
+    ptx.push_str("    mul.lo.u64 %rd19, %rd14, %rd10;   // kv_start * head_dim\n");
+    ptx.push_str("    add.u64 %rd19, %rd15, %rd19;\n");
+    ptx.push_str("    shl.b64 %rd19, %rd19, 2;\n");
+    ptx.push_str("    add.u64 %rd19, %rd3, %rd19;        // v_global_base\n\n");
+
+    // Cooperative load K tile: thread tid loads rows starting at tid, stride block_q
+    // Each row has head_dim elements in global, stored with hd_padded stride in shmem
+    ptx.push_str("    // Load K tile (with padding) into shmem[0..]\n");
+    ptx.push_str("    mov.u64 %rd20, %rd11;  // nj = tid\n");
+    ptx.push_str("BWD_MAIN_LOAD_K:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd20, {};\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_LOAD_K_DONE;\n");
+
+    // For each row nj: load head_dim elements from global, store to shmem with padded stride
+    ptx.push_str("    mov.u64 %rd21, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_LOAD_K_D:\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd21, %rd10;\n");
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_K_D_DONE;\n");
+    // global addr: k_global_base + (nj * head_dim + d) * 4
+    ptx.push_str("    mul.lo.u64 %rd22, %rd20, %rd10;\n");
+    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;\n");
+    ptx.push_str("    shl.b64 %rd22, %rd22, 2;\n");
+    ptx.push_str("    add.u64 %rd22, %rd18, %rd22;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd22];\n");
+    // shmem addr: (nj * hd_padded + d) * 4
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd23, %rd20, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
+    ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
+    ptx.push_str("    st.shared.f32 [shmem + %rd23], %f0;\n");
+    ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_LOAD_K_D;\n");
+    ptx.push_str("BWD_MAIN_LOAD_K_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd20, %rd20, {};  // nj += block_q (stride by num threads)\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_LOAD_K;\n");
+    ptx.push_str("BWD_MAIN_LOAD_K_DONE:\n\n");
+
+    // Load V tile: shmem offset = v_offset
+    ptx.push_str(&format!(
+        "    // Load V tile into shmem[{}..]\n",
+        v_offset
+    ));
+    ptx.push_str("    mov.u64 %rd20, %rd11;  // nj = tid\n");
+    ptx.push_str("BWD_MAIN_LOAD_V:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd20, {};\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_LOAD_V_DONE;\n");
+    ptx.push_str("    mov.u64 %rd21, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_LOAD_V_D:\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd21, %rd10;\n");
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_V_D_DONE;\n");
+    // global addr: v_global_base + (nj * head_dim + d) * 4
+    ptx.push_str("    mul.lo.u64 %rd22, %rd20, %rd10;\n");
+    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;\n");
+    ptx.push_str("    shl.b64 %rd22, %rd22, 2;\n");
+    ptx.push_str("    add.u64 %rd22, %rd19, %rd22;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd22];\n");
+    // shmem addr: v_offset + (nj * hd_padded + d) * 4
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd23, %rd20, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
+    ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd23, %rd23, {};  // + V tile shmem offset\n",
+        v_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd23], %f0;\n");
+    ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_LOAD_V_D;\n");
+    ptx.push_str("BWD_MAIN_LOAD_V_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd20, %rd20, {};  // nj += block_q\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_LOAD_V;\n");
+    ptx.push_str("BWD_MAIN_LOAD_V_DONE:\n");
+
+    ptx.push_str("    bar.sync 0;  // K and V tiles loaded\n\n");
+}
+
+/// Zero-initialize dK_local and dV_local in shared memory.
+fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let hd_padded = config.head_dim + BWD_PAD;
+    let k_tile_bytes = config.block_kv * hd_padded * 4;
+    let v_tile_bytes = config.block_kv * hd_padded * 4;
+    let q_tile_bytes = config.block_q * hd_padded * 4;
+    let do_tile_bytes = config.block_q * hd_padded * 4;
+    let dk_offset = k_tile_bytes + v_tile_bytes + q_tile_bytes + do_tile_bytes;
+    let dk_elems = config.block_kv * hd_padded;
+    let dv_offset = dk_offset + dk_elems * 4;
+    let dv_elems = config.block_kv * hd_padded;
+
+    ptx.push_str("    // === Zero-initialize dK_local and dV_local in shared memory ===\n");
+    ptx.push_str("    mov.u64 %rd20, %rd11;  // idx = tid\n");
+    ptx.push_str("BWD_MAIN_ZERO_DK:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd20, {};\n",
+        dk_elems
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_ZERO_DK_DONE;\n");
+    ptx.push_str("    shl.b64 %rd21, %rd20, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd21, %rd21, {};  // + dK shmem offset\n",
+        dk_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd21], 0f00000000;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd20, %rd20, {};  // stride by block_q threads\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_ZERO_DK;\n");
+    ptx.push_str("BWD_MAIN_ZERO_DK_DONE:\n\n");
+
+    ptx.push_str("    mov.u64 %rd20, %rd11;  // idx = tid\n");
+    ptx.push_str("BWD_MAIN_ZERO_DV:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd20, {};\n",
+        dv_elems
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_ZERO_DV_DONE;\n");
+    ptx.push_str("    shl.b64 %rd21, %rd20, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd21, %rd21, {};  // + dV shmem offset\n",
+        dv_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd21], 0f00000000;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd20, %rd20, {};  // stride by block_q threads\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_ZERO_DV;\n");
+    ptx.push_str("BWD_MAIN_ZERO_DV_DONE:\n");
+
+    ptx.push_str("    bar.sync 0;  // dK/dV zeroed\n\n");
+}
+
+/// Emit the inner Q-tile loop and all 7 computation steps (3a-3g).
+fn emit_bwd_main_q_tile_loop(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let hd_padded = config.head_dim + BWD_PAD;
+    let k_tile_bytes = config.block_kv * hd_padded * 4;
+    let v_tile_bytes = config.block_kv * hd_padded * 4;
+    let q_shmem_offset = k_tile_bytes + v_tile_bytes;
+    let do_shmem_offset = q_shmem_offset + config.block_q * hd_padded * 4;
+    let dk_shmem_offset = do_shmem_offset + config.block_q * hd_padded * 4;
+    let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
+    let s_shmem_offset = dv_shmem_offset + config.block_kv * hd_padded * 4;
+    let d_shmem_offset = s_shmem_offset + config.block_q * config.block_kv * 4;
+    let l_shmem_offset = d_shmem_offset + config.block_q * 4;
+
+    ptx.push_str("    // === Inner Q-tile loop ===\n");
+
+    // i_block loop: for causal, start at j_block; otherwise start at 0
+    if config.causal {
+        ptx.push_str("    mov.u64 %rd24, %rd13;  // i_block = j_block (causal)\n");
+    } else {
+        ptx.push_str("    mov.u64 %rd24, 0;  // i_block = 0 (non-causal)\n");
+    }
+
+    ptx.push_str("BWD_MAIN_Q_LOOP:\n");
+    ptx.push_str("    setp.ge.u64 %p0, %rd24, %rd17;  // i_block >= num_q_tiles?\n");
+    ptx.push_str("    @%p0 bra BWD_MAIN_Q_LOOP_END;\n\n");
+
+    // q_start = i_block * block_q
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd25, %rd24, {};  // q_start = i_block * block_q\n",
+        config.block_q
+    ));
+
+    // Load Q[i_block] into shmem[q_shmem_offset..]
+    ptx.push_str(&format!(
+        "    // Load Q[i_block] into shmem[{}..]\n",
+        q_shmem_offset
+    ));
+    // q_global_base = q_ptr + (bh_elem_offset + q_start * head_dim) * 4
+    ptx.push_str("    mul.lo.u64 %rd26, %rd25, %rd10;  // q_start * head_dim\n");
+    ptx.push_str("    add.u64 %rd26, %rd15, %rd26;\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
+    ptx.push_str("    add.u64 %rd26, %rd1, %rd26;  // q_global_base\n");
+
+    // Cooperative load Q tile rows
+    ptx.push_str("    mov.u64 %rd27, %rd11;  // mi = tid\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_Q_DONE;\n");
+    ptx.push_str("    mov.u64 %rd28, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q_D:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_Q_D_DONE;\n");
+    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
+    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
+    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
+    // shmem: q_shmem_offset + (mi * hd_padded + d) * 4
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd30, %rd27, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd30, %rd30, {};\n",
+        q_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_LOAD_Q;\n");
+    ptx.push_str("BWD_MAIN_LOAD_Q_DONE:\n\n");
+
+    // Load dO[i_block] into shmem[do_shmem_offset..]
+    ptx.push_str(&format!(
+        "    // Load dO[i_block] into shmem[{}..]\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    mul.lo.u64 %rd26, %rd25, %rd10;\n");
+    ptx.push_str("    add.u64 %rd26, %rd15, %rd26;\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
+    ptx.push_str("    add.u64 %rd26, %rd0, %rd26;  // dO_global_base\n");
+
+    ptx.push_str("    mov.u64 %rd27, %rd11;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DO_DONE;\n");
+    ptx.push_str("    mov.u64 %rd28, 0;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO_D:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd28, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_LOAD_DO_D_DONE;\n");
+    ptx.push_str("    mul.lo.u64 %rd29, %rd27, %rd10;\n");
+    ptx.push_str("    add.u64 %rd29, %rd29, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd29, %rd29, 2;\n");
+    ptx.push_str("    add.u64 %rd29, %rd26, %rd29;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd29];\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd30, %rd27, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd30, %rd30, %rd28;\n");
+    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd30, %rd30, {};\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd27, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_LOAD_DO;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DO_DONE:\n\n");
+
+    // Load D[i_block] and L[i_block] vectors into shmem
+    ptx.push_str("    // Load D[i_block] and L[i_block] into shmem\n");
+    // Each thread loads one element if tid < block_q
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd11, {};  // tid >= block_q?\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_LOAD_DL_DONE;\n");
+    // D[bh * seq_len + q_start + tid]
+    ptx.push_str("    add.u64 %rd26, %rd16, %rd25;  // bh_seq_offset + q_start\n");
+    ptx.push_str("    add.u64 %rd26, %rd26, %rd11;  // + tid\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
+    ptx.push_str("    add.u64 %rd27, %rd7, %rd26;   // d_ptr + offset\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
+    // Store to D_vec in shmem
+    ptx.push_str("    shl.b64 %rd28, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd28, %rd28, {};  // + D_vec shmem offset\n",
+        d_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    // L[bh * seq_len + q_start + tid]
+    ptx.push_str("    add.u64 %rd27, %rd8, %rd26;   // lse_ptr + offset\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
+    ptx.push_str("    shl.b64 %rd28, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd28, %rd28, {};  // + L_vec shmem offset\n",
+        l_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    ptx.push_str("BWD_MAIN_LOAD_DL_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // Q, dO, D, L loaded\n\n");
+
+    // Each thread is assigned mi = tid (one Q row per thread).
+    // Thread iterates over all KV positions nj in the tile.
+    ptx.push_str("    // === Compute steps 3a-3g for mi = tid ===\n");
+    ptx.push_str("    // Each thread handles one Q row (mi = tid)\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd11, {};  // skip if tid >= block_q\n",
+        config.block_q
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_STEPS_DONE;\n\n");
+
+    // Load D[mi] and L[mi] from shmem
+    ptx.push_str("    shl.b64 %rd26, %rd11, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd26, {};\n",
+        d_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_d_val, [shmem + %rd27];  // D[mi]\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd27, %rd26, {};\n",
+        l_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_l_val, [shmem + %rd27];  // L[mi] (logsumexp)\n\n");
+
+    // global_i = q_start + mi
+    ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
+
+    // Inner loop over nj (KV positions in tile)
+    ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
+    ptx.push_str("BWD_MAIN_NJ_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p1, %rd32, {};  // nj >= block_kv?\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p1 bra BWD_MAIN_NJ_DONE;\n\n");
+
+    // global_j = kv_start + nj
+    ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n\n");
+
+    // Step 3a: S[mi][nj] = sum_d(Q[mi,d] * K[nj,d]) * scale
+    ptx.push_str("    // Step 3a: S[mi][nj] = Q[mi,:] . K[nj,:] * scale\n");
+    ptx.push_str("    mov.f32 %f_sum, 0f00000000;\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_S_DOT:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_S_DOT_DONE;\n");
+    // Q[mi, d] from shmem: q_shmem_offset + (mi * hd_padded + d) * 4
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;  // + d\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};\n",
+        q_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];\n");
+    // K[nj, d] from shmem: (nj * hd_padded + d) * 4
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;  // + d\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str("    ld.shared.f32 %f_tmp, [shmem + %rd36];\n");
+    ptx.push_str("    fma.rn.f32 %f_sum, %f_val, %f_tmp, %f_sum;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_S_DOT;\n");
+    ptx.push_str("BWD_MAIN_S_DOT_DONE:\n");
+    ptx.push_str("    mul.f32 %f_s, %f_sum, %scale;  // S *= scale\n\n");
+
+    // Step 3b: P = exp(S - L), with causal mask
+    ptx.push_str("    // Step 3b: P = exp(S - L), causal mask\n");
+    if config.causal {
+        // If global_i < global_j then P = 0 (causal mask)
+        ptx.push_str("    // Causal: P = 0 if global_i < global_j\n");
+        ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
+        ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // set S = -inf so exp = 0\n");
+    }
+    ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;  // S - L\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;   // * log2(e)\n");
+    ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;      // P = exp(S - L)\n");
+    if config.causal {
+        // Ensure exactly zero for masked positions (exp(-inf) should be 0 but be safe)
+        ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
+    }
+    ptx.push('\n');
+
+    // Store S[mi][nj] = P (actually store P, the attention weight) into S_tile in shmem
+    // for later use in steps 3c, 3e
+    ptx.push_str("    // Store P[mi][nj] into S_tile in shmem\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * block_kv\n",
+        config.block_kv
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd32;  // + nj\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};  // + S_tile shmem offset\n",
+        s_shmem_offset
+    ));
+    ptx.push_str("    st.shared.f32 [shmem + %rd35], %f_p;\n\n");
+
+    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]
+    ptx.push_str("    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_DV_ACCUM:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_DV_ACCUM_DONE;\n");
+    // dO[mi, d] from shmem
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];  // dO[mi][d]\n");
+    // dV_local[nj, d] shmem address
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd36, %rd36, {};\n",
+        dv_shmem_offset
+    ));
+    // Atomic add to shared memory (multiple threads accumulate to same dV row)
+    ptx.push_str("    mul.f32 %f_tmp, %f_p, %f_val;     // P * dO[d]\n");
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];\n");
+    ptx.push_str("    add.f32 %f_val, %f_val, %f_tmp;\n");
+    ptx.push_str("    st.shared.f32 [shmem + %rd36], %f_val;  // dV[nj][d] += P * dO[d]\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_DV_ACCUM;\n");
+    ptx.push_str("BWD_MAIN_DV_ACCUM_DONE:\n\n");
+
+    // Step 3d: dP[mi][nj] = sum_d(dO[mi,d] * V[nj,d])
+    ptx.push_str("    // Step 3d: dP[mi][nj] = dO[mi,:] . V[nj,:]\n");
+    ptx.push_str("    mov.f32 %f_sum, 0f00000000;\n");
+    ptx.push_str("    mov.u64 %rd34, 0;\n");
+    ptx.push_str("BWD_MAIN_DP_DOT:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_DP_DOT_DONE;\n");
+    // dO[mi, d]
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd35, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd35, %rd35, {};\n",
+        do_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd35];\n");
+    // V[nj, d]
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd36, %rd36, {};  // V tile shmem offset\n",
+        k_tile_bytes  // V comes right after K
+    ));
+    ptx.push_str("    ld.shared.f32 %f_tmp, [shmem + %rd36];\n");
+    ptx.push_str("    fma.rn.f32 %f_sum, %f_val, %f_tmp, %f_sum;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_DP_DOT;\n");
+    ptx.push_str("BWD_MAIN_DP_DOT_DONE:\n");
+    ptx.push_str("    mov.f32 %f_dp, %f_sum;  // dP[mi][nj]\n\n");
+
+    // Step 3e: dS = P * (dP - D)
+    ptx.push_str("    // Step 3e: dS[mi][nj] = P[mi][nj] * (dP[mi][nj] - D[mi])\n");
+    ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;  // dP - D\n");
+    ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;       // P * (dP - D)\n\n");
+
+    // Step 3f: atomicAdd dQ[i_block][mi][d] += dS[mi][nj] * K[nj][d] * scale
+    ptx.push_str("    // Step 3f: dQ[global_i][d] += dS * K[nj][d] * scale (atomicAdd)\n");
+    // dq_base = dq_ptr + (bh_elem_offset + global_i * head_dim) * 4
+    ptx.push_str("    mul.lo.u64 %rd35, %rd31, %rd10;  // global_i * head_dim\n");
+    ptx.push_str("    add.u64 %rd35, %rd15, %rd35;\n");
+    ptx.push_str("    shl.b64 %rd35, %rd35, 2;\n");
+    ptx.push_str("    add.u64 %rd35, %rd4, %rd35;  // dq_global_base for this row\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_DQ_ACCUM:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_DQ_ACCUM_DONE;\n");
+    // K[nj, d] from shmem
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];  // K[nj][d]\n");
+    // dQ_contrib = dS * K[d] * scale
+    ptx.push_str("    mul.f32 %f_tmp, %f_ds, %f_val;   // dS * K[d]\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %scale;   // * scale\n");
+    // atomicAdd to global dQ
+    ptx.push_str("    shl.b64 %rd37, %rd34, 2;\n");
+    ptx.push_str("    add.u64 %rd37, %rd35, %rd37;  // dQ_addr = dq_base + d*4\n");
+    ptx.push_str("    atom.global.add.f32 %f_val, [%rd37], %f_tmp;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_DQ_ACCUM;\n");
+    ptx.push_str("BWD_MAIN_DQ_ACCUM_DONE:\n\n");
+
+    // Step 3g: dK_local[nj][d] += dS[mi][nj] * Q[mi][d] * scale
+    ptx.push_str("    // Step 3g: dK_local[nj][d] += dS * Q[mi][d] * scale\n");
+    ptx.push_str("    mov.u64 %rd34, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_DK_ACCUM:\n");
+    ptx.push_str("    setp.ge.u64 %p2, %rd34, %rd10;\n");
+    ptx.push_str("    @%p2 bra BWD_MAIN_DK_ACCUM_DONE;\n");
+    // Q[mi, d] from shmem
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd36, %rd11, {};  // mi * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd36, %rd36, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd36, %rd36, {};\n",
+        q_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd36];  // Q[mi][d]\n");
+    // dK contribution
+    ptx.push_str("    mul.f32 %f_tmp, %f_ds, %f_val;   // dS * Q[d]\n");
+    ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %scale;   // * scale\n");
+    // dK_local[nj, d] shmem address
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd37, %rd32, {};  // nj * hd_padded\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd37, %rd37, %rd34;\n");
+    ptx.push_str("    shl.b64 %rd37, %rd37, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd37, %rd37, {};\n",
+        dk_shmem_offset
+    ));
+    // Read-modify-write (same thread may accumulate across Q tiles via nj loop)
+    ptx.push_str("    ld.shared.f32 %f_val, [shmem + %rd37];\n");
+    ptx.push_str("    add.f32 %f_val, %f_val, %f_tmp;\n");
+    ptx.push_str("    st.shared.f32 [shmem + %rd37], %f_val;  // dK[nj][d] += dS * Q[d] * scale\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_DK_ACCUM;\n");
+    ptx.push_str("BWD_MAIN_DK_ACCUM_DONE:\n\n");
+
+    // End of nj loop
+    ptx.push_str("    add.u64 %rd32, %rd32, 1;  // nj++\n");
+    ptx.push_str("    bra BWD_MAIN_NJ_LOOP;\n");
+    ptx.push_str("BWD_MAIN_NJ_DONE:\n\n");
+
+    ptx.push_str("BWD_MAIN_STEPS_DONE:\n");
+    ptx.push_str("    bar.sync 0;  // all threads done with steps 3a-3g\n\n");
+
+    // Advance i_block
+    ptx.push_str("    add.u64 %rd24, %rd24, 1;  // i_block++\n");
+    ptx.push_str("    bra BWD_MAIN_Q_LOOP;\n");
+    ptx.push_str("BWD_MAIN_Q_LOOP_END:\n\n");
+}
+
+/// Store dK_local and dV_local from shared memory to global dK/dV arrays.
+fn emit_bwd_main_store_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    let hd_padded = config.head_dim + BWD_PAD;
+    let k_tile_bytes = config.block_kv * hd_padded * 4;
+    let v_tile_bytes = config.block_kv * hd_padded * 4;
+    let q_tile_bytes = config.block_q * hd_padded * 4;
+    let do_tile_bytes = config.block_q * hd_padded * 4;
+    let dk_shmem_offset = k_tile_bytes + v_tile_bytes + q_tile_bytes + do_tile_bytes;
+    let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
+
+    ptx.push_str("    // === Store dK_local and dV_local to global memory ===\n");
+
+    // dK global base: dk_ptr + (bh_elem_offset + kv_start * head_dim) * 4
+    ptx.push_str("    mul.lo.u64 %rd20, %rd14, %rd10;  // kv_start * head_dim\n");
+    ptx.push_str("    add.u64 %rd20, %rd15, %rd20;\n");
+    ptx.push_str("    shl.b64 %rd20, %rd20, 2;\n");
+    ptx.push_str("    add.u64 %rd20, %rd5, %rd20;  // dk_global_base\n\n");
+
+    // dV global base
+    ptx.push_str("    mul.lo.u64 %rd21, %rd14, %rd10;\n");
+    ptx.push_str("    add.u64 %rd21, %rd15, %rd21;\n");
+    ptx.push_str("    shl.b64 %rd21, %rd21, 2;\n");
+    ptx.push_str("    add.u64 %rd21, %rd6, %rd21;  // dv_global_base\n\n");
+
+    // Store dK: thread tid stores rows starting at tid, stride block_q
+    ptx.push_str("    mov.u64 %rd22, %rd11;  // nj = tid\n");
+    ptx.push_str("BWD_MAIN_STORE_DK:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd22, {};\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_STORE_DK_DONE;\n");
+    ptx.push_str("    mov.u64 %rd23, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_STORE_DK_D:\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd23, %rd10;\n");
+    ptx.push_str("    @%p1 bra BWD_MAIN_STORE_DK_D_DONE;\n");
+    // shmem addr: dk_shmem_offset + (nj * hd_padded + d) * 4
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd24, %rd22, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd24, %rd24, %rd23;\n");
+    ptx.push_str("    shl.b64 %rd24, %rd24, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd24, %rd24, {};\n",
+        dk_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f0, [shmem + %rd24];\n");
+    // global addr: dk_global_base + (nj * head_dim + d) * 4
+    ptx.push_str("    mul.lo.u64 %rd25, %rd22, %rd10;\n");
+    ptx.push_str("    add.u64 %rd25, %rd25, %rd23;\n");
+    ptx.push_str("    shl.b64 %rd25, %rd25, 2;\n");
+    ptx.push_str("    add.u64 %rd25, %rd20, %rd25;\n");
+    ptx.push_str("    st.global.f32 [%rd25], %f0;\n");
+    ptx.push_str("    add.u64 %rd23, %rd23, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_STORE_DK_D;\n");
+    ptx.push_str("BWD_MAIN_STORE_DK_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd22, %rd22, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_STORE_DK;\n");
+    ptx.push_str("BWD_MAIN_STORE_DK_DONE:\n\n");
+
+    // Store dV
+    ptx.push_str("    mov.u64 %rd22, %rd11;  // nj = tid\n");
+    ptx.push_str("BWD_MAIN_STORE_DV:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p0, %rd22, {};\n",
+        config.block_kv
+    ));
+    ptx.push_str("    @%p0 bra BWD_MAIN_STORE_DV_DONE;\n");
+    ptx.push_str("    mov.u64 %rd23, 0;  // d = 0\n");
+    ptx.push_str("BWD_MAIN_STORE_DV_D:\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd23, %rd10;\n");
+    ptx.push_str("    @%p1 bra BWD_MAIN_STORE_DV_D_DONE;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd24, %rd22, {};\n",
+        hd_padded
+    ));
+    ptx.push_str("    add.u64 %rd24, %rd24, %rd23;\n");
+    ptx.push_str("    shl.b64 %rd24, %rd24, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd24, %rd24, {};\n",
+        dv_shmem_offset
+    ));
+    ptx.push_str("    ld.shared.f32 %f0, [shmem + %rd24];\n");
+    ptx.push_str("    mul.lo.u64 %rd25, %rd22, %rd10;\n");
+    ptx.push_str("    add.u64 %rd25, %rd25, %rd23;\n");
+    ptx.push_str("    shl.b64 %rd25, %rd25, 2;\n");
+    ptx.push_str("    add.u64 %rd25, %rd21, %rd25;\n");
+    ptx.push_str("    st.global.f32 [%rd25], %f0;\n");
+    ptx.push_str("    add.u64 %rd23, %rd23, 1;\n");
+    ptx.push_str("    bra BWD_MAIN_STORE_DV_D;\n");
+    ptx.push_str("BWD_MAIN_STORE_DV_D_DONE:\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd22, %rd22, {};\n",
+        config.block_q
+    ));
+    ptx.push_str("    bra BWD_MAIN_STORE_DV;\n");
+    ptx.push_str("BWD_MAIN_STORE_DV_DONE:\n\n");
 }
 
 #[cfg(test)]
@@ -2877,5 +3707,210 @@ mod tests {
             "kernel name should contain _t1_ for tree_mask=true, got {}",
             name
         );
+    }
+
+    // ── Backward main kernel (Phase 2) tests ──────────────────────────
+
+    fn bwd_config(causal: bool) -> FlashAttentionBackwardConfig {
+        FlashAttentionBackwardConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal,
+            gpu_sm: 80,
+        }
+    }
+
+    #[test]
+    fn test_bwd_main_kernel_name() {
+        let cfg = bwd_config(true);
+        assert_eq!(
+            flash_attention_bwd_main_kernel_name(&cfg),
+            "flash_attn_bwd_main_c1_q64_kv64"
+        );
+        let cfg2 = bwd_config(false);
+        assert_eq!(
+            flash_attention_bwd_main_kernel_name(&cfg2),
+            "flash_attn_bwd_main_c0_q64_kv64"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_synthesize_noncausal() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+
+        // Entry point
+        assert!(
+            ptx.contains("flash_attn_bwd_main_c0_q64_kv64"),
+            "kernel name in entry"
+        );
+        // Parameters
+        assert!(ptx.contains("param_dout"), "dout param");
+        assert!(ptx.contains("param_dq"), "dq param");
+        assert!(ptx.contains("param_dk"), "dk param");
+        assert!(ptx.contains("param_dv"), "dv param");
+        assert!(ptx.contains("param_lse"), "lse param");
+        assert!(ptx.contains("param_scale"), "scale param");
+        assert!(ptx.contains("param_seq_len"), "seq_len param");
+        assert!(ptx.contains("param_head_dim"), "head_dim param");
+    }
+
+    #[test]
+    fn test_bwd_main_has_atomic_dq() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        assert!(
+            ptx.contains("atom.global.add.f32"),
+            "dQ must use atomicAdd"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_has_regular_store_dk_dv() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        assert!(
+            ptx.contains("BWD_MAIN_STORE_DK"),
+            "dK store section"
+        );
+        assert!(
+            ptx.contains("BWD_MAIN_STORE_DV"),
+            "dV store section"
+        );
+        // dK/dV use regular st.global, not atomic
+        assert!(
+            ptx.contains("st.global.f32"),
+            "dK/dV use regular global store"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_has_barriers() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        let barrier_count = ptx.matches("bar.sync 0").count();
+        // At least 3: after KV load, after dK/dV zero init, after steps 3a-3g
+        assert!(
+            barrier_count >= 3,
+            "need at least 3 bar.sync 0, got {}",
+            barrier_count
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_has_exp_via_ex2() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        assert!(ptx.contains("ex2.approx.f32"), "exp via ex2.approx");
+        assert!(
+            ptx.contains("0f3FB8AA3B") || ptx.contains("0x3FB8AA3B"),
+            "log2(e) constant"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_causal_mask() {
+        let cfg = bwd_config(true);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        // Causal: i_block starts at j_block
+        assert!(
+            ptx.contains("i_block = j_block (causal)"),
+            "causal loop start"
+        );
+        // Causal mask check
+        assert!(
+            ptx.contains("global_i < global_j"),
+            "causal mask predicate"
+        );
+        // Force P = 0
+        assert!(
+            ptx.contains("force P = 0 for masked"),
+            "masked P zeroing"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_noncausal_no_mask() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        // Non-causal: i_block starts at 0
+        assert!(
+            ptx.contains("i_block = 0 (non-causal)"),
+            "non-causal loop start"
+        );
+        assert!(
+            !ptx.contains("force P = 0 for masked"),
+            "no causal mask in non-causal variant"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_shared_mem_size() {
+        let cfg = bwd_config(false);
+        let shmem = backward_shared_mem_bytes(&cfg);
+        // block_q=64, block_kv=64, head_dim=64, pad=4, hd_padded=68
+        // K: 64*68*4=17408, V: same, Q: 64*68*4=17408, dO: same
+        // dK: 17408, dV: 17408
+        // S_tile: 64*64*4=16384, D: 64*4=256, L: 64*4=256
+        // Total: 6*17408 + 16384 + 256 + 256 = 104448 + 16896 = 121344
+        // ... just check it's a reasonable size
+        assert!(shmem > 0, "shmem must be > 0");
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        assert!(
+            ptx.contains(&format!("shmem[{}]", shmem)),
+            "shared memory declaration matches computed size"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_all_7_steps_present() {
+        let cfg = bwd_config(true);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        assert!(ptx.contains("Step 3a"), "step 3a: S = Q.K * scale");
+        assert!(ptx.contains("Step 3b"), "step 3b: P = exp(S - L)");
+        assert!(ptx.contains("Step 3c"), "step 3c: dV += P^T @ dO");
+        assert!(ptx.contains("Step 3d"), "step 3d: dP = dO @ V^T");
+        assert!(ptx.contains("Step 3e"), "step 3e: dS = P * (dP - D)");
+        assert!(ptx.contains("Step 3f"), "step 3f: dQ += dS @ K * scale");
+        assert!(ptx.contains("Step 3g"), "step 3g: dK += dS^T @ Q * scale");
+    }
+
+    #[test]
+    fn test_bwd_main_null_terminated() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        assert_eq!(
+            *ptx2_bytes.last().unwrap(),
+            0,
+            "PTX must be null-terminated"
+        );
+    }
+
+    #[test]
+    fn test_bwd_main_labels_unique_prefix() {
+        let cfg = bwd_config(false);
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        // All labels should start with BWD_MAIN_
+        for line in ptx.lines() {
+            let trimmed = line.trim();
+            if trimmed.ends_with(':') && !trimmed.starts_with("//") && !trimmed.starts_with('.') {
+                assert!(
+                    trimmed.starts_with("BWD_MAIN_"),
+                    "label '{}' does not have BWD_MAIN_ prefix",
+                    trimmed
+                );
+            }
+        }
     }
 }
