@@ -1503,6 +1503,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         scale_bits,
                         *batch, *heads, *seq_len, *head_dim,
                         causal_i,
+                        0, 0, 0, 0, // no PTX pointers — tape-based path uses CPU fallback
                     );
 
                     // Eagerly free saved Q, K, V and intermediates

@@ -706,12 +706,25 @@ impl Compiler<'_> {
             let bwd_p1_id = self.embed_raw_data("__nsl_flash_bwd_p1", bwd_p1)?;
             let bwd_p2_id = self.embed_raw_data("__nsl_flash_bwd_p2", bwd_p2)?;
 
+            // Embed backward kernel name strings as null-terminated C strings
+            let bwd_p1_name = crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config);
+            let mut bwd_p1_name_bytes = bwd_p1_name.into_bytes();
+            bwd_p1_name_bytes.push(0); // null-terminate
+            let bwd_p1_name_id = self.embed_raw_data("__nsl_flash_bwd_p1_name", bwd_p1_name_bytes)?;
+
+            let bwd_p2_name = crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config);
+            let mut bwd_p2_name_bytes = bwd_p2_name.into_bytes();
+            bwd_p2_name_bytes.push(0); // null-terminate
+            let bwd_p2_name_id = self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
+
             Ok(Some(FlashAttentionCompileContext {
                 ptx_data_id,
                 name_data_id,
                 config,
                 bwd_phase1_data_id: Some(bwd_p1_id),
                 bwd_phase2_data_id: Some(bwd_p2_id),
+                bwd_phase1_name_data_id: Some(bwd_p1_name_id),
+                bwd_phase2_name_data_id: Some(bwd_p2_name_id),
                 bwd_config: Some(bwd_config),
             }))
         } else {
@@ -799,12 +812,25 @@ impl Compiler<'_> {
             let bwd_p1_id = self.embed_raw_data("__nsl_flash_bwd_p1", bwd_p1)?;
             let bwd_p2_id = self.embed_raw_data("__nsl_flash_bwd_p2", bwd_p2)?;
 
+            // Embed backward kernel name strings as null-terminated C strings
+            let bwd_p1_name = crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config);
+            let mut bwd_p1_name_bytes = bwd_p1_name.into_bytes();
+            bwd_p1_name_bytes.push(0);
+            let bwd_p1_name_id = self.embed_raw_data("__nsl_flash_bwd_p1_name", bwd_p1_name_bytes)?;
+
+            let bwd_p2_name = crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config);
+            let mut bwd_p2_name_bytes = bwd_p2_name.into_bytes();
+            bwd_p2_name_bytes.push(0);
+            let bwd_p2_name_id = self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
+
             Ok(Some(FlashAttentionCompileContext {
                 ptx_data_id,
                 name_data_id,
                 config,
                 bwd_phase1_data_id: Some(bwd_p1_id),
                 bwd_phase2_data_id: Some(bwd_p2_id),
+                bwd_phase1_name_data_id: Some(bwd_p1_name_id),
+                bwd_phase2_name_data_id: Some(bwd_p2_name_id),
                 bwd_config: Some(bwd_config),
             }))
         }

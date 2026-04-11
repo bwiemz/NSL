@@ -912,6 +912,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // scale_bits (f32 as i64)
             types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
             types::I64, // causal
+            types::I64, // phase1_ptx_ptr (0 = CPU fallback)
+            types::I64, // phase1_name_ptr
+            types::I64, // phase2_ptx_ptr
+            types::I64, // phase2_name_ptr
         ],
         Some(types::I64),
     ),

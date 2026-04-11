@@ -11,6 +11,7 @@ use crate::wengert::{
 use crate::CodegenError;
 use cranelift_codegen::ir::{types as cl_types, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
+use cranelift_module::Module;
 use std::collections::HashMap;
 
 pub type VarMap = HashMap<VarId, Value>;
@@ -936,13 +937,40 @@ fn lower_single_op(
 
                 let causal_val = builder.ins().iconst(cl_types::I64, if *causal { 1 } else { 0 });
 
+                // Load backward PTX data pointers from .rodata (if available)
+                let (p1_ptx, p1_name, p2_ptx, p2_name) = {
+                    let ctx = compiler.kernels.flash_attention_context.as_ref();
+                    let p1_did = ctx.and_then(|c| c.bwd_phase1_data_id);
+                    let p1_name_did = ctx.and_then(|c| c.bwd_phase1_name_data_id);
+                    let p2_did = ctx.and_then(|c| c.bwd_phase2_data_id);
+                    let p2_name_did = ctx.and_then(|c| c.bwd_phase2_name_data_id);
+
+                    let load_data_ptr = |did: Option<cranelift_module::DataId>,
+                                         builder: &mut FunctionBuilder,
+                                         module: &mut cranelift_object::ObjectModule|
+                                         -> Value {
+                        if let Some(id) = did {
+                            let gv = module.declare_data_in_func(id, builder.func);
+                            builder.ins().symbol_value(cl_types::I64, gv)
+                        } else {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        }
+                    };
+
+                    let v1 = load_data_ptr(p1_did, builder, &mut compiler.module);
+                    let v2 = load_data_ptr(p1_name_did, builder, &mut compiler.module);
+                    let v3 = load_data_ptr(p2_did, builder, &mut compiler.module);
+                    let v4 = load_data_ptr(p2_name_did, builder, &mut compiler.module);
+                    (v1, v2, v3, v4)
+                };
+
                 let list = call(
                     compiler,
                     builder,
                     "nsl_flash_attention_backward",
                     &[dout, q, k, v, fwd_out, lse_null,
                       scale_bits, batch, heads, seq_len, head_dim,
-                      causal_val],
+                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name],
                 )?;
                 compiler.flash_attn_bwd_cache.insert(fwd_out, list);
                 list

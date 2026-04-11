@@ -42,6 +42,9 @@ pub struct FlashAttentionCompileContext {
     // Backward PTX data IDs (Phase 1 D-correction, Phase 2 main dQ/dK/dV)
     pub bwd_phase1_data_id: Option<DataId>,
     pub bwd_phase2_data_id: Option<DataId>,
+    // Backward kernel name data IDs (null-terminated C strings in .rodata)
+    pub bwd_phase1_name_data_id: Option<DataId>,
+    pub bwd_phase2_name_data_id: Option<DataId>,
     pub bwd_config: Option<crate::flash_attention::FlashAttentionBackwardConfig>,
 }
 
