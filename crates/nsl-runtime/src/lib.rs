@@ -79,6 +79,7 @@ pub mod trace_diff;
 pub mod deterministic_ops;
 pub mod multimodal;
 pub mod sparse;
+pub mod peft;
 
 // M54: Unikernel runtime (bare-metal deployment)
 pub mod unikernel;

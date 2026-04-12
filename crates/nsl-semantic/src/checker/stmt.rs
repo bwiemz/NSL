@@ -325,6 +325,60 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // CFTP: @fase and @pca decorator validation
+                        if dname == "fase" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cftp::validate_fase_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+                        if dname == "pca" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cftp::validate_pca_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
+                        // WRGA: @wrga / @freeze / @adapter decorator validation
+                        if dname == "wrga" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::wrga::validate_wrga_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+                        if dname == "freeze" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::wrga::validate_freeze_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+                        if dname == "adapter" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::wrga::validate_adapter_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // M39: @vmap decorator validation
                         if dname == "vmap" {
                             let resolve = |s: nsl_ast::Symbol| -> String {

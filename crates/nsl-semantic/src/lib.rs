@@ -1,4 +1,5 @@
 pub mod builtins;
+pub mod cftp;
 pub mod checker;
 pub mod context_parallel;
 pub mod determinism;
@@ -24,6 +25,7 @@ pub mod speculative;
 pub mod target;
 pub mod types;
 pub mod vmap;
+pub mod wrga;
 
 use std::collections::HashMap;
 
