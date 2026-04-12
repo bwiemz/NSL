@@ -24,6 +24,7 @@ pub mod speculative;
 pub mod target;
 pub mod types;
 pub mod vmap;
+pub mod wrga;
 
 use std::collections::HashMap;
 
