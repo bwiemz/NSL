@@ -54,6 +54,12 @@ pub mod wcet;
 pub mod weight_aware;
 pub mod wengert;
 pub mod wengert_lower;
+pub mod wrga;
+pub mod wrga_fusion;
+pub mod wrga_memory;
+pub mod wrga_prune;
+pub mod wrga_roofline;
+pub mod wrga_spectral;
 pub mod zk;
 
 pub use compiler::{

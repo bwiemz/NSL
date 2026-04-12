@@ -186,6 +186,55 @@ pub enum DatatypePtxKind {
     ArithmeticPtx,
 }
 
+/// WRGA (Wengert-Pruned Roofline-Guided Adaptation) configuration.
+///
+/// Parsed from a `@wrga(mode=auto|manual|hybrid, budget=..., target=..., layers=[...])`
+/// decorator.  Decorators themselves are already stored as `Decorator` nodes;
+/// this struct is the validated, resolved form used by the semantic and codegen
+/// passes.  Keeping it in the AST crate lets both `nsl-semantic` and
+/// `nsl-codegen` share one vocabulary.
+#[derive(Debug, Clone, Serialize)]
+pub struct WrgaBlock {
+    pub mode: WrgaMode,
+    /// Total adapter parameter budget, if specified (e.g. `budget=100K`).
+    pub budget: Option<i64>,
+    /// Target hardware symbol, e.g. `h100`, `rtx5070ti`.
+    pub target: Option<Symbol>,
+    /// Explicit layer selection for `mode=hybrid`.
+    pub layers: Vec<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum WrgaMode {
+    /// Compiler makes all adapter placement + rank decisions.
+    Auto,
+    /// User explicitly specifies `@adapter(...)` sites; compiler only optimizes
+    /// the backward pass, fusion, and memory.
+    Manual,
+    /// User selects layer scope; compiler chooses adapter type, rank, fusion.
+    Hybrid,
+}
+
+impl WrgaMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WrgaMode::Auto => "auto",
+            WrgaMode::Manual => "manual",
+            WrgaMode::Hybrid => "hybrid",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(WrgaMode::Auto),
+            "manual" => Some(WrgaMode::Manual),
+            "hybrid" => Some(WrgaMode::Hybrid),
+            _ => None,
+        }
+    }
+}
+
 /// serve Name:
 ///     config entries + @endpoint functions
 #[derive(Debug, Clone, Serialize)]
