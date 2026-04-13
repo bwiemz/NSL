@@ -67,9 +67,43 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         report.fusion = Some(nsl_codegen::wrga_fusion::build_fusion_plan(&[], None));
     }
 
-    // TODO: memory timeline — Task 5 will populate `report.memory_timeline`
-    // and render it here when `args.memory` is true.
-    let _ = args.memory;
+    if args.memory {
+        // TODO: replace with real WengertList when source-AD integration is
+        // stable. For Phase 1 we synthesize a minimal plausible plan from the
+        // walker's op list: each op produces an activation of `bytes_written`
+        // bytes, birthed at its program-point index and living for a small
+        // sliding window (2 steps) to approximate activation reuse.
+        use nsl_codegen::wrga_memory::{MemoryPlan, MemoryPlanStats, SlotAssignment};
+        const LIFETIME_WINDOW: u32 = 2;
+        let n = report.ops.len() as u32;
+        let assignments: Vec<SlotAssignment> = report
+            .ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                let birth = i as u32;
+                let death = (birth + LIFETIME_WINDOW).min(n.max(1));
+                SlotAssignment {
+                    var: birth,
+                    slot: birth,
+                    size_bytes: op.bytes_written,
+                    birth,
+                    death,
+                }
+            })
+            .collect();
+        let plan = MemoryPlan {
+            assignments,
+            stats: MemoryPlanStats::default(),
+        };
+        let tl = nsl_codegen::profiling::memory_timeline::build(
+            &nsl_codegen::profiling::memory_timeline::MemoryTimelineInput {
+                plan: &plan,
+                phase_markers: vec![],
+            },
+        );
+        report.memory_timeline = Some(tl);
+    }
 
     if args.json {
         return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
@@ -100,6 +134,9 @@ fn render_text(r: &ProfileReport, gpu: &GpuSpec) -> String {
                 d.site, d.target, d.extra_hbm_bytes, d.rationale
             ));
         }
+    }
+    if let Some(tl) = &r.memory_timeline {
+        out.push_str(&nsl_codegen::profiling::memory_timeline::render(tl));
     }
     if !r.recommendations.is_empty() {
         out.push_str("\nRecommendations:\n");

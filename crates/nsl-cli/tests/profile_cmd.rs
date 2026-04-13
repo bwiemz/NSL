@@ -45,6 +45,19 @@ fn json_flag_emits_parseable_report() {
 }
 
 #[test]
+fn memory_flag_appends_timeline() {
+    let args = ProfileArgs {
+        memory: true,
+        ..sample_args()
+    };
+    let out = run_profile(&args).unwrap();
+    assert!(out.contains("Memory Timeline"), "timeline section missing: {}", out);
+    assert!(out.contains("Peak:"), "peak line missing: {}", out);
+    // Per-op table still present — --memory is additive.
+    assert!(out.contains("NSL Predictive Profile"));
+}
+
+#[test]
 fn bad_gpu_errors_with_available_list() {
     let args = ProfileArgs {
         target: "nonsuch".into(),
