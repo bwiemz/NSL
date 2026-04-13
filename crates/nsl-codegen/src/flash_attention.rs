@@ -399,6 +399,13 @@ fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &Flas
     // through to the classic Q-from-HBM path emitted just below.
     emit_csha_rmsnorm_prologue(ptx, config);
 
+    // CSHA A.2.3: matmul projection — emits when `config.csha.fused_projections`
+    // is set. Projects `x_norm @ Wq/Wk/Wv` into Q/K/V SMEM tiles via m16n8k16
+    // MMA, reusing the `matmul_mma` primitives. Runtime-gated on non-null Wq/
+    // Wk/Wv pointers so NULL-pointer calls (current state) fall through to the
+    // classic path. Dormant at runtime until A.2.5.
+    emit_csha_matmul_projection(ptx, config);
+
     // Load Q tile into shared memory
     emit_q_tile_load(ptx, config);
 
@@ -677,6 +684,170 @@ fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("CSHA_PROLOGUE_END:\n");
     ptx.push_str("    bar.sync 0;                       // Q tile (from prologue OR Q load) consistent across warps\n");
     ptx.push_str("    // ── end CSHA prologue ───────────────────────────────────────\n");
+}
+
+/// CSHA A.2.3 — matmul projection emitter.
+///
+/// When `config.csha.fused_projections` is set, this emits PTX that
+/// projects the normalised x tile (produced by the A.2.2 prologue)
+/// into Q/K/V tiles via three m16n8k16 tensor-core matmuls, reusing
+/// the primitives in [`crate::matmul_mma`]:
+///
+/// ```text
+///    Q_tile = x_norm @ Wq   (A=[block_q, d_model], B=[d_model, head_dim])
+///    K_tile = x_norm @ Wk
+///    V_tile = x_norm @ Wv
+/// ```
+///
+/// A.2.3 ships a **single-tile proof of structure** — one MMA per
+/// projection at the tile origin — rather than the full
+/// `(block_q/MMA_M) × (head_dim/MMA_N)` tile-sweep loop. The loop is
+/// marked with a PTX comment and lands in a follow-up; ABI / SMEM
+/// layout / register conventions are fixed here so the loop expansion
+/// is a local change.
+///
+/// Same dormant-kernel contract as A.2.2: the CSHA-tagged kernel
+/// variant is emitted but not launched by `nsl_flash_attention_csha`
+/// today (A.2.5 wires runtime dispatch). Runtime null-checks on
+/// `csha_wq/wk/wv_ptr` keep current A.1/A.2.1x call sites (which pass
+/// NULL) from dereferencing uninitialised pointers if the variant
+/// ever does execute during bring-up.
+fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if !csha.fused_projections {
+        return;
+    }
+
+    let block_q = config.block_q;
+    let head_dim = config.head_dim;
+    let d_model = csha.d_model.max(head_dim as u32);
+
+    ptx.push_str("    // ── CSHA A.2.3: matmul projection (x_norm @ Wq/Wk/Wv) ────\n");
+    ptx.push_str(&format!(
+        "    // fused_projections=1, block_q={}, head_dim={}, d_model={}\n",
+        block_q, head_dim, d_model
+    ));
+
+    // Load the three projection-weight pointers and null-check.
+    ptx.push_str("    ld.param.u64 %rd61, [csha_wq_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd62, [csha_wk_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd63, [csha_wv_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p13, %rd61, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p14, %rd62, 0;\n");
+    ptx.push_str("    or.pred %p13, %p13, %p14;\n");
+    ptx.push_str("    setp.eq.u64 %p14, %rd63, 0;\n");
+    ptx.push_str("    or.pred %p13, %p13, %p14;\n");
+    ptx.push_str("    @%p13 bra CSHA_PROJECTION_END;\n");
+
+    // Emit MMA temporary registers (laneid, row indices, addr scratch).
+    // `emit_mma_temp_registers` is `#[allow(dead_code)]` so calling it here
+    // both gives us the standard MMA scaffolding and removes the dead-code
+    // annotation's need in future commits.
+    emit_mma_temp_registers(ptx);
+
+    // Projection-weight SMEM slot starts right after the Q-tile slot.
+    // Layout (matches `shared_mem_bytes` at `fused_projections` branch):
+    //   [0 .. block_q*head_dim*2)           — Q tile (written by A.2.2 prologue)
+    //   [block_q*head_dim*2 .. + 3*hd*d*2)  — Wq/Wk/Wv tiles
+    let q_tile_bytes = (block_q * head_dim * 2) as u32;
+    let weight_tile_bytes = (head_dim as u32) * d_model.min(256) * 2;
+    ptx.push_str(&format!(
+        "    // SMEM weight-tile bases: wq={}, wk={}, wv={}\n",
+        q_tile_bytes,
+        q_tile_bytes + weight_tile_bytes,
+        q_tile_bytes + 2 * weight_tile_bytes,
+    ));
+
+    // A-fragment and B-fragment registers for one m16n8k16 MMA iteration.
+    // These are local to the projection block — distinct from the attention
+    // QK^T / PV MMAs further down the kernel body to avoid register aliasing.
+    ptx.push_str("    .reg .b32 %proj_a0, %proj_a1, %proj_a2, %proj_a3;\n");
+    ptx.push_str("    .reg .b32 %proj_b0, %proj_b1;\n");
+    ptx.push_str("    .reg .f32 %proj_d0, %proj_d1, %proj_d2, %proj_d3;\n");
+    ptx.push_str("    .reg .f32 %proj_c0, %proj_c1, %proj_c2, %proj_c3;\n");
+    ptx.push_str("    // Zero accumulator for this proof-of-structure iteration\n");
+    ptx.push_str("    mov.f32 %proj_c0, 0.0;\n");
+    ptx.push_str("    mov.f32 %proj_c1, 0.0;\n");
+    ptx.push_str("    mov.f32 %proj_c2, 0.0;\n");
+    ptx.push_str("    mov.f32 %proj_c3, 0.0;\n");
+
+    // Fragment register string lists shared across Q/K/V.
+    let a_regs = [
+        "proj_a0".to_string(),
+        "proj_a1".to_string(),
+        "proj_a2".to_string(),
+        "proj_a3".to_string(),
+    ];
+    let b_regs = ["proj_b0".to_string(), "proj_b1".to_string()];
+    let c_regs = [
+        "%proj_c0".to_string(),
+        "%proj_c1".to_string(),
+        "%proj_c2".to_string(),
+        "%proj_c3".to_string(),
+    ];
+    let d_regs = [
+        "%proj_d0".to_string(),
+        "%proj_d1".to_string(),
+        "%proj_d2".to_string(),
+        "%proj_d3".to_string(),
+    ];
+
+    // x_norm (A side) lives at SMEM offset 0, row-stride = head_dim * 2.
+    // Row-stride here is head_dim rather than d_model because A.2.2's
+    // prologue currently normalises over head_dim (see A.2.2 semantic
+    // note); A.2.3-full-d_model is a follow-up coupled with A.2.1e.
+    let a_stride_bytes = (head_dim * 2) as usize;
+
+    // ── Q projection ──
+    ptx.push_str("    // --- Q projection: x_norm @ Wq (1 tile) ---\n");
+    ptx.push_str("    // Cooperative HBM→SMEM load for Wq tile (scaffold; full tile\n");
+    ptx.push_str("    // sweep TBD in follow-up). Load is skipped here — weight_tile\n");
+    ptx.push_str("    // assumed to have been prefetched by the surrounding launch.\n");
+    crate::matmul_mma::emit_load_a_fragment_smem(ptx, &a_regs, "0", a_stride_bytes);
+    crate::matmul_mma::emit_load_b_fragment_smem(
+        ptx,
+        &b_regs,
+        &format!("{}", q_tile_bytes),
+        (d_model.min(256) * 2) as usize,
+    );
+    crate::matmul_mma::emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+
+    // ── K projection ──
+    ptx.push_str("    // --- K projection: x_norm @ Wk (1 tile) ---\n");
+    crate::matmul_mma::emit_load_a_fragment_smem(ptx, &a_regs, "0", a_stride_bytes);
+    crate::matmul_mma::emit_load_b_fragment_smem(
+        ptx,
+        &b_regs,
+        &format!("{}", q_tile_bytes + weight_tile_bytes),
+        (d_model.min(256) * 2) as usize,
+    );
+    crate::matmul_mma::emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+
+    // ── V projection ──
+    ptx.push_str("    // --- V projection: x_norm @ Wv (1 tile) ---\n");
+    crate::matmul_mma::emit_load_a_fragment_smem(ptx, &a_regs, "0", a_stride_bytes);
+    crate::matmul_mma::emit_load_b_fragment_smem(
+        ptx,
+        &b_regs,
+        &format!("{}", q_tile_bytes + 2 * weight_tile_bytes),
+        (d_model.min(256) * 2) as usize,
+    );
+    crate::matmul_mma::emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+
+    ptx.push_str(
+        "    // TODO(A.2.3-follow-up): expand into tile-sweep loop over\n",
+    );
+    ptx.push_str(&format!(
+        "    // (m = 0..{}/{}, n = 0..{}/{}) per projection, with cooperative\n",
+        block_q, 16, head_dim, 8
+    ));
+    ptx.push_str("    // HBM→SMEM weight loads interleaved with MMA issue.\n");
+
+    ptx.push_str("CSHA_PROJECTION_END:\n");
+    ptx.push_str("    bar.sync 0;                       // Q/K/V SMEM tiles consistent\n");
+    ptx.push_str("    // ── end CSHA projection ─────────────────────────────────────\n");
 }
 
 fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -5880,6 +6051,102 @@ mod tests {
                 && ptx.contains("or.pred %p10, %p10, %p11;")
                 && ptx.contains("@%p10 bra CSHA_PROLOGUE_END;"),
             "runtime null-check on x_ptr/norm_weight_ptr is missing"
+        );
+    }
+
+    // ── CSHA A.2.3: matmul projection emission tests ─────────────────
+
+    fn csha_l2_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            csha: Some(CshaExtras::level2(1e-5, 512)),
+        }
+    }
+
+    #[test]
+    fn a23_projection_appears_with_fused_projections() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        assert!(
+            ptx.contains("CSHA A.2.3: matmul projection"),
+            "projection block missing for CSHA L2 config"
+        );
+        // Three MMA instructions — Q, K, V — each at tile origin.
+        assert_eq!(
+            ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32")
+                .count(),
+            3,
+            "exactly three m16n8k16 MMAs (Q/K/V) expected in CSHA L2 PTX"
+        );
+        // Section markers for each projection.
+        assert!(ptx.contains("--- Q projection:"));
+        assert!(ptx.contains("--- K projection:"));
+        assert!(ptx.contains("--- V projection:"));
+        // End label + bar.sync.
+        assert!(ptx.contains("CSHA_PROJECTION_END:"));
+    }
+
+    #[test]
+    fn a23_projection_absent_without_fused_projections() {
+        // CSHA L1 only has fused_rmsnorm; projections stay external.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.3: matmul projection"),
+            "projection must not appear in CSHA L1 PTX (fused_projections=false)"
+        );
+        assert!(!ptx.contains("CSHA_PROJECTION_END:"));
+    }
+
+    #[test]
+    fn a23_projection_absent_in_non_csha_ptx() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&non_csha_config())).unwrap();
+        assert!(!ptx.contains("CSHA A.2.3: matmul projection"));
+        // And the non-CSHA path emits exactly the attention-body MMAs it
+        // already had (sanity: no CSHA-tagged MMAs leaking through).
+        assert!(!ptx.contains("CSHA_PROJECTION_END:"));
+    }
+
+    #[test]
+    fn a23_projection_runtime_null_check_covers_all_three_weights() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // Must set-predicate-eq for each of Wq/Wk/Wv and or.pred-combine
+        // them, then branch to PROJECTION_END if any is null.
+        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wq_ptr];"));
+        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wk_ptr];"));
+        assert!(ptx.contains("ld.param.u64 %rd63, [csha_wv_ptr];"));
+        assert!(ptx.contains("setp.eq.u64 %p13, %rd61, 0;"));
+        assert!(ptx.contains("setp.eq.u64 %p14, %rd62, 0;"));
+        assert!(ptx.contains("setp.eq.u64 %p14, %rd63, 0;"));
+        assert!(ptx.contains("@%p13 bra CSHA_PROJECTION_END;"));
+    }
+
+    #[test]
+    fn a23_projection_follows_prologue_precedes_q_tile_load() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        let prologue_idx = ptx
+            .find("CSHA A.2.2: RMSNorm prologue")
+            .expect("prologue present (L2 turns on fused_rmsnorm too)");
+        let projection_idx = ptx
+            .find("CSHA A.2.3: matmul projection")
+            .expect("projection present");
+        let q_load_idx = ptx
+            .find("Load Q tile into shared memory")
+            .expect("Q tile load present");
+        assert!(
+            prologue_idx < projection_idx,
+            "prologue must precede projection"
+        );
+        assert!(
+            projection_idx < q_load_idx,
+            "projection must precede classic Q load"
         );
     }
 
