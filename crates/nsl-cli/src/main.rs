@@ -894,6 +894,9 @@ fn main_inner() {
                 wrga_fold_allocations,
                 wggo_mode: wggo.clone(),
                 wggo_report,
+                profile_kernels: false,
+                target_gpu: "h100".to_string(),
+                dtype: "bf16".to_string(),
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1069,6 +1072,9 @@ fn main_inner() {
                 wrga_fold_allocations: false,
                 wggo_mode: None,
                 wggo_report: false,
+                profile_kernels: monitor,
+                target_gpu: "h100".to_string(),
+                dtype: "bf16".to_string(),
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
