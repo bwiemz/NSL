@@ -3,6 +3,13 @@
 //! Verifies that `apply_wrga_hints` is invoked when a WRGA plan is produced,
 //! that it sets the pre/post slot-count side-channels, and that the post-hint
 //! slot count is never greater than pre-hint (conservative coalescing).
+//!
+//! **B.1 scope note:** `apply_wrga_hints` currently observes WRGA's
+//! MemoryPlan and publishes side-channel pre/post slot counts, but does
+//! NOT mutate the real `LivenessAnalyzer` (which is keyed by AST string
+//! names rather than Wengert VarIds).  The aggressive allocator-merge
+//! path is slated for Milestone B.2.  This test asserts observability,
+//! not realised memory savings.
 
 use nsl_codegen::{CompileOptions, FreezeDecoratorConfig, WrgaInputs};
 

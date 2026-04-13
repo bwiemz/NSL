@@ -1826,3 +1826,67 @@ mod tests {
         assert!(recomp_points.is_empty(), "cannot remat if inputs are dead");
     }
 }
+
+#[cfg(test)]
+mod wrga_hints_unit_tests {
+    use super::*;
+    use crate::wrga_memory::SlotAssignment;
+
+    fn mk_assignment(var: u32, slot: u32, size: u64, birth: u32, death: u32) -> SlotAssignment {
+        SlotAssignment {
+            var,
+            slot,
+            size_bytes: size,
+            birth,
+            death,
+        }
+    }
+
+    #[test]
+    fn try_merge_pair_refuses_size_mismatch() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 5),
+            mk_assignment(2, 0, 128, 10, 15), // disjoint liveness, but size differs
+        ];
+        assert!(
+            !try_merge_pair(&assignments, 0, 1),
+            "different sizes must refuse"
+        );
+    }
+
+    #[test]
+    fn try_merge_pair_refuses_overlapping_liveness() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 10),
+            mk_assignment(2, 0, 64, 5, 15), // overlap: 5..=10
+        ];
+        assert!(
+            !try_merge_pair(&assignments, 0, 1),
+            "overlapping liveness must refuse"
+        );
+    }
+
+    #[test]
+    fn try_merge_pair_accepts_disjoint_equal_size() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 5),
+            mk_assignment(2, 0, 64, 10, 15),
+        ];
+        assert!(
+            try_merge_pair(&assignments, 0, 1),
+            "equal size + disjoint liveness must accept"
+        );
+    }
+
+    #[test]
+    fn try_merge_pair_refuses_zero_size() {
+        let assignments = vec![
+            mk_assignment(1, 0, 0, 0, 5),
+            mk_assignment(2, 0, 0, 10, 15),
+        ];
+        assert!(
+            !try_merge_pair(&assignments, 0, 1),
+            "zero size must refuse (guard against unallocated)"
+        );
+    }
+}
