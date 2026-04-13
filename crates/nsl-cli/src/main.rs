@@ -811,11 +811,6 @@ fn main() {
                         process::exit(1);
                     }
                 };
-                if wrga_report.is_some() {
-                    eprintln!(
-                        "nsl: --wrga-report is not yet supported on --standalone builds; decorator effects still apply"
-                    );
-                }
                 run_build_standalone(
                     &file,
                     output.as_deref(),
@@ -823,16 +818,20 @@ fn main() {
                     embed_mode,
                     embed_threshold,
                     &compile_opts,
+                    wrga_report.as_deref(),
                 );
             } else if shared_lib {
                 run_build_shared(&file, output, dump_ir, &compile_opts, wrga_report.as_deref());
             } else if zk_circuit {
-                if wrga_report.is_some() {
-                    eprintln!(
-                        "nsl: --wrga-report is not yet supported on --zk-circuit builds; decorator effects still apply"
-                    );
-                }
-                run_build_zk(&file, output, emit_obj, dump_ir, zk_weights.as_deref(), &compile_opts);
+                run_build_zk(
+                    &file,
+                    output,
+                    emit_obj,
+                    dump_ir,
+                    zk_weights.as_deref(),
+                    &compile_opts,
+                    wrga_report.as_deref(),
+                );
             } else {
                 run_build(&file, output, emit_obj, dump_ir, &compile_opts, wrga_report.as_deref());
             }
@@ -1756,24 +1755,35 @@ fn run_build_zk(
     dump_ir: bool,
     zk_weights: Option<&std::path::Path>,
     options: &nsl_codegen::CompileOptions,
+    wrga_report: Option<&std::path::Path>,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
-    // take effect in codegen even on the ZK build path.  `--wrga-report` is not
-    // supported here (warned at dispatch).
+    // take effect in codegen on the ZK build path.
+    // Task 4 (B.2): if `--wrga-report` is set, fail fast when decorators are
+    // present without `--source-ad` (mirroring the single/multi build paths).
+    check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
     let options = &options;
 
-    let (obj_bytes, zk_proof_fns, zk_results) = match nsl_codegen::compile_with_zk_info(
-        &parse_result.module,
-        &interner,
-        &analysis.type_map,
-        dump_ir,
-        options,
-    ) {
-        Ok(result) => result,
+    // Task 4 (B.2): use the `_returning_plan` variant so the WRGA plan is
+    // observable (and reportable) even if later codegen fails.
+    let (bytes_res, zk_proof_fns, zk_results, wrga_plan) =
+        nsl_codegen::compile_with_zk_info_returning_plan(
+            &parse_result.module,
+            &interner,
+            &analysis.type_map,
+            dump_ir,
+            options,
+        );
+
+    // Emit the WRGA report (if requested) before reporting any codegen error.
+    emit_wrga_report(&wrga_plan, wrga_report);
+
+    let obj_bytes = match bytes_res {
+        Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("codegen error: {e}");
             process::exit(1);
@@ -1952,6 +1962,7 @@ fn run_build_standalone(
     embed_mode: standalone::EmbedMode,
     embed_threshold: u64,
     options: &nsl_codegen::CompileOptions,
+    wrga_report: Option<&std::path::Path>,
 ) {
     // 1. Read weights from safetensors
     let tensors = standalone::read_safetensors(weights).unwrap_or_else(|e| {
@@ -1974,8 +1985,10 @@ fn run_build_standalone(
     let (interner, parse_result, analysis) = frontend(&file_pb);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
-    // take effect in codegen on the standalone build path.  `--wrga-report` is not
-    // supported here (warned at dispatch).
+    // take effect in codegen on the standalone build path.
+    // Task 4 (B.2): if `--wrga-report` is set, fail fast when decorators are
+    // present without `--source-ad`.
+    check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
     let options = &options;
@@ -2002,16 +2015,19 @@ fn run_build_standalone(
         sidecar_path: sidecar_name,
     };
 
-    // 6. Compile with standalone config
-    let obj_bytes = nsl_codegen::compile_standalone(
+    // 6. Compile with standalone config.
+    // Task 4 (B.2): use the `_returning_plan` variant so the WRGA plan is
+    // observable (and reportable) even if later codegen fails.
+    let (bytes_res, wrga_plan) = nsl_codegen::compile_standalone_returning_plan(
         &parse_result.module,
         &interner,
         &analysis.type_map,
         config,
         false,
         options,
-    )
-    .unwrap_or_else(|e| {
+    );
+    emit_wrga_report(&wrga_plan, wrga_report);
+    let obj_bytes = bytes_res.unwrap_or_else(|e| {
         eprintln!("codegen error: {e}");
         process::exit(1);
     });

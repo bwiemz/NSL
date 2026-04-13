@@ -188,7 +188,7 @@ pub fn compile_returning_plan(
 ///
 /// Returns `(object_bytes, zk_proof_fns)` where `zk_proof_fns` maps mangled
 /// function names to their [`crate::zk::backend::ZkMode`].
-#[allow(clippy::type_complexity, clippy::field_reassign_with_default)]
+#[allow(clippy::type_complexity)]
 pub fn compile_with_zk_info(
     ast: &nsl_ast::Module,
     interner: &Interner,
@@ -203,95 +203,139 @@ pub fn compile_with_zk_info(
     ),
     CodegenError,
 > {
-    let mut compiler = Compiler::new(interner, type_map, options)?;
+    let (res, zk_modes, zk_results, _plan) =
+        compile_with_zk_info_best_effort_plan(ast, interner, type_map, dump_ir, options);
+    res.map(|bytes| (bytes, zk_modes, zk_results))
+}
 
-    // M52: Load weights if --weights was provided
-    if let Some(ref weight_path) = options.weight_file {
-        match crate::weight_aware::WeightMap::load(weight_path) {
-            Ok(mut wmap) => {
-                let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
-                if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
-                    let config = &options.weight_config;
-                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                    for name in &names {
-                        if let Some(entry) = wmap.get_mut(name) {
-                            entry.analyze_sparsity(config);
-                        }
-                    }
-                }
-                if options.weight_config.dead_weight_elim {
-                    let eliminator =
-                        crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
-                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                    for name in &names {
-                        if let Some(entry) = wmap.get_mut(name) {
-                            eliminator.eliminate(entry);
-                        }
-                    }
-                }
-                if options.weight_analysis {
-                    crate::weight_aware::print_weight_analysis_report(
-                        &wmap,
-                        &options.weight_config,
-                    );
-                }
-                eprintln!(
-                    "[nsl] loaded {} weights from {} (SHA-256: {})",
-                    wmap.len(),
-                    wmap.source_path(),
-                    integrity.hash_hex
-                );
-                compiler.features.weight_integrity = Some(integrity);
-                compiler.features.weight_map = Some(wmap);
-            }
-            Err(e) => {
-                return Err(crate::error::CodegenError::new(format!(
-                    "failed to load weights: {}",
-                    e
-                )));
-            }
-        }
-    }
+/// Task 4 (B.2): same as [`compile_with_zk_info`] but also returns any `WrgaPlan`
+/// stashed on the compiler during `@train` block lowering.  Used by
+/// `nsl build --zk-circuit --wrga-report` to surface WRGA analysis on the ZK
+/// build path.  The plan is returned even when later codegen stages fail, so
+/// the CLI can emit the report before reporting the error.
+#[allow(clippy::type_complexity)]
+pub fn compile_with_zk_info_returning_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> (
+    Result<Vec<u8>, CodegenError>,
+    HashMap<String, crate::zk::backend::ZkMode>,
+    Vec<(String, crate::zk::ZkCompileResult)>,
+    Option<crate::wrga::WrgaPlan>,
+) {
+    compile_with_zk_info_best_effort_plan(ast, interner, type_map, dump_ir, options)
+}
+
+#[allow(clippy::type_complexity, clippy::field_reassign_with_default)]
+fn compile_with_zk_info_best_effort_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> (
+    Result<Vec<u8>, CodegenError>,
+    HashMap<String, crate::zk::backend::ZkMode>,
+    Vec<(String, crate::zk::ZkCompileResult)>,
+    Option<crate::wrga::WrgaPlan>,
+) {
+    let mut compiler = match Compiler::new(interner, type_map, options) {
+        Ok(c) => c,
+        Err(e) => return (Err(e), HashMap::new(), Vec::new(), None),
+    };
 
     compiler.dump_ir = dump_ir;
-    compiler.intern_string("")?;
-    compiler.collect_strings(&ast.stmts)?;
-    compiler.collect_enums(&ast.stmts)?;
-    compiler.collect_structs(&ast.stmts)?;
-    compiler.collect_models(&ast.stmts)?;
-    compiler.declare_runtime_functions()?;
-    compiler.declare_user_functions(&ast.stmts)?;
-    let vmap_results = compiler.apply_vmap_transforms(ast);
-    compiler.register_batched_functions(&vmap_results);
-    compiler.compile_datatype_defs(&ast.stmts)?;
-    compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
-    compiler.compile_user_functions(&ast.stmts)?;
-    // M39c: Compile batched function bodies
-    compiler.compile_batched_functions(&vmap_results)?;
-    compiler.compile_main(&ast.stmts)?;
-    compiler.compile_pending_lambdas()?;
 
-    if let Some(budget) = options.vram_budget {
-        eprintln!(
-            "[nsl] --vram-budget set to {} bytes (planner integration in progress)",
-            budget
-        );
-    }
-    if options.memory_report {
-        eprintln!("[nsl] --memory-report requested (planner integration in progress)");
-    }
+    // Run every pass up to (but not including) finalize so we can observe
+    // `last_wrga_plan` even on an error path before consuming the compiler.
+    let pre_finalize = (|| -> Result<(), CodegenError> {
+        // M52: Load weights if --weights was provided
+        if let Some(ref weight_path) = options.weight_file {
+            let mut wmap = crate::weight_aware::WeightMap::load(weight_path).map_err(|e| {
+                crate::error::CodegenError::new(format!("failed to load weights: {}", e))
+            })?;
+            let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
+            if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
+                let config = &options.weight_config;
+                let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                for name in &names {
+                    if let Some(entry) = wmap.get_mut(name) {
+                        entry.analyze_sparsity(config);
+                    }
+                }
+            }
+            if options.weight_config.dead_weight_elim {
+                let eliminator =
+                    crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+                let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+                for name in &names {
+                    if let Some(entry) = wmap.get_mut(name) {
+                        eliminator.eliminate(entry);
+                    }
+                }
+            }
+            if options.weight_analysis {
+                crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+            }
+            eprintln!(
+                "[nsl] loaded {} weights from {} (SHA-256: {})",
+                wmap.len(),
+                wmap.source_path(),
+                integrity.hash_hex
+            );
+            compiler.features.weight_integrity = Some(integrity);
+            compiler.features.weight_map = Some(wmap);
+        }
 
-    // M53: Run WCET analysis for @real_time functions
-    if compiler.compile_options.wcet_enabled {
-        compiler.run_wcet_analysis()?;
-    }
+        compiler.intern_string("")?;
+        compiler.collect_strings(&ast.stmts)?;
+        compiler.collect_enums(&ast.stmts)?;
+        compiler.collect_structs(&ast.stmts)?;
+        compiler.collect_models(&ast.stmts)?;
+        compiler.declare_runtime_functions()?;
+        compiler.declare_user_functions(&ast.stmts)?;
+        let vmap_results = compiler.apply_vmap_transforms(ast);
+        compiler.register_batched_functions(&vmap_results);
+        compiler.compile_datatype_defs(&ast.stmts)?;
+        compiler.compile_kernels(&ast.stmts)?;
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+        compiler.compile_user_functions(&ast.stmts)?;
+        compiler.compile_batched_functions(&vmap_results)?;
+        compiler.compile_main(&ast.stmts)?;
+        compiler.compile_pending_lambdas()?;
 
-    // M52: Embed weight hash if weights were loaded
-    compiler.embed_weight_hash()?;
+        if let Some(budget) = options.vram_budget {
+            eprintln!(
+                "[nsl] --vram-budget set to {} bytes (planner integration in progress)",
+                budget
+            );
+        }
+        if options.memory_report {
+            eprintln!("[nsl] --memory-report requested (planner integration in progress)");
+        }
+
+        // M53: Run WCET analysis for @real_time functions
+        if compiler.compile_options.wcet_enabled {
+            compiler.run_wcet_analysis()?;
+        }
+
+        // M52: Embed weight hash if weights were loaded
+        compiler.embed_weight_hash()?;
+        Ok(())
+    })();
+
+    let plan = compiler.last_wrga_plan.clone();
 
     // Capture ZK fn map before finalize() consumes the compiler.
     let zk_proof_fns = compiler.features.zk_proof_fns.clone();
+
+    // If the pre-finalize pipeline failed, bail out with the plan preserved.
+    if let Err(e) = pre_finalize {
+        return (Err(e), zk_proof_fns, Vec::new(), plan);
+    }
 
     // M55: Compile @zk_proof functions to ZK circuits
     let mut zk_results: Vec<(String, crate::zk::ZkCompileResult)> = Vec::new();
@@ -352,8 +396,8 @@ pub fn compile_with_zk_info(
         }
     }
 
-    let bytes = compiler.finalize()?;
-    Ok((bytes, zk_proof_fns, zk_results))
+    let bytes = compiler.finalize();
+    (bytes, zk_proof_fns, zk_results, plan)
 }
 
 /// Compile for standalone export: like `compile()` but uses `compile_standalone_main()`
@@ -366,34 +410,65 @@ pub fn compile_standalone(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map, options)?;
+    let (res, _plan) =
+        compile_standalone_best_effort_plan(ast, interner, type_map, config, dump_ir, options);
+    res
+}
+
+/// Task 4 (B.2): same as [`compile_standalone`] but also returns any `WrgaPlan`
+/// stashed on the compiler during `@train` block lowering.  Used by
+/// `nsl build --standalone --wrga-report` to surface WRGA analysis even when
+/// later codegen stages fail.
+pub fn compile_standalone_returning_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    config: StandaloneConfig,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> (Result<Vec<u8>, CodegenError>, Option<crate::wrga::WrgaPlan>) {
+    compile_standalone_best_effort_plan(ast, interner, type_map, config, dump_ir, options)
+}
+
+fn compile_standalone_best_effort_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    config: StandaloneConfig,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> (Result<Vec<u8>, CodegenError>, Option<crate::wrga::WrgaPlan>) {
+    let mut compiler = match Compiler::new(interner, type_map, options) {
+        Ok(c) => c,
+        Err(e) => return (Err(e), None),
+    };
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
-    compiler.intern_string("")?;
-    compiler.collect_strings(&ast.stmts)?;
-    compiler.collect_enums(&ast.stmts)?;
-    compiler.collect_structs(&ast.stmts)?;
-    compiler.collect_models(&ast.stmts)?;
-    compiler.declare_runtime_functions()?;
-    compiler.declare_user_functions(&ast.stmts)?;
-    // M39b: Apply vmap AST transforms and register batched function variants
-    let vmap_results = compiler.apply_vmap_transforms(ast);
-    compiler.register_batched_functions(&vmap_results);
-    compiler.compile_datatype_defs(&ast.stmts)?;
-    compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
-    compiler.compile_user_functions(&ast.stmts)?;
-    // M39c: Compile batched function bodies
-    compiler.compile_batched_functions(&vmap_results)?;
-    compiler.compile_standalone_main(&ast.stmts)?;
-    compiler.compile_pending_lambdas()?;
-
-    // M53: Run WCET analysis for @real_time functions
-    if compiler.compile_options.wcet_enabled {
-        compiler.run_wcet_analysis()?;
-    }
-
-    compiler.finalize()
+    let pre_finalize = (|| -> Result<(), CodegenError> {
+        compiler.intern_string("")?;
+        compiler.collect_strings(&ast.stmts)?;
+        compiler.collect_enums(&ast.stmts)?;
+        compiler.collect_structs(&ast.stmts)?;
+        compiler.collect_models(&ast.stmts)?;
+        compiler.declare_runtime_functions()?;
+        compiler.declare_user_functions(&ast.stmts)?;
+        let vmap_results = compiler.apply_vmap_transforms(ast);
+        compiler.register_batched_functions(&vmap_results);
+        compiler.compile_datatype_defs(&ast.stmts)?;
+        compiler.compile_kernels(&ast.stmts)?;
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+        compiler.compile_user_functions(&ast.stmts)?;
+        compiler.compile_batched_functions(&vmap_results)?;
+        compiler.compile_standalone_main(&ast.stmts)?;
+        compiler.compile_pending_lambdas()?;
+        if compiler.compile_options.wcet_enabled {
+            compiler.run_wcet_analysis()?;
+        }
+        Ok(())
+    })();
+    let plan = compiler.last_wrga_plan.clone();
+    let result = pre_finalize.and_then(|()| compiler.finalize());
+    (result, plan)
 }
 
 /// Compile in test mode: functions are compiled normally but main() dispatches
