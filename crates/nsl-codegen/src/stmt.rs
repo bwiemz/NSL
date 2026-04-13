@@ -155,8 +155,27 @@ pub(crate) fn invoke_wrga_if_enabled(
             }
         }
     }
-    let _inject = crate::wrga_adapter_inject::run(&mut plan);
-
+    let inject = crate::wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
+    // B.2.1 Task 5.5: only clobber `adapter_sites` when this invocation
+    // actually produced sites. Otherwise we'd wipe the pre-scan result
+    // (which runs before user-function compilation) when a target pattern
+    // like "Toy.w" doesn't match any placement name emitted by
+    // `infer_sites_from_wengert` (which uses bare "w"-style names).
+    // `last_wrga_plan` is always overwritten — the train-block plan is
+    // strictly more informative (real Wengert list, real placements).
+    if !inject.sites.is_empty() {
+        // B.3 Task 4: wire fusion decisions onto each newly-injected site.
+        let mut sites = inject.sites;
+        for site in sites.iter_mut() {
+            for decision in &plan.fusion.decisions {
+                if decision.site == site.target_param {
+                    site.fusion_decision = Some(decision.target.clone());
+                    break;
+                }
+            }
+        }
+        compiler.adapter_sites = sites;
+    }
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)
 }
@@ -1487,6 +1506,61 @@ impl Compiler<'_> {
                 }
                 if let nsl_semantic::types::Type::Model { name, .. } = &obj_type {
                     let model_name = self.resolve_sym(*name).to_string();
+                    // B.2.1 Task 5.5: synthesized adapter field assignment —
+                    // store the new tensor pointer into the model's
+                    // side-table slot rather than a struct field. Mirrors
+                    // the read-through in `expr/access.rs`.
+                    if crate::expr::access::is_synthesized_adapter_field_name(&member_name) {
+                        if matches!(op, AssignOp::Assign) {
+                            if let Some(layout) =
+                                self.types.struct_layouts.get(&model_name).cloned()
+                            {
+                                if let Some(slot_off) = layout.adapter_sidetable_offset {
+                                    let index = self
+                                        .adapter_field_index(&model_name, &member_name)
+                                        .ok_or_else(|| {
+                                            CodegenError::new(format!(
+                                                "synthesized adapter field '{member_name}' \
+                                                 not found for model '{model_name}' in \
+                                                 current WRGA plan"
+                                            ))
+                                        })?;
+                                    let table_ptr = builder.ins().load(
+                                        cl_types::I64,
+                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        obj_val,
+                                        slot_off as i32,
+                                    );
+                                    let byte_off = (index * 8) as i32;
+                                    // Free the existing tensor in the slot
+                                    // before overwriting (side-table owns
+                                    // the tensors it holds).
+                                    let old_ptr = builder.ins().load(
+                                        cl_types::I64,
+                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        table_ptr,
+                                        byte_off,
+                                    );
+                                    self.compile_call_by_name(
+                                        builder,
+                                        "nsl_tensor_free_if_valid",
+                                        &[old_ptr],
+                                    )?;
+                                    builder.ins().store(
+                                        cranelift_codegen::ir::MemFlags::trusted(),
+                                        new_val,
+                                        table_ptr,
+                                        byte_off,
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        return Err(CodegenError::new(format!(
+                            "compound-assign to synthesized adapter field \
+                             '{member_name}' is not supported"
+                        )));
+                    }
                     if let Some(layout) = self.types.struct_layouts.get(&model_name) {
                         for field in &layout.fields {
                             if field.name == member_name {
@@ -3556,6 +3630,32 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
+                // CSHA: Compiler-Synthesized Holistic Attention planner.
+                // Runs the boundary-fusion scan, SMEM feasibility model,
+                // and weight-informed specialization.  Emits either the
+                // full paper-§6.3 report or a compact one-line summary
+                // gated by the `--csha` / `--csha-report` flags.  The
+                // planner is pure data-in/data-out; wiring the kernel
+                // decisions back into codegen is a follow-up step.
+                if let Some(ref mode_str) = self.compile_options.csha_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        if let Some(plan) = crate::csha::run_on_wengert(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
+                            None, // shape override — defaults are fine for diagnostic
+                            8,    // default head count; weight-informed path refines this
+                        ) {
+                            if self.compile_options.csha_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[csha] {}", plan.summary());
+                            }
+                        }
+                    }
+                }
+
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner is pure data-in/data-out and does not mutate the
                 // Wengert list — it produces a report describing the
@@ -3638,6 +3738,45 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // B.2.1 Task 2.5: materialise adapter tensors into the model
+                // struct's side-table slot now that the plan is known. Task 2
+                // reserved the slot + zero-initialised it; this call allocates
+                // the heap table, fills it with freshly-initialised tensors
+                // (LoRA-A randn-scaled, LoRA-B zeros, IA³ ones, gate zeros),
+                // and writes the table pointer into the reserved slot. The
+                // iteration order here MUST match `adapter_field_index` in
+                // `expr/access.rs`.
+                // B.2.1 Task 5.5: prefer the train-block plan only when it
+                // has decorated placements; otherwise fall back to the
+                // prescan plan already stashed on the compiler (which has
+                // the @adapter decorator info attached to a single synthetic
+                // placement). Without this, build configs like
+                // `@adapter(target=["Toy.w"])` would skip init entirely.
+                let init_plan = {
+                    let train_has_decorated = wrga_plan
+                        .as_ref()
+                        .map(|p| {
+                            p.placements
+                                .iter()
+                                .any(|pl| pl.decorator_kind.is_some())
+                        })
+                        .unwrap_or(false);
+                    if train_has_decorated {
+                        wrga_plan.clone()
+                    } else {
+                        self.adapter_prescan_plan.clone()
+                    }
+                };
+                if let Some(plan_ref) = init_plan.as_ref() {
+                    crate::wrga_adapter_init::emit_adapter_init_sidetable(
+                        self,
+                        builder,
+                        state,
+                        model_ptr,
+                        &model_type_name,
+                        plan_ref,
+                    )?;
+                }
                 let effective_primal: crate::wengert::WengertList = match &wrga_plan {
                     Some(plan) => plan.prune.pruned.clone(),
                     None => extractor.wengert_list().clone(),

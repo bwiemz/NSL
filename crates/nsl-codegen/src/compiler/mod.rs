@@ -116,6 +116,13 @@ pub struct ModelMetadata {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
     pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    /// B.2.1 Task 5.5: shape strings (`Tensor<[out, in], dtype>`) for
+    /// Tensor-typed model fields whose initializer carries a literal
+    /// shape (e.g. `w: Tensor = zeros([8, 8])`). Stored separately from
+    /// `model_field_types` so source-AD's sub-model traversal does not
+    /// accidentally treat tensor shapes as nested model types. Consumed
+    /// by `wrga_adapter_inject::resolve_dims_for_target`.
+    pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
 }
 
 impl ModelMetadata {
@@ -127,6 +134,7 @@ impl ModelMetadata {
             imported_model_names: HashSet::new(),
             paged_kv_configs: HashMap::new(),
             model_method_bodies: HashMap::new(),
+            model_tensor_field_shapes: HashMap::new(),
         }
     }
 }
@@ -383,6 +391,43 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
+    /// B.2.1 Task 3: adapter materialisation sites from the most recent
+    /// `wrga_adapter_inject::run_with_compiler` call. Empty when WRGA is
+    /// disabled or no `@adapter` decorators are present.
+    pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
+    /// B.2.1 Task 3: override map from synthesized `MemberAccess` NodeId to
+    /// the resolved field name. Populated by `wrga_adapter_rewrite` when it
+    /// emits member-access nodes for adapter side-table fields whose names
+    /// are not present in the original source (and therefore not in the
+    /// `Interner`). `compile_member_access` consults this map first before
+    /// falling back to `resolve_sym(member)`.
+    pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
+    /// B.2.1 Task 5.5: name of the model class whose method is currently
+    /// being compiled. Used by `compile_member_access` to resolve
+    /// synthesized-adapter-field accesses on `self` (whose obj_type
+    /// lookup returns Unknown because the rewrite pass synthesizes fresh
+    /// `SelfRef` nodes without type-map entries).
+    pub current_method_model_name: Option<String>,
+    /// B.2.1 Task 5.5: WrgaPlan produced by the decorator-driven pre-scan
+    /// pass (`wrga_prescan::prescan_adapter_sites_from_decorators`).
+    /// Persists across the @train-block invocation, which overwrites
+    /// `last_wrga_plan` with a real Wengert-derived plan that lacks
+    /// decorated placements when target patterns don't syntactically
+    /// match the inferred placement names.
+    pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
+    /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
+    /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
+    /// (but potentially different α/rank scales) share one PTX string.
+    /// Populated during the fusion-decision pass and consulted by the
+    /// CUDA launcher (Task 5) to pick the right kernel per call site.
+    pub fused_ptx_kernels:
+        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    /// B.3 Task 4: override map mirroring `synth_member_names` but for
+    /// Call callees.  The AST rewrite synthesizes `ExprKind::Call` nodes
+    /// whose callee Ident carries a sentinel Symbol; the real FFI name
+    /// (`nsl_adapter_fused_lora_matmul` / `nsl_adapter_fused_ia3_matmul`)
+    /// is resolved from this map by `expr_as_func_name`.
+    pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 }
 
 /// Quantization configuration for a model.
@@ -508,6 +553,12 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            adapter_sites: Vec::new(),
+            synth_member_names: std::collections::HashMap::new(),
+            current_method_model_name: None,
+            adapter_prescan_plan: None,
+            fused_ptx_kernels: std::collections::HashMap::new(),
+            synth_call_names: std::collections::HashMap::new(),
         })
     }
 
@@ -525,6 +576,14 @@ impl<'a> Compiler<'a> {
     /// Defaults to CUDA when no target is specified.
     pub fn gpu_target(&self) -> crate::gpu_target::GpuTarget {
         crate::gpu_target::GpuTarget::from_target_string(&self.compile_options.target)
+    }
+
+    /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`
+    /// (e.g. `cuda_sm80` → `Some(80)`).  Returns `None` for non-CUDA
+    /// targets or plain `cuda` (where no sm is pinned).  The fused-adapter
+    /// AST rewrite requires sm >= 80 before emitting the single-FFI path.
+    pub fn target_sm(&self) -> Option<u32> {
+        crate::gpu_target::GpuTarget::parse_sm_version(&self.compile_options.target)
     }
 
     /// M42: Look up the first KV compression policy for a specific model layer.

@@ -5,7 +5,9 @@
 //! module detects those conflicts and resolves them using the priority
 //! order the CFTP/WGGO paper prescribes:
 //!
-//!     CEP > CPDT > CSHA > WRGA > FASE > PCA
+//! ```text
+//! CEP > CPDT > CSHA > WRGA > FASE > PCA
+//! ```
 //!
 //! Rationale (paper §3): structural decisions (which heads exist, how
 //! layers are sharded) must override optimisation decisions (which fused

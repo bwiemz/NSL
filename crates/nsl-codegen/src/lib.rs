@@ -33,6 +33,11 @@ pub mod cpdt_joint;
 pub mod cpdt_optim;
 pub mod cpdt_precision;
 pub mod cpdt_zero;
+pub mod csha;
+pub mod csha_apply;
+pub mod csha_boundary;
+pub mod csha_pipeline;
+pub mod csha_specialize;
 pub mod dynamic_shapes;
 pub mod epilogue_fusion;
 pub mod error;
@@ -94,9 +99,14 @@ pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
 pub mod wrga;
+pub mod matmul_mma;
+pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
+pub mod wrga_adapter_rewrite;
+pub mod wrga_fused_ptx;
 pub mod wrga_fusion;
 pub mod wrga_memory;
+pub mod wrga_prescan;
 pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
@@ -292,6 +302,7 @@ pub fn debug_clear_allocator_slot_channels() {
 
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
+pub use wrga_fusion::{FusionDecision, FusionPlan, FusionTarget};
 
 use std::collections::HashMap;
 
@@ -434,6 +445,11 @@ pub struct CompileOptions {
     /// `min_retained_importance` threshold allows to be pruned.
     /// Clamped to `[0.0, 0.9]`.  Default 0.25.
     pub wggo_prune_fraction: Option<f64>,
+    /// CSHA: fusion mode ("auto", "boundary", "pipeline", "block", "off").
+    /// When `None`, CSHA is not run.  See `crates/nsl-codegen/src/csha.rs`.
+    pub csha_mode: Option<String>,
+    /// CSHA: print the attention-fusion report to stderr.
+    pub csha_report: bool,
 }
 
 impl Default for CompileOptions {
@@ -481,6 +497,8 @@ impl Default for CompileOptions {
             wggo_weights: None,
             wggo_importance: None,
             wggo_prune_fraction: None,
+            csha_mode: None,
+            csha_report: false,
         }
     }
 }

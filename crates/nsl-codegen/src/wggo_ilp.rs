@@ -7,14 +7,16 @@
 //!
 //! The per-layer problem is:
 //!
-//!     minimise   forward + backward + adapter_overhead
-//!     subject to  memory(heads, ffn, rank, prec) ≤ memory_budget
-//!                 smem(heads, ffn, csha)          ≤ smem_budget
-//!                 Σ_k head[k] ≥ 1
-//!                 gqa_group_constraint
-//!                 (heads kept must form whole KV groups)
-//!                 adapter_comm ≤ comm_budget
-//!                 numerical_sensitivity ⇒ prec ≥ min_bits
+//! ```text
+//! minimise   forward + backward + adapter_overhead
+//! subject to  memory(heads, ffn, rank, prec) ≤ memory_budget
+//!             smem(heads, ffn, csha)          ≤ smem_budget
+//!             Σ_k head[k] ≥ 1
+//!             gqa_group_constraint
+//!             (heads kept must form whole KV groups)
+//!             adapter_comm ≤ comm_budget
+//!             numerical_sensitivity ⇒ prec ≥ min_bits
+//! ```
 //!
 //! The search space is `2^H × |FFN widths| × 4 × |ranks| × 3 × 3` ≈ 30 k
 //! at H=8, small enough that branch-and-bound with LUT-based cost

@@ -355,6 +355,25 @@ impl Compiler<'_> {
                 }
             }
 
+            // B.2.1: Zero-initialise the adapter-sidetable slot when present.
+            // Actual tensor allocation is deferred to a later pass that runs
+            // after `invoke_wrga_if_enabled` populates `last_wrga_plan` — at
+            // constructor codegen time the adapter-site list is not yet known
+            // because WRGA fires during train-step source-AD compilation.
+            // Field-access codegen in `expr/access.rs` tolerates a null slot
+            // by falling through to the normal struct-offset path when the
+            // synthesized name also happens to match a real field (it does
+            // not in practice, so access returns null until the init pass is
+            // wired). See DONE_WITH_CONCERNS in the B.2.1 Task 2 report.
+            if let Some(layout) = self.types.struct_layouts.get(&model_name) {
+                if let Some(slot_off) = layout.adapter_sidetable_offset {
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero, ptr, slot_off as i32);
+                }
+            }
+
             // M25: Initialize paged KV cache if model has @paged_kv
             if let Some(&(num_blocks, block_size, num_heads, head_dim, num_layers)) =
                 self.models.paged_kv_configs.get(&model_name)
@@ -507,9 +526,108 @@ impl Compiler<'_> {
                             cl_param_idx += 1;
                         }
 
+                        // B.2.1 Task 3: run the LoRA forward-pass AST rewrite
+                        // over each statement before lowering. Only active when
+                        // adapter sites target this model class.
+                        let sites_for_model: Vec<&crate::wrga_adapter_inject::AdapterSite> = self
+                            .adapter_sites
+                            .iter()
+                            .filter(|s| s.target_model == model_name)
+                            .collect();
+                        let rewritten_stmts: Vec<nsl_ast::stmt::Stmt> = if sites_for_model.is_empty()
+                        {
+                            fn_def.body.stmts.clone()
+                        } else {
+                            let mut ctx =
+                                crate::wrga_adapter_rewrite::RewriteContext::new(sites_for_model);
+                            // B.3 Task 4: expose the compile target's sm
+                            // version so the rewrite can choose between the
+                            // fused single-FFI path and the B.2.1 unfused
+                            // triple.
+                            ctx.target_sm = self.target_sm();
+                            // B.3 Task 5: deterministic ordering of
+                            // fused PTX kernel keys, used by the rewrite
+                            // to assign a stable per-site `kernel_handle`.
+                            // Sort by the full key tuple.
+                            let mut order: Vec<crate::wrga_fused_ptx::LoraKernelKey> = self
+                                .fused_ptx_kernels
+                                .keys()
+                                .cloned()
+                                .collect();
+                            order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
+                            ctx.fused_kernel_order = order;
+                            // Find the `self` Symbol and populate field_symbols
+                            // from the model's known fields for matcher support.
+                            ctx.self_sym = fn_def
+                                .params
+                                .iter()
+                                .find(|p| self.resolve_sym(p.name) == "self")
+                                .map(|p| p.name);
+                            if let Some(field_map) =
+                                self.models.model_field_types.get(&model_name).cloned()
+                            {
+                                for fname in field_map.keys() {
+                                    if let Some(s) = self.interner.get(fname) {
+                                        ctx.field_symbols.insert(
+                                            fname.clone(),
+                                            nsl_ast::Symbol(s),
+                                        );
+                                    }
+                                }
+                            }
+                            // B.2.1 Task 5.5: also include Tensor-typed
+                            // fields (whose shape strings live in the
+                            // separate `model_tensor_field_shapes` map)
+                            // so the rewrite matcher can recognise
+                            // `self.w @ ...` for adapted tensor fields.
+                            if let Some(field_map) = self
+                                .models
+                                .model_tensor_field_shapes
+                                .get(&model_name)
+                                .cloned()
+                            {
+                                for fname in field_map.keys() {
+                                    if let Some(s) = self.interner.get(fname) {
+                                        ctx.field_symbols.insert(
+                                            fname.clone(),
+                                            nsl_ast::Symbol(s),
+                                        );
+                                    }
+                                }
+                            }
+                            let out: Vec<nsl_ast::stmt::Stmt> = fn_def
+                                .body
+                                .stmts
+                                .iter()
+                                .cloned()
+                                .map(|s| crate::wrga_adapter_rewrite::rewrite_stmt(s, &mut ctx))
+                                .collect();
+                            // Commit synth overrides to the compiler so
+                            // compile_member_access can resolve them.
+                            self.synth_member_names.extend(ctx.synth_overrides);
+                            // B.3 Task 4: commit fused-call callee overrides
+                            // so expr_as_func_name can resolve them.
+                            self.synth_call_names.extend(ctx.synth_call_overrides);
+                            out
+                        };
+
+                        // B.2.1 Task 5.5: stash model name so
+                        // `compile_member_access` can resolve synthesized
+                        // adapter field accesses on `self` even when the
+                        // rewrite pass synthesizes fresh (untyped) SelfRef
+                        // nodes.
+                        self.current_method_model_name = Some(model_name.clone());
                         // Compile method body
-                        for stmt in &fn_def.body.stmts {
-                            self.compile_stmt(&mut builder, &mut state, stmt)?;
+                        let mut body_err: Option<CodegenError> = None;
+                        for stmt in &rewritten_stmts {
+                            if let Err(e) = self.compile_stmt(&mut builder, &mut state, stmt) {
+                                body_err = Some(e);
+                                break;
+                            }
+                        }
+                        self.current_method_model_name = None;
+                        if let Some(e) = body_err {
+                            return Err(e);
                         }
 
                         // Add implicit return if body doesn't end with one

@@ -10,8 +10,10 @@
 //!
 //! Sensitivity formula:
 //!
-//!     spectral_condition × gradient_magnitude × position_criticality
-//!     / element_count
+//! ```text
+//! spectral_condition × gradient_magnitude × position_criticality
+//! / element_count
+//! ```
 //!
 //! Every factor is computable from pre-trained weights + compilation
 //! analysis — no training step required.

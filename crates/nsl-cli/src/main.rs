@@ -424,6 +424,16 @@ enum Cli {
         /// Clamped to [0.0, 0.9]; default 0.25.
         #[arg(long, value_name = "F")]
         wggo_prune_fraction: Option<f64>,
+
+        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
+        /// "block", or "off").  Passing `--csha` without a value enables
+        /// auto mode.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+        csha: Option<String>,
+
+        /// CSHA: print the attention-fusion report to stderr
+        #[arg(long)]
+        csha_report: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -749,6 +759,8 @@ fn main_inner() {
             wggo_weights,
             wggo_importance,
             wggo_prune_fraction,
+            csha,
+            csha_report,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -846,6 +858,8 @@ fn main_inner() {
                 wggo_weights: wggo_weights.clone(),
                 wggo_importance: wggo_importance.clone(),
                 wggo_prune_fraction,
+                csha_mode: csha.clone(),
+                csha_report,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -891,6 +905,16 @@ fn main_inner() {
                     eprintln!(
                         "error: --wggo-weights path does not exist: {}",
                         p.display()
+                    );
+                    process::exit(1);
+                }
+            }
+            // Validate CSHA mode string early.
+            if let Some(ref m) = csha {
+                if nsl_codegen::csha::CshaMode::parse(m).is_none() {
+                    eprintln!(
+                        "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
+                        m
                     );
                     process::exit(1);
                 }
@@ -1011,6 +1035,8 @@ fn main_inner() {
                 wggo_weights: None,
                 wggo_importance: None,
                 wggo_prune_fraction: None,
+                csha_mode: None,
+                csha_report: false,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
