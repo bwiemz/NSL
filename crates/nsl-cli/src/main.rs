@@ -546,6 +546,23 @@ enum ZkCmd {
 }
 
 fn main() {
+    // Windows debug builds easily overflow the 1MB main-thread stack
+    // because NSL's compile pipeline has deeply-nested passes (WRGA +
+    // WGGO + source-AD + Cranelift lowering).  Run the real entry
+    // point on a thread with a 16MB stack.  Release builds don't need
+    // this but the cost is negligible.
+    let child = std::thread::Builder::new()
+        .name("nsl-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(main_inner)
+        .expect("failed to spawn nsl-main thread");
+    match child.join() {
+        Ok(()) => {}
+        Err(_) => std::process::exit(101),
+    }
+}
+
+fn main_inner() {
     let cli = Cli::parse();
 
     match cli {
