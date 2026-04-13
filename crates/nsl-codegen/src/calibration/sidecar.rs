@@ -16,6 +16,13 @@ pub struct Sidecar {
     pub checkpoint_sha256: String,
     pub calibration_data_sha256: String,
     pub hook_set_sha256: String,
+    /// Full cache-key digest covering all checkpoints, the calibration
+    /// data, the enabled hook set, and the sample/batch knobs.  When
+    /// non-empty this is the canonical cache-invalidation signal —
+    /// the individual `*_sha256` fields above are diagnostic only.
+    /// Empty string for v1 sidecars (legacy compatibility).
+    #[serde(default)]
+    pub cache_key_digest: String,
     pub num_samples_used: u32,
     #[serde(with = "byte_map_b64")]
     pub hooks: BTreeMap<String, Vec<u8>>,
@@ -23,7 +30,7 @@ pub struct Sidecar {
 
 /// Current on-disk format version.  Bump when a compatibility-breaking
 /// change ships; caches with a lower version are discarded on load.
-pub const SIDECAR_VERSION: u32 = 1;
+pub const SIDECAR_VERSION: u32 = 2;
 
 /// serde helper: encode `Vec<u8>` values as base64 so the JSON stays
 /// human-inspectable and embeddable in text tooling without escaping.
@@ -66,10 +73,11 @@ mod tests {
         hooks.insert("identity".to_string(), vec![1u8, 2, 3, 4]);
         hooks.insert("wggo_head_gradient".to_string(), vec![0xff, 0xee]);
         Sidecar {
-            version: 1,
+            version: SIDECAR_VERSION,
             checkpoint_sha256: "abc123".into(),
             calibration_data_sha256: "def456".into(),
             hook_set_sha256: "ghi789".into(),
+            cache_key_digest: String::new(),
             num_samples_used: 200,
             hooks,
         }
@@ -80,7 +88,7 @@ mod tests {
         let original = payload();
         let json = serde_json::to_string(&original).unwrap();
         let parsed: Sidecar = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.version, SIDECAR_VERSION);
         assert_eq!(parsed.hooks.get("identity"), Some(&vec![1, 2, 3, 4]));
         assert_eq!(
             parsed.hooks.get("wggo_head_gradient"),

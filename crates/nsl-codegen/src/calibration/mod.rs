@@ -99,6 +99,7 @@ pub fn run_harness_stub(
         checkpoint_sha256: hex_digest(checkpoint_bytes),
         calibration_data_sha256: hex_digest(calibration_data_bytes),
         hook_set_sha256: hex_digest_ids(&registry.enabled_ids_sorted()),
+        cache_key_digest: String::new(),
         num_samples_used: num_samples,
         hooks: hooks_out,
     };
@@ -146,9 +147,26 @@ pub fn run_harness_simulated(
     let primary_ckpt = cfg.checkpoints.first().ok_or(HarnessError::Infrastructure {
         reason: "no checkpoint paths supplied".into(),
     })?;
-    let primary_hash = ckpt_hashes.first().unwrap();
 
-    if let Some(cached) = crate::calibration::cache::try_load(primary_ckpt, primary_hash) {
+    // Compute the full cache-key digest covering all invalidation
+    // dimensions — checkpoints, calibration data, hook set, knobs.
+    let calibration_data_hash = crate::calibration::cache::hash_file(&cfg.calibration_data)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!(
+                "hashing calibration data {}: {e}",
+                cfg.calibration_data.display()
+            ),
+        })?;
+    let cache_key = crate::calibration::cache::CacheKey {
+        checkpoint_hashes: ckpt_hashes.clone(),
+        calibration_data_hash: calibration_data_hash.clone(),
+        hook_ids_sorted: registry.enabled_ids_sorted(),
+        samples: cfg.samples,
+        batch_size: cfg.batch_size,
+    };
+    let cache_key_digest = cache_key.digest();
+
+    if let Some(cached) = crate::calibration::cache::try_load(primary_ckpt, &cache_key_digest) {
         return Ok(HarnessOutput {
             sidecar: cached,
             outcome_repr: "cached",
@@ -159,11 +177,13 @@ pub fn run_harness_simulated(
 
     match result {
         Ok(mut out) => {
-            // Overwrite sidecar's checkpoint hash with the real
-            // file-derived digest so cache hits on subsequent runs
-            // (the subprocess may have hashed checkpoint *contents*
-            // differently, e.g. in a stub).
-            out.sidecar.checkpoint_sha256 = primary_hash.clone();
+            // Driver owns canonical identity — overwrite all fields the
+            // subprocess may have stubbed.
+            let primary_hash = ckpt_hashes.first().cloned().unwrap_or_default();
+            out.sidecar.checkpoint_sha256 = primary_hash;
+            out.sidecar.calibration_data_sha256 = calibration_data_hash;
+            out.sidecar.hook_set_sha256 = hex_digest_ids(&registry.enabled_ids_sorted());
+            out.sidecar.cache_key_digest = cache_key_digest;
             let _ = crate::calibration::cache::store(primary_ckpt, &out.sidecar);
             Ok(out)
         }
@@ -192,6 +212,7 @@ fn empty_sidecar_for_fallback(
         checkpoint_sha256: ckpt_hashes.first().cloned().unwrap_or_default(),
         calibration_data_sha256: String::new(),
         hook_set_sha256: hex_digest_ids(&registry.enabled_ids_sorted()),
+        cache_key_digest: String::new(),
         num_samples_used: 0,
         hooks: BTreeMap::new(),
     }
@@ -396,6 +417,39 @@ mod driver_tests {
         }
         let _ = fs::remove_file(&ckpt);
         let _ = fs::remove_file(&data);
+    }
+
+    #[test]
+    fn cache_invalidates_on_sample_count_change() {
+        let ckpt = t13_tmp("ckpt-samples");
+        fs::write(&ckpt, b"x").unwrap();
+        let data = t13_tmp("data-samples.bin");
+        fs::write(&data, [0u8; 8]).unwrap();
+
+        let mut registry = HookRegistry::new();
+        registry.register(Box::new(
+            crate::calibration::identity_hook::IdentityHook::new(b"v1".to_vec()),
+        ));
+
+        let mut cfg = HarnessConfig {
+            checkpoints: vec![ckpt.clone()],
+            calibration_data: data.clone(),
+            samples: 4,
+            batch_size: 2,
+            timeout_secs: 5,
+            mode: HarnessMode::Required,
+        };
+        let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
+        assert_eq!(r1.outcome_repr, "clean");
+
+        // Change sample count → cache must miss.
+        cfg.samples = 8;
+        let r2 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
+        assert_eq!(r2.outcome_repr, "clean", "expected cache miss on sample-count change");
+
+        let _ = fs::remove_file(&ckpt);
+        let _ = fs::remove_file(&data);
+        let _ = fs::remove_file(crate::calibration::cache::sidecar_path_for(&ckpt));
     }
 
     fn simulated_ok_subprocess(

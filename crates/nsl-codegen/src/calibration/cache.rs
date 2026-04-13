@@ -75,9 +75,10 @@ pub fn hash_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// Best-effort cache read.  Returns `None` on any failure.  Caller
-/// passes the *current* checkpoint SHA-256 so we can reject stale
-/// sidecars without re-hashing here.
-pub fn try_load(ckpt_path: &Path, current_checkpoint_sha: &str) -> Option<Sidecar> {
+/// passes the *full* `CacheKey::digest()` so invalidation covers all
+/// checkpoints, calibration data, enabled hook set, and knobs — not
+/// just the primary checkpoint hash.
+pub fn try_load(ckpt_path: &Path, expected_cache_key_digest: &str) -> Option<Sidecar> {
     let sp = sidecar_path_for(ckpt_path);
     if !sp.exists() {
         return None;
@@ -87,7 +88,7 @@ pub fn try_load(ckpt_path: &Path, current_checkpoint_sha: &str) -> Option<Sideca
     if s.version != SIDECAR_VERSION {
         return None;
     }
-    if s.checkpoint_sha256 != current_checkpoint_sha {
+    if s.cache_key_digest != expected_cache_key_digest {
         return None;
     }
     Some(s)
@@ -144,14 +145,15 @@ mod tests {
         let _ = fs::remove_file(sidecar_path_for(p));
     }
 
-    fn sample_sidecar(sha: &str) -> Sidecar {
+    fn sample_sidecar(digest: &str) -> Sidecar {
         let mut hooks = BTreeMap::new();
         hooks.insert("identity".to_string(), vec![1, 2, 3]);
         Sidecar {
             version: crate::calibration::sidecar::SIDECAR_VERSION,
-            checkpoint_sha256: sha.into(),
+            checkpoint_sha256: "ckpt-hash".into(),
             calibration_data_sha256: "data".into(),
             hook_set_sha256: "hooks".into(),
+            cache_key_digest: digest.into(),
             num_samples_used: 10,
             hooks,
         }
@@ -196,9 +198,9 @@ mod tests {
     fn store_then_load_roundtrips() {
         let p = tmp("roundtrip");
         write(&p, b"checkpoint-bytes");
-        let s = sample_sidecar("ckpt-hash");
+        let s = sample_sidecar("test-digest");
         store(&p, &s).unwrap();
-        let loaded = try_load(&p, "ckpt-hash").expect("should load");
+        let loaded = try_load(&p, "test-digest").expect("should load");
         assert_eq!(loaded.hooks.get("identity"), Some(&vec![1, 2, 3]));
         cleanup(&p);
     }
@@ -207,9 +209,9 @@ mod tests {
     fn cache_miss_on_hash_mismatch() {
         let p = tmp("mismatch");
         write(&p, b"x");
-        let s = sample_sidecar("original-hash");
+        let s = sample_sidecar("A");
         store(&p, &s).unwrap();
-        assert!(try_load(&p, "different-hash").is_none());
+        assert!(try_load(&p, "B").is_none());
         cleanup(&p);
     }
 
@@ -226,7 +228,7 @@ mod tests {
         let p = tmp("badver");
         write(&p, b"x");
         let sp = sidecar_path_for(&p);
-        fs::write(&sp, r#"{"version":0,"checkpoint_sha256":"x","calibration_data_sha256":"","hook_set_sha256":"","num_samples_used":0,"hooks":{}}"#).unwrap();
+        fs::write(&sp, r#"{"version":0,"checkpoint_sha256":"x","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{}}"#).unwrap();
         assert!(try_load(&p, "x").is_none());
         cleanup(&p);
     }
