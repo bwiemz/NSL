@@ -4,3 +4,4 @@
 pub mod monitor;
 pub mod profile;
 pub mod shape_debug;
+pub mod wggo_explain;
