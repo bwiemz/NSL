@@ -28,6 +28,10 @@ use crate::wggo_ilp::{
     LayerIlpConstraints, LayerIlpSolution, TemplateStats,
 };
 use crate::wggo_schedule::{build_schedule, CommSchedule};
+use crate::wggo_weight_analysis::{
+    analyze as analyze_weights, AnalysisConfig, NullWeightProvider, WeightAnalysisReport,
+    WeightProvider,
+};
 
 /// User-visible optimisation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -72,6 +76,13 @@ pub struct WggoInput<'a> {
     pub importance: ImportanceScores,
     /// Per-layer ILP constraint overrides.  If empty, defaults are used.
     pub ilp_constraints: Vec<LayerIlpConstraints>,
+    /// Optional weight source for Stage 3 importance analysis.  When
+    /// `None`, `head_importance` falls back to uniform scores
+    /// (today's behaviour).
+    pub weights: Option<&'a dyn WeightProvider>,
+    /// Stage-3 tunables (prune fraction, etc.).  Ignored when
+    /// `weights` is `None`.
+    pub analysis_config: AnalysisConfig,
 }
 
 /// Aggregate plan emitted by the driver.
@@ -89,6 +100,8 @@ pub struct WggoPlan {
     pub schedule: CommSchedule,
     /// Counters for template-layer reuse during the per-layer ILP.
     pub template_stats: TemplateStats,
+    /// Stage-3 importance-analysis output (one entry per layer).
+    pub weight_analysis: WeightAnalysisReport,
     /// Total solver wall-clock time (μs, self-reported — not measured).
     pub estimated_solve_us: u64,
 }
@@ -164,6 +177,13 @@ impl WggoPlan {
             self.template_stats.templates_solved, self.template_stats.template_hits
         )
         .unwrap();
+        writeln!(
+            s,
+            "  Weight analysis: {} layers analysed, {} without weights",
+            self.weight_analysis.per_layer.len(),
+            self.weight_analysis.layers_without_weights
+        )
+        .unwrap();
         writeln!(s).unwrap();
         write!(s, "{}", self.schedule.render()).unwrap();
         s
@@ -200,11 +220,19 @@ pub fn run(input: WggoInput) -> WggoPlan {
             ..Default::default()
         };
         let inter = dp_solve(&graph, &luts, &dp_cfg);
-        let ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
+        let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
             vec![LayerIlpConstraints::default(); n]
         } else {
             input.ilp_constraints
         };
+        let weight_analysis = run_weight_analysis(
+            &graph,
+            &input.layer_shape,
+            &ilp_defaults,
+            input.weights,
+            &input.analysis_config,
+        );
+        weight_analysis.apply_to(&mut ilp_defaults);
         let (per_layer, template_stats) = ilp_solve_all_templated(&luts, &ilp_defaults);
         let applied = apply(&inter, &per_layer);
         let schedule = build_schedule(&inter, &applied);
@@ -218,6 +246,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             applied,
             schedule,
             template_stats,
+            weight_analysis,
             estimated_solve_us: t0.elapsed().as_micros() as u64,
         };
     }
@@ -243,6 +272,17 @@ pub fn run(input: WggoInput) -> WggoPlan {
     } else {
         input.ilp_constraints
     };
+    // Stage 3: weight analysis — overwrites head_importance and (when
+    // the caller left it zero) min_retained_importance on each layer's
+    // constraints, before the ILP runs.
+    let weight_analysis = run_weight_analysis(
+        &graph,
+        &input.layer_shape,
+        &ilp_constraints,
+        input.weights,
+        &input.analysis_config,
+    );
+    weight_analysis.apply_to(&mut ilp_constraints);
     // Pre-prune the FASE option on layers CPDT will shard — fusing the
     // optimizer step into backward conflicts with reduce-scatter ordering,
     // and the conflict resolver would defer it anyway.
@@ -309,8 +349,29 @@ pub fn run(input: WggoInput) -> WggoPlan {
         applied,
         schedule,
         template_stats,
+        weight_analysis,
         estimated_solve_us: t0.elapsed().as_micros() as u64,
     }
+}
+
+/// Run Stage 3 over `graph`, using the first layer's `num_heads` as the
+/// shape hint (the driver constructs all layers with uniform num_heads
+/// today).  When `weights` is `None`, falls back to `NullWeightProvider`
+/// so every layer gets a uniform score vector.
+fn run_weight_analysis(
+    graph: &crate::wggo_graph::OptGraph,
+    layer_shape: &LayerShape,
+    constraints: &[LayerIlpConstraints],
+    weights: Option<&dyn WeightProvider>,
+    config: &AnalysisConfig,
+) -> WeightAnalysisReport {
+    let num_heads = constraints
+        .first()
+        .map(|c| c.num_heads as usize)
+        .unwrap_or(8);
+    let null = NullWeightProvider;
+    let provider: &dyn WeightProvider = weights.unwrap_or(&null);
+    analyze_weights(graph, layer_shape, num_heads, provider, config)
 }
 
 /// Extract `GpuSpec` for the named target or default.
@@ -357,6 +418,8 @@ pub fn run_on_wengert(
         lut_axes: LutAxes::default(),
         importance: ImportanceScores::default(),
         ilp_constraints: Vec::new(),
+        weights: None,
+        analysis_config: AnalysisConfig::default(),
     };
     Some(run(input))
 }
@@ -415,6 +478,8 @@ mod tests {
             lut_axes: LutAxes::default(),
             importance: ImportanceScores::default(),
             ilp_constraints: Vec::new(),
+            weights: None,
+            analysis_config: AnalysisConfig::default(),
         }
     }
 
@@ -551,6 +616,18 @@ mod tests {
             greedy_nodes * 100 < full_nodes,
             "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
         );
+    }
+
+    #[test]
+    fn weight_analysis_runs_with_null_provider() {
+        // Default path (weights=None) → uniform scores, but analyze()
+        // still populates per_layer and the report field.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert_eq!(plan.weight_analysis.per_layer.len(), plan.inter_layer.layers.len());
+        assert!(plan.weight_analysis.layers_without_weights >= 1);
+        let rep = plan.render_report();
+        assert!(rep.contains("Weight analysis"));
     }
 
     #[test]
