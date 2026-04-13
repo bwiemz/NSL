@@ -325,6 +325,18 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // WGGO: @wggo decorator validation
+                        if dname == "wggo" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::wggo::validate_wggo_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // CFTP: @fase and @pca decorator validation
                         if dname == "fase" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
