@@ -20,6 +20,20 @@ impl ParamRef {
     }
 }
 
+/// Opaque reference to a named linear projection inside the model.
+/// Matches parameter-path naming used in the checkpoint and Wengert
+/// list's param-op names (e.g. `"blocks.0.attn.wq"`,
+/// `"blocks.0.mlp.up_proj"`).  First-class observation target for
+/// hooks that want to see the tensor feeding into a specific matmul.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjectionRef(pub String);
+
+impl ProjectionRef {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
 /// What a hook needs the calibration run to observe.  The driver unions
 /// these across all enabled hooks into an `ObservationPlan`.
 #[derive(Debug, Clone)]
@@ -28,6 +42,7 @@ pub enum ObservationSet {
     ForwardActivations(Vec<LayerRef>),
     BackwardGradients(Vec<LayerRef>),
     Weights(Vec<ParamRef>),
+    LinearInputActivations(Vec<ProjectionRef>),
     Union(Vec<ObservationSet>),
 }
 
@@ -38,6 +53,7 @@ pub struct ObservationPlan {
     pub forward_activations: BTreeSet<LayerRef>,
     pub backward_gradients: BTreeSet<LayerRef>,
     pub weights: BTreeSet<ParamRef>,
+    pub linear_input_activations: BTreeSet<ProjectionRef>,
 }
 
 impl ObservationPlan {
@@ -65,6 +81,11 @@ impl ObservationPlan {
             ObservationSet::Weights(v) => {
                 for p in v {
                     self.weights.insert(p.clone());
+                }
+            }
+            ObservationSet::LinearInputActivations(v) => {
+                for p in v {
+                    self.linear_input_activations.insert(p.clone());
                 }
             }
             ObservationSet::Union(children) => {
@@ -122,6 +143,42 @@ mod tests {
         ]);
         let plan = ObservationPlan::union_of(&[outer]);
         assert_eq!(plan.weights.len(), 3);
+    }
+
+    #[test]
+    fn projection_ref_is_hashable_and_ordered() {
+        let mut set = BTreeSet::new();
+        set.insert(ProjectionRef::new("blocks.0.attn.wq"));
+        set.insert(ProjectionRef::new("blocks.0.attn.wk"));
+        set.insert(ProjectionRef::new("blocks.0.attn.wq")); // dedup
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn linear_input_activations_unions_into_plan() {
+        let a = ObservationSet::LinearInputActivations(vec![
+            ProjectionRef::new("blocks.0.attn.wq"),
+            ProjectionRef::new("blocks.0.attn.wk"),
+        ]);
+        let b = ObservationSet::LinearInputActivations(vec![
+            ProjectionRef::new("blocks.0.attn.wk"),
+            ProjectionRef::new("blocks.0.attn.wv"),
+        ]);
+        let plan = ObservationPlan::union_of(&[a, b]);
+        assert_eq!(plan.linear_input_activations.len(), 3);
+        assert!(plan.linear_input_activations.contains(&ProjectionRef::new("blocks.0.attn.wq")));
+        assert!(plan.linear_input_activations.contains(&ProjectionRef::new("blocks.0.attn.wk")));
+        assert!(plan.linear_input_activations.contains(&ProjectionRef::new("blocks.0.attn.wv")));
+    }
+
+    #[test]
+    fn linear_input_activations_nested_in_union() {
+        let inner = ObservationSet::Union(vec![
+            ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p1")]),
+            ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p2")]),
+        ]);
+        let plan = ObservationPlan::union_of(&[inner]);
+        assert_eq!(plan.linear_input_activations.len(), 2);
     }
 
     #[test]

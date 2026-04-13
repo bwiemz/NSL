@@ -14,7 +14,7 @@ pub mod subprocess;
 
 pub use ctx::CalibCtx;
 pub use hooks::{CalibrationHook, CalibrationResult};
-pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef};
+pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
 
 use std::collections::BTreeMap;
