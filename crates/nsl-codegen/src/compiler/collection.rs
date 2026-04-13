@@ -335,6 +335,7 @@ impl Compiler<'_> {
                         name,
                         fields,
                         total_size: offset,
+                        adapter_sidetable_offset: None,
                     },
                 );
             }
@@ -680,12 +681,36 @@ impl Compiler<'_> {
                         .model_field_types
                         .insert(name.clone(), field_type_map);
                 }
+                // B.2.1: Reserve an adapter-sidetable pointer slot whenever
+                // this compile carries any `@adapter(...)` decorator. The slot
+                // holds an i64 pointer (8 bytes, 8-byte aligned) to a heap
+                // table of adapter-tensor pointers. At construction time the
+                // slot is zero-initialised; actual tensor allocation happens
+                // in a later pass (after `invoke_wrga_if_enabled` populates
+                // `last_wrga_plan`). Field access for synthesized adapter
+                // names routes through this slot — see
+                // `expr/access.rs::is_synthesized_adapter_field_name`.
+                let adapter_sidetable_offset = if self
+                    .wrga_inputs
+                    .as_ref()
+                    .map(|w| !w.adapter.is_empty())
+                    .unwrap_or(false)
+                {
+                    let aligned = (offset + 7) & !7usize;
+                    let slot = aligned;
+                    offset = aligned + 8;
+                    Some(slot)
+                } else {
+                    None
+                };
+
                 self.types.struct_layouts.insert(
                     name.clone(),
                     StructLayout {
                         name,
                         fields,
                         total_size: offset,
+                        adapter_sidetable_offset,
                     },
                 );
             }

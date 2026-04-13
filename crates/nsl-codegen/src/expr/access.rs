@@ -96,6 +96,43 @@ impl Compiler<'_> {
                     }
                 }
             }
+            // B.2.1: Route synthesized adapter field accesses through the
+            // per-model side-table. Names of the form `lora_A_*`, `lora_B_*`,
+            // `ia3_scale_*`, `gate_*` are NOT physically laid out as struct
+            // fields — they live in a heap table whose pointer is stored at
+            // `layout.adapter_sidetable_offset`. The index used here must
+            // match the insertion order used by the init pass, i.e. the
+            // flattened `synthesized_fields` sequence across all sites
+            // targeting this model in `last_wrga_plan`.
+            if is_synthesized_adapter_field_name(&member_name) {
+                if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
+                    if let Some(slot_off) = layout.adapter_sidetable_offset {
+                        let index = self
+                            .adapter_field_index(&model_name, &member_name)
+                            .ok_or_else(|| {
+                                CodegenError::new(format!(
+                                    "synthesized adapter field '{member_name}' not found \
+                                     for model '{model_name}' in current WRGA plan"
+                                ))
+                            })?;
+                        let table_ptr = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            obj_val,
+                            slot_off as i32,
+                        );
+                        let byte_off = (index * 8) as i32;
+                        let tensor_ptr = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            table_ptr,
+                            byte_off,
+                        );
+                        return Ok(tensor_ptr);
+                    }
+                }
+            }
+
             if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
                 for field in &layout.fields {
                     if field.name == member_name {
@@ -337,5 +374,64 @@ impl Compiler<'_> {
                 "unknown type conversion: {target_type}()"
             ))),
         }
+    }
+}
+
+/// B.2.1: recognise synthesized adapter field names. These are never
+/// physically laid out in the model struct — they are routed through the
+/// side-table pointer stored at `StructLayout::adapter_sidetable_offset`.
+pub(crate) fn is_synthesized_adapter_field_name(name: &str) -> bool {
+    name.starts_with("lora_A_")
+        || name.starts_with("lora_B_")
+        || name.starts_with("ia3_scale_")
+        || name.starts_with("gate_")
+}
+
+impl Compiler<'_> {
+    /// B.2.1: linear index of a synthesized adapter field within the
+    /// flattened `synthesized_fields` sequence across every active adapter
+    /// site targeting `model_name`, in insertion order as produced by
+    /// `wrga_adapter_inject::run`.
+    ///
+    /// **Ordering invariant:** this MUST match the iteration order used by
+    /// the future init pass that populates the side-table, otherwise an
+    /// access to `self.lora_A_<site>` would dereference the wrong tensor.
+    /// The insertion order is: outer loop over `plan.placements` in the
+    /// order produced by WRGA; inner loop over each placement's
+    /// `synthesized_fields` vec. Only placements whose target field is
+    /// declared on `model_name` participate. Sites whose dims failed to
+    /// resolve (input_dim == 0 || output_dim == 0) are EXCLUDED from both
+    /// the init pass and this index computation to keep them in sync.
+    pub(crate) fn adapter_field_index(
+        &self,
+        model_name: &str,
+        field_name: &str,
+    ) -> Option<usize> {
+        let plan = self.last_wrga_plan.as_ref()?;
+        let field_types = &self.models.model_field_types;
+        let mut idx: usize = 0;
+        for placement in &plan.placements {
+            // Skip placements without a decorator (the inject pass only
+            // synthesizes fields when `decorator_kind` is set).
+            if placement.decorator_kind.is_none() {
+                continue;
+            }
+            // Only count placements whose target field exists on this model.
+            let target_field = placement.name.rsplit('.').next().unwrap_or("");
+            let matches_model = field_types
+                .get(model_name)
+                .map(|m| m.contains_key(target_field))
+                .unwrap_or(false);
+            if !matches_model {
+                continue;
+            }
+            for synth in &placement.synthesized_fields {
+                if synth == field_name {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+        }
+        None
     }
 }
