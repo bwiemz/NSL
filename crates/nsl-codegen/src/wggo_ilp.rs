@@ -46,6 +46,10 @@ pub struct LayerDecision {
     /// this layer.  When `true`, gradient buffers are not materialised in
     /// HBM and the backward kernel writes parameter updates directly.
     pub fase_fused: bool,
+    /// PCA sequence-packing mode for attention kernels on this layer.
+    ///   0 = none, 1 = segment_id, 2 = tile_skip, 3 = multi_seq.
+    /// Each mode skips progressively more padded work (paper §4.3.6).
+    pub packing_mode: u8,
 }
 
 impl LayerDecision {
@@ -99,6 +103,15 @@ pub struct LayerIlpConstraints {
     /// which is modeled as removing one parameter-sized buffer from the
     /// activation footprint.
     pub fase_backward_speedup: f64,
+    /// Bit-mask of permitted PCA packing modes.  Bit `i` set = mode `i`
+    /// allowed.  Default `0b1111` (all four modes).  Callers set this to
+    /// `0b0001` (only `none`) to disable PCA entirely for a layer — e.g.,
+    /// non-attention layers or kernels whose shape forbids packing.
+    pub packing_modes_mask: u8,
+    /// Estimated fractional work reduction per packing mode, indexed by
+    /// mode (0..=3).  Typical defaults: 0.00, 0.15, 0.25, 0.35 — derived
+    /// from the fraction of padded tokens in typical batches.
+    pub packing_savings: [f64; 4],
 }
 
 impl Default for LayerIlpConstraints {
@@ -117,6 +130,8 @@ impl Default for LayerIlpConstraints {
             min_retained_importance: 0.0,
             allow_fase: true,
             fase_backward_speedup: 0.10,
+            packing_modes_mask: 0b1111,
+            packing_savings: [0.00, 0.15, 0.25, 0.35],
         }
     }
 }
@@ -173,45 +188,55 @@ pub fn solve_layer(
                 continue;
             }
             for &fase in fase_domain {
-                for &c in lut.axes_csha_levels.iter().rev() {
-                    for &f in lut.axes_ffn_widths.iter().rev() {
-                        for &r in &lut.axes_adapter_ranks {
-                            for heads_config in enumerate_head_configs(constraints) {
-                                state.nodes += 1;
-                                let h_count = heads_config.iter().filter(|b| **b).count() as u64;
-                                let Some(base) = lut.get(h_count.max(1), f, c, r) else {
-                                    continue;
-                                };
-                                if !base.feasible {
-                                    continue;
+                for pack in enumerate_packing_modes(constraints) {
+                    for &c in lut.axes_csha_levels.iter().rev() {
+                        for &f in lut.axes_ffn_widths.iter().rev() {
+                            for &r in &lut.axes_adapter_ranks {
+                                for heads_config in enumerate_head_configs(constraints) {
+                                    state.nodes += 1;
+                                    let h_count =
+                                        heads_config.iter().filter(|b| **b).count() as u64;
+                                    let Some(base) = lut.get(h_count.max(1), f, c, r) else {
+                                        continue;
+                                    };
+                                    if !base.feasible {
+                                        continue;
+                                    }
+                                    let adj_fase =
+                                        apply_fase(base, fase, constraints.fase_backward_speedup);
+                                    let entry = apply_packing(
+                                        adj_fase,
+                                        pack,
+                                        &constraints.packing_savings,
+                                    );
+                                    if entry.smem_bytes > constraints.smem_budget {
+                                        continue;
+                                    }
+                                    if entry.param_bytes + entry.activation_bytes
+                                        > constraints.memory_budget
+                                    {
+                                        continue;
+                                    }
+                                    if !importance_ok(&heads_config, constraints) {
+                                        continue;
+                                    }
+                                    if entry.total_us() >= state.best_cost {
+                                        continue; // bound prune
+                                    }
+                                    let decision = LayerDecision {
+                                        keep_head: heads_config.clone(),
+                                        ffn_width: f,
+                                        csha_level: c,
+                                        adapter_rank: r,
+                                        optim_m_bits: m_bits,
+                                        optim_v_bits: v_bits,
+                                        fase_fused: fase,
+                                        packing_mode: pack,
+                                    };
+                                    state.best_cost = entry.total_us();
+                                    state.best_decision = Some(decision);
+                                    state.best_entry = Some(entry);
                                 }
-                                let entry = apply_fase(base, fase, constraints.fase_backward_speedup);
-                                if entry.smem_bytes > constraints.smem_budget {
-                                    continue;
-                                }
-                                if entry.param_bytes + entry.activation_bytes
-                                    > constraints.memory_budget
-                                {
-                                    continue;
-                                }
-                                if !importance_ok(&heads_config, constraints) {
-                                    continue;
-                                }
-                                if entry.total_us() >= state.best_cost {
-                                    continue; // bound prune
-                                }
-                                let decision = LayerDecision {
-                                    keep_head: heads_config.clone(),
-                                    ffn_width: f,
-                                    csha_level: c,
-                                    adapter_rank: r,
-                                    optim_m_bits: m_bits,
-                                    optim_v_bits: v_bits,
-                                    fase_fused: fase,
-                                };
-                                state.best_cost = entry.total_us();
-                                state.best_decision = Some(decision);
-                                state.best_entry = Some(entry);
                             }
                         }
                     }
@@ -338,6 +363,39 @@ fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
         optim_m_bits: 32,
         optim_v_bits: 32,
         fase_fused: false,
+        packing_mode: 0,
+    }
+}
+
+/// Enumerate permitted PCA packing modes per the constraint mask.  Modes
+/// are returned with larger-savings modes first so the solver finds a good
+/// incumbent early (tightening the bound).
+fn enumerate_packing_modes(c: &LayerIlpConstraints) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4);
+    for m in (0u8..=3).rev() {
+        if c.packing_modes_mask & (1 << m) != 0 {
+            out.push(m);
+        }
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out
+}
+
+/// Apply the PCA packing-mode's effective work reduction to an entry.
+/// Packing skips padded tokens, so forward + backward compute both shrink
+/// by the same fraction.  Memory and SMEM are unaffected.
+fn apply_packing(base: LayerCostEntry, mode: u8, savings: &[f64; 4]) -> LayerCostEntry {
+    let s = savings.get(mode as usize).copied().unwrap_or(0.0).clamp(0.0, 0.95);
+    LayerCostEntry {
+        forward_us: base.forward_us * (1.0 - s),
+        backward_us: base.backward_us * (1.0 - s),
+        param_bytes: base.param_bytes,
+        activation_bytes: base.activation_bytes,
+        smem_bytes: base.smem_bytes,
+        feasible: base.feasible,
+        classification: base.classification,
     }
 }
 
@@ -495,9 +553,9 @@ mod tests {
     fn solver_visits_finite_number_of_nodes() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let sol = solve_layer(&lut, &LayerIlpConstraints::default());
-        // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 × 2 (FASE) = 459 000.
-        // Allow 2× for expansion inside branches.
-        assert!(sol.nodes_explored <= 1_000_000, "nodes={}", sol.nodes_explored);
+        // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 × 2 (FASE) × 4 (PCA)
+        // = 1 836 000.  Allow 2× for expansion inside branches.
+        assert!(sol.nodes_explored <= 4_000_000, "nodes={}", sol.nodes_explored);
     }
 
     #[test]
@@ -545,6 +603,40 @@ mod tests {
         // either branch.  We only assert feasibility.
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
+    }
+
+    #[test]
+    fn packing_picks_highest_savings_when_all_modes_allowed() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let sol = solve_layer(&lut, &LayerIlpConstraints::default());
+        assert!(sol.feasible);
+        // Default savings are strictly increasing, so mode 3 (multi_seq)
+        // beats every other mode at equal feasibility.
+        assert_eq!(sol.decision.packing_mode, 3);
+    }
+
+    #[test]
+    fn packing_restricted_to_none_when_mask_forbids() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.packing_modes_mask = 0b0001; // only mode 0 allowed
+        let sol = solve_layer(&lut, &c);
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.packing_mode, 0);
+    }
+
+    #[test]
+    fn packing_savings_lower_cost_vs_no_packing() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let with_pack = solve_layer(&lut, &LayerIlpConstraints::default());
+        let without_pack = solve_layer(
+            &lut,
+            &LayerIlpConstraints {
+                packing_modes_mask: 0b0001,
+                ..LayerIlpConstraints::default()
+            },
+        );
+        assert!(with_pack.cost_us < without_pack.cost_us);
     }
 
     #[test]

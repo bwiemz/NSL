@@ -114,7 +114,7 @@ impl WggoPlan {
         for layer in &self.applied.layers {
             writeln!(
                 s,
-                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}",
+                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
                 layer.active_heads, // number of actually-kept heads (no "of total" info here)
@@ -123,7 +123,14 @@ impl WggoPlan {
                 layer.adapter_rank,
                 layer.optim_m_bits,
                 layer.optim_v_bits,
-                if layer.fase_fused { "fused" } else { "deferred" }
+                if layer.fase_fused { "fused" } else { "deferred" },
+                match layer.packing_mode {
+                    0 => "none",
+                    1 => "segment_id",
+                    2 => "tile_skip",
+                    3 => "multi_seq",
+                    _ => "?",
+                }
             )
             .unwrap();
         }
@@ -494,6 +501,14 @@ mod tests {
         let plan = run(toy_input(&w));
         let rep = plan.render_report();
         assert!(rep.contains("FASE="));
+    }
+
+    #[test]
+    fn pca_appears_in_report() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        let rep = plan.render_report();
+        assert!(rep.contains("PCA="));
     }
 
     #[test]

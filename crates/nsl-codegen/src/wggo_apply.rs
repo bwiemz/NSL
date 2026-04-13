@@ -34,6 +34,9 @@ pub struct AppliedLayer {
     /// Forced to `false` for pruned layers and for layers sharded by CPDT
     /// (the conflict resolver demotes the latter via `DeferFaseStep`).
     pub fase_fused: bool,
+    /// PCA packing mode (0=none, 1=segment_id, 2=tile_skip, 3=multi_seq).
+    /// Forced to 0 on pruned layers.
+    pub packing_mode: u8,
     /// Estimated layer cost post-application (μs).
     pub estimated_us: f64,
 }
@@ -75,12 +78,13 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
         let active_heads = ilp_sol.decision.active_heads() as u32;
         // Prune-decision propagation: if the inter-layer DP decided to
         // prune, force adapter rank and csha level to safe defaults.
-        let (csha_level, adapter_rank, fase_fused) = match coarse.decision {
-            CoarseDecision::Prune => (0, 0, false),
+        let (csha_level, adapter_rank, fase_fused, packing_mode) = match coarse.decision {
+            CoarseDecision::Prune => (0, 0, false, 0u8),
             _ => (
                 ilp_sol.decision.csha_level,
                 ilp_sol.decision.adapter_rank,
                 ilp_sol.decision.fase_fused,
+                ilp_sol.decision.packing_mode,
             ),
         };
         let cost = if coarse.decision == CoarseDecision::Prune {
@@ -103,6 +107,7 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
             optim_m_bits: ilp_sol.decision.optim_m_bits,
             optim_v_bits: ilp_sol.decision.optim_v_bits,
             fase_fused,
+            packing_mode,
             estimated_us: cost,
         });
     }
@@ -221,6 +226,21 @@ mod tests {
         let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
         let ilp = vec![solve_layer(&lut, &LayerIlpConstraints::default())];
         let _ = apply(&inter, &ilp);
+    }
+
+    #[test]
+    fn pruned_layers_force_packing_off() {
+        let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
+        let ilp: Vec<_> = (0..3)
+            .map(|_| {
+                let mut s = solve_layer(&lut, &LayerIlpConstraints::default());
+                s.decision.packing_mode = 3;
+                s
+            })
+            .collect();
+        let applied = apply(&inter_plan(3), &ilp);
+        assert_eq!(applied.layers[2].packing_mode, 0);
+        assert_eq!(applied.layers[0].packing_mode, 3);
     }
 
     #[test]
