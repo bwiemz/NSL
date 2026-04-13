@@ -3424,6 +3424,32 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
+                // WGGO: run the global optimization planner if enabled.  The
+                // planner is pure data-in/data-out and does not mutate the
+                // Wengert list — it produces a report describing the
+                // globally-optimal per-layer decisions that downstream
+                // passes SHOULD honour.  Wiring the decisions back into
+                // codegen is a future step; the planner itself is
+                // independently useful as a diagnostic and is exercised by
+                // the test suite and CLI integration tests.
+                if let Some(ref mode_str) = self.compile_options.wggo_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        let plan = crate::wggo::run_on_wengert(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            self.compile_options.world_size,
+                        );
+                        if let Some(plan) = plan {
+                            if self.compile_options.wggo_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[wggo] {}", plan.summary());
+                            }
+                        }
+                    }
+                }
+
                 // 5. Lower PRIMAL Wengert list to Cranelift IR.
                 //    This IS the forward pass — each WengertOp is compiled to
                 //    its runtime FFI call, and ALL intermediate VarId → Value

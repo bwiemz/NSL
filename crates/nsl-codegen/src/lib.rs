@@ -176,6 +176,11 @@ pub struct CompileOptions {
     pub debug_training: bool,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     pub shared_lib: bool,
+    /// WGGO: global optimization mode ("full", "greedy", "off"). When `None`,
+    /// WGGO is not run.  See `crates/nsl-codegen/src/wggo.rs`.
+    pub wggo_mode: Option<String>,
+    /// WGGO: print the global-optimization report to stderr.
+    pub wggo_report: bool,
 }
 
 impl Default for CompileOptions {
@@ -216,6 +221,8 @@ impl Default for CompileOptions {
             zero_stage: None,
             debug_training: false,
             shared_lib: false,
+            wggo_mode: None,
+            wggo_report: false,
         }
     }
 }
