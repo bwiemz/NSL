@@ -14,6 +14,19 @@ use clap::Parser as ClapParser;
 use nsl_errors::{Level, SourceMap};
 use nsl_lexer::Interner;
 
+/// Scan a parsed module for a top-level `train { ... }` block.
+///
+/// Dev Tools Phase 4 Task 6: `nsl run --monitor` uses this detection to
+/// decide whether to enable the health monitor (train program) or fall
+/// back to the Phase 1/2 kernel-timing profile path (non-train program).
+/// Train blocks in NSL are a top-level construct, so a flat scan suffices.
+fn has_train_block(module: &nsl_ast::Module) -> bool {
+    module
+        .stmts
+        .iter()
+        .any(|s| matches!(s.kind, nsl_ast::stmt::StmtKind::TrainBlock(_)))
+}
+
 // The clap command enum carries many subcommand-specific flags, so keeping it
 // as a single enum is clearer than splitting every large variant into boxes.
 #[allow(clippy::large_enum_variant)]
@@ -992,7 +1005,25 @@ fn main_inner() {
             gpu_mem_report,
             monitor,
         } => {
-            if monitor {
+            // Dev Tools Phase 4 Task 6: when --monitor is set, auto-detect
+            // whether this program has a `train { }` block.  If so, enable
+            // the health monitor and skip the Phase 1/2 kernel-timing path
+            // (the two are mutually exclusive per spec § 4.6).  Non-train
+            // programs keep the existing kernel-timing behavior.
+            let detected_train_block: bool = if monitor {
+                let src = std::fs::read_to_string(&file).unwrap_or_default();
+                match nsl_cli::shape_debug::ShapeDebugInput::from_source(
+                    &src,
+                    file.to_str().unwrap_or("<file>"),
+                ) {
+                    Ok(input) => has_train_block(&input.module),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+
+            if monitor && !detected_train_block {
                 let profile_args = nsl_cli::profile::ProfileArgs {
                     file: file.clone(),
                     target: gpu.clone().unwrap_or_else(|| "h100".to_string()),
@@ -1082,7 +1113,10 @@ fn main_inner() {
                 wrga_fold_allocations: false,
                 wggo_mode: None,
                 wggo_report: false,
-                profile_kernels: monitor,
+                // Phase 4 Task 6: when a train block is detected with --monitor,
+                // the health monitor takes over; disable the Phase 1/2 kernel
+                // timing path so they don't stomp on each other.
+                profile_kernels: if detected_train_block { false } else { monitor },
                 target_gpu: "h100".to_string(),
                 dtype: "bf16".to_string(),
                 // Task 6: when --monitor is set, wire the manifest output
@@ -1104,10 +1138,11 @@ fn main_inner() {
                 } else {
                     None
                 },
-                // Dev Tools Phase 4 Task 6 wires train-block detection to
-                // enable these automatically.  Task 4 leaves them false so
-                // the option defaults cleanly to no instrumentation.
-                health_monitor: false,
+                // Dev Tools Phase 4 Task 6: when `nsl run --monitor` is run
+                // against a program containing a top-level `train { }` block,
+                // codegen emits per-step health hooks that flush a snapshot
+                // to `<file>.nsl-health.json` at run end.
+                health_monitor: detected_train_block,
                 health_flush_interval: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
@@ -1322,6 +1357,34 @@ fn main_inner() {
                 }
             } else {
                 run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, gpu_mem_report, &compile_opts);
+                // Phase 4 Task 6: after the child process exits, load and
+                // render the health snapshot written by the runtime flush
+                // hook.  Only runs when `--monitor` + train-block detection
+                // enabled the health monitor upstream.
+                if monitor && detected_train_block {
+                    let health_path = file.with_extension("nsl-health.json");
+                    match std::fs::read_to_string(&health_path) {
+                        Ok(s) => match serde_json::from_str::<
+                            nsl_runtime::health::collector::HealthSnapshot,
+                        >(&s)
+                        {
+                            Ok(snap) => {
+                                let mut renderer =
+                                    nsl_cli::health_monitor::HealthRenderer::new();
+                                renderer.render(&snap);
+                            }
+                            Err(e) => eprintln!(
+                                "warning: health snapshot at {} failed to parse: {}",
+                                health_path.display(),
+                                e
+                            ),
+                        },
+                        Err(_) => eprintln!(
+                            "warning: no health snapshot at {} — train step may not have reached first flush",
+                            health_path.display()
+                        ),
+                    }
+                }
             }
         }
         Cli::Test { file, filter } => {
