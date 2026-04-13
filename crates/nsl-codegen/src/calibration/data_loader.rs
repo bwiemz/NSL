@@ -123,18 +123,16 @@ impl CalibrationDataset {
                 reason: format!("safetensors parse: {e}"),
             }
         })?;
-        // Prefer `input_ids`, fall back to `inputs`.
-        let name = ["input_ids", "inputs"]
+        // Prefer `input_ids`, fall back to `inputs`.  `find_map` does
+        // the lookup once instead of `find` + re-fetch, and unwraps the
+        // borrow indirection from `&&&str` to `&'static str`.
+        let (name, tv) = ["input_ids", "inputs"]
             .iter()
-            .find(|k| st.tensor(k).is_ok())
+            .find_map(|k| st.tensor(k).ok().map(|tv| (*k, tv)))
             .ok_or_else(|| CalibrationDataError::BadHeader {
                 path: path.to_path_buf(),
                 reason: "no tensor named 'input_ids' or 'inputs' in safetensors file".into(),
             })?;
-        let tv = st.tensor(name).map_err(|e| CalibrationDataError::BadHeader {
-            path: path.to_path_buf(),
-            reason: format!("tensor {name} not retrievable: {e}"),
-        })?;
         if tv.dtype() != safetensors::Dtype::I32 {
             return Err(CalibrationDataError::BadHeader {
                 path: path.to_path_buf(),
