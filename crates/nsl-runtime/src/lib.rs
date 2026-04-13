@@ -24,6 +24,7 @@ pub(crate) mod cpu;
 pub(crate) mod cuda;
 pub mod autodiff;
 pub mod checkpoint;
+pub mod inspect;
 pub mod tokenizer;
 pub mod quantize;
 pub mod fp8;
