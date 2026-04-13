@@ -3,6 +3,8 @@
 //! This crate compiles to a static library that is linked into every compiled NSL program.
 //! All public functions use C ABI (`extern "C"`) so Cranelift-generated code can call them.
 
+pub mod health;
+pub mod profiler;
 pub mod print;
 pub mod power;
 pub mod memory;
@@ -22,6 +24,7 @@ pub(crate) mod cpu;
 pub(crate) mod cuda;
 pub mod autodiff;
 pub mod checkpoint;
+pub mod inspect;
 pub mod tokenizer;
 pub mod quantize;
 pub mod fp8;

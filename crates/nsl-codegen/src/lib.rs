@@ -6,6 +6,7 @@ pub mod context;
 pub mod context_parallel;
 pub mod cost_model;
 pub mod deterministic_kernels;
+pub mod profiling;
 pub mod grammar_compiler;
 pub mod schema_convert;
 pub mod stdlib_loader;
@@ -55,6 +56,7 @@ pub mod fusion_graph;
 pub mod fusion_report;
 pub mod gpu_specs;
 pub mod gpu_target;
+pub mod inspect;
 pub mod kernel;
 pub mod kernel_ir;
 pub mod kernel_lower;
@@ -112,6 +114,9 @@ pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers;
 
 pub use compiler::{
     compile, compile_entry, compile_module, compile_module_with_imports,
@@ -433,30 +438,37 @@ pub struct CompileOptions {
     pub wggo_mode: Option<String>,
     /// WGGO: print the global-optimization report to stderr.
     pub wggo_report: bool,
-    /// WGGO Stage 3: path to a `.nslweights` sidecar file for real
-    /// weight-based importance scoring.  When `None`, the analyzer
-    /// falls back to uniform per-head scores.
+    /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
+    pub profile_kernels: bool,
+    /// Dev Tools Phase 2: target GPU name for the profile walker.
+    pub target_gpu: String,
+    /// Dev Tools Phase 2: tensor dtype assumed by the profile walker.
+    pub dtype: String,
+    /// Dev Tools Phase 2, Task 6: manifest output path.
+    pub manifest_output_path: Option<std::path::PathBuf>,
+    /// Dev Tools Phase 2, Task 6: source text for span line numbers.
+    pub profile_source_text: Option<String>,
+    /// Dev Tools Phase 2, Task 6: source file name for manifest spans.
+    pub profile_source_file_name: Option<String>,
+    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission.
+    pub health_monitor: bool,
+    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter.
+    pub health_flush_interval: Option<u64>,
+    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
+    pub inspect_enabled: bool,
+    /// WGGO Stage 3: path to a `.nslweights` sidecar file.
     pub wggo_weights: Option<std::path::PathBuf>,
-    /// WGGO Stage 3: scoring mode ("none", "magnitude").  "grad" is
-    /// reserved for Phase 2 (blocked on a compile-time execution
-    /// harness).  Default "magnitude" when weights are supplied,
-    /// otherwise "none".
+    /// WGGO Stage 3: scoring mode ("none", "magnitude").
     pub wggo_importance: Option<String>,
-    /// WGGO Stage 3: default fraction of heads the auto-derived
-    /// `min_retained_importance` threshold allows to be pruned.
-    /// Clamped to `[0.0, 0.9]`.  Default 0.25.
+    /// WGGO Stage 3: default fraction of heads allowed to be pruned.
     pub wggo_prune_fraction: Option<f64>,
-    /// CSHA: fusion mode ("auto", "boundary", "pipeline", "block", "off").
-    /// When `None`, CSHA is not run.  See `crates/nsl-codegen/src/csha.rs`.
+    /// CSHA: fusion mode.
     pub csha_mode: Option<String>,
-    /// CSHA: print the attention-fusion report to stderr.
+    /// CSHA: print the attention-fusion report.
     pub csha_report: bool,
-    /// Path to calibration dataset (`.bin` or `.safetensors`).  When
-    /// `None`, calibration is skipped entirely and consumers fall back
-    /// to their static paths.
+    /// Path to calibration dataset.
     pub calibration_data: Option<std::path::PathBuf>,
-    /// Failure-handling mode: `"required"` (default) aborts on infra
-    /// failure, `"best-effort"` warns and falls back.  See spec §6.
+    /// Failure-handling mode: `"required"` or `"best-effort"`.
     pub calibration_mode: Option<String>,
     pub calibration_samples: u32,
     pub calibration_batch_size: u32,
@@ -505,6 +517,15 @@ impl Default for CompileOptions {
             wrga_fold_allocations: false,
             wggo_mode: None,
             wggo_report: false,
+            profile_kernels: false,
+            target_gpu: "h100".to_string(),
+            dtype: "bf16".to_string(),
+            manifest_output_path: None,
+            profile_source_text: None,
+            profile_source_file_name: None,
+            health_monitor: false,
+            health_flush_interval: None,
+            inspect_enabled: false,
             wggo_weights: None,
             wggo_importance: None,
             wggo_prune_fraction: None,

@@ -3871,6 +3871,12 @@ pub extern "C" fn nsl_debug_train_step(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn nsl_tensor_l2_norm(t: i64) -> f64 {
+    let tensor = NslTensor::from_ptr(t);
+    tensor_l2_norm(tensor)
+}
+
 fn tensor_l2_norm(t: &NslTensor) -> f64 {
     if t.len == 0 || t.data.is_null() { return 0.0; }
     let len = t.len as usize;
