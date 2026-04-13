@@ -45,6 +45,26 @@ pub struct BridgeResult {
     /// Per-layer FlashAttentionConfig that downstream passes can query
     /// to get the right specialisation for a particular layer.
     pub configs: std::collections::BTreeMap<String, FlashAttentionConfigPayload>,
+    /// A.1: per-layer `CshaExtras` — the runtime-marshalled form that
+    /// the FA FFI dispatch path consumes. Parallel to `configs` but
+    /// carries the full extras struct (non-serializable `f32` fields)
+    /// rather than the serializable payload.
+    #[serde(skip)]
+    pub extras: std::collections::BTreeMap<String, CshaExtras>,
+}
+
+impl BridgeResult {
+    /// A.1 convenience: pick a representative `CshaExtras` when the
+    /// caller cannot identify which layer a particular FA launch
+    /// belongs to. Returns the extras for the first layer in sorted
+    /// order, or `None` if no CSHA-active layers were planned.
+    ///
+    /// This is a *stopgap* for the Tier A plumbing: A.2/A.4 will
+    /// replace it with a proper layer identifier derived from the
+    /// enclosing function / decorator / Wengert-Param-prefix context.
+    pub fn first_extras(&self) -> Option<&CshaExtras> {
+        self.extras.values().next()
+    }
 }
 
 /// Serializable mirror of the bits of `FlashAttentionConfig` a downstream
@@ -131,6 +151,10 @@ pub fn bridge(plan: &CshaPlan, shape_head_dim: i64) -> BridgeResult {
             kernel_name,
             smem_bytes: smem,
         });
+        if let Some(ref extras) = cfg.csha {
+            out.extras
+                .insert(layer_plan.layer.clone(), extras.clone());
+        }
         out.configs
             .insert(layer_plan.layer.clone(), (&cfg).into());
     }
@@ -344,6 +368,47 @@ mod tests {
         assert_eq!(r.kernels.len(), 1);
         assert_eq!(r.kernels[0].layer, "blocks.0");
         assert_ne!(r.kernels[0].level, FusionLevel::None);
+    }
+
+    #[test]
+    fn a1_bridge_populates_extras_per_csha_active_layer() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        // One kernel, one extras entry — keyed by layer name.
+        assert_eq!(r.extras.len(), 1);
+        let extras = r
+            .extras
+            .get("blocks.0")
+            .expect("expected extras for blocks.0");
+        assert!(extras.level >= 1, "CSHA level must be set for auto mode");
+        assert!(
+            extras.fused_rmsnorm,
+            "boundary fusion implies fused RMSNorm prologue"
+        );
+    }
+
+    #[test]
+    fn a1_bridge_extras_empty_when_csha_off() {
+        let plan = toy_plan(CshaMode::Off);
+        let r = bridge(&plan, 64);
+        assert!(
+            r.extras.is_empty(),
+            "Off mode must not populate the extras side-table"
+        );
+    }
+
+    #[test]
+    fn a1_first_extras_returns_some_when_plan_active() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        assert!(r.first_extras().is_some());
+    }
+
+    #[test]
+    fn a1_first_extras_returns_none_when_plan_off() {
+        let plan = toy_plan(CshaMode::Off);
+        let r = bridge(&plan, 64);
+        assert!(r.first_extras().is_none());
     }
 
     #[test]

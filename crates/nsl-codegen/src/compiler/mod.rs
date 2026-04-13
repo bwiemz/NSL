@@ -415,6 +415,13 @@ pub struct Compiler<'a> {
     /// decorated placements when target patterns don't syntactically
     /// match the inferred placement names.
     pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
+    /// CSHA Tier A.1: bridge result from the most recent CSHA planner run.
+    /// Populated by the CSHA hook in `stmt.rs` when
+    /// `CompileOptions.csha_mode` is set to a non-off mode. Consumed by
+    /// `compile_flash_attention_call` to route FA launches through the
+    /// CSHA-aware FFI when per-layer extras are available. `None` when
+    /// CSHA is disabled or when no `@train` block compiled.
+    pub last_csha_bridge: Option<crate::csha_apply::BridgeResult>,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
     /// (but potentially different α/rank scales) share one PTX string.
@@ -557,6 +564,7 @@ impl<'a> Compiler<'a> {
             synth_member_names: std::collections::HashMap::new(),
             current_method_model_name: None,
             adapter_prescan_plan: None,
+            last_csha_bridge: None,
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
         })

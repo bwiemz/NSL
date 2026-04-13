@@ -3652,6 +3652,19 @@ impl Compiler<'_> {
                             } else {
                                 eprintln!("[csha] {}", plan.summary());
                             }
+                            // A.1: persist the bridge result so the FA call
+                            // site can route CSHA-active layers through the
+                            // CSHA-aware FFI. `csha::run` already called
+                            // `csha_apply::bridge`; we reconstruct it here
+                            // to keep the kernels / marks / configs map
+                            // available to downstream code.
+                            self.last_csha_bridge = Some(crate::csha_apply::bridge(
+                                &plan,
+                                plan.per_layer
+                                    .first()
+                                    .map(|lp| lp.tiles.head_dim as i64)
+                                    .unwrap_or(64),
+                            ));
                         }
                     }
                 }

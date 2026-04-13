@@ -1332,37 +1332,88 @@ impl Compiler<'_> {
         let lse_val =
             self.compile_call_by_name(builder, "nsl_tensor_to_device", &[lse_cpu, cuda_device])?;
 
-        // Call flash attention FFI — returns error code (i64), output written to out_val
-        let _err = self.compile_call_by_name(
-            builder,
-            "nsl_flash_attention",
-            &[
-                q_val,
-                k_val,
-                v_val,
-                out_val,
-                lse_val, // logsumexp auxiliary output
-                scale_val,
-                batch,
-                heads,
-                seq_len,
-                head_dim,
-                null,
-                null,
-                null,
-                null, // paged params (null for now)
-                null,
-                null, // RoPE params (null for now)
-                null,
-                null, // seq_ids, seq_lens (M29-ready)
-                shmem_val,
-                ptx_ptr,
-                name_ptr,
-                block_q_val,
-                block_kv_val,
-                causal_val,
-            ],
-        )?;
+        // A.1: dispatch to CSHA-aware FFI when the active CSHA plan
+        // produced extras for at least one layer. The extras carry the
+        // fusion level, active-heads count, and the RMSNorm / projection
+        // flags that A.2's PTX body will consume. For Tier A.1 the
+        // runtime side forwards to the non-CSHA path — the wiring is
+        // observable via the extra args being marshalled and passed.
+        let csha_extras = self
+            .last_csha_bridge
+            .as_ref()
+            .and_then(|b| b.first_extras().cloned());
+
+        if let Some(extras) = csha_extras {
+            let eps_bits = builder
+                .ins()
+                .iconst(cl_types::I64, extras.rmsnorm_eps.to_bits() as i64);
+            let active_heads_val = builder
+                .ins()
+                .iconst(cl_types::I64, extras.active_heads as i64);
+            let d_model_val = builder
+                .ins()
+                .iconst(cl_types::I64, extras.d_model as i64);
+            // CSHA weight pointers are null in A.1 — A.2 threads the
+            // real Param DataIds here by matching the Wengert
+            // `blocks.N.attn.{wq,wk,wv,wo}` names against the bridge
+            // marks. Passing null keeps the ABI stable and lets the
+            // forwarder behave identically to `nsl_flash_attention`.
+            let _err = self.compile_call_by_name(
+                builder,
+                "nsl_flash_attention_csha",
+                &[
+                    q_val, k_val, v_val, out_val,
+                    lse_val,
+                    scale_val,
+                    batch, heads, seq_len, head_dim,
+                    null, null, null, null, // paged
+                    null, null,             // RoPE
+                    null, null,             // seq_ids, seq_lens
+                    shmem_val,
+                    ptx_ptr, name_ptr,
+                    block_q_val, block_kv_val,
+                    causal_val,
+                    // CSHA extras:
+                    null,              // x_ptr  (A.2)
+                    null,              // norm_weight_ptr (A.2)
+                    null, null, null, null, // Wq/Wk/Wv/Wo (A.2)
+                    eps_bits,
+                    active_heads_val,
+                    d_model_val,
+                ],
+            )?;
+        } else {
+            let _err = self.compile_call_by_name(
+                builder,
+                "nsl_flash_attention",
+                &[
+                    q_val,
+                    k_val,
+                    v_val,
+                    out_val,
+                    lse_val, // logsumexp auxiliary output
+                    scale_val,
+                    batch,
+                    heads,
+                    seq_len,
+                    head_dim,
+                    null,
+                    null,
+                    null,
+                    null, // paged params (null for now)
+                    null,
+                    null, // RoPE params (null for now)
+                    null,
+                    null, // seq_ids, seq_lens (M29-ready)
+                    shmem_val,
+                    ptx_ptr,
+                    name_ptr,
+                    block_q_val,
+                    block_kv_val,
+                    causal_val,
+                ],
+            )?;
+        }
 
         // Logsumexp is consumed by the runtime's tape recording in nsl_flash_attention.
         // The TapeOp::FlashAttention variant is recorded there with the logsumexp pointer.

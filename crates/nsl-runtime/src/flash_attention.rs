@@ -263,6 +263,69 @@ pub extern "C" fn nsl_flash_attention(
     }
 }
 
+/// CSHA Tier A.1: FlashAttention FFI variant that carries per-layer CSHA
+/// extras (paper §2). This entry point preserves the argument layout of
+/// `nsl_flash_attention` and *appends* nine CSHA-specific arguments:
+///
+///   x_ptr            — pre-norm input tensor (what RMSNorm will read)
+///   norm_weight_ptr  — RMSNorm gain vector
+///   wq_ptr / wk_ptr / wv_ptr / wo_ptr — projection weights the fused
+///                                       kernel will project in-SMEM
+///   rmsnorm_eps_bits — f32 bits of the RMSNorm epsilon
+///   active_heads     — number of heads the specialised kernel computes
+///                      (0 = use `heads` from the base layout)
+///   d_model          — feature dimension for the projection tiles
+///
+/// For Tier A.1 the CSHA PTX body is not yet emitted (A.2), so this FFI
+/// forwards to `nsl_flash_attention` and deliberately ignores the nine
+/// extras. Plumbing through codegen already ensures the caller passes
+/// them in the correct order; A.2 will light up a second launch path
+/// inside this function that consumes them.
+#[no_mangle]
+pub extern "C" fn nsl_flash_attention_csha(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
+    scale_bits: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    block_table_ptr: i64,
+    k_pool_ptr: i64, v_pool_ptr: i64,
+    block_size: i64,
+    cos_ptr: i64, sin_ptr: i64,
+    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    shared_mem_bytes: i64,
+    ptx_ptr: i64, name_ptr: i64,
+    block_q: i64, block_kv: i64,
+    causal: i64,
+    // A.1: CSHA extras. Ignored by the forwarder; A.2 lights them up.
+    x_ptr: i64,
+    norm_weight_ptr: i64,
+    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    rmsnorm_eps_bits: i64,
+    active_heads: i64,
+    d_model: i64,
+) -> i64 {
+    // Silence unused-parameter warnings until A.2 consumes these.
+    let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
+    let _ = (rmsnorm_eps_bits, active_heads, d_model);
+    nsl_flash_attention(
+        q_ptr, k_ptr, v_ptr,
+        out_ptr,
+        logsumexp_ptr,
+        scale_bits,
+        batch, heads, seq_len, head_dim,
+        block_table_ptr,
+        k_pool_ptr, v_pool_ptr,
+        block_size,
+        cos_ptr, sin_ptr,
+        seq_ids_ptr, seq_lens_ptr,
+        shared_mem_bytes,
+        ptx_ptr, name_ptr,
+        block_q, block_kv,
+        causal,
+    )
+}
+
 /// M42b: Quantized FlashAttention — KV-cache in INT8/FP8, Q in f16/f32.
 ///
 /// Same tiled FlashAttention-2 algorithm but with inline dequantization:
