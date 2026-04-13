@@ -91,6 +91,7 @@ pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wggo_schedule;
 pub mod wggo_weight_analysis;
+pub mod wggo_weight_analysis_nslweights;
 pub mod wrga;
 pub mod wrga_adapter_inject;
 pub mod wrga_fusion;
