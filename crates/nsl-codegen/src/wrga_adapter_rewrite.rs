@@ -57,6 +57,21 @@ pub struct RewriteContext<'a> {
     /// `MemberAccess { object: Ident(self_sym), .. }` patterns are actually
     /// `self`-rooted.
     pub self_sym: Option<Symbol>,
+    /// B.3 Task 4: CUDA sm version resolved from the compile target.
+    /// `None` when the target is plain `cuda` (no sm pinned) or non-CUDA.
+    /// The fused single-FFI rewrite path activates only when this is
+    /// `Some(sm)` with `sm >= 80`.
+    pub target_sm: Option<u32>,
+    /// B.3 Task 4: overrides emitted for synthesized `ExprKind::Call`
+    /// callees.  Keyed by the callee Ident's `NodeId`; value is the real
+    /// FFI name the codegen should dispatch to.  Mirrors `synth_overrides`
+    /// but for call sites, not member accesses.
+    pub synth_call_overrides: HashMap<NodeId, String>,
+    /// B.3 Task 5: deterministic ordering of fused PTX kernel keys, used
+    /// to assign a stable `kernel_handle` index per call site.  Sorted by
+    /// `(m, n, k, rank, target_sm)`.  Empty when the prescan didn't
+    /// populate `Compiler::fused_ptx_kernels` (e.g. non-sm_80 target).
+    pub fused_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -66,6 +81,9 @@ impl<'a> RewriteContext<'a> {
             field_symbols: HashMap::new(),
             synth_overrides: HashMap::new(),
             self_sym: None,
+            target_sm: None,
+            synth_call_overrides: HashMap::new(),
+            fused_kernel_order: Vec::new(),
         }
     }
 }
@@ -184,11 +202,148 @@ fn make_float(v: f64, span: nsl_errors::Span) -> Expr {
     }
 }
 
-/// Synthesize `original + ((lhs @ self.lora_A_<site>) @ self.lora_B_<site>) * scale`.
+/// B.3 Task 4: dispatch between the fused single-FFI path and the B.2.1
+/// unfused triple based on the site's `fusion_decision` and target sm.
+///
+/// * Fused path: `site.fusion_decision == Some(EpilogueFusedLora)` AND
+///   `ctx.target_sm >= 80` → emit one Call to `nsl_adapter_fused_lora_matmul`.
+/// * Unfused path (B.2.1): any other condition → emit the three-FFI
+///   triple `x @ W + ((x @ A) @ B) * scale`.
+///
+/// Renamed from its B.2.1 name to preserve the dispatch seam; the
+/// unfused body now lives in `synthesize_lora_unfused_triple`.
+pub fn synthesize_lora_adapted(
+    original: Expr,
+    lhs: &Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let is_fused = matches!(
+        site.fusion_decision,
+        Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { .. })
+    );
+    let sm_ok = ctx.target_sm.map(|sm| sm >= 80).unwrap_or(false);
+    if is_fused && sm_ok {
+        return synthesize_lora_fused_call(original, lhs, site, ctx);
+    }
+    synthesize_lora_unfused_triple(original, lhs, site, ctx)
+}
+
+/// B.3 Task 4: synthesize a single `Call` to `nsl_adapter_fused_lora_matmul`
+/// with args `[lhs, self.W, self.lora_A_<site>, self.lora_B_<site>,
+/// FloatLit(scale), IntLit(kernel_handle)]`.  The callee Ident carries a
+/// sentinel Symbol; the real FFI name is stashed in
+/// `ctx.synth_call_overrides` keyed by the callee's NodeId.
+pub fn synthesize_lora_fused_call(
+    original: Expr,
+    lhs: &Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let span = original.span;
+    let sentinel = ctx
+        .field_symbols
+        .values()
+        .next()
+        .copied()
+        .expect("RewriteContext must have at least one field symbol");
+
+    // Recover `self.W` from the original `x @ self.W` matmul we're replacing.
+    let self_w = match &original.kind {
+        ExprKind::BinaryOp { right, .. } => (**right).clone(),
+        _ => {
+            // Shouldn't happen — `match_adapter_site` guarantees a
+            // matmul-shaped original.  Fall back to unfused to be safe.
+            return synthesize_lora_unfused_triple(original, lhs, site, ctx);
+        }
+    };
+
+    let a_name = format!("lora_A_{}", site.site_id);
+    let b_name = format!("lora_B_{}", site.site_id);
+    let self_a = make_self_expr(span);
+    let ma_a = make_synth_member_access(ctx, self_a, &a_name, span, sentinel);
+    let self_b = make_self_expr(span);
+    let ma_b = make_synth_member_access(ctx, self_b, &b_name, span, sentinel);
+
+    let rank = site.rank.max(1) as f64;
+    let alpha = site.alpha.max(1) as f64;
+    let scale = alpha / rank;
+
+    // B.3 Task 5: derive a deterministic kernel_handle by looking up
+    // this site's `LoraKernelKey` in the sorted `fused_kernel_order`.
+    // Sites whose key isn't in the order (rank > 16, dims unresolved,
+    // non-sm_80 target) get handle = -1 so the runtime can detect a
+    // miswiring and fall back deterministically.
+    let kernel_handle: i64 = {
+        let target_sm = ctx.target_sm.unwrap_or(0);
+        // Rank from FusionTarget::EpilogueFusedLora { rank }; fall back
+        // to site.rank when the decision shape doesn't carry it.
+        let rank = match &site.fusion_decision {
+            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { rank }) => *rank as u32,
+            _ => site.rank as u32,
+        };
+        let key = crate::wrga_fused_ptx::LoraKernelKey {
+            m: 1,
+            n: site.output_dim,
+            k: site.input_dim,
+            rank,
+            target_sm,
+        };
+        ctx.fused_kernel_order
+            .iter()
+            .position(|k| k == &key)
+            .map(|p| p as i64)
+            .unwrap_or(-1)
+    };
+
+    // Build the callee Ident with a sentinel symbol + override entry
+    // pointing at the FFI name.
+    let callee_id = NodeId::next();
+    ctx.synth_call_overrides
+        .insert(callee_id, "nsl_adapter_fused_lora_matmul".to_string());
+    let callee = Expr {
+        kind: ExprKind::Ident(sentinel),
+        span,
+        id: callee_id,
+    };
+
+    let args = vec![
+        Arg { name: None, value: lhs.clone(), span },
+        Arg { name: None, value: self_w, span },
+        Arg { name: None, value: ma_a, span },
+        Arg { name: None, value: ma_b, span },
+        Arg {
+            name: None,
+            value: make_float(scale, span),
+            span,
+        },
+        Arg {
+            name: None,
+            value: Expr {
+                kind: ExprKind::IntLiteral(kernel_handle),
+                span,
+                id: NodeId::next(),
+            },
+            span,
+        },
+    ];
+
+    Expr {
+        kind: ExprKind::Call {
+            callee: Box::new(callee),
+            args,
+        },
+        span,
+        id: NodeId::next(),
+    }
+}
+
+/// B.2.1's original body, preserved verbatim.  Synthesize
+/// `original + ((lhs @ self.lora_A_<site>) @ self.lora_B_<site>) * scale`.
 /// `original` is the already-recursively-rewritten `x @ self.W` matmul.
 /// `lhs` is a reference to the (already-rewritten) x expression — it
 /// will be cloned for the second matmul chain.
-pub fn synthesize_lora_adapted(
+pub fn synthesize_lora_unfused_triple(
     original: Expr,
     lhs: &Expr,
     site: &AdapterSite,
@@ -231,6 +386,85 @@ pub fn synthesize_lora_adapted(
 /// Broadcast semantics: matmul result has shape `[..., d_out]`, scale has
 /// shape `[d_out]`, standard NSL tensor broadcasting applies.
 pub fn synthesize_ia3_adapted(
+    original: Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let is_fused = matches!(
+        site.fusion_decision,
+        Some(crate::wrga_fusion::FusionTarget::ActivationFusedIa3)
+    );
+    let sm_ok = ctx.target_sm.map(|sm| sm >= 80).unwrap_or(false);
+    if is_fused && sm_ok {
+        return synthesize_ia3_fused_call(original, site, ctx);
+    }
+    synthesize_ia3_unfused_mul(original, site, ctx)
+}
+
+/// B.3 Task 4: single-Call fused IA³ entry —
+/// `nsl_adapter_fused_ia3_matmul(x, self.W, self.ia3_scale_<site>, handle)`.
+pub fn synthesize_ia3_fused_call(
+    original: Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let span = original.span;
+    let sentinel = ctx
+        .field_symbols
+        .values()
+        .next()
+        .copied()
+        .expect("RewriteContext must have at least one field symbol");
+
+    let (lhs_expr, self_w) = match &original.kind {
+        ExprKind::BinaryOp { left, right, .. } => ((**left).clone(), (**right).clone()),
+        _ => return synthesize_ia3_unfused_mul(original, site, ctx),
+    };
+
+    let scale_name = format!("ia3_scale_{}", site.site_id);
+    let self_s = make_self_expr(span);
+    let ma_scale = make_synth_member_access(ctx, self_s, &scale_name, span, sentinel);
+
+    // B.3 Task 5: IA³ has no PTX registry yet (LoRA-only in prescan), so
+    // emit -1 as a sentinel.  The Task-4 CPU stub ignores the handle.
+    let kernel_handle: i64 = -1;
+
+    let callee_id = NodeId::next();
+    ctx.synth_call_overrides
+        .insert(callee_id, "nsl_adapter_fused_ia3_matmul".to_string());
+    let callee = Expr {
+        kind: ExprKind::Ident(sentinel),
+        span,
+        id: callee_id,
+    };
+
+    let args = vec![
+        Arg { name: None, value: lhs_expr, span },
+        Arg { name: None, value: self_w, span },
+        Arg { name: None, value: ma_scale, span },
+        Arg {
+            name: None,
+            value: Expr {
+                kind: ExprKind::IntLiteral(kernel_handle),
+                span,
+                id: NodeId::next(),
+            },
+            span,
+        },
+    ];
+
+    Expr {
+        kind: ExprKind::Call {
+            callee: Box::new(callee),
+            args,
+        },
+        span,
+        id: NodeId::next(),
+    }
+}
+
+/// B.2.1's original IA³ body, preserved verbatim.
+pub fn synthesize_ia3_unfused_mul(
     original: Expr,
     site: &AdapterSite,
     ctx: &mut RewriteContext<'_>,
@@ -447,6 +681,7 @@ pub fn rewrite_expr(mut expr: Expr, ctx: &mut RewriteContext<'_>) -> Expr {
             output_dim: site.output_dim,
             target_model: site.target_model.clone(),
             target_field: site.target_field.clone(),
+            fusion_decision: site.fusion_decision.clone(),
         };
         let lhs_clone = lhs.clone();
         return match site_copy.kind {
@@ -563,6 +798,7 @@ mod tests {
             output_dim: 32,
             target_model: "Toy".to_string(),
             target_field: target_field.to_string(),
+            fusion_decision: None,
         }
     }
 
@@ -664,6 +900,7 @@ mod tests {
             output_dim: 32,
             target_model: "Toy".to_string(),
             target_field: target_field.to_string(),
+            fusion_decision: None,
         }
     }
 

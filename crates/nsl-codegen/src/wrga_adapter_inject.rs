@@ -57,6 +57,13 @@ pub struct AdapterSite {
     /// Target field name on the model struct (e.g. `"w"` for `"m.w"`).
     /// Empty on resolution failure.
     pub target_field: String,
+    /// B.3 Task 4: fusion decision for this site, populated after the
+    /// fusion pass runs.  `None` when no fusion analysis has been run
+    /// (e.g. the prescan path skipped fusion because the target did not
+    /// match).  When `Some(EpilogueFusedLora)` / `Some(ActivationFusedIa3)`
+    /// AND the compile target is sm_80+, the AST rewrite emits the
+    /// single-FFI fused call instead of the unfused triple.
+    pub fusion_decision: Option<crate::wrga_fusion::FusionTarget>,
 }
 
 /// Result of the inject pass.
@@ -151,6 +158,7 @@ pub fn run(plan: &mut WrgaPlan) -> AdapterInjectResult {
             output_dim: 0,
             target_model: String::new(),
             target_field: String::new(),
+            fusion_decision: None,
         });
     }
     AdapterInjectResult { sites }
@@ -295,6 +303,19 @@ pub fn run_with_compiler(
             }
         }
         let _ = var_name; // reserved for later let-binding-type-map resolution
+        // B.3: single-pass epilogue requires rank <= 16. Multi-pass is a
+        // follow-up milestone.
+        if site.rank > 16
+            && matches!(site.kind, AdapterKind::Lora | AdapterKind::GatedLora)
+        {
+            eprintln!(
+                "[wrga] @adapter(target='{}'): rank={} > 16; B.3 single-pass epilogue \
+                 does not support rank > 16.  Use rank <= 16 or await multi-pass support.",
+                site.target_param, site.rank,
+            );
+            site.input_dim = 0;
+            site.output_dim = 0;
+        }
     }
     result
 }

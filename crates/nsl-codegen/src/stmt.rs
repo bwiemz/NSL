@@ -164,7 +164,17 @@ pub(crate) fn invoke_wrga_if_enabled(
     // `last_wrga_plan` is always overwritten — the train-block plan is
     // strictly more informative (real Wengert list, real placements).
     if !inject.sites.is_empty() {
-        compiler.adapter_sites = inject.sites;
+        // B.3 Task 4: wire fusion decisions onto each newly-injected site.
+        let mut sites = inject.sites;
+        for site in sites.iter_mut() {
+            for decision in &plan.fusion.decisions {
+                if decision.site == site.target_param {
+                    site.fusion_decision = Some(decision.target.clone());
+                    break;
+                }
+            }
+        }
+        compiler.adapter_sites = sites;
     }
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)
@@ -3656,11 +3666,32 @@ impl Compiler<'_> {
                 // the test suite and CLI integration tests.
                 if let Some(ref mode_str) = self.compile_options.wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        let plan = crate::wggo::run_on_wengert(
+                        // Build AnalysisConfig from CLI overrides; clamp is
+                        // also applied in analyze(), but applying it here
+                        // keeps the --wggo-report line honest.
+                        let mut analysis_config =
+                            crate::wggo_weight_analysis::AnalysisConfig::default();
+                        if let Some(f) = self.compile_options.wggo_prune_fraction {
+                            analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
+                        }
+                        // Honour `--wggo-importance=none` by clearing the
+                        // weights path — the analyzer then runs against
+                        // NullWeightProvider and produces uniform scores.
+                        let weights_path = match self
+                            .compile_options
+                            .wggo_importance
+                            .as_deref()
+                        {
+                            Some("none") => None,
+                            _ => self.compile_options.wggo_weights.as_deref(),
+                        };
+                        let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
                             &self.compile_options.target,
                             mode_str,
                             self.compile_options.world_size,
+                            weights_path,
+                            analysis_config,
                         );
                         if let Some(plan) = plan {
                             if self.compile_options.wggo_report {
