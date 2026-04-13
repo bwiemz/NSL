@@ -264,17 +264,19 @@ mod tests {
 
     #[test]
     fn null_byte_at_checkpoint_data_boundary_does_not_collide() {
-        // ckpts=["a"] + data="bd" should differ from ckpts=["ab"] + data="d".
+        // Under the pre-fix \0-separator framing, both inputs produced
+        // the byte stream `a\0b\0d\0` and collided.  The length-prefix
+        // framing distinguishes them.
         let a = CacheKey {
-            checkpoint_hashes: vec!["a".into()],
-            calibration_data_hash: "bd".into(),
+            checkpoint_hashes: vec!["a\0b".into()],
+            calibration_data_hash: "d".into(),
             hook_ids_sorted: vec![],
             samples: 1,
             batch_size: 1,
         };
         let b = CacheKey {
-            checkpoint_hashes: vec!["ab".into()],
-            calibration_data_hash: "d".into(),
+            checkpoint_hashes: vec!["a".into()],
+            calibration_data_hash: "b\0d".into(),
             hook_ids_sorted: vec![],
             samples: 1,
             batch_size: 1,
