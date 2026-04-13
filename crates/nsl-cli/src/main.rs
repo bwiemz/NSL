@@ -209,6 +209,10 @@ enum Cli {
         #[arg(long)]
         gpu_mem_report: bool,
 
+        /// Render predicted-vs-actual kernel timings instead of running the program
+        #[arg(long)]
+        monitor: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -974,7 +978,56 @@ fn main_inner() {
             fpga_device,
             cuda_sync,
             gpu_mem_report,
+            monitor,
         } => {
+            if monitor {
+                let profile_args = nsl_cli::profile::ProfileArgs {
+                    file: file.clone(),
+                    target: gpu.clone().unwrap_or_else(|| "h100".to_string()),
+                    dtype: "bf16".into(),
+                    batch: 1,
+                    seq: 2048,
+                    dim: vec![],
+                    fusion: true,
+                    memory: false,
+                    entry: "auto".into(),
+                    json: true,
+                };
+                let report_json = match nsl_cli::profile::run_profile(&profile_args) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                };
+                let report: nsl_codegen::profiling::types::ProfileReport =
+                    match serde_json::from_str(&report_json) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("error: profile JSON parse: {e}");
+                            process::exit(1);
+                        }
+                    };
+                let manifest_path =
+                    match nsl_cli::monitor::write_manifest_beside(&file, &report) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                let actual_path = file.with_extension("nsl-profile-actual.json");
+                match nsl_cli::monitor::run_monitor(&file, &manifest_path, &actual_path) {
+                    Ok(rendered) => {
+                        println!("{}", rendered);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
                 autotune_fresh: false,

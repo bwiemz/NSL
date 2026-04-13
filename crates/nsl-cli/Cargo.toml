@@ -24,6 +24,7 @@ nsl-ast.workspace = true
 nsl-parser.workspace = true
 nsl-semantic.workspace = true
 nsl-codegen.workspace = true
+nsl-runtime = { path = "../nsl-runtime" }
 clap.workspace = true
 serde_json.workspace = true
 safetensors = "0.4"
