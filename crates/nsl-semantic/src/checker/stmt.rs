@@ -325,6 +325,28 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // CEP: @cep_prune / @cep_search decorator validation
+                        if dname == "cep_prune" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cep::validate_cep_prune_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+                        if dname == "cep_search" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cep::validate_cep_search_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // WGGO: @wggo decorator validation
                         if dname == "wggo" {
                             let resolve = |s: nsl_ast::Symbol| -> String {

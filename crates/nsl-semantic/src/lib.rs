@@ -1,4 +1,5 @@
 pub mod builtins;
+pub mod cep;
 pub mod cftp;
 pub mod checker;
 pub mod context_parallel;
