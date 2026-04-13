@@ -59,7 +59,6 @@ pub struct CalibrationDataset {
 #[derive(Debug)]
 enum DatasetKind {
     Bin,
-    #[allow(dead_code)] // populated in Task 5
     Safetensors,
 }
 
@@ -71,6 +70,7 @@ impl CalibrationDataset {
             .map(|s| s.to_ascii_lowercase());
         match ext.as_deref() {
             Some("bin") => Self::open_bin(path),
+            Some("safetensors") => Self::open_safetensors(path),
             other => Err(CalibrationDataError::UnsupportedExtension {
                 path: path.to_path_buf(),
                 extension: other.map(str::to_string),
@@ -109,6 +109,63 @@ impl CalibrationDataset {
         }
         Ok(Self {
             kind: DatasetKind::Bin,
+            num_samples,
+            seq_len,
+            tokens,
+        })
+    }
+
+    fn open_safetensors(path: &Path) -> Result<Self, CalibrationDataError> {
+        let bytes = fs::read(path)?;
+        let st = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| {
+            CalibrationDataError::BadHeader {
+                path: path.to_path_buf(),
+                reason: format!("safetensors parse: {e}"),
+            }
+        })?;
+        // Prefer `input_ids`, fall back to `inputs`.
+        let name = ["input_ids", "inputs"]
+            .iter()
+            .find(|k| st.tensor(k).is_ok())
+            .ok_or_else(|| CalibrationDataError::BadHeader {
+                path: path.to_path_buf(),
+                reason: "no tensor named 'input_ids' or 'inputs' in safetensors file".into(),
+            })?;
+        let tv = st.tensor(name).map_err(|e| CalibrationDataError::BadHeader {
+            path: path.to_path_buf(),
+            reason: format!("tensor {name} not retrievable: {e}"),
+        })?;
+        if tv.dtype() != safetensors::Dtype::I32 {
+            return Err(CalibrationDataError::BadHeader {
+                path: path.to_path_buf(),
+                reason: format!("tensor {name} dtype is {:?}, expected I32", tv.dtype()),
+            });
+        }
+        let shape = tv.shape();
+        if shape.len() != 2 {
+            return Err(CalibrationDataError::BadHeader {
+                path: path.to_path_buf(),
+                reason: format!("tensor {name} has rank {}, expected 2", shape.len()),
+            });
+        }
+        let num_samples = shape[0] as u32;
+        let seq_len = shape[1] as u32;
+        let data = tv.data();
+        let expected_bytes = (num_samples as usize) * (seq_len as usize) * 4;
+        if data.len() < expected_bytes {
+            return Err(CalibrationDataError::Truncated {
+                path: path.to_path_buf(),
+                claimed_bytes: expected_bytes,
+                actual_bytes: data.len(),
+            });
+        }
+        let mut tokens = Vec::with_capacity(expected_bytes / 4);
+        for i in 0..(expected_bytes / 4) {
+            let off = i * 4;
+            tokens.push(i32::from_le_bytes(data[off..off + 4].try_into().unwrap()));
+        }
+        Ok(Self {
+            kind: DatasetKind::Safetensors,
             num_samples,
             seq_len,
             tokens,
@@ -210,6 +267,65 @@ mod tests {
         match CalibrationDataset::open(&p) {
             Err(CalibrationDataError::Truncated { .. }) => {}
             other => panic!("expected Truncated, got {other:?}"),
+        }
+        let _ = fs::remove_file(&p);
+    }
+
+    fn write_safetensors_input_ids(path: &std::path::Path, samples: u64, seq_len: u64) {
+        // Minimal safetensors blob: one tensor named "input_ids", shape
+        // [samples, seq_len], dtype I32.  Header is JSON:
+        //   {"input_ids":{"dtype":"I32","shape":[samples,seq_len],"data_offsets":[0,nbytes]}}
+        let nbytes = (samples * seq_len * 4) as usize;
+        let header_json = format!(
+            r#"{{"input_ids":{{"dtype":"I32","shape":[{samples},{seq_len}],"data_offsets":[0,{nbytes}]}}}}"#
+        );
+        let header_bytes = header_json.into_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&header_len.to_le_bytes());
+        blob.extend_from_slice(&header_bytes);
+        for i in 0..(samples * seq_len) as i32 {
+            blob.extend_from_slice(&i.to_le_bytes());
+        }
+        fs::write(path, blob).unwrap();
+    }
+
+    #[test]
+    fn opens_safetensors_and_reports_sample_count() {
+        let p = tmp("safetensors");
+        write_safetensors_input_ids(&p, 3, 5);
+        let ds = CalibrationDataset::open(&p).unwrap();
+        assert_eq!(ds.num_samples(), 3);
+        assert_eq!(ds.seq_len(), 5);
+        assert!(!ds.kind_is_bin());
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn safetensors_sample_tokens_match_sequential_fill() {
+        let p = tmp("safetensors");
+        write_safetensors_input_ids(&p, 2, 4);
+        let ds = CalibrationDataset::open(&p).unwrap();
+        assert_eq!(ds.sample_tokens(0), vec![0, 1, 2, 3]);
+        assert_eq!(ds.sample_tokens(1), vec![4, 5, 6, 7]);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn safetensors_missing_input_ids_errors() {
+        let p = tmp("safetensors");
+        let header = r#"{"other":{"dtype":"I32","shape":[2,2],"data_offsets":[0,16]}}"#;
+        let hb = header.as_bytes();
+        let mut blob = (hb.len() as u64).to_le_bytes().to_vec();
+        blob.extend_from_slice(hb);
+        blob.extend_from_slice(&[0u8; 16]);
+        fs::write(&p, blob).unwrap();
+        match CalibrationDataset::open(&p) {
+            Err(CalibrationDataError::BadHeader { reason, .. }) => {
+                assert!(reason.contains("input_ids") || reason.contains("inputs"));
+            }
+            other => panic!("expected BadHeader, got {other:?}"),
         }
         let _ = fs::remove_file(&p);
     }
