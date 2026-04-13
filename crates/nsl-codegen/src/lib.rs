@@ -1,5 +1,6 @@
 pub mod autotune;
 pub mod builtins;
+pub mod calibration;
 pub mod compiler;
 pub mod context;
 pub mod context_parallel;
@@ -450,6 +451,16 @@ pub struct CompileOptions {
     pub csha_mode: Option<String>,
     /// CSHA: print the attention-fusion report to stderr.
     pub csha_report: bool,
+    /// Path to calibration dataset (`.bin` or `.safetensors`).  When
+    /// `None`, calibration is skipped entirely and consumers fall back
+    /// to their static paths.
+    pub calibration_data: Option<std::path::PathBuf>,
+    /// Failure-handling mode: `"required"` (default) aborts on infra
+    /// failure, `"best-effort"` warns and falls back.  See spec §6.
+    pub calibration_mode: Option<String>,
+    pub calibration_samples: u32,
+    pub calibration_batch_size: u32,
+    pub calibration_timeout_secs: u64,
 }
 
 impl Default for CompileOptions {
@@ -499,6 +510,26 @@ impl Default for CompileOptions {
             wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
+            calibration_data: None,
+            calibration_mode: Some("required".to_string()),
+            calibration_samples: 512,
+            calibration_batch_size: 8,
+            calibration_timeout_secs: 600,
         }
+    }
+}
+
+#[cfg(test)]
+mod calib_options_tests {
+    use super::*;
+
+    #[test]
+    fn default_has_no_calibration_data() {
+        let o = CompileOptions::default();
+        assert!(o.calibration_data.is_none());
+        assert_eq!(o.calibration_mode.as_deref(), Some("required"));
+        assert_eq!(o.calibration_samples, 512);
+        assert_eq!(o.calibration_batch_size, 8);
+        assert_eq!(o.calibration_timeout_secs, 600);
     }
 }
