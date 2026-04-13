@@ -263,6 +263,48 @@ fn resolve_gpu(name: &str) -> &'static GpuSpec {
     find_gpu(name).unwrap_or_else(default_gpu)
 }
 
+/// Convenience: run WGGO on a Wengert list with default cluster/importance/
+/// LUT axes.  Used by the compile-pipeline integration point so callers
+/// don't have to hand-assemble `WggoInput`.
+///
+/// * `target` — GPU name (e.g. "H100"); falls back to the default when
+///              unknown.
+/// * `mode_str` — "full" | "greedy" | "off" | "auto" | "disable".
+///              Returns `None` if the string is invalid.
+/// * `world_size` — number of devices (drives the `ClusterSpec`).
+pub fn run_on_wengert(
+    wengert: &WengertList,
+    target: &str,
+    mode_str: &str,
+    world_size: usize,
+) -> Option<WggoPlan> {
+    let mode = WggoMode::parse(mode_str)?;
+    let cluster = ClusterSpec {
+        num_gpus: world_size.max(1) as u32,
+        ..ClusterSpec::default()
+    };
+    let input = WggoInput {
+        mode,
+        target,
+        wengert,
+        // Reasonable defaults for a small transformer layer; used only to
+        // size the LUT — the graph drives which layers are present.
+        layer_shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
+        cluster,
+        lut_axes: LutAxes::default(),
+        importance: ImportanceScores::default(),
+        ilp_constraints: Vec::new(),
+    };
+    Some(run(input))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -396,5 +438,26 @@ mod tests {
             assert_eq!(WggoMode::parse(m.as_str()), Some(m));
         }
         assert!(WggoMode::parse("nonsense").is_none());
+    }
+
+    #[test]
+    fn run_on_wengert_accepts_canonical_mode_strings() {
+        let w = two_block_wengert();
+        for mode in ["full", "greedy", "off", "auto"] {
+            let plan = run_on_wengert(&w, "H100", mode, 1);
+            assert!(plan.is_some(), "mode '{}' should be accepted", mode);
+        }
+        assert!(run_on_wengert(&w, "H100", "nonsense", 1).is_none());
+    }
+
+    #[test]
+    fn run_on_wengert_propagates_world_size() {
+        // ClusterSpec is buried inside InterLayerPlan's source — we can't
+        // read it back directly, but we can verify the plan is produced
+        // without panicking for a multi-GPU cluster.
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        assert_eq!(plan.mode, WggoMode::Full);
+        assert!(!plan.inter_layer.layers.is_empty());
     }
 }

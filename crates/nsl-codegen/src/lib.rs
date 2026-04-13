@@ -412,6 +412,11 @@ pub struct CompileOptions {
     /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
     /// allocations (vs. B.1's observational-only path). Default false.
     pub wrga_fold_allocations: bool,
+    /// WGGO: global optimization mode ("full", "greedy", "off"). When `None`,
+    /// WGGO is not run.  See `crates/nsl-codegen/src/wggo.rs`.
+    pub wggo_mode: Option<String>,
+    /// WGGO: print the global-optimization report to stderr.
+    pub wggo_report: bool,
 }
 
 impl Default for CompileOptions {
@@ -454,6 +459,8 @@ impl Default for CompileOptions {
             shared_lib: false,
             wrga_inputs: None,
             wrga_fold_allocations: false,
+            wggo_mode: None,
+            wggo_report: false,
         }
     }
 }
