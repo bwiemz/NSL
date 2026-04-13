@@ -8,6 +8,7 @@ pub mod hooks;
 pub mod observation;
 pub mod registry;
 pub mod sidecar;
+pub mod subprocess;
 
 pub use ctx::CalibCtx;
 pub use hooks::{CalibrationHook, CalibrationResult};
