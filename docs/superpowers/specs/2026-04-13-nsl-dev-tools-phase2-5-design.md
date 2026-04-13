@@ -95,15 +95,37 @@ pub fn apply_reduction_fusion(
 
 ### 4.3 Pre-pass fusion-plan wire-up
 
-In `run_profile_pre_pass`, around the current `compiler.fusion_plan_for_profile = None;` line:
+**Ordering constraint.** Epilogue/reduction fusion decisions happen *during* function-body codegen, after `run_profile_pre_pass` runs. If the pre-pass clones `last_wrga_plan.fusion` into `fusion_plan_for_profile` once and stops, the clone captures WRGA-level adapter fusion but not the codegen-level fusion that runs later. `fusion_constituents` reads `self.fusion_plan_for_profile` (`compiler/mod.rs:562`), so those later decisions must land in that same instance.
+
+Fix: the pre-pass *seeds* `fusion_plan_for_profile = Some(...)` (copying WRGA's groups if present, else a fresh empty plan), and the epilogue/reduction passes receive a `&mut FusionPlan` that points into this field. Both passes mutate the Compiler-owned plan in-place, so `fusion_constituents` at launch-emit time reads the fully populated groups.
 
 ```rust
-compiler.fusion_plan_for_profile = compiler.last_wrga_plan
+let seeded = compiler.last_wrga_plan
     .as_ref()
-    .map(|p| p.fusion.clone());
+    .map(|p| p.fusion.clone())
+    .unwrap_or_default();
+compiler.fusion_plan_for_profile = Some(seeded);
 ```
 
-When `last_wrga_plan` is `None` (pure-inference compile), `fusion_plan_for_profile` remains `None` and `fusion_constituents(root)` returns `vec![root]`. For inference-only compiles, epilogue/reduction fusion still slightly under-predicts until Phase 3 adds a pure-inference fusion-plan carrier. Documented as Phase 3 follow-up.
+Callers of `apply_epilogue_fusion` and `apply_reduction_fusion` that have `&mut Compiler` in scope pass `compiler.fusion_plan_for_profile.as_mut().expect("profile pre-pass seeds Some")`. Call sites that don't have a Compiler (standalone tests, pure-graph utilities) pass `&mut FusionPlan::default()` — those paths never feed the profiler so the groups are discarded harmlessly.
+
+For compiles with `profile_kernels = false`, `fusion_plan_for_profile` stays `None` (pre-pass never runs). Call sites must handle this by falling back to `&mut FusionPlan::default()` when the option is `None`. Cheap helper on `Compiler`:
+
+```rust
+impl Compiler<'_> {
+    pub fn profile_fusion_plan_mut(&mut self) -> Option<&mut FusionPlan> {
+        self.fusion_plan_for_profile.as_mut()
+    }
+}
+```
+
+Fusion-pass call sites become:
+
+```rust
+let mut scratch = FusionPlan::default();
+let plan = compiler.profile_fusion_plan_mut().unwrap_or(&mut scratch);
+apply_epilogue_fusion(graph, chains, kid, plan);
+```
 
 ### 4.4 Source-text disk fallback
 
@@ -150,12 +172,14 @@ apply_reduction_fusion(plan: &mut)    [§4.2] → plan.fused_node_groups[root] =
 - Source file missing on disk: empty `source_text`, line numbers degrade to 1 (same as pre-Phase-2.5 default). No error.
 - `last_wrga_plan` is `None`: `fusion_plan_for_profile` stays `None`, `fusion_constituents` returns `vec![root]`. Epilogue/reduction fusion in pure-inference compiles under-predicts on fused kernels (Phase 3 follow-up).
 - Call-site plan sharing: sites that previously built a fresh `FusionPlan` per-call now need to share one with the constituent-fusion passes. Isolated test harnesses use `FusionPlan::default()` and accept empty groups.
+- Read path consistency: `Compiler::fusion_constituents` reads `self.fusion_plan_for_profile`. The pre-pass seeds that field with `Some(...)`, and the epilogue/reduction passes mutate it in-place via `profile_fusion_plan_mut`. If any fusion call site forgets to thread the Compiler-owned plan and passes a throwaway `&mut FusionPlan` instead, its groups silently don't flow into predictions. Spec test §7 covers this: an epilogue fusion run against the Compiler-owned plan must make the groups visible via `fusion_constituents`.
 
 ## 7. Testing
 
 - **Unit (epilogue_fusion):** synthetic chain populates `fused_node_groups[matmul_node] == [matmul_node, ...epilogue_nodes]`.
 - **Unit (reduction_fusion):** synthetic match populates `fused_node_groups[root_node] == all_matched_nodes`.
 - **Unit (pre-pass wire-up):** mock `last_wrga_plan` with a non-empty `fusion.fused_node_groups`; `run_profile_pre_pass` copies it so `compiler.fusion_constituents(root)` returns the full Vec.
+- **Unit (read path):** after pre-pass, call `apply_epilogue_fusion` with `compiler.profile_fusion_plan_mut().unwrap()` as the plan argument; then `compiler.fusion_constituents(matmul_root)` must return the full constituent vec including the eliminated epilogue nodes. Guards against the regression where epilogue/reduction groups land in a throwaway plan.
 - **Unit (source fallback):** `run_profile_pre_pass` with `profile_source_file_name = Some(tempfile_path)` and `profile_source_text = None` populates `compiler.source_text` with the file contents.
 - **Regression:** all existing `profiling_*`, `wrga_fusion_groups`, `epilogue_fusion`, `reduction_fusion`, and `monitor_e2e` tests still pass.
 
