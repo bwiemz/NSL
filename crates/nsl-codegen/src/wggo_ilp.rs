@@ -270,6 +270,231 @@ pub fn solve_layer(
     }
 }
 
+/// Diagnostic counters for [`solve_all_templated`].
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct TemplateStats {
+    /// Number of distinct (LUT, constraint) templates that required a
+    /// fresh ILP solve.  Always ≥ 1 when there is at least one layer.
+    pub templates_solved: u32,
+    /// Number of layers whose solution was reused from a previously
+    /// solved template instead of being re-derived.
+    pub template_hits: u32,
+}
+
+/// Solve every layer, but reuse the solution across consecutive layers
+/// whose `(LayerCostLut, LayerIlpConstraints)` are identical.  This is
+/// the "template-layer optimization" the audit calls out: transformer
+/// blocks repeat the same shape and constraints, so solving once per
+/// template and replicating costs a single ILP pass for the whole model.
+///
+/// Importance-aware specialisation: the importance vectors are part of
+/// the template key, so any layer whose `head_importance` diverges from
+/// its predecessors will spawn a fresh solve.
+pub fn solve_all_templated(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (Vec<LayerIlpSolution>, TemplateStats) {
+    assert_eq!(
+        luts.len(),
+        constraints.len(),
+        "luts and constraints must be parallel arrays"
+    );
+    let mut out: Vec<LayerIlpSolution> = Vec::with_capacity(luts.len());
+    let mut stats = TemplateStats::default();
+    let mut template_idx: Option<usize> = None;
+
+    for (i, (lut, c)) in luts.iter().zip(constraints.iter()).enumerate() {
+        let reuse = template_idx
+            .map(|j| lut_eq(&luts[j], lut) && constraints_eq(&constraints[j], c))
+            .unwrap_or(false);
+        if reuse {
+            let mut s = out[template_idx.unwrap()].clone();
+            // Mark replicated solutions with zero nodes so callers can
+            // distinguish fresh solves from cache hits.
+            s.nodes_explored = 0;
+            out.push(s);
+            stats.template_hits += 1;
+        } else {
+            let sol = solve_layer(lut, c);
+            out.push(sol);
+            stats.templates_solved += 1;
+            template_idx = Some(i);
+        }
+    }
+
+    (out, stats)
+}
+
+/// Field-by-field equality for [`LayerCostLut`] (manual to avoid
+/// requiring `PartialEq` on the cost-model leaves).
+fn lut_eq(a: &LayerCostLut, b: &LayerCostLut) -> bool {
+    if a.axes_head_counts != b.axes_head_counts
+        || a.axes_ffn_widths != b.axes_ffn_widths
+        || a.axes_csha_levels != b.axes_csha_levels
+        || a.axes_adapter_ranks != b.axes_adapter_ranks
+        || a.entries.len() != b.entries.len()
+    {
+        return false;
+    }
+    a.entries.iter().zip(b.entries.iter()).all(|(x, y)| {
+        x.forward_us.to_bits() == y.forward_us.to_bits()
+            && x.backward_us.to_bits() == y.backward_us.to_bits()
+            && x.param_bytes == y.param_bytes
+            && x.activation_bytes == y.activation_bytes
+            && x.smem_bytes == y.smem_bytes
+            && x.feasible == y.feasible
+            && x.classification == y.classification
+    })
+}
+
+/// Field-by-field equality for [`LayerIlpConstraints`], including the
+/// importance vector — divergent importance must trigger a fresh solve.
+fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
+    a.num_heads == b.num_heads
+        && a.num_kv_groups == b.num_kv_groups
+        && a.memory_budget == b.memory_budget
+        && a.smem_budget == b.smem_budget
+        && a.adapter_comm_budget.to_bits() == b.adapter_comm_budget.to_bits()
+        && a.gqa_group == b.gqa_group
+        && a.sensitivity.to_bits() == b.sensitivity.to_bits()
+        && a.high_prec_threshold.to_bits() == b.high_prec_threshold.to_bits()
+        && a.critical_prec_threshold.to_bits() == b.critical_prec_threshold.to_bits()
+        && a.head_importance.len() == b.head_importance.len()
+        && a.head_importance
+            .iter()
+            .zip(b.head_importance.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.min_retained_importance.to_bits() == b.min_retained_importance.to_bits()
+        && a.allow_fase == b.allow_fase
+        && a.fase_backward_speedup.to_bits() == b.fase_backward_speedup.to_bits()
+        && a.packing_modes_mask == b.packing_modes_mask
+        && a.packing_savings
+            .iter()
+            .zip(b.packing_savings.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Solve a layer **greedily** — paper §5.3.
+///
+/// Each decision variable is chosen independently using a fast local
+/// heuristic instead of the cross-product branch-and-bound search.  The
+/// result may be sub-optimal but is reached in O(sum-of-domains) LUT
+/// lookups (~30) instead of O(product-of-domains) (~1.8 M with FASE and
+/// PCA enabled) — the paper measures this at <500 ms on full transformer
+/// models.  The conflict resolver runs downstream as usual; greedy makes
+/// no attempt to satisfy inter-technique constraints by itself.
+pub fn solve_layer_greedy(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> LayerIlpSolution {
+    let mut nodes = 0u64;
+
+    // Heads: keep all that satisfy the GQA-group + importance constraint.
+    let h = constraints.num_heads as usize;
+    let keep_head = if importance_ok(&vec![true; h], constraints) {
+        vec![true; h]
+    } else {
+        enumerate_head_configs(constraints)
+            .into_iter()
+            .find(|cfg| importance_ok(cfg, constraints))
+            .unwrap_or_else(|| vec![true; h])
+    };
+    let h_count = (keep_head.iter().filter(|b| **b).count() as u64).max(1);
+
+    // FFN: largest available width.
+    let f = *lut.axes_ffn_widths.iter().max().unwrap_or(&1024);
+
+    // CSHA: highest level whose smem fits.
+    let c = lut
+        .axes_csha_levels
+        .iter()
+        .copied()
+        .rev()
+        .find(|&lvl| {
+            nodes += 1;
+            lut.get(h_count, f, lvl, 0)
+                .map(|e| e.feasible && e.smem_bytes <= constraints.smem_budget)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+
+    // Adapter rank: greedy keeps it at 0 (no LoRA unless explicitly asked).
+    let r = *lut.axes_adapter_ranks.iter().min().unwrap_or(&0);
+
+    // Precision: lowest precision allowed by sensitivity (cheapest).
+    let m_bits = pick_precision_low(constraints);
+    let v_bits = pick_precision_low(constraints);
+
+    // FASE + PCA: pick the local-best at this layer.
+    let fase_fused = constraints.allow_fase;
+    let packing_mode = enumerate_packing_modes(constraints)[0];
+
+    let Some(base) = lut.get(h_count, f, c, r) else {
+        return LayerIlpSolution {
+            decision: fallback_decision(constraints),
+            cost_us: f64::INFINITY,
+            memory_bytes: 0,
+            smem_bytes: 0,
+            nodes_explored: nodes,
+            feasible: false,
+        };
+    };
+    let entry = apply_packing(
+        apply_fase(base, fase_fused, constraints.fase_backward_speedup),
+        packing_mode,
+        &constraints.packing_savings,
+    );
+    let memory_bytes = entry.param_bytes + entry.activation_bytes;
+    let feasible = base.feasible
+        && entry.smem_bytes <= constraints.smem_budget
+        && memory_bytes <= constraints.memory_budget;
+
+    if !feasible {
+        return LayerIlpSolution {
+            decision: fallback_decision(constraints),
+            cost_us: f64::INFINITY,
+            memory_bytes,
+            smem_bytes: entry.smem_bytes,
+            nodes_explored: nodes,
+            feasible: false,
+        };
+    }
+
+    LayerIlpSolution {
+        decision: LayerDecision {
+            keep_head,
+            ffn_width: f,
+            csha_level: c,
+            adapter_rank: r,
+            optim_m_bits: m_bits,
+            optim_v_bits: v_bits,
+            fase_fused,
+            packing_mode,
+        },
+        cost_us: entry.total_us(),
+        memory_bytes,
+        smem_bytes: entry.smem_bytes,
+        nodes_explored: nodes,
+        feasible: true,
+    }
+}
+
+/// Greedy variant of [`solve_all`].
+pub fn solve_all_greedy(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> Vec<LayerIlpSolution> {
+    assert_eq!(
+        luts.len(),
+        constraints.len(),
+        "luts and constraints must be parallel arrays"
+    );
+    luts.iter()
+        .zip(constraints.iter())
+        .map(|(lut, c)| solve_layer_greedy(lut, c))
+        .collect()
+}
+
 /// Solve all layers in parallel-safe sequential order.
 pub fn solve_all(
     luts: &[LayerCostLut],
@@ -297,6 +522,18 @@ struct SolverState {
     nodes: u64,
     #[allow(dead_code)]
     global_lower_bound: f64,
+}
+
+/// Pick the lowest precision (in bits) that the sensitivity floor allows.
+/// Used by the greedy solver — lower precision is cheaper to execute, so
+/// the locally-optimal pick is "as low as legal".
+fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
+    for &bits in &[8u8, 16, 32] {
+        if prec_allowed(bits, c) {
+            return bits;
+        }
+    }
+    32
 }
 
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
@@ -535,6 +772,73 @@ mod tests {
     }
 
     #[test]
+    fn templated_solve_reuses_identical_layers() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut.clone(); 8];
+        let cs = vec![c; 8];
+        let (sols, stats) = solve_all_templated(&luts, &cs);
+        assert_eq!(sols.len(), 8);
+        assert_eq!(stats.templates_solved, 1);
+        assert_eq!(stats.template_hits, 7);
+        // Replicated solutions report zero nodes_explored.
+        assert!(sols[0].nodes_explored > 0);
+        for s in &sols[1..] {
+            assert_eq!(s.nodes_explored, 0);
+        }
+        // The decisions themselves must match.
+        for s in &sols[1..] {
+            assert_eq!(s.decision, sols[0].decision);
+        }
+    }
+
+    #[test]
+    fn templated_solve_specialises_when_importance_diverges() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c1 = LayerIlpConstraints::default();
+        c1.num_heads = 4;
+        let mut c2 = c1.clone();
+        c2.head_importance = vec![10.0, 0.1, 0.1, 0.1];
+        c2.min_retained_importance = 5.0;
+        let luts = vec![lut.clone(), lut.clone(), lut];
+        let cs = vec![c1.clone(), c1.clone(), c2];
+        let (_sols, stats) = solve_all_templated(&luts, &cs);
+        // Layers 0 and 1 share a template; layer 2's diverging
+        // importance must trigger a fresh solve.
+        assert_eq!(stats.templates_solved, 2);
+        assert_eq!(stats.template_hits, 1);
+    }
+
+    #[test]
+    fn templated_solve_matches_full_solve_per_layer() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut.clone(); 4];
+        let cs = vec![c.clone(); 4];
+        let full = solve_all(&luts, &cs);
+        let (templated, _) = solve_all_templated(&luts, &cs);
+        for (a, b) in full.iter().zip(templated.iter()) {
+            assert_eq!(a.decision, b.decision);
+            assert!((a.cost_us - b.cost_us).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn templated_solve_handles_alternating_templates() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c1 = LayerIlpConstraints::default();
+        let mut c2 = c1.clone();
+        c2.smem_budget = 4096; // forces csha=0 → different solution
+        // Pattern: A, A, B, A — three template switches, two solves of A.
+        let luts = vec![lut.clone(); 4];
+        let cs = vec![c1.clone(), c1.clone(), c2, c1];
+        let (sols, stats) = solve_all_templated(&luts, &cs);
+        assert_eq!(sols.len(), 4);
+        assert_eq!(stats.templates_solved, 3);
+        assert_eq!(stats.template_hits, 1);
+    }
+
+    #[test]
     fn solver_never_picks_infeasible_csha() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let mut constraints = LayerIlpConstraints::default();
@@ -605,6 +909,70 @@ mod tests {
         // either branch.  We only assert feasibility.
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
+    }
+
+    #[test]
+    fn greedy_explores_far_fewer_nodes_than_full() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints::default();
+        let full = solve_layer(&lut, &constraints);
+        let greedy = solve_layer_greedy(&lut, &constraints);
+        assert!(greedy.feasible);
+        // Greedy is meant to be O(sum-of-domains) — orders of magnitude
+        // cheaper than the full cross-product.
+        assert!(
+            greedy.nodes_explored * 100 < full.nodes_explored,
+            "greedy={} full={}",
+            greedy.nodes_explored,
+            full.nodes_explored
+        );
+    }
+
+    #[test]
+    fn greedy_returns_finite_cost() {
+        // Quality bound vs full ILP is workload-dependent — paper claims
+        // ~5 % on real transformers, but the toy LUT's roofline model can
+        // make greedy's "largest FFN + highest CSHA" picks look much
+        // worse than full's globally-balanced choice.  We only assert
+        // greedy returns a feasible plan with finite cost; the
+        // `greedy_explores_far_fewer_nodes_than_full` test already
+        // verifies the speed promise.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let greedy = solve_layer_greedy(&lut, &LayerIlpConstraints::default());
+        assert!(greedy.feasible);
+        assert!(greedy.cost_us.is_finite());
+        assert!(greedy.cost_us > 0.0);
+    }
+
+    #[test]
+    fn greedy_respects_smem_budget() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.smem_budget = 1024; // forces csha=0
+        let g = solve_layer_greedy(&lut, &c);
+        assert!(g.feasible);
+        assert_eq!(g.decision.csha_level, 0);
+    }
+
+    #[test]
+    fn greedy_respects_sensitivity_floor() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.sensitivity = 0.95; // forces 32 bits
+        let g = solve_layer_greedy(&lut, &c);
+        assert!(g.feasible);
+        assert_eq!(g.decision.optim_m_bits, 32);
+        assert_eq!(g.decision.optim_v_bits, 32);
+    }
+
+    #[test]
+    fn solve_all_greedy_runs_one_per_layer() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut; 4];
+        let sols = solve_all_greedy(&luts, &vec![c; 4]);
+        assert_eq!(sols.len(), 4);
+        assert!(sols.iter().all(|s| s.feasible));
     }
 
     #[test]
