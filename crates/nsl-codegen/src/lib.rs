@@ -117,6 +117,8 @@ pub mod debug_channels {
     use std::cell::Cell;
     thread_local! {
         pub static ADJOINT_OPS_DROPPED: Cell<Option<usize>> = const { Cell::new(None) };
+        pub static ALLOC_SLOTS_PRE_HINT: Cell<Option<usize>> = const { Cell::new(None) };
+        pub static ALLOC_SLOTS_POST_HINT: Cell<Option<usize>> = const { Cell::new(None) };
     }
 }
 
@@ -128,6 +130,28 @@ pub fn debug_set_adjoint_ops_dropped(n: usize) {
 #[doc(hidden)]
 pub fn debug_last_adjoint_ops_dropped() -> Option<usize> {
     debug_channels::ADJOINT_OPS_DROPPED.with(|c| c.get())
+}
+
+#[doc(hidden)]
+pub fn debug_set_allocator_slot_count_pre_hint(n: usize) {
+    debug_channels::ALLOC_SLOTS_PRE_HINT.with(|c| c.set(Some(n)));
+}
+#[doc(hidden)]
+pub fn debug_last_allocator_slot_count_pre_hint() -> Option<usize> {
+    debug_channels::ALLOC_SLOTS_PRE_HINT.with(|c| c.get())
+}
+#[doc(hidden)]
+pub fn debug_set_allocator_slot_count_post_hint(n: usize) {
+    debug_channels::ALLOC_SLOTS_POST_HINT.with(|c| c.set(Some(n)));
+}
+#[doc(hidden)]
+pub fn debug_last_allocator_slot_count_post_hint() -> Option<usize> {
+    debug_channels::ALLOC_SLOTS_POST_HINT.with(|c| c.get())
+}
+#[doc(hidden)]
+pub fn debug_clear_allocator_slot_channels() {
+    debug_channels::ALLOC_SLOTS_PRE_HINT.with(|c| c.set(None));
+    debug_channels::ALLOC_SLOTS_POST_HINT.with(|c| c.set(None));
 }
 
 pub use error::CodegenError;
