@@ -27,7 +27,7 @@
 //! See `docs/plans/2026-04-13-wggo-weight-analysis-design.md` for the
 //! full design, rationale, and Phase-2 plan.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::wggo_cost::LayerShape;
 use crate::wggo_graph::OptGraph;
@@ -60,7 +60,7 @@ impl WeightProvider for NullWeightProvider {
 }
 
 /// Importance data for one layer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerImportance {
     /// Per-Q-head score; length == `num_heads`.  Normalised so
     /// `Σ head_scores ≈ num_heads` (uniform distribution when all
