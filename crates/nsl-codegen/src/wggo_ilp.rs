@@ -23,9 +23,32 @@
 //! The solver's bounding function uses the LUT's `argmin_feasible` as a
 //! global lower bound and prunes aggressively.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::wggo_cost::{LayerCostEntry, LayerCostLut};
+
+/// The kind of decision recorded in a [`DecisionTrace`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DecisionKind {
+    CepHeadPrune,
+    CshaLevel,
+    WrgaAdapter,
+    CpdtPrecision,
+}
+
+/// A human-readable record of one ILP decision, suitable for reporting.
+///
+/// Populated by `solve_layer` (Phase 3 Task 2) and rendered by the
+/// dev-tools CLI (Phase 3 Tasks 3/4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionTrace {
+    pub kind: DecisionKind,
+    pub chosen: String,
+    pub runner_up: Option<String>,
+    pub binding_constraint: Option<String>,
+    pub metric_summary: String,
+    pub cross_decision_note: Option<String>,
+}
 
 /// Integer decision variables for one layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -114,6 +137,10 @@ pub struct LayerIlpSolution {
     pub nodes_explored: u64,
     /// Whether the solver found a feasible assignment at all.
     pub feasible: bool,
+    /// Human-readable decision records for reporting.  Populated by
+    /// `solve_layer` in Phase 3 Task 2; empty until then.
+    #[serde(default)]
+    pub decision_trace: Vec<DecisionTrace>,
 }
 
 /// Solve the Level-2 ILP for a single layer.
@@ -203,6 +230,7 @@ pub fn solve_layer(
                 smem_bytes: entry.smem_bytes,
                 nodes_explored: state.nodes,
                 feasible: true,
+                decision_trace: Vec::new(),
             }
         }
         None => LayerIlpSolution {
@@ -212,6 +240,7 @@ pub fn solve_layer(
             smem_bytes: 0,
             nodes_explored: state.nodes,
             feasible: false,
+            decision_trace: Vec::new(),
         },
     }
 }
