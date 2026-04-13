@@ -31,9 +31,11 @@ Tasks run in this sequence because each downstream task benefits from the previo
 
 **What it does.** The helper in `crates/nsl-codegen/src/lib.rs` currently parses and analyses only the caller's single source. When that source includes `train(...): optimizer: sgd(lr=...)`, codegen hits `undefined function 'nsl__optim__sgd__sgd_step'` because the stdlib module graph wasn't loaded. Fix so the helper loads stdlib the way `nsl-cli`'s `frontend()` does.
 
-**Primary approach.** Factor the module-graph-loading logic from `crates/nsl-cli/src/loader.rs` into a reusable free function (or small struct) that both `nsl-cli` and `debug_compile_and_return_plan` call. `nsl-cli` stays the canonical compile flow; `debug_compile_and_return_plan` becomes a thin wrapper.
+**Primary approach.** Factor the module-graph-loading logic from `crates/nsl-cli/src/loader.rs` into a reusable free function inside **`nsl-codegen`** (NOT `nsl-runtime` — keeping the runtime crate minimal is a deliberate constraint since it gets linked into deployable binaries). `nsl-cli`'s existing loader calls into the extracted function. `debug_compile_and_return_plan` in nsl-codegen uses it directly. If the shared surface is too narrow for a pub nsl-codegen function (e.g., loader internals are CLI-specific), put it in a new `crates/nsl-codegen/src/stdlib_loader.rs` private module and expose only the narrow helper `debug_compile_and_return_plan` needs.
 
 **Fallback.** If the existing loader is too entangled with CLI state to extract cleanly, inline a minimal stdlib loader in `debug_compile_and_return_plan` that resolves `NSL_STDLIB_PATH` and loads `nsl/optim/*.nsl` plus the minimal set of imports needed by the failing test. Document the limitation; a fuller refactor lands as a follow-up.
+
+**Non-goal.** Do NOT introduce file-I/O or path-resolution logic into `nsl-runtime`. That crate's footprint is a constraint.
 
 **Acceptance.**
 - The B.1 Task 5 non-training workaround test (`no_wrga_inputs_skips_wrga_run_on_simple_compile`) grows a sibling test using a real `train(...): optimizer: sgd(lr=1e-3)` source. Both pass.
@@ -56,13 +58,26 @@ Tasks run in this sequence because each downstream task benefits from the previo
 
 **Site identifier.** A stable `<layer_name>__<kind>` string (e.g. `blocks_0_attn_q__lora`) derived from the decorator's `target` glob + adapter kind. Deterministic across compiles so checkpoints round-trip.
 
-**Initialization.** Emitted by the codegen pass as part of the model's construction path. LoRA `A` = Kaiming-uniform, `B` = zeros; IA³ = ones; GatedLoRA `gate` = zeros. Hardcoded constants for B.2 — configurable init via `@adapter(init=...)` becomes a follow-up if needed.
+**Initialization.** Emitted by the codegen pass as part of the model's construction path with **strict, explicit initializers** — never rely on default init for these fields, since "default" may be random noise that corrupts the base-model trajectory on step 0.
 
-**Forward-pass threading.** The same codegen pass rewrites forward-path matmul calls at adapter sites to apply the adapter. For LoRA, the unfused rewrite is:
+- LoRA: `A` = Kaiming-uniform (variance-scaling); `B` = **strict zeros via `nsl_tensor_zeros`**.
+- IA³: `ia3_scale` = ones.
+- GatedLoRA: A/B as LoRA; `gate` = strict zeros.
+
+Hardcoded constants for B.2 — configurable init via `@adapter(init=...)` becomes a follow-up if demand appears.
+
+**Scaling factor (alpha/rank).** Standard LoRA convention requires a scaling factor so changing rank doesn't silently force a learning-rate retune. The `@adapter` decorator gains an optional `alpha: i64` argument; default is `alpha = rank` (→ scaling = 1.0). The forward-pass rewrite for LoRA is:
+
 ```
-y = x @ W + (x @ A) @ B
+scale = alpha as f32 / rank as f32
+y = x @ W + ((x @ A) @ B) * scale
 ```
-This is slow — two extra matmuls per site — but it is correct, produces real numerical output, and is what the B.3 MMA epilogue will later collapse into one fused kernel.
+
+IA³ and GatedLoRA do not use alpha. `@adapter(alpha=...)` without `rank=...` is accepted; `@adapter(alpha=...)` on a non-LoRA type emits a semantic warning and is ignored.
+
+**Forward-pass threading.** The same codegen pass rewrites forward-path matmul calls at adapter sites to apply the adapter using the scaled expression above. This is slow — two extra matmuls plus an elementwise scale+add per site, with a VRAM round-trip on the intermediate `x @ A` — but it is correct, produces real numerical output, and is exactly what the B.3 MMA epilogue will later collapse into one fused kernel.
+
+**Expected performance regression in B.2 (intentional).** Models compiled with `@adapter(type=lora, ...)` will run measurably slower after B.2 than before (before B.2 the decorator had no runtime effect). Per-site overhead: two extra `nsl_matmul` launches plus a scale+add elementwise launch, with VRAM materialization of the `x @ A` intermediate. CI perf gates should either (a) exclude adapter-enabled benchmarks from B.2's baseline, or (b) be updated to reflect the expected interim cost. The regression is resolved when B.3's MMA epilogue lands and collapses the three kernels into one fused pass.
 
 **Serialization.** The synthesized fields are real model fields, so the existing `save_model` / `load_model` paths discover them automatically. No serialization-format changes in B.2; a follow-up can wrap them in an `@wrga_adapters` section if cross-compile checkpoint rename becomes necessary.
 
@@ -86,12 +101,24 @@ This is slow — two extra matmuls per site — but it is correct, produces real
 
 **What it does.** Extend `LivenessAnalyzer` with a parallel VarId-keyed slot map. Implement `consume_hints(&WrgaPlan) -> usize` that actually folds allocations using the existing size+liveness safety gates. Gate real folding behind a new CLI flag (default off). Existing observational `apply_wrga_hints` behavior is unchanged.
 
-**Architecture.** Dual-keyspace allocator.
+**Architecture.** Dual-keyspace allocator, with the keyspace boundary **enforced by the type system** — not documentation.
 
-- Add `allocated_slots: HashMap<VarId, RealSlotId>` to `LivenessAnalyzer`, with new type `RealSlotId(u32)`.
-- Populated ONLY by WRGA-aware codegen paths (i.e., the `@train` block under source-AD). The existing String-keyed allocation path is unchanged — most of nsl-codegen continues to work as it does today.
-- `real_slot_for(var: VarId) -> Option<RealSlotId>` and `try_merge_into_slot(var: VarId, target: RealSlotId) -> bool` become real implementations. Safety gates are the same ones B.1 proved: size equality, liveness disjointness. Refuse on any failure.
-- `consume_hints(&WrgaPlan) -> usize`: walks `plan.memory.assignments`, groups entries by WRGA slot, calls `try_merge_into_slot` pairwise within each group. Returns post-merge real slot count.
+Introduce a new typed key wrapping both existing keyspaces:
+
+```rust
+pub enum AllocationKey {
+    /// Compile-time-named allocation (weights, constants, stdlib-backed buffers).
+    Weight(String),
+    /// Source-AD-tracked activation, keyed by its primal VarId.
+    Activation(crate::wengert::VarId),
+}
+```
+
+`LivenessAnalyzer`'s slot map becomes `HashMap<AllocationKey, RealSlotId>` with new type `RealSlotId(u32)`. All accessors take `&AllocationKey` or variant-specific helpers (`record_weight_alloc(name: String, ...)`, `record_activation_alloc(var: VarId, ...)`, `real_slot_for_activation(var: VarId)`). A future contributor cannot pass a `String` where a `VarId` is expected — the compiler refuses.
+
+- Populated ONLY by WRGA-aware codegen paths (i.e., the `@train` block under source-AD) for the `Activation` variant. The existing String-keyed allocation path becomes the `Weight` variant — mechanical migration, no behavior change for non-WRGA code.
+- `real_slot_for_activation(var: VarId) -> Option<RealSlotId>` and `try_merge_activation_into_slot(var: VarId, target: RealSlotId) -> bool` become real implementations. Safety gates are the same ones B.1 proved: size equality, liveness disjointness. Refuse on any failure.
+- `consume_hints(&WrgaPlan) -> usize`: walks `plan.memory.assignments`, groups entries by WRGA slot, calls `try_merge_activation_into_slot` pairwise within each group. Returns post-merge real slot count.
 - `apply_wrga_hints` (from B.1) stays as-is for the default path. `stmt.rs` chooses `apply_wrga_hints` (observational) or `consume_hints` (folding) based on the new flag.
 
 **CLI flag.** `--wrga-fold-allocations: bool` on the `Build` subcommand in `crates/nsl-cli/src/main.rs`, plumbed through `CompileOptions` as `wrga_fold_allocations: bool`. Default **off**. B.3 or later flips the default after the MMA epilogue gives us real workloads to validate against.
@@ -100,7 +127,7 @@ This is slow — two extra matmuls per site — but it is correct, produces real
 - **Unit test:** in `memory_planner.rs`, construct a synthetic `LivenessAnalyzer`, insert two VarIds into the same WRGA slot with non-overlapping liveness and equal size, call `consume_hints(&plan_with_those_assignments)`, assert post-merge slot count = 1.
 - **Integration test:** compile a source with multiple frozen weights and `--wrga-fold-allocations`. Assert `debug_last_allocator_slot_count_post_hint() < pre_hint`. Without the flag, B.1's observational test (`post ≤ pre`) continues to pass.
 
-**Sharp edge.** Dual-keyspace risk — the VarId-keyed slot number may differ from the String-keyed slot number for the same logical tensor. Mitigation: no cross-keyspace comparisons. The VarId map is populated only by WRGA-aware codegen; `consume_hints` operates only on VarId-keyed entries; String-keyed entries are untouched.
+**Sharp edge, neutralised.** The `AllocationKey` enum makes cross-keyspace confusion a compile error rather than a runtime risk. Both `Weight(String)` and `Activation(VarId)` live in the same `HashMap<AllocationKey, RealSlotId>`; accessors are variant-specific; there is no way to pass a `String` where a `VarId` is expected. B.1's "document the invariant" mitigation is replaced by type-system enforcement.
 
 **Acceptance.**
 - Unit test for `consume_hints` passes.
@@ -166,8 +193,9 @@ This is slow — two extra matmuls per site — but it is correct, produces real
 
 ## Risk register
 
-1. **Task 1 loader extraction fragility.** If nsl-cli's loader is too entangled to extract cleanly, fall back to the inline minimal loader in `debug_compile_and_return_plan`. Acceptance bar is "test with real optimizer source passes", not "loader is perfectly factored."
-2. **Task 2 forward-pass rewrite correctness.** The unfused `y = x @ W + (x @ A) @ B` rewrite must preserve the base-model output when `B = 0`. The integration test pins this down; if it drifts, the rewrite is wrong, not the baseline.
-3. **Task 3 dual-keyspace drift.** The String-keyed and VarId-keyed maps are independent. The mitigation (no cross-comparisons) relies on convention, not type enforcement. Risk of a future contributor introducing a bridge that assumes equality. Document the invariant in `memory_planner.rs` docstring.
-4. **Task 4 pipeline asymmetry.** ZK/standalone may differ structurally from the normal path. If so, ship the plan-returning variants but document gaps in `emit_wrga_report` output for those paths.
-5. **B.3 dependency on B.2 Task 2.** The MMA epilogue kernel needs real A/B matrices to validate against. If Task 2 ships with a known correctness issue, B.3 is blocked. Task 2's integration test is the gate.
+1. **Task 1 loader extraction fragility.** If nsl-cli's loader is too entangled to extract cleanly, fall back to the inline minimal loader in `debug_compile_and_return_plan`. Acceptance bar is "test with real optimizer source passes", not "loader is perfectly factored." Extraction target is `nsl-codegen`, never `nsl-runtime`.
+2. **Task 2 forward-pass rewrite correctness.** The unfused `y = x @ W + ((x @ A) @ B) * scale` rewrite must preserve the base-model output when `B = 0`, regardless of `alpha`. The integration test pins this down; if it drifts, the rewrite is wrong, not the baseline.
+3. **Task 2 performance regression is expected, not a bug.** Adapter-enabled models run slower in B.2 than pre-B.2 (where the decorator was a no-op). Per-site cost: 2× extra `nsl_matmul` + elementwise scale+add, with VRAM intermediate for `x @ A`. CI perf baselines must accommodate. B.3 MMA epilogue collapses the penalty.
+4. **Task 3 dual-keyspace — neutralised.** The `AllocationKey` enum moves cross-keyspace confusion from a runtime discipline problem to a compile error. No further mitigation needed.
+5. **Task 4 pipeline asymmetry.** ZK/standalone may differ structurally from the normal path. If so, ship the plan-returning variants but document gaps in `emit_wrga_report` output for those paths.
+6. **B.3 dependency on B.2 Task 2.** The MMA epilogue kernel needs real A/B matrices + alpha scaling to validate against. If Task 2 ships with a known correctness issue, B.3 is blocked. Task 2's integration test is the gate.
