@@ -32,6 +32,10 @@ pub mod cpdt_joint;
 pub mod cpdt_optim;
 pub mod cpdt_precision;
 pub mod cpdt_zero;
+pub mod csha;
+pub mod csha_boundary;
+pub mod csha_pipeline;
+pub mod csha_specialize;
 pub mod dynamic_shapes;
 pub mod epilogue_fusion;
 pub mod error;
@@ -181,6 +185,11 @@ pub struct CompileOptions {
     pub wggo_mode: Option<String>,
     /// WGGO: print the global-optimization report to stderr.
     pub wggo_report: bool,
+    /// CSHA: fusion mode ("auto", "boundary", "pipeline", "block", "off").
+    /// When `None`, CSHA is not run.  See `crates/nsl-codegen/src/csha.rs`.
+    pub csha_mode: Option<String>,
+    /// CSHA: print the attention-fusion report to stderr.
+    pub csha_report: bool,
 }
 
 impl Default for CompileOptions {
@@ -223,6 +232,8 @@ impl Default for CompileOptions {
             shared_lib: false,
             wggo_mode: None,
             wggo_report: false,
+            csha_mode: None,
+            csha_report: false,
         }
     }
 }
