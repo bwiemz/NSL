@@ -411,3 +411,187 @@ mod tests {
         unsafe { awq_free_packed(&packed) };
     }
 }
+
+// ---------------------------------------------------------------------------
+// AWQ sidecar reader (calibration harness → runtime)
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::path::Path;
+
+const AWQ_SIDECAR_KEY: &str = "awq_activation_scales";
+const AWQ_SIDECAR_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct AwqScales {
+    /// Projection name → per-output-channel max|activation| values.
+    pub by_projection: HashMap<String, Vec<f32>>,
+}
+
+#[derive(Debug)]
+pub enum AwqScalesError {
+    Io(std::io::Error),
+    BadJson(String),
+    MissingAwqKey,
+    BadBase64(String),
+    BlobTooSmall { need: usize, got: usize },
+    UnsupportedVersion { got: u32 },
+    BlobTruncated { at: &'static str },
+    BadUtf8,
+}
+
+impl std::fmt::Display for AwqScalesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::BadJson(e) => write!(f, "bad sidecar JSON: {e}"),
+            Self::MissingAwqKey => write!(f, "sidecar has no '{AWQ_SIDECAR_KEY}' key"),
+            Self::BadBase64(e) => write!(f, "bad base64 for awq blob: {e}"),
+            Self::BlobTooSmall { need, got } => write!(f, "blob too small: need {need}, got {got}"),
+            Self::UnsupportedVersion { got } => write!(f, "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"),
+            Self::BlobTruncated { at } => write!(f, "blob truncated at {at}"),
+            Self::BadUtf8 => write!(f, "invalid UTF-8 in projection name"),
+        }
+    }
+}
+
+impl std::error::Error for AwqScalesError {}
+
+impl From<std::io::Error> for AwqScalesError {
+    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+}
+
+impl AwqScales {
+    /// Parse the raw AWQ-format blob produced by the calibration harness.
+    pub fn from_blob(blob: &[u8]) -> Result<Self, AwqScalesError> {
+        if blob.len() < 8 {
+            return Err(AwqScalesError::BlobTooSmall { need: 8, got: blob.len() });
+        }
+        let version = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+        if version != AWQ_SIDECAR_VERSION {
+            return Err(AwqScalesError::UnsupportedVersion { got: version });
+        }
+        let num_projections = u32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize;
+        let mut by_projection = HashMap::with_capacity(num_projections);
+        let mut cursor = 8;
+        for _ in 0..num_projections {
+            if blob.len() < cursor + 4 {
+                return Err(AwqScalesError::BlobTruncated { at: "name_len" });
+            }
+            let name_len = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if blob.len() < cursor + name_len {
+                return Err(AwqScalesError::BlobTruncated { at: "name bytes" });
+            }
+            let name = std::str::from_utf8(&blob[cursor..cursor + name_len])
+                .map_err(|_| AwqScalesError::BadUtf8)?
+                .to_string();
+            cursor += name_len;
+            if blob.len() < cursor + 4 {
+                return Err(AwqScalesError::BlobTruncated { at: "channel_count" });
+            }
+            let channel_count = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let scale_bytes = channel_count.checked_mul(4).ok_or(AwqScalesError::BlobTruncated { at: "scales (channel_count overflow)" })?;
+            if blob.len() < cursor + scale_bytes {
+                return Err(AwqScalesError::BlobTruncated { at: "scales" });
+            }
+            let mut scales = Vec::with_capacity(channel_count);
+            for i in 0..channel_count {
+                let off = cursor + i * 4;
+                scales.push(f32::from_le_bytes(blob[off..off + 4].try_into().unwrap()));
+            }
+            cursor += scale_bytes;
+            by_projection.insert(name, scales);
+        }
+        Ok(Self { by_projection })
+    }
+
+    /// Read the sidecar JSON at `path`, base64-decode the
+    /// `"awq_activation_scales"` key, and parse into `AwqScales`.
+    pub fn from_sidecar_json_path(path: &Path) -> Result<Self, AwqScalesError> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let json = std::fs::read_to_string(path)?;
+        let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| AwqScalesError::BadJson(e.to_string()))?;
+        let b64 = v
+            .get("hooks")
+            .and_then(|h| h.get(AWQ_SIDECAR_KEY))
+            .and_then(|s| s.as_str())
+            .ok_or(AwqScalesError::MissingAwqKey)?;
+        let blob = STANDARD.decode(b64).map_err(|e| AwqScalesError::BadBase64(e.to_string()))?;
+        Self::from_blob(&blob)
+    }
+}
+
+#[cfg(test)]
+mod awq_sidecar_reader_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Produce a valid v1 AWQ sidecar blob for testing.
+    fn valid_sidecar_blob(entries: &[(&str, &[f32])]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // version
+        blob.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (name, scales) in entries {
+            let nb = name.as_bytes();
+            blob.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            blob.extend_from_slice(nb);
+            blob.extend_from_slice(&(scales.len() as u32).to_le_bytes());
+            for v in *scales {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        blob
+    }
+
+    #[test]
+    fn parse_blob_produces_named_lookup() {
+        let blob = valid_sidecar_blob(&[
+            ("blocks.0.attn.wq", &[1.0, 2.0]),
+            ("blocks.0.attn.wk", &[0.5, 0.25, 0.125]),
+        ]);
+        let scales = AwqScales::from_blob(&blob).unwrap();
+        assert_eq!(scales.by_projection.get("blocks.0.attn.wq").unwrap(), &vec![1.0, 2.0]);
+        assert_eq!(scales.by_projection.get("blocks.0.attn.wk").unwrap(), &vec![0.5, 0.25, 0.125]);
+        assert!(scales.by_projection.get("missing").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_bad_version() {
+        let mut blob = valid_sidecar_blob(&[("x", &[1.0])]);
+        blob[0..4].copy_from_slice(&7u32.to_le_bytes());
+        assert!(AwqScales::from_blob(&blob).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_truncated_blob() {
+        let full = valid_sidecar_blob(&[("long_name", &[1.0, 2.0, 3.0])]);
+        let truncated = &full[..full.len() / 2];
+        assert!(AwqScales::from_blob(truncated).is_err());
+    }
+
+    #[test]
+    fn from_sidecar_reads_base64_key() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let blob = valid_sidecar_blob(&[("p", &[0.5])]);
+        let b64 = STANDARD.encode(&blob);
+        let sidecar_json = format!(
+            r#"{{"version":1,"checkpoint_sha256":"","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{{"awq_activation_scales":"{b64}"}}}}"#
+        );
+        let tmp = std::env::temp_dir().join(format!("nsl-awq-sidecar-{}.json", std::process::id()));
+        std::fs::File::create(&tmp).unwrap().write_all(sidecar_json.as_bytes()).unwrap();
+        let scales = AwqScales::from_sidecar_json_path(&tmp).unwrap();
+        assert_eq!(scales.by_projection.get("p").unwrap(), &vec![0.5]);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn from_sidecar_errors_when_awq_key_absent() {
+        let sidecar_json = r#"{"version":1,"checkpoint_sha256":"","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{}}"#;
+        let tmp = std::env::temp_dir().join(format!("nsl-awq-sidecar-empty-{}.json", std::process::id()));
+        std::fs::write(&tmp, sidecar_json).unwrap();
+        assert!(AwqScales::from_sidecar_json_path(&tmp).is_err());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
