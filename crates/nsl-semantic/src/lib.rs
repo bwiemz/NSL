@@ -2,6 +2,7 @@ pub mod builtins;
 pub mod cep;
 pub mod cftp;
 pub mod checker;
+pub mod cpdt;
 pub mod context_parallel;
 pub mod determinism;
 pub mod effects;

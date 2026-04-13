@@ -325,6 +325,18 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // CPDT: @cpdt decorator validation
+                        if dname == "cpdt" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cpdt::validate_cpdt_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // CEP: @cep_prune / @cep_search decorator validation
                         if dname == "cep_prune" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
