@@ -383,6 +383,17 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
+    /// B.2.1 Task 3: adapter materialisation sites from the most recent
+    /// `wrga_adapter_inject::run_with_compiler` call. Empty when WRGA is
+    /// disabled or no `@adapter` decorators are present.
+    pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
+    /// B.2.1 Task 3: override map from synthesized `MemberAccess` NodeId to
+    /// the resolved field name. Populated by `wrga_adapter_rewrite` when it
+    /// emits member-access nodes for adapter side-table fields whose names
+    /// are not present in the original source (and therefore not in the
+    /// `Interner`). `compile_member_access` consults this map first before
+    /// falling back to `resolve_sym(member)`.
+    pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 }
 
 /// Quantization configuration for a model.
@@ -508,6 +519,8 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            adapter_sites: Vec::new(),
+            synth_member_names: std::collections::HashMap::new(),
         })
     }
 

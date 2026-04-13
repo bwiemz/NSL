@@ -526,8 +526,54 @@ impl Compiler<'_> {
                             cl_param_idx += 1;
                         }
 
+                        // B.2.1 Task 3: run the LoRA forward-pass AST rewrite
+                        // over each statement before lowering. Only active when
+                        // adapter sites target this model class.
+                        let sites_for_model: Vec<&crate::wrga_adapter_inject::AdapterSite> = self
+                            .adapter_sites
+                            .iter()
+                            .filter(|s| s.target_model == model_name)
+                            .collect();
+                        let rewritten_stmts: Vec<nsl_ast::stmt::Stmt> = if sites_for_model.is_empty()
+                        {
+                            fn_def.body.stmts.clone()
+                        } else {
+                            let mut ctx =
+                                crate::wrga_adapter_rewrite::RewriteContext::new(sites_for_model);
+                            // Find the `self` Symbol and populate field_symbols
+                            // from the model's known fields for matcher support.
+                            ctx.self_sym = fn_def
+                                .params
+                                .iter()
+                                .find(|p| self.resolve_sym(p.name) == "self")
+                                .map(|p| p.name);
+                            if let Some(field_map) =
+                                self.models.model_field_types.get(&model_name).cloned()
+                            {
+                                for fname in field_map.keys() {
+                                    if let Some(s) = self.interner.get(fname) {
+                                        ctx.field_symbols.insert(
+                                            fname.clone(),
+                                            nsl_ast::Symbol(s),
+                                        );
+                                    }
+                                }
+                            }
+                            let out: Vec<nsl_ast::stmt::Stmt> = fn_def
+                                .body
+                                .stmts
+                                .iter()
+                                .cloned()
+                                .map(|s| crate::wrga_adapter_rewrite::rewrite_stmt(s, &mut ctx))
+                                .collect();
+                            // Commit synth overrides to the compiler so
+                            // compile_member_access can resolve them.
+                            self.synth_member_names.extend(ctx.synth_overrides);
+                            out
+                        };
+
                         // Compile method body
-                        for stmt in &fn_def.body.stmts {
+                        for stmt in &rewritten_stmts {
                             self.compile_stmt(&mut builder, &mut state, stmt)?;
                         }
 

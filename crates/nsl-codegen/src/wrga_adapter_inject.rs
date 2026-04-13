@@ -51,6 +51,12 @@ pub struct AdapterSite {
     /// Output dimension (d_out) of the target weight. Zero when resolution
     /// failed (see `input_dim`).
     pub output_dim: u32,
+    /// Resolved model-class name that owns the target field (e.g. `"Toy"`).
+    /// Empty when the target could not be resolved to a known model.
+    pub target_model: String,
+    /// Target field name on the model struct (e.g. `"w"` for `"m.w"`).
+    /// Empty on resolution failure.
+    pub target_field: String,
 }
 
 /// Result of the inject pass.
@@ -143,6 +149,8 @@ pub fn run(plan: &mut WrgaPlan) -> AdapterInjectResult {
             synthesized_fields: fields,
             input_dim: 0,
             output_dim: 0,
+            target_model: String::new(),
+            target_field: String::new(),
         });
     }
     AdapterInjectResult { sites }
@@ -232,10 +240,29 @@ pub fn run_with_compiler(
             );
         }
         let model_name = candidates.remove(0).clone();
+        // B.2.1 Task 3: submodel-target detection. If the target field's type
+        // string does not start with `"Tensor<"`, it's a submodel reference
+        // (e.g. a nested model), which is out of scope for B.2.1.
+        let type_str = field_types
+            .get(&model_name)
+            .and_then(|m| m.get(field_name))
+            .cloned()
+            .unwrap_or_default();
+        if !type_str.trim_start().starts_with("Tensor<") {
+            eprintln!(
+                "[wrga] @adapter target '{}': targets a submodel, not a weight tensor; \
+                 adapt the submodel's inner weight directly (e.g., \"{}.weight\") \
+                 or use a submodel-level decorator (not yet supported)",
+                target, target,
+            );
+            continue;
+        }
         match resolve_dims_for_target(&model_name, field_name, field_types) {
             Some((inp, out)) => {
                 site.input_dim = inp;
                 site.output_dim = out;
+                site.target_model = model_name.clone();
+                site.target_field = field_name.to_string();
             }
             None => {
                 eprintln!(

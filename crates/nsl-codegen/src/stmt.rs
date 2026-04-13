@@ -155,7 +155,8 @@ pub(crate) fn invoke_wrga_if_enabled(
             }
         }
     }
-    let _inject = crate::wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
+    let inject = crate::wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
+    compiler.adapter_sites = inject.sites;
 
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)

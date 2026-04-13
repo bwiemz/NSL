@@ -21,7 +21,13 @@ impl Compiler<'_> {
         member: nsl_ast::Symbol,
         expr: &Expr,
     ) -> Result<Value, CodegenError> {
-        let member_name = self.resolve_sym(member).to_string();
+        // B.2.1 Task 3: the WRGA LoRA AST rewrite synthesizes MemberAccess
+        // nodes whose field names (`lora_A_<site>`, `lora_B_<site>`) may not
+        // be present in the Interner. Prefer the synth override map.
+        let member_name = match self.synth_member_names.get(&expr.id) {
+            Some(name) => name.clone(),
+            None => self.resolve_sym(member).to_string(),
+        };
 
         // Check if this is a module alias access: math.clamp (non-call context)
         {
