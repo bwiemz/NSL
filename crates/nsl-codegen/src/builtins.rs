@@ -260,6 +260,25 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_mean", &[types::I64], Some(types::I64)),
     // Tensor scalar extraction
     ("nsl_tensor_item", &[types::I64], Some(types::F64)),
+    ("nsl_tensor_l2_norm", &[types::I64], Some(types::F64)),
+    // Health monitor FFI (dev-tools phase 4)
+    ("nsl_health_record_loss", &[types::F64, types::I64], None),
+    (
+        "nsl_health_record_grad_norm",
+        &[types::I64, types::I64, types::I32, types::F64],
+        None,
+    ),
+    (
+        "nsl_health_record_weight_norm",
+        &[types::I64, types::I64, types::F64, types::I8],
+        None,
+    ),
+    (
+        "nsl_health_flush_snapshot",
+        &[types::I64, types::I64],
+        Some(types::I32),
+    ),
+    ("nsl_health_set_flush_interval", &[types::I64], None),
     // Tensor display
     ("nsl_tensor_print", &[types::I64], None),
     // Tensor memory

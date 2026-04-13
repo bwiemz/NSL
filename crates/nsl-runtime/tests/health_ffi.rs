@@ -53,6 +53,16 @@ fn flush_invalid_utf8_returns_2() {
 }
 
 #[test]
+fn tensor_l2_norm_symbol_exists() {
+    // Link-only assertion: if this coerces, the `#[no_mangle] pub extern "C"`
+    // symbol is exported. Numeric correctness of the underlying
+    // `tensor_l2_norm` helper is covered by tensor-module unit tests;
+    // constructing a valid NslTensor handle from a unit test requires
+    // runtime scope setup that's out of scope here.
+    let _f: extern "C" fn(i64) -> f64 = nsl_runtime::tensor::nsl_tensor_l2_norm;
+}
+
+#[test]
 fn weight_norm_is_init_then_update_round_trips() {
     let path = "m.l0.w";
     let b = path.as_bytes();
