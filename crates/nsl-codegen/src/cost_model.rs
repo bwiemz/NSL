@@ -30,6 +30,8 @@ pub struct OpCost {
     pub classification: BoundClassification,
     pub fused: bool,
     pub estimated_time_us: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node: Option<nsl_ast::NodeId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1151,7 @@ mod tests {
             classification: BoundClassification::MemoryBound,
             fused: false,
             estimated_time_us: 10.0,
+            origin_node: None,
         }];
         let trace = format_chrome_trace(&ops);
         assert!(trace.contains("traceEvents"));
@@ -1171,6 +1174,7 @@ mod tests {
             classification: BoundClassification::MemoryBound,
             fused: false,
             estimated_time_us: 5.0,
+            origin_node: None,
         }];
         let json = format_json_report(&ops, gpu, "fp16");
         assert!(json.contains("H100-SXM"));
@@ -1193,6 +1197,7 @@ mod tests {
             classification: BoundClassification::MemoryBound,
             fused: false,
             estimated_time_us: 50.0,
+            origin_node: None,
         }];
         let table = format_perf_table(&ops, gpu, "fp16");
         assert!(table.contains("Performance Analysis"));

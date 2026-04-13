@@ -58,6 +58,7 @@ fn build_from_report_splits_ops_and_eliminated() {
         classification: BoundClassification::MemoryBound,
         fused: false,
         estimated_time_us: 1.5,
+        origin_node: None,
     });
     ops.push(OpCost {
         name: "chunk".into(),
@@ -71,6 +72,7 @@ fn build_from_report_splits_ops_and_eliminated() {
         classification: BoundClassification::Unknown,
         fused: false,
         estimated_time_us: 0.0,
+        origin_node: None,
     });
     ops.push(OpCost {
         name: "reshape".into(),
@@ -84,6 +86,7 @@ fn build_from_report_splits_ops_and_eliminated() {
         classification: BoundClassification::MemoryBound,
         fused: true,
         estimated_time_us: 0.5,
+        origin_node: None,
     });
     let report = ProfileReport {
         target_gpu: "h100-sxm".into(),

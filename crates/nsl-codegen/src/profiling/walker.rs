@@ -373,6 +373,7 @@ impl<'a> WalkCtx<'a> {
             classification,
             fused: false,
             estimated_time_us,
+            origin_node: Some(expr.id),
         });
     }
 

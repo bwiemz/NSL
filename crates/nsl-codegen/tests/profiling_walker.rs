@@ -152,3 +152,25 @@ fn step(x: Tensor<[B, 16], f32>, w: Tensor<[16, 8], f32>) -> Tensor<[B, 8], f32>
         }
     }
 }
+
+#[test]
+fn walker_populates_origin_node_on_each_op() {
+    let src = r#"
+fn forward(x: Tensor<[B=1, S=2048, D=512], bf16>, W: Tensor<[512, 512], bf16>) -> Tensor:
+    let y = matmul(x, W)
+    return y
+"#;
+    let (m, analysis, interner) = parse_and_analyze(src);
+    let gpu = nsl_codegen::gpu_specs::find_gpu("h100").unwrap();
+    let env = nsl_codegen::profiling::shape_env::ShapeEnv::with_defaults();
+    let r = nsl_codegen::profiling::walker::walk_ops(
+        &m, &analysis, &interner,
+        nsl_codegen::profiling::types::EntryKind::Auto,
+        &env, gpu, "bf16",
+    ).unwrap();
+    assert!(!r.ops.is_empty());
+    for op in &r.ops {
+        assert!(op.origin_node.is_some(),
+            "every walked op should carry its source NodeId, got None for {}", op.name);
+    }
+}
