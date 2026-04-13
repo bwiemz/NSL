@@ -566,6 +566,14 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Returns a mutable borrow of the Compiler-owned FusionPlan when profiling
+    /// is active. Fusion passes should call this and thread the borrow into
+    /// apply_epilogue_fusion / apply_reduction_fusion so that mutations land
+    /// in the same instance that fusion_constituents reads.
+    pub fn profile_fusion_plan_mut(&mut self) -> Option<&mut crate::wrga_fusion::FusionPlan> {
+        self.fusion_plan_for_profile.as_mut()
+    }
+
     /// M42: Look up the first KV compression policy for a specific model layer.
     /// Key format: `"ModelName.layer_name"` (matches collection.rs insertion key).
     /// Returns `None` when no `@kv_compress` decorator was found for that layer.

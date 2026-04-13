@@ -74,12 +74,17 @@ fn run_profile_pre_pass(
             if let Some(name) = &options.profile_source_file_name {
                 compiler.source_file_name = name.clone();
             }
-            // Phase 2 follow-up: the existing fusion pass does not yet
-            // populate `FusionPlan.fused_node_groups` for all kernels, so
-            // leave `fusion_plan_for_profile` as `None` — `fusion_constituents`
-            // falls back to `vec![root]`, which is correct for non-fused
-            // kernels.  Wiring the real plan is a separate task.
-            compiler.fusion_plan_for_profile = None;
+            // Phase 2.5 Task 3: seed the Compiler-owned plan so later fusion
+            // passes (apply_epilogue_fusion, apply_reduction_fusion) can write
+            // into the same instance that `fusion_constituents` reads at
+            // launch-emit time. Copy WRGA-level adapter-fusion groups if a
+            // recent @train compile produced them; otherwise start empty.
+            let seeded = compiler
+                .last_wrga_plan
+                .as_ref()
+                .map(|p| p.fusion.clone())
+                .unwrap_or_default();
+            compiler.fusion_plan_for_profile = Some(seeded);
         }
         Err(e) => {
             if std::env::var("NSL_DEBUG").is_ok() {

@@ -110,7 +110,14 @@ pub fn run_pre_pass_only(
             .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
             .collect();
         compiler.manifest_builder = Some(ManifestBuilder::new(target_gpu, dtype));
-        compiler.fusion_plan_for_profile = None;
+        // Phase 2.5 Task 3: mirror `run_profile_pre_pass` seeding so
+        // `fusion_plan_for_profile` is `Some(...)` after the pre-pass.
+        let seeded = compiler
+            .last_wrga_plan
+            .as_ref()
+            .map(|p| p.fusion.clone())
+            .unwrap_or_default();
+        compiler.fusion_plan_for_profile = Some(seeded);
 
         prediction_map_len = compiler.prediction_map.len();
         manifest_builder_set = compiler.manifest_builder.is_some();
