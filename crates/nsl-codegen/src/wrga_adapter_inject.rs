@@ -295,6 +295,19 @@ pub fn run_with_compiler(
             }
         }
         let _ = var_name; // reserved for later let-binding-type-map resolution
+        // B.3: single-pass epilogue requires rank <= 16. Multi-pass is a
+        // follow-up milestone.
+        if site.rank > 16
+            && matches!(site.kind, AdapterKind::Lora | AdapterKind::GatedLora)
+        {
+            eprintln!(
+                "[wrga] @adapter(target='{}'): rank={} > 16; B.3 single-pass epilogue \
+                 does not support rank > 16.  Use rank <= 16 or await multi-pass support.",
+                site.target_param, site.rank,
+            );
+            site.input_dim = 0;
+            site.output_dim = 0;
+        }
     }
     result
 }
