@@ -406,6 +406,13 @@ fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &Flas
     // classic path. Dormant at runtime until A.2.5.
     emit_csha_matmul_projection(ptx, config);
 
+    // CSHA A.2.4: RoPE epilogue — emits when both `config.rope_q` and
+    // `config.csha.fused_projections` are set. Rotates the projected Q/K
+    // fragments in registers before they feed the QK^T MMA, rather than
+    // loading pre-rotated Q from HBM. Runtime-gated on non-null cos/sin
+    // pointers. Dormant until A.2.5.
+    emit_csha_rope_epilogue(ptx, config);
+
     // Load Q tile into shared memory
     emit_q_tile_load(ptx, config);
 
@@ -848,6 +855,118 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
     ptx.push_str("CSHA_PROJECTION_END:\n");
     ptx.push_str("    bar.sync 0;                       // Q/K/V SMEM tiles consistent\n");
     ptx.push_str("    // ── end CSHA projection ─────────────────────────────────────\n");
+}
+
+/// CSHA A.2.4 — RoPE epilogue emitter.
+///
+/// When both `config.rope_q` and `config.csha.fused_projections` are set,
+/// this emits PTX that rotates the Q and K fragments produced by the
+/// A.2.3 matmul projection **in registers** before they feed the QK^T
+/// MMA, rather than loading pre-rotated Q from HBM as `emit_q_tile_load`
+/// does in the non-CSHA path.
+///
+/// Rotation math matches the existing [`emit_q_tile_load`] RoPE branch:
+///
+/// ```text
+///   q_rot_a = q_a * cos - q_b * sin
+///   q_rot_b = q_a * sin + q_b * cos
+/// ```
+///
+/// A.2.4 ships a **register-level scaffold** — one (q_a, q_b) pair
+/// rotation for Q and one for K, using the `proj_d*` output registers
+/// from A.2.3's single MMA. The tile-sweep that applies rotation to
+/// every fragment across `(block_q, head_dim)` lands with A.2.3's
+/// tile-sweep follow-up, since the two loops share the same tiling.
+///
+/// Runtime null-check on `cos_ptr` / `sin_ptr` keeps current
+/// A.1/A.2.1x call sites (which pass null for CSHA-tagged kernels via
+/// the non-CSHA forwarder) from dereferencing uninitialised pointers.
+/// Kernel variant remains dormant until A.2.5 wires the runtime FFI.
+fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if !csha.fused_projections || !config.rope_q {
+        return;
+    }
+
+    let head_dim = config.head_dim;
+    let stride_val = match config.rope_style {
+        RopeStyle::HalfSplit => head_dim / 2,
+        RopeStyle::Adjacent => 1,
+    };
+
+    ptx.push_str("    // ── CSHA A.2.4: RoPE epilogue ────────────────────────────\n");
+    ptx.push_str(&format!(
+        "    // rope_q=1, rope_style={:?}, head_dim={}, stride={}\n",
+        config.rope_style, head_dim, stride_val
+    ));
+
+    // cos/sin param pointers are loaded into %rd12/%rd13 by
+    // `emit_param_loads`; we just need to null-check them here.
+    ptx.push_str("    setp.eq.u64 %p15, %rd12, 0;       // cos_ptr null?\n");
+    ptx.push_str("    setp.eq.u64 %p14, %rd13, 0;       // sin_ptr null?\n");
+    ptx.push_str("    or.pred %p15, %p15, %p14;\n");
+    ptx.push_str("    @%p15 bra CSHA_ROPE_EPILOGUE_END;\n");
+
+    // Local scratch — `%f200..%f205` are well outside any in-use range
+    // (existing code uses %f0..%f127 generously, but the .reg pool
+    // `%f<128>` does not bound above with modern PTX; declare fresh).
+    ptx.push_str("    .reg .f32 %rope_q_a, %rope_q_b, %rope_q_rot_a, %rope_q_rot_b;\n");
+    ptx.push_str("    .reg .f32 %rope_k_a, %rope_k_b, %rope_k_rot_a, %rope_k_rot_b;\n");
+    ptx.push_str("    .reg .f32 %rope_cos, %rope_sin, %rope_tmp;\n");
+    ptx.push_str("    .reg .u64 %rope_addr;\n");
+
+    // Load one (cos, sin) pair for the tile's origin position. In the
+    // full tile-sweep this will index by `q_start + row` and by `d` —
+    // for the scaffold we just sample the first element to exercise
+    // the load path.
+    ptx.push_str("    // Sample cos/sin at position 0 (scaffold — full indexing lands\n");
+    ptx.push_str("    // with the A.2.3 tile-sweep follow-up).\n");
+    ptx.push_str("    ld.global.f32 %rope_cos, [%rd12];\n");
+    ptx.push_str("    ld.global.f32 %rope_sin, [%rd13];\n");
+
+    // --- Q rotation ---
+    // Seed from A.2.3's proj_d output registers (%proj_d0/%proj_d1)
+    // which carry the Q fragment accumulated by the single MMA.
+    ptx.push_str("    // --- Q rotation ---\n");
+    ptx.push_str("    mov.f32 %rope_q_a, %proj_d0;\n");
+    ptx.push_str("    mov.f32 %rope_q_b, %proj_d1;\n");
+    ptx.push_str("    mul.f32 %rope_q_rot_a, %rope_q_a, %rope_cos;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_q_b, %rope_sin;\n");
+    ptx.push_str("    sub.f32 %rope_q_rot_a, %rope_q_rot_a, %rope_tmp;\n");
+    ptx.push_str("    mul.f32 %rope_q_rot_b, %rope_q_a, %rope_sin;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_q_b, %rope_cos;\n");
+    ptx.push_str("    add.f32 %rope_q_rot_b, %rope_q_rot_b, %rope_tmp;\n");
+    ptx.push_str("    mov.f32 %proj_d0, %rope_q_rot_a;   // write-back in place\n");
+    ptx.push_str("    mov.f32 %proj_d1, %rope_q_rot_b;\n");
+
+    // --- K rotation ---
+    // K fragment also flows through the same MMA output registers in
+    // the scaffold. In the tile-sweep, K will have distinct fragment
+    // registers fed by the second MMA; the rotation pattern is
+    // identical.
+    ptx.push_str("    // --- K rotation ---\n");
+    ptx.push_str("    mov.f32 %rope_k_a, %proj_d2;\n");
+    ptx.push_str("    mov.f32 %rope_k_b, %proj_d3;\n");
+    ptx.push_str("    mul.f32 %rope_k_rot_a, %rope_k_a, %rope_cos;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_k_b, %rope_sin;\n");
+    ptx.push_str("    sub.f32 %rope_k_rot_a, %rope_k_rot_a, %rope_tmp;\n");
+    ptx.push_str("    mul.f32 %rope_k_rot_b, %rope_k_a, %rope_sin;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_k_b, %rope_cos;\n");
+    ptx.push_str("    add.f32 %rope_k_rot_b, %rope_k_rot_b, %rope_tmp;\n");
+    ptx.push_str("    mov.f32 %proj_d2, %rope_k_rot_a;\n");
+    ptx.push_str("    mov.f32 %proj_d3, %rope_k_rot_b;\n");
+
+    ptx.push_str(
+        "    // TODO(A.2.4-follow-up): extend to the full (block_q, head_dim)\n",
+    );
+    ptx.push_str(
+        "    // tile-sweep once A.2.3's loop-expansion lands. V is unchanged.\n",
+    );
+
+    ptx.push_str("CSHA_ROPE_EPILOGUE_END:\n");
+    ptx.push_str("    // ── end CSHA RoPE epilogue ─────────────────────────────────\n");
 }
 
 fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -6126,6 +6245,109 @@ mod tests {
         assert!(ptx.contains("setp.eq.u64 %p14, %rd62, 0;"));
         assert!(ptx.contains("setp.eq.u64 %p14, %rd63, 0;"));
         assert!(ptx.contains("@%p13 bra CSHA_PROJECTION_END;"));
+    }
+
+    // ── CSHA A.2.4: RoPE epilogue emission tests ────────────────────
+
+    fn csha_l2_rope_config() -> FlashAttentionConfig {
+        let mut cfg = csha_l2_config();
+        cfg.rope_q = true;
+        cfg.rope_style = RopeStyle::HalfSplit;
+        cfg
+    }
+
+    #[test]
+    fn a24_rope_epilogue_appears_with_rope_plus_fused_projections() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        assert!(
+            ptx.contains("CSHA A.2.4: RoPE epilogue"),
+            "RoPE epilogue block missing for CSHA L2 + rope_q config"
+        );
+        // Both Q and K rotation sections must be present.
+        assert!(ptx.contains("--- Q rotation ---"));
+        assert!(ptx.contains("--- K rotation ---"));
+        // Rotation math: Q and K each do cos*a - sin*b and sin*a + cos*b.
+        assert!(ptx.contains("sub.f32 %rope_q_rot_a"));
+        assert!(ptx.contains("add.f32 %rope_q_rot_b"));
+        assert!(ptx.contains("sub.f32 %rope_k_rot_a"));
+        assert!(ptx.contains("add.f32 %rope_k_rot_b"));
+        // Write-back into the A.2.3 proj_d* output registers.
+        assert!(ptx.contains("mov.f32 %proj_d0, %rope_q_rot_a;"));
+        assert!(ptx.contains("mov.f32 %proj_d2, %rope_k_rot_a;"));
+        // End label.
+        assert!(ptx.contains("CSHA_ROPE_EPILOGUE_END:"));
+    }
+
+    #[test]
+    fn a24_rope_epilogue_absent_without_rope() {
+        // fused_projections on, rope_q off → epilogue must not appear;
+        // the A.2.3 projection still does.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.4: RoPE epilogue"),
+            "RoPE epilogue must respect the rope_q gate"
+        );
+        assert!(ptx.contains("CSHA A.2.3: matmul projection"));
+    }
+
+    #[test]
+    fn a24_rope_epilogue_absent_without_fused_projections() {
+        // CSHA L1 (fused_rmsnorm only) + rope_q on. Pre-CSHA RoPE path
+        // in `emit_q_tile_load` handles rotation from HBM; the A.2.4
+        // epilogue is only meaningful when Q/K come from A.2.3's
+        // in-kernel projection.
+        let mut cfg = csha_l1_config();
+        cfg.rope_q = true;
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.4: RoPE epilogue"),
+            "RoPE epilogue requires fused_projections — L1 must not emit it"
+        );
+    }
+
+    #[test]
+    fn a24_rope_epilogue_runtime_null_check_on_cos_sin() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        // cos_ptr is %rd12, sin_ptr is %rd13 per `emit_param_loads`.
+        assert!(ptx.contains("setp.eq.u64 %p15, %rd12, 0;"));
+        assert!(ptx.contains("setp.eq.u64 %p14, %rd13, 0;"));
+        assert!(ptx.contains("or.pred %p15, %p15, %p14;"));
+        assert!(ptx.contains("@%p15 bra CSHA_ROPE_EPILOGUE_END;"));
+    }
+
+    #[test]
+    fn a24_rope_epilogue_follows_projection() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        let projection_idx = ptx
+            .find("CSHA A.2.3: matmul projection")
+            .expect("projection present");
+        let epilogue_idx = ptx
+            .find("CSHA A.2.4: RoPE epilogue")
+            .expect("epilogue present");
+        let q_load_idx = ptx
+            .find("Load Q tile into shared memory")
+            .expect("Q tile load present");
+        assert!(
+            projection_idx < epilogue_idx,
+            "RoPE epilogue must follow A.2.3 projection"
+        );
+        assert!(
+            epilogue_idx < q_load_idx,
+            "RoPE epilogue must precede the classic Q-from-HBM load"
+        );
+    }
+
+    #[test]
+    fn a24_rope_epilogue_absent_in_non_csha_ptx() {
+        // Non-CSHA + rope_q uses the original in-Q-load RoPE path; the
+        // CSHA-specific epilogue must NOT leak in.
+        let mut cfg = non_csha_config();
+        cfg.rope_q = true;
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(!ptx.contains("CSHA A.2.4: RoPE epilogue"));
+        assert!(!ptx.contains("CSHA_ROPE_EPILOGUE_END:"));
+        // But the original RoPE path must still be active.
+        assert!(ptx.contains("LOOP_Q_LOAD_ROPE:"));
     }
 
     #[test]
