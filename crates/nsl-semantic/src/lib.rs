@@ -9,6 +9,7 @@ pub mod determinism;
 pub mod effects;
 pub mod fp8;
 pub mod grammar;
+pub mod inspect;
 pub mod kv_compress;
 pub mod moe;
 pub mod multimodal;

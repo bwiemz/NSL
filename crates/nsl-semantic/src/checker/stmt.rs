@@ -325,6 +325,18 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // Dev Tools Phase 5: @inspect decorator validation
+                        if dname == "inspect" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::inspect::validate_inspect_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // CFIE: @cfie decorator validation
                         if dname == "cfie" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
