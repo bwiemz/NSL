@@ -193,6 +193,10 @@ mod tests {
             adapter,
             suggested_rank: rank,
             rationale: "test".into(),
+            decorator_kind: None,
+            alpha: None,
+            synthesized_fields: Vec::new(),
+            init_strategies: Vec::new(),
         }
     }
 

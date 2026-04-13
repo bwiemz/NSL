@@ -133,7 +133,30 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
     };
-    let plan = crate::wrga::run(wrga_input);
+    let mut plan = crate::wrga::run(wrga_input);
+
+    // B.2 Task 2b: thread the user-facing `@adapter(type=..., alpha=...)`
+    // decorator config onto each matching placement, then run the adapter
+    // inject pass to populate `synthesized_fields` / `init_strategies`.
+    for adapter_cfg in &inputs.adapter {
+        for placement in plan.placements.iter_mut() {
+            let matches = adapter_cfg
+                .targets
+                .iter()
+                .any(|pat| crate::wrga_prune::glob_match(pat, &placement.name));
+            if matches {
+                placement.decorator_kind = Some(adapter_cfg.kind);
+                placement.alpha = adapter_cfg.alpha;
+                if let Some(r) = adapter_cfg.rank {
+                    if r > 0 {
+                        placement.suggested_rank = r as usize;
+                    }
+                }
+            }
+        }
+    }
+    let _inject = crate::wrga_adapter_inject::run(&mut plan);
+
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)
 }

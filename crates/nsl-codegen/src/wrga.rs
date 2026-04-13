@@ -23,6 +23,10 @@ use crate::wrga_prune::{prune, PruneResult};
 use crate::wrga_roofline::{place_adapters, AdapterPlacement, AdapterSite, SiteKind};
 use crate::wrga_spectral::{allocate_ranks, analyse_weight_map, RankAllocation, SpectralAnalysis};
 
+// Re-export B.2 Task 2b observation surfaces so consumers can use
+// `crate::wrga::{InitKind, InitStrategy}`.
+pub use crate::wrga_adapter_inject::{InitKind, InitStrategy};
+
 /// Input to the WRGA driver.
 #[derive(Clone)]
 pub struct WrgaInput<'a> {

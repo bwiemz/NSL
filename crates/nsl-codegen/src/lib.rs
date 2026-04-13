@@ -90,6 +90,7 @@ pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wrga;
+pub mod wrga_adapter_inject;
 pub mod wrga_fusion;
 pub mod wrga_memory;
 pub mod wrga_prune;
