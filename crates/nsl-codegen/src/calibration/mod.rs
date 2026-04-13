@@ -15,10 +15,10 @@ pub mod subprocess;
 pub use ctx::CalibCtx;
 pub use hooks::{CalibrationHook, CalibrationResult};
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef};
+pub use registry::HookRegistry;
 
 use std::collections::BTreeMap;
 
-use crate::calibration::registry::HookRegistry;
 use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
 use sha2::{Digest, Sha256};
 
