@@ -23,7 +23,10 @@ use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
 use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan};
 use crate::wggo_graph::{build as build_graph, OptGraph};
-use crate::wggo_ilp::{solve_all as ilp_solve_all, LayerIlpConstraints, LayerIlpSolution};
+use crate::wggo_ilp::{
+    solve_all as ilp_solve_all, solve_all_greedy as ilp_solve_all_greedy, LayerIlpConstraints,
+    LayerIlpSolution,
+};
 
 /// User-visible optimisation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,7 +234,10 @@ pub fn run(input: WggoInput) -> WggoPlan {
             cons.allow_fase = false;
         }
     }
-    let per_layer = ilp_solve_all(&luts, &ilp_constraints);
+    let per_layer = match input.mode {
+        WggoMode::Greedy => ilp_solve_all_greedy(&luts, &ilp_constraints),
+        _ => ilp_solve_all(&luts, &ilp_constraints),
+    };
 
     // 6. Build initial LayerDecisions vector for conflict detection.
     let layer_decisions: Vec<LayerDecisions> = inter
@@ -501,6 +507,27 @@ mod tests {
         let plan = run(toy_input(&w));
         let rep = plan.render_report();
         assert!(rep.contains("FASE="));
+    }
+
+    #[test]
+    fn greedy_mode_uses_greedy_solver() {
+        // The greedy solver explores at most a handful of nodes per layer
+        // (sum-of-domains, not product).  The full solver explores
+        // hundreds of thousands.  Run both modes and confirm Greedy
+        // produces drastically lower per-layer node counts.
+        let w = two_block_wengert();
+        let mut inp_full = toy_input(&w);
+        inp_full.mode = WggoMode::Full;
+        let mut inp_greedy = toy_input(&w);
+        inp_greedy.mode = WggoMode::Greedy;
+        let full = run(inp_full);
+        let greedy = run(inp_greedy);
+        let full_nodes: u64 = full.per_layer.iter().map(|s| s.nodes_explored).sum();
+        let greedy_nodes: u64 = greedy.per_layer.iter().map(|s| s.nodes_explored).sum();
+        assert!(
+            greedy_nodes * 100 < full_nodes,
+            "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
+        );
     }
 
     #[test]
