@@ -3617,6 +3617,24 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // B.2.1 Task 2.5: materialise adapter tensors into the model
+                // struct's side-table slot now that the plan is known. Task 2
+                // reserved the slot + zero-initialised it; this call allocates
+                // the heap table, fills it with freshly-initialised tensors
+                // (LoRA-A randn-scaled, LoRA-B zeros, IA³ ones, gate zeros),
+                // and writes the table pointer into the reserved slot. The
+                // iteration order here MUST match `adapter_field_index` in
+                // `expr/access.rs`.
+                if let Some(plan_ref) = wrga_plan.as_ref() {
+                    crate::wrga_adapter_init::emit_adapter_init_sidetable(
+                        self,
+                        builder,
+                        state,
+                        model_ptr,
+                        &model_type_name,
+                        plan_ref,
+                    )?;
+                }
                 let effective_primal: crate::wengert::WengertList = match &wrga_plan {
                     Some(plan) => plan.prune.pruned.clone(),
                     None => extractor.wengert_list().clone(),

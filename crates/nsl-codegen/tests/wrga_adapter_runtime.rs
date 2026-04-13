@@ -206,6 +206,99 @@ fn ia3_constructor_emits_scale_field() {
     );
 }
 
+// ── B.2.1 Task 2.5: side-table init emission at @train block entry ─────
+//
+// These tests exercise the full codegen path end-to-end for each adapter
+// kind. Compilation routes through `wrga_adapter_init::emit_adapter_init_sidetable`
+// immediately after WRGA fires, which builds the heap table, populates it
+// with freshly-initialised tensors, and writes the table pointer into the
+// reserved slot on the model struct. A successful compile is evidence that
+// the IR is emitted; runtime tensor-shape verification is covered by the
+// B.2.1 Build 4 e2e proof (Task 5) which executes the compiled binary.
+
+#[test]
+fn task_2_5_lora_init_emits_cleanly() {
+    let opts = CompileOptions {
+        wrga_inputs: Some(WrgaInputs {
+            adapter: vec![AdapterDecoratorConfig {
+                kind: AdapterKind::Lora,
+                targets: vec!["m.w".into()],
+                rank: Some(4),
+                alpha: Some(4),
+            }],
+            ..Default::default()
+        }),
+        source_ad: true,
+        ..Default::default()
+    };
+    let plan = nsl_codegen::debug_compile_and_return_plan(LORA_B21_SRC, &opts)
+        .expect("lora init-pass compile must succeed")
+        .expect("wrga::run must fire");
+    // Sanity: the placement that drives init emission has resolved dims.
+    let placement = plan
+        .placements
+        .iter()
+        .find(|p| p.decorator_kind.is_some())
+        .expect("adapter placement must exist");
+    assert_eq!(placement.init_strategies.len(), 2, "LoRA has A + B");
+}
+
+#[test]
+fn task_2_5_ia3_init_emits_cleanly() {
+    let opts = CompileOptions {
+        wrga_inputs: Some(WrgaInputs {
+            adapter: vec![AdapterDecoratorConfig {
+                kind: AdapterKind::Ia3,
+                targets: vec!["m.w".into()],
+                rank: None,
+                alpha: None,
+            }],
+            ..Default::default()
+        }),
+        source_ad: true,
+        ..Default::default()
+    };
+    let plan = nsl_codegen::debug_compile_and_return_plan(IA3_B21_SRC, &opts)
+        .expect("ia3 init-pass compile must succeed")
+        .expect("wrga::run must fire");
+    let placement = plan
+        .placements
+        .iter()
+        .find(|p| p.decorator_kind.is_some())
+        .expect("adapter placement must exist");
+    assert_eq!(placement.init_strategies.len(), 1, "IA3 has single scale");
+}
+
+#[test]
+fn task_2_5_gatedlora_init_emits_cleanly() {
+    let opts = CompileOptions {
+        wrga_inputs: Some(WrgaInputs {
+            adapter: vec![AdapterDecoratorConfig {
+                kind: AdapterKind::GatedLora,
+                targets: vec!["m.w".into()],
+                rank: Some(4),
+                alpha: Some(4),
+            }],
+            ..Default::default()
+        }),
+        source_ad: true,
+        ..Default::default()
+    };
+    let plan = nsl_codegen::debug_compile_and_return_plan(GATED_B21_SRC, &opts)
+        .expect("gated-lora init-pass compile must succeed")
+        .expect("wrga::run must fire");
+    let placement = plan
+        .placements
+        .iter()
+        .find(|p| p.decorator_kind.is_some())
+        .expect("adapter placement must exist");
+    assert_eq!(
+        placement.init_strategies.len(),
+        3,
+        "GatedLoRA has A + B + gate",
+    );
+}
+
 #[test]
 fn gatedlora_constructor_emits_a_b_and_gate() {
     let opts = CompileOptions {
