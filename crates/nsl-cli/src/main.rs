@@ -386,6 +386,15 @@ enum Cli {
         /// M55: Path to .safetensors weights file used as ZK witness
         #[arg(long)]
         zk_weights: Option<PathBuf>,
+
+        /// WGGO: global-optimization mode ("full", "greedy", or "off").
+        /// Passing `--wggo` without a value enables full mode.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        wggo: Option<String>,
+
+        /// WGGO: print the global-optimization report to stderr
+        #[arg(long)]
+        wggo_report: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -687,6 +696,8 @@ fn main() {
             zk_field,
             zk_solidity,
             zk_weights,
+            wggo,
+            wggo_report,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -777,7 +788,21 @@ fn main() {
                 zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib,
+                wggo_mode: wggo.clone(),
+                wggo_report,
             };
+
+            // Validate WGGO mode string early so users get a clear error
+            // instead of a silent no-op.
+            if let Some(ref m) = wggo {
+                if nsl_codegen::wggo::WggoMode::parse(m).is_none() {
+                    eprintln!(
+                        "error: --wggo value '{}' is not one of full|greedy|off|auto",
+                        m
+                    );
+                    process::exit(1);
+                }
+            }
 
             if standalone {
                 if weights.is_none() {
@@ -878,6 +903,8 @@ fn main() {
                 zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib: false,
+                wggo_mode: None,
+                wggo_report: false,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
