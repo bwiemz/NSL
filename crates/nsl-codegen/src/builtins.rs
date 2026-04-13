@@ -277,6 +277,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // WRGA B.3 Task 5.6: fused-PTX runtime registry registration.
+    // Args: (handle_i64, ptx_ptr_i64, ptx_len_i64, name_ptr_i64, name_len_i64).
+    // Called from `main` preamble, one call per unique (m,n,k,rank,sm) key.
+    (
+        "nsl_wrga_register_fused_ptx",
+        &[types::I64, types::I64, types::I64, types::I64, types::I64],
+        None,
+    ),
     // Tensor reductions (return scalar tensor ptr, not f64)
     ("nsl_tensor_sum", &[types::I64], Some(types::I64)),
     ("nsl_tensor_mean", &[types::I64], Some(types::I64)),
