@@ -24,8 +24,8 @@ use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan};
 use crate::wggo_graph::{build as build_graph, OptGraph};
 use crate::wggo_ilp::{
-    solve_all as ilp_solve_all, solve_all_greedy as ilp_solve_all_greedy, LayerIlpConstraints,
-    LayerIlpSolution,
+    solve_all_greedy as ilp_solve_all_greedy, solve_all_templated as ilp_solve_all_templated,
+    LayerIlpConstraints, LayerIlpSolution, TemplateStats,
 };
 use crate::wggo_schedule::{build_schedule, CommSchedule};
 
@@ -87,6 +87,8 @@ pub struct WggoPlan {
     /// Cross-device collective schedule (Stage 8).  Produced from the
     /// post-resolution per-layer plan; consumed by CPDT lowering.
     pub schedule: CommSchedule,
+    /// Counters for template-layer reuse during the per-layer ILP.
+    pub template_stats: TemplateStats,
     /// Total solver wall-clock time (μs, self-reported — not measured).
     pub estimated_solve_us: u64,
 }
@@ -156,6 +158,12 @@ impl WggoPlan {
         )
         .unwrap();
         writeln!(s, "  Solve time: {:.2} ms", self.estimated_solve_us as f64 / 1000.0).unwrap();
+        writeln!(
+            s,
+            "  Templates: {} solved, {} layers reused",
+            self.template_stats.templates_solved, self.template_stats.template_hits
+        )
+        .unwrap();
         writeln!(s).unwrap();
         write!(s, "{}", self.schedule.render()).unwrap();
         s
@@ -197,7 +205,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         } else {
             input.ilp_constraints
         };
-        let per_layer = ilp_solve_all(&luts, &ilp_defaults);
+        let (per_layer, template_stats) = ilp_solve_all_templated(&luts, &ilp_defaults);
         let applied = apply(&inter, &per_layer);
         let schedule = build_schedule(&inter, &applied);
         return WggoPlan {
@@ -209,6 +217,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             resolutions: Vec::new(),
             applied,
             schedule,
+            template_stats,
             estimated_solve_us: t0.elapsed().as_micros() as u64,
         };
     }
@@ -242,9 +251,12 @@ pub fn run(input: WggoInput) -> WggoPlan {
             cons.allow_fase = false;
         }
     }
-    let per_layer = match input.mode {
-        WggoMode::Greedy => ilp_solve_all_greedy(&luts, &ilp_constraints),
-        _ => ilp_solve_all(&luts, &ilp_constraints),
+    let (per_layer, template_stats) = match input.mode {
+        WggoMode::Greedy => (
+            ilp_solve_all_greedy(&luts, &ilp_constraints),
+            TemplateStats::default(),
+        ),
+        _ => ilp_solve_all_templated(&luts, &ilp_constraints),
     };
 
     // 6. Build initial LayerDecisions vector for conflict detection.
@@ -296,6 +308,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         resolutions,
         applied,
         schedule,
+        template_stats,
         estimated_solve_us: t0.elapsed().as_micros() as u64,
     }
 }
@@ -538,6 +551,30 @@ mod tests {
             greedy_nodes * 100 < full_nodes,
             "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
         );
+    }
+
+    #[test]
+    fn template_stats_reuse_identical_blocks() {
+        // The two-block toy Wengert produces two layers with identical
+        // shape and constraints, so Full mode should solve once and
+        // replicate.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert_eq!(plan.template_stats.templates_solved, 1);
+        assert!(plan.template_stats.template_hits >= 1);
+        let rep = plan.render_report();
+        assert!(rep.contains("Templates:"));
+    }
+
+    #[test]
+    fn template_stats_zero_in_greedy_mode() {
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.mode = WggoMode::Greedy;
+        let plan = run(inp);
+        // Greedy bypasses the templated solver — counters are default.
+        assert_eq!(plan.template_stats.templates_solved, 0);
+        assert_eq!(plan.template_stats.template_hits, 0);
     }
 
     #[test]
