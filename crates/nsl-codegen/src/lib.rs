@@ -50,6 +50,7 @@ pub mod fusion_graph;
 pub mod fusion_report;
 pub mod gpu_specs;
 pub mod gpu_target;
+pub mod inspect;
 pub mod kernel;
 pub mod kernel_ir;
 pub mod kernel_lower;
