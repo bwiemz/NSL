@@ -268,6 +268,110 @@ pub fn solve_layer(
     }
 }
 
+/// Diagnostic counters for [`solve_all_templated`].
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct TemplateStats {
+    /// Number of distinct (LUT, constraint) templates that required a
+    /// fresh ILP solve.  Always ≥ 1 when there is at least one layer.
+    pub templates_solved: u32,
+    /// Number of layers whose solution was reused from a previously
+    /// solved template instead of being re-derived.
+    pub template_hits: u32,
+}
+
+/// Solve every layer, but reuse the solution across consecutive layers
+/// whose `(LayerCostLut, LayerIlpConstraints)` are identical.  This is
+/// the "template-layer optimization" the audit calls out: transformer
+/// blocks repeat the same shape and constraints, so solving once per
+/// template and replicating costs a single ILP pass for the whole model.
+///
+/// Importance-aware specialisation: the importance vectors are part of
+/// the template key, so any layer whose `head_importance` diverges from
+/// its predecessors will spawn a fresh solve.
+pub fn solve_all_templated(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (Vec<LayerIlpSolution>, TemplateStats) {
+    assert_eq!(
+        luts.len(),
+        constraints.len(),
+        "luts and constraints must be parallel arrays"
+    );
+    let mut out: Vec<LayerIlpSolution> = Vec::with_capacity(luts.len());
+    let mut stats = TemplateStats::default();
+    let mut template_idx: Option<usize> = None;
+
+    for (i, (lut, c)) in luts.iter().zip(constraints.iter()).enumerate() {
+        let reuse = template_idx
+            .map(|j| lut_eq(&luts[j], lut) && constraints_eq(&constraints[j], c))
+            .unwrap_or(false);
+        if reuse {
+            let mut s = out[template_idx.unwrap()].clone();
+            // Mark replicated solutions with zero nodes so callers can
+            // distinguish fresh solves from cache hits.
+            s.nodes_explored = 0;
+            out.push(s);
+            stats.template_hits += 1;
+        } else {
+            let sol = solve_layer(lut, c);
+            out.push(sol);
+            stats.templates_solved += 1;
+            template_idx = Some(i);
+        }
+    }
+
+    (out, stats)
+}
+
+/// Field-by-field equality for [`LayerCostLut`] (manual to avoid
+/// requiring `PartialEq` on the cost-model leaves).
+fn lut_eq(a: &LayerCostLut, b: &LayerCostLut) -> bool {
+    if a.axes_head_counts != b.axes_head_counts
+        || a.axes_ffn_widths != b.axes_ffn_widths
+        || a.axes_csha_levels != b.axes_csha_levels
+        || a.axes_adapter_ranks != b.axes_adapter_ranks
+        || a.entries.len() != b.entries.len()
+    {
+        return false;
+    }
+    a.entries.iter().zip(b.entries.iter()).all(|(x, y)| {
+        x.forward_us.to_bits() == y.forward_us.to_bits()
+            && x.backward_us.to_bits() == y.backward_us.to_bits()
+            && x.param_bytes == y.param_bytes
+            && x.activation_bytes == y.activation_bytes
+            && x.smem_bytes == y.smem_bytes
+            && x.feasible == y.feasible
+            && x.classification == y.classification
+    })
+}
+
+/// Field-by-field equality for [`LayerIlpConstraints`], including the
+/// importance vector — divergent importance must trigger a fresh solve.
+fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
+    a.num_heads == b.num_heads
+        && a.num_kv_groups == b.num_kv_groups
+        && a.memory_budget == b.memory_budget
+        && a.smem_budget == b.smem_budget
+        && a.adapter_comm_budget.to_bits() == b.adapter_comm_budget.to_bits()
+        && a.gqa_group == b.gqa_group
+        && a.sensitivity.to_bits() == b.sensitivity.to_bits()
+        && a.high_prec_threshold.to_bits() == b.high_prec_threshold.to_bits()
+        && a.critical_prec_threshold.to_bits() == b.critical_prec_threshold.to_bits()
+        && a.head_importance.len() == b.head_importance.len()
+        && a.head_importance
+            .iter()
+            .zip(b.head_importance.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.min_retained_importance.to_bits() == b.min_retained_importance.to_bits()
+        && a.allow_fase == b.allow_fase
+        && a.fase_backward_speedup.to_bits() == b.fase_backward_speedup.to_bits()
+        && a.packing_modes_mask == b.packing_modes_mask
+        && a.packing_savings
+            .iter()
+            .zip(b.packing_savings.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
 /// Solve a layer **greedily** — paper §5.3.
 ///
 /// Each decision variable is chosen independently using a fast local
@@ -663,6 +767,73 @@ mod tests {
         for s in &sols {
             assert!(s.feasible);
         }
+    }
+
+    #[test]
+    fn templated_solve_reuses_identical_layers() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut.clone(); 8];
+        let cs = vec![c; 8];
+        let (sols, stats) = solve_all_templated(&luts, &cs);
+        assert_eq!(sols.len(), 8);
+        assert_eq!(stats.templates_solved, 1);
+        assert_eq!(stats.template_hits, 7);
+        // Replicated solutions report zero nodes_explored.
+        assert!(sols[0].nodes_explored > 0);
+        for s in &sols[1..] {
+            assert_eq!(s.nodes_explored, 0);
+        }
+        // The decisions themselves must match.
+        for s in &sols[1..] {
+            assert_eq!(s.decision, sols[0].decision);
+        }
+    }
+
+    #[test]
+    fn templated_solve_specialises_when_importance_diverges() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c1 = LayerIlpConstraints::default();
+        c1.num_heads = 4;
+        let mut c2 = c1.clone();
+        c2.head_importance = vec![10.0, 0.1, 0.1, 0.1];
+        c2.min_retained_importance = 5.0;
+        let luts = vec![lut.clone(), lut.clone(), lut];
+        let cs = vec![c1.clone(), c1.clone(), c2];
+        let (_sols, stats) = solve_all_templated(&luts, &cs);
+        // Layers 0 and 1 share a template; layer 2's diverging
+        // importance must trigger a fresh solve.
+        assert_eq!(stats.templates_solved, 2);
+        assert_eq!(stats.template_hits, 1);
+    }
+
+    #[test]
+    fn templated_solve_matches_full_solve_per_layer() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut.clone(); 4];
+        let cs = vec![c.clone(); 4];
+        let full = solve_all(&luts, &cs);
+        let (templated, _) = solve_all_templated(&luts, &cs);
+        for (a, b) in full.iter().zip(templated.iter()) {
+            assert_eq!(a.decision, b.decision);
+            assert!((a.cost_us - b.cost_us).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn templated_solve_handles_alternating_templates() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c1 = LayerIlpConstraints::default();
+        let mut c2 = c1.clone();
+        c2.smem_budget = 4096; // forces csha=0 → different solution
+        // Pattern: A, A, B, A — three template switches, two solves of A.
+        let luts = vec![lut.clone(); 4];
+        let cs = vec![c1.clone(), c1.clone(), c2, c1];
+        let (sols, stats) = solve_all_templated(&luts, &cs);
+        assert_eq!(sols.len(), 4);
+        assert_eq!(stats.templates_solved, 3);
+        assert_eq!(stats.template_hits, 1);
     }
 
     #[test]
