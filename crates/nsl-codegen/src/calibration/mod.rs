@@ -67,10 +67,8 @@ pub fn run_harness_stub(
     calibration_data_bytes: &[u8],
     num_samples: u32,
 ) -> Result<HarnessOutput, HarnessError> {
-    let mut ctx = CalibCtx {
-        sample_idx: 0,
-        total_samples: num_samples,
-    };
+    let mut ctx = CalibCtx::stub_for_tests();
+    ctx.total_samples = num_samples;
     for hook in registry.iter() {
         hook.emit_init(&mut ctx);
     }
