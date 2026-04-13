@@ -1270,6 +1270,7 @@ impl Compiler<'_> {
     pub(crate) fn compile_flash_attention_call(
         &mut self,
         builder: &mut FunctionBuilder,
+        state: &mut FuncState,
         q_val: Value,
         k_val: Value,
         v_val: Value,
@@ -1345,10 +1346,13 @@ impl Compiler<'_> {
         // proper layer-name resolver (Wengert `Param` prefix →
         // enclosing function → layer key).
         let ordinal = self.csha_fa_call_ordinal;
-        let csha_extras = self
-            .last_csha_bridge
-            .as_ref()
-            .and_then(|b| b.extras_at_index(ordinal).cloned());
+        let (csha_layer, csha_extras) = match self.last_csha_bridge.as_ref() {
+            Some(b) => (
+                b.layer_at_index(ordinal).map(str::to_string),
+                b.extras_at_index(ordinal).cloned(),
+            ),
+            None => (None, None),
+        };
         self.csha_fa_call_ordinal = ordinal.saturating_add(1);
 
         if let Some(extras) = csha_extras {
@@ -1361,11 +1365,40 @@ impl Compiler<'_> {
             let d_model_val = builder
                 .ins()
                 .iconst(cl_types::I64, extras.d_model as i64);
-            // CSHA weight pointers are null in A.1 — A.2 threads the
-            // real Param DataIds here by matching the Wengert
-            // `blocks.N.attn.{wq,wk,wv,wo}` names against the bridge
-            // marks. Passing null keeps the ABI stable and lets the
-            // forwarder behave identically to `nsl_flash_attention`.
+
+            // A.2.1a: resolve bridge marks' `param_name` strings against
+            // `FuncState.weights_by_name` — this gives the Cranelift
+            // Value of the already-loaded Wq/Wk/Wv/Wo weight tensor
+            // without re-emitting the field load. For marks whose
+            // param_name isn't in the forward map (weight never loaded,
+            // or named differently than `model.member`), we fall back to
+            // null — the CSHA runtime forwarder tolerates null weight
+            // pointers in A.2.1 and delegates to the non-fused path.
+            //
+            // A.2.1b will extend this to suppress the separately-lowered
+            // matmul launches when all four weights resolve, and will
+            // thread `x` + `norm_weight` via a norm-layer-name resolver.
+            let (mut wq_v, mut wk_v, mut wv_v, mut wo_v) = (null, null, null, null);
+            if let (Some(bridge), Some(layer)) =
+                (self.last_csha_bridge.as_ref(), csha_layer.as_deref())
+            {
+                use crate::csha_boundary::ProjKind;
+                use crate::csha_apply::MarkRole;
+                for mark in bridge.marks_for_layer(layer) {
+                    let v = match state.weights_by_name.get(&mark.param_name) {
+                        Some(v) => *v,
+                        None => continue,
+                    };
+                    match (mark.role, mark.kind) {
+                        (MarkRole::NormPrologue, Some(ProjKind::Q)) => wq_v = v,
+                        (MarkRole::NormPrologue, Some(ProjKind::K)) => wk_v = v,
+                        (MarkRole::NormPrologue, Some(ProjKind::V)) => wv_v = v,
+                        (MarkRole::OutputProjEpilogue, _) => wo_v = v,
+                        _ => {}
+                    }
+                }
+            }
+
             let _err = self.compile_call_by_name(
                 builder,
                 "nsl_flash_attention_csha",
@@ -1381,10 +1414,10 @@ impl Compiler<'_> {
                     ptx_ptr, name_ptr,
                     block_q_val, block_kv_val,
                     causal_val,
-                    // CSHA extras:
-                    null,              // x_ptr  (A.2)
-                    null,              // norm_weight_ptr (A.2)
-                    null, null, null, null, // Wq/Wk/Wv/Wo (A.2)
+                    // CSHA extras (A.2.1a):
+                    null,                      // x_ptr  (A.2.1b: needs norm-input resolver)
+                    null,                      // norm_weight_ptr (A.2.1b)
+                    wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                     eps_bits,
                     active_heads_val,
                     d_model_val,

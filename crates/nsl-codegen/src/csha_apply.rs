@@ -91,6 +91,27 @@ impl BridgeResult {
     pub fn active_layer_count(&self) -> usize {
         self.extras.len()
     }
+
+    /// A.2.1a: positional layer-name lookup — returns the layer name for
+    /// the Nth entry in sorted-key order. Parallel to
+    /// [`Self::extras_at_index`] so the FA call site can reach both the
+    /// extras and the layer name from a single ordinal, in order to
+    /// query `marks_for_layer` for weight-param resolution.
+    pub fn layer_at_index(&self, index: usize) -> Option<&str> {
+        self.extras.keys().nth(index).map(|s| s.as_str())
+    }
+
+    /// A.2.1a: iterate the subset of `marks` belonging to a given layer.
+    /// Used by the FA call site to resolve `param_name` strings
+    /// (e.g. `"TransformerBlock.wq"`) against `FuncState.weights_by_name`
+    /// and thread the resulting Cranelift Values into
+    /// `nsl_flash_attention_csha`.
+    pub fn marks_for_layer<'a>(
+        &'a self,
+        layer: &'a str,
+    ) -> impl Iterator<Item = &'a FusionMark> + 'a {
+        self.marks.iter().filter(move |m| m.layer == layer)
+    }
 }
 
 /// Serializable mirror of the bits of `FlashAttentionConfig` a downstream
@@ -474,6 +495,39 @@ mod tests {
         let plan_off = toy_plan(CshaMode::Off);
         let r_off = bridge(&plan_off, 64);
         assert_eq!(r_off.active_layer_count(), 0);
+    }
+
+    #[test]
+    fn a21a_layer_at_index_matches_extras_at_index() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        // In-order traversal of `extras` yields the same layer name
+        // that `layer_at_index` returns for each ordinal — the FA
+        // call site relies on this parallel structure to reach both
+        // `CshaExtras` and the layer name from a single ordinal.
+        let layer = r
+            .layer_at_index(0)
+            .expect("toy plan must have at least one CSHA-active layer");
+        assert_eq!(layer, "blocks.0");
+        assert!(r.extras_at_index(0).is_some());
+        assert!(r.layer_at_index(1).is_none());
+    }
+
+    #[test]
+    fn a21a_marks_for_layer_filters_by_layer_name() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        // Every mark yielded by `marks_for_layer("blocks.0")` must
+        // carry that same layer name — the FA call site uses this
+        // filter to scope `weights_by_name` lookups to the current
+        // layer's Wq/Wk/Wv/Wo params.
+        let count = r.marks_for_layer("blocks.0").count();
+        assert!(count >= 1, "toy plan must produce at least one mark");
+        for m in r.marks_for_layer("blocks.0") {
+            assert_eq!(m.layer, "blocks.0");
+        }
+        // Unknown layer yields no marks.
+        assert_eq!(r.marks_for_layer("blocks.9999").count(), 0);
     }
 
     #[test]
