@@ -3703,6 +3703,58 @@ impl Compiler<'_> {
                     }
                 }
 
+                // Calibration harness (MVP): currently a pass-through
+                // when no consumers are registered.  Real consumers
+                // (AWQ/WGGO Phase 2/FP8/GPTQ) land in follow-up plans.
+                if let Some(ref data_path) = self.compile_options.calibration_data {
+                    let registry = crate::calibration::registry::HookRegistry::new();
+                    if registry.is_empty() {
+                        eprintln!(
+                            "warning: --calibration-data {} supplied but no calibration hooks registered (no consumers yet — this is a no-op in MVP)",
+                            data_path.display()
+                        );
+                    } else {
+                        let mode = match self
+                            .compile_options
+                            .calibration_mode
+                            .as_deref()
+                            .unwrap_or("required")
+                        {
+                            "best-effort" => crate::calibration::HarnessMode::BestEffort,
+                            _ => crate::calibration::HarnessMode::Required,
+                        };
+                        let cfg = crate::calibration::HarnessConfig {
+                            checkpoints: self
+                                .compile_options
+                                .weight_file
+                                .as_ref()
+                                .map(|p| vec![p.clone()])
+                                .unwrap_or_default(),
+                            calibration_data: data_path.clone(),
+                            samples: self.compile_options.calibration_samples,
+                            batch_size: self.compile_options.calibration_batch_size,
+                            timeout_secs: self.compile_options.calibration_timeout_secs,
+                            mode,
+                        };
+                        match crate::calibration::run_harness_simulated(
+                            &registry,
+                            &cfg,
+                            crate::calibration::binary_codegen::real_subprocess_entry,
+                        ) {
+                            Ok(out) => eprintln!(
+                                "[calibration] {} ({} hooks)",
+                                out.outcome_repr,
+                                out.sidecar.hooks.len()
+                            ),
+                            Err(e) => {
+                                return Err(crate::error::CodegenError::new(format!(
+                                    "calibration failed: {e}"
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 // 5. Lower PRIMAL Wengert list to Cranelift IR.
                 //    This IS the forward pass — each WengertOp is compiled to
                 //    its runtime FFI call, and ALL intermediate VarId → Value
