@@ -9,6 +9,79 @@ use nsl_semantic::checker::TypeMap;
 use super::{Compiler, StandaloneConfig};
 use crate::error::CodegenError;
 
+/// Dev Tools Phase 2, Task 4: run the profiling walker once and stash its
+/// output on the compiler so kernel-launch sites can attach compile-time
+/// predictions by `NodeId`.  Non-fatal: a walker error is logged to stderr
+/// (under `NSL_DEBUG`) and leaves the maps empty — profiling is advisory and
+/// must never break a build.
+fn run_profile_pre_pass(
+    compiler: &mut Compiler<'_>,
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    options: &crate::CompileOptions,
+) {
+    use crate::gpu_specs::find_gpu;
+    use crate::profiling::instrument::ManifestBuilder;
+    use crate::profiling::shape_env::ShapeEnv;
+    use crate::profiling::types::EntryKind;
+    use crate::profiling::walker::walk_ops;
+
+    let env = ShapeEnv::with_defaults();
+    let target_gpu = options.target_gpu.as_str();
+    let dtype = options.dtype.as_str();
+
+    let gpu = match find_gpu(target_gpu) {
+        Some(g) => g,
+        None => {
+            if std::env::var("NSL_DEBUG").is_ok() {
+                eprintln!(
+                    "[nsl] profile_kernels: unknown GPU target {:?}, skipping pre-pass",
+                    target_gpu
+                );
+            }
+            return;
+        }
+    };
+
+    // The walker expects an `&AnalysisResult` but only reads `type_map`.
+    // Construct a minimal synthetic result from the `TypeMap` we already have.
+    let analysis = nsl_semantic::AnalysisResult {
+        diagnostics: Vec::new(),
+        type_map: type_map.clone(),
+        scopes: nsl_semantic::scope::ScopeMap::new(),
+        ownership_info: std::collections::HashMap::new(),
+        wrga_configs: Vec::new(),
+        freeze_configs: Vec::new(),
+        adapter_configs: Vec::new(),
+    };
+
+    match walk_ops(ast, &analysis, interner, EntryKind::Auto, &env, gpu, dtype) {
+        Ok(report) => {
+            compiler.prediction_map = report
+                .ops
+                .iter()
+                .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
+                .collect();
+            compiler.manifest_builder = Some(ManifestBuilder::new(target_gpu, dtype));
+            // Phase 2 follow-up: the existing fusion pass does not yet
+            // populate `FusionPlan.fused_node_groups` for all kernels, so
+            // leave `fusion_plan_for_profile` as `None` — `fusion_constituents`
+            // falls back to `vec![root]`, which is correct for non-fused
+            // kernels.  Wiring the real plan is a separate task.
+            compiler.fusion_plan_for_profile = None;
+        }
+        Err(e) => {
+            if std::env::var("NSL_DEBUG").is_ok() {
+                eprintln!(
+                    "[nsl] profile_kernels: walker failed ({}), continuing without predictions",
+                    e
+                );
+            }
+        }
+    }
+}
+
 /// Main entry point (single-file, backward compatible).
 pub fn compile(
     ast: &nsl_ast::Module,
@@ -615,6 +688,14 @@ pub fn compile_module_with_imports_best_effort_plan(
     for name in imported_model_names {
         compiler.models.imported_model_names.insert(name);
     }
+
+    // Dev Tools Phase 2, Task 4: run the kernel-profile pre-pass once at the
+    // start of codegen so downstream kernel-launch sites can attach
+    // compile-time predictions by `NodeId`.
+    if options.profile_kernels {
+        run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
+    }
+
     // Run every pass up to (but not including) `finalize`, so we can observe
     // `last_wrga_plan` even on an error path before consuming the compiler.
     let pre_finalize = (|| -> Result<(), CodegenError> {

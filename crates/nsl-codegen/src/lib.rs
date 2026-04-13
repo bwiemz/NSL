@@ -99,6 +99,9 @@ pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers;
+
 pub use compiler::{
     compile, compile_entry, compile_module, compile_module_with_imports,
     compile_entry_returning_plan, compile_module_with_imports_returning_plan,
@@ -418,6 +421,18 @@ pub struct CompileOptions {
     pub wggo_mode: Option<String>,
     /// WGGO: print the global-optimization report to stderr.
     pub wggo_report: bool,
+    /// Dev Tools Phase 2: enable the kernel-profile pre-pass. When true,
+    /// the codegen entry function runs `profiling::walker::walk_ops` once
+    /// before function bodies are lowered, and populates
+    /// `Compiler::{prediction_map, manifest_builder}`.
+    pub profile_kernels: bool,
+    /// Dev Tools Phase 2: target GPU name for the profile walker (e.g.
+    /// `"h100"`, `"a100"`).  Defaults to `"h100"` to match the Phase 1
+    /// `nsl profile` CLI default.
+    pub target_gpu: String,
+    /// Dev Tools Phase 2: tensor dtype assumed by the profile walker
+    /// (e.g. `"bf16"`, `"fp8"`).  Defaults to `"bf16"`.
+    pub dtype: String,
 }
 
 impl Default for CompileOptions {
@@ -462,6 +477,9 @@ impl Default for CompileOptions {
             wrga_fold_allocations: false,
             wggo_mode: None,
             wggo_report: false,
+            profile_kernels: false,
+            target_gpu: "h100".to_string(),
+            dtype: "bf16".to_string(),
         }
     }
 }

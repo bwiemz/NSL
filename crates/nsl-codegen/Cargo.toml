@@ -29,6 +29,7 @@ half = { version = "2.4", features = ["std"] }
 [features]
 default = []
 cuda = ["nsl-runtime/cuda"]
+test-helpers = []
 
 [dev-dependencies]
 string-interner.workspace = true

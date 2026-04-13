@@ -383,6 +383,21 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
+
+    // ── Dev Tools Phase 2: kernel-profile pre-pass ─────────────────────
+    /// Map from AST `NodeId` of a kernel-launching operation to the
+    /// predicted `OpCost` computed by the profiling walker.  Populated
+    /// only when `compile_options.profile_kernels` is true.  Consumed by
+    /// `compile_gpu_kernel_launch` (Task 5) to stamp kernel launches with
+    /// compile-time predictions and by the manifest writer (Task 6).
+    pub prediction_map: HashMap<NodeId, crate::cost_model::OpCost>,
+    /// Manifest builder accumulating kernel entries during codegen.
+    /// `None` when `profile_kernels` is disabled.
+    pub manifest_builder: Option<crate::profiling::instrument::ManifestBuilder>,
+    /// Snapshot of the fusion plan recorded for profile attribution.
+    /// Used by `fusion_constituents` to map a fused kernel root back to the
+    /// AST `NodeId`s folded into it.  `None` until wired in a follow-up.
+    pub fusion_plan_for_profile: Option<crate::wrga_fusion::FusionPlan>,
 }
 
 /// Quantization configuration for a model.
@@ -508,6 +523,9 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            prediction_map: HashMap::new(),
+            manifest_builder: None,
+            fusion_plan_for_profile: None,
         })
     }
 
@@ -525,6 +543,16 @@ impl<'a> Compiler<'a> {
     /// Defaults to CUDA when no target is specified.
     pub fn gpu_target(&self) -> crate::gpu_target::GpuTarget {
         crate::gpu_target::GpuTarget::from_target_string(&self.compile_options.target)
+    }
+
+    /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the
+    /// kernel rooted at `root`.  For non-fused kernels (or when no
+    /// `FusionPlan` is recorded for profiling), returns `vec![root]`.
+    pub fn fusion_constituents(&self, root: NodeId) -> Vec<NodeId> {
+        match &self.fusion_plan_for_profile {
+            Some(p) => p.constituents_of(root),
+            None => vec![root],
+        }
     }
 
     /// M42: Look up the first KV compression policy for a specific model layer.
