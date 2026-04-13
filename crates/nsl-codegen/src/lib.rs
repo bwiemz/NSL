@@ -95,9 +95,11 @@ pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wrga;
+pub mod matmul_mma;
 pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
 pub mod wrga_adapter_rewrite;
+pub mod wrga_fused_ptx;
 pub mod wrga_fusion;
 pub mod wrga_memory;
 pub mod wrga_prescan;
@@ -296,6 +298,7 @@ pub fn debug_clear_allocator_slot_channels() {
 
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
+pub use wrga_fusion::{FusionDecision, FusionPlan, FusionTarget};
 
 use std::collections::HashMap;
 

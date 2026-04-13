@@ -164,7 +164,17 @@ pub(crate) fn invoke_wrga_if_enabled(
     // `last_wrga_plan` is always overwritten — the train-block plan is
     // strictly more informative (real Wengert list, real placements).
     if !inject.sites.is_empty() {
-        compiler.adapter_sites = inject.sites;
+        // B.3 Task 4: wire fusion decisions onto each newly-injected site.
+        let mut sites = inject.sites;
+        for site in sites.iter_mut() {
+            for decision in &plan.fusion.decisions {
+                if decision.site == site.target_param {
+                    site.fusion_decision = Some(decision.target.clone());
+                    break;
+                }
+            }
+        }
+        compiler.adapter_sites = sites;
     }
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)

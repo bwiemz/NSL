@@ -169,6 +169,44 @@ fn decide(p: &AdapterPlacement, rank: usize) -> (FusionTarget, String, u64) {
     }
 }
 
+/// B.3 Task 3: verify the `activation_live` invariant for EpilogueFusedLora
+/// sites.  Because the AST rewrite (B.2.1 Task 3, modified by B.3 Task 4)
+/// emits a SINGLE FFI call for fused sites, the `x @ A` intermediate is
+/// never in the AST → never in Wengert → never in activation_live.  If a
+/// fused site's Wengert list contains a matmul op whose name matches
+/// `lora_A_<site>` as an input, that's a regression.
+///
+/// Call this after the fusion plan is finalized, passing the Wengert list.
+pub fn verify_fused_sites_have_no_intermediate(
+    plan: &FusionPlan,
+    wengert: &crate::wengert::WengertList,
+) {
+    for decision in &plan.decisions {
+        if !matches!(decision.target, FusionTarget::EpilogueFusedLora { .. }) {
+            continue;
+        }
+        for op in &wengert.ops {
+            let op_name = wengert
+                .var_names
+                .get(&op.result)
+                .cloned()
+                .unwrap_or_default();
+            if op_name.starts_with("matmul_")
+                && op_name.contains(&format!("lora_A_{}", decision.site))
+            {
+                panic!(
+                    "[wrga B.3 Task 3 invariant] Fused site '{}' has an x @ A \
+                     intermediate in the Wengert list ('{}').  The AST rewrite \
+                     emitted the unfused triple for a site whose FusionDecision \
+                     is EpilogueFusedLora.  Check wrga_adapter_rewrite.rs's \
+                     conditional on site.fusion_decision.",
+                    decision.site, op_name,
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
