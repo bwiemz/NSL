@@ -418,6 +418,31 @@ mod tests {
         }
     }
 
+    /// A.2.1c: single-class variant of `attn_wengert` — params use
+    /// `Model.member` naming rather than `blocks.N.attn.member`. Before
+    /// the A.2.1c fallback, `chain.layer` was None for these names and
+    /// no `FusionMark`s were produced.
+    fn flat_attn_wengert() -> WengertList {
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            op(2, 2, PrimalOp::Param("TransformerBlock.wq".into()), vec![]),
+            op(3, 3, PrimalOp::Matmul, vec![1, 2]),
+            op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
+            op(5, 5, PrimalOp::Param("TransformerBlock.wk".into()), vec![]),
+            op(6, 6, PrimalOp::Matmul, vec![1, 5]),
+            op(7, 7, PrimalOp::RoPE { dim: 64 }, vec![6]),
+            op(8, 8, PrimalOp::Param("TransformerBlock.wv".into()), vec![]),
+            op(9, 9, PrimalOp::Matmul, vec![1, 8]),
+        ];
+        WengertList {
+            ops,
+            output: 9,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
     fn toy_plan(mode: CshaMode) -> CshaPlan {
         let w = attn_wengert();
         run(CshaInput {
@@ -542,6 +567,53 @@ mod tests {
         assert_eq!(layer, "blocks.0");
         assert!(r.extras_at_index(0).is_some());
         assert!(r.layer_at_index(1).is_none());
+    }
+
+    #[test]
+    fn a21c_flat_model_params_produce_marks_via_last_dot_fallback() {
+        // Single-class model: params named `"TransformerBlock.wq"` lack
+        // a canonical `blocks.N` prefix. Pre-A.2.1c, `chain.layer` was
+        // None for these and `bridge()` emitted zero `FusionMark`s —
+        // meaning the FA call site's `marks_for_layer` iterator was
+        // empty and Wq/Wk/Wv/Wo threading always fell back to null.
+        //
+        // After A.2.1c, `layer_key_with_fallback` strips `.wq`/`.wk`/etc.
+        // to give `"TransformerBlock"` as the layer key, so marks are
+        // emitted and wq/wk/wv/wo threading actually resolves.
+        let w = flat_attn_wengert();
+        let plan = run(CshaInput {
+            mode: CshaMode::Auto,
+            target: "H100",
+            wengert: &w,
+            weights: None,
+            shape: LayerShape {
+                batch: 1,
+                seq: 1024,
+                d_model: 512,
+                head_dim: 64,
+                n_kv_heads: 4,
+                dtype_bytes: 2,
+            },
+            n_heads: 8,
+            spec_cfg: SpecConfig::default(),
+            pattern_cfg: crate::csha_patterns::PatternConfig::default(),
+        });
+        let r = bridge(&plan, 64);
+
+        // At least one mark must be emitted, and all of them must
+        // carry the class-level fallback layer key.
+        assert!(
+            !r.marks.is_empty(),
+            "flat-model chains must still emit marks via last-dot fallback"
+        );
+        for m in &r.marks {
+            assert_eq!(m.layer, "TransformerBlock");
+        }
+
+        // The extras map must also key on the fallback layer — the FA
+        // call site's name-based resolver (A.2.1b) relies on this
+        // consistency to look up extras by the enclosing function name.
+        assert!(r.extras.contains_key("TransformerBlock"));
     }
 
     #[test]
