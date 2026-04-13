@@ -114,7 +114,7 @@ impl WggoPlan {
         for layer in &self.applied.layers {
             writeln!(
                 s,
-                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b",
+                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
                 layer.active_heads, // number of actually-kept heads (no "of total" info here)
@@ -122,7 +122,15 @@ impl WggoPlan {
                 layer.csha_level,
                 layer.adapter_rank,
                 layer.optim_m_bits,
-                layer.optim_v_bits
+                layer.optim_v_bits,
+                if layer.fase_fused { "fused" } else { "deferred" },
+                match layer.packing_mode {
+                    0 => "none",
+                    1 => "segment_id",
+                    2 => "tile_skip",
+                    3 => "multi_seq",
+                    _ => "?",
+                }
             )
             .unwrap();
         }
@@ -210,11 +218,19 @@ pub fn run(input: WggoInput) -> WggoPlan {
 
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
-    let ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
+    let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
         vec![LayerIlpConstraints::default(); n]
     } else {
         input.ilp_constraints
     };
+    // Pre-prune the FASE option on layers CPDT will shard — fusing the
+    // optimizer step into backward conflicts with reduce-scatter ordering,
+    // and the conflict resolver would defer it anyway.
+    for (cons, lp) in ilp_constraints.iter_mut().zip(inter.layers.iter()) {
+        if lp.shard_params > 1 || lp.shard_grads > 1 || lp.shard_optim > 1 {
+            cons.allow_fase = false;
+        }
+    }
     let per_layer = ilp_solve_all(&luts, &ilp_constraints);
 
     // 6. Build initial LayerDecisions vector for conflict detection.
@@ -230,7 +246,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
                 .saturating_sub(sol.decision.active_heads() as u32),
             adapter_rank: sol.decision.adapter_rank,
             shard_factor: inter_layer.shard_params,
-            fase_fused: false,
+            fase_fused: sol.decision.fase_fused,
             adapter_comm_cost: 0.0,
             adapter_comm_budget: f64::MAX,
         })
@@ -240,7 +256,18 @@ pub fn run(input: WggoInput) -> WggoPlan {
     //    Full mode still runs the same resolver because the ILP itself
     //    already honours the hard constraints — remaining conflicts are
     //    the ones crossing technique boundaries).
-    let (_resolved, resolutions) = greedy_resolve(layer_decisions);
+    let (resolved, resolutions) = greedy_resolve(layer_decisions);
+
+    // Feed the resolver's verdicts back into the per-layer ILP solutions so
+    // `apply` sees the post-resolution decisions, not the pre-resolution
+    // ones.  The resolver may have downgraded CSHA, removed an adapter, or
+    // deferred a FASE fused step.
+    let mut per_layer = per_layer;
+    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
+        sol.decision.csha_level = r.csha_level;
+        sol.decision.adapter_rank = r.adapter_rank;
+        sol.decision.fase_fused = r.fase_fused;
+    }
 
     // 8. Apply.
     let applied = apply(&inter, &per_layer);
@@ -448,6 +475,40 @@ mod tests {
             assert!(plan.is_some(), "mode '{}' should be accepted", mode);
         }
         assert!(run_on_wengert(&w, "H100", "nonsense", 1).is_none());
+    }
+
+    #[test]
+    fn fase_disabled_on_sharded_layers() {
+        // Multi-GPU run will trigger ZeRO sharding in the inter-layer DP,
+        // which must in turn force allow_fase=false on those layers — so
+        // the resulting AppliedLayer must not report fase_fused=true.
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        for layer in &plan.applied.layers {
+            if layer.shard_factor > 1 {
+                assert!(
+                    !layer.fase_fused,
+                    "sharded layer {} should not have FASE fused",
+                    layer.layer_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fase_appears_in_report() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        let rep = plan.render_report();
+        assert!(rep.contains("FASE="));
+    }
+
+    #[test]
+    fn pca_appears_in_report() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        let rep = plan.render_report();
+        assert!(rep.contains("PCA="));
     }
 
     #[test]
