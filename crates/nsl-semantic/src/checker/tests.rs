@@ -748,6 +748,30 @@ let coder = load_model()
 }
 
 #[test]
+fn adapter_alpha_is_captured() {
+    let src = r#"
+@adapter(type=lora, target=["m.w"], rank=4, alpha=8)
+let m = MyModel()
+"#;
+    let res = analyze_source(src);
+    assert_eq!(res.adapter_configs.len(), 1);
+    let cfg = &res.adapter_configs[0];
+    assert_eq!(cfg.rank, Some(4));
+    assert_eq!(cfg.alpha, Some(8), "alpha must be captured from decorator");
+}
+
+#[test]
+fn adapter_alpha_defaults_to_rank_when_absent() {
+    let src = r#"
+@adapter(type=lora, target=["m.w"], rank=4)
+let m = MyModel()
+"#;
+    let res = analyze_source(src);
+    let cfg = &res.adapter_configs[0];
+    assert_eq!(cfg.alpha, None, "absent alpha stays None; codegen defaults to rank");
+}
+
+#[test]
 fn wrga_hybrid_without_layers_errors() {
     let src = r#"
 @wrga(mode=hybrid)

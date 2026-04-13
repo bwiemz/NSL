@@ -244,6 +244,9 @@ pub struct AdapterConfig {
     /// Explicit rank override; if `None`, WRGA picks the rank via roofline
     /// + spectral analysis.
     pub rank: Option<i64>,
+    /// LoRA scaling: `scale = alpha / rank`.  `None` → codegen uses
+    /// `alpha = rank` (scale = 1.0).  Ignored for non-LoRA adapters.
+    pub alpha: Option<i64>,
     pub span: Span,
 }
 
@@ -273,6 +276,7 @@ pub fn validate_adapter_decorator(
     let mut kind: Option<AdapterKind> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut rank: Option<i64> = None;
+    let mut alpha: Option<i64> = None;
 
     let Some(ref args) = deco.args else {
         diagnostics.push(
@@ -354,6 +358,22 @@ pub fn validate_adapter_decorator(
                         .with_label(arg.span, "expected integer"),
                 ),
             },
+            "alpha" => match &arg.value.kind {
+                ExprKind::IntLiteral(n) => {
+                    if *n <= 0 {
+                        diagnostics.push(
+                            Diagnostic::error("@adapter: alpha must be positive".to_string())
+                                .with_label(arg.span, "alpha <= 0"),
+                        );
+                    } else {
+                        alpha = Some(*n);
+                    }
+                }
+                _ => diagnostics.push(
+                    Diagnostic::error("@adapter: alpha must be an integer literal".to_string())
+                        .with_label(arg.span, "expected integer"),
+                ),
+            },
             _ => diagnostics.push(
                 Diagnostic::error(format!("@adapter: unknown argument '{aname}'"))
                     .with_label(arg.span, "unknown argument"),
@@ -380,10 +400,20 @@ pub fn validate_adapter_decorator(
             .with_label(deco.span, "missing target"),
         );
     }
+    if alpha.is_some() && !matches!(kind, AdapterKind::Lora) {
+        diagnostics.push(
+            Diagnostic::warning(
+                "@adapter: alpha is only meaningful for LoRA; ignored for ia3/gatedlora"
+                    .to_string(),
+            )
+            .with_label(deco.span, "alpha ignored"),
+        );
+    }
     Some(AdapterConfig {
         kind,
         targets,
         rank,
+        alpha,
         span: deco.span,
     })
 }

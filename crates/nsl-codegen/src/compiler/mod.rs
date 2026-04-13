@@ -30,8 +30,9 @@ use crate::error::CodegenError;
 pub use entry_points::{
     compile, compile_entry, compile_module, compile_module_with_imports,
     compile_module_with_imports_best_effort_plan, compile_module_with_imports_returning_plan,
-    compile_entry_returning_plan, compile_returning_plan, compile_standalone, compile_test,
-    compile_with_zk_info,
+    compile_entry_returning_plan, compile_returning_plan, compile_standalone,
+    compile_standalone_returning_plan, compile_test, compile_with_zk_info,
+    compile_with_zk_info_returning_plan,
 };
 
 /// Compile-time context for FlashAttention PTX dispatch.

@@ -23,6 +23,10 @@ use crate::wrga_prune::{prune, PruneResult};
 use crate::wrga_roofline::{place_adapters, AdapterPlacement, AdapterSite, SiteKind};
 use crate::wrga_spectral::{allocate_ranks, analyse_weight_map, RankAllocation, SpectralAnalysis};
 
+// Re-export B.2 Task 2b observation surfaces so consumers can use
+// `crate::wrga::{InitKind, InitStrategy}`.
+pub use crate::wrga_adapter_inject::{InitKind, InitStrategy};
+
 /// Input to the WRGA driver.
 #[derive(Clone)]
 pub struct WrgaInput<'a> {
@@ -71,6 +75,35 @@ pub struct WrgaPlan {
 }
 
 impl WrgaPlan {
+    /// Test-only minimal WrgaPlan constructor. Callers typically overwrite
+    /// the `memory` field after construction. Do NOT use in production code.
+    #[cfg(test)]
+    pub(crate) fn test_dummy() -> Self {
+        use std::collections::{BTreeSet, HashMap};
+        let wengert = WengertList {
+            ops: Vec::new(),
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        let prune = PruneResult {
+            pruned: wengert,
+            backward_live: BTreeSet::new(),
+            activation_live: BTreeSet::new(),
+            stats: crate::wrga_prune::PruneStats::default(),
+        };
+        WrgaPlan {
+            mode: WrgaMode::Auto,
+            target_gpu: String::new(),
+            prune,
+            placements: Vec::new(),
+            spectral: Vec::new(),
+            ranks: Vec::new(),
+            fusion: FusionPlan::default(),
+            memory: MemoryPlan::default(),
+        }
+    }
+
     /// Total adapter parameter count after rank allocation.
     pub fn adapter_params(&self) -> usize {
         self.ranks.iter().map(|r| r.adapter_params).sum()

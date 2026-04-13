@@ -7,6 +7,7 @@ pub mod cost_model;
 pub mod deterministic_kernels;
 pub mod grammar_compiler;
 pub mod schema_convert;
+pub mod stdlib_loader;
 
 pub mod ad_rules;
 pub mod backend_amdgpu;
@@ -89,6 +90,7 @@ pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wrga;
+pub mod wrga_adapter_inject;
 pub mod wrga_fusion;
 pub mod wrga_memory;
 pub mod wrga_prune;
@@ -99,7 +101,8 @@ pub mod zk;
 pub use compiler::{
     compile, compile_entry, compile_module, compile_module_with_imports,
     compile_entry_returning_plan, compile_module_with_imports_returning_plan,
-    compile_returning_plan, compile_standalone, compile_test, compile_with_zk_info,
+    compile_returning_plan, compile_standalone, compile_standalone_returning_plan,
+    compile_test, compile_with_zk_info, compile_with_zk_info_returning_plan,
     StandaloneConfig,
 };
 
@@ -109,10 +112,20 @@ pub use compiler::{
 /// effect is the stashed plan, independent of whether the full object file
 /// links.
 #[doc(hidden)]
-pub fn debug_compile_and_return_plan(
+pub fn debug_compile_and_return_plan_from_ast(
     ast: &nsl_ast::Module,
     interner: &nsl_lexer::Interner,
     type_map: &nsl_semantic::checker::TypeMap,
+    options: &CompileOptions,
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
+    debug_compile_and_return_plan_with_imports(ast, interner, type_map, &[], options)
+}
+
+fn debug_compile_and_return_plan_with_imports(
+    ast: &nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    type_map: &nsl_semantic::checker::TypeMap,
+    imported_fns: &[(String, String, cranelift_codegen::ir::Signature)],
     options: &CompileOptions,
 ) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
     let (res, plan) = crate::compiler::compile_module_with_imports_best_effort_plan(
@@ -120,7 +133,7 @@ pub fn debug_compile_and_return_plan(
         interner,
         type_map,
         "",
-        &[],
+        imported_fns,
         HashMap::new(),
         std::collections::HashSet::new(),
         false,
@@ -138,6 +151,82 @@ pub fn debug_compile_and_return_plan(
         (Err(e), None) => Err(e),
     }
 }
+
+/// B.2 Task 1 test helper: compile a raw NSL source string and return any
+/// `WrgaPlan` produced.  Loads stdlib optimizer signatures as needed so that
+/// real `train` blocks can be compiled in-process without an on-disk workspace.
+#[doc(hidden)]
+pub fn debug_compile_and_return_plan(
+    src: &str,
+    options: &CompileOptions,
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    if lex_diags
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
+        return Err(CodegenError::new(format!(
+            "lex errors: {:?}",
+            lex_diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
+        return Err(CodegenError::new(format!(
+            "parse errors: {:?}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        )));
+    }
+
+    // Build imported_fns for any stdlib optimizer modules referenced in
+    // train-block `optimizer:` sections.  This mutates the interner, so it
+    // must run before semantic analysis / codegen (which borrow immutably).
+    // Semantic analysis doesn't need the stdlib imports here because the
+    // train block's optimizer expression is captured structurally and not
+    // type-checked as a regular call — matching the existing baseline tests.
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    if analysis
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
+        return Err(CodegenError::new(format!(
+            "semantic errors: {:?}",
+            analysis
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        )));
+    }
+
+    let imported_fns = crate::stdlib_loader::build_imported_fns_for_entry(
+        &parsed.module,
+        &mut interner,
+        &analysis.type_map,
+        options,
+    )?;
+
+    debug_compile_and_return_plan_with_imports(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        &imported_fns,
+        options,
+    )
+}
 #[doc(hidden)]
 pub mod debug_channels {
     use std::cell::Cell;
@@ -145,7 +234,24 @@ pub mod debug_channels {
         pub static ADJOINT_OPS_DROPPED: Cell<Option<usize>> = const { Cell::new(None) };
         pub static ALLOC_SLOTS_PRE_HINT: Cell<Option<usize>> = const { Cell::new(None) };
         pub static ALLOC_SLOTS_POST_HINT: Cell<Option<usize>> = const { Cell::new(None) };
+        pub static CONSUME_HINTS_CALLS: Cell<usize> = const { Cell::new(0) };
     }
+}
+
+#[doc(hidden)]
+pub fn debug_bump_consume_hints_calls() {
+    debug_channels::CONSUME_HINTS_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[doc(hidden)]
+pub fn debug_last_consume_hints_calls() -> Option<usize> {
+    let n = debug_channels::CONSUME_HINTS_CALLS.with(|c| c.get());
+    if n == 0 { None } else { Some(n) }
+}
+
+#[doc(hidden)]
+pub fn debug_reset_consume_hints_calls() {
+    debug_channels::CONSUME_HINTS_CALLS.with(|c| c.set(0));
 }
 
 #[doc(hidden)]
@@ -220,6 +326,7 @@ pub struct AdapterDecoratorConfig {
     pub kind: AdapterKind,
     pub targets: Vec<String>,
     pub rank: Option<i64>,
+    pub alpha: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +409,9 @@ pub struct CompileOptions {
     pub shared_lib: bool,
     /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
     pub wrga_inputs: Option<WrgaInputs>,
+    /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
+    /// allocations (vs. B.1's observational-only path). Default false.
+    pub wrga_fold_allocations: bool,
 }
 
 impl Default for CompileOptions {
@@ -343,6 +453,7 @@ impl Default for CompileOptions {
             debug_training: false,
             shared_lib: false,
             wrga_inputs: None,
+            wrga_fold_allocations: false,
         }
     }
 }

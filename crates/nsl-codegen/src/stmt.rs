@@ -133,7 +133,30 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
     };
-    let plan = crate::wrga::run(wrga_input);
+    let mut plan = crate::wrga::run(wrga_input);
+
+    // B.2 Task 2b: thread the user-facing `@adapter(type=..., alpha=...)`
+    // decorator config onto each matching placement, then run the adapter
+    // inject pass to populate `synthesized_fields` / `init_strategies`.
+    for adapter_cfg in &inputs.adapter {
+        for placement in plan.placements.iter_mut() {
+            let matches = adapter_cfg
+                .targets
+                .iter()
+                .any(|pat| crate::wrga_prune::glob_match(pat, &placement.name));
+            if matches {
+                placement.decorator_kind = Some(adapter_cfg.kind);
+                placement.alpha = adapter_cfg.alpha;
+                if let Some(r) = adapter_cfg.rank {
+                    if r > 0 {
+                        placement.suggested_rank = r as usize;
+                    }
+                }
+            }
+        }
+    }
+    let _inject = crate::wrga_adapter_inject::run(&mut plan);
+
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)
 }
@@ -3576,8 +3599,22 @@ impl Compiler<'_> {
                 // WRGA B.1 Task 4: feed MemoryPlan.assignments to the real
                 // memory planner as coalescing hints.  Conservative: only
                 // merges pairs that pass size + liveness-disjoint checks.
+                // B.2 Task 3: when `--wrga-fold-allocations` is set, also
+                // run the typed-key `consume_hints` path on a transient
+                // allocator so the side-channel counter bumps. The real
+                // folding into the production allocator is wired in later
+                // tasks; this branch exists so the flag has observable
+                // effect today.
                 if let Some(plan) = &wrga_plan {
-                    let _ = crate::memory_planner::apply_wrga_hints(plan);
+                    if self.compile_options.wrga_fold_allocations {
+                        let mut transient = crate::memory_planner::LivenessAnalyzer::new();
+                        for a in &plan.memory.assignments {
+                            transient.record_activation_alloc(a.var, a.size_bytes);
+                        }
+                        let _ = crate::memory_planner::consume_hints(&mut transient, plan);
+                    } else {
+                        let _ = crate::memory_planner::apply_wrga_hints(plan);
+                    }
                 }
 
                 let full_lowered = crate::wengert_lower::compile_wengert_ops(

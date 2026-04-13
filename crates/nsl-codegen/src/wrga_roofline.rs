@@ -95,6 +95,18 @@ pub struct AdapterPlacement {
     pub suggested_rank: usize,
     /// Human-readable rationale for the decision.
     pub rationale: String,
+    // ─── B.2 Task 2b: adapter materialisation observation surface ────────
+    /// Adapter kind as declared by the user-facing `@adapter(type=...)`
+    /// decorator. Populated by the codegen bridge when a manual decorator
+    /// config is threaded through; `None` when WRGA placed the adapter
+    /// itself (auto mode only sees `self.adapter` above).
+    pub decorator_kind: Option<crate::AdapterKind>,
+    /// User-supplied LoRA alpha (defaults to `rank` when unset).
+    pub alpha: Option<i64>,
+    /// Field names synthesized onto the model struct by `wrga_adapter_inject`.
+    pub synthesized_fields: Vec<String>,
+    /// Initializer strategies for each synthesized field.
+    pub init_strategies: Vec<crate::wrga_adapter_inject::InitStrategy>,
 }
 
 /// Compute the `(flops, bytes_read, bytes_written)` tuple for a site.
@@ -213,6 +225,10 @@ pub fn place_adapters(
                 adapter: kind,
                 suggested_rank: rank,
                 rationale: why.into(),
+                decorator_kind: None,
+                alpha: None,
+                synthesized_fields: Vec::new(),
+                init_strategies: Vec::new(),
             }
         })
         .collect()

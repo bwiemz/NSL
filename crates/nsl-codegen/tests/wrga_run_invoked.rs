@@ -50,7 +50,7 @@ fn wrga_run_fires_for_train_block_with_freeze() {
         ..Default::default()
     };
 
-    let plan = nsl_codegen::debug_compile_and_return_plan(
+    let plan = nsl_codegen::debug_compile_and_return_plan_from_ast(
         &parsed.module,
         &interner,
         &analysis.type_map,

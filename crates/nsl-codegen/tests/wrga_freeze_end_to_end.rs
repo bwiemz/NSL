@@ -43,7 +43,7 @@ fn compile_with(opts: CompileOptions) -> Option<WrgaPlan> {
         "input must type-check: {:?}",
         analysis.diagnostics
     );
-    nsl_codegen::debug_compile_and_return_plan(
+    nsl_codegen::debug_compile_and_return_plan_from_ast(
         &parsed.module,
         &interner,
         &analysis.type_map,
@@ -136,7 +136,7 @@ fn main():
         "input must type-check: {:?}",
         analysis.diagnostics
     );
-    let plan = nsl_codegen::debug_compile_and_return_plan(
+    let plan = nsl_codegen::debug_compile_and_return_plan_from_ast(
         &parsed.module,
         &interner,
         &analysis.type_map,
@@ -144,4 +144,46 @@ fn main():
     )
     .expect("compile must succeed");
     assert!(plan.is_none(), "empty WrgaInputs must skip wrga::run");
+}
+
+/// Task 1 (B.2): `debug_compile_and_return_plan` must handle sources that
+/// import stdlib optimizers.  Prior to B.2 this failed with
+/// `undefined function 'nsl__optim__sgd__sgd_step'`.
+#[test]
+fn debug_compile_and_return_plan_loads_stdlib_for_real_training_source() {
+    // Make sure the stdlib loader can find stdlib/ from the workspace root.
+    if std::env::var("NSL_STDLIB_PATH").is_err() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root = std::path::Path::new(manifest_dir)
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root above crates/nsl-codegen");
+        let stdlib = workspace_root.join("stdlib");
+        std::env::set_var("NSL_STDLIB_PATH", stdlib);
+    }
+
+    const SRC: &str = r#"
+model Toy:
+    w: Tensor = zeros([16, 16])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+fn main():
+    let m = Toy()
+    let x = ones([4, 16])
+    train(model = m, epochs = 1):
+        optimizer: SGD(lr = 0.001)
+        step(batch):
+            let y = m.forward(x)
+            let loss = y.sum()
+"#;
+
+    let opts = nsl_codegen::CompileOptions {
+        wrga_inputs: Some(nsl_codegen::WrgaInputs::default()),
+        source_ad: true,
+        ..Default::default()
+    };
+    let _plan = nsl_codegen::debug_compile_and_return_plan(SRC, &opts)
+        .expect("compile with real sgd optimizer must succeed after stdlib loading");
 }
