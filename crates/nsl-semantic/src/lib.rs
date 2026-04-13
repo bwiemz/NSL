@@ -1,5 +1,6 @@
 pub mod builtins;
 pub mod cep;
+pub mod cfie;
 pub mod cftp;
 pub mod checker;
 pub mod cpdt;
