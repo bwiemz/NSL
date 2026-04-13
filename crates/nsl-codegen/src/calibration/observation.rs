@@ -79,3 +79,57 @@ impl ObservationPlan {
         !self.backward_gradients.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn union_collapses_duplicates_across_hooks() {
+        let a = ObservationSet::ForwardActivations(vec![
+            LayerRef::new("blocks.0"),
+            LayerRef::new("blocks.1"),
+        ]);
+        let b = ObservationSet::ForwardActivations(vec![
+            LayerRef::new("blocks.1"),
+            LayerRef::new("blocks.2"),
+        ]);
+        let plan = ObservationPlan::union_of(&[a, b]);
+        assert_eq!(plan.forward_activations.len(), 3);
+        assert!(plan.forward_activations.contains(&LayerRef::new("blocks.0")));
+        assert!(plan.forward_activations.contains(&LayerRef::new("blocks.1")));
+        assert!(plan.forward_activations.contains(&LayerRef::new("blocks.2")));
+    }
+
+    #[test]
+    fn needs_backward_reflects_backward_gradients() {
+        let a = ObservationSet::ForwardActivations(vec![LayerRef::new("x")]);
+        assert!(!ObservationPlan::union_of(&[a]).needs_backward());
+
+        let b = ObservationSet::BackwardGradients(vec![LayerRef::new("x")]);
+        assert!(ObservationPlan::union_of(&[b]).needs_backward());
+    }
+
+    #[test]
+    fn nested_union_flattens() {
+        let inner = ObservationSet::Union(vec![
+            ObservationSet::Weights(vec![ParamRef::new("w1")]),
+            ObservationSet::Weights(vec![ParamRef::new("w2")]),
+        ]);
+        let outer = ObservationSet::Union(vec![
+            inner,
+            ObservationSet::Weights(vec![ParamRef::new("w3")]),
+        ]);
+        let plan = ObservationPlan::union_of(&[outer]);
+        assert_eq!(plan.weights.len(), 3);
+    }
+
+    #[test]
+    fn empty_plan_needs_nothing() {
+        let plan = ObservationPlan::union_of(&[ObservationSet::Empty]);
+        assert!(plan.forward_activations.is_empty());
+        assert!(plan.backward_gradients.is_empty());
+        assert!(plan.weights.is_empty());
+        assert!(!plan.needs_backward());
+    }
+}
