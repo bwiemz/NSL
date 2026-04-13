@@ -5,8 +5,9 @@
 //! avoid cross-test races on the shared collector state.
 
 use nsl_runtime::health::ffi::{
-    nsl_health_flush_snapshot, nsl_health_record_grad_norm, nsl_health_record_loss,
-    nsl_health_record_weight_norm,
+    nsl_health_flush_snapshot, nsl_health_get_grad_norm_total, nsl_health_get_loss_ema,
+    nsl_health_get_loss_ema_slope, nsl_health_get_nan_inf_count_window,
+    nsl_health_record_grad_norm, nsl_health_record_loss, nsl_health_record_weight_norm,
 };
 
 fn flush_to_string() -> String {
@@ -74,4 +75,23 @@ fn weight_norm_is_init_then_update_round_trips() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     let pct = v["per_tensor_weight_pct_delta"]["m.l0.w"].as_f64().unwrap();
     assert!((pct - 10.0).abs() < 1e-6, "expected +10%, got {}", pct);
+}
+
+#[test]
+fn getters_return_finite_values_after_recording() {
+    nsl_health_record_loss(2.0, 1);
+    nsl_health_record_loss(2.5, 2);
+    let ema = nsl_health_get_loss_ema();
+    assert!(ema > 0.0, "ema should be > 0 after recording, got {}", ema);
+
+    // grad_norm_total is sticky from earlier tests; only assert non-negative
+    let g = nsl_health_get_grad_norm_total();
+    assert!(g >= 0.0, "grad_norm_total should be >= 0, got {}", g);
+
+    let nan = nsl_health_get_nan_inf_count_window();
+    assert!(nan >= 0, "nan count should be >= 0, got {}", nan);
+
+    // loss_ema_slope is finite (could be 0.0 with too few samples but never NaN)
+    let slope = nsl_health_get_loss_ema_slope();
+    assert!(slope.is_finite(), "slope should be finite, got {}", slope);
 }

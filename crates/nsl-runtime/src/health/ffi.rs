@@ -94,3 +94,33 @@ pub unsafe extern "C" fn nsl_health_flush_snapshot(
 pub extern "C" fn nsl_health_set_flush_interval(n: u64) {
     COLLECTOR.lock().unwrap().set_flush_interval(n);
 }
+
+#[no_mangle]
+pub extern "C" fn nsl_health_get_loss_ema() -> f64 {
+    COLLECTOR.lock().unwrap().snapshot().loss_ema.unwrap_or(0.0)
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_health_get_loss_ema_slope() -> f64 {
+    COLLECTOR
+        .lock()
+        .unwrap()
+        .snapshot()
+        .loss_ema_slope
+        .unwrap_or(0.0)
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_health_get_grad_norm_total() -> f64 {
+    COLLECTOR
+        .lock()
+        .unwrap()
+        .snapshot()
+        .grad_norm_total
+        .unwrap_or(0.0)
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_health_get_nan_inf_count_window() -> i64 {
+    COLLECTOR.lock().unwrap().snapshot().nan_inf_count_window as i64
+}
