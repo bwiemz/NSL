@@ -17,7 +17,9 @@
 //! with the norm or softmax.
 
 use crate::wrga_roofline::{AdapterKind, AdapterPlacement, SiteKind};
+use nsl_ast::NodeId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Fusion target for a single adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,9 +63,32 @@ pub struct FusionDecision {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FusionPlan {
     pub decisions: Vec<FusionDecision>,
+    /// Map from a fused kernel's root NodeId to the constituent source
+    /// NodeIds folded into it.  Non-fused kernels have no entry here;
+    /// `constituents_of` returns `vec![root]` for them.
+    ///
+    /// TODO(phase-2.5): Populate this from the CSHA / epilogue fusion
+    /// passes.  Currently left empty because the fusion passes do not have
+    /// NodeIds threaded through their decision sites, and adding that
+    /// plumbing is out of scope for Phase 2.  The empty-map fallback keeps
+    /// cost prediction correct for non-fused kernels; fused kernels will
+    /// under-predict cost until this is populated.
+    #[serde(default)]
+    pub fused_node_groups: HashMap<NodeId, Vec<NodeId>>,
 }
 
 impl FusionPlan {
+    /// Returns the constituent NodeIds folded into the kernel rooted at
+    /// `root`.  For non-fused kernels (no entry in the map), returns
+    /// `vec![root]` so callers can unconditionally sum per-constituent
+    /// costs.
+    pub fn constituents_of(&self, root: NodeId) -> Vec<NodeId> {
+        self.fused_node_groups
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| vec![root])
+    }
+
     pub fn fused_count(&self) -> usize {
         self.decisions.iter().filter(|d| d.target.is_fused()).count()
     }
@@ -105,7 +130,10 @@ pub fn build_fusion_plan(
             rationale,
         });
     }
-    FusionPlan { decisions }
+    FusionPlan {
+        decisions,
+        fused_node_groups: HashMap::new(),
+    }
 }
 
 /// Heuristic: recover the site kind from the name when not supplied by the
