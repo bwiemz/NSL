@@ -15,16 +15,6 @@ impl ClockSource for NanoClock {
     }
 }
 
-#[cfg(feature = "cuda-real-events")]
-pub struct CudaEventClock;
-#[cfg(feature = "cuda-real-events")]
-impl ClockSource for CudaEventClock {
-    fn elapsed_us(&self, _start: u64, _end: u64) -> f64 {
-        // TODO: wrap cudarc cuEventElapsedTime. Phase 2.
-        unimplemented!("cuda-real-events backend not yet implemented")
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Aggregate {
     pub kernel_id: u32,
