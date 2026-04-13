@@ -102,6 +102,15 @@ Populate in `solve_layer()` after each sub-decision is finalized:
 
 When `WggoMode` is `Off` or `Greedy`, `decision_trace` stays empty. The renderer detects empty traces and prints a one-line skip message per layer.
 
+#### 4.1.1 `runner_up` is best-effort
+
+`runner_up: Option<String>` is intentionally optional. Populating it requires the ILP solver to retain the second-best candidate's identity and cost. Two ways to get it:
+
+1. **If `solve_layer()` enumerates candidates internally** (likely — single-layer ILP has ~30 variables with pre-computed LUTs, so branch-and-bound already walks the candidate set): keep the top-2 by cost while iterating. Cost: a few lines added to the existing search loop.
+2. **If the solver hands back only the optimal**: skip `runner_up` for the first pass — set `runner_up: None` everywhere. The renderer simply omits the `Runner-up:` line when `None`.
+
+Implementer checks the actual solver structure (`crates/nsl-codegen/src/wggo_ilp.rs::solve_layer`) and picks #1 when cheap, #2 when not. **Do not block the phase on getting `runner_up` populated.** The high-value fields are `chosen`, `metric_summary`, `binding_constraint`, and `cross_decision_note` — those alone meet the PDF §3.3 explainability bar. `runner_up` is bonus context.
+
 ### 4.2 Renderer — `wggo_explain.rs`
 
 ```rust
