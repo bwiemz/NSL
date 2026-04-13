@@ -434,6 +434,28 @@ enum Cli {
         /// CSHA: print the attention-fusion report to stderr
         #[arg(long)]
         csha_report: bool,
+
+        /// Path to calibration dataset (.bin or .safetensors).  When
+        /// omitted, calibration is skipped entirely.
+        #[arg(long, value_name = "PATH")]
+        calibration_data: Option<PathBuf>,
+
+        /// Calibration failure policy.  Default `required` aborts the
+        /// build on infrastructure errors; `best-effort` warns and
+        /// falls back.  Degenerate-data errors are always fatal.
+        #[arg(long, value_name = "MODE", default_value = "required")]
+        calibrate: String,
+
+        /// Number of calibration samples to consume (default 512).
+        /// Truncated to the dataset size with a warning when smaller.
+        #[arg(long, value_name = "N", default_value_t = 512)]
+        calibration_samples: u32,
+
+        #[arg(long, value_name = "N", default_value_t = 8)]
+        calibration_batch_size: u32,
+
+        #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+        calibration_timeout: u64,
     },
 
     /// Run @test functions in an NSL file
@@ -761,6 +783,11 @@ fn main_inner() {
             wggo_prune_fraction,
             csha,
             csha_report,
+            calibration_data,
+            calibrate,
+            calibration_samples,
+            calibration_batch_size,
+            calibration_timeout,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -805,6 +832,54 @@ fn main_inner() {
             } else {
                 None
             };
+
+            // Calibration-flag validation per spec §8.
+            if calibration_data.is_none() && calibrate.as_str() != "required" {
+                eprintln!(
+                    "error: --calibrate={} requires --calibration-data <PATH>",
+                    calibrate
+                );
+                process::exit(1);
+            }
+            match calibrate.as_str() {
+                "required" | "best-effort" => {}
+                other => {
+                    eprintln!(
+                        "error: --calibrate value '{}' is not one of required|best-effort",
+                        other
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = calibration_data {
+                if !p.exists() {
+                    eprintln!("error: --calibration-data path does not exist: {}", p.display());
+                    process::exit(1);
+                }
+                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+                match ext.as_deref() {
+                    Some("bin") | Some("safetensors") => {}
+                    other => {
+                        eprintln!(
+                            "error: --calibration-data extension {:?} is not one of .bin|.safetensors",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            if calibration_samples == 0 {
+                eprintln!("error: --calibration-samples must be > 0");
+                process::exit(1);
+            }
+            if calibration_batch_size == 0 {
+                eprintln!("error: --calibration-batch-size must be > 0");
+                process::exit(1);
+            }
+            if calibration_timeout == 0 {
+                eprintln!("error: --calibration-timeout must be > 0");
+                process::exit(1);
+            }
 
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
@@ -860,11 +935,11 @@ fn main_inner() {
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
-                calibration_data: None,
-                calibration_mode: Some("required".to_string()),
-                calibration_samples: 512,
-                calibration_batch_size: 8,
-                calibration_timeout_secs: 600,
+                calibration_data: calibration_data.clone(),
+                calibration_mode: Some(calibrate.clone()),
+                calibration_samples,
+                calibration_batch_size,
+                calibration_timeout_secs: calibration_timeout,
             };
 
             // Validate WGGO mode string early so users get a clear error
