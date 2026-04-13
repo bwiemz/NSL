@@ -1,0 +1,10 @@
+//! Compile-time calibration harness — see
+//! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
+
+pub mod ctx;
+pub mod hooks;
+pub mod observation;
+
+pub use ctx::CalibCtx;
+pub use hooks::{CalibrationHook, CalibrationResult};
+pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef};
