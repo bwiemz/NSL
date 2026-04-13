@@ -6,6 +6,7 @@ pub mod ctx;
 pub mod data_loader;
 pub mod hooks;
 pub mod observation;
+pub mod registry;
 pub mod sidecar;
 
 pub use ctx::CalibCtx;
