@@ -255,6 +255,26 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I8],
         Some(types::I64),
     ),
+    // WRGA B.3 Task 4: fused LoRA/IA³ adapter matmul FFIs.
+    // LoRA args: (x_ptr, w_ptr, a_ptr, b_ptr, scale_f32, kernel_handle_i64)
+    (
+        "nsl_adapter_fused_lora_matmul",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::F32,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    // IA³ args: (x_ptr, w_ptr, ia3_scale_ptr, kernel_handle_i64)
+    (
+        "nsl_adapter_fused_ia3_matmul",
+        &[types::I64, types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
     // Tensor reductions (return scalar tensor ptr, not f64)
     ("nsl_tensor_sum", &[types::I64], Some(types::I64)),
     ("nsl_tensor_mean", &[types::I64], Some(types::I64)),

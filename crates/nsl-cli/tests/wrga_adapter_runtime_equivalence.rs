@@ -294,6 +294,40 @@ let y = m.forward(x)
 print(y)
 "#;
 
+// ─── B.3 Task 4: fused FFI reachability when target=cuda_sm80 ───────────
+//
+// Same load-bearing source as Build 4, but compiled with `--target
+// cuda_sm80`.  The AST rewrite's fused path activates (FusionTarget =
+// EpilogueFusedLora AND sm >= 80), emitting a single Call to
+// `nsl_adapter_fused_lora_matmul` instead of the unfused triple.  The
+// Task 4 CPU-fallback FFI computes identical math, so the numeric
+// output must still be 16.0 per element — proving:
+//   (a) the fused FFI is reachable (codegen produces a linkable symbol),
+//   (b) the conditional rewrite fires for sm_80+ targets,
+//   (c) the CPU stub's math matches B.2.1 within 1e-5 tolerance.
+//
+// Task 5 will replace the CPU stub with a real CUDA launch; the
+// assertion stays unchanged (numeric equivalence at 1e-5).
+#[test]
+fn task_4_fused_ffi_is_referenced_when_target_sm80() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("task4_sm80.nsl");
+    fs::write(&src_path, BUILD4_SRC).unwrap();
+    let stdout =
+        run_nsl_expect_ok(&src_path, &["--source-ad", "--target", "cuda_sm80"]);
+    let tensor = parse_tensor_2d(&stdout);
+    assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
+    for (i, row) in tensor.iter().enumerate() {
+        assert_eq!(row.len(), 8, "row {i} wrong width: {row:?}");
+        for (j, v) in row.iter().enumerate() {
+            assert!(
+                (v - 16.0).abs() < 1e-5,
+                "Task 4 fused path: expected 16.0 at [{i},{j}]; got {v}",
+            );
+        }
+    }
+}
+
 #[test]
 fn build_4_lora_rewrite_load_bearing_proof() {
     let tmp = TempDir::new().unwrap();

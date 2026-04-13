@@ -83,6 +83,9 @@ pub mod cpdt;
 pub mod sparse;
 pub mod peft;
 
+// WRGA B.3 Task 4: fused LoRA/IA³ adapter FFIs
+pub mod fused_adapter;
+
 // M54: Unikernel runtime (bare-metal deployment)
 pub mod unikernel;
 

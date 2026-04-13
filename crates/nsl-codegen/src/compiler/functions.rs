@@ -540,6 +540,11 @@ impl Compiler<'_> {
                         } else {
                             let mut ctx =
                                 crate::wrga_adapter_rewrite::RewriteContext::new(sites_for_model);
+                            // B.3 Task 4: expose the compile target's sm
+                            // version so the rewrite can choose between the
+                            // fused single-FFI path and the B.2.1 unfused
+                            // triple.
+                            ctx.target_sm = self.target_sm();
                             // Find the `self` Symbol and populate field_symbols
                             // from the model's known fields for matcher support.
                             ctx.self_sym = fn_def
@@ -589,6 +594,9 @@ impl Compiler<'_> {
                             // Commit synth overrides to the compiler so
                             // compile_member_access can resolve them.
                             self.synth_member_names.extend(ctx.synth_overrides);
+                            // B.3 Task 4: commit fused-call callee overrides
+                            // so expr_as_func_name can resolve them.
+                            self.synth_call_names.extend(ctx.synth_call_overrides);
                             out
                         };
 
