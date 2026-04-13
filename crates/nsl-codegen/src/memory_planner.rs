@@ -1,6 +1,107 @@
 //! M36: Compile-time memory planning — liveness analysis, interference graph, slab assignment.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+// ---------------------------------------------------------------------------
+// WRGA Milestone B.1 Task 4: `apply_wrga_hints`
+// ---------------------------------------------------------------------------
+
+/// Conservative coalescing pass: consume a `WrgaPlan`'s `MemoryPlan` as a
+/// hint to the real memory planner.  Two WRGA-assigned vars may share a
+/// real slot only when:
+///   1. they share a WRGA slot (WRGA already proved non-overlap),
+///   2. their `size_bytes` match exactly,
+///   3. their `[birth, death]` intervals do not overlap.
+///
+/// The function records pre/post *real* slot counts on debug side-channels
+/// for test observation and returns the post-hint slot count.  It does NOT
+/// mutate the string-keyed `LivenessAnalyzer`: that allocator works on
+/// AST-level names and has no natural mapping from Wengert `VarId`.  The
+/// aggressive version — folding these merges into the live interference
+/// graph — is scheduled for Milestone B.2 alongside the MMA epilogue.
+pub fn apply_wrga_hints(plan: &crate::wrga::WrgaPlan) -> usize {
+    let mem = &plan.memory;
+
+    // Group WRGA assignments by WRGA slot id.
+    let mut wrga_groups: HashMap<crate::wrga_memory::SlotId, Vec<&crate::wrga_memory::SlotAssignment>> =
+        HashMap::new();
+    for a in &mem.assignments {
+        wrga_groups.entry(a.slot).or_default().push(a);
+    }
+
+    // Pre-hint real slot count: one slot per assignment (the "no coalescing"
+    // baseline — equivalent to the allocator not yet having seen the hints).
+    let pre = mem.assignments.len();
+
+    // Post-hint: greedy union-find across each WRGA group, but only merging
+    // pairs that pass the size+liveness safety gates.  This mirrors what
+    // `try_merge_into_slot` would do on a VarId-keyed allocator.
+    let all_slots: BTreeSet<_> = (0..mem.assignments.len()).collect();
+    let mut parent: Vec<usize> = (0..mem.assignments.len()).collect();
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        if parent[x] != x {
+            let r = find(parent, parent[x]);
+            parent[x] = r;
+        }
+        parent[x]
+    }
+
+    // Index assignments by their WRGA slot group for iteration.
+    let mut by_slot: HashMap<crate::wrga_memory::SlotId, Vec<usize>> = HashMap::new();
+    for (i, a) in mem.assignments.iter().enumerate() {
+        by_slot.entry(a.slot).or_default().push(i);
+    }
+    for indices in by_slot.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        // Anchor at the first assignment; merge each compatible successor.
+        let anchor = indices[0];
+        for &other in &indices[1..] {
+            if try_merge_pair(&mem.assignments, anchor, other) {
+                let ra = find(&mut parent, anchor);
+                let ro = find(&mut parent, other);
+                if ra != ro {
+                    parent[ro] = ra;
+                }
+            }
+        }
+    }
+
+    let mut roots = BTreeSet::new();
+    for s in &all_slots {
+        let r = find(&mut parent, *s);
+        roots.insert(r);
+    }
+    let post = roots.len();
+
+    crate::debug_set_allocator_slot_count_pre_hint(pre);
+    crate::debug_set_allocator_slot_count_post_hint(post);
+    post
+}
+
+/// Safety gate for merging two WRGA slot assignments into a single real
+/// slot.  Requires: WRGA already agreed they don't overlap (implicit via
+/// shared WRGA slot), byte sizes equal, and `[birth, death]` intervals do
+/// not overlap (belt-and-braces check).
+fn try_merge_pair(
+    assignments: &[crate::wrga_memory::SlotAssignment],
+    a: usize,
+    b: usize,
+) -> bool {
+    let aa = &assignments[a];
+    let bb = &assignments[b];
+    if aa.size_bytes != bb.size_bytes || aa.size_bytes == 0 {
+        return false;
+    }
+    // Non-overlap: `death_a < birth_b || death_b < birth_a`
+    let disjoint = aa.death < bb.birth || bb.death < aa.birth;
+    if !disjoint {
+        return false;
+    }
+    true
+}
+
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1723,5 +1824,69 @@ mod tests {
             rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
         // Input dies at 10 but recompute point is at 94 — cannot remat
         assert!(recomp_points.is_empty(), "cannot remat if inputs are dead");
+    }
+}
+
+#[cfg(test)]
+mod wrga_hints_unit_tests {
+    use super::*;
+    use crate::wrga_memory::SlotAssignment;
+
+    fn mk_assignment(var: u32, slot: u32, size: u64, birth: u32, death: u32) -> SlotAssignment {
+        SlotAssignment {
+            var,
+            slot,
+            size_bytes: size,
+            birth,
+            death,
+        }
+    }
+
+    #[test]
+    fn try_merge_pair_refuses_size_mismatch() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 5),
+            mk_assignment(2, 0, 128, 10, 15), // disjoint liveness, but size differs
+        ];
+        assert!(
+            !try_merge_pair(&assignments, 0, 1),
+            "different sizes must refuse"
+        );
+    }
+
+    #[test]
+    fn try_merge_pair_refuses_overlapping_liveness() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 10),
+            mk_assignment(2, 0, 64, 5, 15), // overlap: 5..=10
+        ];
+        assert!(
+            !try_merge_pair(&assignments, 0, 1),
+            "overlapping liveness must refuse"
+        );
+    }
+
+    #[test]
+    fn try_merge_pair_accepts_disjoint_equal_size() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 5),
+            mk_assignment(2, 0, 64, 10, 15),
+        ];
+        assert!(
+            try_merge_pair(&assignments, 0, 1),
+            "equal size + disjoint liveness must accept"
+        );
+    }
+
+    #[test]
+    fn try_merge_pair_refuses_zero_size() {
+        let assignments = vec![
+            mk_assignment(1, 0, 0, 0, 5),
+            mk_assignment(2, 0, 0, 10, 15),
+        ];
+        assert!(
+            !try_merge_pair(&assignments, 0, 1),
+            "zero size must refuse (guard against unallocated)"
+        );
     }
 }

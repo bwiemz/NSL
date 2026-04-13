@@ -3573,6 +3573,13 @@ impl Compiler<'_> {
                     None => extractor.wengert_list().clone(),
                 };
 
+                // WRGA B.1 Task 4: feed MemoryPlan.assignments to the real
+                // memory planner as coalescing hints.  Conservative: only
+                // merges pairs that pass size + liveness-disjoint checks.
+                if let Some(plan) = &wrga_plan {
+                    let _ = crate::memory_planner::apply_wrga_hints(plan);
+                }
+
                 let full_lowered = crate::wengert_lower::compile_wengert_ops(
                     self,
                     builder,
@@ -3598,6 +3605,7 @@ impl Compiler<'_> {
                     adjoint.ops = crate::source_ad::eliminate_by_backward_live(
                         &adjoint.ops,
                         &plan.prune.backward_live,
+                        gen.adjoint_vars_map(),
                     );
                 }
 

@@ -99,3 +99,49 @@ fn freeze_eliminates_frozen_param_from_backward_live() {
     );
 }
 
+
+/// B.1 Task 5: Sanity counterpart to `freeze_eliminates_frozen_param_from_backward_live`.
+///
+/// When `WrgaInputs` is empty, `invoke_wrga_if_enabled` must return None and
+/// `last_wrga_plan` stays unset.  We use a train-block-free source to sidestep
+/// the stdlib-optimizer resolution gap tracked separately.
+#[test]
+fn no_wrga_inputs_skips_wrga_run_on_simple_compile() {
+    const SRC: &str = r#"
+model Toy:
+    w: Tensor = ones([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+fn main():
+    let m = Toy()
+    let x = ones([4, 4])
+    let _y = m.forward(x)
+"#;
+
+    let opts = nsl_codegen::CompileOptions {
+        wrga_inputs: Some(nsl_codegen::WrgaInputs::default()),
+        ..Default::default()
+    };
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _) = nsl_lexer::tokenize(SRC, nsl_errors::FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "input must type-check: {:?}",
+        analysis.diagnostics
+    );
+    let plan = nsl_codegen::debug_compile_and_return_plan(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        &opts,
+    )
+    .expect("compile must succeed");
+    assert!(plan.is_none(), "empty WrgaInputs must skip wrga::run");
+}
