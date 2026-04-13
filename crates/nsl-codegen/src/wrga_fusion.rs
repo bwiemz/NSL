@@ -17,9 +17,10 @@
 //! with the norm or softmax.
 
 use crate::wrga_roofline::{AdapterKind, AdapterPlacement, SiteKind};
+use serde::{Deserialize, Serialize};
 
 /// Fusion target for a single adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FusionTarget {
     /// Fold the LoRA contribution into the matmul epilogue:
     /// `y = W₀x + α · B·(A·x)` → same memory round-trip as the base matmul.
@@ -44,7 +45,7 @@ impl FusionTarget {
 }
 
 /// Per-site fusion decision.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FusionDecision {
     pub site: String,
     pub site_kind: SiteKind,
@@ -57,7 +58,7 @@ pub struct FusionDecision {
 }
 
 /// Complete fusion plan across all sites.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FusionPlan {
     pub decisions: Vec<FusionDecision>,
 }

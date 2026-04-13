@@ -5,6 +5,7 @@ pub mod context;
 pub mod context_parallel;
 pub mod cost_model;
 pub mod deterministic_kernels;
+pub mod profiling;
 pub mod grammar_compiler;
 pub mod schema_convert;
 pub mod stdlib_loader;

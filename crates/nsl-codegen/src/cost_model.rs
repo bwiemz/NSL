@@ -1,13 +1,14 @@
 //! M37: Compile-time roofline cost model — FLOP/byte formulas and performance analysis.
 
 use crate::gpu_specs::GpuSpec;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /// Classification of an operation relative to the GPU roofline.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BoundClassification {
     ComputeBound,
     MemoryBound,
@@ -16,7 +17,7 @@ pub enum BoundClassification {
 }
 
 /// Cost analysis for a single operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpCost {
     pub name: String,
     pub loc: String,
