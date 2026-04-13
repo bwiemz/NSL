@@ -36,6 +36,7 @@ pub mod cpdt_zero;
 pub mod csha;
 pub mod csha_apply;
 pub mod csha_boundary;
+pub mod csha_patterns;
 pub mod csha_pipeline;
 pub mod csha_specialize;
 pub mod dynamic_shapes;

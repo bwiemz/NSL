@@ -16,6 +16,7 @@
 use serde::Serialize;
 
 use crate::csha_boundary::{scan as scan_boundaries, BoundaryScan, ProjKind};
+use crate::csha_patterns::{analyze as analyze_patterns, PatternConfig, PatternPlan};
 use crate::csha_pipeline::{plan_all, FusionLevel, LayerPlan};
 use crate::csha_specialize::{analyze as analyze_spec, SpecConfig, SpecializationPlan};
 use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
@@ -86,6 +87,8 @@ pub struct CshaInput<'a> {
     /// Number of attention heads.  Used for per-head specialization.
     pub n_heads: u32,
     pub spec_cfg: SpecConfig,
+    /// Config for [`csha_patterns`] analysis (causal/GQA/sinks).
+    pub pattern_cfg: PatternConfig,
 }
 
 /// Aggregate plan emitted by the driver.
@@ -96,6 +99,8 @@ pub struct CshaPlan {
     pub boundary: BoundaryScan,
     pub per_layer: Vec<LayerPlan>,
     pub specialization: SpecializationPlan,
+    /// Per-layer causal-mask / GQA / attention-sink decisions.
+    pub patterns: PatternPlan,
     /// Per-layer kernel-specialisation artefacts produced by the
     /// `csha_apply` bridge.  Empty in `Off` mode.
     pub kernels: Vec<crate::csha_apply::KernelSpec>,
@@ -234,6 +239,16 @@ impl CshaPlan {
             {
                 writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
             }
+            if let Some(pat) = self.patterns.get(&plan.layer) {
+                writeln!(
+                    s,
+                    "  Patterns: causal={} gqa={} sink={}",
+                    pat.causal_mask.as_str(),
+                    pat.gqa.as_str(),
+                    pat.sink.as_str(),
+                )
+                .unwrap();
+            }
         }
 
         writeln!(s).unwrap();
@@ -261,6 +276,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
             boundary: BoundaryScan::default(),
             per_layer: Vec::new(),
             specialization: SpecializationPlan::default(),
+            patterns: PatternPlan::default(),
             kernels: Vec::new(),
             marks: Vec::new(),
             solve_us: t0.elapsed().as_micros() as u64,
@@ -275,6 +291,13 @@ pub fn run(input: CshaInput) -> CshaPlan {
         input.n_heads,
         &input.spec_cfg,
     );
+    let patterns = analyze_patterns(
+        &per_layer,
+        &input.shape,
+        input.n_heads,
+        input.weights,
+        &input.pattern_cfg,
+    );
 
     // Stitch everything together via the apply-bridge so the plan
     // carries ready-to-consume kernel specs + graph marks.
@@ -284,6 +307,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         boundary: boundary.clone(),
         per_layer: per_layer.clone(),
         specialization: specialization.clone(),
+        patterns: patterns.clone(),
         kernels: Vec::new(),
         marks: Vec::new(),
         solve_us: 0,
@@ -296,6 +320,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         boundary,
         per_layer,
         specialization,
+        patterns,
         kernels: bridge.kernels,
         marks: bridge.marks,
         solve_us: t0.elapsed().as_micros() as u64,
@@ -329,6 +354,7 @@ pub fn run_on_wengert(
         shape,
         n_heads: n_heads.max(1),
         spec_cfg: SpecConfig::default(),
+        pattern_cfg: PatternConfig::default(),
     }))
 }
 
@@ -390,6 +416,7 @@ mod tests {
             },
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
+            pattern_cfg: PatternConfig::default(),
         }
     }
 

@@ -120,7 +120,8 @@ pub fn bridge(plan: &CshaPlan, shape_head_dim: i64) -> BridgeResult {
     }
 
     for layer_plan in &plan.per_layer {
-        let cfg = build_flash_config(layer_plan, &plan.specialization, shape_head_dim);
+        let pat = plan.patterns.get(&layer_plan.layer);
+        let cfg = build_flash_config(layer_plan, &plan.specialization, pat, shape_head_dim);
         let kernel_name = crate::flash_attention::flash_attention_kernel_name(&cfg);
         let smem = crate::flash_attention::shared_mem_bytes(&cfg);
 
@@ -178,6 +179,7 @@ pub fn bridge(plan: &CshaPlan, shape_head_dim: i64) -> BridgeResult {
 fn build_flash_config(
     layer: &LayerPlan,
     spec: &crate::csha_specialize::SpecializationPlan,
+    pattern: Option<&crate::csha_patterns::PatternDecision>,
     shape_head_dim: i64,
 ) -> FlashAttentionConfig {
     let head_dim = shape_head_dim.max(layer.tiles.head_dim as i64);
@@ -185,6 +187,15 @@ fn build_flash_config(
         .get(&layer.layer)
         .map(|s| s.n_active_heads)
         .unwrap_or(0);
+    // Causal defaults to true (autoregressive LLMs); the pattern pass
+    // flips it to false for bidirectional models.
+    let causal = pattern
+        .map(|p| !matches!(p.causal_mask, crate::csha_patterns::CausalMaskStrategy::None))
+        .unwrap_or(true);
+    let gqa_group_size: u32 = match pattern.map(|p| p.gqa) {
+        Some(crate::csha_patterns::GqaStrategy::ZeroCopyStride { group_size }) => group_size,
+        _ => 1,
+    };
 
     let csha = match layer.level {
         FusionLevel::None => None,
@@ -209,11 +220,11 @@ fn build_flash_config(
         block_q: layer.tiles.block_q as i64,
         block_kv: layer.tiles.block_kv as i64,
         head_dim,
-        causal: true, // autoregressive is the common case; overridable later
+        causal,
         paged: false,
         rope_q: true,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1,
+        gqa_group_size,
         tree_mask: false,
         gpu_sm: 80,
         csha,
@@ -322,6 +333,7 @@ mod tests {
             },
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
+            pattern_cfg: crate::csha_patterns::PatternConfig::default(),
         })
     }
 
