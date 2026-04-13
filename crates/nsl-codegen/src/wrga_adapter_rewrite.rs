@@ -1,14 +1,25 @@
-//! WRGA Milestone B.2.1 Task 3: LoRA forward-pass AST rewrite.
+//! WRGA Milestone B.2.1 Tasks 3+4: LoRA / IA³ / GatedLoRA forward-pass AST rewrite.
 //!
 //! Walks each model-method body and replaces every matmul of the form
 //! `x @ self.W` — where `W` is a raw `Tensor<...>` field targeted by an
-//! active LoRA adapter — with the LoRA-adapted expression:
+//! active adapter — with the adapter-specific rewritten expression:
 //!
 //! ```text
-//! x @ self.W + ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * (alpha / rank)
+//! LoRA:       x @ self.W + ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * (alpha / rank)
+//! IA³:        (x @ self.W) * self.ia3_scale_<site>
+//! GatedLoRA:  x @ self.W + sigmoid(self.gate_<site>)
+//!                          * ((x @ self.lora_A_<site>) @ self.lora_B_<site>)
+//!                          * (alpha / rank)
 //! ```
 //!
-//! IA³ and GatedLoRA rewrites are the scope of Task 4 and are skipped here.
+//! # Risk #6 — Step-0 invariant for GatedLoRA (LOAD-BEARING)
+//!
+//! `gate_<site>` is initialized to zeros, and `sigmoid(0) == 0.5` — NOT 0.
+//! The gate is HALF-OPEN at step 0. Base-model equivalence at step 0
+//! depends ENTIRELY on `lora_B = 0` zeroing the entire adapter contribution.
+//! A refactor that changes `lora_B`'s init without simultaneously changing
+//! the gate's init (or vice versa) will silently break the equivalence
+//! invariant. Task 5 Build 4 is the load-bearing runtime assertion.
 //!
 //! Synthesized `MemberAccess` nodes use a sentinel `Symbol` (reusing the
 //! original `W` field's Symbol) paired with an override entry in
@@ -74,8 +85,11 @@ fn is_self_expr(expr: &Expr, self_sym: Option<Symbol>) -> bool {
 
 /// Attempt to match a `BinaryOp MatMul` whose right operand is
 /// `self.<field>` where `<field>` is the `target_field` of an active
-/// LoRA site in `ctx`. On match, returns `(site, lhs_expr)`.
-pub fn match_lora_site<'a, 'b>(
+/// adapter site (any kind) in `ctx`. On match, returns `(site, lhs_expr)`.
+///
+/// The matcher is shared across all adapter kinds — the pattern
+/// (`x @ self.W`) is identical; only the synthesized replacement differs.
+pub fn match_adapter_site<'a, 'b>(
     expr: &'b Expr,
     ctx: &'a RewriteContext<'a>,
 ) -> Option<(&'a AdapterSite, &'b Expr)> {
@@ -99,8 +113,7 @@ pub fn match_lora_site<'a, 'b>(
         .find_map(|(name, sym)| if *sym == member { Some(name.as_str()) } else { None });
     let member_name = member_name?;
     for site in &ctx.sites {
-        if site.kind == AdapterKind::Lora
-            && site.target_field == member_name
+        if site.target_field == member_name
             && site.input_dim > 0
             && site.output_dim > 0
         {
@@ -108,6 +121,17 @@ pub fn match_lora_site<'a, 'b>(
         }
     }
     None
+}
+
+/// Backwards-compatible alias used by the original Task 3 tests.
+pub fn match_lora_site<'a, 'b>(
+    expr: &'b Expr,
+    ctx: &'a RewriteContext<'a>,
+) -> Option<(&'a AdapterSite, &'b Expr)> {
+    match match_adapter_site(expr, ctx) {
+        Some((site, lhs)) if site.kind == AdapterKind::Lora => Some((site, lhs)),
+        _ => None,
+    }
 }
 
 /// Build a `MemberAccess { self, <field>_name }` expression whose
@@ -195,6 +219,118 @@ pub fn synthesize_lora_adapted(
     let alpha = site.alpha.max(1) as f64;
     let scale = alpha / rank;
     let scaled = make_bin(BinOp::Mul, xa_at_b, make_float(scale, span), span);
+
+    make_bin(BinOp::Add, original, scaled, span)
+}
+
+/// Synthesize `(original) * self.ia3_scale_<site>`.
+///
+/// `original` is the already-recursively-rewritten `x @ self.W` matmul.
+/// IA³ multiplies the matmul result elementwise by a per-output-channel
+/// scale vector initialized to ones (base-model equivalent at step 0).
+/// Broadcast semantics: matmul result has shape `[..., d_out]`, scale has
+/// shape `[d_out]`, standard NSL tensor broadcasting applies.
+pub fn synthesize_ia3_adapted(
+    original: Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let span = original.span;
+    let sentinel = ctx
+        .field_symbols
+        .values()
+        .next()
+        .copied()
+        .expect("RewriteContext must have at least one field symbol");
+
+    let scale_name = format!("ia3_scale_{}", site.site_id);
+    let self_s = make_self_expr(span);
+    let ma_scale = make_synth_member_access(ctx, self_s, &scale_name, span, sentinel);
+
+    make_bin(BinOp::Mul, original, ma_scale, span)
+}
+
+/// Synthesize
+/// `original + sigmoid(self.gate_<site>) * ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * scale`.
+///
+/// # Step-0 invariant (LOAD-BEARING — DO NOT REMOVE)
+///
+/// `gate_<site>` is initialized to zeros. `sigmoid(0) == 0.5`, NOT 0.
+/// The gate is HALF-OPEN at step 0. Base-model equivalence at step 0
+/// depends ENTIRELY on `lora_B = 0` zeroing the entire adapter
+/// contribution. If `lora_B`'s init is changed from zero, the equivalence
+/// invariant breaks silently. Task 5 Build 4 is the load-bearing runtime
+/// assertion that catches such regressions.
+pub fn synthesize_gatedlora_adapted(
+    original: Expr,
+    lhs: &Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let span = original.span;
+    let sentinel = ctx
+        .field_symbols
+        .values()
+        .next()
+        .copied()
+        .expect("RewriteContext must have at least one field symbol");
+
+    let a_name = format!("lora_A_{}", site.site_id);
+    let b_name = format!("lora_B_{}", site.site_id);
+    let g_name = format!("gate_{}", site.site_id);
+
+    // LoRA contribution: (x @ A) @ B
+    let self_a = make_self_expr(span);
+    let ma_a = make_synth_member_access(ctx, self_a, &a_name, span, sentinel);
+    let x_at_a = make_bin(BinOp::MatMul, lhs.clone(), ma_a, span);
+
+    let self_b = make_self_expr(span);
+    let ma_b = make_synth_member_access(ctx, self_b, &b_name, span, sentinel);
+    let xa_at_b = make_bin(BinOp::MatMul, x_at_a, ma_b, span);
+
+    // sigmoid(self.gate_<site>)
+    let self_g = make_self_expr(span);
+    let ma_g = make_synth_member_access(ctx, self_g, &g_name, span, sentinel);
+    let sigmoid_sym = ctx
+        .field_symbols
+        .values()
+        .next()
+        .copied()
+        .expect("sentinel symbol required");
+    // Build sigmoid callee as a plain Ident. Codegen's expr::calls
+    // resolves "sigmoid" by name, so we need an Ident whose Symbol
+    // stringifies to "sigmoid" — use the compiler's synth_member_names
+    // override is not available for Call callees; instead, the caller
+    // is expected to resolve the sigmoid symbol via the shared interner
+    // and place it in `field_symbols` under the key "sigmoid" BEFORE
+    // invoking the rewrite. Production callers (adapter_inject pipeline)
+    // must ensure this. In unit tests we register it explicitly.
+    let sigmoid_ident_sym = ctx
+        .field_symbols
+        .get("sigmoid")
+        .copied()
+        .unwrap_or(sigmoid_sym);
+    let sigmoid_callee = Expr {
+        kind: ExprKind::Ident(sigmoid_ident_sym),
+        span,
+        id: NodeId::next(),
+    };
+    let sigmoid_call = Expr {
+        kind: ExprKind::Call {
+            callee: Box::new(sigmoid_callee),
+            args: vec![Arg { name: None, value: ma_g, span }],
+        },
+        span,
+        id: NodeId::next(),
+    };
+
+    // sigmoid(gate) * ((x @ A) @ B)
+    let gated = make_bin(BinOp::Mul, sigmoid_call, xa_at_b, span);
+
+    let rank = site.rank.max(1) as f64;
+    let alpha = site.alpha.max(1) as f64;
+    let scale = alpha / rank;
+    let scaled = make_bin(BinOp::Mul, gated, make_float(scale, span), span);
 
     make_bin(BinOp::Add, original, scaled, span)
 }
@@ -298,7 +434,7 @@ pub fn rewrite_expr(mut expr: Expr, ctx: &mut RewriteContext<'_>) -> Expr {
     };
 
     // Post-order pattern match on the rewritten node.
-    if let Some((site, lhs)) = match_lora_site(&expr, ctx) {
+    if let Some((site, lhs)) = match_adapter_site(&expr, ctx) {
         // Clone the site handle before we mutate ctx via synth_overrides.
         let site_copy = AdapterSite {
             site_id: site.site_id.clone(),
@@ -313,7 +449,13 @@ pub fn rewrite_expr(mut expr: Expr, ctx: &mut RewriteContext<'_>) -> Expr {
             target_field: site.target_field.clone(),
         };
         let lhs_clone = lhs.clone();
-        return synthesize_lora_adapted(expr, &lhs_clone, &site_copy, ctx);
+        return match site_copy.kind {
+            AdapterKind::Lora => synthesize_lora_adapted(expr, &lhs_clone, &site_copy, ctx),
+            AdapterKind::Ia3 => synthesize_ia3_adapted(expr, &site_copy, ctx),
+            AdapterKind::GatedLora => {
+                synthesize_gatedlora_adapted(expr, &lhs_clone, &site_copy, ctx)
+            }
+        };
     }
 
     expr
@@ -503,6 +645,137 @@ mod tests {
         let add = bin(x, BinOp::Add, sw);
 
         assert!(match_lora_site(&add, &ctx).is_none());
+    }
+
+    fn mk_site_with_kind(target_field: &str, kind: AdapterKind) -> AdapterSite {
+        let tag = match kind {
+            AdapterKind::Lora => "lora",
+            AdapterKind::Ia3 => "ia3",
+            AdapterKind::GatedLora => "gatedlora",
+        };
+        AdapterSite {
+            site_id: format!("m_{}__{}", target_field, tag),
+            kind,
+            target_param: format!("m.{}", target_field),
+            rank: 8,
+            alpha: 16,
+            synthesized_fields: vec![],
+            input_dim: 16,
+            output_dim: 32,
+            target_model: "Toy".to_string(),
+            target_field: target_field.to_string(),
+        }
+    }
+
+    #[test]
+    fn ia3_rewrite_multiplies_matmul_result_by_scale() {
+        let site = mk_site_with_kind("w", AdapterKind::Ia3);
+        let mut interner = Interner::new();
+        let x_sym: Symbol = interner.get_or_intern("x").into();
+        let (mut ctx, w_sym) = make_ctx(vec![&site], &mut interner, "w");
+
+        let x = ident(x_sym);
+        let sw = member(self_ref(), w_sym);
+        let matmul = bin(x, BinOp::MatMul, sw);
+
+        let out = rewrite_expr(matmul, &mut ctx);
+        // Expected: (x @ self.w) * self.ia3_scale_<site>
+        match &out.kind {
+            ExprKind::BinaryOp { op: BinOp::Mul, left, right } => {
+                // left: matmul x @ self.w
+                match &left.kind {
+                    ExprKind::BinaryOp { op: BinOp::MatMul, .. } => {}
+                    other => panic!("expected MatMul on left, got {:?}", other),
+                }
+                // right: MemberAccess (self, ia3_scale_<site>)
+                match &right.kind {
+                    ExprKind::MemberAccess { .. } => {}
+                    other => panic!("expected MemberAccess on right, got {:?}", other),
+                }
+            }
+            other => panic!("expected top-level Mul for IA3, got {:?}", other),
+        }
+        // Exactly one synth override (ia3_scale_<site>).
+        assert_eq!(ctx.synth_overrides.len(), 1);
+        let name = ctx.synth_overrides.values().next().unwrap();
+        assert!(name.starts_with("ia3_scale_"), "got {name}");
+    }
+
+    #[test]
+    fn gatedlora_rewrite_adds_sigmoid_gate_times_lora_contrib() {
+        // STEP-0 INVARIANT (keep this comment forever):
+        //   `gate_<site>` is initialized to zeros. `sigmoid(0) == 0.5`, NOT 0.
+        //   The gate is HALF-OPEN at step 0. Base-model equivalence at step 0
+        //   depends ENTIRELY on `lora_B = 0`. A refactor that changes B's init
+        //   without simultaneously changing the gate's init will silently break
+        //   the equivalence invariant. Task 5 Build 4 is the load-bearing
+        //   runtime assertion.
+        let site = mk_site_with_kind("w", AdapterKind::GatedLora);
+        let mut interner = Interner::new();
+        let x_sym: Symbol = interner.get_or_intern("x").into();
+        let sig_sym: Symbol = interner.get_or_intern("sigmoid").into();
+        let (mut ctx, w_sym) = make_ctx(vec![&site], &mut interner, "w");
+        ctx.field_symbols.insert("sigmoid".to_string(), sig_sym);
+
+        let x = ident(x_sym);
+        let sw = member(self_ref(), w_sym);
+        let matmul = bin(x, BinOp::MatMul, sw);
+
+        let out = rewrite_expr(matmul, &mut ctx);
+        // Top-level should be Add (original + scaled gated LoRA).
+        match &out.kind {
+            ExprKind::BinaryOp { op: BinOp::Add, left, right } => {
+                // left: original matmul
+                match &left.kind {
+                    ExprKind::BinaryOp { op: BinOp::MatMul, .. } => {}
+                    other => panic!("expected original MatMul on left, got {:?}", other),
+                }
+                // right: Mul(..., scale_float)
+                match &right.kind {
+                    ExprKind::BinaryOp { op: BinOp::Mul, left: inner_left, right: inner_right } => {
+                        // inner_right must be a float literal (alpha/rank scale)
+                        match &inner_right.kind {
+                            ExprKind::FloatLiteral(_) => {}
+                            other => panic!("expected scale FloatLiteral, got {:?}", other),
+                        }
+                        // inner_left: Mul(sigmoid(gate), (x @ A) @ B)
+                        match &inner_left.kind {
+                            ExprKind::BinaryOp {
+                                op: BinOp::Mul,
+                                left: gate_side,
+                                right: lora_side,
+                            } => {
+                                // gate_side: sigmoid(self.gate_<site>)
+                                match &gate_side.kind {
+                                    ExprKind::Call { .. } => {}
+                                    other => panic!(
+                                        "expected sigmoid Call, got {:?}",
+                                        other
+                                    ),
+                                }
+                                // lora_side: (x @ A) @ B
+                                match &lora_side.kind {
+                                    ExprKind::BinaryOp { op: BinOp::MatMul, .. } => {}
+                                    other => panic!(
+                                        "expected LoRA chain MatMul, got {:?}",
+                                        other
+                                    ),
+                                }
+                            }
+                            other => panic!("expected gated Mul, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected scale Mul on right, got {:?}", other),
+                }
+            }
+            other => panic!("expected top-level Add for GatedLoRA, got {:?}", other),
+        }
+        // Three synth overrides: lora_A_<site>, lora_B_<site>, gate_<site>.
+        assert_eq!(ctx.synth_overrides.len(), 3);
+        let names: Vec<&String> = ctx.synth_overrides.values().collect();
+        assert!(names.iter().any(|n| n.starts_with("lora_A_")));
+        assert!(names.iter().any(|n| n.starts_with("lora_B_")));
+        assert!(names.iter().any(|n| n.starts_with("gate_")));
     }
 
     #[test]
