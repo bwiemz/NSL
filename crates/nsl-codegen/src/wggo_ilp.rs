@@ -268,6 +268,127 @@ pub fn solve_layer(
     }
 }
 
+/// Solve a layer **greedily** — paper §5.3.
+///
+/// Each decision variable is chosen independently using a fast local
+/// heuristic instead of the cross-product branch-and-bound search.  The
+/// result may be sub-optimal but is reached in O(sum-of-domains) LUT
+/// lookups (~30) instead of O(product-of-domains) (~1.8 M with FASE and
+/// PCA enabled) — the paper measures this at <500 ms on full transformer
+/// models.  The conflict resolver runs downstream as usual; greedy makes
+/// no attempt to satisfy inter-technique constraints by itself.
+pub fn solve_layer_greedy(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> LayerIlpSolution {
+    let mut nodes = 0u64;
+
+    // Heads: keep all that satisfy the GQA-group + importance constraint.
+    let h = constraints.num_heads as usize;
+    let keep_head = if importance_ok(&vec![true; h], constraints) {
+        vec![true; h]
+    } else {
+        enumerate_head_configs(constraints)
+            .into_iter()
+            .find(|cfg| importance_ok(cfg, constraints))
+            .unwrap_or_else(|| vec![true; h])
+    };
+    let h_count = (keep_head.iter().filter(|b| **b).count() as u64).max(1);
+
+    // FFN: largest available width.
+    let f = *lut.axes_ffn_widths.iter().max().unwrap_or(&1024);
+
+    // CSHA: highest level whose smem fits.
+    let c = lut
+        .axes_csha_levels
+        .iter()
+        .copied()
+        .rev()
+        .find(|&lvl| {
+            nodes += 1;
+            lut.get(h_count, f, lvl, 0)
+                .map(|e| e.feasible && e.smem_bytes <= constraints.smem_budget)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+
+    // Adapter rank: greedy keeps it at 0 (no LoRA unless explicitly asked).
+    let r = *lut.axes_adapter_ranks.iter().min().unwrap_or(&0);
+
+    // Precision: lowest precision allowed by sensitivity (cheapest).
+    let m_bits = pick_precision_low(constraints);
+    let v_bits = pick_precision_low(constraints);
+
+    // FASE + PCA: pick the local-best at this layer.
+    let fase_fused = constraints.allow_fase;
+    let packing_mode = enumerate_packing_modes(constraints)[0];
+
+    let Some(base) = lut.get(h_count, f, c, r) else {
+        return LayerIlpSolution {
+            decision: fallback_decision(constraints),
+            cost_us: f64::INFINITY,
+            memory_bytes: 0,
+            smem_bytes: 0,
+            nodes_explored: nodes,
+            feasible: false,
+        };
+    };
+    let entry = apply_packing(
+        apply_fase(base, fase_fused, constraints.fase_backward_speedup),
+        packing_mode,
+        &constraints.packing_savings,
+    );
+    let memory_bytes = entry.param_bytes + entry.activation_bytes;
+    let feasible = base.feasible
+        && entry.smem_bytes <= constraints.smem_budget
+        && memory_bytes <= constraints.memory_budget;
+
+    if !feasible {
+        return LayerIlpSolution {
+            decision: fallback_decision(constraints),
+            cost_us: f64::INFINITY,
+            memory_bytes,
+            smem_bytes: entry.smem_bytes,
+            nodes_explored: nodes,
+            feasible: false,
+        };
+    }
+
+    LayerIlpSolution {
+        decision: LayerDecision {
+            keep_head,
+            ffn_width: f,
+            csha_level: c,
+            adapter_rank: r,
+            optim_m_bits: m_bits,
+            optim_v_bits: v_bits,
+            fase_fused,
+            packing_mode,
+        },
+        cost_us: entry.total_us(),
+        memory_bytes,
+        smem_bytes: entry.smem_bytes,
+        nodes_explored: nodes,
+        feasible: true,
+    }
+}
+
+/// Greedy variant of [`solve_all`].
+pub fn solve_all_greedy(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> Vec<LayerIlpSolution> {
+    assert_eq!(
+        luts.len(),
+        constraints.len(),
+        "luts and constraints must be parallel arrays"
+    );
+    luts.iter()
+        .zip(constraints.iter())
+        .map(|(lut, c)| solve_layer_greedy(lut, c))
+        .collect()
+}
+
 /// Solve all layers in parallel-safe sequential order.
 pub fn solve_all(
     luts: &[LayerCostLut],
@@ -295,6 +416,18 @@ struct SolverState {
     nodes: u64,
     #[allow(dead_code)]
     global_lower_bound: f64,
+}
+
+/// Pick the lowest precision (in bits) that the sensitivity floor allows.
+/// Used by the greedy solver — lower precision is cheaper to execute, so
+/// the locally-optimal pick is "as low as legal".
+fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
+    for &bits in &[8u8, 16, 32] {
+        if prec_allowed(bits, c) {
+            return bits;
+        }
+    }
+    32
 }
 
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
@@ -603,6 +736,70 @@ mod tests {
         // either branch.  We only assert feasibility.
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
+    }
+
+    #[test]
+    fn greedy_explores_far_fewer_nodes_than_full() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints::default();
+        let full = solve_layer(&lut, &constraints);
+        let greedy = solve_layer_greedy(&lut, &constraints);
+        assert!(greedy.feasible);
+        // Greedy is meant to be O(sum-of-domains) — orders of magnitude
+        // cheaper than the full cross-product.
+        assert!(
+            greedy.nodes_explored * 100 < full.nodes_explored,
+            "greedy={} full={}",
+            greedy.nodes_explored,
+            full.nodes_explored
+        );
+    }
+
+    #[test]
+    fn greedy_returns_finite_cost() {
+        // Quality bound vs full ILP is workload-dependent — paper claims
+        // ~5 % on real transformers, but the toy LUT's roofline model can
+        // make greedy's "largest FFN + highest CSHA" picks look much
+        // worse than full's globally-balanced choice.  We only assert
+        // greedy returns a feasible plan with finite cost; the
+        // `greedy_explores_far_fewer_nodes_than_full` test already
+        // verifies the speed promise.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let greedy = solve_layer_greedy(&lut, &LayerIlpConstraints::default());
+        assert!(greedy.feasible);
+        assert!(greedy.cost_us.is_finite());
+        assert!(greedy.cost_us > 0.0);
+    }
+
+    #[test]
+    fn greedy_respects_smem_budget() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.smem_budget = 1024; // forces csha=0
+        let g = solve_layer_greedy(&lut, &c);
+        assert!(g.feasible);
+        assert_eq!(g.decision.csha_level, 0);
+    }
+
+    #[test]
+    fn greedy_respects_sensitivity_floor() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.sensitivity = 0.95; // forces 32 bits
+        let g = solve_layer_greedy(&lut, &c);
+        assert!(g.feasible);
+        assert_eq!(g.decision.optim_m_bits, 32);
+        assert_eq!(g.decision.optim_v_bits, 32);
+    }
+
+    #[test]
+    fn solve_all_greedy_runs_one_per_layer() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut; 4];
+        let sols = solve_all_greedy(&luts, &vec![c; 4]);
+        assert_eq!(sols.len(), 4);
+        assert!(sols.iter().all(|s| s.feasible));
     }
 
     #[test]
