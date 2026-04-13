@@ -638,5 +638,6 @@ fn build_report(ctx: WalkCtx<'_>, entry: EntryKind) -> ProfileReport {
         fusion: None,
         memory_timeline: None,
         recommendations,
+        wggo_explain: None,
     }
 }

@@ -21,7 +21,32 @@ fn sample_args() -> ProfileArgs {
         memory: false,
         entry: "auto".into(),
         json: false,
+        explain_wggo: false,
     }
+}
+
+#[test]
+fn explain_wggo_flag_appends_explanation_block() {
+    let mut args = sample_args();
+    args.explain_wggo = true;
+    let out = run_profile(&args).expect("profile should succeed");
+    assert!(out.contains("=== NSL Predictive Profile ==="),
+        "per-op table should still be present (additive flag)");
+    assert!(out.contains("=== WGGO Decision Explanation ==="),
+        "WGGO explanation block missing — flag did not append");
+}
+
+#[test]
+fn explain_wggo_with_json_attaches_wggo_plan() {
+    let mut args = sample_args();
+    args.json = true;
+    args.explain_wggo = true;
+    let out = run_profile(&args).expect("profile should succeed");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
+    assert!(!v["wggo_explain"].is_null(),
+        "wggo_explain should be populated in JSON mode, got null");
+    let per_layer = &v["wggo_explain"]["per_layer"];
+    assert!(per_layer.is_array(), "per_layer should be array, got {per_layer:?}");
 }
 
 #[test]

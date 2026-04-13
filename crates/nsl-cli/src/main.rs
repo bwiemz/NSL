@@ -527,6 +527,10 @@ enum Cli {
         /// Emit machine-readable JSON instead of a formatted table
         #[arg(long)]
         json: bool,
+
+        /// Run WGGO Full mode and append/attach the decision explanation
+        #[arg(long)]
+        explain_wggo: bool,
     },
 
     /// Train a BPE tokenizer from source files
@@ -998,6 +1002,7 @@ fn main_inner() {
                     memory: false,
                     entry: "auto".into(),
                     json: true,
+                    explain_wggo: false,
                 };
                 let report_json = match nsl_cli::profile::run_profile(&profile_args) {
                     Ok(s) => s,
@@ -1358,6 +1363,7 @@ fn main_inner() {
             memory,
             entry,
             json,
+            explain_wggo,
         } => {
             let args = nsl_cli::profile::ProfileArgs {
                 file,
@@ -1370,6 +1376,7 @@ fn main_inner() {
                 memory,
                 entry,
                 json,
+                explain_wggo,
             };
             match nsl_cli::profile::run_profile(&args) {
                 Ok(s) => println!("{s}"),

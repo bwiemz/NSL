@@ -99,6 +99,7 @@ fn build_from_report_splits_ops_and_eliminated() {
         fusion: None,
         memory_timeline: None,
         recommendations: vec![],
+        wggo_explain: None,
     };
     let src = "line1\nline2\nline3\n";
     let m = build_manifest_from_report(&report, "m.nsl", src);

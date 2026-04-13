@@ -2,6 +2,7 @@
 //! memory planner, CLI reports).
 
 use crate::cost_model::OpCost;
+use crate::wggo::WggoPlan;
 use crate::wrga_fusion::FusionPlan;
 use serde::{Deserialize, Serialize};
 
@@ -95,4 +96,8 @@ pub struct ProfileReport {
     pub fusion: Option<FusionPlan>,
     pub memory_timeline: Option<Vec<MemoryTimelineEntry>>,
     pub recommendations: Vec<Recommendation>,
+    /// Populated by `nsl profile --explain-wggo`. `WggoPlan` is serialize-only,
+    /// so this field is skipped on deserialization and defaults to `None`.
+    #[serde(default, skip_deserializing)]
+    pub wggo_explain: Option<WggoPlan>,
 }

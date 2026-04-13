@@ -13,6 +13,7 @@ fn empty_report_round_trips_json() {
         fusion: None,
         memory_timeline: None,
         recommendations: vec![],
+        wggo_explain: None,
     };
     let j = serde_json::to_string(&r).unwrap();
     let back: ProfileReport = serde_json::from_str(&j).unwrap();

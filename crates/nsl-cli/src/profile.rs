@@ -24,6 +24,8 @@ pub struct ProfileArgs {
     pub memory: bool,
     pub entry: String,
     pub json: bool,
+    /// Run WGGO `Full` mode and attach/append the decision explanation.
+    pub explain_wggo: bool,
 }
 
 pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
@@ -105,11 +107,68 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         report.memory_timeline = Some(tl);
     }
 
+    if args.explain_wggo {
+        // Phase 3 Task 4: the CLI profile path doesn't yet carry a real
+        // source-AD WengertList, so we synthesize a minimal two-block
+        // attention-shaped list. This is sufficient for the decision-trace
+        // renderer (Task 3) to produce a complete per-layer explanation.
+        // When Phase-4 source-AD lands in `nsl profile`, replace with the
+        // real wengert extraction.
+        let wengert = synth_two_block_wengert();
+        let plan = nsl_codegen::wggo::run_on_wengert(
+            &wengert,
+            &args.target,
+            "full",
+            1,
+        )
+        .ok_or_else(|| "WGGO mode 'full' rejected — internal error".to_string())?;
+        if args.json {
+            report.wggo_explain = Some(plan);
+        } else {
+            let explain = crate::wggo_explain::render_explain(&plan);
+            // Defer to render_text below; stash via a helper string.
+            let text = render_text(&report, gpu);
+            let mut out = text;
+            out.push('\n');
+            out.push_str(&explain);
+            return Ok(out);
+        }
+    }
+
     if args.json {
         return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
     }
 
     Ok(render_text(&report, gpu))
+}
+
+/// Synthesize a two-block attention Wengert list suitable for WGGO
+/// driver input. Mirrors the test fixture used by Task 2's decision-trace
+/// tests. Used only by `--explain-wggo` until real AD extraction is wired.
+fn synth_two_block_wengert() -> nsl_codegen::wengert::WengertList {
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use std::collections::HashMap;
+    let op = |id: u32, result: u32, o: PrimalOp, inputs: Vec<u32>| WengertOp {
+        id,
+        result,
+        op: o,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let ops = vec![
+        op(0, 0, PrimalOp::Input("x".into()), vec![]),
+        op(1, 1, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
+        op(2, 2, PrimalOp::Matmul, vec![1, 0]),
+        op(3, 3, PrimalOp::Param("blocks.1.attn.wq".into()), vec![]),
+        op(4, 4, PrimalOp::Matmul, vec![3, 2]),
+    ];
+    WengertList {
+        ops,
+        output: 4,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    }
 }
 
 fn render_text(r: &ProfileReport, gpu: &GpuSpec) -> String {
