@@ -176,3 +176,113 @@ mod tests {
         assert_eq!(ctx.finalize_read(h), vec![3.0, 5.0, 2.0]);
     }
 }
+
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{types as cl_types, InstBuilder, MemFlags, Value};
+use cranelift_frontend::FunctionBuilder;
+
+/// Emit Cranelift IR for: `for i in 0..len { buf[i] = max(buf[i], |src[i]|) }`.
+///
+/// - `buf_ptr` (i64): pointer to a running-max f32 array (read + written in place).
+/// - `src_ptr` (i64): pointer to a sample f32 array (read only).
+/// - `len_val` (i32): number of f32 elements to process.
+///
+/// This is the core reduction shared by every AWQ-style calibration hook
+/// (AWQ activation scales, FP8 amax tracking, GPTQ activation-stats inputs).
+/// Task 11 will wire this into the per-step loop of the production calibration
+/// binary; this helper is self-contained IR emission.
+pub(crate) fn emit_running_max_abs_f32(
+    fb: &mut FunctionBuilder,
+    buf_ptr: Value,
+    src_ptr: Value,
+    len_val: Value,
+) {
+    // Loop via block-param induction variable (no shared Variable slot, so
+    // this helper is safe to call from any `FunctionBuilder` context).
+    let header = fb.create_block();
+    let body = fb.create_block();
+    let exit = fb.create_block();
+    fb.append_block_param(header, cl_types::I32);
+
+    let zero_i32 = fb.ins().iconst(cl_types::I32, 0);
+    fb.ins().jump(header, &[zero_i32.into()]);
+
+    // header: if i < len goto body(i) else goto exit
+    fb.switch_to_block(header);
+    let i_cur = fb.block_params(header)[0];
+    let cond = fb.ins().icmp(IntCC::UnsignedLessThan, i_cur, len_val);
+    fb.ins().brif(cond, body, &[], exit, &[]);
+
+    // body
+    fb.switch_to_block(body);
+    fb.seal_block(body);
+    let four = fb.ins().iconst(cl_types::I32, 4);
+    let off32 = fb.ins().imul(i_cur, four);
+    let off64 = fb.ins().sextend(cl_types::I64, off32);
+    let src_addr = fb.ins().iadd(src_ptr, off64);
+    let buf_addr = fb.ins().iadd(buf_ptr, off64);
+    let src_val = fb.ins().load(cl_types::F32, MemFlags::new(), src_addr, 0);
+    let abs_val = fb.ins().fabs(src_val);
+    let buf_val = fb.ins().load(cl_types::F32, MemFlags::new(), buf_addr, 0);
+    let new_val = fb.ins().fmax(buf_val, abs_val);
+    fb.ins().store(MemFlags::new(), new_val, buf_addr, 0);
+    let one = fb.ins().iconst(cl_types::I32, 1);
+    let i_next = fb.ins().iadd(i_cur, one);
+    fb.ins().jump(header, &[i_next.into()]);
+
+    fb.seal_block(header);
+    fb.switch_to_block(exit);
+    fb.seal_block(exit);
+}
+
+#[cfg(test)]
+mod ir_tests {
+    use super::emit_running_max_abs_f32;
+    use cranelift_codegen::ir::{types as cl_types, AbiParam, InstBuilder, Function, UserFuncName, Signature};
+    use cranelift_codegen::isa::CallConv;
+    use cranelift_codegen::settings;
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    #[test]
+    fn running_max_abs_ir_contains_abs_max_and_store() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(cl_types::I64)); // buf_ptr
+        sig.params.push(AbiParam::new(cl_types::I64)); // src_ptr
+        sig.params.push(AbiParam::new(cl_types::I32)); // len
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut fb = FunctionBuilder::new(&mut func, &mut fb_ctx);
+
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        let buf_ptr = fb.block_params(entry)[0];
+        let src_ptr = fb.block_params(entry)[1];
+        let len_val = fb.block_params(entry)[2];
+
+        emit_running_max_abs_f32(&mut fb, buf_ptr, src_ptr, len_val);
+        fb.ins().return_(&[]);
+        fb.finalize();
+
+        // Verify the IR verifies.
+        let flags = settings::Flags::new(settings::builder());
+        cranelift_codegen::verifier::verify_function(&func, &flags)
+            .expect("emitted IR should verify");
+
+        let ir_text = format!("{}", func.display());
+        assert!(
+            ir_text.contains("fabs") || ir_text.contains("band"),
+            "IR should take abs of src (fabs or bitmask band): {ir_text}"
+        );
+        assert!(
+            ir_text.contains("fmax") || (ir_text.contains("fcmp") && ir_text.contains("select")),
+            "IR should compute max via fmax or fcmp+select: {ir_text}"
+        );
+        assert!(
+            ir_text.contains("store"),
+            "IR should store result back to buf: {ir_text}"
+        );
+    }
+}
