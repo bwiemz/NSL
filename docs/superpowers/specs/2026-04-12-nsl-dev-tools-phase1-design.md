@@ -35,7 +35,17 @@ Four CLI features share a single new module, `nsl-codegen/src/profiling/`, that 
 
 ### 3.1 Shared layer: `nsl-codegen/src/profiling/`
 
-- `walker.rs` — `walk_ops(typed_module, &GpuSpec, dtype) -> ProfileReport`. Walks the typed AST, dispatches to the per-op cost functions in `cost_model.rs` (`matmul_cost`, `flash_attention_cost`, `softmax_cost`, `layernorm_cost`, `embedding_cost`, …), and produces:
+- `walker.rs` — `walk_ops(typed_module, entry, &ShapeEnv, &GpuSpec, dtype) -> ProfileReport`. Walks the typed AST, dispatches to the per-op cost functions in `cost_model.rs` (`matmul_cost`, `flash_attention_cost`, `softmax_cost`, `layernorm_cost`, `embedding_cost`, …), and produces:
+
+  **Entry-point selection.** The walker is given an `entry: EntryKind` which is either:
+  - `EntryKind::Function(name)` — walk the named top-level function's body.
+  - `EntryKind::Train` — find the module's `train` block, walk `step`, and **inline the model's `forward` (or `forward_train`) method body** at the call site. Inlining is recursive through `model.method(...)` calls whose callee resolves to a method on a `model` block; non-model calls are left opaque.
+  - `EntryKind::Auto` (default) — pick `Train` if a `train` block exists, else the sole top-level function, else error.
+
+  Inlining means the per-layer table reflects the full forward cost, not just the three lines in the train block.
+
+  **Shape resolution.** Shape variables (`batch`, `seq`, named dims) are resolved via a `ShapeEnv` map supplied by the caller (populated from `--batch` / `--seq` / `--dim <name>=<n>` CLI flags, defaults `batch=1`, `seq=2048`). Unresolved shape variables cause the walker to emit `OpCost { flops: 0, note: "unresolved shape var: <name>" }` rather than aborting.
+
   - `Vec<OpCost>` with `source_span` attached per entry.
   - Aggregate totals (FLOPs, HBM bytes, estimated time).
   - Roofline classification histogram.
@@ -101,7 +111,12 @@ New clap subcommand.
 - `--target <gpu>` — default: first entry in `GPU_DATABASE` (H100-SXM).
 - `--dtype <bf16|fp16|fp8>` — default: `bf16`.
 - `--fusion` / `--no-fusion` — default: on. Shows pre- and post-fusion timing.
-- `--memory` — switches to §4.3 renderer. Mutually exclusive with the default per-op table output.
+- `--batch <N>` — concrete value for the `batch` shape variable. Default: `1`.
+- `--seq <N>` — concrete value for the `seq` shape variable. Default: `2048`.
+- `--dim <name>=<N>` — repeatable; binds any other named dimension (e.g., `--dim heads=8`).
+- `--memory` / `--memory-timeline` — **additive**: appends the §4.3 timeline below the per-op table rather than replacing it. The shared walker runs once; the timeline renderer reuses its output.
+- `--entry <function|train|auto>` — selects the walker's entry point (see §3.1). Default: `auto`.
+- `--json` — emit the `ProfileReport` as machine-readable JSON on stdout instead of the formatted table. Mutually exclusive with `--memory` rendering (JSON mode includes the memory timeline as a nested field whenever memory data is available, so no separate flag combination is needed).
 
 **Pipeline:**
 
@@ -183,13 +198,12 @@ report:   CLI reads both JSONs, renders predicted-vs-actual table + source-mappe
 
 **Runtime — `nsl-runtime/src/profiler/collector.rs` (~200 LOC):**
 
-1. `nsl_profile_kernel_begin(kernel_id)` creates (or reuses) a `cudaEvent_t`, records it on the current stream, and pushes into a per-thread ring buffer keyed by `kernel_id`.
-2. `nsl_profile_kernel_end(kernel_id)` records a matching end event.
-3. On program exit (via a runtime `Drop` hook, plus an explicit `nsl_profile_flush()` FFI for host-driven flushes), the collector:
-   - Synchronizes the stream.
-   - Calls `cudaEventElapsedTime` on each pair.
-   - Aggregates per `kernel_id`: `{ count, sum_us, min_us, max_us }`.
-   - Writes `<out>.nsl-profile-actual.json` next to the binary.
+1. `nsl_profile_kernel_begin(kernel_id)` records a start `cudaEvent_t` on the current stream and stashes it in a small per-thread "in-flight" map keyed by `kernel_id` (max one open event per `kernel_id` per thread).
+2. `nsl_profile_kernel_end(kernel_id)` records a matching end event. The collector **does not store the event pair long-term**. Instead:
+   - It enqueues the pair on a bounded per-kernel-id "drain queue" (capacity: 64 pairs).
+   - Whenever the drain queue is full, the collector synchronizes those events, resolves them via `cudaEventElapsedTime`, folds the measurements into a running per-kernel-id aggregate `{ count, sum_us, min_us, max_us, sum_sq_us }` (the `sum_sq_us` supports stddev later), and recycles the event handles into a free pool.
+   - This keeps per-kernel-id memory at a fixed O(64 events) regardless of run length. A 10,000-step × 64-kernel training run does **not** grow unbounded.
+3. On program exit (via a runtime `Drop` hook, plus an explicit `nsl_profile_flush()` FFI for host-driven flushes), the collector drains any remaining queued events, folds them into the aggregates, and writes `<out>.nsl-profile-actual.json` next to the binary.
 4. When the binary is not instrumented, the FFI symbols are not linked; zero cost.
 
 **CLI — `nsl-cli/src/monitor.rs` (~200 LOC):**
