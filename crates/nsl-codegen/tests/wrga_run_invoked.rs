@@ -7,9 +7,10 @@ const TRAIN_SRC: &str = r#"from nsl.nn.losses import mse_loss
 
 model Toy:
     w: Tensor = ones([16, 16])
+    b: Tensor = zeros([16])
 
     fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
+        return x @ self.w + self.b
 
 fn main():
     let m = Toy()
@@ -41,7 +42,7 @@ fn wrga_run_fires_for_train_block_with_freeze() {
         source_ad: true,
         wrga_inputs: Some(WrgaInputs {
             freeze: vec![FreezeDecoratorConfig {
-                include: vec!["w".into()],
+                include: vec!["m.w".into()],
                 exclude: vec![],
             }],
             ..Default::default()
@@ -62,9 +63,8 @@ fn wrga_run_fires_for_train_block_with_freeze() {
     );
     let plan = plan.unwrap();
     assert!(
-        plan.prune.stats.frozen_params > 0
-            || plan.prune.stats.gradient_targets > 0,
-        "wrga plan should reflect at least one param classification, stats={:?}",
+        plan.prune.stats.frozen_params > 0,
+        "wrga plan should reflect at least one frozen param, stats={:?}",
         plan.prune.stats
     );
 }
