@@ -56,6 +56,24 @@ fn run_profile_pre_pass(
         adapter_configs: Vec::new(),
     };
 
+    // Task 6 + Phase 2.5 Task 4: populate source text/name so
+    // SourceSpanJson::from_span produces real line numbers in manifest records.
+    // Source-text priority: explicit options → disk fallback → empty.  Runs
+    // before walk_ops so source context is ready even if the walker fails,
+    // and before any fusion decisions are made.
+    compiler.source_text = match &options.profile_source_text {
+        Some(s) => s.clone(),
+        None => options
+            .profile_source_file_name
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default(),
+    };
+    compiler.source_file_name = options
+        .profile_source_file_name
+        .clone()
+        .unwrap_or_default();
+
     match walk_ops(ast, &analysis, interner, EntryKind::Auto, &env, gpu, dtype) {
         Ok(report) => {
             compiler.prediction_map = report
@@ -64,16 +82,6 @@ fn run_profile_pre_pass(
                 .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
                 .collect();
             compiler.manifest_builder = Some(ManifestBuilder::new(target_gpu, dtype));
-            // Task 6: populate source text/name so SourceSpanJson::from_span
-            // produces real line numbers in manifest records.  When the CLI
-            // doesn't pass them through (e.g. pure library callers), we
-            // leave the defaults and accept degraded spans.
-            if let Some(src) = &options.profile_source_text {
-                compiler.source_text = src.clone();
-            }
-            if let Some(name) = &options.profile_source_file_name {
-                compiler.source_file_name = name.clone();
-            }
             // Phase 2.5 Task 3: seed the Compiler-owned plan so later fusion
             // passes (apply_epilogue_fusion, apply_reduction_fusion) can write
             // into the same instance that `fusion_constituents` reads at

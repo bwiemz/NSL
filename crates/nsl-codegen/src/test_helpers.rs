@@ -71,6 +71,7 @@ pub fn run_pre_pass_only(
     let mut prediction_map_len = 0usize;
     let mut manifest_builder_set = false;
     let mut fusion_plan_set = false;
+    let mut source_text_out = String::new();
 
     if opts.profile_kernels {
         use crate::gpu_specs::find_gpu;
@@ -78,6 +79,22 @@ pub fn run_pre_pass_only(
         use crate::profiling::shape_env::ShapeEnv;
         use crate::profiling::types::EntryKind;
         use crate::profiling::walker::walk_ops;
+
+        // Phase 2.5 Task 4: install source-text/name up front, mirroring
+        // `run_profile_pre_pass`.  Runs independently of walker success.
+        compiler.source_text = match &opts.profile_source_text {
+            Some(s) => s.clone(),
+            None => opts
+                .profile_source_file_name
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default(),
+        };
+        compiler.source_file_name = opts
+            .profile_source_file_name
+            .clone()
+            .unwrap_or_default();
+        source_text_out = compiler.source_text.clone();
 
         let env = ShapeEnv::with_defaults();
         let target_gpu = opts.target_gpu.as_str();
@@ -94,7 +111,10 @@ pub fn run_pre_pass_only(
             freeze_configs: Vec::new(),
             adapter_configs: Vec::new(),
         };
-        let report = walk_ops(
+        // walk_ops may fail on trivial test inputs (no fn/train block).  The
+        // production path is non-fatal; mirror that so the source-text
+        // fallback can be exercised independently of walker success.
+        if let Ok(report) = walk_ops(
             &parsed.module,
             &synth_analysis,
             &interner,
@@ -102,13 +122,13 @@ pub fn run_pre_pass_only(
             &env,
             gpu,
             dtype,
-        )
-        .map_err(|e| format!("walk_ops failed: {}", e))?;
-        compiler.prediction_map = report
-            .ops
-            .iter()
-            .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
-            .collect();
+        ) {
+            compiler.prediction_map = report
+                .ops
+                .iter()
+                .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
+                .collect();
+        }
         compiler.manifest_builder = Some(ManifestBuilder::new(target_gpu, dtype));
         // Phase 2.5 Task 3: mirror `run_profile_pre_pass` seeding so
         // `fusion_plan_for_profile` is `Some(...)` after the pre-pass.
@@ -128,6 +148,7 @@ pub fn run_pre_pass_only(
         prediction_map_len,
         manifest_builder_set,
         fusion_plan_set,
+        source_text: source_text_out,
     })
 }
 
@@ -138,4 +159,8 @@ pub struct PrePassResult {
     pub prediction_map_len: usize,
     pub manifest_builder_set: bool,
     pub fusion_plan_set: bool,
+    /// Phase 2.5 Task 4: the `source_text` the pre-pass installed on the
+    /// `Compiler` (explicit `profile_source_text`, else disk read from
+    /// `profile_source_file_name`, else empty).
+    pub source_text: String,
 }
