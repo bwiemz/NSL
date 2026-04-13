@@ -4,6 +4,7 @@
 pub mod ctx;
 pub mod hooks;
 pub mod observation;
+pub mod sidecar;
 
 pub use ctx::CalibCtx;
 pub use hooks::{CalibrationHook, CalibrationResult};
