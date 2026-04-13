@@ -112,6 +112,37 @@ impl BridgeResult {
     ) -> impl Iterator<Item = &'a FusionMark> + 'a {
         self.marks.iter().filter(move |m| m.layer == layer)
     }
+
+    /// A.2.1b: name-based extras resolver — given the Cranelift
+    /// function name currently being compiled (typically mangled as
+    /// `"ModelName__method_name"`, or for loop-unrolled per-block
+    /// methods `"ModelName__method__blocks_0"`), try to derive a
+    /// layer key that matches one of the bridge's per-layer entries.
+    ///
+    /// Heuristic: scan the function name for each `extras` key as a
+    /// substring after normalising dots to underscores (bridge uses
+    /// `"blocks.0"`, mangled names use `"blocks_0"`). Return the first
+    /// match. Callers should fall back to `extras_at_index` when this
+    /// returns `None`.
+    ///
+    /// This is an incremental step away from pure positional matching:
+    /// in multi-layer transformers where FA call order doesn't align
+    /// with plan layer order (e.g. iterative `for block in self.blocks`
+    /// after loop-unrolling), a name-based match picks the right
+    /// layer's extras even if the ordinal would not.
+    pub fn extras_for_current_function(
+        &self,
+        fn_name: &str,
+    ) -> Option<(&str, &CshaExtras)> {
+        let needle = fn_name.replace('.', "_");
+        for (key, extras) in &self.extras {
+            let normalised = key.replace('.', "_");
+            if needle.contains(&normalised) {
+                return Some((key.as_str(), extras));
+            }
+        }
+        None
+    }
 }
 
 /// Serializable mirror of the bits of `FlashAttentionConfig` a downstream
@@ -511,6 +542,50 @@ mod tests {
         assert_eq!(layer, "blocks.0");
         assert!(r.extras_at_index(0).is_some());
         assert!(r.layer_at_index(1).is_none());
+    }
+
+    #[test]
+    fn a21b_extras_for_current_function_matches_mangled_name() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        // Cranelift mangling typically produces `ModelName__method`
+        // or `ModelName__method__blocks_0`. With dot→underscore
+        // normalisation, "blocks.0" matches "blocks_0" inside the
+        // mangled name.
+        let (layer, extras) = r
+            .extras_for_current_function("TransformerBlock__forward__blocks_0")
+            .expect("mangled fn name should resolve to blocks.0");
+        assert_eq!(layer, "blocks.0");
+        assert!(extras.level >= 1);
+    }
+
+    #[test]
+    fn a21b_extras_for_current_function_matches_plain_name() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        // An un-mangled debug-build name still matches — the bridge
+        // key `blocks.0` is a substring of `"Model.forward.blocks.0"`
+        // under the dot-preserving view.
+        let hit = r.extras_for_current_function("Model_forward_blocks_0");
+        assert!(hit.is_some());
+    }
+
+    #[test]
+    fn a21b_extras_for_current_function_returns_none_when_no_layer_match() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        // Function name without any `blocks.N` shape — name-based
+        // resolver declines; caller falls back to ordinal.
+        assert!(r.extras_for_current_function("MLP__forward").is_none());
+    }
+
+    #[test]
+    fn a21b_extras_for_current_function_none_when_csha_off() {
+        let plan = toy_plan(CshaMode::Off);
+        let r = bridge(&plan, 64);
+        assert!(r
+            .extras_for_current_function("anything__blocks_0")
+            .is_none());
     }
 
     #[test]

@@ -1345,12 +1345,28 @@ impl Compiler<'_> {
         // picks up the Nth layer's extras. A.2.1 replaces this with a
         // proper layer-name resolver (Wengert `Param` prefix →
         // enclosing function → layer key).
+        // A.2.1b: prefer name-based layer resolution when the current
+        // function name contains a bridge layer key (normalising dots
+        // ↔ underscores to tolerate Cranelift mangling). Falls back to
+        // the A.2.0 positional ordinal match when the name lookup
+        // misses — e.g. single-layer toy models whose function name
+        // doesn't carry a `blocks.N` prefix.
         let ordinal = self.csha_fa_call_ordinal;
         let (csha_layer, csha_extras) = match self.last_csha_bridge.as_ref() {
-            Some(b) => (
-                b.layer_at_index(ordinal).map(str::to_string),
-                b.extras_at_index(ordinal).cloned(),
-            ),
+            Some(b) => {
+                let by_name = state
+                    .current_function_name
+                    .as_deref()
+                    .and_then(|fn_name| b.extras_for_current_function(fn_name))
+                    .map(|(layer, extras)| (layer.to_string(), extras.clone()));
+                match by_name {
+                    Some((layer, extras)) => (Some(layer), Some(extras)),
+                    None => (
+                        b.layer_at_index(ordinal).map(str::to_string),
+                        b.extras_at_index(ordinal).cloned(),
+                    ),
+                }
+            }
             None => (None, None),
         };
         self.csha_fa_call_ordinal = ordinal.saturating_add(1);
