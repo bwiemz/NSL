@@ -238,6 +238,7 @@ pub fn apply_epilogue_fusion(
     graph: &mut FusionGraph,
     chains: &[EpilogueChain],
     base_kernel_id: FusedKernelId,
+    plan: &mut crate::wrga_fusion::FusionPlan,
 ) {
     for (i, chain) in chains.iter().enumerate() {
         let kid = base_kernel_id + i as FusedKernelId;
@@ -247,6 +248,21 @@ pub fn apply_epilogue_fusion(
         for &node_id in &chain.eliminated_nodes {
             graph.nodes[node_id as usize].fused_into = Some(kid);
         }
+
+        // Record constituent NodeIds for prediction-sum lookup.
+        // `fusion_graph::NodeId` is `u32`; `FusionPlan.fused_node_groups` is keyed
+        // by `nsl_ast::NodeId`, so wrap the raw ids.
+        let root = nsl_ast::NodeId(chain.matmul_node);
+        let mut constituents = Vec::with_capacity(1 + chain.eliminated_nodes.len());
+        constituents.push(root);
+        constituents.extend(
+            chain
+                .eliminated_nodes
+                .iter()
+                .copied()
+                .map(nsl_ast::NodeId),
+        );
+        plan.fused_node_groups.insert(root, constituents);
     }
 }
 
@@ -719,7 +735,8 @@ mod tests {
     fn test_apply_marks_fused_into() {
         let mut g = make_matmul_bias_relu();
         let chains = detect_epilogue_chains(&g);
-        apply_epilogue_fusion(&mut g, &chains, 0);
+        let mut _scratch_fusion_plan = crate::wrga_fusion::FusionPlan::default();
+        apply_epilogue_fusion(&mut g, &chains, 0, &mut _scratch_fusion_plan);
 
         assert_eq!(g.nodes[3].fused_into, Some(0)); // matmul
         assert_eq!(g.nodes[4].fused_into, Some(0)); // add

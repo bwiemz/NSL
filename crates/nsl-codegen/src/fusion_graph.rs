@@ -477,7 +477,8 @@ mod tests {
         // av matmul has 1 consumer (add) -> should detect epilogue chain
         assert_eq!(epi_chains.len(), 1);
         assert_eq!(epi_chains[0].matmul_node, av);
-        apply_epilogue_fusion(&mut g, &epi_chains, 100);
+        let mut _scratch_fusion_plan = crate::wrga_fusion::FusionPlan::default();
+        apply_epilogue_fusion(&mut g, &epi_chains, 100, &mut _scratch_fusion_plan);
 
         // Verify: softmax nodes claimed by kernel 0, epilogue by kernel 100
         assert!(g.nodes[rmax as usize].fused_into.is_some());
