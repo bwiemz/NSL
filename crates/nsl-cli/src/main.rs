@@ -226,6 +226,10 @@ enum Cli {
         #[arg(long)]
         monitor: bool,
 
+        /// Activate @inspect hooks: dump tensor stats/contents to .nsl-inspect/
+        #[arg(long)]
+        inspect: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -1005,6 +1009,7 @@ fn main_inner() {
             cuda_sync,
             gpu_mem_report,
             monitor,
+            inspect,
         } => {
             // Dev Tools Phase 4 Task 6: when --monitor is set, auto-detect
             // whether this program has a `train { }` block.  If so, enable
@@ -1145,7 +1150,7 @@ fn main_inner() {
                 // to `<file>.nsl-health.json` at run end.
                 health_monitor: detected_train_block,
                 health_flush_interval: None,
-                inspect_enabled: false,
+                inspect_enabled: inspect,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -1385,6 +1390,37 @@ fn main_inner() {
                             "warning: no health snapshot at {} — train step may not have reached first flush",
                             health_path.display()
                         ),
+                    }
+                }
+                // Phase 5 Task 8: summarize @inspect dumps written by the
+                // runtime hook to `.nsl-inspect/`.
+                if inspect {
+                    let dir = std::path::PathBuf::from(".nsl-inspect");
+                    match std::fs::read_dir(&dir) {
+                        Ok(entries) => {
+                            let (mut stats_count, mut full_count) = (0usize, 0usize);
+                            for entry in entries.flatten() {
+                                let name = entry.file_name();
+                                let name_str = name.to_string_lossy();
+                                if name_str.ends_with(".stats.bin") {
+                                    stats_count += 1;
+                                } else if name_str.ends_with(".tensor.bin") {
+                                    full_count += 1;
+                                }
+                            }
+                            eprintln!(
+                                "[inspect] Wrote {} stats records, {} full dumps to {}/",
+                                stats_count,
+                                full_count,
+                                dir.display()
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[inspect] No inspect output directory at {} — @inspect sites may not have fired",
+                                dir.display()
+                            );
+                        }
                     }
                 }
             }
