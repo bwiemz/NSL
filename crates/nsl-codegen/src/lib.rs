@@ -71,13 +71,94 @@ pub mod wrga_spectral;
 pub mod zk;
 
 pub use compiler::{
-    compile, compile_entry, compile_module, compile_module_with_imports, compile_standalone,
-    compile_test, compile_with_zk_info, StandaloneConfig,
+    compile, compile_entry, compile_module, compile_module_with_imports,
+    compile_module_with_imports_returning_plan, compile_standalone, compile_test,
+    compile_with_zk_info, StandaloneConfig,
 };
+
+/// Task 4 test helper: compile a module and return any `WrgaPlan` produced
+/// during `@train` block lowering.  The plan is returned even when codegen
+/// fails *after* `wrga::run` has fired — this is deliberate: WRGA's observable
+/// effect is the stashed plan, independent of whether the full object file
+/// links.
+#[doc(hidden)]
+pub fn debug_compile_and_return_plan(
+    ast: &nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    type_map: &nsl_semantic::checker::TypeMap,
+    options: &CompileOptions,
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
+    let (res, plan) = crate::compiler::compile_module_with_imports_best_effort_plan(
+        ast,
+        interner,
+        type_map,
+        "",
+        &[],
+        HashMap::new(),
+        std::collections::HashSet::new(),
+        false,
+        options,
+    );
+    match (res, plan) {
+        (Ok(_), plan) => Ok(plan),
+        (Err(e), Some(plan)) => {
+            eprintln!(
+                "[debug_compile_and_return_plan] codegen failed but a WRGA plan was produced: {}",
+                e.message
+            );
+            Ok(Some(plan))
+        }
+        (Err(e), None) => Err(e),
+    }
+}
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
 
 use std::collections::HashMap;
+
+/// Decorator configs captured by nsl-semantic and forwarded to
+/// `nsl_codegen::wrga::run` during `@train` block compilation.
+///
+/// Derived from `nsl_semantic::AnalysisResult.{wrga,freeze,adapter}_configs`.
+/// Kept as a codegen-side newtype so nsl-codegen does not depend on
+/// nsl-semantic (mirroring how `imported_fns` is passed as raw signatures).
+#[derive(Debug, Clone, Default)]
+pub struct WrgaInputs {
+    /// Validated `@wrga(...)` configs (one per occurrence).
+    pub wrga: Vec<WrgaDecoratorConfig>,
+    /// Validated `@freeze(...)` configs.
+    pub freeze: Vec<FreezeDecoratorConfig>,
+    /// Validated `@adapter(...)` configs.
+    pub adapter: Vec<AdapterDecoratorConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WrgaDecoratorConfig {
+    pub mode: nsl_ast::block::WrgaMode,
+    pub budget: Option<i64>,
+    pub target: Option<String>,
+    pub layers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FreezeDecoratorConfig {
+    pub exclude: Vec<String>,
+    pub include: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterDecoratorConfig {
+    pub kind: AdapterKind,
+    pub targets: Vec<String>,
+    pub rank: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterKind {
+    Lora,
+    Ia3,
+    GatedLora,
+}
 
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
@@ -150,6 +231,8 @@ pub struct CompileOptions {
     pub debug_training: bool,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     pub shared_lib: bool,
+    /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
+    pub wrga_inputs: Option<WrgaInputs>,
 }
 
 impl Default for CompileOptions {
@@ -190,6 +273,7 @@ impl Default for CompileOptions {
             zero_stage: None,
             debug_training: false,
             shared_lib: false,
+            wrga_inputs: None,
         }
     }
 }

@@ -33,3 +33,4 @@ cuda = ["nsl-runtime/cuda"]
 string-interner.workspace = true
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
+nsl-parser.workspace = true

@@ -724,7 +724,7 @@ model Toy:
 fn freeze_decorator_is_captured() {
     let src = r#"
 @freeze(exclude=["blocks.6.*", "blocks.7.*"])
-let coder: int = 42
+let coder = load_model()
 "#;
     let res = analyze_source(src);
     assert_eq!(res.freeze_configs.len(), 1);
@@ -737,7 +737,7 @@ let coder: int = 42
 fn adapter_decorator_is_captured() {
     let src = r#"
 @adapter(type=lora, target=["blocks.*.attn.q"], rank=8)
-let coder: int = 42
+let coder = load_model()
 "#;
     let res = analyze_source(src);
     assert_eq!(res.adapter_configs.len(), 1);
@@ -771,7 +771,7 @@ model Toy:
 fn freeze_include_and_exclude_conflict_errors() {
     let src = r#"
 @freeze(include=["a.*"], exclude=["b.*"])
-let coder: int = 42
+let coder = load_model()
 "#;
     let res = analyze_source(src);
     assert!(
@@ -787,7 +787,7 @@ let coder: int = 42
 fn adapter_missing_type_errors() {
     let src = r#"
 @adapter(target=["blocks.*.attn.q"])
-let coder: int = 42
+let coder = load_model()
 "#;
     let res = analyze_source(src);
     assert!(
@@ -798,4 +798,36 @@ let coder: int = 42
         res.diagnostics
     );
     assert!(res.adapter_configs.is_empty(), "invalid adapter should not be captured");
+}
+
+#[test]
+fn freeze_on_non_model_let_binding_errors() {
+    let src = r#"
+@freeze(exclude=["a.*"])
+let x: int = 42
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("@freeze can only be applied to a model")),
+        "expected @freeze target error, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn adapter_on_non_model_let_binding_errors() {
+    let src = r#"
+@adapter(type=lora, target=["blocks.*.attn.q"], rank=8)
+let x: int = 42
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("@adapter can only be applied to a model")),
+        "expected @adapter target error, got: {:?}",
+        res.diagnostics
+    );
 }

@@ -452,38 +452,104 @@ pub fn compile_module_with_imports(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
-    let mut compiler = Compiler::new(interner, type_map, options)?;
+    compile_module_with_imports_returning_plan(
+        ast,
+        interner,
+        type_map,
+        module_prefix,
+        imported_fns,
+        imported_struct_layouts,
+        imported_model_names,
+        dump_ir,
+        options,
+    )
+    .map(|(bytes, _)| bytes)
+}
+
+/// Task 4: same as `compile_module_with_imports` but also returns the last
+/// `WrgaPlan` stashed on the `Compiler` during this compile (if any).  On
+/// error, the plan is *discarded* — use
+/// [`compile_module_with_imports_best_effort_plan`] when you need to observe
+/// the plan produced before a later codegen failure.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_module_with_imports_returning_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    module_prefix: &str,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
+    let (res, plan) = compile_module_with_imports_best_effort_plan(
+        ast,
+        interner,
+        type_map,
+        module_prefix,
+        imported_fns,
+        imported_struct_layouts,
+        imported_model_names,
+        dump_ir,
+        options,
+    );
+    res.map(|bytes| (bytes, plan))
+}
+
+/// Task 4: like `compile_module_with_imports_returning_plan` but returns the
+/// plan *even when codegen fails*, so test harnesses can assert on WRGA
+/// behaviour without a full link-ready object.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_module_with_imports_best_effort_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    module_prefix: &str,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> (Result<Vec<u8>, CodegenError>, Option<crate::wrga::WrgaPlan>) {
+    let mut compiler = match Compiler::new(interner, type_map, options) {
+        Ok(c) => c,
+        Err(e) => return (Err(e), None),
+    };
     compiler.dump_ir = dump_ir;
     compiler.module_prefix = module_prefix.to_string();
-
-    // Register imported structs/models from dependencies
     for (name, layout) in imported_struct_layouts {
         compiler.types.struct_layouts.insert(name, layout);
     }
     for name in imported_model_names {
         compiler.models.imported_model_names.insert(name);
     }
-
-    compiler.intern_string("")?;
-    compiler.collect_strings(&ast.stmts)?;
-    compiler.collect_enums(&ast.stmts)?;
-    compiler.collect_structs(&ast.stmts)?;
-    compiler.collect_models(&ast.stmts)?;
-    compiler.declare_runtime_functions()?;
-    compiler.declare_imported_functions(imported_fns)?;
-    compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
-    // M39b: Apply vmap AST transforms and register batched function variants
-    let vmap_results = compiler.apply_vmap_transforms(ast);
-    compiler.register_batched_functions(&vmap_results);
-    compiler.compile_datatype_defs(&ast.stmts)?;
-    compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
-    compiler.compile_user_functions(&ast.stmts)?;
-    // M39c: Compile batched function bodies
-    compiler.compile_batched_functions(&vmap_results)?;
-    compiler.compile_pending_lambdas()?;
-    compiler.finalize()
+    // Run every pass up to (but not including) `finalize`, so we can observe
+    // `last_wrga_plan` even on an error path before consuming the compiler.
+    let pre_finalize = (|| -> Result<(), CodegenError> {
+        compiler.intern_string("")?;
+        compiler.collect_strings(&ast.stmts)?;
+        compiler.collect_enums(&ast.stmts)?;
+        compiler.collect_structs(&ast.stmts)?;
+        compiler.collect_models(&ast.stmts)?;
+        compiler.declare_runtime_functions()?;
+        compiler.declare_imported_functions(imported_fns)?;
+        compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+        let vmap_results = compiler.apply_vmap_transforms(ast);
+        compiler.register_batched_functions(&vmap_results);
+        compiler.compile_datatype_defs(&ast.stmts)?;
+        compiler.compile_kernels(&ast.stmts)?;
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
+        compiler.compile_user_functions(&ast.stmts)?;
+        compiler.compile_batched_functions(&vmap_results)?;
+        compiler.compile_pending_lambdas()?;
+        Ok(())
+    })();
+    let plan = compiler.last_wrga_plan.clone();
+    let result = pre_finalize.and_then(|()| compiler.finalize());
+    (result, plan)
 }
+
 
 /// Compile the entry module with imported functions from other modules.
 /// Own functions use Linkage::Export, imported functions use Linkage::Import.

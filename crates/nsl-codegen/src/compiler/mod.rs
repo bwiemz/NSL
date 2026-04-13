@@ -28,8 +28,9 @@ use crate::error::CodegenError;
 
 // Re-export the free functions for `pub use compiler::{...}` in lib.rs
 pub use entry_points::{
-    compile, compile_entry, compile_module, compile_module_with_imports, compile_standalone,
-    compile_test, compile_with_zk_info,
+    compile, compile_entry, compile_module, compile_module_with_imports,
+    compile_module_with_imports_best_effort_plan, compile_module_with_imports_returning_plan,
+    compile_standalone, compile_test, compile_with_zk_info,
 };
 
 /// Compile-time context for FlashAttention PTX dispatch.
@@ -370,6 +371,16 @@ pub struct Compiler<'a> {
     /// so only the first component (dQ) triggers the backward call and dK/dV
     /// extract from the cached list.
     pub flash_attn_bwd_cache: HashMap<Value, Value>,
+
+    // ── WRGA side-channel (Milestone A) ─────────────────────────────
+    /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.
+    /// Consumed inside `compile_train_step_with_source_ad` when a `@train` block
+    /// is lowered.  `None` means WRGA is disabled for this build.
+    pub wrga_inputs: Option<crate::WrgaInputs>,
+    /// The most recent `WrgaPlan` produced during this compile, kept for
+    /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
+    /// compiled, or if WRGA was disabled.
+    pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 }
 
 /// Quantization configuration for a model.
@@ -493,6 +504,8 @@ impl<'a> Compiler<'a> {
             features: FeatureConfigs::new(options),
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
+            wrga_inputs: options.wrga_inputs.clone(),
+            last_wrga_plan: None,
         })
     }
 

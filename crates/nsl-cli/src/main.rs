@@ -777,6 +777,7 @@ fn main() {
                 zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib,
+                wrga_inputs: None,
             };
 
             if standalone {
@@ -878,6 +879,7 @@ fn main() {
                 zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib: false,
+                wrga_inputs: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -1184,6 +1186,49 @@ fn frontend(file: &PathBuf) -> (Interner, nsl_parser::ParseResult, nsl_semantic:
     (interner, parse_result, analysis)
 }
 
+/// Convert WRGA decorator configs captured by nsl-semantic into the codegen-side
+/// `WrgaInputs` newtype (Task 1 of WRGA bridge). Keeps nsl-codegen free of a
+/// direct dependency on nsl-semantic.
+fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
+    use nsl_codegen::{
+        AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
+        WrgaInputs,
+    };
+    WrgaInputs {
+        wrga: a
+            .wrga_configs
+            .iter()
+            .map(|c| WrgaDecoratorConfig {
+                mode: c.block.mode,
+                budget: c.block.budget,
+                target: None, // Symbol->string resolution happens at codegen if needed
+                layers: c.block.layers.clone(),
+            })
+            .collect(),
+        freeze: a
+            .freeze_configs
+            .iter()
+            .map(|c| FreezeDecoratorConfig {
+                exclude: c.exclude.clone(),
+                include: c.include.clone(),
+            })
+            .collect(),
+        adapter: a
+            .adapter_configs
+            .iter()
+            .map(|c| AdapterDecoratorConfig {
+                kind: match c.kind {
+                    nsl_semantic::wrga::AdapterKind::Lora => AdapterKind::Lora,
+                    nsl_semantic::wrga::AdapterKind::Ia3 => AdapterKind::Ia3,
+                    nsl_semantic::wrga::AdapterKind::GatedLora => AdapterKind::GatedLora,
+                },
+                targets: c.targets.clone(),
+                rank: c.rank,
+            })
+            .collect(),
+    }
+}
+
 fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool, linear_types: bool) {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
@@ -1309,6 +1354,7 @@ fn run_build_shared_single(
     options: &nsl_codegen::CompileOptions,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
+    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
 
     // Codegen with PIC enabled (shared_lib=true in options)
     let obj_bytes = match nsl_codegen::compile(
@@ -1557,6 +1603,7 @@ fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
+    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
 
     let (obj_bytes, zk_proof_fns, zk_results) = match nsl_codegen::compile_with_zk_info(
         &parse_result.module,
@@ -1764,6 +1811,7 @@ fn run_build_standalone(
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
     let (interner, parse_result, analysis) = frontend(&file_pb);
+    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
 
     // 5. Determine output path
     let output_path = if let Some(out) = output {
@@ -1870,6 +1918,11 @@ fn run_build_inner(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump
 /// Single-file build (backward compatible, fast path).
 fn run_build_single(file: &PathBuf, output: Option<PathBuf>, emit_obj: bool, dump_ir: bool, quiet: bool, options: &nsl_codegen::CompileOptions) {
     let (interner, parse_result, analysis) = frontend(file);
+
+    // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
+    let mut options = options.clone();
+    options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    let options = &options;
 
     // M45: Run compile-time NaN risk analysis before codegen if --nan-analysis is set.
     if options.nan_analysis {
