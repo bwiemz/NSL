@@ -90,3 +90,42 @@ fn wrga_report_flag_writes_to_file_when_path_given() {
         "report file missing header; got: {contents}",
     );
 }
+
+/// Task 3 (B.1): WRGA decorators must take effect on the shared-lib build path.
+///
+/// The test uses `--source-ad` (required for WRGA to fire at all in the current
+/// wiring) and `--wrga-report` to observe that the bridge is live on that path.
+#[test]
+fn wrga_report_works_on_shared_library_build_path() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    fs::write(&src_path, SRC).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .arg("build")
+        .arg(&src_path)
+        .arg("--shared-lib")
+        .arg("--source-ad")
+        .arg("--wrga-report");
+    cmd.assert()
+        .stdout(predicate::str::contains("=== WRGA Compilation Report ==="));
+}
+
+/// Task 3 (B.1): `--wrga-report` without `--source-ad` must fail with a clear error
+/// when the source has WRGA decorators, rather than silently producing no plan.
+#[test]
+fn wrga_report_without_source_ad_errors_when_decorators_present() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    fs::write(&src_path, SRC).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .arg("build")
+        .arg(&src_path)
+        .arg("--wrga-report"); // no --source-ad
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("--wrga-report requires --source-ad"));
+}

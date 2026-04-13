@@ -571,7 +571,6 @@ pub fn compile_module_with_imports_best_effort_plan(
 /// Own functions use Linkage::Export, imported functions use Linkage::Import.
 /// imported_fns entries are (raw_name, mangled_name, signature).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn compile_entry(
     ast: &nsl_ast::Module,
     interner: &Interner,

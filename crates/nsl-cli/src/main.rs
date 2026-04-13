@@ -804,6 +804,11 @@ fn main() {
                         process::exit(1);
                     }
                 };
+                if wrga_report.is_some() {
+                    eprintln!(
+                        "nsl: --wrga-report is not yet supported on --standalone builds; decorator effects still apply"
+                    );
+                }
                 run_build_standalone(
                     &file,
                     output.as_deref(),
@@ -813,8 +818,13 @@ fn main() {
                     &compile_opts,
                 );
             } else if shared_lib {
-                run_build_shared(&file, output, dump_ir, &compile_opts);
+                run_build_shared(&file, output, dump_ir, &compile_opts, wrga_report.as_deref());
             } else if zk_circuit {
+                if wrga_report.is_some() {
+                    eprintln!(
+                        "nsl: --wrga-report is not yet supported on --zk-circuit builds; decorator effects still apply"
+                    );
+                }
                 run_build_zk(&file, output, emit_obj, dump_ir, zk_weights.as_deref(), &compile_opts);
             } else {
                 run_build(&file, output, emit_obj, dump_ir, &compile_opts, wrga_report.as_deref());
@@ -1385,17 +1395,65 @@ fn run_build(
     run_build_inner(file, output, emit_obj, dump_ir, false, options, wrga_report);
 }
 
+/// Task 3 (B.1): `--wrga-report` requires `--source-ad`, since WRGA only fires
+/// in the source-AD lowering path. Detect and fail fast rather than silently
+/// producing an empty report.
+fn check_wrga_report_preconditions(
+    analysis: &nsl_semantic::AnalysisResult,
+    wrga_report: Option<&std::path::Path>,
+    options: &nsl_codegen::CompileOptions,
+) {
+    if wrga_report.is_none() || options.source_ad {
+        return;
+    }
+    let has_wrga_decorators = !analysis.wrga_configs.is_empty()
+        || !analysis.freeze_configs.is_empty()
+        || !analysis.adapter_configs.is_empty();
+    if has_wrga_decorators {
+        eprintln!(
+            "nsl: --wrga-report requires --source-ad when WRGA decorators are present; re-run with --source-ad"
+        );
+        process::exit(2);
+    }
+}
+
+/// Task 3 (B.1): emit the WRGA report to stdout or a file. Mirrors the logic in
+/// `run_build_single` / `run_build_multi`.
+fn emit_wrga_report(
+    wrga_plan: &Option<nsl_codegen::wrga::WrgaPlan>,
+    wrga_report: Option<&std::path::Path>,
+) {
+    let Some(report_path) = wrga_report else { return; };
+    match wrga_plan {
+        Some(p) => {
+            let report = p.render_report();
+            if report_path == std::path::Path::new("-") {
+                print!("{}", report);
+            } else if let Err(e) = std::fs::write(report_path, &report) {
+                eprintln!("error: could not write WRGA report: {e}");
+                process::exit(1);
+            }
+        }
+        None => {
+            eprintln!(
+                "nsl: --wrga-report requested but no @train block with WRGA decorators was compiled"
+            );
+        }
+    }
+}
+
 /// M62a: Build as a shared library (.so/.dylib/.dll) with stable C API.
 fn run_build_shared(
     file: &PathBuf,
     output: Option<PathBuf>,
     dump_ir: bool,
     options: &nsl_codegen::CompileOptions,
+    wrga_report: Option<&std::path::Path>,
 ) {
     if needs_multi_file(file) {
-        run_build_shared_multi(file, output, dump_ir, options);
+        run_build_shared_multi(file, output, dump_ir, options, wrga_report);
     } else {
-        run_build_shared_single(file, output, dump_ir, options);
+        run_build_shared_single(file, output, dump_ir, options, wrga_report);
     }
 }
 
@@ -1405,24 +1463,34 @@ fn run_build_shared_single(
     output: Option<PathBuf>,
     dump_ir: bool,
     options: &nsl_codegen::CompileOptions,
+    wrga_report: Option<&std::path::Path>,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
-    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
+
+    // Task 3 (B.1): forward WRGA decorator configs so they take effect on the
+    // shared-library build path, and fail fast if --wrga-report is combined
+    // with decorators but without --source-ad.
+    check_wrga_report_preconditions(&analysis, wrga_report, options);
+    let mut options = options.clone();
+    options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    let options = &options;
 
     // Codegen with PIC enabled (shared_lib=true in options)
-    let obj_bytes = match nsl_codegen::compile(
+    let (obj_bytes, wrga_plan) = match nsl_codegen::compile_returning_plan(
         &parse_result.module,
         &interner,
         &analysis.type_map,
         dump_ir,
         options,
     ) {
-        Ok(bytes) => bytes,
+        Ok(result) => result,
         Err(e) => {
             eprintln!("codegen error: {e}");
             process::exit(1);
         }
     };
+
+    emit_wrga_report(&wrga_plan, wrga_report);
 
     let stem = file
         .file_stem()
@@ -1462,7 +1530,9 @@ fn run_build_shared_multi(
     output: Option<PathBuf>,
     dump_ir: bool,
     options: &nsl_codegen::CompileOptions,
+    wrga_report: Option<&std::path::Path>,
 ) {
+    let mut entry_wrga_plan: Option<nsl_codegen::wrga::WrgaPlan> = None;
     let mut source_map = SourceMap::new();
     let mut interner = Interner::new();
 
@@ -1577,7 +1647,24 @@ fn run_build_shared_multi(
                 imported_enum_defs.extend(dep_data.enum_defs.clone());
             }
 
-            match nsl_codegen::compile_entry(
+            // Task 3 (B.1): forward entry-module decorator configs to codegen
+            // and fail fast if --wrga-report is used without --source-ad.
+            if wrga_report.is_some() && !options.source_ad {
+                let has_wrga_decorators = !mod_data.wrga_configs.is_empty()
+                    || !mod_data.freeze_configs.is_empty()
+                    || !mod_data.adapter_configs.is_empty();
+                if has_wrga_decorators {
+                    eprintln!(
+                        "nsl: --wrga-report requires --source-ad when WRGA decorators are present; re-run with --source-ad"
+                    );
+                    process::exit(2);
+                }
+            }
+            let mut entry_options = options.clone();
+            entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
+            let entry_options = &entry_options;
+
+            match nsl_codegen::compile_entry_returning_plan(
                 &mod_data.ast,
                 &interner,
                 &mod_data.type_map,
@@ -1589,9 +1676,12 @@ fn run_build_shared_multi(
                 imported_model_method_bodies,
                 imported_model_field_types,
                 dump_ir,
-                options,
+                entry_options,
             ) {
-                Ok(bytes) => bytes,
+                Ok((bytes, plan)) => {
+                    entry_wrga_plan = plan;
+                    bytes
+                }
                 Err(e) => {
                     eprintln!("codegen error in '{}': {e}", path.display());
                     process::exit(1);
@@ -1625,6 +1715,8 @@ fn run_build_shared_multi(
         obj_files.push(obj_path);
     }
 
+    emit_wrga_report(&entry_wrga_plan, wrga_report);
+
     let lib_path = if let Some(out) = output {
         out
     } else {
@@ -1656,7 +1748,13 @@ fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
-    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
+
+    // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
+    // take effect in codegen even on the ZK build path.  `--wrga-report` is not
+    // supported here (warned at dispatch).
+    let mut options = options.clone();
+    options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    let options = &options;
 
     let (obj_bytes, zk_proof_fns, zk_results) = match nsl_codegen::compile_with_zk_info(
         &parse_result.module,
@@ -1864,7 +1962,13 @@ fn run_build_standalone(
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
     let (interner, parse_result, analysis) = frontend(&file_pb);
-    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
+
+    // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
+    // take effect in codegen on the standalone build path.  `--wrga-report` is not
+    // supported here (warned at dispatch).
+    let mut options = options.clone();
+    options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    let options = &options;
 
     // 5. Determine output path
     let output_path = if let Some(out) = output {
@@ -1987,6 +2091,11 @@ fn run_build_single(
     wrga_report: Option<&std::path::Path>,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
+
+    // Task 3 (B.1): fail fast if --wrga-report is used without --source-ad
+    // when decorators are present — the old silent-notice behaviour was
+    // confusing.
+    check_wrga_report_preconditions(&analysis, wrga_report, options);
 
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
@@ -2223,6 +2332,18 @@ fn run_build_multi(
             }
 
             // WRGA Milestone B.1: forward entry-module decorator configs to codegen.
+            // Task 3: fail fast if --wrga-report is used without --source-ad.
+            if wrga_report.is_some() && !options.source_ad {
+                let has_wrga_decorators = !mod_data.wrga_configs.is_empty()
+                    || !mod_data.freeze_configs.is_empty()
+                    || !mod_data.adapter_configs.is_empty();
+                if has_wrga_decorators {
+                    eprintln!(
+                        "nsl: --wrga-report requires --source-ad when WRGA decorators are present; re-run with --source-ad"
+                    );
+                    process::exit(2);
+                }
+            }
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
             let entry_options = &entry_options;
