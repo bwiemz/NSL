@@ -96,6 +96,13 @@ pub struct CshaPlan {
     pub boundary: BoundaryScan,
     pub per_layer: Vec<LayerPlan>,
     pub specialization: SpecializationPlan,
+    /// Per-layer kernel-specialisation artefacts produced by the
+    /// `csha_apply` bridge.  Empty in `Off` mode.
+    pub kernels: Vec<crate::csha_apply::KernelSpec>,
+    /// Fusion-graph marks that claim Q/K/V matmul nodes on behalf of
+    /// CSHA-fused kernels, so `epilogue_fusion` and `reduction_fusion`
+    /// do not double-fuse them.
+    pub marks: Vec<crate::csha_apply::FusionMark>,
     /// Total driver wall-clock time (microseconds).
     pub solve_us: u64,
 }
@@ -218,6 +225,15 @@ impl CshaPlan {
                     writeln!(s, "  Precisions: {}", precisions.join(", ")).unwrap();
                 }
             }
+            // Kernel specialisation name that downstream passes embed
+            // into the compiled artefact.
+            if let Some(kspec) = self
+                .kernels
+                .iter()
+                .find(|k| k.layer == plan.layer)
+            {
+                writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
+            }
         }
 
         writeln!(s).unwrap();
@@ -245,6 +261,8 @@ pub fn run(input: CshaInput) -> CshaPlan {
             boundary: BoundaryScan::default(),
             per_layer: Vec::new(),
             specialization: SpecializationPlan::default(),
+            kernels: Vec::new(),
+            marks: Vec::new(),
             solve_us: t0.elapsed().as_micros() as u64,
         };
     }
@@ -258,12 +276,28 @@ pub fn run(input: CshaInput) -> CshaPlan {
         &input.spec_cfg,
     );
 
+    // Stitch everything together via the apply-bridge so the plan
+    // carries ready-to-consume kernel specs + graph marks.
+    let interim = CshaPlan {
+        mode: input.mode,
+        target_gpu: gpu.name.to_string(),
+        boundary: boundary.clone(),
+        per_layer: per_layer.clone(),
+        specialization: specialization.clone(),
+        kernels: Vec::new(),
+        marks: Vec::new(),
+        solve_us: 0,
+    };
+    let bridge = crate::csha_apply::bridge(&interim, input.shape.head_dim as i64);
+
     CshaPlan {
         mode: input.mode,
         target_gpu: gpu.name.to_string(),
         boundary,
         per_layer,
         specialization,
+        kernels: bridge.kernels,
+        marks: bridge.marks,
         solve_us: t0.elapsed().as_micros() as u64,
     }
 }

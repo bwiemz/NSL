@@ -114,6 +114,7 @@ mod tests {
             gqa_group_size: 2,
             tree_mask: false,
             gpu_sm: 90,
+        csha: None,
         }
     }
 

@@ -624,6 +624,7 @@ impl Compiler<'_> {
                     gqa_group_size,
                     tree_mask: false,
                     gpu_sm: 80,
+                    csha: None,
                 };
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
@@ -675,6 +676,7 @@ impl Compiler<'_> {
                 gqa_group_size,
                 tree_mask: false,
                 gpu_sm: 80,
+                csha: None,
             };
 
             let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
@@ -711,6 +713,7 @@ impl Compiler<'_> {
                 gqa_group_size,
                 tree_mask: false,
                 gpu_sm: 80,
+                csha: None,
             };
 
             let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);

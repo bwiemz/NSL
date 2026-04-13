@@ -1,6 +1,6 @@
 ---
 source: crates/nsl-codegen/tests/snapshot_tests.rs
-assertion_line: 66
+assertion_line: 72
 expression: ptx_str
 ---
 .version 7.0
@@ -28,7 +28,16 @@ expression: ptx_str
     .param .u64 dfs_enter_ptr,
     .param .u64 dfs_exit_ptr,
     .param .u64 num_tree_nodes,
-    .param .u64 param_logsumexp
+    .param .u64 param_logsumexp,
+    .param .u64 csha_x_ptr,
+    .param .u64 csha_norm_weight_ptr,
+    .param .u64 csha_wq_ptr,
+    .param .u64 csha_wk_ptr,
+    .param .u64 csha_wv_ptr,
+    .param .u64 csha_wo_ptr,
+    .param .f32 csha_rmsnorm_eps,
+    .param .u32 csha_active_heads,
+    .param .u32 csha_d_model
 )
 {
     .shared .align 16 .b8 shmem[32768];

@@ -115,6 +115,89 @@ pub struct FlashAttentionConfig {
     pub tree_mask: bool,
     /// Target GPU SM version for PTX target selection (default: 52).
     pub gpu_sm: u32,
+    /// CSHA (Compiler-Synthesized Holistic Attention) extensions.  `None`
+    /// (the default) leaves the kernel functionally identical to classic
+    /// FlashAttention-2.  `Some(..)` selects a CSHA-fused variant per
+    /// `NSL-CSHA-Research.PDF`.
+    #[doc(hidden)]
+    pub csha: Option<CshaExtras>,
+}
+
+/// CSHA kernel-level fusion extensions.
+///
+/// Stored as an optional sub-struct so that adding CSHA doesn't force
+/// the many existing `FlashAttentionConfig { .. }` construction sites
+/// in the codebase to change.  Callers that don't want CSHA leave
+/// `csha: None`.
+#[derive(Clone, Debug, Default)]
+pub struct CshaExtras {
+    /// Fusion level this kernel realises (1=boundary, 2=pipeline,
+    /// 3=block).  0 is invalid — use `FlashAttentionConfig { csha: None
+    /// }` for "no CSHA" instead.
+    pub level: u8,
+    /// Prologue fusion: read raw `x` and compute `RMSNorm(x)` on tiles
+    /// before projecting into Q/K/V (paper §2.1).  Requires
+    /// `rmsnorm_eps` and passing the norm weight pointer at launch.
+    pub fused_rmsnorm: bool,
+    /// Pipelined fusion (paper §2.2): compute Q/K/V projections inside
+    /// the attention kernel rather than reading pre-materialised
+    /// tensors.  Requires `d_model` to size the projection-weight tile.
+    pub fused_projections: bool,
+    /// Epilogue fusion: apply `Attn_out @ Wo` before writing out
+    /// (§2.2 end, §2.3).
+    pub fused_output_proj: bool,
+    /// Number of attention heads actually computed.  `0` means "use
+    /// the full head count from the launch parameter" — i.e. no
+    /// weight-informed pruning.  A non-zero value indicates the
+    /// kernel has been specialised to skip pruned heads entirely
+    /// (§3.1 / §5.2 dead-head-gradient-elimination).
+    pub active_heads: u32,
+    /// RMSNorm epsilon baked into the prologue.  Ignored if
+    /// `fused_rmsnorm` is false.
+    pub rmsnorm_eps: f32,
+    /// `d_model` — feature dimension fed into the fused projections.
+    /// Ignored unless `fused_projections` is true.
+    pub d_model: u32,
+}
+
+impl CshaExtras {
+    /// CSHA level 1 preset — boundary fusion (prologue norm + epilogue
+    /// RoPE).  `rope_q` should also be set on the parent config.
+    pub fn level1(rmsnorm_eps: f32) -> Self {
+        Self {
+            level: 1,
+            fused_rmsnorm: true,
+            fused_projections: false,
+            fused_output_proj: false,
+            active_heads: 0,
+            rmsnorm_eps,
+            d_model: 0,
+        }
+    }
+
+    /// CSHA level 2 preset — full projection pipelining.
+    pub fn level2(rmsnorm_eps: f32, d_model: u32) -> Self {
+        Self {
+            level: 2,
+            fused_rmsnorm: true,
+            fused_projections: true,
+            fused_output_proj: true,
+            active_heads: 0,
+            rmsnorm_eps,
+            d_model,
+        }
+    }
+
+    /// CSHA level 3 preset — full-block fusion.  At emit time this is
+    /// identical to level 2; the difference is that the memory planner
+    /// has confirmed the subsequent FFN also fits in SMEM, so the
+    /// compiler chains them together.
+    pub fn level3(rmsnorm_eps: f32, d_model: u32) -> Self {
+        Self {
+            level: 3,
+            ..Self::level2(rmsnorm_eps, d_model)
+        }
+    }
 }
 
 /// Generate PTX for the FlashAttention-2 kernel with the given configuration.
@@ -151,8 +234,12 @@ pub fn synthesize_rope_cache_write_ptx(head_dim: i64, rope_style: RopeStyle) -> 
 /// Compute the kernel name encoding variant flags and tile sizes.
 ///
 /// Format: `flash_attn_p{paged}_r{rope}_{style}_g{gqa}_c{causal}_t{tree}_q{block_q}_kv{block_kv}`
+///
+/// When CSHA extras are present, the name gets a `_cshaL{level}[_nN_pN_oN_hN]`
+/// suffix so compiler-cached kernel bytes don't collide with the
+/// non-fused baseline.
 pub fn flash_attention_kernel_name(config: &FlashAttentionConfig) -> String {
-    format!(
+    let base = format!(
         "flash_attn_p{}_r{}_{}_g{}_c{}_t{}_q{}_kv{}",
         config.paged as u8,
         config.rope_q as u8,
@@ -165,15 +252,51 @@ pub fn flash_attention_kernel_name(config: &FlashAttentionConfig) -> String {
         config.tree_mask as u8,
         config.block_q,
         config.block_kv,
-    )
+    );
+    match &config.csha {
+        None => base,
+        Some(c) => {
+            // Encode which fusion phases are active so kernel-bytes
+            // caches never collide between specialisations.
+            let n = c.fused_rmsnorm as u8;
+            let p = c.fused_projections as u8;
+            let o = c.fused_output_proj as u8;
+            let h = c.active_heads;
+            format!("{base}_cshaL{}_n{n}_p{p}_o{o}_h{h}", c.level)
+        }
+    }
 }
 
 /// Compute shared memory bytes for a given config.
 ///
-/// Formula: (block_q + block_kv) * head_dim * sizeof(f16)
-/// where sizeof(f16) = 2.
+/// Baseline formula: `(block_q + block_kv) * head_dim * sizeof(f16)`.
+/// CSHA extras add per-phase SMEM allocations:
+///
+///   * `fused_rmsnorm`     → +`block_q * head_dim * 2`  (normed-x tile)
+///   * `fused_projections` → +`3 * head_dim * d_model` (Q/K/V weight tile,
+///                                                      clamped to avoid
+///                                                      blowing the budget)
+///   * `fused_output_proj` → +`block_q * head_dim * 2`  (output tile)
 pub fn shared_mem_bytes(config: &FlashAttentionConfig) -> u32 {
-    ((config.block_q + config.block_kv) * config.head_dim * 2) as u32
+    let base = ((config.block_q + config.block_kv) * config.head_dim * 2) as u32;
+    let Some(c) = &config.csha else { return base };
+    let head_dim = config.head_dim.max(0) as u32;
+    let block_q = config.block_q.max(0) as u32;
+    let mut extra: u32 = 0;
+    if c.fused_rmsnorm {
+        extra = extra.saturating_add(block_q.saturating_mul(head_dim).saturating_mul(2));
+    }
+    if c.fused_projections {
+        // Projection-weight tile — cap d_model at 256 to keep SMEM
+        // bounded even for large models (paper §2.2 "tile the weight
+        // matrices too").
+        let d = c.d_model.min(256);
+        extra = extra.saturating_add(3u32.saturating_mul(head_dim).saturating_mul(d).saturating_mul(2));
+    }
+    if c.fused_output_proj {
+        extra = extra.saturating_add(block_q.saturating_mul(head_dim).saturating_mul(2));
+    }
+    base.saturating_add(extra)
 }
 
 // ── PTX emission helpers ──────────────────────────────────────────
@@ -223,10 +346,35 @@ fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &Flas
     ptx.push_str("    .param .u64 dfs_exit_ptr,\n");
     ptx.push_str("    .param .u64 num_tree_nodes,\n");
     // Backward pass: logsumexp auxiliary output (null = skip, inference-only)
-    ptx.push_str("    .param .u64 param_logsumexp\n");
+    ptx.push_str("    .param .u64 param_logsumexp,\n");
+    // CSHA extensions (paper §2): always declared; null pointers when the
+    // kernel was compiled without CSHA so cuLaunchKernel alignment stays
+    // stable across variants.
+    ptx.push_str("    .param .u64 csha_x_ptr,\n");
+    ptx.push_str("    .param .u64 csha_norm_weight_ptr,\n");
+    ptx.push_str("    .param .u64 csha_wq_ptr,\n");
+    ptx.push_str("    .param .u64 csha_wk_ptr,\n");
+    ptx.push_str("    .param .u64 csha_wv_ptr,\n");
+    ptx.push_str("    .param .u64 csha_wo_ptr,\n");
+    ptx.push_str("    .param .f32 csha_rmsnorm_eps,\n");
+    ptx.push_str("    .param .u32 csha_active_heads,\n");
+    ptx.push_str("    .param .u32 csha_d_model\n");
 
     ptx.push_str(")\n");
     ptx.push_str("{\n");
+
+    // CSHA marker comment — makes ptxas diagnostics easier and documents
+    // which phases this kernel realises for ahead-of-time inspection.
+    if let Some(c) = &config.csha {
+        ptx.push_str(&format!(
+            "    // CSHA-L{} phases: norm={} proj={} out={} active_heads={}\n",
+            c.level,
+            c.fused_rmsnorm as u8,
+            c.fused_projections as u8,
+            c.fused_output_proj as u8,
+            c.active_heads,
+        ));
+    }
 
     // Shared memory declaration (must be inside kernel body for ptxas)
     let shmem_bytes = shared_mem_bytes(config);
@@ -2490,6 +2638,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -2510,6 +2659,7 @@ mod tests {
             gqa_group_size: 4,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -2530,6 +2680,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         // (64 + 64) * 128 * 2 = 32768 bytes (32 KB)
         assert_eq!(shared_mem_bytes(&config), 32768);
@@ -2550,6 +2701,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         assert_eq!(shared_mem_bytes(&config), 49152);
         // This exceeds 48KB — the semantic checker should reject this combination
@@ -2568,6 +2720,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap(); // strip null
@@ -2593,6 +2746,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
         let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len() - 1]).unwrap();
@@ -2618,6 +2772,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -2639,6 +2794,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -2660,6 +2816,7 @@ mod tests {
             gqa_group_size: 4,
             tree_mask: false,
             gpu_sm: 80,
+        csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -2696,6 +2853,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: true,
             gpu_sm: 80,
+        csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
