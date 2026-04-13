@@ -391,6 +391,11 @@ enum Cli {
         /// With no value, prints to stdout.  With a path, writes to that file.
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
         wrga_report: Option<PathBuf>,
+
+        /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
+        /// allocations.  Default off — observational mode ships per B.1.
+        #[arg(long, default_value_t = false)]
+        wrga_fold_allocations: bool,
     },
 
     /// Run @test functions in an NSL file
@@ -693,6 +698,7 @@ fn main() {
             zk_solidity,
             zk_weights,
             wrga_report,
+            wrga_fold_allocations,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -784,6 +790,7 @@ fn main() {
                 debug_training,
                 shared_lib,
                 wrga_inputs: None,
+                wrga_fold_allocations,
             };
 
             if standalone {
@@ -896,6 +903,7 @@ fn main() {
                 debug_training,
                 shared_lib: false,
                 wrga_inputs: None,
+                wrga_fold_allocations: false,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

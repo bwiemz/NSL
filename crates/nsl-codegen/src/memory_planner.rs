@@ -2,6 +2,28 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::wengert::VarId;
+
+// ---------------------------------------------------------------------------
+// WRGA Milestone B.2 Task 3: typed dual-keyspace allocation keys
+// ---------------------------------------------------------------------------
+
+/// Typed key into the real allocator. Enforces at the type level that a
+/// caller cannot pass a `String` (weight name) where a `VarId` (activation
+/// id) is expected, or vice versa. This is deliberately a plain enum rather
+/// than a pair of newtypes so the keyspace boundary is checked at pattern
+/// sites.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum AllocationKey {
+    Weight(String),
+    Activation(VarId),
+}
+
+/// Physical slot id assigned by the real allocator (distinct from the
+/// `wrga_memory::SlotId` produced by the WRGA planner).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct RealSlotId(pub u32);
+
 // ---------------------------------------------------------------------------
 // WRGA Milestone B.1 Task 4: `apply_wrga_hints`
 // ---------------------------------------------------------------------------
@@ -78,6 +100,16 @@ pub fn apply_wrga_hints(plan: &crate::wrga::WrgaPlan) -> usize {
     crate::debug_set_allocator_slot_count_pre_hint(pre);
     crate::debug_set_allocator_slot_count_post_hint(post);
     post
+}
+
+/// WRGA Milestone B.2 Task 3: free-function shim around
+/// `LivenessAnalyzer::consume_hints`, mirroring `apply_wrga_hints`'s
+/// call site in `stmt.rs`.
+pub fn consume_hints(
+    allocator: &mut LivenessAnalyzer,
+    plan: &crate::wrga::WrgaPlan,
+) -> usize {
+    allocator.consume_hints(plan)
 }
 
 /// Safety gate for merging two WRGA slot assignments into a single real
@@ -170,6 +202,11 @@ pub struct LivenessAnalyzer {
     /// Maps variable name -> TensorAllocId for currently-live tensors.
     live_set: HashMap<String, TensorAllocId>,
     current_pp: ProgramPoint,
+    /// WRGA B.2 Task 3: typed-keyed real slot map.
+    pub(crate) slots: HashMap<AllocationKey, RealSlotId>,
+    pub(crate) slot_sizes: HashMap<RealSlotId, u64>,
+    pub(crate) slot_liveness: HashMap<RealSlotId, Vec<(u32, u32)>>,
+    pub(crate) next_slot_id: u32,
 }
 
 impl Default for LivenessAnalyzer {
@@ -184,7 +221,96 @@ impl LivenessAnalyzer {
             allocs: Vec::new(),
             live_set: HashMap::new(),
             current_pp: 0,
+            slots: HashMap::new(),
+            slot_sizes: HashMap::new(),
+            slot_liveness: HashMap::new(),
+            next_slot_id: 0,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // WRGA B.2 Task 3: typed-key allocation + consume_hints
+    // -----------------------------------------------------------------
+
+    /// Record a fresh activation allocation keyed by its Wengert VarId,
+    /// giving it its own `RealSlotId`. This is the entry point the real
+    /// allocator uses before `consume_hints` runs.
+    pub fn record_activation_alloc(&mut self, var: VarId, size_bytes: u64) {
+        let key = AllocationKey::Activation(var);
+        let slot = RealSlotId(self.next_slot_id);
+        self.next_slot_id += 1;
+        self.slots.insert(key, slot);
+        self.slot_sizes.insert(slot, size_bytes);
+        self.slot_liveness.insert(slot, Vec::new());
+    }
+
+    pub fn real_slot_for_activation(&self, var: VarId) -> Option<RealSlotId> {
+        self.slots.get(&AllocationKey::Activation(var)).copied()
+    }
+
+    /// Try to fold `var`'s real slot into `target`. Requires equal sizes
+    /// and a live target slot; returns false otherwise.
+    pub fn try_merge_activation_into_slot(
+        &mut self,
+        var: VarId,
+        target: RealSlotId,
+    ) -> bool {
+        let Some(source) = self.real_slot_for_activation(var) else { return false; };
+        if source == target { return false; }
+        let Some(&src_size) = self.slot_sizes.get(&source) else { return false; };
+        let Some(&tgt_size) = self.slot_sizes.get(&target) else { return false; };
+        if src_size != tgt_size { return false; }
+        self.slots.insert(AllocationKey::Activation(var), target);
+        self.slot_sizes.remove(&source);
+        if let Some(src_liv) = self.slot_liveness.remove(&source) {
+            self.slot_liveness.entry(target).or_default().extend(src_liv);
+        }
+        true
+    }
+
+    /// Consume a WRGA `MemoryPlan` as merge hints on the real allocator.
+    /// Folds activations that share a WRGA slot and whose real slots have
+    /// equal size and disjoint liveness. Returns the post-hint distinct
+    /// real-slot count (also recorded on the
+    /// `ALLOC_SLOTS_POST_HINT` side-channel for test observation).
+    pub fn consume_hints(&mut self, plan: &crate::wrga::WrgaPlan) -> usize {
+        let mut by_wrga_slot: HashMap<crate::wrga_memory::SlotId, Vec<(VarId, u32, u32, u64)>> =
+            HashMap::new();
+        for a in &plan.memory.assignments {
+            by_wrga_slot
+                .entry(a.slot)
+                .or_default()
+                .push((a.var, a.birth, a.death, a.size_bytes));
+        }
+
+        crate::debug_bump_consume_hints_calls();
+
+        for (_wrga_slot, group) in by_wrga_slot {
+            if group.len() < 2 { continue; }
+            let (first_var, first_birth, first_death, first_size) = group[0];
+            let Some(target) = self.real_slot_for_activation(first_var) else { continue; };
+            // Seed target liveness with the anchor's range.
+            self.slot_liveness
+                .entry(target)
+                .or_default()
+                .push((first_birth, first_death));
+            for &(other_var, o_birth, o_death, o_size) in &group[1..] {
+                if o_size != first_size { continue; }
+                let overlap = self.slot_liveness
+                    .get(&target)
+                    .map(|ranges| ranges.iter().any(|&(b, d)| !(o_death < b || d < o_birth)))
+                    .unwrap_or(false);
+                if overlap { continue; }
+                if self.try_merge_activation_into_slot(other_var, target) {
+                    self.slot_liveness.entry(target).or_default().push((o_birth, o_death));
+                }
+            }
+        }
+
+        let distinct: BTreeSet<_> = self.slots.values().copied().collect();
+        let post = distinct.len();
+        crate::debug_set_allocator_slot_count_post_hint(post);
+        post
     }
 
     /// Record a tensor allocation at the current program point.
@@ -1888,5 +2014,54 @@ mod wrga_hints_unit_tests {
             !try_merge_pair(&assignments, 0, 1),
             "zero size must refuse (guard against unallocated)"
         );
+    }
+}
+
+#[cfg(test)]
+mod consume_hints_tests {
+    use super::*;
+    use crate::wrga_memory::{MemoryPlan, MemoryPlanStats, SlotAssignment};
+
+    fn mk_plan_with_shared_slot() -> crate::wrga::WrgaPlan {
+        let mut plan = crate::wrga::WrgaPlan::test_dummy();
+        plan.memory = MemoryPlan {
+            assignments: vec![
+                SlotAssignment { var: 1, slot: 0, size_bytes: 64, birth: 0, death: 5 },
+                SlotAssignment { var: 2, slot: 0, size_bytes: 64, birth: 10, death: 15 },
+            ],
+            stats: MemoryPlanStats::default(),
+        };
+        plan
+    }
+
+    #[test]
+    fn consume_hints_merges_disjoint_equal_size_activations() {
+        let mut a = LivenessAnalyzer::new();
+        a.record_activation_alloc(1, 64);
+        a.record_activation_alloc(2, 64);
+        let plan = mk_plan_with_shared_slot();
+        let post = a.consume_hints(&plan);
+        assert_eq!(post, 1, "disjoint+equal-size should merge into one slot");
+    }
+
+    #[test]
+    fn consume_hints_refuses_overlapping_liveness() {
+        let mut a = LivenessAnalyzer::new();
+        a.record_activation_alloc(1, 64);
+        a.record_activation_alloc(2, 64);
+        let mut plan = mk_plan_with_shared_slot();
+        plan.memory.assignments[1].birth = 3; // overlaps var 1's 0..=5
+        let post = a.consume_hints(&plan);
+        assert_eq!(post, 2, "overlapping liveness must refuse to merge");
+    }
+
+    #[test]
+    fn consume_hints_refuses_size_mismatch() {
+        let mut a = LivenessAnalyzer::new();
+        a.record_activation_alloc(1, 64);
+        a.record_activation_alloc(2, 128);
+        let plan = mk_plan_with_shared_slot();
+        let post = a.consume_hints(&plan);
+        assert_eq!(post, 2, "size mismatch must refuse to merge");
     }
 }

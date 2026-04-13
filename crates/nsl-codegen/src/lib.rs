@@ -233,7 +233,24 @@ pub mod debug_channels {
         pub static ADJOINT_OPS_DROPPED: Cell<Option<usize>> = const { Cell::new(None) };
         pub static ALLOC_SLOTS_PRE_HINT: Cell<Option<usize>> = const { Cell::new(None) };
         pub static ALLOC_SLOTS_POST_HINT: Cell<Option<usize>> = const { Cell::new(None) };
+        pub static CONSUME_HINTS_CALLS: Cell<usize> = const { Cell::new(0) };
     }
+}
+
+#[doc(hidden)]
+pub fn debug_bump_consume_hints_calls() {
+    debug_channels::CONSUME_HINTS_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[doc(hidden)]
+pub fn debug_last_consume_hints_calls() -> Option<usize> {
+    let n = debug_channels::CONSUME_HINTS_CALLS.with(|c| c.get());
+    if n == 0 { None } else { Some(n) }
+}
+
+#[doc(hidden)]
+pub fn debug_reset_consume_hints_calls() {
+    debug_channels::CONSUME_HINTS_CALLS.with(|c| c.set(0));
 }
 
 #[doc(hidden)]
@@ -391,6 +408,9 @@ pub struct CompileOptions {
     pub shared_lib: bool,
     /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
     pub wrga_inputs: Option<WrgaInputs>,
+    /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
+    /// allocations (vs. B.1's observational-only path). Default false.
+    pub wrga_fold_allocations: bool,
 }
 
 impl Default for CompileOptions {
@@ -432,6 +452,7 @@ impl Default for CompileOptions {
             debug_training: false,
             shared_lib: false,
             wrga_inputs: None,
+            wrga_fold_allocations: false,
         }
     }
 }
