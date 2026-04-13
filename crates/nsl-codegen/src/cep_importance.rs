@@ -3,9 +3,11 @@
 //! Per-component scores that guide the pruning search.  The scoring
 //! function from §3.3 of the paper:
 //!
-//!     importance(head_h_in_layer_l) =
-//!         weight_magnitude   × spectral_energy
-//!         × roofline_slack   × position_factor
+//! ```text
+//! importance(head_h_in_layer_l) =
+//!     weight_magnitude   × spectral_energy
+//!     × roofline_slack   × position_factor
+//! ```
 //!
 //! All four factors are computable from pre-trained weights + the
 //! compilation oracle — no forward/backward pass, no calibration data.
@@ -84,7 +86,9 @@ impl RooflineSlackTable {
 
 /// Position factor (paper §3.3):
 ///
-///     position_factor(l/L) = 1.0 + 0.3 × |2l/L - 1|
+/// ```text
+/// position_factor(l/L) = 1.0 + 0.3 × |2l/L - 1|
+/// ```
 ///
 /// Produces a U-shaped curve: early (l=0) and late (l=L-1) layers are
 /// weighted more heavily because empirical evidence shows they're the

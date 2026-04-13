@@ -3620,6 +3620,32 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
+                // CSHA: Compiler-Synthesized Holistic Attention planner.
+                // Runs the boundary-fusion scan, SMEM feasibility model,
+                // and weight-informed specialization.  Emits either the
+                // full paper-§6.3 report or a compact one-line summary
+                // gated by the `--csha` / `--csha-report` flags.  The
+                // planner is pure data-in/data-out; wiring the kernel
+                // decisions back into codegen is a follow-up step.
+                if let Some(ref mode_str) = self.compile_options.csha_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        if let Some(plan) = crate::csha::run_on_wengert(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
+                            None, // shape override — defaults are fine for diagnostic
+                            8,    // default head count; weight-informed path refines this
+                        ) {
+                            if self.compile_options.csha_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[csha] {}", plan.summary());
+                            }
+                        }
+                    }
+                }
+
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner is pure data-in/data-out and does not mutate the
                 // Wengert list — it produces a report describing the
