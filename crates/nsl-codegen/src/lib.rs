@@ -95,6 +95,7 @@ pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wrga;
+pub mod matmul_mma;
 pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
 pub mod wrga_adapter_rewrite;
