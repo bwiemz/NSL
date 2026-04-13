@@ -124,15 +124,28 @@ Body adds three things, all gated on `self.manifest_builder.is_some()`:
 ```rust
 let kernel_id = if let Some(mb) = self.manifest_builder.as_mut() {
     let id = mb.reserve_id();
-    let pred = self.prediction_map.get(&origin_node).cloned();
+    // Sum constituent op predictions when the launch represents a fused
+    // kernel — see §4.2.1 below. For non-fused launches, fused_node_ids
+    // is the single-element vec [origin_node].
+    let constituent_nodes = self.fusion_constituents(origin_node);
+    let mut total_us = 0.0;
+    let mut total_flops = 0u64;
+    let mut total_hbm = 0u64;
+    let mut had_any = false;
+    for nid in &constituent_nodes {
+        if let Some(p) = self.prediction_map.get(nid) {
+            total_us += p.estimated_time_us;
+            total_flops += p.flops;
+            total_hbm += p.bytes_read + p.bytes_written;
+            had_any = true;
+        }
+    }
+    if !had_any {
+        // Fully synthetic kernel (e.g. memset). Record with zeros + name.
+    }
     let span_json = SourceSpanJson::from_span(span, &self.source_map);
     mb.record_kernel_at(
-        id,
-        op_name_hint,
-        span_json,
-        pred.as_ref().map(|p| p.estimated_time_us).unwrap_or(0.0),
-        pred.as_ref().map(|p| p.flops).unwrap_or(0),
-        pred.as_ref().map(|p| p.bytes_read + p.bytes_written).unwrap_or(0),
+        id, op_name_hint, span_json, total_us, total_flops, total_hbm,
     );
     Some(id)
 } else { None };
@@ -156,6 +169,20 @@ if let Some(id) = kernel_id {
 `SourceSpanJson::from_span(span, source_map)` is a new helper. Resolves byte positions to 1-based line numbers using whatever `SourceMap` the codegen already passes around. If no `SourceMap` is in scope, the fallback is `line: 1, end_line: 1` — degraded but not broken.
 
 `func_ref` is the codegen helper that gets-or-creates a Cranelift `FuncRef` for an extern symbol. Pattern is identical to the existing `nsl_kernel_launch` registration; just two more registrations once.
+
+#### 4.2.1 Fusion constituent lookup
+
+When CSHA / epilogue fusion folds N source ops into one kernel launch, the launch's `origin_node` is the fusion root (typically the outermost expression). The walker emitted N separate `OpCost` entries — one per original op, each with its own `NodeId`. A naive `prediction_map.get(&origin_node)` returns only the root's prediction, undercounting the kernel's real cost by 2–4× for typical attention fusions.
+
+`Compiler::fusion_constituents(origin_node) -> Vec<NodeId>` resolves this:
+
+- Codegen already builds a `FusionPlan` (see `wrga_fusion::build_fusion_plan`). Extend it (additively) with a `pub fused_node_groups: HashMap<NodeId, Vec<NodeId>>` mapping each fusion-root NodeId to the constituent NodeIds folded into it.
+- `fusion_constituents` returns the entry for `origin_node` if present, otherwise `vec![origin_node]` (non-fused case).
+- Hook emission sums the predictions over the returned NodeIds.
+
+This keeps the manifest's predicted times accurate after fusion. Without it, fused kernels would systematically appear 50–70% slower than predicted in the predicted-vs-actual table — a misleading false alarm.
+
+If `fused_node_groups` isn't already populated by the existing fusion pass, the implementer adds the populating step where fusion decisions are made (`wrga_fusion.rs::build_fusion_plan` and any related epilogue/CSHA passes). This is a small additive change to the fusion pass — read the constituent NodeIds at the point where the pass decides to fuse them, and stash them on the plan.
 
 **Two new methods on `ManifestBuilder`** (additive; Phase 1 callers unaffected):
 
@@ -279,7 +306,15 @@ pub extern "C" fn nsl_profile_kernel_begin(kernel_id: u32) {
 // nsl_profile_kernel_end mirrors the same shape.
 ```
 
-`current_stream()` returns the same `CUstream` the runtime's `nsl_kernel_launch` uses. The runtime already maintains thread-local CUDA context state — confirm at implementation time which call returns the active stream and use it.
+**Critical: stream binding.** Both `cuEventRecord` calls — the one in `nsl_profile_kernel_begin` and the one in `nsl_profile_kernel_end` — **must record on the same stream that `nsl_kernel_launch` uses**. If begin records on stream A and end records on stream B, `cuEventElapsedTime` returns nonsense. If either records on the default/null stream while the launch ran on a non-default stream, the events fire at host-submit time and you measure host launch latency (~1–10 µs), not GPU execution time.
+
+`current_stream()` is a placeholder name. At implementation time:
+
+1. Find the runtime function that returns the `CUstream` used by `nsl_kernel_launch` (read `crates/nsl-runtime/src/cuda/mod.rs` around the existing `cuLaunchKernel` call site — it pulls the stream from a thread-local).
+2. Export that getter as `pub fn current_stream() -> CUstream` if it isn't already public.
+3. Both FFI hooks call the same getter. **Do not pass `0` (null stream) under any circumstances.**
+
+A regression test (gated `#[cfg(feature = "cuda")]`) verifies a known-busy-loop kernel produces an actual time within an order of magnitude of its predicted time. If the test reports microsecond-scale times for a kernel that should run for 100+ µs, the stream binding is broken.
 
 The `Collector` itself is unchanged. The `cuda-real-events` feature stub from Phase 1 is removed; replaced by the existing `cuda` feature.
 
@@ -397,6 +432,7 @@ Both are local lookups that don't change the design.
 - `crates/nsl-codegen/src/compiler/mod.rs` — three new fields on `Compiler`.
 - `crates/nsl-codegen/src/cost_model.rs` — `OpCost.origin_node: Option<NodeId>`.
 - `crates/nsl-codegen/src/profiling/walker.rs` — populate `origin_node`.
+- `crates/nsl-codegen/src/wrga_fusion.rs` — add `fused_node_groups: HashMap<NodeId, Vec<NodeId>>` to `FusionPlan` and populate it where fusion decisions are made.
 - `crates/nsl-codegen/src/profiling/instrument.rs` — add `reserve_id`, `record_kernel_at`, `SourceSpanJson::from_span`.
 - `crates/nsl-codegen/src/lib.rs` — pre-pass + manifest write in `compile()`.
 - `crates/nsl-codegen/src/expr/calls.rs` — extend `compile_gpu_kernel_launch` signature, emit hooks.
