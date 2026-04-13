@@ -29,6 +29,14 @@ pub struct StructLayout {
     pub name: String,
     pub fields: Vec<StructField>,
     pub total_size: usize,
+    /// B.2.1: byte offset of the single adapter-sidetable pointer slot.
+    /// `None` when no `@adapter` decorator is active in this compile. When
+    /// `Some(o)`, the slot at byte offset `o` holds an `i64` pointer to a
+    /// heap-allocated table of adapter-tensor pointers, indexed by the linear
+    /// position of each synthesized field across all active adapter sites
+    /// targeting this model. Field access for synthesized names (`lora_A_*`,
+    /// `lora_B_*`, `ia3_scale_*`, `gate_*`) routes through this slot.
+    pub adapter_sidetable_offset: Option<usize>,
 }
 
 /// Tensor temporary tracking and cleanup state.

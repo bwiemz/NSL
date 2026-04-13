@@ -121,6 +121,12 @@ pub fn compile_returning_plan(
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    // B.2.1 Task 5.5: pre-populate adapter_sites + last_wrga_plan from the
+    // user-facing @adapter decorators BEFORE model methods (e.g. `forward`)
+    // are compiled. Without this, the Task 3 LoRA AST rewrite never fires
+    // because adapter_sites is empty at that point (train-block WRGA
+    // invocation happens later, inside compile_main).
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
     compiler.compile_user_functions(&ast.stmts)?;
     // M39c: Compile batched function bodies (after user functions, before main)
     compiler.compile_batched_functions(&vmap_results)?;
@@ -302,6 +308,7 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
         compiler.compile_flash_attention_kernels(&ast.stmts)?;
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         compiler.compile_user_functions(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_main(&ast.stmts)?;
@@ -457,6 +464,7 @@ fn compile_standalone_best_effort_plan(
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
         compiler.compile_flash_attention_kernels(&ast.stmts)?;
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         compiler.compile_user_functions(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_standalone_main(&ast.stmts)?;
@@ -631,6 +639,7 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
         compiler.compile_flash_attention_kernels(&ast.stmts)?;
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         compiler.compile_user_functions(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_pending_lambdas()?;
@@ -745,6 +754,7 @@ pub fn compile_entry_returning_plan(
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
     compiler.compile_user_functions(&ast.stmts)?;
     // M39c: Compile batched function bodies
     compiler.compile_batched_functions(&vmap_results)?;
