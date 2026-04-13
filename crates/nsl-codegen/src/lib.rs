@@ -458,6 +458,12 @@ pub struct CompileOptions {
     /// (calls `nsl_health_set_flush_interval(n)` once at train-block entry).
     /// `None` keeps the runtime default.
     pub health_flush_interval: Option<u64>,
+    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission inside
+    /// `compile_train_block`.  When `false` (default), any `@inspect` decorator
+    /// is a no-op and the generated IR is byte-identical to the pre-phase-5
+    /// path.  When `true`, each `@inspect(tensor, every=N?, condition="...")`
+    /// emits a step-gated stats branch and/or a predicate-gated dump branch.
+    pub inspect_enabled: bool,
 }
 
 impl Default for CompileOptions {
@@ -510,6 +516,7 @@ impl Default for CompileOptions {
             profile_source_file_name: None,
             health_monitor: false,
             health_flush_interval: None,
+            inspect_enabled: false,
         }
     }
 }

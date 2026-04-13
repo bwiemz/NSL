@@ -919,6 +919,7 @@ fn main_inner() {
                 profile_source_file_name: None,
                 health_monitor: false,
                 health_flush_interval: None,
+                inspect_enabled: false,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1144,6 +1145,7 @@ fn main_inner() {
                 // to `<file>.nsl-health.json` at run end.
                 health_monitor: detected_train_block,
                 health_flush_interval: None,
+                inspect_enabled: false,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

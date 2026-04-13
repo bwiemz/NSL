@@ -18,7 +18,7 @@ use crate::gpu_specs::{default_gpu, find_gpu};
 use crate::wengert::{PrimalOp, VarId, WengertList};
 use crate::weight_aware::WeightMap;
 use crate::wrga_fusion::{build_fusion_plan, FusionPlan};
-use crate::wrga_memory::{plan_memory, MemoryPlan, SizeHints};
+use crate::wrga_memory::{plan_memory_with_pin, MemoryPlan, SizeHints};
 use crate::wrga_prune::{prune, PruneResult};
 use crate::wrga_roofline::{place_adapters, AdapterPlacement, AdapterSite, SiteKind};
 use crate::wrga_spectral::{allocate_ranks, analyse_weight_map, RankAllocation, SpectralAnalysis};
@@ -59,6 +59,11 @@ pub struct WrgaInput<'a> {
     pub r_max: usize,
     /// Deterministic seed for randomized SVD.
     pub seed: u64,
+    /// Dev Tools Phase 5 Task 7: VarIds pinned by `@inspect` decorators whose
+    /// backing storage must survive past the last program point so the
+    /// inspector stream memcpy can read them without UAF.  Empty when
+    /// `@inspect` is disabled.
+    pub inspect_pinned_vars: BTreeSet<VarId>,
 }
 
 /// Compiled WRGA plan — consumed by downstream codegen stages.
@@ -186,7 +191,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
 
     // ── Stage 6: Memory plan ──────────────────────────────────────────────
     let size_hints: SizeHints = HashMap::new(); // callers can enrich later
-    let memory = plan_memory(
+    let memory = plan_memory_with_pin(
         input.wengert,
         &prune_result.activation_live,
         &size_hints,
@@ -195,6 +200,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
             s.insert(input.loss_output);
             s
         },
+        &input.inspect_pinned_vars,
     );
 
     WrgaPlan {
@@ -423,6 +429,7 @@ mod tests {
             r_min: 2,
             r_max: 16,
             seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
         };
         let plan = run(input);
         // Exactly one param (blocks.7.wq) is trainable → exactly one site.
@@ -450,6 +457,7 @@ mod tests {
             r_min: 2,
             r_max: 16,
             seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
         };
         let plan = run(input);
         assert_eq!(plan.prune.stats.gradient_targets, 1);
@@ -471,6 +479,7 @@ mod tests {
             r_min: 2,
             r_max: 16,
             seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
         };
         let plan = run(input);
         // Both blocks.6.wq and blocks.6.wk match the layer scope.
@@ -494,6 +503,7 @@ mod tests {
             r_min: 2,
             r_max: 16,
             seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
         };
         assert_eq!(run(make()).render_report(), run(make()).render_report());
     }

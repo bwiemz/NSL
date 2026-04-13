@@ -407,6 +407,18 @@ pub struct Compiler<'a> {
     /// File name displayed in profile manifest entries (Task 5/6).
     /// May be empty when not plumbed.
     pub source_file_name: String,
+
+    // ── Dev Tools Phase 5: @inspect decorator state ─────────────────────
+    /// Current train-block step-counter Cranelift `Variable`, set while we
+    /// are compiling the step body of a `compile_train_block` invocation
+    /// (and cleared on exit).  `None` outside train scope — `@inspect` in
+    /// non-train contexts is treated as a no-op for Phase 5 ship-first.
+    pub inspect_train_step_var: Option<cranelift_frontend::Variable>,
+    /// VarIds that appear as `@inspect` targets during this compile.  Passed
+    /// to `plan_memory_with_pin` so the allocator extends their death point
+    /// past the last program point — otherwise the backing storage could be
+    /// reused before the inspector stream memcpy finishes reading it.
+    pub inspect_pinned_vars: std::collections::BTreeSet<crate::wengert::VarId>,
 }
 
 /// Quantization configuration for a model.
@@ -537,6 +549,8 @@ impl<'a> Compiler<'a> {
             fusion_plan_for_profile: None,
             source_text: String::new(),
             source_file_name: String::new(),
+            inspect_train_step_var: None,
+            inspect_pinned_vars: std::collections::BTreeSet::new(),
         })
     }
 

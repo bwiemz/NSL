@@ -279,6 +279,31 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I32),
     ),
     ("nsl_health_set_flush_interval", &[types::I64], None),
+    // Inspector FFI (dev-tools phase 5)
+    (
+        "nsl_tensor_stats",
+        &[types::I64, types::I64],
+        Some(types::I32),
+    ),
+    (
+        "nsl_inspect_record_stats",
+        &[types::I64, types::I64, types::I64, types::I64],
+        Some(types::I32),
+    ),
+    (
+        "nsl_inspect_dump_full",
+        &[types::I64, types::I64, types::I64, types::I64],
+        Some(types::I32),
+    ),
+    ("nsl_inspect_set_dir", &[types::I64, types::I64], None),
+    ("nsl_health_get_loss_ema", &[], Some(types::F64)),
+    ("nsl_health_get_loss_ema_slope", &[], Some(types::F64)),
+    ("nsl_health_get_grad_norm_total", &[], Some(types::F64)),
+    (
+        "nsl_health_get_nan_inf_count_window",
+        &[],
+        Some(types::I64),
+    ),
     // Tensor display
     ("nsl_tensor_print", &[types::I64], None),
     // Tensor memory

@@ -171,6 +171,169 @@ impl Parser {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Predicate lowering (Phase 5 Task 7)
+//
+// Compiles a parsed `PredicateExpr` into Cranelift IR.  The resulting `Value`
+// is a boolean (`I8`) where `1` means "predicate satisfied, take dump branch"
+// and `0` means "skip dump".
+// ──────────────────────────────────────────────────────────────────────────
+
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{types as cl_types, FuncRef, InstBuilder, Value};
+use cranelift_frontend::FunctionBuilder;
+
+/// Shared context threaded through predicate lowering.  Callers construct
+/// this once per `@inspect` site and pass it through the recursion.
+pub struct PredicateLowerCtx {
+    /// Current train-loop step counter loaded as an I64 value.
+    pub step_val: Value,
+    /// Current scalar loss (F64).  When the compiler cannot resolve `loss`
+    /// in scope (e.g. `@inspect` fires before the loss is computed), this is
+    /// a compile-time zero constant — predicates referencing `loss` degrade
+    /// to `false` / `0.0` rather than erroring.
+    pub loss_val: Value,
+    pub get_loss_ema_ref: FuncRef,
+    pub get_loss_ema_slope_ref: FuncRef,
+    pub get_grad_norm_total_ref: FuncRef,
+    pub get_nan_inf_count_window_ref: FuncRef,
+}
+
+/// Lower a predicate AST into an I8 boolean value (0 or 1).
+pub fn lower_predicate(
+    pred: &PredicateExpr,
+    builder: &mut FunctionBuilder,
+    ctx: &PredicateLowerCtx,
+) -> Value {
+    match pred {
+        PredicateExpr::And(l, r) => {
+            let lv = lower_predicate(l, builder, ctx);
+            let rv = lower_predicate(r, builder, ctx);
+            builder.ins().band(lv, rv)
+        }
+        PredicateExpr::Or(l, r) => {
+            let lv = lower_predicate(l, builder, ctx);
+            let rv = lower_predicate(r, builder, ctx);
+            builder.ins().bor(lv, rv)
+        }
+        PredicateExpr::Not(inner) => {
+            let v = lower_predicate(inner, builder, ctx);
+            let one = builder.ins().iconst(cl_types::I8, 1);
+            builder.ins().bxor(v, one)
+        }
+        PredicateExpr::Cmp(l, op, r) => {
+            let (lv, rv, is_float) = lower_cmp_operands(l, r, builder, ctx);
+            if is_float {
+                let cc = match op {
+                    CmpOp::Gt => FloatCC::GreaterThan,
+                    CmpOp::Lt => FloatCC::LessThan,
+                    CmpOp::Ge => FloatCC::GreaterThanOrEqual,
+                    CmpOp::Le => FloatCC::LessThanOrEqual,
+                    CmpOp::Eq => FloatCC::Equal,
+                    CmpOp::Ne => FloatCC::NotEqual,
+                };
+                builder.ins().fcmp(cc, lv, rv)
+            } else {
+                let cc = match op {
+                    CmpOp::Gt => IntCC::SignedGreaterThan,
+                    CmpOp::Lt => IntCC::SignedLessThan,
+                    CmpOp::Ge => IntCC::SignedGreaterThanOrEqual,
+                    CmpOp::Le => IntCC::SignedLessThanOrEqual,
+                    CmpOp::Eq => IntCC::Equal,
+                    CmpOp::Ne => IntCC::NotEqual,
+                };
+                builder.ins().icmp(cc, lv, rv)
+            }
+        }
+        // Bare literals / idents as predicates — "truthy" test.
+        PredicateExpr::IntLit(n) => {
+            let v = builder.ins().iconst(cl_types::I64, *n);
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            builder.ins().icmp(IntCC::NotEqual, v, zero)
+        }
+        PredicateExpr::FloatLit(f) => {
+            let v = builder.ins().f64const(*f);
+            let zero = builder.ins().f64const(0.0);
+            builder.ins().fcmp(FloatCC::NotEqual, v, zero)
+        }
+        PredicateExpr::Ident(_) => {
+            let (v, is_float) = lower_ident_to_value(pred, builder, ctx);
+            if is_float {
+                let zero = builder.ins().f64const(0.0);
+                builder.ins().fcmp(FloatCC::NotEqual, v, zero)
+            } else {
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.ins().icmp(IntCC::NotEqual, v, zero)
+            }
+        }
+    }
+}
+
+/// Resolve an ident/literal atom to its runtime `Value`.  Returns `(value,
+/// is_float)` — the caller may need to coerce to a common type.
+fn lower_ident_to_value(
+    expr: &PredicateExpr,
+    builder: &mut FunctionBuilder,
+    ctx: &PredicateLowerCtx,
+) -> (Value, bool) {
+    match expr {
+        PredicateExpr::IntLit(n) => (builder.ins().iconst(cl_types::I64, *n), false),
+        PredicateExpr::FloatLit(f) => (builder.ins().f64const(*f), true),
+        PredicateExpr::Ident(s) => match s.as_str() {
+            "step" => (ctx.step_val, false),
+            "loss" => (ctx.loss_val, true),
+            "loss_ema" => {
+                let inst = builder.ins().call(ctx.get_loss_ema_ref, &[]);
+                (builder.inst_results(inst)[0], true)
+            }
+            "loss_ema_slope" => {
+                let inst = builder.ins().call(ctx.get_loss_ema_slope_ref, &[]);
+                (builder.inst_results(inst)[0], true)
+            }
+            "grad_norm_total" => {
+                let inst = builder.ins().call(ctx.get_grad_norm_total_ref, &[]);
+                (builder.inst_results(inst)[0], true)
+            }
+            "nan_inf_count_window" => {
+                let inst = builder.ins().call(ctx.get_nan_inf_count_window_ref, &[]);
+                (builder.inst_results(inst)[0], false)
+            }
+            other => panic!(
+                "predicate ident {:?} should have been rejected by parse_predicate",
+                other
+            ),
+        },
+        _ => panic!("lower_ident_to_value called on non-atom predicate expr"),
+    }
+}
+
+/// Lower both operands of a `Cmp`, coercing to a common numeric type.
+/// Mixed int/float comparisons widen the int side to f64.
+fn lower_cmp_operands(
+    l: &PredicateExpr,
+    r: &PredicateExpr,
+    builder: &mut FunctionBuilder,
+    ctx: &PredicateLowerCtx,
+) -> (Value, Value, bool) {
+    let (lv, lf) = lower_ident_to_value(l, builder, ctx);
+    let (rv, rf) = lower_ident_to_value(r, builder, ctx);
+    let is_float = lf || rf;
+    if !is_float {
+        return (lv, rv, false);
+    }
+    let lv2 = if lf {
+        lv
+    } else {
+        builder.ins().fcvt_from_sint(cl_types::F64, lv)
+    };
+    let rv2 = if rf {
+        rv
+    } else {
+        builder.ins().fcvt_from_sint(cl_types::F64, rv)
+    };
+    (lv2, rv2, true)
+}
+
 pub fn parse_predicate(src: &str) -> Result<PredicateExpr, String> {
     if src.trim().is_empty() { return Err("empty predicate".to_string()); }
     let toks = tokenize(src)?;
