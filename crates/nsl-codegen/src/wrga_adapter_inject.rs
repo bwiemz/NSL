@@ -44,6 +44,13 @@ pub struct AdapterSite {
     pub rank: i64,
     pub alpha: i64,
     pub synthesized_fields: Vec<String>,
+    /// Input dimension (k_in) of the target weight. Zero when resolution
+    /// failed — callers MUST treat zero as "skip materialisation" and a
+    /// diagnostic will already have been emitted.
+    pub input_dim: u32,
+    /// Output dimension (d_out) of the target weight. Zero when resolution
+    /// failed (see `input_dim`).
+    pub output_dim: u32,
 }
 
 /// Result of the inject pass.
@@ -134,9 +141,113 @@ pub fn run(plan: &mut WrgaPlan) -> AdapterInjectResult {
             rank,
             alpha,
             synthesized_fields: fields,
+            input_dim: 0,
+            output_dim: 0,
         });
     }
     AdapterInjectResult { sites }
+}
+
+/// Parse a tensor type string like `"Tensor<[32, 16], f32>"` into its
+/// `(output_dim, input_dim)` shape pair.  Returns None if the string is
+/// not a 2-D tensor type annotation.
+///
+/// Convention: NSL weights are declared as `Tensor<[out, in], dtype>` so
+/// the first dim is the output channel count and the second is the input.
+pub(crate) fn parse_tensor_2d_shape(type_str: &str) -> Option<(u32, u32)> {
+    let open = type_str.find('[')?;
+    let close = type_str.find(']')?;
+    if close <= open {
+        return None;
+    }
+    let inner = &type_str[open + 1..close];
+    let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let out: u32 = parts[0].parse().ok()?;
+    let inp: u32 = parts[1].parse().ok()?;
+    Some((out, inp))
+}
+
+/// Resolve `(input_dim, output_dim)` for an adapter target weight.
+///
+/// Returns `Some((input_dim, output_dim))` when resolution succeeds;
+/// `None` when the model/field is absent or the type isn't a 2-D tensor.
+/// On `None`, the caller must emit a diagnostic — never ship `(0, 0)`
+/// silently onto an `AdapterSite`.
+pub(crate) fn resolve_dims_for_target(
+    model_name: &str,
+    field_name: &str,
+    field_types: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+) -> Option<(u32, u32)> {
+    let field_map = field_types.get(model_name)?;
+    let type_str = field_map.get(field_name)?;
+    let (out, inp) = parse_tensor_2d_shape(type_str)?;
+    Some((inp, out))
+}
+
+/// Wrapper over [`run`] that additionally resolves real `input_dim` /
+/// `output_dim` values on each produced `AdapterSite` by consulting the
+/// compiler's `model_field_types` registry.  On any resolution failure an
+/// `eprintln!` diagnostic is emitted and the site's dims remain zero so
+/// downstream stages skip materialisation.
+pub fn run_with_compiler(
+    plan: &mut WrgaPlan,
+    compiler: &crate::compiler::Compiler,
+) -> AdapterInjectResult {
+    let mut result = run(plan);
+    for site in result.sites.iter_mut() {
+        let target = site.target_param.clone();
+        let (var_name, field_name) = match target.split_once('.') {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "[wrga] @adapter target '{}' is not a `model.field` form; skipping",
+                    target
+                );
+                continue;
+            }
+        };
+
+        let field_types = &compiler.models.model_field_types;
+        let mut candidates: Vec<&String> = field_types
+            .iter()
+            .filter(|(_, fields)| fields.contains_key(field_name))
+            .map(|(name, _)| name)
+            .collect();
+        if candidates.is_empty() {
+            eprintln!(
+                "[wrga] @adapter target '{}': field '{}' not found in any known model; \
+                 skipping adapter materialisation (dims remain 0)",
+                target, field_name
+            );
+            continue;
+        }
+        if candidates.len() > 1 {
+            eprintln!(
+                "[wrga] @adapter target '{}': field '{}' ambiguous across models {:?}; \
+                 using first; follow-up: thread let-binding type map",
+                target, field_name, candidates
+            );
+        }
+        let model_name = candidates.remove(0).clone();
+        match resolve_dims_for_target(&model_name, field_name, field_types) {
+            Some((inp, out)) => {
+                site.input_dim = inp;
+                site.output_dim = out;
+            }
+            None => {
+                eprintln!(
+                    "[wrga] @adapter target '{}': type string for '{}.{}' \
+                     isn't a 2-D tensor; skipping",
+                    target, model_name, field_name
+                );
+            }
+        }
+        let _ = var_name; // reserved for later let-binding-type-map resolution
+    }
+    result
 }
 
 /// Build a stable site identifier from the target parameter path + kind.
@@ -153,6 +264,42 @@ fn site_id_for(target: &str, kind: AdapterKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dims_for_resolves_from_field_types_registry() {
+        use std::collections::HashMap;
+        let mut inner = HashMap::new();
+        inner.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
+        let mut outer = HashMap::new();
+        outer.insert("Toy".to_string(), inner);
+        let (input_dim, output_dim) =
+            resolve_dims_for_target("Toy", "w", &outer).expect("dims must resolve");
+        assert_eq!(input_dim, 16, "input_dim = k_in (second dim of Tensor<[out, in]>)");
+        assert_eq!(output_dim, 32, "output_dim = d_out (first dim)");
+    }
+
+    #[test]
+    fn dims_for_returns_none_on_missing_model() {
+        use std::collections::HashMap;
+        let mut inner = HashMap::new();
+        inner.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
+        let mut outer = HashMap::new();
+        outer.insert("Toy".to_string(), inner);
+        assert!(
+            resolve_dims_for_target("Unknown", "w", &outer).is_none(),
+            "unknown model must return None (caller emits diagnostic)",
+        );
+    }
+
+    #[test]
+    fn dims_for_returns_none_on_missing_field() {
+        use std::collections::HashMap;
+        let mut inner = HashMap::new();
+        inner.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
+        let mut outer = HashMap::new();
+        outer.insert("Toy".to_string(), inner);
+        assert!(resolve_dims_for_target("Toy", "nonexistent", &outer).is_none());
+    }
 
     #[test]
     fn site_id_replaces_dots_and_adds_kind_suffix() {
