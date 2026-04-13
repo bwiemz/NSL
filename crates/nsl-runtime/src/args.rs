@@ -50,6 +50,19 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(crate::fused_adapter::nsl_fused_adapter_launch_count_atexit);
         }
     }
+
+    // B.3 Task 5.6 hardening: GPU-specific launch counter, enabled when
+    // NSL_WRGA_GPU_LAUNCH_COUNTER=1.  Distinguishes real-GPU execution
+    // from CPU fallback so tests can assert the fused CUDA path actually
+    // fired (not just the math came out right).
+    if std::env::var("NSL_WRGA_GPU_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(crate::fused_adapter::nsl_fused_adapter_gpu_launch_count_atexit);
+        }
+    }
 }
 
 extern "C" fn nsl_gpu_mem_report_atexit() {
