@@ -89,6 +89,7 @@ pub mod wggo_cost;
 pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
+pub mod wggo_schedule;
 pub mod wrga;
 pub mod wrga_adapter_inject;
 pub mod wrga_fusion;
