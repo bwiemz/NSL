@@ -681,3 +681,121 @@ fn bad(box: Box<int, str>) -> int:
         diags
     );
 }
+
+// -----------------------------------------------------------------------
+// WRGA decorator collection tests
+// -----------------------------------------------------------------------
+
+/// Parse and analyze a snippet, returning the full AnalysisResult.
+fn analyze_source(src: &str) -> crate::AnalysisResult {
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parse_result = nsl_parser::parse(&tokens, &mut interner);
+    crate::analyze(&parse_result.module, &mut interner)
+}
+
+#[test]
+fn wrga_decorator_is_captured() {
+    let src = r#"
+@wrga(mode=auto, budget=100000, target=rtx5070ti)
+model Toy:
+    layer lin: Linear<16, 16>
+
+    fn forward(self, x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
+        return self.lin(x)
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.wrga_configs.len(),
+        1,
+        "expected one @wrga config, got {:?}",
+        res.wrga_configs
+    );
+    let cfg = &res.wrga_configs[0];
+    assert_eq!(cfg.block.budget, Some(100000));
+    assert!(
+        matches!(cfg.block.mode, nsl_ast::block::WrgaMode::Auto),
+        "mode mismatch: {:?}",
+        cfg.block.mode
+    );
+}
+
+#[test]
+fn freeze_decorator_is_captured() {
+    let src = r#"
+@freeze(exclude=["blocks.6.*", "blocks.7.*"])
+let coder: int = 42
+"#;
+    let res = analyze_source(src);
+    assert_eq!(res.freeze_configs.len(), 1);
+    let cfg = &res.freeze_configs[0];
+    assert_eq!(cfg.exclude, vec!["blocks.6.*".to_string(), "blocks.7.*".to_string()]);
+    assert!(cfg.include.is_empty());
+}
+
+#[test]
+fn adapter_decorator_is_captured() {
+    let src = r#"
+@adapter(type=lora, target=["blocks.*.attn.q"], rank=8)
+let coder: int = 42
+"#;
+    let res = analyze_source(src);
+    assert_eq!(res.adapter_configs.len(), 1);
+    let cfg = &res.adapter_configs[0];
+    assert!(matches!(cfg.kind, crate::wrga::AdapterKind::Lora));
+    assert_eq!(cfg.rank, Some(8));
+    assert_eq!(cfg.targets, vec!["blocks.*.attn.q".to_string()]);
+}
+
+#[test]
+fn wrga_hybrid_without_layers_errors() {
+    let src = r#"
+@wrga(mode=hybrid)
+model Toy:
+    layer lin: Linear<16, 16>
+
+    fn forward(self, x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
+        return self.lin(x)
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("hybrid) requires a `layers=")),
+        "expected hybrid-mode layer-scope error, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn freeze_include_and_exclude_conflict_errors() {
+    let src = r#"
+@freeze(include=["a.*"], exclude=["b.*"])
+let coder: int = 42
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("include` and `exclude` cannot be combined")),
+        "expected freeze include/exclude conflict error, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn adapter_missing_type_errors() {
+    let src = r#"
+@adapter(target=["blocks.*.attn.q"])
+let coder: int = 42
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("requires a `type=")),
+        "expected missing-type error, got: {:?}",
+        res.diagnostics
+    );
+    assert!(res.adapter_configs.is_empty(), "invalid adapter should not be captured");
+}

@@ -57,6 +57,13 @@ pub struct AnalysisResult {
     /// M38a: Per-function ownership metadata (function name → info).
     /// Only populated when linear_types analysis is enabled.
     pub ownership_info: HashMap<String, FunctionOwnershipInfo>,
+    /// WRGA: validated `@wrga(...)` configurations for later consumption by
+    /// `nsl-codegen::wrga::run`.  One entry per decorator occurrence.
+    pub wrga_configs: Vec<crate::wrga::WrgaConfig>,
+    /// WRGA: validated `@freeze(...)` configurations.
+    pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
+    /// WRGA: validated `@adapter(...)` configurations.
+    pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -87,6 +94,9 @@ pub fn analyze_with_imports(
     // Extract results from type checker, releasing its borrows on interner/scopes
     let mut diagnostics = checker.diagnostics;
     let type_map = checker.type_map;
+    let wrga_configs = checker.wrga_configs;
+    let freeze_configs = checker.freeze_configs;
+    let adapter_configs = checker.adapter_configs;
 
     // M38a: Run ownership analysis when --linear-types is active.
     // Runs after type checking so we have the TypeMap for tensor type detection.
@@ -104,5 +114,8 @@ pub fn analyze_with_imports(
         type_map,
         scopes,
         ownership_info,
+        wrga_configs,
+        freeze_configs,
+        adapter_configs,
     }
 }

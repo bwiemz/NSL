@@ -58,6 +58,13 @@ pub struct TypeChecker<'a> {
     import_types: HashMap<Symbol, Type>,
     /// Registry of user-defined `datatype` blocks validated in this module.
     custom_datatypes: HashMap<String, CustomDtypeSemanticInfo>,
+    /// WRGA: `@wrga(...)` configs captured during semantic analysis (one per
+    /// decorated model or let-binding). Consumed by `nsl-codegen::wrga::run`.
+    pub wrga_configs: Vec<crate::wrga::WrgaConfig>,
+    /// WRGA: `@freeze(...)` configs captured during semantic analysis.
+    pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
+    /// WRGA: `@adapter(...)` configs captured during semantic analysis.
+    pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -73,6 +80,9 @@ impl<'a> TypeChecker<'a> {
             current_callees: Vec::new(),
             import_types: HashMap::new(),
             custom_datatypes: HashMap::new(),
+            wrga_configs: Vec::new(),
+            freeze_configs: Vec::new(),
+            adapter_configs: Vec::new(),
         }
     }
 
