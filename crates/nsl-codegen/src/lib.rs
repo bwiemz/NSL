@@ -433,6 +433,20 @@ pub struct CompileOptions {
     /// Dev Tools Phase 2: tensor dtype assumed by the profile walker
     /// (e.g. `"bf16"`, `"fp8"`).  Defaults to `"bf16"`.
     pub dtype: String,
+    /// Dev Tools Phase 2, Task 6: when `Some`, the codegen entry writes the
+    /// kernel-profile manifest (accumulated into `Compiler.manifest_builder`
+    /// during body codegen) to this path in JSON form.  `None` skips the
+    /// write even if the builder is populated (useful for tests that only
+    /// exercise the pre-pass).
+    pub manifest_output_path: Option<std::path::PathBuf>,
+    /// Dev Tools Phase 2, Task 6: source text the entry function should
+    /// stash onto `Compiler.source_text` so `SourceSpanJson::from_span`
+    /// produces real 1-based line numbers (rather than the Task 5 default
+    /// of line 1).  Populated by the CLI when `profile_kernels` is on.
+    pub profile_source_text: Option<String>,
+    /// Dev Tools Phase 2, Task 6: human-readable source file name for the
+    /// manifest's span records (paired with `profile_source_text`).
+    pub profile_source_file_name: Option<String>,
 }
 
 impl Default for CompileOptions {
@@ -480,6 +494,9 @@ impl Default for CompileOptions {
             profile_kernels: false,
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
+            manifest_output_path: None,
+            profile_source_text: None,
+            profile_source_file_name: None,
         }
     }
 }

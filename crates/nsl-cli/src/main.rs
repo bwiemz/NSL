@@ -897,6 +897,9 @@ fn main_inner() {
                 profile_kernels: false,
                 target_gpu: "h100".to_string(),
                 dtype: "bf16".to_string(),
+                manifest_output_path: None,
+                profile_source_text: None,
+                profile_source_file_name: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1075,6 +1078,25 @@ fn main_inner() {
                 profile_kernels: monitor,
                 target_gpu: "h100".to_string(),
                 dtype: "bf16".to_string(),
+                // Task 6: when --monitor is set, wire the manifest output
+                // path + source text so SourceSpanJson::from_span produces
+                // real line numbers.  The CLI derives the manifest path
+                // from the built binary below (Task 8 wiring).
+                manifest_output_path: if monitor {
+                    Some(file.with_extension("nsl-profile.json"))
+                } else {
+                    None
+                },
+                profile_source_text: if monitor {
+                    std::fs::read_to_string(&file).ok()
+                } else {
+                    None
+                },
+                profile_source_file_name: if monitor {
+                    Some(file.display().to_string())
+                } else {
+                    None
+                },
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

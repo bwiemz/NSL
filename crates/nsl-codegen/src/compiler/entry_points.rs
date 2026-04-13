@@ -64,6 +64,16 @@ fn run_profile_pre_pass(
                 .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
                 .collect();
             compiler.manifest_builder = Some(ManifestBuilder::new(target_gpu, dtype));
+            // Task 6: populate source text/name so SourceSpanJson::from_span
+            // produces real line numbers in manifest records.  When the CLI
+            // doesn't pass them through (e.g. pure library callers), we
+            // leave the defaults and accept degraded spans.
+            if let Some(src) = &options.profile_source_text {
+                compiler.source_text = src.clone();
+            }
+            if let Some(name) = &options.profile_source_file_name {
+                compiler.source_file_name = name.clone();
+            }
             // Phase 2 follow-up: the existing fusion pass does not yet
             // populate `FusionPlan.fused_node_groups` for all kernels, so
             // leave `fusion_plan_for_profile` as `None` — `fusion_constituents`
@@ -79,6 +89,44 @@ fn run_profile_pre_pass(
                 );
             }
         }
+    }
+}
+
+/// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
+/// write the resulting kernel-profile manifest to
+/// `options.manifest_output_path`.  Non-fatal on any failure — profiling is
+/// advisory and must never break a build.  Called from each codegen entry
+/// function's latest reliable success path.
+fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::CompileOptions) {
+    let Some(mb) = compiler.manifest_builder.take() else {
+        return;
+    };
+    let manifest = mb.finish();
+    if let Some(out_path) = &options.manifest_output_path {
+        match crate::profiling::instrument::write_manifest(out_path, &manifest) {
+            Ok(_) => {
+                if std::env::var("NSL_DEBUG").is_ok() {
+                    eprintln!(
+                        "[profile] wrote manifest with {} kernels to {}",
+                        manifest.kernels.len(),
+                        out_path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to write profile manifest to {}: {}",
+                    out_path.display(),
+                    e
+                );
+            }
+        }
+    } else if std::env::var("NSL_DEBUG").is_ok() {
+        eprintln!(
+            "[profile] manifest_builder set but no manifest_output_path — \
+             skipping write ({} kernels)",
+            manifest.kernels.len()
+        );
     }
 }
 
@@ -181,6 +229,14 @@ pub fn compile_returning_plan(
     }
 
     compiler.dump_ir = dump_ir;
+
+    // Dev Tools Phase 2, Task 4/6: run the kernel-profile pre-pass before any
+    // body codegen so downstream kernel-launch sites can record manifest
+    // entries keyed by `NodeId`.
+    if options.profile_kernels {
+        run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
+    }
+
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
@@ -250,6 +306,9 @@ pub fn compile_returning_plan(
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize
+    // consumes the compiler.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, plan))
 }
@@ -469,6 +528,8 @@ fn compile_with_zk_info_best_effort_plan(
         }
     }
 
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize();
     (bytes, zk_proof_fns, zk_results, plan)
 }
@@ -540,6 +601,10 @@ fn compile_standalone_best_effort_plan(
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    if pre_finalize.is_ok() {
+        write_manifest_if_needed(&mut compiler, options);
+    }
     let result = pre_finalize.and_then(|()| compiler.finalize());
     (result, plan)
 }
@@ -577,6 +642,8 @@ pub fn compile_test(
         return Err(CodegenError::new("no @test functions found".to_string()));
     }
     compiler.compile_test_main()?;
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, test_fns))
 }
@@ -718,6 +785,10 @@ pub fn compile_module_with_imports_best_effort_plan(
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    if pre_finalize.is_ok() {
+        write_manifest_if_needed(&mut compiler, options);
+    }
     let result = pre_finalize.and_then(|()| compiler.finalize());
     (result, plan)
 }
@@ -793,6 +864,12 @@ pub fn compile_entry_returning_plan(
         compiler.types.enum_defs.insert(name, variants);
     }
 
+    // Dev Tools Phase 2, Task 4/6: run the kernel-profile pre-pass before any
+    // body codegen.
+    if options.profile_kernels {
+        run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
+    }
+
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
@@ -843,6 +920,8 @@ pub fn compile_entry_returning_plan(
         );
     }
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, plan))
 }

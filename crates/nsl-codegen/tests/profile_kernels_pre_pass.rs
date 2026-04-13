@@ -32,6 +32,22 @@ fn forward(x: Tensor<[B=1, S=2048, D=512], bf16>, W: Tensor<[512, 512], bf16>) -
 }
 
 #[test]
+fn pre_pass_api_surface_with_profile_kernels_enabled() {
+    // Task 6: confirm the pre-pass helper doesn't panic when profile_kernels
+    // is set.  Full source_text population is a side-effect of the entry
+    // function, not the pre-pass alone; end-to-end manifest writes are
+    // covered by Task 9's E2E test.
+    let src = r#"
+fn forward(x: Tensor<[1, 2048, 512], bf16>, W: Tensor<[512, 512], bf16>) -> Tensor:
+    return matmul(x, W)
+"#;
+    let mut opts = CompileOptions::default();
+    opts.profile_kernels = true;
+    let _result = nsl_codegen::test_helpers::run_pre_pass_only(src, &opts)
+        .expect("pre-pass should succeed");
+}
+
+#[test]
 fn pre_pass_skipped_when_profile_kernels_disabled() {
     let src = r#"
 fn forward(x: Tensor<[1, 2048, 512], bf16>, W: Tensor<[512, 512], bf16>) -> Tensor:
