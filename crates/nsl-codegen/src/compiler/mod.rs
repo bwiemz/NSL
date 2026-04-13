@@ -398,6 +398,15 @@ pub struct Compiler<'a> {
     /// Used by `fusion_constituents` to map a fused kernel root back to the
     /// AST `NodeId`s folded into it.  `None` until wired in a follow-up.
     pub fusion_plan_for_profile: Option<crate::wrga_fusion::FusionPlan>,
+    /// Source-text snapshot of the module being compiled. Used by Task 5
+    /// to resolve `Span` byte offsets to 1-based line numbers when
+    /// recording kernel entries on the manifest. May be empty when the
+    /// caller did not plumb the original source through (manifest line
+    /// numbers fall back to 1 in that case — non-fatal).
+    pub source_text: String,
+    /// File name displayed in profile manifest entries (Task 5/6).
+    /// May be empty when not plumbed.
+    pub source_file_name: String,
 }
 
 /// Quantization configuration for a model.
@@ -526,6 +535,8 @@ impl<'a> Compiler<'a> {
             prediction_map: HashMap::new(),
             manifest_builder: None,
             fusion_plan_for_profile: None,
+            source_text: String::new(),
+            source_file_name: String::new(),
         })
     }
 

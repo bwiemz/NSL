@@ -866,6 +866,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_profiler_stop", &[], None),
     ("nsl_profiler_dump", &[types::I64, types::I64], None),
     ("nsl_profiler_peak", &[], Some(types::I64)),
+    // Dev Tools Phase 2, Task 5: kernel-launch profile hooks.
+    // Emitted around every GPU `kernel { ... }` launch when codegen runs
+    // with `profile_kernels` enabled. Take a single i32 kernel_id matching
+    // the dense ids assigned by ManifestBuilder::reserve_id().
+    ("nsl_profile_kernel_begin", &[types::I32], None),
+    ("nsl_profile_kernel_end", &[types::I32], None),
     // Kernel profiler (M26) — flush is NOT registered here (Rust-only atexit call)
     ("nsl_kernel_profiler_start", &[], None),
     ("nsl_kernel_profiler_stop", &[], None),
