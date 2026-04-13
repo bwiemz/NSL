@@ -161,6 +161,16 @@ pub(crate) fn invoke_wrga_if_enabled(
     Some(plan)
 }
 
+/// Dev Tools Phase 4 Task 4: extract a layer index from a parameter path.
+/// Finds the last numeric segment (e.g. "blocks.3.attn.wq" -> 3).  Returns
+/// `u32::MAX` when no numeric segment is present.
+fn parse_layer_idx_for_health(path: &str) -> u32 {
+    path.split('.')
+        .rev()
+        .find_map(|seg| seg.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
+}
+
 fn classify_source_ad_param_name(
     param_name: &str,
     tensor_param_paths: &std::collections::HashSet<String>,
@@ -3248,6 +3258,14 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // ── 5a. Dev Tools Phase 4 Task 4: optional health flush-interval setter ──
+        if self.compile_options.health_monitor {
+            if let Some(n) = self.compile_options.health_flush_interval {
+                let n_val = builder.ins().iconst(cl_types::I64, n as i64);
+                self.compile_call_by_name(builder, "nsl_health_set_flush_interval", &[n_val])?;
+            }
+        }
+
         // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
         // These persist across batches within each accumulation window. Each buffer
         // is zeros_like(param) and gets += each batch's grads, then zeroed after
@@ -3990,6 +4008,151 @@ impl Compiler<'_> {
                 "nsl_debug_grad_checksum",
                 &[grads_list, num_params_val],
             )?;
+        }
+
+        // 7e1c. Dev Tools Phase 4 Task 4: health-monitor hooks.
+        // Emits per-step loss, per-parameter gradient norm, per-parameter
+        // weight norm (step 0 + every 100 steps), and a snapshot flush every
+        // 100 steps.  Gated entirely on `health_monitor`; when off the IR is
+        // byte-identical to pre-phase-4.
+        //
+        // TODO(phase4-fase): splice grad-norm emission into the FASE per-layer
+        // loop when FASE is active.  Phase 4 Task 4 ships the standard-
+        // backward-only path — grads_list is indexed the same whether the
+        // primary backward was tape-AD or source-AD.
+        if self.compile_options.health_monitor {
+            use cranelift_codegen::ir::{types as cl_types, MemFlags};
+            let _ = MemFlags::trusted(); // keep import valid across cfgs
+
+            // (a) Record loss: scalarize loss_val and call
+            //     nsl_health_record_loss(loss_scalar, step).
+            let loss_scalar = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_item",
+                &[loss_val],
+            )?;
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_health_record_loss",
+                &[loss_scalar, step_now],
+            )?;
+
+            // Precompute step-gating flags shared by grad/weight/flush hooks.
+            let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
+            let step_h = builder.use_var(step_count_var);
+            let hundred = builder.ins().iconst(cl_types::I64, 100);
+            let step_mod = builder.ins().srem(step_h, hundred);
+            let is_flush_due = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                step_mod,
+                zero_i64_h,
+            );
+            // Init == step 0.  We reuse `is_flush_due` for the weight-norm
+            // periodic check (step 0 also satisfies step % 100 == 0), so a
+            // single gate covers both "init" and "every 100".
+
+            // (b) Per-parameter gradient norms (unrolled over compile-time
+            //     param_paths; grads_list / param_list are indexed by idx).
+            for (i, path) in param_paths.iter().enumerate() {
+                let path_data_id = self.intern_string(path)?;
+                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                let path_len = builder
+                    .ins()
+                    .iconst(cl_types::I64, path.len() as i64);
+                let layer_idx = parse_layer_idx_for_health(path);
+                let layer_idx_val = builder
+                    .ins()
+                    .iconst(cl_types::I32, layer_idx as i64);
+
+                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                let grad = self.compile_call_by_name(
+                    builder,
+                    "nsl_list_get",
+                    &[grads_list, idx_val],
+                )?;
+                let gnorm = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_l2_norm",
+                    &[grad],
+                )?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_health_record_grad_norm",
+                    &[path_ptr, path_len, layer_idx_val, gnorm],
+                )?;
+            }
+
+            // (c) Per-parameter weight norms — gated by step % 100 == 0
+            //     (which includes step 0 as the initial weight snapshot).
+            let wnorm_block = builder.create_block();
+            let after_wnorm = builder.create_block();
+            builder
+                .ins()
+                .brif(is_flush_due, wnorm_block, &[], after_wnorm, &[]);
+
+            builder.switch_to_block(wnorm_block);
+            builder.seal_block(wnorm_block);
+            state.current_block = Some(wnorm_block);
+
+            for (i, path) in param_paths.iter().enumerate() {
+                let path_data_id = self.intern_string(path)?;
+                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                let path_len = builder
+                    .ins()
+                    .iconst(cl_types::I64, path.len() as i64);
+                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                let param = self.compile_call_by_name(
+                    builder,
+                    "nsl_list_get",
+                    &[param_list, idx_val],
+                )?;
+                let wnorm = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_l2_norm",
+                    &[param],
+                )?;
+                // is_init flag: 1 iff step == 0.
+                let step_cmp = builder.use_var(step_count_var);
+                let zero_cmp = builder.ins().iconst(cl_types::I64, 0);
+                let is_init_b1 = builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    step_cmp,
+                    zero_cmp,
+                );
+                let is_init_i8 = builder.ins().uextend(cl_types::I8, is_init_b1);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_health_record_weight_norm",
+                    &[path_ptr, path_len, wnorm, is_init_i8],
+                )?;
+            }
+
+            // (d) Snapshot flush (reuses is_flush_due — we're still in wnorm_block).
+            let snap_path = self
+                .compile_options
+                .profile_source_file_name
+                .as_ref()
+                .map(|p| format!("{}.nsl-health.json", p))
+                .unwrap_or_else(|| "nsl-health.json".to_string());
+            let snap_data_id = self.intern_string(&snap_path)?;
+            let snap_gv = self.module.declare_data_in_func(snap_data_id, builder.func);
+            let snap_ptr = builder.ins().symbol_value(cl_types::I64, snap_gv);
+            let snap_len = builder
+                .ins()
+                .iconst(cl_types::I64, snap_path.len() as i64);
+            self.compile_call_by_name(
+                builder,
+                "nsl_health_flush_snapshot",
+                &[snap_ptr, snap_len],
+            )?;
+
+            builder.ins().jump(after_wnorm, &[]);
+            builder.switch_to_block(after_wnorm);
+            builder.seal_block(after_wnorm);
+            state.current_block = Some(after_wnorm);
         }
 
         // 7e2. Gradient clipping (only if grad_clip was specified)

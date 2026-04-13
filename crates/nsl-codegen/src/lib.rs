@@ -447,6 +447,16 @@ pub struct CompileOptions {
     /// Dev Tools Phase 2, Task 6: human-readable source file name for the
     /// manifest's span records (paired with `profile_source_text`).
     pub profile_source_file_name: Option<String>,
+    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission inside
+    /// `compile_train_block`.  When true, codegen inserts calls to
+    /// `nsl_health_record_loss`, `_grad_norm`, `_weight_norm`, and
+    /// `_flush_snapshot`.  When false (default), train-block IR is byte-
+    /// identical to pre-phase-4.
+    pub health_monitor: bool,
+    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter
+    /// (calls `nsl_health_set_flush_interval(n)` once at train-block entry).
+    /// `None` keeps the runtime default.
+    pub health_flush_interval: Option<u64>,
 }
 
 impl Default for CompileOptions {
@@ -497,6 +507,8 @@ impl Default for CompileOptions {
             manifest_output_path: None,
             profile_source_text: None,
             profile_source_file_name: None,
+            health_monitor: false,
+            health_flush_interval: None,
         }
     }
 }

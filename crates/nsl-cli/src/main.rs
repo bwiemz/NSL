@@ -904,6 +904,8 @@ fn main_inner() {
                 manifest_output_path: None,
                 profile_source_text: None,
                 profile_source_file_name: None,
+                health_monitor: false,
+                health_flush_interval: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1102,6 +1104,11 @@ fn main_inner() {
                 } else {
                     None
                 },
+                // Dev Tools Phase 4 Task 6 wires train-block detection to
+                // enable these automatically.  Task 4 leaves them false so
+                // the option defaults cleanly to no instrumentation.
+                health_monitor: false,
+                health_flush_interval: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
