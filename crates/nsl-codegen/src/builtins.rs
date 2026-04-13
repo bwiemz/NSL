@@ -256,7 +256,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     // WRGA B.3 Task 4: fused LoRA/IA³ adapter matmul FFIs.
-    // LoRA args: (x_ptr, w_ptr, a_ptr, b_ptr, scale_f32, kernel_handle_i64)
+    // LoRA args: (x_ptr, w_ptr, a_ptr, b_ptr, scale_f64, kernel_handle_i64).
+    // The scale is f64 at the FFI boundary because NSL FloatLiteral is f64;
+    // the runtime narrows to f32 internally.
     (
         "nsl_adapter_fused_lora_matmul",
         &[
@@ -264,7 +266,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,
             types::I64,
             types::I64,
-            types::F32,
+            types::F64,
             types::I64,
         ],
         Some(types::I64),

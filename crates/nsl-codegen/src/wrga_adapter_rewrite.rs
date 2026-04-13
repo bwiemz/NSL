@@ -67,6 +67,11 @@ pub struct RewriteContext<'a> {
     /// FFI name the codegen should dispatch to.  Mirrors `synth_overrides`
     /// but for call sites, not member accesses.
     pub synth_call_overrides: HashMap<NodeId, String>,
+    /// B.3 Task 5: deterministic ordering of fused PTX kernel keys, used
+    /// to assign a stable `kernel_handle` index per call site.  Sorted by
+    /// `(m, n, k, rank, target_sm)`.  Empty when the prescan didn't
+    /// populate `Compiler::fused_ptx_kernels` (e.g. non-sm_80 target).
+    pub fused_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -78,6 +83,7 @@ impl<'a> RewriteContext<'a> {
             self_sym: None,
             target_sm: None,
             synth_call_overrides: HashMap::new(),
+            fused_kernel_order: Vec::new(),
         }
     }
 }
@@ -263,11 +269,32 @@ pub fn synthesize_lora_fused_call(
     let alpha = site.alpha.max(1) as f64;
     let scale = alpha / rank;
 
-    // Kernel handle: Task 5 replaces the 0 placeholder with a real index
-    // into `Compiler::fused_ptx_kernels` (deterministic sort by
-    // LoraKernelKey tuple).  For Task 4 we pass 0 since the CPU-fallback
-    // stub ignores the handle.
-    let kernel_handle: i64 = 0;
+    // B.3 Task 5: derive a deterministic kernel_handle by looking up
+    // this site's `LoraKernelKey` in the sorted `fused_kernel_order`.
+    // Sites whose key isn't in the order (rank > 16, dims unresolved,
+    // non-sm_80 target) get handle = -1 so the runtime can detect a
+    // miswiring and fall back deterministically.
+    let kernel_handle: i64 = {
+        let target_sm = ctx.target_sm.unwrap_or(0);
+        // Rank from FusionTarget::EpilogueFusedLora { rank }; fall back
+        // to site.rank when the decision shape doesn't carry it.
+        let rank = match &site.fusion_decision {
+            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { rank }) => *rank as u32,
+            _ => site.rank as u32,
+        };
+        let key = crate::wrga_fused_ptx::LoraKernelKey {
+            m: 1,
+            n: site.output_dim,
+            k: site.input_dim,
+            rank,
+            target_sm,
+        };
+        ctx.fused_kernel_order
+            .iter()
+            .position(|k| k == &key)
+            .map(|p| p as i64)
+            .unwrap_or(-1)
+    };
 
     // Build the callee Ident with a sentinel symbol + override entry
     // pointing at the FFI name.
@@ -398,7 +425,9 @@ pub fn synthesize_ia3_fused_call(
     let self_s = make_self_expr(span);
     let ma_scale = make_synth_member_access(ctx, self_s, &scale_name, span, sentinel);
 
-    let kernel_handle: i64 = 0;
+    // B.3 Task 5: IA³ has no PTX registry yet (LoRA-only in prescan), so
+    // emit -1 as a sentinel.  The Task-4 CPU stub ignores the handle.
+    let kernel_handle: i64 = -1;
 
     let callee_id = NodeId::next();
     ctx.synth_call_overrides

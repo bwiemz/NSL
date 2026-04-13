@@ -30,6 +30,29 @@ use crate::tensor::arithmetic::{
     nsl_tensor_add, nsl_tensor_matmul, nsl_tensor_mul, nsl_tensor_mul_scalar,
 };
 use crate::tensor::fbip_flags::{RELINQUISH_A, RELINQUISH_B};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// B.3 Task 5: side-channel counter for fused-adapter kernel launches.
+/// Increments once per call to a fused FFI (per call site, per invocation).
+/// When `NSL_KERNEL_LAUNCH_COUNTER=1` is set in the environment, a value
+/// is printed to stderr at process exit via the atexit hook registered in
+/// `args.rs::nsl_args_init`.
+pub(crate) static FUSED_ADAPTER_LAUNCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the fused-adapter launch counter.  Only effective (i.e. observed
+/// by the atexit reporter) when `NSL_KERNEL_LAUNCH_COUNTER=1`; the
+/// increment itself is unconditional and thread-safe.
+#[inline]
+fn record_fused_launch() {
+    FUSED_ADAPTER_LAUNCH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Atexit hook: print `[nsl-kernel-count] <N>` to stderr.  Registered
+/// from `args.rs::nsl_args_init` only when `NSL_KERNEL_LAUNCH_COUNTER=1`.
+pub extern "C" fn nsl_fused_adapter_launch_count_atexit() {
+    let n = FUSED_ADAPTER_LAUNCH_COUNT.load(Ordering::Relaxed);
+    eprintln!("[nsl-kernel-count] {n}");
+}
 
 /// Fused LoRA matmul: `y = x @ W + ((x @ A) @ B) * scale` in a single
 /// FFI call.
@@ -59,7 +82,7 @@ pub extern "C" fn nsl_adapter_fused_lora_matmul(
     w: i64,
     lora_a: i64,
     lora_b: i64,
-    scale: f32,
+    scale: f64,
     kernel_handle: i64,
 ) -> i64 {
     // kernel_handle is Task-5 territory; silence unused-var warning here.
@@ -68,6 +91,7 @@ pub extern "C" fn nsl_adapter_fused_lora_matmul(
     if x == 0 || w == 0 || lora_a == 0 || lora_b == 0 {
         return 0;
     }
+    record_fused_launch();
 
     // y_main = x @ W
     let y_main = nsl_tensor_matmul(x, w, 0);
@@ -85,7 +109,7 @@ pub extern "C" fn nsl_adapter_fused_lora_matmul(
         return 0;
     }
     // scaled = x_ab * scale   (consume x_ab)
-    let scaled = nsl_tensor_mul_scalar(x_ab, scale as f64, RELINQUISH_A);
+    let scaled = nsl_tensor_mul_scalar(x_ab, scale, RELINQUISH_A);
     if scaled == 0 {
         return 0;
     }
@@ -116,6 +140,7 @@ pub extern "C" fn nsl_adapter_fused_ia3_matmul(
     if x == 0 || w == 0 || ia3_scale == 0 {
         return 0;
     }
+    record_fused_launch();
 
     // y_main = x @ W
     let y_main = nsl_tensor_matmul(x, w, 0);

@@ -63,7 +63,14 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
             };
             placements.push(AdapterPlacement {
                 name: target.clone(),
-                arithmetic_intensity: 0.0,
+                // B.3 Task 5: the prescan path has no Wengert graph to
+                // measure arithmetic intensity, but `@adapter(type=lora,
+                // target=["Class.field"])` syntactically targets a
+                // matmul-shaped field by construction (LoRA only makes
+                // sense on a 2D weight).  Default AI to 1.0 so the
+                // fusion-decision pass classifies the site as Matmul →
+                // EpilogueFusedLora, enabling the B.3 fused FFI path.
+                arithmetic_intensity: 1.0,
                 classification: BoundClassification::Unknown,
                 roofline_slack: 1.0,
                 adapter: roofline_kind,

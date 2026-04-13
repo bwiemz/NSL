@@ -38,6 +38,18 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(nsl_gpu_mem_report_atexit);
         }
     }
+
+    // B.3 Task 5: print fused-adapter kernel-launch count at exit when
+    // NSL_KERNEL_LAUNCH_COUNTER=1.  The counter is always live (cheap
+    // atomic increment); the env var only gates the report.
+    if std::env::var("NSL_KERNEL_LAUNCH_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(crate::fused_adapter::nsl_fused_adapter_launch_count_atexit);
+        }
+    }
 }
 
 extern "C" fn nsl_gpu_mem_report_atexit() {

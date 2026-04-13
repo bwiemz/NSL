@@ -328,6 +328,117 @@ fn task_4_fused_ffi_is_referenced_when_target_sm80() {
     }
 }
 
+// ─── B.3 Task 5: build_4_fused — load-bearing proof at 1e-4 tolerance ───
+//
+// Same source as Build 4, compiled with `--target cuda_sm80` so the AST
+// rewrite emits a single Call to `nsl_adapter_fused_lora_matmul` with a
+// real, deterministic `kernel_handle` (Task 5 wiring).  Tolerance is
+// **1e-4**, NOT 1e-3:
+//   - 1e-3 would mask numeric drift indicating the PTX epilogue is doing
+//     something subtly wrong.  If 1e-4 fails, **investigate before
+//     loosening** — see diagnostic guidance in the panic message.
+//
+// As of Task 5 the FFI body is still the CPU-fallback stub (real cudarc
+// launch is the test's eventual unblock target — see
+// `build_5_real_cuda_launch` ignored case).  The CPU stub computes the
+// exact math, so this test exercises the full dispatch + kernel_handle
+// plumbing and asserts numeric correctness; the runtime-counter test
+// (build_5) is what proves "exactly one kernel per site".
+#[test]
+fn build_4_fused() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build4_fused.nsl");
+    fs::write(&src_path, BUILD4_SRC).unwrap();
+    let stdout =
+        run_nsl_expect_ok(&src_path, &["--source-ad", "--target", "cuda_sm80"]);
+    let tensor = parse_tensor_2d(&stdout);
+    assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
+    let mut max_diff: f32 = 0.0;
+    for row in &tensor {
+        assert_eq!(row.len(), 8);
+        for v in row {
+            max_diff = max_diff.max((v - 16.0).abs());
+        }
+    }
+    assert!(
+        max_diff < 1e-4,
+        "build_4_fused: max |y - 16.0| = {max_diff:.3e}, want < 1e-4. \
+         Diagnostic: \
+         ~1e-3 = numeric bug (epilogue accumulator order or scale dtype); \
+         ~1.0+ = scale/dim wrong (alpha/rank, m@A@B order); \
+         exactly 0 = test never exercised the fused path (rewrite skipped); \
+         exactly 16.0 difference (y == 0) = base matmul fired but adapter delta dropped. \
+         Tensor: {tensor:?}",
+    );
+}
+
+// ─── B.3 Task 5: build_5_kernel_count — exactly one launch per site ─────
+//
+// Runs the same single-LoRA-site source as Build 4, with the runtime
+// kernel-launch counter enabled via `NSL_KERNEL_LAUNCH_COUNTER=1`.  At
+// process exit the runtime prints `[nsl-kernel-count] <N>` to stderr.
+// Asserts N == 1: one fused FFI call per `m.forward(x)` invocation, and
+// the BUILD4_SRC source invokes forward exactly once *after* the train
+// step.  (The train step itself also invokes forward, so the total is 2
+// — see assertion.)
+#[test]
+fn build_5_fused_launches_one_kernel_per_site() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build5_count.nsl");
+    fs::write(&src_path, BUILD4_SRC).unwrap();
+
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_KERNEL_LAUNCH_COUNTER", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    assert!(
+        output.status.success(),
+        "nsl run failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Find the count line.
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("[nsl-kernel-count]"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no [nsl-kernel-count] line in stderr; counter never fired. \
+                 Either env-gating broken or atexit didn't run.\nstderr:\n{stderr}",
+            )
+        });
+    let count: u64 = line
+        .split_whitespace()
+        .next_back()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("malformed count line: {line:?}"));
+
+    // The B.3 spec invariant: exactly one fused-FFI launch per adapter
+    // call site per program invocation of that site.  BUILD4_SRC has one
+    // top-level `m.forward(x)` after seeding that resolves through the
+    // rewritten fused path.  The in-train-step `m.forward` uses the
+    // source-AD forward graph (a separate compilation that does not pass
+    // through the same model-method body), so does NOT increment the
+    // counter.  Net expected: 1.
+    assert_eq!(
+        count, 1,
+        "build_5: expected exactly 1 fused launch per LoRA site per \
+         user-level forward call, got {count}. \
+         Diagnostic: \
+         0 = rewrite never produced a fused Call (target_sm or fusion \
+         gate failed); \
+         2+ = the same site was lowered through both the fused and \
+         unfused paths, or the AST rewrite duplicated the Call.",
+    );
+}
+
 #[test]
 fn build_4_lora_rewrite_load_bearing_proof() {
     let tmp = TempDir::new().unwrap();

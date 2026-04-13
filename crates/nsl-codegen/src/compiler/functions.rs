@@ -545,6 +545,17 @@ impl Compiler<'_> {
                             // fused single-FFI path and the B.2.1 unfused
                             // triple.
                             ctx.target_sm = self.target_sm();
+                            // B.3 Task 5: deterministic ordering of
+                            // fused PTX kernel keys, used by the rewrite
+                            // to assign a stable per-site `kernel_handle`.
+                            // Sort by the full key tuple.
+                            let mut order: Vec<crate::wrga_fused_ptx::LoraKernelKey> = self
+                                .fused_ptx_kernels
+                                .keys()
+                                .cloned()
+                                .collect();
+                            order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
+                            ctx.fused_kernel_order = order;
                             // Find the `self` Symbol and populate field_symbols
                             // from the model's known fields for matcher support.
                             ctx.self_sym = fn_def
