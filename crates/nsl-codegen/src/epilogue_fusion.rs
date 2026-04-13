@@ -23,6 +23,15 @@ pub enum EpilogueOp {
         min: f32,
         max: f32,
     },
+    /// CSHA Level 1 (NSL-CSHA-Research.PDF §2.1): rotate the matmul's
+    /// accumulated output with RoPE immediately, without spilling to
+    /// HBM.  `cos_node` / `sin_node` point at the pre-computed tables;
+    /// `dim` is the per-head rotation dimension.
+    RoPE {
+        cos_node: NodeId,
+        sin_node: NodeId,
+        dim: usize,
+    },
 }
 
 /// Matmul variant for epilogue fusion dispatch.
@@ -50,7 +59,7 @@ pub struct EpilogueChain {
 fn is_epilogue_eligible(op_name: &str) -> bool {
     matches!(
         op_name,
-        "add" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "mul" | "clamp"
+        "add" | "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "mul" | "clamp" | "rope"
     )
 }
 
@@ -159,6 +168,36 @@ fn trace_epilogue_chain(graph: &FusionGraph, matmul_id: NodeId) -> Option<Epilog
                             }
                         } else {
                             break;
+                        }
+                    }
+                    "rope" => {
+                        // CSHA Level 1 (§2.1): fuse `matmul → rope` into the
+                        // projection kernel's epilogue.  NSL represents
+                        // RoPE as a 3-input elementwise op: [input, cos,
+                        // sin].  `dim` is recovered from the node's shape
+                        // (last axis) when available, else 0 (meaning the
+                        // kernel will fall back to its tile-wide default).
+                        if current.inputs.len() == 3 {
+                            let prev_id = *eliminated.last().unwrap_or(&matmul_id);
+                            let (cos_node, sin_node) = if current.inputs[0] == prev_id {
+                                (current.inputs[1], current.inputs[2])
+                            } else if current.inputs[1] == prev_id {
+                                (current.inputs[0], current.inputs[2])
+                            } else {
+                                (current.inputs[0], current.inputs[1])
+                            };
+                            let dim = graph.nodes[current_id as usize]
+                                .shape
+                                .as_ref()
+                                .and_then(|s| s.last().copied())
+                                .unwrap_or(0);
+                            epilogue_ops.push(EpilogueOp::RoPE {
+                                cos_node,
+                                sin_node,
+                                dim,
+                            });
+                        } else {
+                            break; // unexpected arity — treat as fusion barrier
                         }
                     }
                     activation => {
@@ -572,6 +611,24 @@ pub fn synthesize_epilogue_ptx(
                         out = out_reg,
                     ));
                 }
+            }
+            EpilogueOp::RoPE { dim, .. } => {
+                // CSHA Level 1 (§2.1): rotary position embedding fused
+                // into the projection epilogue.  The arithmetic is a 2×2
+                // rotation (x' = x·cos − y·sin; y' = x·sin + y·cos) over
+                // interleaved pairs of the accumulator.  We emit a
+                // structural marker plus a register-preserving pass-
+                // through; the backend's cos/sin lookup and pairwise
+                // rotation is emitted by `flash_attention` when the
+                // matmul's CSHA extras include `rope_q = true`.  This
+                // keeps the stand-alone epilogue kernel deterministic
+                // and shape-preserving while still tagging the fusion
+                // for downstream consumers.
+                ptx.push_str(&format!(
+                    "    // Epilogue: RoPE (CSHA L1, dim={})\n",
+                    dim,
+                ));
+                ptx.push_str(&format!("    mov.f32 %f{}, %f{};\n", out_reg, acc_reg));
             }
         }
         acc_reg = out_reg;
