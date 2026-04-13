@@ -122,3 +122,54 @@ fn write_manifest_round_trips() {
     let back: Manifest = serde_json::from_str(&s).unwrap();
     assert_eq!(back.target_gpu, "h100-sxm");
 }
+
+#[test]
+fn reserve_id_returns_dense_monotonic() {
+    let mut b = ManifestBuilder::new("h100-sxm", "bf16");
+    assert_eq!(b.reserve_id(), 0);
+    assert_eq!(b.reserve_id(), 1);
+    assert_eq!(b.reserve_id(), 2);
+}
+
+#[test]
+fn record_kernel_at_uses_supplied_id() {
+    let mut b = ManifestBuilder::new("h100-sxm", "bf16");
+    let id = b.reserve_id();
+    b.record_kernel_at(
+        id, "matmul",
+        SourceSpanJson { file: "m.nsl".into(), start_line: 10, end_line: 12 },
+        1.5, 1000, 50,
+    );
+    let m = b.finish();
+    assert_eq!(m.kernels.len(), 1);
+    assert_eq!(m.kernels[0].kernel_id, id);
+    assert_eq!(m.kernels[0].op_name, "matmul");
+    assert_eq!(m.kernels[0].source_span.start_line, 10);
+}
+
+#[test]
+fn reserve_id_and_record_kernel_interoperate() {
+    let mut b = ManifestBuilder::new("h100-sxm", "bf16");
+    let a = b.reserve_id();
+    b.record_kernel_at(a, "x", SourceSpanJson { file: "m".into(), start_line: 1, end_line: 1 }, 0.0, 0, 0);
+    let bid = b.record_kernel("y", SourceSpanJson { file: "m".into(), start_line: 2, end_line: 2 }, 0.0, 0, 0);
+    assert_eq!(bid, 1);
+    let mfst = b.finish();
+    assert_eq!(mfst.kernels.len(), 2);
+    assert_eq!(mfst.kernels[0].kernel_id, 0);
+    assert_eq!(mfst.kernels[1].kernel_id, 1);
+}
+
+#[test]
+fn source_span_json_from_span_resolves_lines() {
+    let src = "line1\nline2\nline3\nline4\n";
+    let span = nsl_errors::Span {
+        file_id: nsl_errors::FileId(0),
+        start: nsl_errors::BytePos(6),
+        end: nsl_errors::BytePos(11),
+    };
+    let s = SourceSpanJson::from_span(span, "m.nsl", src);
+    assert_eq!(s.start_line, 2);
+    assert_eq!(s.end_line, 2);
+    assert_eq!(s.file, "m.nsl");
+}

@@ -22,6 +22,20 @@ pub struct SourceSpanJson {
     pub end_line: u32,
 }
 
+impl SourceSpanJson {
+    /// Resolve a byte-positioned Span to 1-based line numbers using the source text.
+    pub fn from_span(span: nsl_errors::Span, file_name: &str, source_text: &str) -> Self {
+        let start_line = line_of_byte(source_text, span.start.0);
+        let end_byte = span.end.0.saturating_sub(1).max(span.start.0);
+        let end_line = line_of_byte(source_text, end_byte);
+        Self {
+            file: file_name.into(),
+            start_line,
+            end_line,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelEntry {
     pub kernel_id: u32,
@@ -65,6 +79,35 @@ impl ManifestBuilder {
         }
     }
 
+    /// Reserve the next kernel_id without recording a KernelEntry.
+    /// Used by codegen so the same id can be emitted as a Cranelift constant
+    /// in begin/end hook calls, and the entry recorded in the same call site.
+    pub fn reserve_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Record a KernelEntry at a caller-supplied id.
+    pub fn record_kernel_at(
+        &mut self,
+        id: u32,
+        op_name: &str,
+        span: SourceSpanJson,
+        predicted_us: f64,
+        predicted_flops: u64,
+        predicted_hbm_bytes: u64,
+    ) {
+        self.inner.kernels.push(KernelEntry {
+            kernel_id: id,
+            op_name: op_name.into(),
+            source_span: span,
+            predicted_us,
+            predicted_flops,
+            predicted_hbm_bytes,
+        });
+    }
+
     pub fn record_kernel(
         &mut self,
         op_name: &str,
@@ -73,16 +116,8 @@ impl ManifestBuilder {
         flops: u64,
         hbm: u64,
     ) -> u32 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.inner.kernels.push(KernelEntry {
-            kernel_id: id,
-            op_name: op_name.into(),
-            source_span: span,
-            predicted_us: us,
-            predicted_flops: flops,
-            predicted_hbm_bytes: hbm,
-        });
+        let id = self.reserve_id();
+        self.record_kernel_at(id, op_name, span, us, flops, hbm);
         id
     }
 
