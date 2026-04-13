@@ -406,6 +406,25 @@ enum Cli {
         #[arg(long)]
         wggo_report: bool,
 
+        /// WGGO Stage 3: path to a `.nslweights` sidecar for real
+        /// weight-based importance scoring.  Without this flag the
+        /// analyzer falls back to uniform head scores.
+        #[arg(long, value_name = "PATH")]
+        wggo_weights: Option<PathBuf>,
+
+        /// WGGO Stage 3 importance-scoring mode ("none" or
+        /// "magnitude").  "grad" is reserved for a future milestone
+        /// (blocked on a compile-time execution harness).  Defaults
+        /// to "magnitude" when `--wggo-weights` is set, else "none".
+        #[arg(long, value_name = "MODE")]
+        wggo_importance: Option<String>,
+
+        /// WGGO Stage 3: fraction of heads the default
+        /// `min_retained_importance` threshold allows to be pruned.
+        /// Clamped to [0.0, 0.9]; default 0.25.
+        #[arg(long, value_name = "F")]
+        wggo_prune_fraction: Option<f64>,
+
         /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
         /// "block", or "off").  Passing `--csha` without a value enables
         /// auto mode.
@@ -737,6 +756,9 @@ fn main_inner() {
             wrga_fold_allocations,
             wggo,
             wggo_report,
+            wggo_weights,
+            wggo_importance,
+            wggo_prune_fraction,
             csha,
             csha_report,
         } => {
@@ -833,6 +855,9 @@ fn main_inner() {
                 wrga_fold_allocations,
                 wggo_mode: wggo.clone(),
                 wggo_report,
+                wggo_weights: wggo_weights.clone(),
+                wggo_importance: wggo_importance.clone(),
+                wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
             };
@@ -844,6 +869,42 @@ fn main_inner() {
                     eprintln!(
                         "error: --wggo value '{}' is not one of full|greedy|off|auto",
                         m
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref m) = wggo_importance {
+                match m.as_str() {
+                    "none" | "magnitude" => {}
+                    "grad" => {
+                        eprintln!(
+                            "error: --wggo-importance=grad is reserved for a future milestone (blocked on a compile-time execution harness); use 'magnitude' or 'none' for now"
+                        );
+                        process::exit(1);
+                    }
+                    other => {
+                        eprintln!(
+                            "error: --wggo-importance value '{}' is not one of none|magnitude",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            if let Some(f) = wggo_prune_fraction {
+                if !(0.0..=0.9).contains(&f) {
+                    eprintln!(
+                        "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
+                        f
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = wggo_weights {
+                if !p.exists() {
+                    eprintln!(
+                        "error: --wggo-weights path does not exist: {}",
+                        p.display()
                     );
                     process::exit(1);
                 }
@@ -971,6 +1032,9 @@ fn main_inner() {
                 wrga_fold_allocations: false,
                 wggo_mode: None,
                 wggo_report: false,
+                wggo_weights: None,
+                wggo_importance: None,
+                wggo_prune_fraction: None,
                 csha_mode: None,
                 csha_report: false,
             };

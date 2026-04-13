@@ -94,6 +94,10 @@ pub mod wggo_cost;
 pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
+pub mod wggo_schedule;
+pub mod wggo_weight_analysis;
+pub mod wggo_weight_analysis_cache;
+pub mod wggo_weight_analysis_nslweights;
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;
@@ -428,6 +432,19 @@ pub struct CompileOptions {
     pub wggo_mode: Option<String>,
     /// WGGO: print the global-optimization report to stderr.
     pub wggo_report: bool,
+    /// WGGO Stage 3: path to a `.nslweights` sidecar file for real
+    /// weight-based importance scoring.  When `None`, the analyzer
+    /// falls back to uniform per-head scores.
+    pub wggo_weights: Option<std::path::PathBuf>,
+    /// WGGO Stage 3: scoring mode ("none", "magnitude").  "grad" is
+    /// reserved for Phase 2 (blocked on a compile-time execution
+    /// harness).  Default "magnitude" when weights are supplied,
+    /// otherwise "none".
+    pub wggo_importance: Option<String>,
+    /// WGGO Stage 3: default fraction of heads the auto-derived
+    /// `min_retained_importance` threshold allows to be pruned.
+    /// Clamped to `[0.0, 0.9]`.  Default 0.25.
+    pub wggo_prune_fraction: Option<f64>,
     /// CSHA: fusion mode ("auto", "boundary", "pipeline", "block", "off").
     /// When `None`, CSHA is not run.  See `crates/nsl-codegen/src/csha.rs`.
     pub csha_mode: Option<String>,
@@ -477,6 +494,9 @@ impl Default for CompileOptions {
             wrga_fold_allocations: false,
             wggo_mode: None,
             wggo_report: false,
+            wggo_weights: None,
+            wggo_importance: None,
+            wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
         }
