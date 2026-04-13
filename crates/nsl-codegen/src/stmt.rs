@@ -3598,6 +3598,7 @@ impl Compiler<'_> {
                     adjoint.ops = crate::source_ad::eliminate_by_backward_live(
                         &adjoint.ops,
                         &plan.prune.backward_live,
+                        gen.adjoint_vars_map(),
                     );
                 }
 

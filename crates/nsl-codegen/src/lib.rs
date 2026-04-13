@@ -111,6 +111,24 @@ pub fn debug_compile_and_return_plan(
         (Err(e), None) => Err(e),
     }
 }
+#[doc(hidden)]
+pub mod debug_channels {
+    use std::cell::Cell;
+    thread_local! {
+        pub static ADJOINT_OPS_DROPPED: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+}
+
+#[doc(hidden)]
+pub fn debug_set_adjoint_ops_dropped(n: usize) {
+    debug_channels::ADJOINT_OPS_DROPPED.with(|c| c.set(Some(n)));
+}
+
+#[doc(hidden)]
+pub fn debug_last_adjoint_ops_dropped() -> Option<usize> {
+    debug_channels::ADJOINT_OPS_DROPPED.with(|c| c.get())
+}
+
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
 
