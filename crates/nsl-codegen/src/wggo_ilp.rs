@@ -7,14 +7,16 @@
 //!
 //! The per-layer problem is:
 //!
-//!     minimise   forward + backward + adapter_overhead
-//!     subject to  memory(heads, ffn, rank, prec) ≤ memory_budget
-//!                 smem(heads, ffn, csha)          ≤ smem_budget
-//!                 Σ_k head[k] ≥ 1
-//!                 gqa_group_constraint
-//!                 (heads kept must form whole KV groups)
-//!                 adapter_comm ≤ comm_budget
-//!                 numerical_sensitivity ⇒ prec ≥ min_bits
+//! ```text
+//! minimise   forward + backward + adapter_overhead
+//! subject to  memory(heads, ffn, rank, prec) ≤ memory_budget
+//!             smem(heads, ffn, csha)          ≤ smem_budget
+//!             Σ_k head[k] ≥ 1
+//!             gqa_group_constraint
+//!             (heads kept must form whole KV groups)
+//!             adapter_comm ≤ comm_budget
+//!             numerical_sensitivity ⇒ prec ≥ min_bits
+//! ```
 //!
 //! The search space is `2^H × |FFN widths| × 4 × |ranks| × 3 × 3` ≈ 30 k
 //! at H=8, small enough that branch-and-bound with LUT-based cost
@@ -65,6 +67,14 @@ pub struct LayerDecision {
     pub optim_m_bits: u8,
     /// Optimizer `v` precision (bits).
     pub optim_v_bits: u8,
+    /// Whether FASE fuses the optimizer step into the backward pass for
+    /// this layer.  When `true`, gradient buffers are not materialised in
+    /// HBM and the backward kernel writes parameter updates directly.
+    pub fase_fused: bool,
+    /// PCA sequence-packing mode for attention kernels on this layer.
+    ///   0 = none, 1 = segment_id, 2 = tile_skip, 3 = multi_seq.
+    /// Each mode skips progressively more padded work (paper §4.3.6).
+    pub packing_mode: u8,
 }
 
 impl LayerDecision {
@@ -106,6 +116,27 @@ pub struct LayerIlpConstraints {
     /// summed importance.
     pub head_importance: Vec<f64>,
     pub min_retained_importance: f64,
+    /// Whether the FASE fused-step option is permitted for this layer.
+    /// When `false` the solver must pick `fase_fused = false`.  Callers
+    /// set this to `false` for layers sharded by CPDT (since fusing into
+    /// backward conflicts with reduce-scatter ordering — the conflict
+    /// resolver would defer it anyway, but pre-pruning saves work).
+    pub allow_fase: bool,
+    /// Estimated relative speedup of the backward pass when FASE fuses
+    /// the optimizer step into it.  Typical values: 0.05–0.15.  The
+    /// fused step also eliminates a separate gradient HBM round-trip,
+    /// which is modeled as removing one parameter-sized buffer from the
+    /// activation footprint.
+    pub fase_backward_speedup: f64,
+    /// Bit-mask of permitted PCA packing modes.  Bit `i` set = mode `i`
+    /// allowed.  Default `0b1111` (all four modes).  Callers set this to
+    /// `0b0001` (only `none`) to disable PCA entirely for a layer — e.g.,
+    /// non-attention layers or kernels whose shape forbids packing.
+    pub packing_modes_mask: u8,
+    /// Estimated fractional work reduction per packing mode, indexed by
+    /// mode (0..=3).  Typical defaults: 0.00, 0.15, 0.25, 0.35 — derived
+    /// from the fraction of padded tokens in typical batches.
+    pub packing_savings: [f64; 4],
 }
 
 impl Default for LayerIlpConstraints {
@@ -122,6 +153,10 @@ impl Default for LayerIlpConstraints {
             critical_prec_threshold: 0.9,
             head_importance: Vec::new(),
             min_retained_importance: 0.0,
+            allow_fase: true,
+            fase_backward_speedup: 0.10,
+            packing_modes_mask: 0b1111,
+            packing_savings: [0.00, 0.15, 0.25, 0.35],
         }
     }
 }
@@ -167,6 +202,11 @@ pub fn solve_layer(
     // largest ffn, min rank, min precision) first because those tend to be
     // near-optimal — producing a good incumbent early tightens the bound.
     let precision_domain: &[u8] = &[32, 16, 8];
+    let fase_domain: &[bool] = if constraints.allow_fase {
+        &[true, false]
+    } else {
+        &[false]
+    };
 
     for &m_bits in precision_domain {
         if !prec_allowed(m_bits, constraints) {
@@ -176,43 +216,57 @@ pub fn solve_layer(
             if !prec_allowed(v_bits, constraints) {
                 continue;
             }
-            for &c in lut.axes_csha_levels.iter().rev() {
-                for &f in lut.axes_ffn_widths.iter().rev() {
-                    for &r in &lut.axes_adapter_ranks {
-                        for heads_config in enumerate_head_configs(constraints) {
-                            state.nodes += 1;
-                            let h_count = heads_config.iter().filter(|b| **b).count() as u64;
-                            let Some(entry) = lut.get(h_count.max(1), f, c, r) else {
-                                continue;
-                            };
-                            if !entry.feasible {
-                                continue;
+            for &fase in fase_domain {
+                for pack in enumerate_packing_modes(constraints) {
+                    for &c in lut.axes_csha_levels.iter().rev() {
+                        for &f in lut.axes_ffn_widths.iter().rev() {
+                            for &r in &lut.axes_adapter_ranks {
+                                for heads_config in enumerate_head_configs(constraints) {
+                                    state.nodes += 1;
+                                    let h_count =
+                                        heads_config.iter().filter(|b| **b).count() as u64;
+                                    let Some(base) = lut.get(h_count.max(1), f, c, r) else {
+                                        continue;
+                                    };
+                                    if !base.feasible {
+                                        continue;
+                                    }
+                                    let adj_fase =
+                                        apply_fase(base, fase, constraints.fase_backward_speedup);
+                                    let entry = apply_packing(
+                                        adj_fase,
+                                        pack,
+                                        &constraints.packing_savings,
+                                    );
+                                    if entry.smem_bytes > constraints.smem_budget {
+                                        continue;
+                                    }
+                                    if entry.param_bytes + entry.activation_bytes
+                                        > constraints.memory_budget
+                                    {
+                                        continue;
+                                    }
+                                    if !importance_ok(&heads_config, constraints) {
+                                        continue;
+                                    }
+                                    if entry.total_us() >= state.best_cost {
+                                        continue; // bound prune
+                                    }
+                                    let decision = LayerDecision {
+                                        keep_head: heads_config.clone(),
+                                        ffn_width: f,
+                                        csha_level: c,
+                                        adapter_rank: r,
+                                        optim_m_bits: m_bits,
+                                        optim_v_bits: v_bits,
+                                        fase_fused: fase,
+                                        packing_mode: pack,
+                                    };
+                                    state.best_cost = entry.total_us();
+                                    state.best_decision = Some(decision);
+                                    state.best_entry = Some(entry);
+                                }
                             }
-                            if entry.smem_bytes > constraints.smem_budget {
-                                continue;
-                            }
-                            if entry.param_bytes + entry.activation_bytes
-                                > constraints.memory_budget
-                            {
-                                continue;
-                            }
-                            if !importance_ok(&heads_config, constraints) {
-                                continue;
-                            }
-                            if entry.total_us() >= state.best_cost {
-                                continue; // bound prune
-                            }
-                            let decision = LayerDecision {
-                                keep_head: heads_config.clone(),
-                                ffn_width: f,
-                                csha_level: c,
-                                adapter_rank: r,
-                                optim_m_bits: m_bits,
-                                optim_v_bits: v_bits,
-                            };
-                            state.best_cost = entry.total_us();
-                            state.best_decision = Some(decision);
-                            state.best_entry = Some(entry);
                         }
                     }
                 }
@@ -246,6 +300,234 @@ pub fn solve_layer(
     }
 }
 
+/// Diagnostic counters for [`solve_all_templated`].
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct TemplateStats {
+    /// Number of distinct (LUT, constraint) templates that required a
+    /// fresh ILP solve.  Always ≥ 1 when there is at least one layer.
+    pub templates_solved: u32,
+    /// Number of layers whose solution was reused from a previously
+    /// solved template instead of being re-derived.
+    pub template_hits: u32,
+}
+
+/// Solve every layer, but reuse the solution across consecutive layers
+/// whose `(LayerCostLut, LayerIlpConstraints)` are identical.  This is
+/// the "template-layer optimization" the audit calls out: transformer
+/// blocks repeat the same shape and constraints, so solving once per
+/// template and replicating costs a single ILP pass for the whole model.
+///
+/// Importance-aware specialisation: the importance vectors are part of
+/// the template key, so any layer whose `head_importance` diverges from
+/// its predecessors will spawn a fresh solve.
+pub fn solve_all_templated(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (Vec<LayerIlpSolution>, TemplateStats) {
+    assert_eq!(
+        luts.len(),
+        constraints.len(),
+        "luts and constraints must be parallel arrays"
+    );
+    let mut out: Vec<LayerIlpSolution> = Vec::with_capacity(luts.len());
+    let mut stats = TemplateStats::default();
+    let mut template_idx: Option<usize> = None;
+
+    for (i, (lut, c)) in luts.iter().zip(constraints.iter()).enumerate() {
+        let reuse = template_idx
+            .map(|j| lut_eq(&luts[j], lut) && constraints_eq(&constraints[j], c))
+            .unwrap_or(false);
+        if reuse {
+            let mut s = out[template_idx.unwrap()].clone();
+            // Mark replicated solutions with zero nodes so callers can
+            // distinguish fresh solves from cache hits.
+            s.nodes_explored = 0;
+            out.push(s);
+            stats.template_hits += 1;
+        } else {
+            let sol = solve_layer(lut, c);
+            out.push(sol);
+            stats.templates_solved += 1;
+            template_idx = Some(i);
+        }
+    }
+
+    (out, stats)
+}
+
+/// Field-by-field equality for [`LayerCostLut`] (manual to avoid
+/// requiring `PartialEq` on the cost-model leaves).
+fn lut_eq(a: &LayerCostLut, b: &LayerCostLut) -> bool {
+    if a.axes_head_counts != b.axes_head_counts
+        || a.axes_ffn_widths != b.axes_ffn_widths
+        || a.axes_csha_levels != b.axes_csha_levels
+        || a.axes_adapter_ranks != b.axes_adapter_ranks
+        || a.entries.len() != b.entries.len()
+    {
+        return false;
+    }
+    a.entries.iter().zip(b.entries.iter()).all(|(x, y)| {
+        x.forward_us.to_bits() == y.forward_us.to_bits()
+            && x.backward_us.to_bits() == y.backward_us.to_bits()
+            && x.param_bytes == y.param_bytes
+            && x.activation_bytes == y.activation_bytes
+            && x.smem_bytes == y.smem_bytes
+            && x.feasible == y.feasible
+            && x.classification == y.classification
+    })
+}
+
+/// Field-by-field equality for [`LayerIlpConstraints`], including the
+/// importance vector — divergent importance must trigger a fresh solve.
+fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
+    a.num_heads == b.num_heads
+        && a.num_kv_groups == b.num_kv_groups
+        && a.memory_budget == b.memory_budget
+        && a.smem_budget == b.smem_budget
+        && a.adapter_comm_budget.to_bits() == b.adapter_comm_budget.to_bits()
+        && a.gqa_group == b.gqa_group
+        && a.sensitivity.to_bits() == b.sensitivity.to_bits()
+        && a.high_prec_threshold.to_bits() == b.high_prec_threshold.to_bits()
+        && a.critical_prec_threshold.to_bits() == b.critical_prec_threshold.to_bits()
+        && a.head_importance.len() == b.head_importance.len()
+        && a.head_importance
+            .iter()
+            .zip(b.head_importance.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.min_retained_importance.to_bits() == b.min_retained_importance.to_bits()
+        && a.allow_fase == b.allow_fase
+        && a.fase_backward_speedup.to_bits() == b.fase_backward_speedup.to_bits()
+        && a.packing_modes_mask == b.packing_modes_mask
+        && a.packing_savings
+            .iter()
+            .zip(b.packing_savings.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Solve a layer **greedily** — paper §5.3.
+///
+/// Each decision variable is chosen independently using a fast local
+/// heuristic instead of the cross-product branch-and-bound search.  The
+/// result may be sub-optimal but is reached in O(sum-of-domains) LUT
+/// lookups (~30) instead of O(product-of-domains) (~1.8 M with FASE and
+/// PCA enabled) — the paper measures this at <500 ms on full transformer
+/// models.  The conflict resolver runs downstream as usual; greedy makes
+/// no attempt to satisfy inter-technique constraints by itself.
+pub fn solve_layer_greedy(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> LayerIlpSolution {
+    let mut nodes = 0u64;
+
+    // Heads: keep all that satisfy the GQA-group + importance constraint.
+    let h = constraints.num_heads as usize;
+    let keep_head = if importance_ok(&vec![true; h], constraints) {
+        vec![true; h]
+    } else {
+        enumerate_head_configs(constraints)
+            .into_iter()
+            .find(|cfg| importance_ok(cfg, constraints))
+            .unwrap_or_else(|| vec![true; h])
+    };
+    let h_count = (keep_head.iter().filter(|b| **b).count() as u64).max(1);
+
+    // FFN: largest available width.
+    let f = *lut.axes_ffn_widths.iter().max().unwrap_or(&1024);
+
+    // CSHA: highest level whose smem fits.
+    let c = lut
+        .axes_csha_levels
+        .iter()
+        .copied()
+        .rev()
+        .find(|&lvl| {
+            nodes += 1;
+            lut.get(h_count, f, lvl, 0)
+                .map(|e| e.feasible && e.smem_bytes <= constraints.smem_budget)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+
+    // Adapter rank: greedy keeps it at 0 (no LoRA unless explicitly asked).
+    let r = *lut.axes_adapter_ranks.iter().min().unwrap_or(&0);
+
+    // Precision: lowest precision allowed by sensitivity (cheapest).
+    let m_bits = pick_precision_low(constraints);
+    let v_bits = pick_precision_low(constraints);
+
+    // FASE + PCA: pick the local-best at this layer.
+    let fase_fused = constraints.allow_fase;
+    let packing_mode = enumerate_packing_modes(constraints)[0];
+
+    let Some(base) = lut.get(h_count, f, c, r) else {
+        return LayerIlpSolution {
+            decision: fallback_decision(constraints),
+            cost_us: f64::INFINITY,
+            memory_bytes: 0,
+            smem_bytes: 0,
+            nodes_explored: nodes,
+            feasible: false,
+            decision_trace: Vec::new(),
+        };
+    };
+    let entry = apply_packing(
+        apply_fase(base, fase_fused, constraints.fase_backward_speedup),
+        packing_mode,
+        &constraints.packing_savings,
+    );
+    let memory_bytes = entry.param_bytes + entry.activation_bytes;
+    let feasible = base.feasible
+        && entry.smem_bytes <= constraints.smem_budget
+        && memory_bytes <= constraints.memory_budget;
+
+    if !feasible {
+        return LayerIlpSolution {
+            decision: fallback_decision(constraints),
+            cost_us: f64::INFINITY,
+            memory_bytes,
+            smem_bytes: entry.smem_bytes,
+            nodes_explored: nodes,
+            feasible: false,
+            decision_trace: Vec::new(),
+        };
+    }
+
+    LayerIlpSolution {
+        decision: LayerDecision {
+            keep_head,
+            ffn_width: f,
+            csha_level: c,
+            adapter_rank: r,
+            optim_m_bits: m_bits,
+            optim_v_bits: v_bits,
+            fase_fused,
+            packing_mode,
+        },
+        cost_us: entry.total_us(),
+        memory_bytes,
+        smem_bytes: entry.smem_bytes,
+        nodes_explored: nodes,
+        feasible: true,
+        decision_trace: Vec::new(),
+    }
+}
+
+/// Greedy variant of [`solve_all`].
+pub fn solve_all_greedy(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> Vec<LayerIlpSolution> {
+    assert_eq!(
+        luts.len(),
+        constraints.len(),
+        "luts and constraints must be parallel arrays"
+    );
+    luts.iter()
+        .zip(constraints.iter())
+        .map(|(lut, c)| solve_layer_greedy(lut, c))
+        .collect()
+}
+
 /// Solve all layers in parallel-safe sequential order.
 pub fn solve_all(
     luts: &[LayerCostLut],
@@ -273,6 +555,18 @@ struct SolverState {
     nodes: u64,
     #[allow(dead_code)]
     global_lower_bound: f64,
+}
+
+/// Pick the lowest precision (in bits) that the sensitivity floor allows.
+/// Used by the greedy solver — lower precision is cheaper to execute, so
+/// the locally-optimal pick is "as low as legal".
+fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
+    for &bits in &[8u8, 16, 32] {
+        if prec_allowed(bits, c) {
+            return bits;
+        }
+    }
+    32
 }
 
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
@@ -491,6 +785,66 @@ fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
         adapter_rank: 0,
         optim_m_bits: 32,
         optim_v_bits: 32,
+        fase_fused: false,
+        packing_mode: 0,
+    }
+}
+
+/// Enumerate permitted PCA packing modes per the constraint mask.  Modes
+/// are returned with larger-savings modes first so the solver finds a good
+/// incumbent early (tightening the bound).
+fn enumerate_packing_modes(c: &LayerIlpConstraints) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4);
+    for m in (0u8..=3).rev() {
+        if c.packing_modes_mask & (1 << m) != 0 {
+            out.push(m);
+        }
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out
+}
+
+/// Apply the PCA packing-mode's effective work reduction to an entry.
+/// Packing skips padded tokens, so forward + backward compute both shrink
+/// by the same fraction.  Memory and SMEM are unaffected.
+fn apply_packing(base: LayerCostEntry, mode: u8, savings: &[f64; 4]) -> LayerCostEntry {
+    let s = savings.get(mode as usize).copied().unwrap_or(0.0).clamp(0.0, 0.95);
+    LayerCostEntry {
+        forward_us: base.forward_us * (1.0 - s),
+        backward_us: base.backward_us * (1.0 - s),
+        param_bytes: base.param_bytes,
+        activation_bytes: base.activation_bytes,
+        smem_bytes: base.smem_bytes,
+        feasible: base.feasible,
+        classification: base.classification,
+    }
+}
+
+/// Adjust a baseline LUT entry for the FASE fused-step option.  Fusing the
+/// optimizer step into the backward kernel removes the explicit gradient
+/// HBM round-trip (modeled as one parameter-sized buffer dropping out of
+/// the activation footprint) and reduces backward latency by
+/// `fase_backward_speedup` (typically 5–15 %).  Both adjustments saturate
+/// at zero so the entry remains physically meaningful.
+fn apply_fase(base: LayerCostEntry, fase_fused: bool, speedup: f64) -> LayerCostEntry {
+    if !fase_fused {
+        return base;
+    }
+    let s = speedup.clamp(0.0, 0.5);
+    let backward_us = base.backward_us * (1.0 - s);
+    // Fused step writes parameter updates directly — the gradient buffer
+    // (≈ param_bytes) never lands in HBM as a distinct activation tensor.
+    let activation_bytes = base.activation_bytes.saturating_sub(base.param_bytes);
+    LayerCostEntry {
+        forward_us: base.forward_us,
+        backward_us,
+        param_bytes: base.param_bytes,
+        activation_bytes,
+        smem_bytes: base.smem_bytes,
+        feasible: base.feasible,
+        classification: base.classification,
     }
 }
 
@@ -602,6 +956,73 @@ mod tests {
     }
 
     #[test]
+    fn templated_solve_reuses_identical_layers() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut.clone(); 8];
+        let cs = vec![c; 8];
+        let (sols, stats) = solve_all_templated(&luts, &cs);
+        assert_eq!(sols.len(), 8);
+        assert_eq!(stats.templates_solved, 1);
+        assert_eq!(stats.template_hits, 7);
+        // Replicated solutions report zero nodes_explored.
+        assert!(sols[0].nodes_explored > 0);
+        for s in &sols[1..] {
+            assert_eq!(s.nodes_explored, 0);
+        }
+        // The decisions themselves must match.
+        for s in &sols[1..] {
+            assert_eq!(s.decision, sols[0].decision);
+        }
+    }
+
+    #[test]
+    fn templated_solve_specialises_when_importance_diverges() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c1 = LayerIlpConstraints::default();
+        c1.num_heads = 4;
+        let mut c2 = c1.clone();
+        c2.head_importance = vec![10.0, 0.1, 0.1, 0.1];
+        c2.min_retained_importance = 5.0;
+        let luts = vec![lut.clone(), lut.clone(), lut];
+        let cs = vec![c1.clone(), c1.clone(), c2];
+        let (_sols, stats) = solve_all_templated(&luts, &cs);
+        // Layers 0 and 1 share a template; layer 2's diverging
+        // importance must trigger a fresh solve.
+        assert_eq!(stats.templates_solved, 2);
+        assert_eq!(stats.template_hits, 1);
+    }
+
+    #[test]
+    fn templated_solve_matches_full_solve_per_layer() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut.clone(); 4];
+        let cs = vec![c.clone(); 4];
+        let full = solve_all(&luts, &cs);
+        let (templated, _) = solve_all_templated(&luts, &cs);
+        for (a, b) in full.iter().zip(templated.iter()) {
+            assert_eq!(a.decision, b.decision);
+            assert!((a.cost_us - b.cost_us).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn templated_solve_handles_alternating_templates() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c1 = LayerIlpConstraints::default();
+        let mut c2 = c1.clone();
+        c2.smem_budget = 4096; // forces csha=0 → different solution
+        // Pattern: A, A, B, A — three template switches, two solves of A.
+        let luts = vec![lut.clone(); 4];
+        let cs = vec![c1.clone(), c1.clone(), c2, c1];
+        let (sols, stats) = solve_all_templated(&luts, &cs);
+        assert_eq!(sols.len(), 4);
+        assert_eq!(stats.templates_solved, 3);
+        assert_eq!(stats.template_hits, 1);
+    }
+
+    #[test]
     fn solver_never_picks_infeasible_csha() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let mut constraints = LayerIlpConstraints::default();
@@ -622,9 +1043,154 @@ mod tests {
     fn solver_visits_finite_number_of_nodes() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let sol = solve_layer(&lut, &LayerIlpConstraints::default());
-        // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 = 229 500.  Allow
-        // 2× for expansion inside branches.
-        assert!(sol.nodes_explored <= 500_000, "nodes={}", sol.nodes_explored);
+        // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 × 2 (FASE) × 4 (PCA)
+        // = 1 836 000.  Allow 2× for expansion inside branches.
+        assert!(sol.nodes_explored <= 4_000_000, "nodes={}", sol.nodes_explored);
+    }
+
+    #[test]
+    fn fase_fused_picked_when_allowed_and_lowers_backward() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let with_fase = solve_layer(&lut, &LayerIlpConstraints::default());
+        let without_fase = solve_layer(
+            &lut,
+            &LayerIlpConstraints {
+                allow_fase: false,
+                ..LayerIlpConstraints::default()
+            },
+        );
+        assert!(with_fase.feasible && without_fase.feasible);
+        assert!(with_fase.decision.fase_fused);
+        assert!(!without_fase.decision.fase_fused);
+        // Fusion must strictly improve the objective at the default 10%
+        // backward speedup.
+        assert!(
+            with_fase.cost_us < without_fase.cost_us,
+            "with_fase={} should beat without_fase={}",
+            with_fase.cost_us,
+            without_fase.cost_us
+        );
+    }
+
+    #[test]
+    fn fase_fused_forced_off_when_disallowed() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut constraints = LayerIlpConstraints::default();
+        constraints.allow_fase = false;
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert!(!sol.decision.fase_fused);
+    }
+
+    #[test]
+    fn fase_speedup_zero_makes_decision_neutral() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut constraints = LayerIlpConstraints::default();
+        constraints.fase_backward_speedup = 0.0;
+        // With no backward speedup the only benefit is reduced activation
+        // bytes — still strictly preferable under default unbounded memory,
+        // but the cost objective is identical, so the solver may pick
+        // either branch.  We only assert feasibility.
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+    }
+
+    #[test]
+    fn greedy_explores_far_fewer_nodes_than_full() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints::default();
+        let full = solve_layer(&lut, &constraints);
+        let greedy = solve_layer_greedy(&lut, &constraints);
+        assert!(greedy.feasible);
+        // Greedy is meant to be O(sum-of-domains) — orders of magnitude
+        // cheaper than the full cross-product.
+        assert!(
+            greedy.nodes_explored * 100 < full.nodes_explored,
+            "greedy={} full={}",
+            greedy.nodes_explored,
+            full.nodes_explored
+        );
+    }
+
+    #[test]
+    fn greedy_returns_finite_cost() {
+        // Quality bound vs full ILP is workload-dependent — paper claims
+        // ~5 % on real transformers, but the toy LUT's roofline model can
+        // make greedy's "largest FFN + highest CSHA" picks look much
+        // worse than full's globally-balanced choice.  We only assert
+        // greedy returns a feasible plan with finite cost; the
+        // `greedy_explores_far_fewer_nodes_than_full` test already
+        // verifies the speed promise.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let greedy = solve_layer_greedy(&lut, &LayerIlpConstraints::default());
+        assert!(greedy.feasible);
+        assert!(greedy.cost_us.is_finite());
+        assert!(greedy.cost_us > 0.0);
+    }
+
+    #[test]
+    fn greedy_respects_smem_budget() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.smem_budget = 1024; // forces csha=0
+        let g = solve_layer_greedy(&lut, &c);
+        assert!(g.feasible);
+        assert_eq!(g.decision.csha_level, 0);
+    }
+
+    #[test]
+    fn greedy_respects_sensitivity_floor() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.sensitivity = 0.95; // forces 32 bits
+        let g = solve_layer_greedy(&lut, &c);
+        assert!(g.feasible);
+        assert_eq!(g.decision.optim_m_bits, 32);
+        assert_eq!(g.decision.optim_v_bits, 32);
+    }
+
+    #[test]
+    fn solve_all_greedy_runs_one_per_layer() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let luts = vec![lut; 4];
+        let sols = solve_all_greedy(&luts, &vec![c; 4]);
+        assert_eq!(sols.len(), 4);
+        assert!(sols.iter().all(|s| s.feasible));
+    }
+
+    #[test]
+    fn packing_picks_highest_savings_when_all_modes_allowed() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let sol = solve_layer(&lut, &LayerIlpConstraints::default());
+        assert!(sol.feasible);
+        // Default savings are strictly increasing, so mode 3 (multi_seq)
+        // beats every other mode at equal feasibility.
+        assert_eq!(sol.decision.packing_mode, 3);
+    }
+
+    #[test]
+    fn packing_restricted_to_none_when_mask_forbids() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.packing_modes_mask = 0b0001; // only mode 0 allowed
+        let sol = solve_layer(&lut, &c);
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.packing_mode, 0);
+    }
+
+    #[test]
+    fn packing_savings_lower_cost_vs_no_packing() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let with_pack = solve_layer(&lut, &LayerIlpConstraints::default());
+        let without_pack = solve_layer(
+            &lut,
+            &LayerIlpConstraints {
+                packing_modes_mask: 0b0001,
+                ..LayerIlpConstraints::default()
+            },
+        );
+        assert!(with_pack.cost_us < without_pack.cost_us);
     }
 
     #[test]

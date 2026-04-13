@@ -1,5 +1,6 @@
 pub mod autotune;
 pub mod builtins;
+pub mod calibration;
 pub mod compiler;
 pub mod context;
 pub mod context_parallel;
@@ -34,6 +35,11 @@ pub mod cpdt_joint;
 pub mod cpdt_optim;
 pub mod cpdt_precision;
 pub mod cpdt_zero;
+pub mod csha;
+pub mod csha_apply;
+pub mod csha_boundary;
+pub mod csha_pipeline;
+pub mod csha_specialize;
 pub mod dynamic_shapes;
 pub mod epilogue_fusion;
 pub mod error;
@@ -91,10 +97,19 @@ pub mod wggo_cost;
 pub mod wggo_dp;
 pub mod wggo_graph;
 pub mod wggo_ilp;
+pub mod wggo_schedule;
+pub mod wggo_weight_analysis;
+pub mod wggo_weight_analysis_cache;
+pub mod wggo_weight_analysis_nslweights;
 pub mod wrga;
+pub mod matmul_mma;
+pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
+pub mod wrga_adapter_rewrite;
+pub mod wrga_fused_ptx;
 pub mod wrga_fusion;
 pub mod wrga_memory;
+pub mod wrga_prescan;
 pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
@@ -293,6 +308,7 @@ pub fn debug_clear_allocator_slot_channels() {
 
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
+pub use wrga_fusion::{FusionDecision, FusionPlan, FusionTarget};
 
 use std::collections::HashMap;
 
@@ -422,48 +438,41 @@ pub struct CompileOptions {
     pub wggo_mode: Option<String>,
     /// WGGO: print the global-optimization report to stderr.
     pub wggo_report: bool,
-    /// Dev Tools Phase 2: enable the kernel-profile pre-pass. When true,
-    /// the codegen entry function runs `profiling::walker::walk_ops` once
-    /// before function bodies are lowered, and populates
-    /// `Compiler::{prediction_map, manifest_builder}`.
+    /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
     pub profile_kernels: bool,
-    /// Dev Tools Phase 2: target GPU name for the profile walker (e.g.
-    /// `"h100"`, `"a100"`).  Defaults to `"h100"` to match the Phase 1
-    /// `nsl profile` CLI default.
+    /// Dev Tools Phase 2: target GPU name for the profile walker.
     pub target_gpu: String,
-    /// Dev Tools Phase 2: tensor dtype assumed by the profile walker
-    /// (e.g. `"bf16"`, `"fp8"`).  Defaults to `"bf16"`.
+    /// Dev Tools Phase 2: tensor dtype assumed by the profile walker.
     pub dtype: String,
-    /// Dev Tools Phase 2, Task 6: when `Some`, the codegen entry writes the
-    /// kernel-profile manifest (accumulated into `Compiler.manifest_builder`
-    /// during body codegen) to this path in JSON form.  `None` skips the
-    /// write even if the builder is populated (useful for tests that only
-    /// exercise the pre-pass).
+    /// Dev Tools Phase 2, Task 6: manifest output path.
     pub manifest_output_path: Option<std::path::PathBuf>,
-    /// Dev Tools Phase 2, Task 6: source text the entry function should
-    /// stash onto `Compiler.source_text` so `SourceSpanJson::from_span`
-    /// produces real 1-based line numbers (rather than the Task 5 default
-    /// of line 1).  Populated by the CLI when `profile_kernels` is on.
+    /// Dev Tools Phase 2, Task 6: source text for span line numbers.
     pub profile_source_text: Option<String>,
-    /// Dev Tools Phase 2, Task 6: human-readable source file name for the
-    /// manifest's span records (paired with `profile_source_text`).
+    /// Dev Tools Phase 2, Task 6: source file name for manifest spans.
     pub profile_source_file_name: Option<String>,
-    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission inside
-    /// `compile_train_block`.  When true, codegen inserts calls to
-    /// `nsl_health_record_loss`, `_grad_norm`, `_weight_norm`, and
-    /// `_flush_snapshot`.  When false (default), train-block IR is byte-
-    /// identical to pre-phase-4.
+    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission.
     pub health_monitor: bool,
-    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter
-    /// (calls `nsl_health_set_flush_interval(n)` once at train-block entry).
-    /// `None` keeps the runtime default.
+    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter.
     pub health_flush_interval: Option<u64>,
-    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission inside
-    /// `compile_train_block`.  When `false` (default), any `@inspect` decorator
-    /// is a no-op and the generated IR is byte-identical to the pre-phase-5
-    /// path.  When `true`, each `@inspect(tensor, every=N?, condition="...")`
-    /// emits a step-gated stats branch and/or a predicate-gated dump branch.
+    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
+    /// WGGO Stage 3: path to a `.nslweights` sidecar file.
+    pub wggo_weights: Option<std::path::PathBuf>,
+    /// WGGO Stage 3: scoring mode ("none", "magnitude").
+    pub wggo_importance: Option<String>,
+    /// WGGO Stage 3: default fraction of heads allowed to be pruned.
+    pub wggo_prune_fraction: Option<f64>,
+    /// CSHA: fusion mode.
+    pub csha_mode: Option<String>,
+    /// CSHA: print the attention-fusion report.
+    pub csha_report: bool,
+    /// Path to calibration dataset.
+    pub calibration_data: Option<std::path::PathBuf>,
+    /// Failure-handling mode: `"required"` or `"best-effort"`.
+    pub calibration_mode: Option<String>,
+    pub calibration_samples: u32,
+    pub calibration_batch_size: u32,
+    pub calibration_timeout_secs: u64,
 }
 
 impl Default for CompileOptions {
@@ -517,6 +526,31 @@ impl Default for CompileOptions {
             health_monitor: false,
             health_flush_interval: None,
             inspect_enabled: false,
+            wggo_weights: None,
+            wggo_importance: None,
+            wggo_prune_fraction: None,
+            csha_mode: None,
+            csha_report: false,
+            calibration_data: None,
+            calibration_mode: Some("required".to_string()),
+            calibration_samples: 512,
+            calibration_batch_size: 8,
+            calibration_timeout_secs: 600,
         }
+    }
+}
+
+#[cfg(test)]
+mod calib_options_tests {
+    use super::*;
+
+    #[test]
+    fn default_has_no_calibration_data() {
+        let o = CompileOptions::default();
+        assert!(o.calibration_data.is_none());
+        assert_eq!(o.calibration_mode.as_deref(), Some("required"));
+        assert_eq!(o.calibration_samples, 512);
+        assert_eq!(o.calibration_batch_size, 8);
+        assert_eq!(o.calibration_timeout_secs, 600);
     }
 }

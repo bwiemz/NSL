@@ -1,4 +1,4 @@
-mod access;
+pub(crate) mod access;
 mod advanced;
 mod binary_ops;
 mod calls;
@@ -205,6 +205,13 @@ impl Compiler<'_> {
     }
 
     pub fn expr_as_func_name(&self, expr: &Expr) -> Option<String> {
+        // WRGA B.3 Task 4: fused-adapter rewrite emits synthesized Call
+        // nodes whose callee Ident carries a sentinel Symbol; the real
+        // FFI name lives in `synth_call_names` keyed by the callee's
+        // NodeId.
+        if let Some(name) = self.synth_call_names.get(&expr.id) {
+            return Some(name.clone());
+        }
         match &expr.kind {
             ExprKind::Ident(sym) => Some(self.resolve_sym(*sym).to_string()),
             _ => None,

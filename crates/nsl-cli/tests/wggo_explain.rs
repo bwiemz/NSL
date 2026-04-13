@@ -30,6 +30,8 @@ fn empty_layer_solution() -> LayerIlpSolution {
             adapter_rank: 0,
             optim_m_bits: 16,
             optim_v_bits: 16,
+            fase_fused: false,
+            packing_mode: 0,
         },
         cost_us: 0.0,
         memory_bytes: 0,
@@ -54,6 +56,9 @@ fn empty_plan() -> WggoPlan {
         per_layer: Vec::new(),
         resolutions: Vec::new(),
         applied: AppliedPlan::default(),
+        schedule: Default::default(),
+        template_stats: Default::default(),
+        weight_analysis: Default::default(),
         estimated_solve_us: 0,
     }
 }

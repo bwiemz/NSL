@@ -430,6 +430,57 @@ enum Cli {
         /// WGGO: print the global-optimization report to stderr
         #[arg(long)]
         wggo_report: bool,
+
+        /// WGGO Stage 3: path to a `.nslweights` sidecar for real
+        /// weight-based importance scoring.  Without this flag the
+        /// analyzer falls back to uniform head scores.
+        #[arg(long, value_name = "PATH")]
+        wggo_weights: Option<PathBuf>,
+
+        /// WGGO Stage 3 importance-scoring mode ("none" or
+        /// "magnitude").  "grad" is reserved for a future milestone
+        /// (blocked on a compile-time execution harness).  Defaults
+        /// to "magnitude" when `--wggo-weights` is set, else "none".
+        #[arg(long, value_name = "MODE")]
+        wggo_importance: Option<String>,
+
+        /// WGGO Stage 3: fraction of heads the default
+        /// `min_retained_importance` threshold allows to be pruned.
+        /// Clamped to [0.0, 0.9]; default 0.25.
+        #[arg(long, value_name = "F")]
+        wggo_prune_fraction: Option<f64>,
+
+        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
+        /// "block", or "off").  Passing `--csha` without a value enables
+        /// auto mode.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+        csha: Option<String>,
+
+        /// CSHA: print the attention-fusion report to stderr
+        #[arg(long)]
+        csha_report: bool,
+
+        /// Path to calibration dataset (.bin or .safetensors).  When
+        /// omitted, calibration is skipped entirely.
+        #[arg(long, value_name = "PATH")]
+        calibration_data: Option<PathBuf>,
+
+        /// Calibration failure policy.  Default `required` aborts the
+        /// build on infrastructure errors; `best-effort` warns and
+        /// falls back.  Degenerate-data errors are always fatal.
+        #[arg(long, value_name = "MODE", default_value = "required")]
+        calibrate: String,
+
+        /// Number of calibration samples to consume (default 512).
+        /// Truncated to the dataset size with a warning when smaller.
+        #[arg(long, value_name = "N", default_value_t = 512)]
+        calibration_samples: u32,
+
+        #[arg(long, value_name = "N", default_value_t = 8)]
+        calibration_batch_size: u32,
+
+        #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+        calibration_timeout: u64,
     },
 
     /// Run @test functions in an NSL file
@@ -821,6 +872,16 @@ fn main_inner() {
             wrga_fold_allocations,
             wggo,
             wggo_report,
+            wggo_weights,
+            wggo_importance,
+            wggo_prune_fraction,
+            csha,
+            csha_report,
+            calibration_data,
+            calibrate,
+            calibration_samples,
+            calibration_batch_size,
+            calibration_timeout,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -865,6 +926,54 @@ fn main_inner() {
             } else {
                 None
             };
+
+            // Calibration-flag validation per spec §8.
+            if calibration_data.is_none() && calibrate.as_str() != "required" {
+                eprintln!(
+                    "error: --calibrate={} requires --calibration-data <PATH>",
+                    calibrate
+                );
+                process::exit(1);
+            }
+            match calibrate.as_str() {
+                "required" | "best-effort" => {}
+                other => {
+                    eprintln!(
+                        "error: --calibrate value '{}' is not one of required|best-effort",
+                        other
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = calibration_data {
+                if !p.exists() {
+                    eprintln!("error: --calibration-data path does not exist: {}", p.display());
+                    process::exit(1);
+                }
+                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+                match ext.as_deref() {
+                    Some("bin") | Some("safetensors") => {}
+                    other => {
+                        eprintln!(
+                            "error: --calibration-data extension {:?} is not one of .bin|.safetensors",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            if calibration_samples == 0 {
+                eprintln!("error: --calibration-samples must be > 0");
+                process::exit(1);
+            }
+            if calibration_batch_size == 0 {
+                eprintln!("error: --calibration-batch-size must be > 0");
+                process::exit(1);
+            }
+            if calibration_timeout == 0 {
+                eprintln!("error: --calibration-timeout must be > 0");
+                process::exit(1);
+            }
 
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
@@ -924,6 +1033,16 @@ fn main_inner() {
                 health_monitor: false,
                 health_flush_interval: None,
                 inspect_enabled: false,
+                wggo_weights: wggo_weights.clone(),
+                wggo_importance: wggo_importance.clone(),
+                wggo_prune_fraction,
+                csha_mode: csha.clone(),
+                csha_report,
+                calibration_data: calibration_data.clone(),
+                calibration_mode: Some(calibrate.clone()),
+                calibration_samples,
+                calibration_batch_size,
+                calibration_timeout_secs: calibration_timeout,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -932,6 +1051,52 @@ fn main_inner() {
                 if nsl_codegen::wggo::WggoMode::parse(m).is_none() {
                     eprintln!(
                         "error: --wggo value '{}' is not one of full|greedy|off|auto",
+                        m
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref m) = wggo_importance {
+                match m.as_str() {
+                    "none" | "magnitude" => {}
+                    "grad" => {
+                        eprintln!(
+                            "error: --wggo-importance=grad is reserved for a future milestone (blocked on a compile-time execution harness); use 'magnitude' or 'none' for now"
+                        );
+                        process::exit(1);
+                    }
+                    other => {
+                        eprintln!(
+                            "error: --wggo-importance value '{}' is not one of none|magnitude",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            if let Some(f) = wggo_prune_fraction {
+                if !(0.0..=0.9).contains(&f) {
+                    eprintln!(
+                        "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
+                        f
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = wggo_weights {
+                if !p.exists() {
+                    eprintln!(
+                        "error: --wggo-weights path does not exist: {}",
+                        p.display()
+                    );
+                    process::exit(1);
+                }
+            }
+            // Validate CSHA mode string early.
+            if let Some(ref m) = csha {
+                if nsl_codegen::csha::CshaMode::parse(m).is_none() {
+                    eprintln!(
+                        "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
                         m
                     );
                     process::exit(1);
@@ -1125,10 +1290,6 @@ fn main_inner() {
                 profile_kernels: if detected_train_block { false } else { monitor },
                 target_gpu: "h100".to_string(),
                 dtype: "bf16".to_string(),
-                // Task 6: when --monitor is set, wire the manifest output
-                // path + source text so SourceSpanJson::from_span produces
-                // real line numbers.  The CLI derives the manifest path
-                // from the built binary below (Task 8 wiring).
                 manifest_output_path: if monitor {
                     Some(file.with_extension("nsl-profile.json"))
                 } else {
@@ -1144,13 +1305,19 @@ fn main_inner() {
                 } else {
                     None
                 },
-                // Dev Tools Phase 4 Task 6: when `nsl run --monitor` is run
-                // against a program containing a top-level `train { }` block,
-                // codegen emits per-step health hooks that flush a snapshot
-                // to `<file>.nsl-health.json` at run end.
                 health_monitor: detected_train_block,
                 health_flush_interval: None,
                 inspect_enabled: inspect,
+                wggo_weights: None,
+                wggo_importance: None,
+                wggo_prune_fraction: None,
+                csha_mode: None,
+                csha_report: false,
+                calibration_data: None,
+                calibration_mode: Some("required".to_string()),
+                calibration_samples: 512,
+                calibration_batch_size: 8,
+                calibration_timeout_secs: 600,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

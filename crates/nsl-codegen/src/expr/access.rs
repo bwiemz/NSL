@@ -21,7 +21,13 @@ impl Compiler<'_> {
         member: nsl_ast::Symbol,
         expr: &Expr,
     ) -> Result<Value, CodegenError> {
-        let member_name = self.resolve_sym(member).to_string();
+        // B.2.1 Task 3: the WRGA LoRA AST rewrite synthesizes MemberAccess
+        // nodes whose field names (`lora_A_<site>`, `lora_B_<site>`) may not
+        // be present in the Interner. Prefer the synth override map.
+        let member_name = match self.synth_member_names.get(&expr.id) {
+            Some(name) => name.clone(),
+            None => self.resolve_sym(member).to_string(),
+        };
 
         // Check if this is a module alias access: math.clamp (non-call context)
         {
@@ -51,7 +57,26 @@ impl Compiler<'_> {
         }
 
         let obj_val = self.compile_expr(builder, state, object)?;
-        let obj_type = self.node_type(object.id).clone();
+        let mut obj_type = self.node_type(object.id).clone();
+        // B.2.1 Task 5.5: synthesized SelfRef nodes produced by the LoRA
+        // AST rewrite pass have no type-map entry (fresh NodeId). Fall
+        // back to the current model context so the Type::Model branch
+        // below fires and the side-table route-through happens.
+        if matches!(obj_type, Type::Unknown) {
+            if matches!(object.kind, ExprKind::SelfRef) {
+                if let Some(ref model_name) = self.current_method_model_name {
+                    if let Some(sym) = self.interner.get(model_name) {
+                        obj_type = Type::Model {
+                            name: nsl_ast::Symbol(sym),
+                            type_params: Vec::new(),
+                            type_args: Vec::new(),
+                            fields: Vec::new(),
+                            methods: Vec::new(),
+                        };
+                    }
+                }
+            }
+        }
 
         if let Type::Struct { name, .. } = &obj_type {
             let struct_name = self.resolve_sym(*name).to_string();
@@ -96,6 +121,43 @@ impl Compiler<'_> {
                     }
                 }
             }
+            // B.2.1: Route synthesized adapter field accesses through the
+            // per-model side-table. Names of the form `lora_A_*`, `lora_B_*`,
+            // `ia3_scale_*`, `gate_*` are NOT physically laid out as struct
+            // fields — they live in a heap table whose pointer is stored at
+            // `layout.adapter_sidetable_offset`. The index used here must
+            // match the insertion order used by the init pass, i.e. the
+            // flattened `synthesized_fields` sequence across all sites
+            // targeting this model in `last_wrga_plan`.
+            if is_synthesized_adapter_field_name(&member_name) {
+                if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
+                    if let Some(slot_off) = layout.adapter_sidetable_offset {
+                        let index = self
+                            .adapter_field_index(&model_name, &member_name)
+                            .ok_or_else(|| {
+                                CodegenError::new(format!(
+                                    "synthesized adapter field '{member_name}' not found \
+                                     for model '{model_name}' in current WRGA plan"
+                                ))
+                            })?;
+                        let table_ptr = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            obj_val,
+                            slot_off as i32,
+                        );
+                        let byte_off = (index * 8) as i32;
+                        let tensor_ptr = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            table_ptr,
+                            byte_off,
+                        );
+                        return Ok(tensor_ptr);
+                    }
+                }
+            }
+
             if let Some(layout) = self.types.struct_layouts.get(&model_name).cloned() {
                 for field in &layout.fields {
                     if field.name == member_name {
@@ -337,5 +399,61 @@ impl Compiler<'_> {
                 "unknown type conversion: {target_type}()"
             ))),
         }
+    }
+}
+
+/// B.2.1: recognise synthesized adapter field names. These are never
+/// physically laid out in the model struct — they are routed through the
+/// side-table pointer stored at `StructLayout::adapter_sidetable_offset`.
+pub(crate) fn is_synthesized_adapter_field_name(name: &str) -> bool {
+    name.starts_with("lora_A_")
+        || name.starts_with("lora_B_")
+        || name.starts_with("ia3_scale_")
+        || name.starts_with("gate_")
+}
+
+impl Compiler<'_> {
+    /// B.2.1: linear index of a synthesized adapter field within the
+    /// flattened `synthesized_fields` sequence across every active adapter
+    /// site targeting `model_name`, in insertion order as produced by
+    /// `wrga_adapter_inject::run`.
+    ///
+    /// **Ordering invariant:** this MUST match the iteration order used by
+    /// the future init pass that populates the side-table, otherwise an
+    /// access to `self.lora_A_<site>` would dereference the wrong tensor.
+    /// The insertion order is: outer loop over `plan.placements` in the
+    /// order produced by WRGA; inner loop over each placement's
+    /// `synthesized_fields` vec. Only placements whose target field is
+    /// declared on `model_name` participate. Sites whose dims failed to
+    /// resolve (input_dim == 0 || output_dim == 0) are EXCLUDED from both
+    /// the init pass and this index computation to keep them in sync.
+    pub(crate) fn adapter_field_index(
+        &self,
+        model_name: &str,
+        field_name: &str,
+    ) -> Option<usize> {
+        // B.2.1 Task 5.5: read directly from `adapter_sites` (set by the
+        // pre-scan pass) rather than `last_wrga_plan` — the latter is
+        // overwritten inside @train-block lowering with a real Wengert plan
+        // that has no decorated placements when its placement names don't
+        // syntactically match the @adapter target pattern.
+        let mut idx: usize = 0;
+        for site in &self.adapter_sites {
+            if site.target_model != model_name {
+                continue;
+            }
+            // Skip sites whose dims failed to resolve (the init pass also
+            // skips these, so the indices stay in sync).
+            if site.input_dim == 0 || site.output_dim == 0 {
+                continue;
+            }
+            for synth in &site.synthesized_fields {
+                if synth == field_name {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+        }
+        None
     }
 }

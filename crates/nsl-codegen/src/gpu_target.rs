@@ -13,13 +13,35 @@ pub enum GpuTarget {
 impl GpuTarget {
     /// Parse from CLI string.
     pub fn parse_target(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
             "cuda" => Some(GpuTarget::Cuda),
             "rocm" | "amd" | "hip" => Some(GpuTarget::Rocm),
             "metal" | "apple" | "mps" => Some(GpuTarget::Metal),
             "webgpu" | "wgsl" => Some(GpuTarget::WebGpu),
+            // WRGA B.3 Task 4: accept `cuda_sm<N>` / `sm<N>` variants.
+            s if s.starts_with("cuda_sm") || s.starts_with("sm") => Some(GpuTarget::Cuda),
             _ => None,
         }
+    }
+
+    /// WRGA B.3 Task 4: extract a CUDA sm version from the raw target string,
+    /// if present.  Accepts `cuda_sm80`, `sm_80`, `sm80`.  Returns `None`
+    /// when the target is non-CUDA or carries no sm qualifier.
+    pub fn parse_sm_version(s: &str) -> Option<u32> {
+        let lower = s.to_lowercase();
+        let tail = if let Some(rest) = lower.strip_prefix("cuda_sm") {
+            rest
+        } else if let Some(rest) = lower.strip_prefix("sm_") {
+            rest
+        } else if let Some(rest) = lower.strip_prefix("sm") {
+            rest
+        } else {
+            return None;
+        };
+        // Trim any trailing non-digit (e.g. `sm_80a`).
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
     }
 
     /// Parse from CLI string, defaulting to Cuda when empty or unrecognized.

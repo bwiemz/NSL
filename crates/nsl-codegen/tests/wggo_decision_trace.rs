@@ -61,6 +61,8 @@ fn layer_ilp_solution_default_decision_trace_is_empty() {
             adapter_rank: 0,
             optim_m_bits: 8,
             optim_v_bits: 8,
+            fase_fused: false,
+            packing_mode: 0,
         },
         cost_us: 0.0,
         memory_bytes: 0,

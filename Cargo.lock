@@ -1180,6 +1180,7 @@ dependencies = [
 name = "nsl-codegen"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",

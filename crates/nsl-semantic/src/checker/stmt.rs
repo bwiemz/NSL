@@ -383,6 +383,18 @@ impl<'a> TypeChecker<'a> {
                             );
                         }
 
+                        // CSHA: @csha decorator validation
+                        if dname == "csha" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::csha::validate_csha_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // WGGO: @wggo decorator validation
                         if dname == "wggo" {
                             let resolve = |s: nsl_ast::Symbol| -> String {

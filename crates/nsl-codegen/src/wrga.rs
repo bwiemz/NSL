@@ -17,7 +17,9 @@ use nsl_ast::block::WrgaMode;
 use crate::gpu_specs::{default_gpu, find_gpu};
 use crate::wengert::{PrimalOp, VarId, WengertList};
 use crate::weight_aware::WeightMap;
-use crate::wrga_fusion::{build_fusion_plan, FusionPlan};
+use crate::wrga_fusion::{
+    build_fusion_plan, verify_fused_sites_have_no_intermediate, FusionPlan,
+};
 use crate::wrga_memory::{plan_memory_with_pin, MemoryPlan, SizeHints};
 use crate::wrga_prune::{prune, PruneResult};
 use crate::wrga_roofline::{place_adapters, AdapterPlacement, AdapterSite, SiteKind};
@@ -188,6 +190,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
     let rank_overrides: Vec<usize> =
         ranks.iter().map(|r| r.rank).collect();
     let fusion = build_fusion_plan(&placements, Some(&rank_overrides));
+    verify_fused_sites_have_no_intermediate(&fusion, input.wengert);
 
     // ── Stage 6: Memory plan ──────────────────────────────────────────────
     let size_hints: SizeHints = HashMap::new(); // callers can enrich later

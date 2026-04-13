@@ -9,7 +9,7 @@
 //!   5. Level 2: per-layer ILP            — `wggo_ilp::solve_all`
 //!   6. Level 3: kernel generation        — delegated to backend
 //!   7. Memory planning                   — delegated to M36
-//!   8. Communication schedule            — delegated to CPDT (future)
+//!   8. Communication schedule            — `wggo_schedule::build_schedule`
 //!
 //! The driver is pure data-in / data-out and has no backend side
 //! effects.  It produces a [`WggoPlan`] downstream passes consume.
@@ -23,7 +23,15 @@ use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
 use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan};
 use crate::wggo_graph::{build as build_graph, OptGraph};
-use crate::wggo_ilp::{solve_all as ilp_solve_all, LayerIlpConstraints, LayerIlpSolution};
+use crate::wggo_ilp::{
+    solve_all_greedy as ilp_solve_all_greedy, solve_all_templated as ilp_solve_all_templated,
+    LayerIlpConstraints, LayerIlpSolution, TemplateStats,
+};
+use crate::wggo_schedule::{build_schedule, CommSchedule};
+use crate::wggo_weight_analysis::{
+    analyze as analyze_weights, AnalysisConfig, NullWeightProvider, WeightAnalysisReport,
+    WeightProvider,
+};
 
 /// User-visible optimisation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -68,6 +76,13 @@ pub struct WggoInput<'a> {
     pub importance: ImportanceScores,
     /// Per-layer ILP constraint overrides.  If empty, defaults are used.
     pub ilp_constraints: Vec<LayerIlpConstraints>,
+    /// Optional weight source for Stage 3 importance analysis.  When
+    /// `None`, `head_importance` falls back to uniform scores
+    /// (today's behaviour).
+    pub weights: Option<&'a dyn WeightProvider>,
+    /// Stage-3 tunables (prune fraction, etc.).  Ignored when
+    /// `weights` is `None`.
+    pub analysis_config: AnalysisConfig,
 }
 
 /// Aggregate plan emitted by the driver.
@@ -80,6 +95,13 @@ pub struct WggoPlan {
     pub per_layer: Vec<LayerIlpSolution>,
     pub resolutions: Vec<Resolution>,
     pub applied: AppliedPlan,
+    /// Cross-device collective schedule (Stage 8).  Produced from the
+    /// post-resolution per-layer plan; consumed by CPDT lowering.
+    pub schedule: CommSchedule,
+    /// Counters for template-layer reuse during the per-layer ILP.
+    pub template_stats: TemplateStats,
+    /// Stage-3 importance-analysis output (one entry per layer).
+    pub weight_analysis: WeightAnalysisReport,
     /// Total solver wall-clock time (μs, self-reported — not measured).
     pub estimated_solve_us: u64,
 }
@@ -114,7 +136,7 @@ impl WggoPlan {
         for layer in &self.applied.layers {
             writeln!(
                 s,
-                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b",
+                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
                 layer.active_heads, // number of actually-kept heads (no "of total" info here)
@@ -122,7 +144,15 @@ impl WggoPlan {
                 layer.csha_level,
                 layer.adapter_rank,
                 layer.optim_m_bits,
-                layer.optim_v_bits
+                layer.optim_v_bits,
+                if layer.fase_fused { "fused" } else { "deferred" },
+                match layer.packing_mode {
+                    0 => "none",
+                    1 => "segment_id",
+                    2 => "tile_skip",
+                    3 => "multi_seq",
+                    _ => "?",
+                }
             )
             .unwrap();
         }
@@ -141,6 +171,21 @@ impl WggoPlan {
         )
         .unwrap();
         writeln!(s, "  Solve time: {:.2} ms", self.estimated_solve_us as f64 / 1000.0).unwrap();
+        writeln!(
+            s,
+            "  Templates: {} solved, {} layers reused",
+            self.template_stats.templates_solved, self.template_stats.template_hits
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "  Weight analysis: {} layers analysed, {} without weights",
+            self.weight_analysis.per_layer.len(),
+            self.weight_analysis.layers_without_weights
+        )
+        .unwrap();
+        writeln!(s).unwrap();
+        write!(s, "{}", self.schedule.render()).unwrap();
         s
     }
 
@@ -175,13 +220,22 @@ pub fn run(input: WggoInput) -> WggoPlan {
             ..Default::default()
         };
         let inter = dp_solve(&graph, &luts, &dp_cfg);
-        let ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
+        let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
             vec![LayerIlpConstraints::default(); n]
         } else {
             input.ilp_constraints
         };
-        let per_layer = ilp_solve_all(&luts, &ilp_defaults);
+        let weight_analysis = run_weight_analysis(
+            &graph,
+            &input.layer_shape,
+            &ilp_defaults,
+            input.weights,
+            &input.analysis_config,
+        );
+        weight_analysis.apply_to(&mut ilp_defaults);
+        let (per_layer, template_stats) = ilp_solve_all_templated(&luts, &ilp_defaults);
         let applied = apply(&inter, &per_layer);
+        let schedule = build_schedule(&inter, &applied);
         return WggoPlan {
             mode: WggoMode::Off,
             target_gpu: gpu.name.to_string(),
@@ -190,6 +244,9 @@ pub fn run(input: WggoInput) -> WggoPlan {
             per_layer,
             resolutions: Vec::new(),
             applied,
+            schedule,
+            template_stats,
+            weight_analysis,
             estimated_solve_us: t0.elapsed().as_micros() as u64,
         };
     }
@@ -210,12 +267,37 @@ pub fn run(input: WggoInput) -> WggoPlan {
 
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
-    let ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
+    let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
         vec![LayerIlpConstraints::default(); n]
     } else {
         input.ilp_constraints
     };
-    let per_layer = ilp_solve_all(&luts, &ilp_constraints);
+    // Stage 3: weight analysis — overwrites head_importance and (when
+    // the caller left it zero) min_retained_importance on each layer's
+    // constraints, before the ILP runs.
+    let weight_analysis = run_weight_analysis(
+        &graph,
+        &input.layer_shape,
+        &ilp_constraints,
+        input.weights,
+        &input.analysis_config,
+    );
+    weight_analysis.apply_to(&mut ilp_constraints);
+    // Pre-prune the FASE option on layers CPDT will shard — fusing the
+    // optimizer step into backward conflicts with reduce-scatter ordering,
+    // and the conflict resolver would defer it anyway.
+    for (cons, lp) in ilp_constraints.iter_mut().zip(inter.layers.iter()) {
+        if lp.shard_params > 1 || lp.shard_grads > 1 || lp.shard_optim > 1 {
+            cons.allow_fase = false;
+        }
+    }
+    let (per_layer, template_stats) = match input.mode {
+        WggoMode::Greedy => (
+            ilp_solve_all_greedy(&luts, &ilp_constraints),
+            TemplateStats::default(),
+        ),
+        _ => ilp_solve_all_templated(&luts, &ilp_constraints),
+    };
 
     // 6. Build initial LayerDecisions vector for conflict detection.
     let layer_decisions: Vec<LayerDecisions> = inter
@@ -230,7 +312,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
                 .saturating_sub(sol.decision.active_heads() as u32),
             adapter_rank: sol.decision.adapter_rank,
             shard_factor: inter_layer.shard_params,
-            fase_fused: false,
+            fase_fused: sol.decision.fase_fused,
             adapter_comm_cost: 0.0,
             adapter_comm_budget: f64::MAX,
         })
@@ -240,10 +322,22 @@ pub fn run(input: WggoInput) -> WggoPlan {
     //    Full mode still runs the same resolver because the ILP itself
     //    already honours the hard constraints — remaining conflicts are
     //    the ones crossing technique boundaries).
-    let (_resolved, resolutions) = greedy_resolve(layer_decisions);
+    let (resolved, resolutions) = greedy_resolve(layer_decisions);
 
-    // 8. Apply.
+    // Feed the resolver's verdicts back into the per-layer ILP solutions so
+    // `apply` sees the post-resolution decisions, not the pre-resolution
+    // ones.  The resolver may have downgraded CSHA, removed an adapter, or
+    // deferred a FASE fused step.
+    let mut per_layer = per_layer;
+    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
+        sol.decision.csha_level = r.csha_level;
+        sol.decision.adapter_rank = r.adapter_rank;
+        sol.decision.fase_fused = r.fase_fused;
+    }
+
+    // 8. Apply + communication schedule.
     let applied = apply(&inter, &per_layer);
+    let schedule = build_schedule(&inter, &applied);
 
     WggoPlan {
         mode: input.mode,
@@ -253,8 +347,31 @@ pub fn run(input: WggoInput) -> WggoPlan {
         per_layer,
         resolutions,
         applied,
+        schedule,
+        template_stats,
+        weight_analysis,
         estimated_solve_us: t0.elapsed().as_micros() as u64,
     }
+}
+
+/// Run Stage 3 over `graph`, using the first layer's `num_heads` as the
+/// shape hint (the driver constructs all layers with uniform num_heads
+/// today).  When `weights` is `None`, falls back to `NullWeightProvider`
+/// so every layer gets a uniform score vector.
+fn run_weight_analysis(
+    graph: &crate::wggo_graph::OptGraph,
+    layer_shape: &LayerShape,
+    constraints: &[LayerIlpConstraints],
+    weights: Option<&dyn WeightProvider>,
+    config: &AnalysisConfig,
+) -> WeightAnalysisReport {
+    let num_heads = constraints
+        .first()
+        .map(|c| c.num_heads as usize)
+        .unwrap_or(8);
+    let null = NullWeightProvider;
+    let provider: &dyn WeightProvider = weights.unwrap_or(&null);
+    analyze_weights(graph, layer_shape, num_heads, provider, config)
 }
 
 /// Extract `GpuSpec` for the named target or default.
@@ -301,8 +418,91 @@ pub fn run_on_wengert(
         lut_axes: LutAxes::default(),
         importance: ImportanceScores::default(),
         ilp_constraints: Vec::new(),
+        weights: None,
+        analysis_config: AnalysisConfig::default(),
     };
     Some(run(input))
+}
+
+/// Extended convenience entry point — accepts an optional weights file
+/// and `AnalysisConfig` so Stage 3 can use real importance scoring.
+///
+/// When `weights_path` fails to load, emits a warning on stderr and
+/// falls back to uniform scores rather than failing the compile.
+pub fn run_on_wengert_with_weights(
+    wengert: &WengertList,
+    target: &str,
+    mode_str: &str,
+    world_size: usize,
+    weights_path: Option<&std::path::Path>,
+    analysis_config: AnalysisConfig,
+) -> Option<WggoPlan> {
+    let mode = WggoMode::parse(mode_str)?;
+    let cluster = ClusterSpec {
+        num_gpus: world_size.max(1) as u32,
+        ..ClusterSpec::default()
+    };
+
+    // Check the sidecar cache first — a hit lets us skip the
+    // checkpoint load entirely.
+    let cached_report = weights_path
+        .and_then(|p| crate::wggo_weight_analysis_cache::try_load(p));
+
+    // Load the weights file up front so its lifetime covers the call.
+    // Skip the load when the cache hit already carries the scores.
+    let checkpoint = if cached_report.is_some() {
+        None
+    } else {
+        weights_path.and_then(|p| {
+            match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
+                Ok(ck) => Some(ck),
+                Err(e) => {
+                    eprintln!(
+                        "[wggo] warning: could not load weights from {}: {} — falling back to uniform scores",
+                        p.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        })
+    };
+    let weights_ref: Option<&dyn WeightProvider> = checkpoint
+        .as_ref()
+        .map(|ck| ck as &dyn WeightProvider);
+
+    let input = WggoInput {
+        mode,
+        target,
+        wengert,
+        layer_shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
+        cluster,
+        lut_axes: LutAxes::default(),
+        importance: ImportanceScores::default(),
+        ilp_constraints: Vec::new(),
+        weights: weights_ref,
+        analysis_config,
+    };
+    let mut plan = run(input);
+
+    // Overwrite with cached report when it was a hit — saves both the
+    // checkpoint load and the analyzer's per-layer L2 reductions.
+    if let Some(cached) = cached_report {
+        plan.weight_analysis = cached;
+    } else if let Some(p) = weights_path {
+        // Cache miss — persist the freshly-computed report alongside
+        // the checkpoint.  Failures are silent; the cache is advisory.
+        let _ = crate::wggo_weight_analysis_cache::store(p, &plan.weight_analysis);
+    }
+
+    Some(plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +559,8 @@ mod tests {
             lut_axes: LutAxes::default(),
             importance: ImportanceScores::default(),
             ilp_constraints: Vec::new(),
+            weights: None,
+            analysis_config: AnalysisConfig::default(),
         }
     }
 
@@ -448,6 +650,137 @@ mod tests {
             assert!(plan.is_some(), "mode '{}' should be accepted", mode);
         }
         assert!(run_on_wengert(&w, "H100", "nonsense", 1).is_none());
+    }
+
+    #[test]
+    fn fase_disabled_on_sharded_layers() {
+        // Multi-GPU run will trigger ZeRO sharding in the inter-layer DP,
+        // which must in turn force allow_fase=false on those layers — so
+        // the resulting AppliedLayer must not report fase_fused=true.
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        for layer in &plan.applied.layers {
+            if layer.shard_factor > 1 {
+                assert!(
+                    !layer.fase_fused,
+                    "sharded layer {} should not have FASE fused",
+                    layer.layer_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fase_appears_in_report() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        let rep = plan.render_report();
+        assert!(rep.contains("FASE="));
+    }
+
+    #[test]
+    fn greedy_mode_uses_greedy_solver() {
+        // The greedy solver explores at most a handful of nodes per layer
+        // (sum-of-domains, not product).  The full solver explores
+        // hundreds of thousands.  Run both modes and confirm Greedy
+        // produces drastically lower per-layer node counts.
+        let w = two_block_wengert();
+        let mut inp_full = toy_input(&w);
+        inp_full.mode = WggoMode::Full;
+        let mut inp_greedy = toy_input(&w);
+        inp_greedy.mode = WggoMode::Greedy;
+        let full = run(inp_full);
+        let greedy = run(inp_greedy);
+        let full_nodes: u64 = full.per_layer.iter().map(|s| s.nodes_explored).sum();
+        let greedy_nodes: u64 = greedy.per_layer.iter().map(|s| s.nodes_explored).sum();
+        assert!(
+            greedy_nodes * 100 < full_nodes,
+            "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
+        );
+    }
+
+    #[test]
+    fn run_on_wengert_with_weights_handles_missing_file() {
+        // A nonexistent weights path should warn and fall back to
+        // uniform scores, not fail the call.
+        let w = two_block_wengert();
+        let plan = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            Some(std::path::Path::new("/nonexistent/path.nslweights")),
+            crate::wggo_weight_analysis::AnalysisConfig::default(),
+        )
+        .expect("plan");
+        // Every layer should be counted as without_weights since the
+        // checkpoint didn't load.
+        assert_eq!(
+            plan.weight_analysis.layers_without_weights,
+            plan.weight_analysis.per_layer.len() as u32
+        );
+    }
+
+    #[test]
+    fn weight_analysis_runs_with_null_provider() {
+        // Default path (weights=None) → uniform scores, but analyze()
+        // still populates per_layer and the report field.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert_eq!(plan.weight_analysis.per_layer.len(), plan.inter_layer.layers.len());
+        assert!(plan.weight_analysis.layers_without_weights >= 1);
+        let rep = plan.render_report();
+        assert!(rep.contains("Weight analysis"));
+    }
+
+    #[test]
+    fn template_stats_reuse_identical_blocks() {
+        // The two-block toy Wengert produces two layers with identical
+        // shape and constraints, so Full mode should solve once and
+        // replicate.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert_eq!(plan.template_stats.templates_solved, 1);
+        assert!(plan.template_stats.template_hits >= 1);
+        let rep = plan.render_report();
+        assert!(rep.contains("Templates:"));
+    }
+
+    #[test]
+    fn template_stats_zero_in_greedy_mode() {
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.mode = WggoMode::Greedy;
+        let plan = run(inp);
+        // Greedy bypasses the templated solver — counters are default.
+        assert_eq!(plan.template_stats.templates_solved, 0);
+        assert_eq!(plan.template_stats.template_hits, 0);
+    }
+
+    #[test]
+    fn schedule_present_for_multi_gpu_run() {
+        // Multi-GPU triggers ZeRO sharding via the inter-layer DP, which
+        // in turn forces the schedule to issue collectives.
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        assert!(plan.schedule.total_collectives >= 1);
+        let rep = plan.render_report();
+        assert!(rep.contains("Communication schedule"));
+    }
+
+    #[test]
+    fn schedule_empty_for_single_gpu_run() {
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 1).expect("plan");
+        assert_eq!(plan.schedule.total_collectives, 0);
+    }
+
+    #[test]
+    fn pca_appears_in_report() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        let rep = plan.render_report();
+        assert!(rep.contains("PCA="));
     }
 
     #[test]

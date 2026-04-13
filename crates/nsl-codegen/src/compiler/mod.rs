@@ -116,6 +116,13 @@ pub struct ModelMetadata {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
     pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    /// B.2.1 Task 5.5: shape strings (`Tensor<[out, in], dtype>`) for
+    /// Tensor-typed model fields whose initializer carries a literal
+    /// shape (e.g. `w: Tensor = zeros([8, 8])`). Stored separately from
+    /// `model_field_types` so source-AD's sub-model traversal does not
+    /// accidentally treat tensor shapes as nested model types. Consumed
+    /// by `wrga_adapter_inject::resolve_dims_for_target`.
+    pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
 }
 
 impl ModelMetadata {
@@ -127,6 +134,7 @@ impl ModelMetadata {
             imported_model_names: HashSet::new(),
             paged_kv_configs: HashMap::new(),
             model_method_bodies: HashMap::new(),
+            model_tensor_field_shapes: HashMap::new(),
         }
     }
 }
@@ -385,40 +393,24 @@ pub struct Compiler<'a> {
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 
     // ── Dev Tools Phase 2: kernel-profile pre-pass ─────────────────────
-    /// Map from AST `NodeId` of a kernel-launching operation to the
-    /// predicted `OpCost` computed by the profiling walker.  Populated
-    /// only when `compile_options.profile_kernels` is true.  Consumed by
-    /// `compile_gpu_kernel_launch` (Task 5) to stamp kernel launches with
-    /// compile-time predictions and by the manifest writer (Task 6).
     pub prediction_map: HashMap<NodeId, crate::cost_model::OpCost>,
-    /// Manifest builder accumulating kernel entries during codegen.
-    /// `None` when `profile_kernels` is disabled.
     pub manifest_builder: Option<crate::profiling::instrument::ManifestBuilder>,
-    /// Snapshot of the fusion plan recorded for profile attribution.
-    /// Used by `fusion_constituents` to map a fused kernel root back to the
-    /// AST `NodeId`s folded into it.  `None` until wired in a follow-up.
     pub fusion_plan_for_profile: Option<crate::wrga_fusion::FusionPlan>,
-    /// Source-text snapshot of the module being compiled. Used by Task 5
-    /// to resolve `Span` byte offsets to 1-based line numbers when
-    /// recording kernel entries on the manifest. May be empty when the
-    /// caller did not plumb the original source through (manifest line
-    /// numbers fall back to 1 in that case — non-fatal).
     pub source_text: String,
-    /// File name displayed in profile manifest entries (Task 5/6).
-    /// May be empty when not plumbed.
     pub source_file_name: String,
 
     // ── Dev Tools Phase 5: @inspect decorator state ─────────────────────
-    /// Current train-block step-counter Cranelift `Variable`, set while we
-    /// are compiling the step body of a `compile_train_block` invocation
-    /// (and cleared on exit).  `None` outside train scope — `@inspect` in
-    /// non-train contexts is treated as a no-op for Phase 5 ship-first.
     pub inspect_train_step_var: Option<cranelift_frontend::Variable>,
-    /// VarIds that appear as `@inspect` targets during this compile.  Passed
-    /// to `plan_memory_with_pin` so the allocator extends their death point
-    /// past the last program point — otherwise the backing storage could be
-    /// reused before the inspector stream memcpy finishes reading it.
     pub inspect_pinned_vars: std::collections::BTreeSet<crate::wengert::VarId>,
+
+    // ── WRGA Milestone B.2/B.3 adapter state ─────────────────────
+    pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
+    pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
+    pub current_method_model_name: Option<String>,
+    pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
+    pub fused_ptx_kernels:
+        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 }
 
 /// Quantization configuration for a model.
@@ -551,6 +543,12 @@ impl<'a> Compiler<'a> {
             source_file_name: String::new(),
             inspect_train_step_var: None,
             inspect_pinned_vars: std::collections::BTreeSet::new(),
+            adapter_sites: Vec::new(),
+            synth_member_names: std::collections::HashMap::new(),
+            current_method_model_name: None,
+            adapter_prescan_plan: None,
+            fused_ptx_kernels: std::collections::HashMap::new(),
+            synth_call_names: std::collections::HashMap::new(),
         })
     }
 
@@ -586,6 +584,14 @@ impl<'a> Compiler<'a> {
     /// in the same instance that fusion_constituents reads.
     pub fn profile_fusion_plan_mut(&mut self) -> Option<&mut crate::wrga_fusion::FusionPlan> {
         self.fusion_plan_for_profile.as_mut()
+    }
+
+    /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`
+    /// (e.g. `cuda_sm80` → `Some(80)`).  Returns `None` for non-CUDA
+    /// targets or plain `cuda` (where no sm is pinned).  The fused-adapter
+    /// AST rewrite requires sm >= 80 before emitting the single-FFI path.
+    pub fn target_sm(&self) -> Option<u32> {
+        crate::gpu_target::GpuTarget::parse_sm_version(&self.compile_options.target)
     }
 
     /// M42: Look up the first KV compression policy for a specific model layer.
