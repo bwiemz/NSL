@@ -325,6 +325,18 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // CFIE: @cfie decorator validation
+                        if dname == "cfie" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cfie::validate_cfie_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // CPDT: @cpdt decorator validation
                         if dname == "cpdt" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
