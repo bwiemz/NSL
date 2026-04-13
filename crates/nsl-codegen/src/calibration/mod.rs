@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod identity_hook;
 pub mod observation;
 pub mod registry;
+pub mod retention;
 pub mod sidecar;
 pub mod subprocess;
 
