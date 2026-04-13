@@ -50,7 +50,7 @@ fn backward_live_filter_drops_adjoint_ops_for_frozen_param() {
         analysis.diagnostics
     );
 
-    let plan = nsl_codegen::debug_compile_and_return_plan(
+    let plan = nsl_codegen::debug_compile_and_return_plan_from_ast(
         &parsed.module,
         &interner,
         &analysis.type_map,

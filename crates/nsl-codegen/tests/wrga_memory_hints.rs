@@ -66,7 +66,7 @@ fn wrga_memory_hints_reduce_or_maintain_slot_count() {
     // Clear side-channels from any prior test in the same thread.
     nsl_codegen::debug_clear_allocator_slot_channels();
 
-    let plan = nsl_codegen::debug_compile_and_return_plan(
+    let plan = nsl_codegen::debug_compile_and_return_plan_from_ast(
         &parsed.module,
         &interner,
         &analysis.type_map,

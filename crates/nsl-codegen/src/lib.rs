@@ -7,6 +7,7 @@ pub mod cost_model;
 pub mod deterministic_kernels;
 pub mod grammar_compiler;
 pub mod schema_convert;
+pub mod stdlib_loader;
 
 pub mod ad_rules;
 pub mod backend_amdgpu;
@@ -109,10 +110,20 @@ pub use compiler::{
 /// effect is the stashed plan, independent of whether the full object file
 /// links.
 #[doc(hidden)]
-pub fn debug_compile_and_return_plan(
+pub fn debug_compile_and_return_plan_from_ast(
     ast: &nsl_ast::Module,
     interner: &nsl_lexer::Interner,
     type_map: &nsl_semantic::checker::TypeMap,
+    options: &CompileOptions,
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
+    debug_compile_and_return_plan_with_imports(ast, interner, type_map, &[], options)
+}
+
+fn debug_compile_and_return_plan_with_imports(
+    ast: &nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    type_map: &nsl_semantic::checker::TypeMap,
+    imported_fns: &[(String, String, cranelift_codegen::ir::Signature)],
     options: &CompileOptions,
 ) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
     let (res, plan) = crate::compiler::compile_module_with_imports_best_effort_plan(
@@ -120,7 +131,7 @@ pub fn debug_compile_and_return_plan(
         interner,
         type_map,
         "",
-        &[],
+        imported_fns,
         HashMap::new(),
         std::collections::HashSet::new(),
         false,
@@ -137,6 +148,82 @@ pub fn debug_compile_and_return_plan(
         }
         (Err(e), None) => Err(e),
     }
+}
+
+/// B.2 Task 1 test helper: compile a raw NSL source string and return any
+/// `WrgaPlan` produced.  Loads stdlib optimizer signatures as needed so that
+/// real `train` blocks can be compiled in-process without an on-disk workspace.
+#[doc(hidden)]
+pub fn debug_compile_and_return_plan(
+    src: &str,
+    options: &CompileOptions,
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    if lex_diags
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
+        return Err(CodegenError::new(format!(
+            "lex errors: {:?}",
+            lex_diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
+        return Err(CodegenError::new(format!(
+            "parse errors: {:?}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        )));
+    }
+
+    // Build imported_fns for any stdlib optimizer modules referenced in
+    // train-block `optimizer:` sections.  This mutates the interner, so it
+    // must run before semantic analysis / codegen (which borrow immutably).
+    // Semantic analysis doesn't need the stdlib imports here because the
+    // train block's optimizer expression is captured structurally and not
+    // type-checked as a regular call — matching the existing baseline tests.
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    if analysis
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
+        return Err(CodegenError::new(format!(
+            "semantic errors: {:?}",
+            analysis
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        )));
+    }
+
+    let imported_fns = crate::stdlib_loader::build_imported_fns_for_entry(
+        &parsed.module,
+        &mut interner,
+        &analysis.type_map,
+        options,
+    )?;
+
+    debug_compile_and_return_plan_with_imports(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        &imported_fns,
+        options,
+    )
 }
 #[doc(hidden)]
 pub mod debug_channels {
