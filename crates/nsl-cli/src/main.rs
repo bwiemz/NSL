@@ -483,6 +483,48 @@ enum Cli {
         cmd: ZkCmd,
     },
 
+    /// Predictive performance profile for a target GPU
+    Profile {
+        /// Path to the .nsl file
+        file: PathBuf,
+
+        /// Target GPU (e.g., "h100", "a100", "rtx-4090")
+        #[arg(long, default_value = "h100")]
+        target: String,
+
+        /// Dtype to cost (e.g., "bf16", "fp16", "fp8")
+        #[arg(long, default_value = "bf16")]
+        dtype: String,
+
+        /// Concrete batch size to resolve shape symbols
+        #[arg(long, default_value_t = 1)]
+        batch: u64,
+
+        /// Concrete sequence length to resolve shape symbols
+        #[arg(long, default_value_t = 2048)]
+        seq: u64,
+
+        /// Extra shape-env bindings as "name=N" (repeatable)
+        #[arg(long)]
+        dim: Vec<String>,
+
+        /// Disable fusion plan in the report
+        #[arg(long)]
+        no_fusion: bool,
+
+        /// Include memory timeline in the report (Task 5)
+        #[arg(long)]
+        memory: bool,
+
+        /// Entry point: "auto", "train", or "fn:<name>"
+        #[arg(long, default_value = "auto")]
+        entry: String,
+
+        /// Emit machine-readable JSON instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Train a BPE tokenizer from source files
     Tokenize {
         /// Directories to scan for source files (default: stdlib/ examples/ tests/)
@@ -1223,6 +1265,38 @@ fn main_inner() {
         }
         Cli::Zk { cmd } => {
             run_zk_cmd(cmd);
+        }
+        Cli::Profile {
+            file,
+            target,
+            dtype,
+            batch,
+            seq,
+            dim,
+            no_fusion,
+            memory,
+            entry,
+            json,
+        } => {
+            let args = nsl_cli::profile::ProfileArgs {
+                file,
+                target,
+                dtype,
+                batch,
+                seq,
+                dim,
+                fusion: !no_fusion,
+                memory,
+                entry,
+                json,
+            };
+            match nsl_cli::profile::run_profile(&args) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
         }
         Cli::Tokenize { dirs, output, vocab_size, min_freq, ext } => {
             run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
