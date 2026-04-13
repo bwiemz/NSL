@@ -424,6 +424,87 @@ pub fn run_on_wengert(
     Some(run(input))
 }
 
+/// Extended convenience entry point — accepts an optional weights file
+/// and `AnalysisConfig` so Stage 3 can use real importance scoring.
+///
+/// When `weights_path` fails to load, emits a warning on stderr and
+/// falls back to uniform scores rather than failing the compile.
+pub fn run_on_wengert_with_weights(
+    wengert: &WengertList,
+    target: &str,
+    mode_str: &str,
+    world_size: usize,
+    weights_path: Option<&std::path::Path>,
+    analysis_config: AnalysisConfig,
+) -> Option<WggoPlan> {
+    let mode = WggoMode::parse(mode_str)?;
+    let cluster = ClusterSpec {
+        num_gpus: world_size.max(1) as u32,
+        ..ClusterSpec::default()
+    };
+
+    // Check the sidecar cache first — a hit lets us skip the
+    // checkpoint load entirely.
+    let cached_report = weights_path
+        .and_then(|p| crate::wggo_weight_analysis_cache::try_load(p));
+
+    // Load the weights file up front so its lifetime covers the call.
+    // Skip the load when the cache hit already carries the scores.
+    let checkpoint = if cached_report.is_some() {
+        None
+    } else {
+        weights_path.and_then(|p| {
+            match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
+                Ok(ck) => Some(ck),
+                Err(e) => {
+                    eprintln!(
+                        "[wggo] warning: could not load weights from {}: {} — falling back to uniform scores",
+                        p.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        })
+    };
+    let weights_ref: Option<&dyn WeightProvider> = checkpoint
+        .as_ref()
+        .map(|ck| ck as &dyn WeightProvider);
+
+    let input = WggoInput {
+        mode,
+        target,
+        wengert,
+        layer_shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
+        cluster,
+        lut_axes: LutAxes::default(),
+        importance: ImportanceScores::default(),
+        ilp_constraints: Vec::new(),
+        weights: weights_ref,
+        analysis_config,
+    };
+    let mut plan = run(input);
+
+    // Overwrite with cached report when it was a hit — saves both the
+    // checkpoint load and the analyzer's per-layer L2 reductions.
+    if let Some(cached) = cached_report {
+        plan.weight_analysis = cached;
+    } else if let Some(p) = weights_path {
+        // Cache miss — persist the freshly-computed report alongside
+        // the checkpoint.  Failures are silent; the cache is advisory.
+        let _ = crate::wggo_weight_analysis_cache::store(p, &plan.weight_analysis);
+    }
+
+    Some(plan)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -615,6 +696,28 @@ mod tests {
         assert!(
             greedy_nodes * 100 < full_nodes,
             "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
+        );
+    }
+
+    #[test]
+    fn run_on_wengert_with_weights_handles_missing_file() {
+        // A nonexistent weights path should warn and fall back to
+        // uniform scores, not fail the call.
+        let w = two_block_wengert();
+        let plan = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            Some(std::path::Path::new("/nonexistent/path.nslweights")),
+            crate::wggo_weight_analysis::AnalysisConfig::default(),
+        )
+        .expect("plan");
+        // Every layer should be counted as without_weights since the
+        // checkpoint didn't load.
+        assert_eq!(
+            plan.weight_analysis.layers_without_weights,
+            plan.weight_analysis.per_layer.len() as u32
         );
     }
 
