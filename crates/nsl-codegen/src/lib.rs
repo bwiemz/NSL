@@ -79,6 +79,50 @@ pub use standalone::create_weight_object;
 
 use std::collections::HashMap;
 
+/// Decorator configs captured by nsl-semantic and forwarded to
+/// `nsl_codegen::wrga::run` during `@train` block compilation.
+///
+/// Derived from `nsl_semantic::AnalysisResult.{wrga,freeze,adapter}_configs`.
+/// Kept as a codegen-side newtype so nsl-codegen does not depend on
+/// nsl-semantic (mirroring how `imported_fns` is passed as raw signatures).
+#[derive(Debug, Clone, Default)]
+pub struct WrgaInputs {
+    /// Validated `@wrga(...)` configs (one per occurrence).
+    pub wrga: Vec<WrgaDecoratorConfig>,
+    /// Validated `@freeze(...)` configs.
+    pub freeze: Vec<FreezeDecoratorConfig>,
+    /// Validated `@adapter(...)` configs.
+    pub adapter: Vec<AdapterDecoratorConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WrgaDecoratorConfig {
+    pub mode: nsl_ast::block::WrgaMode,
+    pub budget: Option<i64>,
+    pub target: Option<String>,
+    pub layers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FreezeDecoratorConfig {
+    pub exclude: Vec<String>,
+    pub include: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterDecoratorConfig {
+    pub kind: AdapterKind,
+    pub targets: Vec<String>,
+    pub rank: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterKind {
+    Lora,
+    Ia3,
+    GatedLora,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -150,6 +194,8 @@ pub struct CompileOptions {
     pub debug_training: bool,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     pub shared_lib: bool,
+    /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
+    pub wrga_inputs: Option<WrgaInputs>,
 }
 
 impl Default for CompileOptions {
@@ -190,6 +236,7 @@ impl Default for CompileOptions {
             zero_stage: None,
             debug_training: false,
             shared_lib: false,
+            wrga_inputs: None,
         }
     }
 }
