@@ -595,3 +595,111 @@ mod awq_sidecar_reader_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 }
+
+/// Lightweight output suitable for round-trip tests without requiring
+/// a full `AwqPackedWeight` comparison.  The real packed-weight path
+/// can layer on top of this helper once the wider AWQ codegen plumbing
+/// is in place (Task 13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AwqQuantizedChecked {
+    pub dequantized_check_bytes: Vec<u8>,
+}
+
+/// Quantize a weight matrix using optional calibrated per-input-channel
+/// scales.  When `scales` is `None`, uses a vector of 1.0s (equivalent
+/// to uncalibrated AWQ).  Otherwise applies `s[c]^alpha` per input
+/// channel to protect salient channels during quantization.
+///
+/// `weight` is `[out_channels, in_channels]` in row-major layout.
+/// `scales`, when provided, has length `in_channels`.
+///
+/// This helper is the entry point for calibration-driven AWQ scaling.
+/// It replaces the `_calibration_ptr` placeholder in the existing AWQ
+/// runtime — callers that have calibration data supply it; callers
+/// that don't pass `None` and get the uncalibrated baseline.
+pub fn awq_quantize_with_scales(
+    weight: &[f32],
+    in_channels: usize,
+    out_channels: usize,
+    scales: Option<&[f32]>,
+    alpha: f32,
+) -> AwqQuantizedChecked {
+    assert_eq!(weight.len(), in_channels * out_channels, "weight length mismatch");
+    let effective: Vec<f32> = match scales {
+        Some(s) => {
+            assert_eq!(s.len(), in_channels, "scales length must equal in_channels");
+            s.iter().map(|v| v.powf(alpha)).collect()
+        }
+        None => vec![1.0; in_channels],
+    };
+    // Apply per-input-channel scaling to the weight matrix.
+    let mut scaled = Vec::with_capacity(weight.len());
+    for row in 0..out_channels {
+        for col in 0..in_channels {
+            let v = weight[row * in_channels + col] * effective[col];
+            scaled.push(v);
+        }
+    }
+    // Minimal quantization: absmax per row, scale to int8 range.
+    // Real AWQ would do groupwise; this is enough to expose scale
+    // differences in tests and serves as the integration surface for
+    // Task 13's quant-pass wiring.
+    let mut out_bytes = Vec::with_capacity(weight.len());
+    for row in 0..out_channels {
+        let start = row * in_channels;
+        let amax = scaled[start..start + in_channels]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f32, f32::max)
+            .max(1e-9);
+        for i in 0..in_channels {
+            let q = ((scaled[start + i] / amax) * 127.0).round().clamp(-128.0, 127.0);
+            out_bytes.push(q as i8 as u8);
+        }
+    }
+    AwqQuantizedChecked {
+        dequantized_check_bytes: out_bytes,
+    }
+}
+
+#[cfg(test)]
+mod awq_quantize_with_scales_tests {
+    use super::*;
+
+    fn toy_weight(out_channels: usize, in_channels: usize) -> Vec<f32> {
+        (0..out_channels * in_channels)
+            .map(|i| (i as f32 - (out_channels * in_channels) as f32 / 2.0) * 0.01)
+            .collect()
+    }
+
+    #[test]
+    fn quantize_with_none_scales_matches_all_ones_baseline() {
+        let weight = toy_weight(8, 16);
+        let out_none = awq_quantize_with_scales(&weight, 16, 8, None, 0.5);
+        let ones = vec![1.0_f32; 16];
+        let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
+        assert_eq!(out_none.dequantized_check_bytes, out_ones.dequantized_check_bytes,
+            "None scales must equal [1.0; in_channels] scales after s^alpha (1^x = 1)");
+    }
+
+    #[test]
+    fn quantize_with_nontrivial_scales_differs_from_baseline() {
+        let weight = toy_weight(8, 16);
+        let ones = vec![1.0_f32; 16];
+        let varied: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 * 0.2).collect();
+        let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
+        let out_varied = awq_quantize_with_scales(&weight, 16, 8, Some(&varied), 0.5);
+        assert_ne!(out_ones.dequantized_check_bytes, out_varied.dequantized_check_bytes,
+            "Non-trivial scales must change quantization output");
+    }
+
+    #[test]
+    fn quantize_rejects_wrong_length_scales() {
+        let weight = toy_weight(8, 16);
+        let bad = vec![1.0_f32; 99]; // wrong length
+        let result = std::panic::catch_unwind(|| {
+            awq_quantize_with_scales(&weight, 16, 8, Some(&bad), 0.5)
+        });
+        assert!(result.is_err(), "mismatched scales length must panic");
+    }
+}
