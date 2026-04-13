@@ -3,6 +3,7 @@
 
 pub mod cache;
 pub mod ctx;
+pub mod data_loader;
 pub mod hooks;
 pub mod observation;
 pub mod sidecar;
