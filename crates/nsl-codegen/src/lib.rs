@@ -71,9 +71,46 @@ pub mod wrga_spectral;
 pub mod zk;
 
 pub use compiler::{
-    compile, compile_entry, compile_module, compile_module_with_imports, compile_standalone,
-    compile_test, compile_with_zk_info, StandaloneConfig,
+    compile, compile_entry, compile_module, compile_module_with_imports,
+    compile_module_with_imports_returning_plan, compile_standalone, compile_test,
+    compile_with_zk_info, StandaloneConfig,
 };
+
+/// Task 4 test helper: compile a module and return any `WrgaPlan` produced
+/// during `@train` block lowering.  The plan is returned even when codegen
+/// fails *after* `wrga::run` has fired — this is deliberate: WRGA's observable
+/// effect is the stashed plan, independent of whether the full object file
+/// links.
+#[doc(hidden)]
+pub fn debug_compile_and_return_plan(
+    ast: &nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    type_map: &nsl_semantic::checker::TypeMap,
+    options: &CompileOptions,
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
+    let (res, plan) = crate::compiler::compile_module_with_imports_best_effort_plan(
+        ast,
+        interner,
+        type_map,
+        "",
+        &[],
+        HashMap::new(),
+        std::collections::HashSet::new(),
+        false,
+        options,
+    );
+    match (res, plan) {
+        (Ok(_), plan) => Ok(plan),
+        (Err(e), Some(plan)) => {
+            eprintln!(
+                "[debug_compile_and_return_plan] codegen failed but a WRGA plan was produced: {}",
+                e.message
+            );
+            Ok(Some(plan))
+        }
+        (Err(e), None) => Err(e),
+    }
+}
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
 

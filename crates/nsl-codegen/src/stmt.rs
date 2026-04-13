@@ -29,6 +29,115 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
 }
 
+/// Task 4: WRGA bridge — build a `WrgaInput` from decorator configs stashed on
+/// the Compiler and run `wrga::run` against the primal Wengert list.
+///
+/// Returns `None` when WRGA is disabled (`wrga_inputs == None`) or when all
+/// three decorator sets (`wrga`, `freeze`, `adapter`) are empty.  In that case
+/// callers fall back to the unpruned primal/adjoint lists — this matches the
+/// Task 5 sanity expectation that an empty `WrgaInputs` is a no-op.
+///
+/// When a plan is produced, it is stashed on `compiler.last_wrga_plan` for
+/// later observability (`nsl check --wrga-report`).
+pub(crate) fn invoke_wrga_if_enabled(
+    compiler: &mut crate::compiler::Compiler,
+    list: &crate::wengert::WengertList,
+) -> Option<crate::wrga::WrgaPlan> {
+    let inputs = compiler.wrga_inputs.as_ref()?;
+    if inputs.wrga.is_empty() && inputs.freeze.is_empty() && inputs.adapter.is_empty() {
+        return None;
+    }
+
+    let mode = inputs
+        .wrga
+        .first()
+        .map(|c| c.mode)
+        .unwrap_or(nsl_ast::block::WrgaMode::Auto);
+
+    // Collect param names present in the Wengert list so we can synthesise
+    // the "complement" of an `@freeze(include=...)` spec.  `WrgaInput` only
+    // takes a "trainable" allowlist, so `include` (= "these are frozen") is
+    // translated to "everything else is trainable".
+    let mut param_names: Vec<String> = Vec::new();
+    for op in &list.ops {
+        if let crate::wengert::PrimalOp::Param(name) = &op.op {
+            param_names.push(name.clone());
+        }
+    }
+
+    let mut trainable_owned: Vec<String> = Vec::new();
+    for f in &inputs.freeze {
+        // `exclude` semantics: these patterns mark params to *keep* trainable.
+        for pat in &f.exclude {
+            trainable_owned.push(pat.clone());
+        }
+        // `include` semantics: these patterns mark params to *freeze*; the
+        // complement is trainable.  `wrga_prune::glob_match` is the pattern
+        // language.
+        if !f.include.is_empty() {
+            for name in &param_names {
+                let frozen = f
+                    .include
+                    .iter()
+                    .any(|pat| crate::wrga_prune::glob_match(pat, name));
+                if !frozen {
+                    trainable_owned.push(name.clone());
+                }
+            }
+        }
+    }
+    if trainable_owned.is_empty() && inputs.freeze.is_empty() {
+        // No freeze config at all → default to "everything trainable".
+        trainable_owned.push("*".to_string());
+    }
+    // Deduplicate to keep the allowlist compact.
+    trainable_owned.sort();
+    trainable_owned.dedup();
+
+    let manual_adapter_owned: Vec<String> = inputs
+        .adapter
+        .iter()
+        .flat_map(|a| a.targets.iter().cloned())
+        .collect();
+
+    let hybrid_owned: Vec<String> = inputs
+        .wrga
+        .iter()
+        .flat_map(|c| c.layers.iter().cloned())
+        .collect();
+
+    let budget_params = inputs
+        .wrga
+        .iter()
+        .find_map(|c| c.budget)
+        .unwrap_or(0)
+        .max(0) as usize;
+
+    // Borrow the owned strings into the `&'a str` slots `WrgaInput` expects.
+    let trainable_patterns: Vec<&str> = trainable_owned.iter().map(|s| s.as_str()).collect();
+    let manual_adapter_targets: Vec<&str> =
+        manual_adapter_owned.iter().map(|s| s.as_str()).collect();
+    let hybrid_layers: Vec<&str> = hybrid_owned.iter().map(|s| s.as_str()).collect();
+
+    let wrga_input = crate::wrga::WrgaInput {
+        mode,
+        trainable_patterns,
+        manual_adapter_targets,
+        hybrid_layers,
+        wengert: list,
+        loss_output: list.output,
+        weights: None,
+        target: "rtx5070ti",
+        budget_params,
+        r_min: 2,
+        r_max: 16,
+        seed: 0xC0DE_FACE,
+    };
+    let plan = crate::wrga::run(wrga_input);
+    compiler.last_wrga_plan = Some(plan.clone());
+    Some(plan)
+}
+
 fn classify_source_ad_param_name(
     param_name: &str,
     tensor_param_paths: &std::collections::HashSet<String>,
@@ -3454,11 +3563,21 @@ impl Compiler<'_> {
                         );
                     }
                 }
+                // Task 4: invoke WRGA driver (pruning / rank allocation /
+                // fusion) before primal lowering.  When WRGA is disabled or
+                // inputs are empty, this is a no-op and we use the raw
+                // extractor list.
+                let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                let effective_primal: crate::wengert::WengertList = match &wrga_plan {
+                    Some(plan) => plan.prune.pruned.clone(),
+                    None => extractor.wengert_list().clone(),
+                };
+
                 let full_lowered = crate::wengert_lower::compile_wengert_ops(
                     self,
                     builder,
                     state,
-                    extractor.wengert_list(),
+                    &effective_primal,
                     &primal_vars,
                 )?;
                 let full_vars = &full_lowered.var_map;
@@ -3467,10 +3586,20 @@ impl Compiler<'_> {
                     CodegenError::new("source AD: loss VarId not found in compiled forward graph")
                 })?;
 
-                // 6. Generate adjoint backward graph from the primal list.
+                // 6. Generate adjoint backward graph from the (possibly
+                //    pruned) primal list.
                 let start_var = extractor.next_var_id();
                 let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
-                let mut adjoint = gen.generate(extractor.wengert_list());
+                let mut adjoint = gen.generate(&effective_primal);
+
+                // 6a. Task 4: WRGA backward-live filter — drop adjoint ops
+                // that the WRGA prune pass proved to be on frozen branches.
+                if let Some(plan) = &wrga_plan {
+                    adjoint.ops = crate::source_ad::eliminate_by_backward_live(
+                        &adjoint.ops,
+                        &plan.prune.backward_live,
+                    );
+                }
 
                 // 6b. Dead gradient elimination: prune adjoint ops not needed
                 // by any parameter gradient. This removes ghost VarId chains

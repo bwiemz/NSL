@@ -645,6 +645,82 @@ pub fn eliminate_dead_gradients(
         .collect()
 }
 
+/// Task 4: WRGA backward-live filter.
+///
+/// Drop adjoint ops whose **primal** dependency is not in `backward_live`.
+/// `backward_live` is the set of *primal* VarIds whose adjoint must be
+/// materialised, as computed by `wrga_prune::prune`.  Each adjoint op's
+/// `inputs[0]` (the op's seeded adjoint input or primal it differentiates
+/// against) must lie on that set, otherwise the adjoint is dead by pruning.
+///
+/// For ops whose `inputs` are empty (e.g. adjoint constant seeds), keep them;
+/// the downstream `eliminate_dead_gradients` pass is the authority on true
+/// dead-code elimination.  This pass is coarser: it only removes ops the
+/// WRGA prune pass has already proved to be on frozen branches.
+pub fn eliminate_by_backward_live(
+    ops: &[WengertOp],
+    backward_live: &std::collections::BTreeSet<VarId>,
+) -> Vec<WengertOp> {
+    ops.iter()
+        .filter(|op| {
+            // Keep seed / constant ops (no inputs) unconditionally.
+            if op.inputs.is_empty() {
+                return true;
+            }
+            // Keep the op if any of its inputs is on the live set — this
+            // handles both the "result is adjoint of a live primal" and the
+            // "op chains from another live adjoint" cases.
+            op.inputs.iter().any(|v| backward_live.contains(v))
+                || backward_live.contains(&op.result)
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod backward_live_tests {
+    use super::*;
+    use crate::wengert::{PrimalOp, WengertOp};
+    use std::collections::BTreeSet;
+
+    fn mk(id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>) -> WengertOp {
+        WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        }
+    }
+
+    #[test]
+    fn retains_only_live_ops() {
+        // Three ops: op1 depends on primal var 1, op2 on var 2, op3 on var 3.
+        // live = {2}. Op1 and op3 should be dropped; op2 kept.
+        let ops = vec![
+            mk(0, 10, PrimalOp::Neg, vec![1]),
+            mk(1, 11, PrimalOp::Neg, vec![2]),
+            mk(2, 12, PrimalOp::Neg, vec![3]),
+        ];
+        let mut live = BTreeSet::new();
+        live.insert(2u32);
+        let kept = eliminate_by_backward_live(&ops, &live);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].result, 11);
+    }
+
+    #[test]
+    fn keeps_input_less_seed_ops() {
+        // Constant / seed ops with no inputs are always kept — dead-code
+        // elimination happens in the follow-on pass.
+        let ops = vec![mk(0, 5, PrimalOp::Constant(1.0), vec![])];
+        let live: BTreeSet<VarId> = BTreeSet::new();
+        let kept = eliminate_by_backward_live(&ops, &live);
+        assert_eq!(kept.len(), 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Saved tensor analysis
 // ---------------------------------------------------------------------------
