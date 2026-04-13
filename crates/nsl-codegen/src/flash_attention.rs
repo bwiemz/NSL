@@ -392,6 +392,13 @@ fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &Flas
     // Compute thread/block indices
     emit_index_computation(ptx, config);
 
+    // CSHA A.2.2: RMSNorm prologue — emits when `config.csha.fused_rmsnorm`
+    // is set. Writes normalised x into the Q-tile SMEM slot, runtime-gated
+    // on a non-null `csha_x_ptr` so kernels that were compiled with the
+    // flag but launched with null pointers (current A.1/A.2.1x state) fall
+    // through to the classic Q-from-HBM path emitted just below.
+    emit_csha_rmsnorm_prologue(ptx, config);
+
     // Load Q tile into shared memory
     emit_q_tile_load(ptx, config);
 
@@ -528,6 +535,148 @@ fn emit_index_computation(ptx: &mut String, config: &FlashAttentionConfig) {
             config.gqa_group_size
         ));
     }
+}
+
+/// CSHA A.2.2 — RMSNorm prologue emitter.
+///
+/// When `config.csha.fused_rmsnorm` is set, this emits PTX that:
+///
+///   1. Loads the `csha_x_ptr` and `csha_norm_weight_ptr` params.
+///   2. Runtime null-checks — if either pointer is null (the current
+///      A.1/A.2.1x state where the FA call site still passes NULL), the
+///      whole block is a no-op and the classic `emit_q_tile_load` path
+///      fills SMEM as before.
+///   3. When pointers are non-null (future A.2.1e), computes
+///      `rsqrt(sum(x²)/head_dim + eps) * x * w` per Q-tile row and
+///      stores the f16 result into the Q-tile SMEM region (same
+///      `shmem[0..]` slot that `emit_q_tile_load` writes, accounted for
+///      in `shared_mem_bytes` at the `fused_rmsnorm` branch).
+///   4. Finishes with `bar.sync 0` so the main QK^T loop sees a
+///      consistent Q tile regardless of which path filled SMEM.
+///
+/// NOTE: Level 1 (`fused_rmsnorm=true`, `fused_projections=false`) is
+/// semantically ambiguous — a complete implementation also needs the
+/// matmul projection inside the kernel (A.2.3) because the prologue's
+/// output is `x_norm: [block_q, d_model]`, not the `[block_q, head_dim]`
+/// Q tile that the attention body consumes. For now we normalise across
+/// `head_dim` so the SMEM geometry matches; A.2.3 will replace this
+/// with a proper d_model reduction followed by Wq projection.
+///
+/// The kernel variant that uses this prologue is currently dormant —
+/// `nsl_flash_attention_csha` still forwards to the non-CSHA path per
+/// A.1, and A.2.5 is where the CSHA-tagged PTX actually launches.
+fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if !csha.fused_rmsnorm {
+        return;
+    }
+
+    let block_q = config.block_q;
+    let head_dim = config.head_dim;
+
+    ptx.push_str("    // ── CSHA A.2.2: RMSNorm prologue ──────────────────────────\n");
+    ptx.push_str(&format!(
+        "    // fused_rmsnorm=1, block_q={}, head_dim={}\n",
+        block_q, head_dim
+    ));
+    ptx.push_str("    // Registers %rd50-%rd60, %f100-%f103, %p10-%p12 are reserved for this block.\n");
+
+    // Declare local registers — PTX requires all regs pre-declared in the
+    // prolog, but the helper is emitted inline. These are additive to the
+    // generous `%rd<64>`, `%f<128>`, `%p<16>` pools declared in
+    // `emit_register_declarations`, so the indices here don't need new
+    // `.reg` lines.
+    ptx.push_str("    // (no new .reg lines — all indices fall within the pools declared above)\n");
+
+    ptx.push_str("    ld.param.u64 %rd50, [csha_x_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd51, [csha_norm_weight_ptr];\n");
+    ptx.push_str("    ld.param.f32 %f100, [csha_rmsnorm_eps];\n");
+
+    // Runtime null-check: if x_ptr OR norm_weight_ptr is null, skip the
+    // whole prologue and let `emit_q_tile_load` run normally.
+    ptx.push_str("    setp.eq.u64 %p10, %rd50, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p11, %rd51, 0;\n");
+    ptx.push_str("    or.pred %p10, %p10, %p11;\n");
+    ptx.push_str("    @%p10 bra CSHA_PROLOGUE_END;\n");
+
+    // Per-thread row-scoped RMSNorm. We restrict this prologue so that
+    // only threads with `tid_x < block_q` (one thread per Q-tile row)
+    // actually do the reduction — keeps the code straightforward until
+    // A.2.3 brings in MMA-primitive reductions.
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p12, %tid_x, {}; // only threads with tid_x < block_q\n",
+        block_q
+    ));
+    ptx.push_str("    @%p12 bra CSHA_PROLOGUE_END;\n");
+
+    // row = tid_x (u64 for address math)
+    ptx.push_str("    cvt.u64.u32 %rd52, %tid_x;\n");
+
+    // x base addr = csha_x_ptr + (batch_idx*seq_len*head_dim + (q_start+row)*head_dim) * 4
+    // assumes x is [batch, seq, head_dim] laid out contiguously, f32.
+    ptx.push_str("    mul.lo.u64 %rd53, %rd19, %rd6;   // batch_idx * seq_len\n");
+    ptx.push_str("    add.u64 %rd53, %rd53, %rd16;     // + q_start\n");
+    ptx.push_str("    add.u64 %rd53, %rd53, %rd52;     // + row\n");
+    ptx.push_str("    mul.lo.u64 %rd53, %rd53, %rd7;   // * head_dim\n");
+    ptx.push_str("    shl.b64 %rd53, %rd53, 2;         // * 4 bytes (f32)\n");
+    ptx.push_str("    add.u64 %rd53, %rd50, %rd53;     // %rd53 = x row base\n");
+
+    // Pass 1: sum of squares across head_dim.
+    ptx.push_str("    mov.f32 %f101, 0.0;              // sum_sq\n");
+    ptx.push_str("    mov.u64 %rd54, 0;                // d\n");
+    ptx.push_str("CSHA_PROLOGUE_SUMSQ:\n");
+    ptx.push_str("    shl.b64 %rd55, %rd54, 2;         // d * 4\n");
+    ptx.push_str("    add.u64 %rd55, %rd53, %rd55;     // x[row, d] addr\n");
+    ptx.push_str("    ld.global.f32 %f102, [%rd55];\n");
+    ptx.push_str("    fma.rn.f32 %f101, %f102, %f102, %f101;\n");
+    ptx.push_str("    add.u64 %rd54, %rd54, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u64 %p11, %rd54, {};\n",
+        head_dim
+    ));
+    ptx.push_str("    @%p11 bra CSHA_PROLOGUE_SUMSQ;\n");
+
+    // mean = sum_sq / head_dim; inv_rms = rsqrt(mean + eps)
+    ptx.push_str(&format!(
+        "    mov.f32 %f103, 0f{:08X};         // 1.0 / head_dim\n",
+        (1.0f32 / head_dim as f32).to_bits()
+    ));
+    ptx.push_str("    mul.f32 %f101, %f101, %f103;     // mean_sq\n");
+    ptx.push_str("    add.f32 %f101, %f101, %f100;     // + eps\n");
+    ptx.push_str("    rsqrt.approx.f32 %f101, %f101;   // inv_rms\n");
+
+    // Pass 2: y = x * inv_rms * w, stored as f16 into SMEM at
+    // shmem[(row * head_dim + d) * 2]. `shmem` is the PTX symbol for the
+    // shared-memory array declared in emit_flash_attention_entry.
+    ptx.push_str("    mul.lo.u64 %rd56, %rd52, %rd7;   // row * head_dim\n");
+    ptx.push_str("    shl.b64 %rd56, %rd56, 1;         // * 2 bytes (f16)\n");
+    ptx.push_str("    mov.u64 %rd57, shmem;\n");
+    ptx.push_str("    add.u64 %rd56, %rd57, %rd56;     // %rd56 = row SMEM base\n");
+    ptx.push_str("    mov.u64 %rd54, 0;                // d = 0\n");
+    ptx.push_str("CSHA_PROLOGUE_APPLY:\n");
+    ptx.push_str("    shl.b64 %rd58, %rd54, 2;         // d * 4\n");
+    ptx.push_str("    add.u64 %rd59, %rd53, %rd58;     // x[row, d]\n");
+    ptx.push_str("    ld.global.f32 %f102, [%rd59];\n");
+    ptx.push_str("    add.u64 %rd60, %rd51, %rd58;     // w[d]\n");
+    ptx.push_str("    ld.global.f32 %f103, [%rd60];\n");
+    ptx.push_str("    mul.f32 %f102, %f102, %f101;     // x * inv_rms\n");
+    ptx.push_str("    mul.f32 %f102, %f102, %f103;     // * w\n");
+    ptx.push_str("    cvt.rn.f16.f32 %h0, %f102;\n");
+    ptx.push_str("    shl.b64 %rd58, %rd54, 1;         // d * 2 (SMEM offset)\n");
+    ptx.push_str("    add.u64 %rd58, %rd56, %rd58;\n");
+    ptx.push_str("    st.shared.b16 [%rd58], %h0;\n");
+    ptx.push_str("    add.u64 %rd54, %rd54, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u64 %p11, %rd54, {};\n",
+        head_dim
+    ));
+    ptx.push_str("    @%p11 bra CSHA_PROLOGUE_APPLY;\n");
+
+    ptx.push_str("CSHA_PROLOGUE_END:\n");
+    ptx.push_str("    bar.sync 0;                       // Q tile (from prologue OR Q load) consistent across warps\n");
+    ptx.push_str("    // ── end CSHA prologue ───────────────────────────────────────\n");
 }
 
 fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -5635,5 +5784,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── CSHA A.2.2: RMSNorm prologue emission tests ──────────────────
+
+    fn csha_l1_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            csha: Some(CshaExtras::level1(1e-5)),
+        }
+    }
+
+    fn non_csha_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            csha: None,
+        }
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_appears_with_fused_rmsnorm() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        // Prologue marker comment must appear — this is the anchor
+        // downstream assertions use to confirm the block was emitted.
+        assert!(
+            ptx.contains("CSHA A.2.2: RMSNorm prologue"),
+            "prologue block missing for CSHA L1 config"
+        );
+        // Core PTX ops that the prologue emits.
+        assert!(ptx.contains("ld.param.u64 %rd50, [csha_x_ptr];"));
+        assert!(ptx.contains("ld.param.u64 %rd51, [csha_norm_weight_ptr];"));
+        assert!(ptx.contains("ld.param.f32 %f100, [csha_rmsnorm_eps];"));
+        assert!(ptx.contains("rsqrt.approx.f32 %f101, %f101;"));
+        assert!(ptx.contains("st.shared.b16 [%rd58], %h0;"));
+        // Labels must be present for the runtime null-check branch.
+        assert!(ptx.contains("CSHA_PROLOGUE_SUMSQ:"));
+        assert!(ptx.contains("CSHA_PROLOGUE_APPLY:"));
+        assert!(ptx.contains("CSHA_PROLOGUE_END:"));
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_absent_without_csha() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&non_csha_config())).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.2: RMSNorm prologue"),
+            "prologue must not appear in non-CSHA PTX"
+        );
+        assert!(!ptx.contains("CSHA_PROLOGUE_SUMSQ:"));
+        assert!(!ptx.contains("CSHA_PROLOGUE_APPLY:"));
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_absent_when_fused_rmsnorm_off() {
+        // CSHA plumbing enabled but prologue fusion explicitly off —
+        // the kernel variant registers the CSHA param list (so ABI stays
+        // stable across cshaL*/non-CSHA variants) but the prologue
+        // PTX body is still elided.
+        let mut cfg = csha_l1_config();
+        cfg.csha.as_mut().unwrap().fused_rmsnorm = false;
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.2: RMSNorm prologue"),
+            "prologue must respect the fused_rmsnorm gate"
+        );
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_runtime_null_check_uses_or_pred() {
+        // The prologue must short-circuit if EITHER csha_x_ptr OR
+        // csha_norm_weight_ptr is null — otherwise threading only one
+        // of them (possible during A.2.1e rollout) would dereference a
+        // null pointer in the other. Check the or.pred guard.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        assert!(
+            ptx.contains("setp.eq.u64 %p10, %rd50, 0;")
+                && ptx.contains("setp.eq.u64 %p11, %rd51, 0;")
+                && ptx.contains("or.pred %p10, %p10, %p11;")
+                && ptx.contains("@%p10 bra CSHA_PROLOGUE_END;"),
+            "runtime null-check on x_ptr/norm_weight_ptr is missing"
+        );
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_precedes_q_tile_load() {
+        // The prologue must emit BEFORE the classic Q-from-HBM load so
+        // that when null pointers short-circuit the prologue, Q load
+        // still fills SMEM and the kernel behaves identically to the
+        // non-CSHA variant at runtime (current A.1/A.2.1x state).
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        let prologue_idx = ptx.find("CSHA A.2.2: RMSNorm prologue").expect("prologue present");
+        let q_load_idx = ptx
+            .find("Load Q tile into shared memory")
+            .expect("Q tile load present");
+        assert!(
+            prologue_idx < q_load_idx,
+            "prologue at offset {} must precede Q tile load at offset {}",
+            prologue_idx,
+            q_load_idx
+        );
     }
 }
