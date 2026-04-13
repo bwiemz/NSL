@@ -30,6 +30,10 @@ pub struct AppliedLayer {
     pub adapter_rank: u64,
     pub optim_m_bits: u8,
     pub optim_v_bits: u8,
+    /// Whether FASE fuses the optimizer step into the backward pass.
+    /// Forced to `false` for pruned layers and for layers sharded by CPDT
+    /// (the conflict resolver demotes the latter via `DeferFaseStep`).
+    pub fase_fused: bool,
     /// Estimated layer cost post-application (μs).
     pub estimated_us: f64,
 }
@@ -71,9 +75,13 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
         let active_heads = ilp_sol.decision.active_heads() as u32;
         // Prune-decision propagation: if the inter-layer DP decided to
         // prune, force adapter rank and csha level to safe defaults.
-        let (csha_level, adapter_rank) = match coarse.decision {
-            CoarseDecision::Prune => (0, 0),
-            _ => (ilp_sol.decision.csha_level, ilp_sol.decision.adapter_rank),
+        let (csha_level, adapter_rank, fase_fused) = match coarse.decision {
+            CoarseDecision::Prune => (0, 0, false),
+            _ => (
+                ilp_sol.decision.csha_level,
+                ilp_sol.decision.adapter_rank,
+                ilp_sol.decision.fase_fused,
+            ),
         };
         let cost = if coarse.decision == CoarseDecision::Prune {
             0.0
@@ -94,6 +102,7 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
             adapter_rank,
             optim_m_bits: ilp_sol.decision.optim_m_bits,
             optim_v_bits: ilp_sol.decision.optim_v_bits,
+            fase_fused,
             estimated_us: cost,
         });
     }
@@ -212,6 +221,21 @@ mod tests {
         let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
         let ilp = vec![solve_layer(&lut, &LayerIlpConstraints::default())];
         let _ = apply(&inter, &ilp);
+    }
+
+    #[test]
+    fn pruned_layers_force_fase_fused_off() {
+        let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
+        let ilp: Vec<_> = (0..3)
+            .map(|_| {
+                let mut s = solve_layer(&lut, &LayerIlpConstraints::default());
+                s.decision.fase_fused = true; // pretend ILP picked fused
+                s
+            })
+            .collect();
+        let applied = apply(&inter_plan(3), &ilp);
+        assert!(!applied.layers[2].fase_fused, "pruned layer must not fuse");
+        assert!(applied.layers[0].fase_fused, "kept layer preserves choice");
     }
 
     #[test]

@@ -42,6 +42,10 @@ pub struct LayerDecision {
     pub optim_m_bits: u8,
     /// Optimizer `v` precision (bits).
     pub optim_v_bits: u8,
+    /// Whether FASE fuses the optimizer step into the backward pass for
+    /// this layer.  When `true`, gradient buffers are not materialised in
+    /// HBM and the backward kernel writes parameter updates directly.
+    pub fase_fused: bool,
 }
 
 impl LayerDecision {
@@ -83,6 +87,18 @@ pub struct LayerIlpConstraints {
     /// summed importance.
     pub head_importance: Vec<f64>,
     pub min_retained_importance: f64,
+    /// Whether the FASE fused-step option is permitted for this layer.
+    /// When `false` the solver must pick `fase_fused = false`.  Callers
+    /// set this to `false` for layers sharded by CPDT (since fusing into
+    /// backward conflicts with reduce-scatter ordering — the conflict
+    /// resolver would defer it anyway, but pre-pruning saves work).
+    pub allow_fase: bool,
+    /// Estimated relative speedup of the backward pass when FASE fuses
+    /// the optimizer step into it.  Typical values: 0.05–0.15.  The
+    /// fused step also eliminates a separate gradient HBM round-trip,
+    /// which is modeled as removing one parameter-sized buffer from the
+    /// activation footprint.
+    pub fase_backward_speedup: f64,
 }
 
 impl Default for LayerIlpConstraints {
@@ -99,6 +115,8 @@ impl Default for LayerIlpConstraints {
             critical_prec_threshold: 0.9,
             head_importance: Vec::new(),
             min_retained_importance: 0.0,
+            allow_fase: true,
+            fase_backward_speedup: 0.10,
         }
     }
 }
@@ -140,6 +158,11 @@ pub fn solve_layer(
     // largest ffn, min rank, min precision) first because those tend to be
     // near-optimal — producing a good incumbent early tightens the bound.
     let precision_domain: &[u8] = &[32, 16, 8];
+    let fase_domain: &[bool] = if constraints.allow_fase {
+        &[true, false]
+    } else {
+        &[false]
+    };
 
     for &m_bits in precision_domain {
         if !prec_allowed(m_bits, constraints) {
@@ -149,43 +172,47 @@ pub fn solve_layer(
             if !prec_allowed(v_bits, constraints) {
                 continue;
             }
-            for &c in lut.axes_csha_levels.iter().rev() {
-                for &f in lut.axes_ffn_widths.iter().rev() {
-                    for &r in &lut.axes_adapter_ranks {
-                        for heads_config in enumerate_head_configs(constraints) {
-                            state.nodes += 1;
-                            let h_count = heads_config.iter().filter(|b| **b).count() as u64;
-                            let Some(entry) = lut.get(h_count.max(1), f, c, r) else {
-                                continue;
-                            };
-                            if !entry.feasible {
-                                continue;
+            for &fase in fase_domain {
+                for &c in lut.axes_csha_levels.iter().rev() {
+                    for &f in lut.axes_ffn_widths.iter().rev() {
+                        for &r in &lut.axes_adapter_ranks {
+                            for heads_config in enumerate_head_configs(constraints) {
+                                state.nodes += 1;
+                                let h_count = heads_config.iter().filter(|b| **b).count() as u64;
+                                let Some(base) = lut.get(h_count.max(1), f, c, r) else {
+                                    continue;
+                                };
+                                if !base.feasible {
+                                    continue;
+                                }
+                                let entry = apply_fase(base, fase, constraints.fase_backward_speedup);
+                                if entry.smem_bytes > constraints.smem_budget {
+                                    continue;
+                                }
+                                if entry.param_bytes + entry.activation_bytes
+                                    > constraints.memory_budget
+                                {
+                                    continue;
+                                }
+                                if !importance_ok(&heads_config, constraints) {
+                                    continue;
+                                }
+                                if entry.total_us() >= state.best_cost {
+                                    continue; // bound prune
+                                }
+                                let decision = LayerDecision {
+                                    keep_head: heads_config.clone(),
+                                    ffn_width: f,
+                                    csha_level: c,
+                                    adapter_rank: r,
+                                    optim_m_bits: m_bits,
+                                    optim_v_bits: v_bits,
+                                    fase_fused: fase,
+                                };
+                                state.best_cost = entry.total_us();
+                                state.best_decision = Some(decision);
+                                state.best_entry = Some(entry);
                             }
-                            if entry.smem_bytes > constraints.smem_budget {
-                                continue;
-                            }
-                            if entry.param_bytes + entry.activation_bytes
-                                > constraints.memory_budget
-                            {
-                                continue;
-                            }
-                            if !importance_ok(&heads_config, constraints) {
-                                continue;
-                            }
-                            if entry.total_us() >= state.best_cost {
-                                continue; // bound prune
-                            }
-                            let decision = LayerDecision {
-                                keep_head: heads_config.clone(),
-                                ffn_width: f,
-                                csha_level: c,
-                                adapter_rank: r,
-                                optim_m_bits: m_bits,
-                                optim_v_bits: v_bits,
-                            };
-                            state.best_cost = entry.total_us();
-                            state.best_decision = Some(decision);
-                            state.best_entry = Some(entry);
                         }
                     }
                 }
@@ -310,6 +337,33 @@ fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
         adapter_rank: 0,
         optim_m_bits: 32,
         optim_v_bits: 32,
+        fase_fused: false,
+    }
+}
+
+/// Adjust a baseline LUT entry for the FASE fused-step option.  Fusing the
+/// optimizer step into the backward kernel removes the explicit gradient
+/// HBM round-trip (modeled as one parameter-sized buffer dropping out of
+/// the activation footprint) and reduces backward latency by
+/// `fase_backward_speedup` (typically 5–15 %).  Both adjustments saturate
+/// at zero so the entry remains physically meaningful.
+fn apply_fase(base: LayerCostEntry, fase_fused: bool, speedup: f64) -> LayerCostEntry {
+    if !fase_fused {
+        return base;
+    }
+    let s = speedup.clamp(0.0, 0.5);
+    let backward_us = base.backward_us * (1.0 - s);
+    // Fused step writes parameter updates directly — the gradient buffer
+    // (≈ param_bytes) never lands in HBM as a distinct activation tensor.
+    let activation_bytes = base.activation_bytes.saturating_sub(base.param_bytes);
+    LayerCostEntry {
+        forward_us: base.forward_us,
+        backward_us,
+        param_bytes: base.param_bytes,
+        activation_bytes,
+        smem_bytes: base.smem_bytes,
+        feasible: base.feasible,
+        classification: base.classification,
     }
 }
 
@@ -441,9 +495,56 @@ mod tests {
     fn solver_visits_finite_number_of_nodes() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let sol = solve_layer(&lut, &LayerIlpConstraints::default());
-        // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 = 229 500.  Allow
-        // 2× for expansion inside branches.
-        assert!(sol.nodes_explored <= 500_000, "nodes={}", sol.nodes_explored);
+        // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 × 2 (FASE) = 459 000.
+        // Allow 2× for expansion inside branches.
+        assert!(sol.nodes_explored <= 1_000_000, "nodes={}", sol.nodes_explored);
+    }
+
+    #[test]
+    fn fase_fused_picked_when_allowed_and_lowers_backward() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let with_fase = solve_layer(&lut, &LayerIlpConstraints::default());
+        let without_fase = solve_layer(
+            &lut,
+            &LayerIlpConstraints {
+                allow_fase: false,
+                ..LayerIlpConstraints::default()
+            },
+        );
+        assert!(with_fase.feasible && without_fase.feasible);
+        assert!(with_fase.decision.fase_fused);
+        assert!(!without_fase.decision.fase_fused);
+        // Fusion must strictly improve the objective at the default 10%
+        // backward speedup.
+        assert!(
+            with_fase.cost_us < without_fase.cost_us,
+            "with_fase={} should beat without_fase={}",
+            with_fase.cost_us,
+            without_fase.cost_us
+        );
+    }
+
+    #[test]
+    fn fase_fused_forced_off_when_disallowed() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut constraints = LayerIlpConstraints::default();
+        constraints.allow_fase = false;
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert!(!sol.decision.fase_fused);
+    }
+
+    #[test]
+    fn fase_speedup_zero_makes_decision_neutral() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut constraints = LayerIlpConstraints::default();
+        constraints.fase_backward_speedup = 0.0;
+        // With no backward speedup the only benefit is reduced activation
+        // bytes — still strictly preferable under default unbounded memory,
+        // but the cost objective is identical, so the solver may pick
+        // either branch.  We only assert feasibility.
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
     }
 
     #[test]
