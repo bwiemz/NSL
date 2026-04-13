@@ -860,6 +860,11 @@ fn main_inner() {
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
+                calibration_data: None,
+                calibration_mode: Some("required".to_string()),
+                calibration_samples: 512,
+                calibration_batch_size: 8,
+                calibration_timeout_secs: 600,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1037,6 +1042,11 @@ fn main_inner() {
                 wggo_prune_fraction: None,
                 csha_mode: None,
                 csha_report: false,
+                calibration_data: None,
+                calibration_mode: Some("required".to_string()),
+                calibration_samples: 512,
+                calibration_batch_size: 8,
+                calibration_timeout_secs: 600,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
