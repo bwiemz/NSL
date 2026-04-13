@@ -185,7 +185,7 @@ pub struct WeightEntry {
     /// Number of elements
     pub num_elements: usize,
     /// Sparsity analysis results (computed lazily on first access)
-    sparsity: Option<SparsityInfo>,
+    pub(crate) sparsity: Option<SparsityInfo>,
     /// Whether this weight has been eliminated (near-zero)
     pub eliminated: bool,
 }

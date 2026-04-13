@@ -325,6 +325,64 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // CFIE: @cfie decorator validation
+                        if dname == "cfie" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cfie::validate_cfie_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
+                        // CPDT: @cpdt decorator validation
+                        if dname == "cpdt" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cpdt::validate_cpdt_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
+                        // CEP: @cep_prune / @cep_search decorator validation
+                        if dname == "cep_prune" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cep::validate_cep_prune_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+                        if dname == "cep_search" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::cep::validate_cep_search_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
+                        // WGGO: @wggo decorator validation
+                        if dname == "wggo" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::wggo::validate_wggo_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         // CFTP: @fase and @pca decorator validation
                         if dname == "fase" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
