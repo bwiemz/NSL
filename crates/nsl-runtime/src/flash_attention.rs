@@ -277,10 +277,23 @@ pub extern "C" fn nsl_flash_attention(
 ///   d_model          — feature dimension for the projection tiles
 ///
 /// For Tier A.1 the CSHA PTX body is not yet emitted (A.2), so this FFI
-/// forwards to `nsl_flash_attention` and deliberately ignores the nine
-/// extras. Plumbing through codegen already ensures the caller passes
-/// them in the correct order; A.2 will light up a second launch path
-/// inside this function that consumes them.
+/// launches the CSHA-tagged PTX variant directly with a 30-argument
+/// launch list — the 21 base FlashAttention params plus the nine CSHA
+/// extras declared by `emit_flash_attention_entry` (csha_x_ptr through
+/// csha_d_model).
+///
+/// A.2.5: this replaces the pre-A.2.5 forwarder (which invoked
+/// `nsl_flash_attention` and dropped the extras, causing a cuLaunch arg
+/// count mismatch on kernels whose body now references the CSHA params).
+/// The CSHA PTX scaffolds from A.2.2/A.2.3/A.2.4 still runtime-null-check
+/// the pointers, so callers that pass NULL for any of Wq/Wk/Wv/Wo/
+/// x_ptr/norm_weight_ptr (current A.1/A.2.1x state) execute the classic
+/// Q-from-HBM path inside the kernel. This FFI's contract is therefore
+/// a strict extension of `nsl_flash_attention`'s behaviour.
+///
+/// FA3 Hopper fallback is intentionally skipped here — the FA3 kernel
+/// does not understand CSHA extras. Ampere/Hopper both run the Ampere
+/// mma.sync FA2 path when CSHA is active.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_csha(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -295,9 +308,12 @@ pub extern "C" fn nsl_flash_attention_csha(
     seq_ids_ptr: i64, seq_lens_ptr: i64,
     shared_mem_bytes: i64,
     ptx_ptr: i64, name_ptr: i64,
-    block_q: i64, block_kv: i64,
+    block_q: i64, _block_kv: i64,
     causal: i64,
-    // A.1: CSHA extras. Ignored by the forwarder; A.2 lights them up.
+    // CSHA extras consumed by the PTX prologue/projection/epilogue
+    // scaffolds (A.2.2/A.2.3/A.2.4). Each pointer is null-checked
+    // inside the kernel so current NULL-passing call sites fall through
+    // to the classic path without dereferencing garbage.
     x_ptr: i64,
     norm_weight_ptr: i64,
     wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
@@ -305,25 +321,135 @@ pub extern "C" fn nsl_flash_attention_csha(
     active_heads: i64,
     d_model: i64,
 ) -> i64 {
-    // Silence unused-parameter warnings until A.2 consumes these.
-    let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
-    let _ = (rmsnorm_eps_bits, active_heads, d_model);
-    nsl_flash_attention(
-        q_ptr, k_ptr, v_ptr,
-        out_ptr,
-        logsumexp_ptr,
-        scale_bits,
-        batch, heads, seq_len, head_dim,
-        block_table_ptr,
-        k_pool_ptr, v_pool_ptr,
-        block_size,
-        cos_ptr, sin_ptr,
-        seq_ids_ptr, seq_lens_ptr,
-        shared_mem_bytes,
-        ptx_ptr, name_ptr,
-        block_q, block_kv,
-        causal,
-    )
+    #[cfg(feature = "cuda")]
+    {
+        // Grid / block identical to `nsl_flash_attention` — CSHA doesn't
+        // change the outer tiling.
+        let grid_x = (seq_len + block_q - 1) / block_q;
+        let grid_y = batch * heads;
+        let grid_z = 1i64;
+        let block_x = 128i64;
+        let block_y = 1i64;
+        let block_z = 1i64;
+
+        // 21 base args — must exactly mirror the non-CSHA path so the
+        // shared PTX body works identically on NULL CSHA extras.
+        let mut q = q_ptr as u64;
+        let mut k = k_ptr as u64;
+        let mut v = v_ptr as u64;
+        let mut out = out_ptr as u64;
+        let mut s = f32::from_bits(scale_bits as u32);
+        let mut b = batch as u64;
+        let mut h = heads as u64;
+        let mut sl = seq_len as u64;
+        let mut hd = head_dim as u64;
+        let mut bt = block_table_ptr as u64;
+        let mut kp = k_pool_ptr as u64;
+        let mut vp = v_pool_ptr as u64;
+        let mut bs = block_size as u64;
+        let mut cos = cos_ptr as u64;
+        let mut sin = sin_ptr as u64;
+        let mut sids = seq_ids_ptr as u64;
+        let mut slens = seq_lens_ptr as u64;
+        let mut dfs_enter: u64 = 0;
+        let mut dfs_exit: u64 = 0;
+        let mut num_tree_nodes: u64 = 0;
+        let mut lse = logsumexp_ptr as u64;
+
+        // 9 CSHA extras, matching the PTX param declarations in
+        // `emit_flash_attention_entry`. eps is declared .f32; heads /
+        // d_model are .u32. Widths matter — the launch wrapper reads
+        // sizeof(param_type) bytes starting at each `*mut c_void`.
+        let mut x = x_ptr as u64;
+        let mut nw = norm_weight_ptr as u64;
+        let mut wq = wq_ptr as u64;
+        let mut wk = wk_ptr as u64;
+        let mut wv = wv_ptr as u64;
+        let mut wo = wo_ptr as u64;
+        let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
+        let mut ah = active_heads as u32;
+        let mut dm = d_model as u32;
+
+        let args: [*mut c_void; 30] = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut sids as *mut _ as *mut c_void,
+            &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
+            // ── CSHA extras ───────────────────────────────────────
+            &mut x as *mut _ as *mut c_void,
+            &mut nw as *mut _ as *mut c_void,
+            &mut wq as *mut _ as *mut c_void,
+            &mut wk as *mut _ as *mut c_void,
+            &mut wv as *mut _ as *mut c_void,
+            &mut wo as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ah as *mut _ as *mut c_void,
+            &mut dm as *mut _ as *mut c_void,
+        ];
+
+        let result = crate::cuda::inner::kernel_launch(
+            ptx_ptr as *const u8,
+            name_ptr as *const u8,
+            [grid_x, grid_y, grid_z],
+            [block_x, block_y, block_z],
+            &args,
+            shared_mem_bytes as u32,
+        ) as i64;
+
+        // Tape recording mirrors `nsl_flash_attention` exactly — CSHA
+        // is a forward-pass optimisation; the backward pass re-reads Q/K/V
+        // from the same pointers the caller supplied.
+        if autodiff::is_recording() {
+            let scale = f32::from_bits(scale_bits as u32);
+            NslTensor::from_ptr(q_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(k_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(v_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(out_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(logsumexp_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            autodiff::maybe_record(autodiff::TapeOp::FlashAttention {
+                q: q_ptr, k: k_ptr, v: v_ptr,
+                out: out_ptr,
+                logsumexp: logsumexp_ptr,
+                scale,
+                batch, heads, seq_len, head_dim,
+                causal: causal != 0,
+                saved_q: q_ptr,
+                saved_k: k_ptr,
+                saved_v: v_ptr,
+            });
+        }
+
+        result
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale_bits);
+        let _ = (batch, heads, seq_len, head_dim);
+        let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
+        let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
+        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
+        let _ = (rmsnorm_eps_bits, active_heads, d_model);
+        eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
+        -1
+    }
 }
 
 /// M42b: Quantized FlashAttention — KV-cache in INT8/FP8, Q in f16/f32.
@@ -2017,5 +2143,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── CSHA A.2.5: FFI launch path tests ────────────────────────────
+
+    /// Pre-A.2.5 the `_csha` FFI forwarded to `nsl_flash_attention` and
+    /// dropped the nine CSHA extras. Any unit test that could observe
+    /// the difference without a GPU was really testing the forwarder's
+    /// fallback. Post-A.2.5, the CSHA FFI launches the PTX variant
+    /// directly — we can still exercise it on a non-CUDA build: the
+    /// function must return a clean error code (-1) rather than
+    /// panicking, and must accept the full 30-argument FFI signature
+    /// without unused-parameter lints.
+    ///
+    /// On a CUDA build, the same call with null pointers would skip the
+    /// PTX prologue/projection/epilogue scaffolds (runtime null-checks)
+    /// and execute the classic Q-from-HBM path, so behaviour is a
+    /// strict extension of `nsl_flash_attention`.
+    #[test]
+    #[cfg(not(feature = "cuda"))]
+    fn a25_csha_ffi_noncuda_returns_error_without_panic() {
+        let r = nsl_flash_attention_csha(
+            0, 0, 0, 0, 0, 1.0f32.to_bits() as i64,
+            1, 1, 16, 64,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0,
+            64, 64, 0,
+            // CSHA extras (all null / zero — matches current call-site state).
+            0, 0, 0, 0, 0, 0,
+            1e-5f32.to_bits() as i64,
+            0, 0,
+        );
+        assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
+    }
+
+    /// Smoke test: the CSHA FFI symbol resolves and the 30-parameter
+    /// signature is wired correctly through the `extern "C"` ABI.
+    /// This catches A.2.5 signature regressions (e.g. an accidentally
+    /// dropped extras arg) at link time — the forwarder version would
+    /// have silently ignored wrong-count calls.
+    #[test]
+    #[cfg(not(feature = "cuda"))]
+    fn a25_csha_ffi_signature_has_thirty_params() {
+        // Type-check: compiler enforces the full 30-arg signature.
+        let _: extern "C" fn(
+            i64, i64, i64, i64, i64, i64,
+            i64, i64, i64, i64,
+            i64, i64, i64, i64,
+            i64, i64, i64, i64,
+            i64, i64, i64,
+            i64, i64, i64,
+            // extras
+            i64, i64, i64, i64, i64, i64,
+            i64, i64, i64,
+        ) -> i64 = nsl_flash_attention_csha;
     }
 }
