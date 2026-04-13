@@ -392,6 +392,17 @@ fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &Flas
     // Compute thread/block indices
     emit_index_computation(ptx, config);
 
+    // CSHA A.4: active_heads guard — compile-time literal early-exit.
+    // When `config.csha.active_heads` is set to a non-zero value smaller
+    // than the full head count, the runtime launches with a shrunken
+    // grid_y so each CTA's `bid_y % heads` lands inside the active range
+    // — but as a defence-in-depth measure we emit a `setp.ge ... @ret`
+    // right after head_idx is computed so any launch-vs-kernel
+    // specialisation mismatch fails cleanly instead of corrupting
+    // memory. ptxas turns the literal into dead-code elimination when
+    // the guard is provably unreachable.
+    emit_csha_active_heads_guard(ptx, config);
+
     // CSHA A.2.2: RMSNorm prologue — emits when `config.csha.fused_rmsnorm`
     // is set. Writes normalised x into the Q-tile SMEM slot, runtime-gated
     // on a non-null `csha_x_ptr` so kernels that were compiled with the
@@ -691,6 +702,48 @@ fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("CSHA_PROLOGUE_END:\n");
     ptx.push_str("    bar.sync 0;                       // Q tile (from prologue OR Q load) consistent across warps\n");
     ptx.push_str("    // ── end CSHA prologue ───────────────────────────────────────\n");
+}
+
+/// CSHA A.4 — active_heads early-exit guard.
+///
+/// Emits a compile-time-literal guard that returns from the kernel when
+/// `head_idx >= active_heads`. Present only when
+/// `config.csha.active_heads` is non-zero (weight-informed specialisation
+/// per paper §9.3 — i.e. some heads were pruned by the planner).
+///
+/// The runtime path (`nsl_flash_attention_csha`, A.4 runtime side)
+/// shrinks `grid_y = batch * active_heads` when `active_heads > 0`, so
+/// in a correctly-paired launch this guard never fires. Emitting it
+/// anyway protects against:
+///
+///   - A launch-vs-kernel specialisation mismatch (e.g. grid built for
+///     a different `active_heads` than the kernel variant was
+///     compiled with).
+///   - Cache-hit misrouting: two callers of the same FA entry pointing
+///     at different PTX variants.
+///
+/// The literal makes it a strict optimisation hint for ptxas — when
+/// `active_heads == heads` at launch time (the common no-pruning case
+/// with `active_heads=0`), this function emits nothing.
+fn emit_csha_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if csha.active_heads == 0 {
+        return;
+    }
+
+    ptx.push_str("    // ── CSHA A.4: active_heads guard ─────────────────────────\n");
+    ptx.push_str(&format!(
+        "    // active_heads={} (weight-informed kernel specialisation)\n",
+        csha.active_heads
+    ));
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p9, %rd18, {};       // head_idx >= active_heads\n",
+        csha.active_heads
+    ));
+    ptx.push_str("    @%p9 ret;                         // dead head: exit CTA cleanly\n");
+    ptx.push_str("    // ── end CSHA active_heads guard ─────────────────────────────\n");
 }
 
 /// CSHA A.2.3 — matmul projection emitter.
@@ -6245,6 +6298,69 @@ mod tests {
         assert!(ptx.contains("setp.eq.u64 %p14, %rd62, 0;"));
         assert!(ptx.contains("setp.eq.u64 %p14, %rd63, 0;"));
         assert!(ptx.contains("@%p13 bra CSHA_PROJECTION_END;"));
+    }
+
+    // ── CSHA A.4: active_heads guard emission tests ──────────────────
+
+    fn csha_pruned_config(active_heads: u32) -> FlashAttentionConfig {
+        let mut cfg = csha_l1_config();
+        cfg.csha.as_mut().unwrap().active_heads = active_heads;
+        cfg
+    }
+
+    #[test]
+    fn a4_active_heads_guard_absent_when_zero() {
+        // active_heads=0 is the "no pruning" signal — kernel runs the
+        // full head count and the guard must not appear (otherwise ptxas
+        // sees a `bid_y >= 0` check which is never false but still
+        // emits the branch instruction).
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        assert!(!ptx.contains("CSHA A.4: active_heads guard"));
+        assert!(!ptx.contains("@%p9 ret;"));
+    }
+
+    #[test]
+    fn a4_active_heads_guard_emits_literal_bound() {
+        let cfg = csha_pruned_config(5);
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(
+            ptx.contains("CSHA A.4: active_heads guard"),
+            "guard must appear when active_heads > 0"
+        );
+        // The compile-time literal (5) appears in the setp operand,
+        // letting ptxas fold the comparison against a constant rather
+        // than a runtime-loaded param.
+        assert!(
+            ptx.contains("setp.ge.u64 %p9, %rd18, 5;"),
+            "guard must use the compile-time active_heads literal"
+        );
+        assert!(ptx.contains("@%p9 ret;"));
+    }
+
+    #[test]
+    fn a4_active_heads_guard_follows_index_computation() {
+        // The guard must appear AFTER `emit_index_computation` (which
+        // writes %rd18 = head_idx) but BEFORE the A.2.2 prologue — so
+        // dead heads exit without doing any SMEM work.
+        let cfg = csha_pruned_config(3);
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        let head_idx = ptx
+            .find("head_idx = bid_y % heads")
+            .expect("index computation writes head_idx");
+        let guard_idx = ptx.find("CSHA A.4: active_heads guard").unwrap();
+        let prologue_idx = ptx.find("CSHA A.2.2: RMSNorm prologue").unwrap();
+        assert!(head_idx < guard_idx, "guard must follow head_idx computation");
+        assert!(
+            guard_idx < prologue_idx,
+            "guard must precede the prologue so dead heads skip SMEM work"
+        );
+    }
+
+    #[test]
+    fn a4_active_heads_guard_absent_in_non_csha_ptx() {
+        // Sanity: the guard is purely a CSHA feature.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&non_csha_config())).unwrap();
+        assert!(!ptx.contains("CSHA A.4: active_heads guard"));
     }
 
     // ── CSHA A.2.4: RoPE epilogue emission tests ────────────────────

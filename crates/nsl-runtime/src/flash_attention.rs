@@ -324,9 +324,19 @@ pub extern "C" fn nsl_flash_attention_csha(
     #[cfg(feature = "cuda")]
     {
         // Grid / block identical to `nsl_flash_attention` — CSHA doesn't
-        // change the outer tiling.
+        // change the outer tiling, except for A.4 weight-informed
+        // specialisation: when `active_heads` is non-zero and smaller
+        // than the full head count, the kernel variant was compiled
+        // with a matching early-exit guard; shrink grid_y so each CTA
+        // lands inside the active range. active_heads == 0 means "no
+        // pruning — run the full head count".
+        let effective_heads = if active_heads > 0 && active_heads < heads {
+            active_heads
+        } else {
+            heads
+        };
         let grid_x = (seq_len + block_q - 1) / block_q;
-        let grid_y = batch * heads;
+        let grid_y = batch * effective_heads;
         let grid_z = 1i64;
         let block_x = 128i64;
         let block_y = 1i64;
@@ -2176,6 +2186,49 @@ mod tests {
             0, 0,
         );
         assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
+    }
+
+    /// A.4 grid-sizing logic, extracted as a pure function so it can be
+    /// exercised without a GPU. Mirrors the `effective_heads` computation
+    /// inside `nsl_flash_attention_csha`'s cuda branch — keep the two
+    /// in sync.
+    fn a4_effective_heads(heads: i64, active_heads: i64) -> i64 {
+        if active_heads > 0 && active_heads < heads {
+            active_heads
+        } else {
+            heads
+        }
+    }
+
+    #[test]
+    fn a4_grid_y_uses_full_heads_when_active_heads_zero() {
+        // active_heads == 0 is the "no pruning" signal — grid_y must
+        // use the full head count.
+        assert_eq!(a4_effective_heads(8, 0), 8);
+    }
+
+    #[test]
+    fn a4_grid_y_shrinks_when_active_heads_prunes() {
+        // Common weight-informed specialisation: 3 of 8 heads pruned,
+        // kernel launches with grid_y = batch * 5.
+        assert_eq!(a4_effective_heads(8, 5), 5);
+    }
+
+    #[test]
+    fn a4_grid_y_falls_back_to_heads_when_active_exceeds() {
+        // Defensive: if the plan somehow reports active_heads > heads
+        // (shouldn't happen but could during bring-up), use the full
+        // count — the kernel's A.4 PTX guard would otherwise eject
+        // every block.
+        assert_eq!(a4_effective_heads(8, 16), 8);
+    }
+
+    #[test]
+    fn a4_grid_y_full_heads_when_active_equals_heads() {
+        // active_heads == heads is semantically "no pruning expressed
+        // differently"; fall back to the full count so we don't emit
+        // the guard branch unnecessarily.
+        assert_eq!(a4_effective_heads(8, 8), 8);
     }
 
     /// Smoke test: the CSHA FFI symbol resolves and the 30-parameter
