@@ -1240,6 +1240,7 @@ fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::Wrg
                 },
                 targets: c.targets.clone(),
                 rank: c.rank,
+                alpha: c.alpha,
             })
             .collect(),
     }
@@ -1280,6 +1281,7 @@ fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::Wrg
                 },
                 targets: c.targets.clone(),
                 rank: c.rank,
+                alpha: c.alpha,
             })
             .collect(),
     }

@@ -307,6 +307,7 @@ pub struct AdapterDecoratorConfig {
     pub kind: AdapterKind,
     pub targets: Vec<String>,
     pub rank: Option<i64>,
+    pub alpha: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
