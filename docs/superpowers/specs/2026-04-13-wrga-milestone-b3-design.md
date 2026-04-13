@@ -93,8 +93,11 @@ pub struct FusedLoraConfig {
     pub n: u32,               // output dim = d_out
     pub k: u32,               // input dim = k_in (matches W's k)
     pub rank: u32,            // rank (≤ 16)
-    pub scale: f32,           // alpha / rank, compile-time constant
     pub target_sm: u32,       // 80 or 86 etc.
+    // NOTE: scale (alpha/rank) is NOT part of the kernel dedup key or
+    // config struct — it's passed at launch time as a kernel parameter
+    // (.param .f32).  This enables dedup by (m, n, k, rank, target_sm)
+    // across sites with different alpha values.  See Task 4 dedup notes.
 }
 
 pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String;
@@ -110,23 +113,34 @@ pub struct FusedIa3Config {
 pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String;
 ```
 
-**LoRA kernel structure:**
-1. Header + `.entry` declaration with params `x`, `W`, `A`, `B`, `y`.
-2. Register decl (main accum × 8, main A frag × 4, main B frag × 2, epilogue A/B frags × 4+2, epilogue accum × 8, SMEM pointers, loop counters).
-3. SMEM load loop for K-tile of `x @ W`: tiled `mma.sync` accumulating into main accum.
-4. **Epilogue (before global store):**
-   - Load `A` tile from global → SMEM → A fragment.
-   - MMA: `main_A_frag @ A_frag → epilogue_intermediate` (this is `x @ A`, register-resident).
-   - Load `B` tile → SMEM → B fragment.
-   - MMA: `epilogue_intermediate @ B_frag → epilogue_accum` (this is `(x@A) @ B`).
-   - Multiply epilogue_accum by `scale` (f32 literal, single `mul.f32`).
-   - Add epilogue_accum into main accum (8 × `add.f32`).
-5. Store main accum to global `y`.
+**LoRA kernel structure (interleaved epilogue — CRITICAL):**
 
-**IA³ kernel structure:** Same header + main matmul as LoRA, but the epilogue:
-   - Load `γ` (1-D vector of shape `[n]`) from global.
-   - Broadcast-multiply each element of the main accum by the corresponding `γ[j]`.
-   - No second MMA.
+The naive "main loop then epilogue" structure is **wrong**: by the end of the main K-tile loop, SMEM has been overwritten each iteration, and only the last K-tile's x fragment lives in `main_A_frag`. A post-loop `x @ A` would compute `x_last_tile @ A`, not `x @ A`. Since `x @ A` has K dimension = k_in (same as the main matmul's K), the epilogue needs the FULL x row.
+
+**Correct structure: interleave the `x @ A` accumulation into the main K-loop.** Each main iteration, after the main MMA, also multiplies the current x tile against the corresponding A tile slice, accumulating into `epilogue_intermediate` (`x @ A` in registers). This piggybacks on x tiles already in SMEM/registers (zero extra HBM reads for x) and only costs one additional A-tile load per K iteration.
+
+1. Header + `.entry` declaration with params `x`, `W`, `A`, `B`, `scale`, `y`. (scale is a `.param .f32`, not a PTX literal — see Task 4 dedup notes.)
+2. Register decl: main accum × 8, main A frag × 4, main B frag × 2, epilogue A frag × 4 (for a tile of the `A` matrix, NOT for `x @ A`), `epilogue_intermediate` accum × 4 (f32, stores `x @ A` tile result), epilogue B frag × 2, epilogue final accum × 8, SMEM pointers, loop counters, scale register.
+3. Load `scale` from `.param` into a dedicated f32 register once (before the K-loop).
+4. **Interleaved main K-loop** — each iteration:
+    a. Load x tile and W tile from global → SMEM → `main_A_frag` / `main_B_frag`.
+    b. `mma.sync main_A_frag @ main_B_frag → main_accum` (standard `x @ W` accumulation).
+    c. Load the corresponding A tile slice (rows matching this K chunk) from global → SMEM → `epilogue_A_frag`.
+    d. `mma.sync main_A_frag @ epilogue_A_frag → epilogue_intermediate` (accumulates the current x tile's contribution to `x @ A`).
+5. **Epilogue (after K-loop completes):** `epilogue_intermediate` now holds the full `x @ A` result in registers.
+    a. Load `B` tile from global → SMEM → `epilogue_B_frag`.
+    b. `mma.sync epilogue_intermediate @ epilogue_B_frag → epilogue_final_accum` (this is `(x@A) @ B`).
+    c. Multiply `epilogue_final_accum` by the scale register (8 × `mul.f32`).
+    d. Add `epilogue_final_accum` into `main_accum` (8 × `add.f32`).
+6. Store `main_accum` to global `y`.
+
+This structure ensures `x @ A` is computed over the full K dimension and keeps everything register/SMEM-resident.
+
+**IA³ kernel structure (no second MMA, no interleaving needed):**
+Same header + main K-loop as above through step 4b (standard `x @ W` accumulation; no epilogue interleaving because IA³ has no `x @ A` term). Epilogue after the main K-loop:
+   - Load `γ` (1-D vector of shape `[n]`) from global into registers.
+   - Broadcast-multiply each element of `main_accum` by the corresponding `γ[j]` (8 × `mul.f32`).
+   - Store.
 
 **Register-count static assertion:** at the top of each synthesize fn, `assert!(config.rank <= 16, "B.3 rank ceiling; multi-pass epilogue is follow-up");`.
 
@@ -272,6 +286,6 @@ Add `build_5_kernel_count`: runs the fused compile, captures CUDA kernel launch 
 
 4. **Associativity tolerance.** If `build_4_fused` fails at 1e-4, the diff amount is diagnostic: ~1e-3 → likely a register-aliasing or double-count bug; ~1.0+ → scale factor wrong or epilogue not firing; exactly identical to unfused → test didn't actually exercise the fused path (check kernel-count assertion).
 
-5. **PTX kernel embedding.** Each adapter site gets its own synthesized PTX (different `m`, `n`, `k`, `rank`). On a model with many LoRA sites (e.g., NSLCoder with 12 layers × 4 attention projections = 48 sites), the embedded PTX-string size grows linearly. Mitigation: Task 4 deduplicates kernels by `(m, n, k, rank)` signature — many sites will share identical PTX and can share one kernel handle. Compile-time dedup, not runtime.
+5. **PTX kernel embedding + dedup.** Each adapter site would naively get its own synthesized PTX, but dedup by `(m, n, k, rank, target_sm)` lets sites share kernels. For this dedup to be effective when sites have **different alpha values**, `scale = alpha/rank` MUST be a kernel launch parameter (`.param .f32`), not a PTX literal. If scale were a literal, each distinct alpha value forks a new kernel even when `(m, n, k, rank)` matches — losing dedup for any model where users tune alpha per layer. The launch-parameter approach costs one extra register load at kernel entry and enables full dedup. Task 4's `synthesize_fused_lora_ptx` emits `.param .f32 scale` and `nsl_adapter_fused_lora_matmul` passes it at launch time. On NSLCoder with 48 LoRA sites and two distinct rank values, dedup collapses 48 kernels to 2.
 
 6. **Windows stack budget.** B.2.1's 16 MB main-thread bootstrap holds today. B.3 adds PTX-generation recursion depth (synthesize fn has nested loop emission). If tests regress with stack overflow, bump to 32 MB.
