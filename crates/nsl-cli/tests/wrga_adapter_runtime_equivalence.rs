@@ -439,6 +439,70 @@ fn build_5_fused_launches_one_kernel_per_site() {
     );
 }
 
+// ─── B.3 Task 5.6 hardening: build_4_fused_cuda_actually_fires ───────
+//
+// Build 4 passing at 1e-4 is consistent with EITHER the real cudarc PTX
+// launch OR the CPU fallback (both produce the correct 16.0).  This
+// hardening test pins down that the real CUDA path actually executes
+// when `NSL_WRGA_FUSED_CUDA=1` is set, using a runtime counter that
+// only increments on successful cudarc launch — never on fallback.
+//
+// Test is `#[ignore]` by default: it requires a CUDA-capable device and
+// `NSL_WRGA_FUSED_CUDA=1`.  Run with:
+//   cargo test -p nsl-cli --test wrga_adapter_runtime_equivalence \
+//     build_4_fused_cuda_actually_fires -- --ignored
+#[test]
+#[ignore]
+fn build_4_fused_cuda_actually_fires() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build4_gpu.nsl");
+    fs::write(&src_path, BUILD4_SRC).unwrap();
+
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "nsl run failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr,
+    );
+
+    // Parse `[nsl-gpu-launch-count] <N>`.  N > 0 proves the real cudarc
+    // PTX launch fired at least once; 0 means every fused FFI call fell
+    // back to CPU math.
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("[nsl-gpu-launch-count]"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no [nsl-gpu-launch-count] line in stderr; atexit hook didn't \
+                 fire.\nstderr:\n{stderr}",
+            )
+        });
+    let count: u64 = line
+        .split_whitespace()
+        .next_back()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("malformed gpu-count line: {line:?}"));
+
+    assert!(
+        count >= 1,
+        "expected ≥1 real CUDA launch with NSL_WRGA_FUSED_CUDA=1, got {count}. \
+         0 means all fused FFI calls hit the CPU fallback — check registry \
+         population, cudarc PTX load, or GPU tensor placement.  See stderr \
+         for fallback warnings:\n{stderr}",
+    );
+}
+
 #[test]
 fn build_4_lora_rewrite_load_bearing_proof() {
     let tmp = TempDir::new().unwrap();

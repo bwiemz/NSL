@@ -89,6 +89,10 @@ impl Compiler<'_> {
             let init_ref = self.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[argc_val, argv_val]);
 
+            // B.3 Task 5.6: register synthesized fused PTX kernels with the
+            // runtime registry so `NSL_WRGA_FUSED_CUDA=1` can launch them.
+            self.emit_fused_ptx_registration(&mut builder)?;
+
             // M46: Set global deterministic mode flag + seed RNG at program start
             if self.compile_options.deterministic {
                 let one = builder.ins().iconst(cl_types::I64, 1);
@@ -337,6 +341,113 @@ impl Compiler<'_> {
         self.module
             .define_function(main_id, &mut ctx)
             .map_err(|e| CodegenError::new(format!("failed to define test main: {e}")))?;
+        Ok(())
+    }
+
+    /// B.3 Task 5.6: emit `nsl_wrga_register_fused_ptx(handle, ptx_ptr,
+    /// ptx_len, name_ptr, name_len)` calls at program start, one per unique
+    /// fused-LoRA kernel in `self.fused_ptx_kernels`.  The handle assigned
+    /// here MUST match the one embedded in each rewritten adapter Call —
+    /// both sides sort by the same `(m, n, k, rank, target_sm)` tuple used
+    /// by the AST rewrite's `fused_kernel_order`.
+    ///
+    /// No-op when the map is empty (non-WRGA compiles or non-sm_80 targets).
+    fn emit_fused_ptx_registration(
+        &mut self,
+        builder: &mut FunctionBuilder,
+    ) -> Result<(), CodegenError> {
+        if self.fused_ptx_kernels.is_empty() {
+            return Ok(());
+        }
+
+        // Deterministic order — must match wrga_adapter_rewrite's
+        // `fused_kernel_order` (sorted by the same key tuple).
+        let mut order: Vec<(crate::wrga_fused_ptx::LoraKernelKey, String)> = self
+            .fused_ptx_kernels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        order.sort_by_key(|(k, _)| (k.m, k.n, k.k, k.rank, k.target_sm));
+
+        let register_id = self.registry.runtime_fns["nsl_wrga_register_fused_ptx"].0;
+        let register_ref = self
+            .module
+            .declare_func_in_func(register_id, builder.func);
+
+        for (handle, (key, ptx)) in order.into_iter().enumerate() {
+            // PTX bytes + null terminator (cudarc's load_ptx needs a C string).
+            let mut ptx_bytes = ptx.as_bytes().to_vec();
+            ptx_bytes.push(0);
+            let ptx_len = (ptx_bytes.len() - 1) as i64; // length excludes NUL
+            let ptx_label = format!(
+                "__nsl_wrga_fused_ptx_m{}n{}k{}r{}sm{}",
+                key.m, key.n, key.k, key.rank, key.target_sm
+            );
+            let ptx_data_id = self
+                .module
+                .declare_data(&ptx_label, cranelift_module::Linkage::Local, false, false)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to declare fused-PTX data '{ptx_label}': {e}"
+                    ))
+                })?;
+            let mut ptx_desc = cranelift_module::DataDescription::new();
+            ptx_desc.define(ptx_bytes.into_boxed_slice());
+            self.module
+                .define_data(ptx_data_id, &ptx_desc)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to define fused-PTX data '{ptx_label}': {e}"
+                    ))
+                })?;
+
+            // Kernel entry symbol name, null-terminated.  Must match the
+            // `.visible .entry` name emitted by `synthesize_fused_lora_ptx`:
+            //   nsl_wrga_fused_lora_m{m}n{n}k{k}r{rank}
+            let kernel_name = format!(
+                "nsl_wrga_fused_lora_m{}n{}k{}r{}",
+                key.m, key.n, key.k, key.rank
+            );
+            let name_len = kernel_name.len() as i64;
+            let mut name_bytes = kernel_name.as_bytes().to_vec();
+            name_bytes.push(0);
+            let name_label = format!(
+                "__nsl_wrga_fused_name_m{}n{}k{}r{}sm{}",
+                key.m, key.n, key.k, key.rank, key.target_sm
+            );
+            let name_data_id = self
+                .module
+                .declare_data(&name_label, cranelift_module::Linkage::Local, false, false)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to declare fused-PTX name data '{name_label}': {e}"
+                    ))
+                })?;
+            let mut name_desc = cranelift_module::DataDescription::new();
+            name_desc.define(name_bytes.into_boxed_slice());
+            self.module
+                .define_data(name_data_id, &name_desc)
+                .map_err(|e| {
+                    CodegenError::new(format!(
+                        "failed to define fused-PTX name data '{name_label}': {e}"
+                    ))
+                })?;
+
+            // Emit the call: nsl_wrga_register_fused_ptx(handle, ptx_ptr,
+            //   ptx_len, name_ptr, name_len)
+            let ptx_gv = self.module.declare_data_in_func(ptx_data_id, builder.func);
+            let ptx_ptr = builder.ins().symbol_value(cl_types::I64, ptx_gv);
+            let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+            let handle_val = builder.ins().iconst(cl_types::I64, handle as i64);
+            let ptx_len_val = builder.ins().iconst(cl_types::I64, ptx_len);
+            let name_len_val = builder.ins().iconst(cl_types::I64, name_len);
+            builder.ins().call(
+                register_ref,
+                &[handle_val, ptx_ptr, ptx_len_val, name_ptr, name_len_val],
+            );
+        }
+
         Ok(())
     }
 

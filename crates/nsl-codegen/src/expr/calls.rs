@@ -155,6 +155,8 @@ impl Compiler<'_> {
                 args,
                 ptx_data_id,
                 name_data_id,
+                call_expr.id,
+                call_expr.span.clone(),
             );
         }
 
@@ -2315,10 +2317,12 @@ impl Compiler<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
-        _kernel_name: &str,
+        kernel_name: &str,
         args: &[nsl_ast::expr::Arg],
         ptx_data_id: cranelift_module::DataId,
         name_data_id: cranelift_module::DataId,
+        origin_node: nsl_ast::NodeId,
+        span: nsl_errors::Span,
     ) -> Result<Value, CodegenError> {
         // Separate positional args (tensor params) from named args (grid, block)
         let mut tensor_args: Vec<Value> = Vec::new();
@@ -2359,14 +2363,56 @@ impl Compiler<'_> {
         let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
         let name_ptr = builder.ins().symbol_value(pointer_type(), name_gv);
 
+        // Dev Tools Phase 2, Task 5: reserve a kernel_id and emit
+        // `nsl_profile_kernel_begin` / `_end` around the launch when the
+        // profile pre-pass populated `manifest_builder`.  When profile_kernels
+        // is disabled, `kernel_id` stays `None` and codegen is byte-identical
+        // to the pre-Phase-2 path.
+        let kernel_id = if self.manifest_builder.is_some() {
+            // Resolve fusion constituents and aggregate predicted cost
+            // BEFORE taking a mutable borrow of `manifest_builder`.
+            let constituents = self.fusion_constituents(origin_node);
+            let mut total_us = 0.0_f64;
+            let mut total_flops = 0u64;
+            let mut total_hbm = 0u64;
+            for nid in &constituents {
+                if let Some(p) = self.prediction_map.get(nid) {
+                    total_us += p.estimated_time_us;
+                    total_flops = total_flops.saturating_add(p.flops);
+                    total_hbm = total_hbm
+                        .saturating_add(p.bytes_read)
+                        .saturating_add(p.bytes_written);
+                }
+            }
+            let span_json = crate::profiling::instrument::SourceSpanJson::from_span(
+                span.clone(),
+                &self.source_file_name,
+                &self.source_text,
+            );
+            let mb = self
+                .manifest_builder
+                .as_mut()
+                .expect("manifest_builder presence checked above");
+            let id = mb.reserve_id();
+            mb.record_kernel_at(id, kernel_name, span_json, total_us, total_flops, total_hbm);
+            Some(id)
+        } else {
+            None
+        };
+
+        if let Some(id) = kernel_id {
+            let id_val = builder.ins().iconst(cl_types::I32, id as i64);
+            self.compile_call_by_name(builder, "nsl_profile_kernel_begin", &[id_val])?;
+        }
+
         // Build args array on stack: each tensor arg is an i64 (pointer)
         let num_args = tensor_args.len();
-        if num_args == 0 {
+        let launch_result = if num_args == 0 {
             // No tensor args -- pass null pointer and 0 count
             let null_ptr = builder.ins().iconst(cl_types::I64, 0);
             let num_args_val = builder.ins().iconst(cl_types::I64, 0);
             let shared_mem = builder.ins().iconst(cl_types::I64, 0);
-            return self.compile_call_by_name(
+            self.compile_call_by_name(
                 builder,
                 "nsl_kernel_launch",
                 &[
@@ -2382,44 +2428,51 @@ impl Compiler<'_> {
                     num_args_val,
                     shared_mem,
                 ],
-            );
+            )?
+        } else {
+            let slot_size = (num_args * 8) as u32;
+            let ss = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                slot_size,
+                8,
+            ));
+
+            for (i, arg_val) in tensor_args.iter().enumerate() {
+                let offset = (i * 8) as i32;
+                builder.ins().stack_store(*arg_val, ss, offset);
+            }
+
+            let args_ptr = builder.ins().stack_addr(cl_types::I64, ss, 0);
+            let num_args_val = builder.ins().iconst(cl_types::I64, num_args as i64);
+            let shared_mem = builder.ins().iconst(cl_types::I64, 0);
+
+            // Call nsl_kernel_launch(ptx_ptr, name_ptr, grid_x, grid_y, grid_z,
+            //                        block_x, block_y, block_z, args_ptr, num_args,
+            //                        shared_mem_bytes)
+            self.compile_call_by_name(
+                builder,
+                "nsl_kernel_launch",
+                &[
+                    ptx_ptr,
+                    name_ptr,
+                    grid_x,
+                    grid_y,
+                    grid_z,
+                    block_x,
+                    block_y,
+                    block_z,
+                    args_ptr,
+                    num_args_val,
+                    shared_mem,
+                ],
+            )?
+        };
+
+        if let Some(id) = kernel_id {
+            let id_val = builder.ins().iconst(cl_types::I32, id as i64);
+            self.compile_call_by_name(builder, "nsl_profile_kernel_end", &[id_val])?;
         }
 
-        let slot_size = (num_args * 8) as u32;
-        let ss = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            slot_size,
-            8,
-        ));
-
-        for (i, arg_val) in tensor_args.iter().enumerate() {
-            let offset = (i * 8) as i32;
-            builder.ins().stack_store(*arg_val, ss, offset);
-        }
-
-        let args_ptr = builder.ins().stack_addr(cl_types::I64, ss, 0);
-        let num_args_val = builder.ins().iconst(cl_types::I64, num_args as i64);
-        let shared_mem = builder.ins().iconst(cl_types::I64, 0);
-
-        // Call nsl_kernel_launch(ptx_ptr, name_ptr, grid_x, grid_y, grid_z,
-        //                        block_x, block_y, block_z, args_ptr, num_args,
-        //                        shared_mem_bytes)
-        self.compile_call_by_name(
-            builder,
-            "nsl_kernel_launch",
-            &[
-                ptx_ptr,
-                name_ptr,
-                grid_x,
-                grid_y,
-                grid_z,
-                block_x,
-                block_y,
-                block_z,
-                args_ptr,
-                num_args_val,
-                shared_mem,
-            ],
-        )
+        Ok(launch_result)
     }
 }

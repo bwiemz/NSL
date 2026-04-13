@@ -198,6 +198,42 @@ pub fn plan_memory(
     }
 }
 
+/// Like [`plan_memory`] but extends the `death` point of any VarId in
+/// `pinned_until_inspect_sync` past the last program point, so the slot's
+/// allocation cannot be reused before an out-of-band consumer (e.g. the
+/// `@inspect` stream memcpy) finishes reading it.
+///
+/// When the set is empty, behaviour is identical to [`plan_memory`].
+///
+/// Note: `stats.planned_peak_bytes` is not recomputed after pinning — it still
+/// reflects the underlying planner's estimate. Memory enforcement does not use
+/// this stat; it is reporting-only.
+pub fn plan_memory_with_pin(
+    list: &WengertList,
+    activation_live: &BTreeSet<VarId>,
+    sizes: &SizeHints,
+    extra_live_at_end: &BTreeSet<VarId>,
+    pinned_until_inspect_sync: &BTreeSet<VarId>,
+) -> MemoryPlan {
+    let mut plan = plan_memory(list, activation_live, sizes, extra_live_at_end);
+    if pinned_until_inspect_sync.is_empty() {
+        return plan;
+    }
+    let max_pp = plan
+        .assignments
+        .iter()
+        .map(|s| s.death)
+        .max()
+        .unwrap_or(0);
+    let pin_target = max_pp.saturating_add(1);
+    for slot in &mut plan.assignments {
+        if pinned_until_inspect_sync.contains(&slot.var) {
+            slot.death = slot.death.max(pin_target);
+        }
+    }
+    plan
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

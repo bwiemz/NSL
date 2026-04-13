@@ -53,6 +53,12 @@ use std::sync::{Mutex, OnceLock};
 /// `args.rs::nsl_args_init`.
 pub(crate) static FUSED_ADAPTER_LAUNCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// B.3 Task 5.6 hardening: counter that increments ONLY when the real
+/// cudarc PTX launch succeeds (not on CPU fallback).  Distinguishes the
+/// two dispatch paths for Task 5.6's hardening test, which asserts real-
+/// GPU execution when `NSL_WRGA_FUSED_CUDA=1` is set.
+pub(crate) static FUSED_ADAPTER_GPU_LAUNCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Bump the fused-adapter launch counter.  Only effective (i.e. observed
 /// by the atexit reporter) when `NSL_KERNEL_LAUNCH_COUNTER=1`; the
 /// increment itself is unconditional and thread-safe.
@@ -61,11 +67,27 @@ fn record_fused_launch() {
     FUSED_ADAPTER_LAUNCH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Bump the GPU-specific launch counter.  Called only from the success
+/// branch of `try_cuda_launch_fused_*` — never on CPU fallback.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[inline]
+pub(crate) fn record_fused_gpu_launch() {
+    FUSED_ADAPTER_GPU_LAUNCH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Atexit hook: print `[nsl-kernel-count] <N>` to stderr.  Registered
 /// from `args.rs::nsl_args_init` only when `NSL_KERNEL_LAUNCH_COUNTER=1`.
 pub extern "C" fn nsl_fused_adapter_launch_count_atexit() {
     let n = FUSED_ADAPTER_LAUNCH_COUNT.load(Ordering::Relaxed);
     eprintln!("[nsl-kernel-count] {n}");
+}
+
+/// Atexit hook: print `[nsl-gpu-launch-count] <N>` to stderr.  Registered
+/// from `args.rs::nsl_args_init` only when `NSL_WRGA_GPU_LAUNCH_COUNTER=1`.
+/// Zero means all fused calls fell back to CPU math.
+pub extern "C" fn nsl_fused_adapter_gpu_launch_count_atexit() {
+    let n = FUSED_ADAPTER_GPU_LAUNCH_COUNT.load(Ordering::Relaxed);
+    eprintln!("[nsl-gpu-launch-count] {n}");
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -249,6 +271,7 @@ fn try_cuda_launch_fused_lora(
     unsafe {
         cudarc::driver::sys::cuCtxSynchronize();
     }
+    record_fused_gpu_launch();
     Some(out_ptr as i64)
 }
 
@@ -346,6 +369,7 @@ fn try_cuda_launch_fused_ia3(
     unsafe {
         cudarc::driver::sys::cuCtxSynchronize();
     }
+    record_fused_gpu_launch();
     Some(out_ptr as i64)
 }
 

@@ -360,7 +360,8 @@ mod tests {
         // Pass 1: Reduction fusion claims the softmax nodes
         let reduction_matches = detect_reduction_patterns(&g);
         assert_eq!(reduction_matches.len(), 1);
-        apply_reduction_fusion(&mut g, &reduction_matches, 0);
+        let mut _scratch_fusion_plan = crate::wrga_fusion::FusionPlan::default();
+        apply_reduction_fusion(&mut g, &reduction_matches, 0, &mut _scratch_fusion_plan);
 
         // Pass 2: Epilogue fusion should find nothing (no matmul, and nodes are claimed)
         let epilogue_chains = detect_epilogue_chains(&g);
@@ -407,7 +408,8 @@ mod tests {
 
         // Pass 1: Reduction claims softmax nodes (div, exp, rsum, sub, rmax)
         let red = detect_reduction_patterns(&g);
-        apply_reduction_fusion(&mut g, &red, 0);
+        let mut _scratch_fusion_plan = crate::wrga_fusion::FusionPlan::default();
+        apply_reduction_fusion(&mut g, &red, 0, &mut _scratch_fusion_plan);
 
         // Pass 2: Epilogue finds matmul+relu (relu is unclaimed; 2 consumers halt
         // iteration but relu is already collected as an Activation epilogue op).
@@ -469,7 +471,8 @@ mod tests {
             .filter(|m| m.pattern == "softmax")
             .count();
         assert_eq!(softmax_count, 1);
-        apply_reduction_fusion(&mut g, &red_matches, 0);
+        let mut _scratch_fusion_plan = crate::wrga_fusion::FusionPlan::default();
+        apply_reduction_fusion(&mut g, &red_matches, 0, &mut _scratch_fusion_plan);
 
         // Pass 2: Epilogue fusion
         let epi_chains = detect_epilogue_chains(&g);
@@ -477,7 +480,7 @@ mod tests {
         // av matmul has 1 consumer (add) -> should detect epilogue chain
         assert_eq!(epi_chains.len(), 1);
         assert_eq!(epi_chains[0].matmul_node, av);
-        apply_epilogue_fusion(&mut g, &epi_chains, 100);
+        apply_epilogue_fusion(&mut g, &epi_chains, 100, &mut _scratch_fusion_plan);
 
         // Verify: softmax nodes claimed by kernel 0, epilogue by kernel 100
         assert!(g.nodes[rmax as usize].fused_into.is_some());

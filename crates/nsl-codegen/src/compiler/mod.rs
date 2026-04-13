@@ -391,29 +391,22 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
-    /// B.2.1 Task 3: adapter materialisation sites from the most recent
-    /// `wrga_adapter_inject::run_with_compiler` call. Empty when WRGA is
-    /// disabled or no `@adapter` decorators are present.
+
+    // ── Dev Tools Phase 2: kernel-profile pre-pass ─────────────────────
+    pub prediction_map: HashMap<NodeId, crate::cost_model::OpCost>,
+    pub manifest_builder: Option<crate::profiling::instrument::ManifestBuilder>,
+    pub fusion_plan_for_profile: Option<crate::wrga_fusion::FusionPlan>,
+    pub source_text: String,
+    pub source_file_name: String,
+
+    // ── Dev Tools Phase 5: @inspect decorator state ─────────────────────
+    pub inspect_train_step_var: Option<cranelift_frontend::Variable>,
+    pub inspect_pinned_vars: std::collections::BTreeSet<crate::wengert::VarId>,
+
+    // ── WRGA Milestone B.2/B.3 adapter state ─────────────────────
     pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
-    /// B.2.1 Task 3: override map from synthesized `MemberAccess` NodeId to
-    /// the resolved field name. Populated by `wrga_adapter_rewrite` when it
-    /// emits member-access nodes for adapter side-table fields whose names
-    /// are not present in the original source (and therefore not in the
-    /// `Interner`). `compile_member_access` consults this map first before
-    /// falling back to `resolve_sym(member)`.
     pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
-    /// B.2.1 Task 5.5: name of the model class whose method is currently
-    /// being compiled. Used by `compile_member_access` to resolve
-    /// synthesized-adapter-field accesses on `self` (whose obj_type
-    /// lookup returns Unknown because the rewrite pass synthesizes fresh
-    /// `SelfRef` nodes without type-map entries).
     pub current_method_model_name: Option<String>,
-    /// B.2.1 Task 5.5: WrgaPlan produced by the decorator-driven pre-scan
-    /// pass (`wrga_prescan::prescan_adapter_sites_from_decorators`).
-    /// Persists across the @train-block invocation, which overwrites
-    /// `last_wrga_plan` with a real Wengert-derived plan that lacks
-    /// decorated placements when target patterns don't syntactically
-    /// match the inferred placement names.
     pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
     /// CSHA Tier A.1: bridge result from the most recent CSHA planner run.
     /// Populated by the CSHA hook in `stmt.rs` when
@@ -438,18 +431,6 @@ pub struct Compiler<'a> {
     /// matmuls, and (where present) the RoPE epilogue op per boundary
     /// chain. Populated at the same hook that sets `last_csha_bridge`
     /// (stmt.rs), from `plan.boundary.chains`.
-    ///
-    /// Purpose: A.2.2-A.2.4 PTX emission will consume Q/K/V inside the
-    /// fused kernel body, which means the separately-emitted matmul /
-    /// RMSNorm / RoPE launches become redundant. This table gives
-    /// downstream codegen passes a single place to ask "is this op
-    /// claimed by a CSHA-fused kernel and therefore safe to skip?"
-    /// without re-walking the plan.
-    ///
-    /// A.2.1d is prep-only: no consumer yet physically skips on this
-    /// set (which would leave Q/K/V uninitialised until A.2.3 lands the
-    /// projection PTX). The getter is in place so the follow-on tasks
-    /// can wire suppression without further compiler-state churn.
     pub csha_claimed_ops: std::collections::HashSet<u32>,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
@@ -458,11 +439,6 @@ pub struct Compiler<'a> {
     /// CUDA launcher (Task 5) to pick the right kernel per call site.
     pub fused_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
-    /// B.3 Task 4: override map mirroring `synth_member_names` but for
-    /// Call callees.  The AST rewrite synthesizes `ExprKind::Call` nodes
-    /// whose callee Ident carries a sentinel Symbol; the real FFI name
-    /// (`nsl_adapter_fused_lora_matmul` / `nsl_adapter_fused_ia3_matmul`)
-    /// is resolved from this map by `expr_as_func_name`.
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 }
 
@@ -589,6 +565,13 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            prediction_map: HashMap::new(),
+            manifest_builder: None,
+            fusion_plan_for_profile: None,
+            source_text: String::new(),
+            source_file_name: String::new(),
+            inspect_train_step_var: None,
+            inspect_pinned_vars: std::collections::BTreeSet::new(),
             adapter_sites: Vec::new(),
             synth_member_names: std::collections::HashMap::new(),
             current_method_model_name: None,
@@ -621,13 +604,26 @@ impl<'a> Compiler<'a> {
     /// been claimed by a CSHA boundary chain (RMSNorm prologue, Q/K/V
     /// projection matmul, or RoPE epilogue). Returns false when CSHA
     /// is off or no plan has been run this compile.
-    ///
-    /// The answer is advisory in A.2.1d — no lowering pass yet acts on
-    /// it. A.2.2 / A.2.3 / A.2.4 wire it into the prologue / projection
-    /// / epilogue emission paths so the CSHA-fused kernel owns Q/K/V
-    /// computation without redundant separately-launched matmuls.
     pub fn is_csha_claimed(&self, op_idx: u32) -> bool {
         self.csha_claimed_ops.contains(&op_idx)
+    }
+
+    /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the
+    /// kernel rooted at `root`.  For non-fused kernels (or when no
+    /// `FusionPlan` is recorded for profiling), returns `vec![root]`.
+    pub fn fusion_constituents(&self, root: NodeId) -> Vec<NodeId> {
+        match &self.fusion_plan_for_profile {
+            Some(p) => p.constituents_of(root),
+            None => vec![root],
+        }
+    }
+
+    /// Returns a mutable borrow of the Compiler-owned FusionPlan when profiling
+    /// is active. Fusion passes should call this and thread the borrow into
+    /// apply_epilogue_fusion / apply_reduction_fusion so that mutations land
+    /// in the same instance that fusion_constituents reads.
+    pub fn profile_fusion_plan_mut(&mut self) -> Option<&mut crate::wrga_fusion::FusionPlan> {
+        self.fusion_plan_for_profile.as_mut()
     }
 
     /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`

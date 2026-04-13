@@ -277,11 +277,63 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // WRGA B.3 Task 5.6: fused-PTX runtime registry registration.
+    // Args: (handle_i64, ptx_ptr_i64, ptx_len_i64, name_ptr_i64, name_len_i64).
+    // Called from `main` preamble, one call per unique (m,n,k,rank,sm) key.
+    (
+        "nsl_wrga_register_fused_ptx",
+        &[types::I64, types::I64, types::I64, types::I64, types::I64],
+        None,
+    ),
     // Tensor reductions (return scalar tensor ptr, not f64)
     ("nsl_tensor_sum", &[types::I64], Some(types::I64)),
     ("nsl_tensor_mean", &[types::I64], Some(types::I64)),
     // Tensor scalar extraction
     ("nsl_tensor_item", &[types::I64], Some(types::F64)),
+    ("nsl_tensor_l2_norm", &[types::I64], Some(types::F64)),
+    // Health monitor FFI (dev-tools phase 4)
+    ("nsl_health_record_loss", &[types::F64, types::I64], None),
+    (
+        "nsl_health_record_grad_norm",
+        &[types::I64, types::I64, types::I32, types::F64],
+        None,
+    ),
+    (
+        "nsl_health_record_weight_norm",
+        &[types::I64, types::I64, types::F64, types::I8],
+        None,
+    ),
+    (
+        "nsl_health_flush_snapshot",
+        &[types::I64, types::I64],
+        Some(types::I32),
+    ),
+    ("nsl_health_set_flush_interval", &[types::I64], None),
+    // Inspector FFI (dev-tools phase 5)
+    (
+        "nsl_tensor_stats",
+        &[types::I64, types::I64],
+        Some(types::I32),
+    ),
+    (
+        "nsl_inspect_record_stats",
+        &[types::I64, types::I64, types::I64, types::I64],
+        Some(types::I32),
+    ),
+    (
+        "nsl_inspect_dump_full",
+        &[types::I64, types::I64, types::I64, types::I64],
+        Some(types::I32),
+    ),
+    ("nsl_inspect_set_dir", &[types::I64, types::I64], None),
+    ("nsl_health_get_loss_ema", &[], Some(types::F64)),
+    ("nsl_health_get_loss_ema_slope", &[], Some(types::F64)),
+    ("nsl_health_get_grad_norm_total", &[], Some(types::F64)),
+    (
+        "nsl_health_get_nan_inf_count_window",
+        &[],
+        Some(types::I64),
+    ),
     // Tensor display
     ("nsl_tensor_print", &[types::I64], None),
     // Tensor memory
@@ -888,6 +940,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_profiler_stop", &[], None),
     ("nsl_profiler_dump", &[types::I64, types::I64], None),
     ("nsl_profiler_peak", &[], Some(types::I64)),
+    // Dev Tools Phase 2, Task 5: kernel-launch profile hooks.
+    // Emitted around every GPU `kernel { ... }` launch when codegen runs
+    // with `profile_kernels` enabled. Take a single i32 kernel_id matching
+    // the dense ids assigned by ManifestBuilder::reserve_id().
+    ("nsl_profile_kernel_begin", &[types::I32], None),
+    ("nsl_profile_kernel_end", &[types::I32], None),
     // Kernel profiler (M26) — flush is NOT registered here (Rust-only atexit call)
     ("nsl_kernel_profiler_start", &[], None),
     ("nsl_kernel_profiler_stop", &[], None),
