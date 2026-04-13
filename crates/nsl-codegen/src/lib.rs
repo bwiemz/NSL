@@ -298,6 +298,7 @@ pub fn debug_clear_allocator_slot_channels() {
 
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
+pub use wrga_fusion::{FusionDecision, FusionPlan, FusionTarget};
 
 use std::collections::HashMap;
 
