@@ -363,26 +363,40 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
                         if dname == "freeze" {
-                            let resolve = |s: nsl_ast::Symbol| -> String {
-                                self.interner.resolve(s.0).unwrap_or("").to_string()
-                            };
-                            let cfg = crate::wrga::validate_freeze_decorator(
-                                deco,
-                                &resolve,
-                                &mut self.diagnostics,
-                            );
-                            self.freeze_configs.push(cfg);
+                            if !is_model_target(&stmt.kind) {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@freeze can only be applied to a model (or a let-binding whose RHS is a model)")
+                                        .with_label(deco.span, "invalid @freeze target"),
+                                );
+                            } else {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
+                                };
+                                let cfg = crate::wrga::validate_freeze_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                                self.freeze_configs.push(cfg);
+                            }
                         }
                         if dname == "adapter" {
-                            let resolve = |s: nsl_ast::Symbol| -> String {
-                                self.interner.resolve(s.0).unwrap_or("").to_string()
-                            };
-                            if let Some(cfg) = crate::wrga::validate_adapter_decorator(
-                                deco,
-                                &resolve,
-                                &mut self.diagnostics,
-                            ) {
-                                self.adapter_configs.push(cfg);
+                            if !is_model_target(&stmt.kind) {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@adapter can only be applied to a model (or a let-binding whose RHS is a model)")
+                                        .with_label(deco.span, "invalid @adapter target"),
+                                );
+                            } else {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
+                                };
+                                if let Some(cfg) = crate::wrga::validate_adapter_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                ) {
+                                    self.adapter_configs.push(cfg);
+                                }
                             }
                         }
 
@@ -848,5 +862,24 @@ impl<'a> TypeChecker<'a> {
             }
             StmtKind::ServeBlock(serve) => self.check_serve_block(serve),
         }
+    }
+}
+
+/// True if a `@freeze` / `@adapter` decorator is on a valid target:
+/// either a `ModelDef` directly, or a `VarDecl` whose initialiser is plausibly
+/// a model (an identifier, call, or member access). Full type resolution
+/// happens later in codegen when the WRGA driver runs.
+fn is_model_target(kind: &StmtKind) -> bool {
+    match kind {
+        StmtKind::ModelDef(_) => true,
+        StmtKind::VarDecl { value: Some(expr), .. } => {
+            matches!(
+                expr.kind,
+                ExprKind::Call { .. }
+                    | ExprKind::Ident(_)
+                    | ExprKind::MemberAccess { .. }
+            )
+        }
+        _ => false,
     }
 }
