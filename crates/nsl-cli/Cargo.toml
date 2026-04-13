@@ -9,6 +9,10 @@ repository.workspace = true
 keywords = ["ml", "compiler", "tensor", "neural-network", "language"]
 categories = ["compilers", "science"]
 
+[lib]
+name = "nsl_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nsl"
 path = "src/main.rs"

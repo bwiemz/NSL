@@ -37,6 +37,10 @@ enum Cli {
         #[arg(long)]
         dump_types: bool,
 
+        /// Print a compile-time shape-propagation trace
+        #[arg(long)]
+        shapes: bool,
+
         /// M37: Run roofline performance analysis
         #[arg(long)]
         perf: bool,
@@ -571,6 +575,7 @@ fn main_inner() {
             dump_tokens,
             dump_ast,
             dump_types,
+            shapes,
             perf: _perf,
             gpu: _gpu,
             trace: _trace,
@@ -588,6 +593,28 @@ fn main_inner() {
             wcet_target: _wcet_target,
             fpga_device: _fpga_device,
         } => {
+            if shapes {
+                let src = match std::fs::read_to_string(&file) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: could not read file '{}': {e}", file.display());
+                        process::exit(1);
+                    }
+                };
+                match nsl_cli::shape_debug::ShapeDebugInput::from_source(
+                    &src,
+                    &file.display().to_string(),
+                ) {
+                    Ok(input) => {
+                        println!("{}", nsl_cli::shape_debug::format_trace(&input));
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: shape debug failed: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
             run_check(&file, dump_tokens, dump_ast, dump_types, linear_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
 
