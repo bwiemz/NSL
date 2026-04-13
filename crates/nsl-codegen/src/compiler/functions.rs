@@ -559,6 +559,26 @@ impl Compiler<'_> {
                                     }
                                 }
                             }
+                            // B.2.1 Task 5.5: also include Tensor-typed
+                            // fields (whose shape strings live in the
+                            // separate `model_tensor_field_shapes` map)
+                            // so the rewrite matcher can recognise
+                            // `self.w @ ...` for adapted tensor fields.
+                            if let Some(field_map) = self
+                                .models
+                                .model_tensor_field_shapes
+                                .get(&model_name)
+                                .cloned()
+                            {
+                                for fname in field_map.keys() {
+                                    if let Some(s) = self.interner.get(fname) {
+                                        ctx.field_symbols.insert(
+                                            fname.clone(),
+                                            nsl_ast::Symbol(s),
+                                        );
+                                    }
+                                }
+                            }
                             let out: Vec<nsl_ast::stmt::Stmt> = fn_def
                                 .body
                                 .stmts
@@ -572,9 +592,23 @@ impl Compiler<'_> {
                             out
                         };
 
+                        // B.2.1 Task 5.5: stash model name so
+                        // `compile_member_access` can resolve synthesized
+                        // adapter field accesses on `self` even when the
+                        // rewrite pass synthesizes fresh (untyped) SelfRef
+                        // nodes.
+                        self.current_method_model_name = Some(model_name.clone());
                         // Compile method body
+                        let mut body_err: Option<CodegenError> = None;
                         for stmt in &rewritten_stmts {
-                            self.compile_stmt(&mut builder, &mut state, stmt)?;
+                            if let Err(e) = self.compile_stmt(&mut builder, &mut state, stmt) {
+                                body_err = Some(e);
+                                break;
+                            }
+                        }
+                        self.current_method_model_name = None;
+                        if let Some(e) = body_err {
+                            return Err(e);
                         }
 
                         // Add implicit return if body doesn't end with one

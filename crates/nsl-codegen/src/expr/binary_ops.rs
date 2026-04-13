@@ -117,17 +117,41 @@ impl Compiler<'_> {
         //  - Both operands are indeterminate (likely from .to(device) or other runtime returns)
         // Exception: inside datatype method bodies, indeterminate types are always scalars
         //   (the semantic checker does not descend into method bodies).
+        // B.2.1 Task 5.5: the LoRA AST rewrite emits synthesized nodes
+        // (e.g. `tensor * f64_literal`) whose NodeIds aren't in the
+        // type-map, so both sides read as Unknown. Without this carve-out,
+        // `both_indeterminate` promotes the f64 literal to "tensor",
+        // which routes the op through `nsl_tensor_mul` (expects two
+        // tensor pointers) and fails verification with an f64 arg mismatch.
+        let left_is_float_literal = matches!(
+            &left.kind,
+            nsl_ast::expr::ExprKind::FloatLiteral(_) | nsl_ast::expr::ExprKind::IntLiteral(_)
+        );
+        let right_is_float_literal = matches!(
+            &right.kind,
+            nsl_ast::expr::ExprKind::FloatLiteral(_) | nsl_ast::expr::ExprKind::IntLiteral(_)
+        );
         let both_indeterminate = left_type.is_indeterminate()
             && right_type.is_indeterminate()
-            && !state.flags.in_dtype_method;
-        let left_is_tensor = left_type.is_tensor()
+            && !state.flags.in_dtype_method
+            && !left_is_float_literal
+            && !right_is_float_literal;
+        let left_is_tensor = (left_type.is_tensor() && !left_is_float_literal)
             || (left_type.is_indeterminate()
                 && !state.flags.in_dtype_method
-                && (matches!(op, BinOp::MatMul) || right_type.is_tensor() || both_indeterminate));
-        let right_is_tensor = right_type.is_tensor()
+                && !left_is_float_literal
+                && (matches!(op, BinOp::MatMul)
+                    || right_type.is_tensor()
+                    || both_indeterminate
+                    || right_is_float_literal));
+        let right_is_tensor = (right_type.is_tensor() && !right_is_float_literal)
             || (right_type.is_indeterminate()
                 && !state.flags.in_dtype_method
-                && (matches!(op, BinOp::MatMul) || left_type.is_tensor() || both_indeterminate));
+                && !right_is_float_literal
+                && (matches!(op, BinOp::MatMul)
+                    || left_type.is_tensor()
+                    || both_indeterminate
+                    || left_is_float_literal));
         if left_is_tensor || right_is_tensor {
             // M50: Extract sparse flags for sparse operation dispatch.
             // Check semantic type AND runtime sparse_vars tracking (for values

@@ -1,4 +1,4 @@
-mod access;
+pub(crate) mod access;
 mod advanced;
 mod binary_ops;
 mod calls;

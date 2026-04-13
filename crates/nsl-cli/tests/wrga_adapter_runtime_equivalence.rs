@@ -205,10 +205,52 @@ fn build_2_sanity_adapter_default_init_matches_base() {
 // Documented as `#[ignore]` so the test suite runs cleanly but the
 // expectation remains on-record for the wiring-fix task.
 
+// Build 3: adapter present, LoRA-B seeded nonzero. Output must diverge from
+// Build 1. Task 5.5 fixed the two wiring issues that previously blocked
+// expressing the seed in surface NSL:
+//   (a) adapter_sites is now pre-populated BEFORE user-function compilation,
+//   (b) field-assignment codegen now routes synthesized adapter names
+//       through the side-table (mirror of read-through).
+const BUILD3_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = zeros([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+let x = ones([4, 8])
+let y_target = zeros([4, 8])
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_B_Toy_w__lora = ones([2, 8])
+let y = m.forward(x)
+print(y)
+"#;
+
 #[test]
-#[ignore = "B.2.1 Task 5: adapter seeding requires assignment wiring or FFI (see file doc)"]
-fn build_3_sanity_adapter_nonzero_b_diverges() {
-    // Intentional no-op body; test is kept as a discoverable placeholder.
+fn build_3_sanity_b_nonzero_diverges() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build3.nsl");
+    fs::write(&src_path, BUILD3_SRC).unwrap();
+    let stdout = run_nsl_expect_ok(&src_path, &["--source-ad"]);
+    let tensor = parse_tensor_2d(&stdout);
+    // If seeding + rewrite both fire, LoRA-A is Kaiming-random so output is
+    // deterministic per-seed but nonzero in at least one element. If either
+    // fails, we'd see all zeros (Build 1 / Build 2).
+    let any_nonzero = tensor
+        .iter()
+        .flat_map(|r| r.iter())
+        .any(|v| v.abs() > 1e-5);
+    assert!(
+        any_nonzero,
+        "Build 3: output must diverge from Build 1 when LoRA-B is seeded nonzero; got {tensor:?}",
+    );
 }
 
 // ─── Build 4: LOAD-BEARING PROOF of the LoRA forward rewrite ─────────────
@@ -223,14 +265,50 @@ fn build_3_sanity_adapter_nonzero_b_diverges() {
 // assertion below is written against the *desired* numeric result so that
 // once seeding lands, Build 4 becomes the load-bearing proof unchanged.
 
+// Build 4: LOAD-BEARING PROOF.
+//
+// W=zeros, x=ones([4,8]), A=ones([2,8]), B=ones([8,2]), alpha=rank=2 ⇒
+// scale=1.0.  Expected y[i,j] = (x @ W)[i,j] + (x @ A^T @ B^T)[i,j] * scale
+//                             = 0 + (1x8 @ 8x2 @ 2x8)[i,j] * 1.0
+//                             = 8 * 2 * 1 = 16.0 for every element.
+const BUILD4_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = zeros([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+let x = ones([4, 8])
+let y_target = zeros([4, 8])
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_A_Toy_w__lora = ones([8, 2])
+m.lora_B_Toy_w__lora = ones([2, 8])
+let y = m.forward(x)
+print(y)
+"#;
+
 #[test]
-#[ignore = "B.2.1 Task 5: adapter seeding requires assignment wiring or FFI (see file doc); \
-            this test is the load-bearing proof of Task 3 rewrite and will fail by \
-            exactly 16.0 per element until wiring lands"]
 fn build_4_lora_rewrite_load_bearing_proof() {
-    // Kept as a discoverable placeholder with the full assertion written so
-    // that enabling this test (remove `#[ignore]`, add the seeding lines
-    // the Task 3/wiring-fix task chooses) yields a one-line flip to a
-    // working proof.  Expected value: 16.0 per element, tol 1e-5.
-    let _expected: f32 = 16.0;
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build4.nsl");
+    fs::write(&src_path, BUILD4_SRC).unwrap();
+    let stdout = run_nsl_expect_ok(&src_path, &["--source-ad"]);
+    let tensor = parse_tensor_2d(&stdout);
+    assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
+    for (i, row) in tensor.iter().enumerate() {
+        assert_eq!(row.len(), 8, "row {i} wrong width: {row:?}");
+        for (j, v) in row.iter().enumerate() {
+            assert!(
+                (v - 16.0).abs() < 1e-5,
+                "Build 4 load-bearing: expected 16.0 at [{i},{j}]; got {v}",
+            );
+        }
+    }
 }

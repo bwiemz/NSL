@@ -57,7 +57,26 @@ impl Compiler<'_> {
         }
 
         let obj_val = self.compile_expr(builder, state, object)?;
-        let obj_type = self.node_type(object.id).clone();
+        let mut obj_type = self.node_type(object.id).clone();
+        // B.2.1 Task 5.5: synthesized SelfRef nodes produced by the LoRA
+        // AST rewrite pass have no type-map entry (fresh NodeId). Fall
+        // back to the current model context so the Type::Model branch
+        // below fires and the side-table route-through happens.
+        if matches!(obj_type, Type::Unknown) {
+            if matches!(object.kind, ExprKind::SelfRef) {
+                if let Some(ref model_name) = self.current_method_model_name {
+                    if let Some(sym) = self.interner.get(model_name) {
+                        obj_type = Type::Model {
+                            name: nsl_ast::Symbol(sym),
+                            type_params: Vec::new(),
+                            type_args: Vec::new(),
+                            fields: Vec::new(),
+                            methods: Vec::new(),
+                        };
+                    }
+                }
+            }
+        }
 
         if let Type::Struct { name, .. } = &obj_type {
             let struct_name = self.resolve_sym(*name).to_string();
@@ -413,25 +432,22 @@ impl Compiler<'_> {
         model_name: &str,
         field_name: &str,
     ) -> Option<usize> {
-        let plan = self.last_wrga_plan.as_ref()?;
-        let field_types = &self.models.model_field_types;
+        // B.2.1 Task 5.5: read directly from `adapter_sites` (set by the
+        // pre-scan pass) rather than `last_wrga_plan` — the latter is
+        // overwritten inside @train-block lowering with a real Wengert plan
+        // that has no decorated placements when its placement names don't
+        // syntactically match the @adapter target pattern.
         let mut idx: usize = 0;
-        for placement in &plan.placements {
-            // Skip placements without a decorator (the inject pass only
-            // synthesizes fields when `decorator_kind` is set).
-            if placement.decorator_kind.is_none() {
+        for site in &self.adapter_sites {
+            if site.target_model != model_name {
                 continue;
             }
-            // Only count placements whose target field exists on this model.
-            let target_field = placement.name.rsplit('.').next().unwrap_or("");
-            let matches_model = field_types
-                .get(model_name)
-                .map(|m| m.contains_key(target_field))
-                .unwrap_or(false);
-            if !matches_model {
+            // Skip sites whose dims failed to resolve (the init pass also
+            // skips these, so the indices stay in sync).
+            if site.input_dim == 0 || site.output_dim == 0 {
                 continue;
             }
-            for synth in &placement.synthesized_fields {
+            for synth in &site.synthesized_fields {
                 if synth == field_name {
                     return Some(idx);
                 }

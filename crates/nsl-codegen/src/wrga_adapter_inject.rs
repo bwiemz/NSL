@@ -218,12 +218,23 @@ pub fn run_with_compiler(
             }
         };
 
+        // B.2.1 Task 5.5: search `model_tensor_field_shapes` (the
+        // shape-bearing map populated by `collect_models` for Tensor
+        // fields) before falling back to `model_field_types`.
+        let tensor_shapes = &compiler.models.model_tensor_field_shapes;
         let field_types = &compiler.models.model_field_types;
-        let mut candidates: Vec<&String> = field_types
+        let mut candidates: Vec<&String> = tensor_shapes
             .iter()
             .filter(|(_, fields)| fields.contains_key(field_name))
             .map(|(name, _)| name)
             .collect();
+        if candidates.is_empty() {
+            candidates = field_types
+                .iter()
+                .filter(|(_, fields)| fields.contains_key(field_name))
+                .map(|(name, _)| name)
+                .collect();
+        }
         if candidates.is_empty() {
             eprintln!(
                 "[wrga] @adapter target '{}': field '{}' not found in any known model; \
@@ -243,10 +254,19 @@ pub fn run_with_compiler(
         // B.2.1 Task 3: submodel-target detection. If the target field's type
         // string does not start with `"Tensor<"`, it's a submodel reference
         // (e.g. a nested model), which is out of scope for B.2.1.
-        let type_str = field_types
+        // Look up the type string from the shape map first (for Tensor
+        // fields populated by collect_models from the init expr), then
+        // fall back to model_field_types (for sub-model references).
+        let type_str = tensor_shapes
             .get(&model_name)
             .and_then(|m| m.get(field_name))
             .cloned()
+            .or_else(|| {
+                field_types
+                    .get(&model_name)
+                    .and_then(|m| m.get(field_name))
+                    .cloned()
+            })
             .unwrap_or_default();
         if !type_str.trim_start().starts_with("Tensor<") {
             eprintln!(
@@ -257,7 +277,9 @@ pub fn run_with_compiler(
             );
             continue;
         }
-        match resolve_dims_for_target(&model_name, field_name, field_types) {
+        match resolve_dims_for_target(&model_name, field_name, tensor_shapes)
+            .or_else(|| resolve_dims_for_target(&model_name, field_name, field_types))
+        {
             Some((inp, out)) => {
                 site.input_dim = inp;
                 site.output_dim = out;

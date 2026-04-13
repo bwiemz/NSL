@@ -68,27 +68,40 @@ pub(crate) fn emit_adapter_init_sidetable(
     // 2. Collect placements targeting this model with usable dims, in the
     //    same order `adapter_field_index` iterates. Each entry keeps the
     //    (input_dim, output_dim, rank, per-field init strategies).
-    let field_types = compiler.models.model_field_types.clone();
+    // B.2.1 Task 5.5: prefer the dedicated tensor-shape map for dim
+    // resolution; fall back to model_field_types for sub-model targets.
+    let tensor_shapes = compiler.models.model_tensor_field_shapes.clone();
+    let model_field_types = compiler.models.model_field_types.clone();
     let mut emit_list: Vec<PlacementEmit> = Vec::new();
     for placement in &plan.placements {
         if placement.decorator_kind.is_none() {
             continue;
         }
         let target_field = placement.name.rsplit('.').next().unwrap_or("");
-        let matches_model = field_types
+        let matches_model = tensor_shapes
             .get(model_type_name)
             .map(|m| m.contains_key(target_field))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || model_field_types
+                .get(model_type_name)
+                .map(|m| m.contains_key(target_field))
+                .unwrap_or(false);
         if !matches_model {
             continue;
         }
-        // Resolve dims from the model_field_types registry (same path the
-        // inject pass uses).  Skip sites with unresolved / zero dims.
+        // Resolve dims: shape map first, model_field_types as fallback.
         let (inp, out) = match crate::wrga_adapter_inject::resolve_dims_for_target(
             model_type_name,
             target_field,
-            &field_types,
-        ) {
+            &tensor_shapes,
+        )
+        .or_else(|| {
+            crate::wrga_adapter_inject::resolve_dims_for_target(
+                model_type_name,
+                target_field,
+                &model_field_types,
+            )
+        }) {
             Some(d) => d,
             None => continue,
         };
@@ -163,9 +176,12 @@ fn emit_one_init(
     // Determine shape + init strategy from field-name prefix. These prefixes
     // are the synthesis contract defined in `wrga_adapter_inject::run`.
     if name.starts_with("lora_A_") {
-        // LoRA A: [rank, input_dim], KaimingUniform (randn scaled by
+        // LoRA A: [input_dim, rank], KaimingUniform (randn scaled by
         // 1/sqrt(fan_in)).
-        let shape = build_shape_list(compiler, builder, &[site.rank, site.input_dim])?;
+        // B.2.1 Task 5.5: shape is [in, rank] (NOT [rank, in]) so the
+        // forward rewrite can do `x @ self.lora_A` directly without
+        // a transpose.
+        let shape = build_shape_list(compiler, builder, &[site.input_dim, site.rank])?;
         let base = compiler.compile_call_by_name(builder, "nsl_tensor_randn", &[shape])?;
         let fan_in = site.input_dim.max(1) as f64;
         let scale = 1.0_f64 / fan_in.sqrt();
@@ -174,13 +190,21 @@ fn emit_one_init(
         let scale_val = builder.ins().f64const(scale);
         let scale_tensor =
             compiler.compile_call_by_name(builder, "nsl_tensor_full", &[one_shape, scale_val])?;
-        let scaled =
-            compiler.compile_call_by_name(builder, "nsl_tensor_mul", &[base, scale_tensor])?;
+        // FBIP flags byte (third arg for tensor-tensor FFIs): pass 0 —
+        // neither operand is relinquished by the init pass.
+        let flags = builder.ins().iconst(cl_types::I8, 0);
+        let scaled = compiler.compile_call_by_name(
+            builder,
+            "nsl_tensor_mul",
+            &[base, scale_tensor, flags],
+        )?;
         Ok(scaled)
     } else if name.starts_with("lora_B_") {
-        // LoRA B: [output_dim, rank], Zeros.
+        // LoRA B: [rank, output_dim], Zeros.
+        // B.2.1 Task 5.5: shape is [rank, out] (NOT [out, rank]) so the
+        // forward rewrite can do `(x @ A) @ self.lora_B` directly.
         debug_assert_eq!(strat.kind, InitKind::Zeros);
-        let shape = build_shape_list(compiler, builder, &[site.output_dim, site.rank])?;
+        let shape = build_shape_list(compiler, builder, &[site.rank, site.output_dim])?;
         compiler.compile_call_by_name(builder, "nsl_tensor_zeros", &[shape])
     } else if name.starts_with("ia3_scale_") {
         // IA³: [output_dim], Ones.

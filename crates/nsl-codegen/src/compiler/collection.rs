@@ -408,10 +408,46 @@ impl Compiler<'_> {
                     if let nsl_ast::decl::ModelMember::LayerDecl {
                         name: field_sym,
                         type_ann,
+                        init,
                         ..
                     } = member
                     {
                         let field_name = self.resolve_sym(*field_sym).to_string();
+                        // B.2.1 Task 5.5: for Tensor fields with a shape-bearing
+                        // init like `zeros([8, 8])`, record a structured
+                        // `Tensor<[out, in], f32>` string in a SEPARATE
+                        // map so downstream passes (notably
+                        // wrga_adapter_inject::resolve_dims_for_target) can
+                        // recover the weight shape. Stored separately from
+                        // `model_field_types` because that map drives
+                        // sub-model traversal in source-AD; polluting it
+                        // with Tensor type strings would make source-AD
+                        // attempt to inline `forward` on a fictitious
+                        // `Tensor<...>` model.
+                        if let nsl_ast::types::TypeExprKind::Named(type_sym) = &type_ann.kind {
+                            let tname = self.resolve_sym(*type_sym).to_string();
+                            if tname == "Tensor" {
+                                if let Some(init_expr) = init {
+                                    if let Some(shape) =
+                                        extract_shape_from_tensor_init(init_expr, &|s| {
+                                            self.resolve_sym(s).to_string()
+                                        })
+                                    {
+                                        if shape.len() == 2 {
+                                            let type_str = format!(
+                                                "Tensor<[{}, {}], f32>",
+                                                shape[0], shape[1]
+                                            );
+                                            self.models
+                                                .model_tensor_field_shapes
+                                                .entry(name.clone())
+                                                .or_insert_with(HashMap::new)
+                                                .insert(field_name.clone(), type_str);
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Check if this is a FixedArray type
                         if let nsl_ast::types::TypeExprKind::FixedArray { element_type, size } =
@@ -717,4 +753,40 @@ impl Compiler<'_> {
         }
         Ok(())
     }
+}
+
+/// B.2.1 Task 5.5: extract a shape `Vec<i64>` from tensor-init call exprs
+/// like `zeros([H, W])`, `ones([H, W])`, `randn([H, W])`, `full([H, W], v)`.
+/// Returns `None` if the initializer is not a recognised shape-bearing call
+/// or the shape list contains non-integer literals.
+fn extract_shape_from_tensor_init<F>(expr: &Expr, resolve: &F) -> Option<Vec<i64>>
+where
+    F: Fn(nsl_ast::Symbol) -> String,
+{
+    let ExprKind::Call { callee, args } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Ident(sym) = &callee.kind else {
+        return None;
+    };
+    let fname = resolve(*sym);
+    if !matches!(
+        fname.as_str(),
+        "zeros" | "ones" | "randn" | "rand" | "full" | "arange"
+    ) {
+        return None;
+    }
+    let first = args.first()?;
+    let ExprKind::ListLiteral(items) = &first.value.kind else {
+        return None;
+    };
+    let mut shape = Vec::with_capacity(items.len());
+    for item in items {
+        if let ExprKind::IntLiteral(n) = &item.kind {
+            shape.push(*n);
+        } else {
+            return None;
+        }
+    }
+    Some(shape)
 }

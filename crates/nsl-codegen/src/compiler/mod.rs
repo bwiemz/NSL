@@ -116,6 +116,13 @@ pub struct ModelMetadata {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
     pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    /// B.2.1 Task 5.5: shape strings (`Tensor<[out, in], dtype>`) for
+    /// Tensor-typed model fields whose initializer carries a literal
+    /// shape (e.g. `w: Tensor = zeros([8, 8])`). Stored separately from
+    /// `model_field_types` so source-AD's sub-model traversal does not
+    /// accidentally treat tensor shapes as nested model types. Consumed
+    /// by `wrga_adapter_inject::resolve_dims_for_target`.
+    pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
 }
 
 impl ModelMetadata {
@@ -127,6 +134,7 @@ impl ModelMetadata {
             imported_model_names: HashSet::new(),
             paged_kv_configs: HashMap::new(),
             model_method_bodies: HashMap::new(),
+            model_tensor_field_shapes: HashMap::new(),
         }
     }
 }
@@ -394,6 +402,19 @@ pub struct Compiler<'a> {
     /// `Interner`). `compile_member_access` consults this map first before
     /// falling back to `resolve_sym(member)`.
     pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
+    /// B.2.1 Task 5.5: name of the model class whose method is currently
+    /// being compiled. Used by `compile_member_access` to resolve
+    /// synthesized-adapter-field accesses on `self` (whose obj_type
+    /// lookup returns Unknown because the rewrite pass synthesizes fresh
+    /// `SelfRef` nodes without type-map entries).
+    pub current_method_model_name: Option<String>,
+    /// B.2.1 Task 5.5: WrgaPlan produced by the decorator-driven pre-scan
+    /// pass (`wrga_prescan::prescan_adapter_sites_from_decorators`).
+    /// Persists across the @train-block invocation, which overwrites
+    /// `last_wrga_plan` with a real Wengert-derived plan that lacks
+    /// decorated placements when target patterns don't syntactically
+    /// match the inferred placement names.
+    pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
 }
 
 /// Quantization configuration for a model.
@@ -521,6 +542,8 @@ impl<'a> Compiler<'a> {
             last_wrga_plan: None,
             adapter_sites: Vec::new(),
             synth_member_names: std::collections::HashMap::new(),
+            current_method_model_name: None,
+            adapter_prescan_plan: None,
         })
     }
 
