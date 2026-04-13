@@ -422,6 +422,17 @@ pub struct Compiler<'a> {
     /// CSHA-aware FFI when per-layer extras are available. `None` when
     /// CSHA is disabled or when no `@train` block compiled.
     pub last_csha_bridge: Option<crate::csha_apply::BridgeResult>,
+    /// CSHA Tier A.2.0: ordinal of the next FlashAttention call lowered
+    /// during this compile. Incremented each time
+    /// `compile_flash_attention_call` runs, so that successive SDPA
+    /// invocations in source order map to successive layers in the
+    /// planner's `per_layer` vec (e.g. `blocks.0`, `blocks.1`, ...).
+    /// Reset implicitly at the start of each compile — currently not
+    /// reset per-function because all observed models have exactly one
+    /// `@flash_attention` function whose body contains the SDPA calls
+    /// for the whole stack. A.2.1 replaces this positional match with a
+    /// proper layer-name resolver.
+    pub csha_fa_call_ordinal: usize,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
     /// (but potentially different α/rank scales) share one PTX string.
@@ -565,6 +576,7 @@ impl<'a> Compiler<'a> {
             current_method_model_name: None,
             adapter_prescan_plan: None,
             last_csha_bridge: None,
+            csha_fa_call_ordinal: 0,
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
         })

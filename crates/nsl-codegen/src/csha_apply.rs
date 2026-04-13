@@ -59,11 +59,37 @@ impl BridgeResult {
     /// belongs to. Returns the extras for the first layer in sorted
     /// order, or `None` if no CSHA-active layers were planned.
     ///
-    /// This is a *stopgap* for the Tier A plumbing: A.2/A.4 will
-    /// replace it with a proper layer identifier derived from the
-    /// enclosing function / decorator / Wengert-Param-prefix context.
+    /// Superseded in A.2.0 by [`Self::extras_for_layer`] /
+    /// [`Self::extras_at_index`]; kept for back-compat with tests.
     pub fn first_extras(&self) -> Option<&CshaExtras> {
         self.extras.values().next()
+    }
+
+    /// A.2.0: look up per-layer CSHA extras by name. Layer names come
+    /// from the Wengert `Param` prefix scan (e.g. `blocks.0`,
+    /// `layers.7`). Returns `None` when the layer isn't in the plan or
+    /// CSHA didn't fuse it.
+    pub fn extras_for_layer(&self, layer: &str) -> Option<&CshaExtras> {
+        self.extras.get(layer)
+    }
+
+    /// A.2.0: positional lookup — returns the extras for the Nth layer
+    /// in sorted-key order. Used by the FA call-site as a stopgap when
+    /// a proper layer name isn't derivable from context, under the
+    /// assumption that FA calls and planner layers appear in matching
+    /// source order. `None` when `index` is out of range.
+    ///
+    /// A.2.1 will replace callers of this with
+    /// [`Self::extras_for_layer`] once the Wengert `Param` → enclosing
+    /// function-name mapping is wired through `compile_flash_attention_call`.
+    pub fn extras_at_index(&self, index: usize) -> Option<&CshaExtras> {
+        self.extras.values().nth(index)
+    }
+
+    /// Number of CSHA-active layers. `0` when the plan produced no
+    /// fused kernels (CSHA off / no Wengert matches / infeasible SMEM).
+    pub fn active_layer_count(&self) -> usize {
+        self.extras.len()
     }
 }
 
@@ -409,6 +435,45 @@ mod tests {
         let plan = toy_plan(CshaMode::Off);
         let r = bridge(&plan, 64);
         assert!(r.first_extras().is_none());
+    }
+
+    // ── A.2.0: per-layer extras lookup ────────────────────────────
+
+    #[test]
+    fn a20_extras_for_layer_returns_extras_for_matching_name() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        let extras = r
+            .extras_for_layer("blocks.0")
+            .expect("blocks.0 should be present in the single-layer plan");
+        assert!(extras.level >= 1);
+    }
+
+    #[test]
+    fn a20_extras_for_layer_returns_none_for_unknown_layer() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        assert!(r.extras_for_layer("blocks.9999").is_none());
+    }
+
+    #[test]
+    fn a20_extras_at_index_positional_lookup() {
+        let plan = toy_plan(CshaMode::Auto);
+        let r = bridge(&plan, 64);
+        assert!(r.extras_at_index(0).is_some());
+        assert!(r.extras_at_index(1).is_none(), "toy plan has one layer");
+    }
+
+    #[test]
+    fn a20_active_layer_count_matches_extras_len() {
+        let plan_on = toy_plan(CshaMode::Auto);
+        let r_on = bridge(&plan_on, 64);
+        assert_eq!(r_on.active_layer_count(), r_on.extras.len());
+        assert!(r_on.active_layer_count() >= 1);
+
+        let plan_off = toy_plan(CshaMode::Off);
+        let r_off = bridge(&plan_off, 64);
+        assert_eq!(r_off.active_layer_count(), 0);
     }
 
     #[test]

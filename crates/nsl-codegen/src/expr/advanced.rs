@@ -1332,16 +1332,24 @@ impl Compiler<'_> {
         let lse_val =
             self.compile_call_by_name(builder, "nsl_tensor_to_device", &[lse_cpu, cuda_device])?;
 
-        // A.1: dispatch to CSHA-aware FFI when the active CSHA plan
-        // produced extras for at least one layer. The extras carry the
-        // fusion level, active-heads count, and the RMSNorm / projection
-        // flags that A.2's PTX body will consume. For Tier A.1 the
-        // runtime side forwards to the non-CSHA path — the wiring is
-        // observable via the extra args being marshalled and passed.
+        // A.1/A.2.0: dispatch to CSHA-aware FFI when the active CSHA
+        // plan produced extras for at least one layer. The extras
+        // carry the fusion level, active-heads count, and the RMSNorm /
+        // projection flags that A.2.1+ PTX emission will consume. For
+        // Tier A.1 the runtime side forwards to the non-CSHA path —
+        // the wiring is observable via the extra args being marshalled
+        // and passed.
+        //
+        // A.2.0: positional match — the Nth FA call in source order
+        // picks up the Nth layer's extras. A.2.1 replaces this with a
+        // proper layer-name resolver (Wengert `Param` prefix →
+        // enclosing function → layer key).
+        let ordinal = self.csha_fa_call_ordinal;
         let csha_extras = self
             .last_csha_bridge
             .as_ref()
-            .and_then(|b| b.first_extras().cloned());
+            .and_then(|b| b.extras_at_index(ordinal).cloned());
+        self.csha_fa_call_ordinal = ordinal.saturating_add(1);
 
         if let Some(extras) = csha_extras {
             let eps_bits = builder
