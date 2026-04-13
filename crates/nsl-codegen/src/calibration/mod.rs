@@ -5,6 +5,7 @@ pub mod cache;
 pub mod ctx;
 pub mod data_loader;
 pub mod hooks;
+pub mod identity_hook;
 pub mod observation;
 pub mod registry;
 pub mod sidecar;
