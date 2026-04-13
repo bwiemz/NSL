@@ -34,16 +34,16 @@ impl CacheKey {
         let mut ckpts = self.checkpoint_hashes.clone();
         ckpts.sort();
         for c in &ckpts {
+            h.update((c.len() as u64).to_le_bytes());
             h.update(c.as_bytes());
-            h.update(b"\0");
         }
+        h.update((self.calibration_data_hash.len() as u64).to_le_bytes());
         h.update(self.calibration_data_hash.as_bytes());
-        h.update(b"\0");
         let mut hooks = self.hook_ids_sorted.clone();
         hooks.sort();
         for hk in &hooks {
+            h.update((hk.len() as u64).to_le_bytes());
             h.update(hk.as_bytes());
-            h.update(b"\0");
         }
         h.update(self.samples.to_le_bytes());
         h.update(self.batch_size.to_le_bytes());
@@ -238,5 +238,47 @@ mod tests {
         fs::write(sidecar_path_for(&p), b"{not json").unwrap();
         assert!(try_load(&p, "anything").is_none());
         cleanup(&p);
+    }
+
+    #[test]
+    fn null_byte_in_hook_id_does_not_collide_with_split_ids() {
+        // The pre-fix code could collide ["h1\0h2"] with ["h1", "h2"]
+        // because the domain separator was a single \0.  Length-prefix
+        // framing prevents this.
+        let combined = CacheKey {
+            checkpoint_hashes: vec!["c".into()],
+            calibration_data_hash: "d".into(),
+            hook_ids_sorted: vec!["h1\0h2".into()],
+            samples: 1,
+            batch_size: 1,
+        };
+        let split = CacheKey {
+            checkpoint_hashes: vec!["c".into()],
+            calibration_data_hash: "d".into(),
+            hook_ids_sorted: vec!["h1".into(), "h2".into()],
+            samples: 1,
+            batch_size: 1,
+        };
+        assert_ne!(combined.digest(), split.digest());
+    }
+
+    #[test]
+    fn null_byte_at_checkpoint_data_boundary_does_not_collide() {
+        // ckpts=["a"] + data="bd" should differ from ckpts=["ab"] + data="d".
+        let a = CacheKey {
+            checkpoint_hashes: vec!["a".into()],
+            calibration_data_hash: "bd".into(),
+            hook_ids_sorted: vec![],
+            samples: 1,
+            batch_size: 1,
+        };
+        let b = CacheKey {
+            checkpoint_hashes: vec!["ab".into()],
+            calibration_data_hash: "d".into(),
+            hook_ids_sorted: vec![],
+            samples: 1,
+            batch_size: 1,
+        };
+        assert_ne!(a.digest(), b.digest());
     }
 }
