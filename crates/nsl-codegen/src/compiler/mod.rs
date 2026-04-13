@@ -433,6 +433,24 @@ pub struct Compiler<'a> {
     /// for the whole stack. A.2.1 replaces this positional match with a
     /// proper layer-name resolver.
     pub csha_fa_call_ordinal: usize,
+    /// CSHA Tier A.2.1d: side-table of Wengert op indices claimed by the
+    /// current CSHA plan — the RMSNorm prologue, the Q/K/V projection
+    /// matmuls, and (where present) the RoPE epilogue op per boundary
+    /// chain. Populated at the same hook that sets `last_csha_bridge`
+    /// (stmt.rs), from `plan.boundary.chains`.
+    ///
+    /// Purpose: A.2.2-A.2.4 PTX emission will consume Q/K/V inside the
+    /// fused kernel body, which means the separately-emitted matmul /
+    /// RMSNorm / RoPE launches become redundant. This table gives
+    /// downstream codegen passes a single place to ask "is this op
+    /// claimed by a CSHA-fused kernel and therefore safe to skip?"
+    /// without re-walking the plan.
+    ///
+    /// A.2.1d is prep-only: no consumer yet physically skips on this
+    /// set (which would leave Q/K/V uninitialised until A.2.3 lands the
+    /// projection PTX). The getter is in place so the follow-on tasks
+    /// can wire suppression without further compiler-state churn.
+    pub csha_claimed_ops: std::collections::HashSet<u32>,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
     /// (but potentially different α/rank scales) share one PTX string.
@@ -577,6 +595,7 @@ impl<'a> Compiler<'a> {
             adapter_prescan_plan: None,
             last_csha_bridge: None,
             csha_fa_call_ordinal: 0,
+            csha_claimed_ops: std::collections::HashSet::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
         })
@@ -596,6 +615,19 @@ impl<'a> Compiler<'a> {
     /// Defaults to CUDA when no target is specified.
     pub fn gpu_target(&self) -> crate::gpu_target::GpuTarget {
         crate::gpu_target::GpuTarget::from_target_string(&self.compile_options.target)
+    }
+
+    /// CSHA A.2.1d: returns true when the Wengert op at `op_idx` has
+    /// been claimed by a CSHA boundary chain (RMSNorm prologue, Q/K/V
+    /// projection matmul, or RoPE epilogue). Returns false when CSHA
+    /// is off or no plan has been run this compile.
+    ///
+    /// The answer is advisory in A.2.1d — no lowering pass yet acts on
+    /// it. A.2.2 / A.2.3 / A.2.4 wire it into the prologue / projection
+    /// / epilogue emission paths so the CSHA-fused kernel owns Q/K/V
+    /// computation without redundant separately-launched matmuls.
+    pub fn is_csha_claimed(&self, op_idx: u32) -> bool {
+        self.csha_claimed_ops.contains(&op_idx)
     }
 
     /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`

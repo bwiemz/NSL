@@ -3665,6 +3665,14 @@ impl Compiler<'_> {
                                     .map(|lp| lp.tiles.head_dim as i64)
                                     .unwrap_or(64),
                             ));
+                            // A.2.1d: record the Wengert op indices CSHA
+                            // has claimed across all boundary chains so
+                            // downstream passes (A.2.2 RMSNorm prologue,
+                            // A.2.3 matmul projection, A.2.4 RoPE
+                            // epilogue) can ask `is_csha_claimed(op)`
+                            // before emitting a redundant launch.
+                            self.csha_claimed_ops =
+                                crate::csha_apply::collect_claimed_ops(&plan);
                         }
                     }
                 }

@@ -210,6 +210,26 @@ pub enum MarkRole {
 // Bridge
 // ---------------------------------------------------------------------------
 
+/// A.2.1d: collect the Wengert op indices claimed by every boundary
+/// chain in `plan` — RMSNorm prologue, Q/K/V projection matmul, and
+/// (optional) RoPE epilogue. Returned set is what
+/// `Compiler.csha_claimed_ops` is populated from at the same stmt.rs
+/// hook that sets `last_csha_bridge`.
+///
+/// Factored as a free function so the population logic is pure and
+/// directly unit-testable without constructing a full `Compiler`.
+pub fn collect_claimed_ops(plan: &CshaPlan) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for chain in &plan.boundary.chains {
+        out.insert(chain.norm_op);
+        out.insert(chain.matmul_op);
+        if let Some(rope_op) = chain.rope_op {
+            out.insert(rope_op);
+        }
+    }
+    out
+}
+
 /// Build the downstream artefacts from a CSHA plan.
 pub fn bridge(plan: &CshaPlan, shape_head_dim: i64) -> BridgeResult {
     let mut out = BridgeResult::default();
@@ -567,6 +587,54 @@ mod tests {
         assert_eq!(layer, "blocks.0");
         assert!(r.extras_at_index(0).is_some());
         assert!(r.layer_at_index(1).is_none());
+    }
+
+    #[test]
+    fn a21d_collect_claimed_ops_covers_norm_matmul_rope_per_chain() {
+        // `attn_wengert` has three boundary chains (Q, K, V). Each
+        // chain contributes (norm_op, matmul_op) always and rope_op
+        // for Q and K. V has no RoPE.
+        //
+        // Concretely in the toy Wengert list:
+        //   op 1 — RMSNorm (shared across chains, so three chains
+        //          all have norm_op = 1)
+        //   op 2 — Param blocks.0.attn.wq
+        //   op 3 — Matmul (Q)
+        //   op 4 — RoPE (Q)
+        //   op 5 — Param blocks.0.attn.wk
+        //   op 6 — Matmul (K)
+        //   op 7 — RoPE (K)
+        //   op 8 — Param blocks.0.attn.wv
+        //   op 9 — Matmul (V)    ← no RoPE consumer
+        //
+        // Claimed set must contain {1, 3, 4, 6, 7, 9} — three matmuls,
+        // two RoPEs, one shared RMSNorm; exactly six entries.
+        let plan = toy_plan(CshaMode::Auto);
+        let claimed = collect_claimed_ops(&plan);
+        assert_eq!(claimed.len(), 6, "got {:?}", claimed);
+        assert!(claimed.contains(&1), "RMSNorm op missing");
+        assert!(claimed.contains(&3), "Q matmul missing");
+        assert!(claimed.contains(&4), "Q RoPE missing");
+        assert!(claimed.contains(&6), "K matmul missing");
+        assert!(claimed.contains(&7), "K RoPE missing");
+        assert!(claimed.contains(&9), "V matmul missing");
+        // V has no rope — op indices 2/5/8 are the Param leaves (not
+        // claimed as fusion targets; the bridge tracks them via
+        // `chain.weight_param` instead).
+        assert!(!claimed.contains(&2));
+        assert!(!claimed.contains(&5));
+        assert!(!claimed.contains(&8));
+    }
+
+    #[test]
+    fn a21d_collect_claimed_ops_empty_when_csha_off() {
+        let plan = toy_plan(CshaMode::Off);
+        let claimed = collect_claimed_ops(&plan);
+        assert!(
+            claimed.is_empty(),
+            "Off mode must produce no claimed ops; got {:?}",
+            claimed
+        );
     }
 
     #[test]
