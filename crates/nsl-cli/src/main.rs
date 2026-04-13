@@ -1354,6 +1354,7 @@ fn run_build_shared_single(
     options: &nsl_codegen::CompileOptions,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
+    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
 
     // Codegen with PIC enabled (shared_lib=true in options)
     let obj_bytes = match nsl_codegen::compile(
@@ -1602,6 +1603,7 @@ fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
 ) {
     let (interner, parse_result, analysis) = frontend(file);
+    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
 
     let (obj_bytes, zk_proof_fns, zk_results) = match nsl_codegen::compile_with_zk_info(
         &parse_result.module,
@@ -1809,6 +1811,7 @@ fn run_build_standalone(
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
     let (interner, parse_result, analysis) = frontend(&file_pb);
+    // WRGA bridge not yet wired for this path — see Milestone B (docs/superpowers/plans/2026-04-12-wrga-milestone-a-bridge.md).
 
     // 5. Determine output path
     let output_path = if let Some(out) = output {
