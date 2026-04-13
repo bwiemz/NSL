@@ -1,6 +1,7 @@
 //! Compile-time calibration harness — see
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
+pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
 pub mod ctx;
