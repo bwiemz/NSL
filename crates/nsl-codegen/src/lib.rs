@@ -72,8 +72,9 @@ pub mod zk;
 
 pub use compiler::{
     compile, compile_entry, compile_module, compile_module_with_imports,
-    compile_module_with_imports_returning_plan, compile_standalone, compile_test,
-    compile_with_zk_info, StandaloneConfig,
+    compile_entry_returning_plan, compile_module_with_imports_returning_plan,
+    compile_returning_plan, compile_standalone, compile_test, compile_with_zk_info,
+    StandaloneConfig,
 };
 
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced

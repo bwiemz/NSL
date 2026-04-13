@@ -33,6 +33,12 @@ pub struct ModuleData {
     pub dependencies: Vec<PathBuf>,
     /// Module prefix for name mangling (empty for entry module)
     pub module_prefix: String,
+    /// WRGA decorator configs captured by nsl-semantic (Milestone B.1).
+    pub wrga_configs: Vec<nsl_semantic::wrga::WrgaConfig>,
+    /// `@freeze` decorator configs captured by nsl-semantic.
+    pub freeze_configs: Vec<nsl_semantic::wrga::FreezeConfig>,
+    /// `@adapter` decorator configs captured by nsl-semantic.
+    pub adapter_configs: Vec<nsl_semantic::wrga::AdapterConfig>,
 }
 
 /// The complete module graph for a compilation unit.
@@ -391,6 +397,9 @@ pub fn load_all_modules(
             enum_defs,
             dependencies: dep_paths,
             module_prefix,
+            wrga_configs: analysis.wrga_configs,
+            freeze_configs: analysis.freeze_configs,
+            adapter_configs: analysis.adapter_configs,
         });
     }
 

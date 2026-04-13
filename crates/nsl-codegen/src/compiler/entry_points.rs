@@ -17,6 +17,20 @@ pub fn compile(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
+    compile_returning_plan(ast, interner, type_map, dump_ir, options).map(|(b, _)| b)
+}
+
+/// Same as [`compile`] but also returns any `WrgaPlan` stashed on the compiler
+/// during `@train` block lowering (Milestone B.1 Task 2).
+///
+/// Used by `nsl build --wrga-report` to surface WRGA analysis to the user.
+pub fn compile_returning_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
 
     // M52: Load weights if --weights was provided
@@ -162,7 +176,9 @@ pub fn compile(
 
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
-    compiler.finalize()
+    let plan = compiler.last_wrga_plan.clone();
+    let bytes = compiler.finalize()?;
+    Ok((bytes, plan))
 }
 
 /// Like [`compile`] but also returns the collected `@zk_proof` function map.
@@ -555,6 +571,7 @@ pub fn compile_module_with_imports_best_effort_plan(
 /// Own functions use Linkage::Export, imported functions use Linkage::Import.
 /// imported_fns entries are (raw_name, mangled_name, signature).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn compile_entry(
     ast: &nsl_ast::Module,
     interner: &Interner,
@@ -569,6 +586,40 @@ pub fn compile_entry(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
+    compile_entry_returning_plan(
+        ast,
+        interner,
+        type_map,
+        imported_fns,
+        imported_struct_layouts,
+        imported_model_names,
+        imported_enum_variants,
+        imported_enum_defs,
+        imported_model_method_bodies,
+        imported_model_field_types,
+        dump_ir,
+        options,
+    )
+    .map(|(b, _)| b)
+}
+
+/// Same as [`compile_entry`] but also returns any `WrgaPlan` stashed on the
+/// compiler during `@train` block lowering (Milestone B.1 Task 2).
+#[allow(clippy::too_many_arguments)]
+pub fn compile_entry_returning_plan(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    imported_enum_variants: HashMap<String, i64>,
+    imported_enum_defs: HashMap<String, Vec<(String, i64)>>,
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
+    imported_model_field_types: HashMap<String, HashMap<String, String>>,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
 
@@ -636,5 +687,7 @@ pub fn compile_entry(
             &compiler.fusion.barriers,
         );
     }
-    compiler.finalize()
+    let plan = compiler.last_wrga_plan.clone();
+    let bytes = compiler.finalize()?;
+    Ok((bytes, plan))
 }
