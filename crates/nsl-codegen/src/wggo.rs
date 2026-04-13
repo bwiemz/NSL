@@ -9,7 +9,7 @@
 //!   5. Level 2: per-layer ILP            — `wggo_ilp::solve_all`
 //!   6. Level 3: kernel generation        — delegated to backend
 //!   7. Memory planning                   — delegated to M36
-//!   8. Communication schedule            — delegated to CPDT (future)
+//!   8. Communication schedule            — `wggo_schedule::build_schedule`
 //!
 //! The driver is pure data-in / data-out and has no backend side
 //! effects.  It produces a [`WggoPlan`] downstream passes consume.
@@ -27,6 +27,7 @@ use crate::wggo_ilp::{
     solve_all as ilp_solve_all, solve_all_greedy as ilp_solve_all_greedy, LayerIlpConstraints,
     LayerIlpSolution,
 };
+use crate::wggo_schedule::{build_schedule, CommSchedule};
 
 /// User-visible optimisation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -83,6 +84,9 @@ pub struct WggoPlan {
     pub per_layer: Vec<LayerIlpSolution>,
     pub resolutions: Vec<Resolution>,
     pub applied: AppliedPlan,
+    /// Cross-device collective schedule (Stage 8).  Produced from the
+    /// post-resolution per-layer plan; consumed by CPDT lowering.
+    pub schedule: CommSchedule,
     /// Total solver wall-clock time (μs, self-reported — not measured).
     pub estimated_solve_us: u64,
 }
@@ -152,6 +156,8 @@ impl WggoPlan {
         )
         .unwrap();
         writeln!(s, "  Solve time: {:.2} ms", self.estimated_solve_us as f64 / 1000.0).unwrap();
+        writeln!(s).unwrap();
+        write!(s, "{}", self.schedule.render()).unwrap();
         s
     }
 
@@ -193,6 +199,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         };
         let per_layer = ilp_solve_all(&luts, &ilp_defaults);
         let applied = apply(&inter, &per_layer);
+        let schedule = build_schedule(&inter, &applied);
         return WggoPlan {
             mode: WggoMode::Off,
             target_gpu: gpu.name.to_string(),
@@ -201,6 +208,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             per_layer,
             resolutions: Vec::new(),
             applied,
+            schedule,
             estimated_solve_us: t0.elapsed().as_micros() as u64,
         };
     }
@@ -275,8 +283,9 @@ pub fn run(input: WggoInput) -> WggoPlan {
         sol.decision.fase_fused = r.fase_fused;
     }
 
-    // 8. Apply.
+    // 8. Apply + communication schedule.
     let applied = apply(&inter, &per_layer);
+    let schedule = build_schedule(&inter, &applied);
 
     WggoPlan {
         mode: input.mode,
@@ -286,6 +295,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         per_layer,
         resolutions,
         applied,
+        schedule,
         estimated_solve_us: t0.elapsed().as_micros() as u64,
     }
 }
@@ -528,6 +538,24 @@ mod tests {
             greedy_nodes * 100 < full_nodes,
             "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
         );
+    }
+
+    #[test]
+    fn schedule_present_for_multi_gpu_run() {
+        // Multi-GPU triggers ZeRO sharding via the inter-layer DP, which
+        // in turn forces the schedule to issue collectives.
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        assert!(plan.schedule.total_collectives >= 1);
+        let rep = plan.render_report();
+        assert!(rep.contains("Communication schedule"));
+    }
+
+    #[test]
+    fn schedule_empty_for_single_gpu_run() {
+        let w = two_block_wengert();
+        let plan = run_on_wengert(&w, "H100", "full", 1).expect("plan");
+        assert_eq!(plan.schedule.total_collectives, 0);
     }
 
     #[test]
