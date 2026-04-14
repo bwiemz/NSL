@@ -7,6 +7,15 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 
+// Supported-config matrix. Published so Task 3's per-config iteration
+// tests and downstream phase emitters can consume the same lists the
+// validator uses (single source of truth — no duplication).
+pub const ALLOWED_BLOCK_Q:   &[i64] = &[4, 8, 16, 32, 64, 128];
+pub const ALLOWED_BLOCK_KV:  &[i64] = &[16, 32, 64, 128];
+pub const ALLOWED_HEAD_DIM:  &[i64] = &[32, 64, 128, 256];
+pub const ALLOWED_GQA:       &[u32] = &[1, 2, 4, 8];
+pub const SMEM_BUDGET_BYTES: u32    = 48 * 1024;
+
 #[derive(Debug)]
 pub struct ConfigError(pub String);
 
@@ -20,12 +29,6 @@ impl std::error::Error for ConfigError {}
 
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
 pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), ConfigError> {
-    const ALLOWED_BLOCK_Q:  &[i64] = &[4, 8, 16, 32, 64, 128];
-    const ALLOWED_BLOCK_KV: &[i64] = &[16, 32, 64, 128];
-    const ALLOWED_HEAD_DIM: &[i64] = &[32, 64, 128, 256];
-    const ALLOWED_GQA:      &[u32] = &[1, 2, 4, 8];
-    const SMEM_BUDGET_BYTES: u32 = 48 * 1024;
-
     if !ALLOWED_BLOCK_Q.contains(&config.block_q) {
         return Err(ConfigError(format!(
             "block_q = {}: must be one of {:?}", config.block_q, ALLOWED_BLOCK_Q
