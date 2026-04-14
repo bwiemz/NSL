@@ -20,3 +20,9 @@ impl CodegenError {
         }
     }
 }
+
+impl From<crate::calibration::DiscoveryError> for CodegenError {
+    fn from(e: crate::calibration::DiscoveryError) -> Self {
+        CodegenError::new(format!("calibration discovery: {e}"))
+    }
+}

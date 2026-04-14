@@ -2,6 +2,7 @@
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
 pub mod awq_hook;
+pub mod discovery;
 pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
@@ -16,6 +17,10 @@ pub mod sidecar;
 pub mod subprocess;
 
 pub use ctx::{BufferHandle, CalibCtx};
+pub use discovery::{
+    discover_awq_projections, discover_awq_projections_from_state, DiscoveredProjection,
+    DiscoveryError,
+};
 pub use hooks::{CalibrationHook, CalibrationResult};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};

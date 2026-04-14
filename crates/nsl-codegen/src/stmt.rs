@@ -6596,18 +6596,88 @@ impl Compiler<'_> {
 
     /// Walk the compiled model's `quant { ... }` blocks and produce the
     /// list of ProjectionRefs that AWQ needs calibration data for.
-    /// Returns `None` when no AWQ quant block is present.
+    /// Returns `None` when no AWQ quant block is present or discovery
+    /// produces no matches.
     ///
-    /// MVP scope: projection enumeration is deferred — Task 13's AWQ
-    /// quant pass reads `compile_options.calibration_sidecar` when a
-    /// sidecar exists and builds its own projection set from the quant
-    /// AST directly.  Returning `None` here keeps the registry empty so
-    /// the harness logs the "no calibration hooks registered" notice
-    /// and proceeds as a no-op until downstream wiring lands.
+    /// Implementation (Task 3): scans `self.features.quant_configs` for
+    /// models quantised with `"awq4"`.  For each such model, retrieves the
+    /// `forward` method body from `model_method_bodies`, walks its pipe chain
+    /// to enumerate linear-projection call sites, and returns the sorted,
+    /// deduplicated `Vec<ProjectionRef>`.  Discovery errors (e.g. empty match)
+    /// are logged to stderr and treated as `None` so the harness falls back to
+    /// its no-op path rather than crashing the compile.
     fn discover_awq_projections(
         &self,
     ) -> Option<Vec<crate::calibration::ProjectionRef>> {
-        None
+        use crate::calibration::discover_awq_projections_from_state;
+
+        // Collect all AWQ-quantised model names.
+        let awq_models: Vec<String> = self
+            .features
+            .quant_configs
+            .iter()
+            .filter(|(_, cfg)| cfg.dtype == "awq4")
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if awq_models.is_empty() {
+            return None;
+        }
+
+        let mut all_projections: Vec<crate::calibration::ProjectionRef> = Vec::new();
+
+        for model_name in &awq_models {
+            // Retrieve the forward method body (if stored).
+            let forward_body: Option<&nsl_ast::stmt::Block> = self
+                .models
+                .model_method_bodies
+                .get(model_name)
+                .and_then(|methods| methods.get("forward"))
+                .map(|fn_def| &fn_def.body);
+
+            // Retrieve field-type and shape maps for this model.
+            let empty_field_types = std::collections::HashMap::new();
+            let field_types = self
+                .models
+                .model_field_types
+                .get(model_name)
+                .unwrap_or(&empty_field_types);
+
+            let empty_shapes = std::collections::HashMap::new();
+            let tensor_shapes = self
+                .models
+                .model_tensor_field_shapes
+                .get(model_name)
+                .unwrap_or(&empty_shapes);
+
+            match discover_awq_projections_from_state(
+                model_name,
+                forward_body,
+                field_types,
+                tensor_shapes,
+                &[], // no exclusions from the Compiler-level stub; the QuantBlock's
+                     // exclude list is stored in the AST which isn't retained here.
+                self.interner,
+            ) {
+                Ok(discovered) => {
+                    for dp in discovered {
+                        all_projections.push(dp.projection);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[calibration] AWQ discovery for model '{model_name}': {e}");
+                }
+            }
+        }
+
+        if all_projections.is_empty() {
+            None
+        } else {
+            // Sort + dedup across models.
+            all_projections.sort();
+            all_projections.dedup();
+            Some(all_projections)
+        }
     }
 
 
