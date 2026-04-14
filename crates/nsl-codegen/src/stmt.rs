@@ -4030,6 +4030,13 @@ impl Compiler<'_> {
                 let mut freed_adjoint_vars = std::collections::HashSet::new();
                 if fase_hook_active {
                     freed_adjoint_vars.extend(param_adj_set.iter().copied());
+                    // Also skip raw_grad VarIds that were freed early by the
+                    // reduce_to_shape identity path in wengert_lower.  When
+                    // shapes match, reduce_to_shape returns the input with a
+                    // refcount bump; the hook's nsl_tensor_free drops rc 2→1
+                    // and wengert_lower emits a second free that drops rc 1→0.
+                    // These VarIds must NOT be freed again by end-of-adjoint cleanup.
+                    freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
                 }
 
                 if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {

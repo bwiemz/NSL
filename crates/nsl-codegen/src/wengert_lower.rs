@@ -19,6 +19,18 @@ pub type VarMap = HashMap<VarId, Value>;
 pub struct LoweredWengert {
     pub var_map: VarMap,
     pub owned_values: Vec<(VarId, Value, WengertType)>,
+    /// VarIds that were freed early by the FASE hook's reduce_to_shape
+    /// identity path.  When the hook fires on a `reduce_to_shape` result and
+    /// the runtime returns the same pointer (shapes match → retain+return),
+    /// the input VarId (raw_grad) needs an extra `nsl_tensor_free` to bring
+    /// the refcount to zero — the hook's free only drops it from 2→1.  The
+    /// extra free is emitted here; these VarIds are added to
+    /// `freed_adjoint_vars` in stmt.rs so `free_wengert_owned_values` skips
+    /// them and does not double-free.
+    ///
+    /// This is also correct when shapes differ (normal clone path): the input
+    /// grad (rc=1) is freed immediately by the extra call, and cleanup skips it.
+    pub hook_freed_input_vars: std::collections::HashSet<VarId>,
 }
 
 /// Lower a WengertList to Cranelift IR by dispatching each PrimalOp to its runtime FFI call.
@@ -53,6 +65,7 @@ pub fn compile_wengert_ops(
 ) -> Result<LoweredWengert, CodegenError> {
     let mut var_map = primal_vars.clone();
     let mut owned_values = Vec::new();
+    let mut hook_freed_input_vars = std::collections::HashSet::new();
     // Clone var_types so the lowerer can look up types for any VarId and
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
@@ -87,6 +100,30 @@ pub fn compile_wengert_ops(
                 // Callback owns/freed the tensor — remove from var_map so
                 // downstream code can't accidentally re-use it.
                 var_map.remove(&op.result);
+
+                // If the hook fired on a reduce_to_shape op, emit an extra
+                // nsl_tensor_free for the raw-grad input (inputs[0]).
+                //
+                // Why this is needed: nsl_tensor_reduce_to_shape increments
+                // the input's refcount and returns the same pointer when the
+                // src and target shapes match (the identity path).  The hook
+                // callback already called nsl_tensor_free(result_val), which
+                // drops refcount from 2→1 — not an actual free.  We need one
+                // more free here to bring it to 0 so the raw grad is released
+                // immediately, not held until end-of-adjoint cleanup (which
+                // is what causes the N×grad_size peak-memory regression).
+                //
+                // This is also correct on the non-identity path (fresh clone):
+                // the raw_grad has rc=1, this free drops it to 0 (freed), and
+                // the cleanup pass skips it via hook_freed_input_vars.
+                if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape") {
+                    if let Some(&input_vid) = op.inputs.first() {
+                        if let Some(&input_val) = var_map.get(&input_vid) {
+                            call(compiler, builder, "nsl_tensor_free", &[input_val])?;
+                            hook_freed_input_vars.insert(input_vid);
+                        }
+                    }
+                }
             }
         }
         // Infer result type: for binary ops, if both inputs are Integer, result is Integer.
@@ -126,6 +163,7 @@ pub fn compile_wengert_ops(
     Ok(LoweredWengert {
         var_map,
         owned_values,
+        hook_freed_input_vars,
     })
 }
 
