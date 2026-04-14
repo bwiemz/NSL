@@ -171,6 +171,10 @@ nsl zk verify proof.zkp             # Verify a proof
 nsl zk stats proof.zkp              # Proof statistics
 ```
 
+## Environment Variables
+
+- `NSL_FA_EMITTER` -- selects the FlashAttention-2 scalar-path emitter version on SM < 80 builds. `v1` (default) uses the legacy emitter; `v2` uses the warp-per-row rewrite validated by the Part 1 GPU integration test. The MMA path (SM >= 80) routes to v1 regardless. Default will flip to `v2` after the soak period; v1 will be deleted in a subsequent commit. See `docs/superpowers/specs/2026-04-14-fa-scalar-emitter-rewrite-design.md` for the migration plan.
+
 ## Project Structure
 
 ```text

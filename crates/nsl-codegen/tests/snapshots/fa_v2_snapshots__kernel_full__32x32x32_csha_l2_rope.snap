@@ -1,0 +1,2856 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: s
+---
+.version 8.7
+.target sm_75
+.address_size 64
+
+.visible .entry flash_attn_p0_r1_hs_g1_c1_t0_q32_kv32_cshaL2_n1_p1_o1_h0_v2 (
+    .param .u64 q_ptr,
+    .param .u64 k_ptr,
+    .param .u64 v_ptr,
+    .param .u64 out_ptr,
+    .param .f32 scale,
+    .param .u64 batch,
+    .param .u64 heads,
+    .param .u64 seq_len,
+    .param .u64 head_dim,
+    .param .u64 block_table_ptr,
+    .param .u64 k_pool_ptr,
+    .param .u64 v_pool_ptr,
+    .param .u64 block_size,
+    .param .u64 cos_ptr,
+    .param .u64 sin_ptr,
+    .param .u64 seq_ids_ptr,
+    .param .u64 seq_lens_ptr,
+    .param .u64 dfs_enter_ptr,
+    .param .u64 dfs_exit_ptr,
+    .param .u64 num_tree_nodes,
+    .param .u64 param_logsumexp,
+    .param .u64 csha_x_ptr,
+    .param .u64 csha_norm_weight_ptr,
+    .param .u64 csha_wq_ptr,
+    .param .u64 csha_wk_ptr,
+    .param .u64 csha_wv_ptr,
+    .param .u64 csha_wo_ptr,
+    .param .f32 csha_eps,
+    .param .u32 csha_active_heads,
+    .param .u32 csha_d_model
+)
+{
+    .shared .align 16 .b8 shmem[4608];
+    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;
+    .reg .u64 %rd<64>;
+    .reg .f32 %f<49>;
+    .reg .b16 %h<32>;
+    .reg .pred %p<8>;
+    .reg .u32 %r<16>;
+    .reg .f32 %scale, %log2e, %row_max, %row_sum, %correction;
+    .reg .f32 %new_max, %old_max, %shfl_tmp;
+    .reg .u64 %q_start, %head_idx, %batch_idx, %k_start, %k_max;
+    .reg .u64 %shmem_base, %smem_addr;
+    .reg .f32 %log_sum, %lse;
+    .reg .u64 %logsumexp_base;
+    .reg .pred %p_has_lse;
+    cvta.shared.u64 %shmem_base, shmem;
+    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))
+    ld.param.f32 %scale, [scale];
+    ld.param.u64 %rd0, [q_ptr];
+    ld.param.u64 %rd1, [k_ptr];
+    ld.param.u64 %rd2, [v_ptr];
+    ld.param.u64 %rd3, [out_ptr];
+    ld.param.u64 %rd4, [batch];
+    ld.param.u64 %rd5, [heads];
+    ld.param.u64 %rd6, [seq_len];
+    ld.param.u64 %rd7, [head_dim];
+    ld.param.u64 %logsumexp_base, [param_logsumexp];
+    mov.u32 %tid_x, %tid.x;
+    shr.u32 %warp_id, %tid_x, 5;       // warp_id = tid_x / 32
+    and.b32 %lane, %tid_x, 31;          // lane = tid_x % 32
+    mov.u32 %bid_x, %ctaid.x;
+    mov.u32 %bid_y, %ctaid.y;
+    cvt.u64.u32 %q_start, %bid_x;
+    mul.lo.u64 %q_start, %q_start, 32;   // * block_q
+    cvt.u64.u32 %rd16, %bid_y;
+    rem.u64 %head_idx,  %rd16, %rd5;   // head_idx  = bid_y % heads
+    div.u64 %batch_idx, %rd16, %rd5;   // batch_idx = bid_y / heads
+    // CSHA A.4: active_heads guard
+    ld.param.u32 %r10, [csha_active_heads];
+    setp.eq.u32 %p0, %r10, 0;
+    @%p0 bra V2_CSHA_ACTIVE_HEADS_SKIP;
+    cvt.u32.u64 %r11, %head_idx;
+    setp.ge.u32 %p0, %r11, %r10;
+    @%p0 ret;
+V2_CSHA_ACTIVE_HEADS_SKIP:
+    // ====== q_tile_iter = 0 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 0)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_0;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 0;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 0;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_0:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 0)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_0;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_0:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 0
+    add.u32 %r0, %warp_id, 0;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_0:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_0:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_0;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 0)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_0:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 0;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_0;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_0:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_0;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 0)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_0:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_0;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_0;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 0)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_0;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_0:
+    // Phase 6: finalize + output store (q_tile_iter = 0)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 0;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 1 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 1)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_1;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 4;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 4;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_1:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 1)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_1;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_1:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 1
+    add.u32 %r0, %warp_id, 4;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_1:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_1:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_1;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 1)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_1:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 4;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_1;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_1:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_1;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 1)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_1:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_1;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_1;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 1)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_1;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_1:
+    // Phase 6: finalize + output store (q_tile_iter = 1)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 4;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 2 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 2)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_2;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 8;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 8;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_2:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 2)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_2;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_2:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 2
+    add.u32 %r0, %warp_id, 8;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_2:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_2:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_2;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 2)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_2:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 8;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_2;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_2:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_2;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 2)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_2:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_2;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_2;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 2)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_2;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_2:
+    // Phase 6: finalize + output store (q_tile_iter = 2)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 8;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 3 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 3)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_3;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 12;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 12;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_3:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 3)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_3;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_3:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 3
+    add.u32 %r0, %warp_id, 12;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_3:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_3:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_3;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 3)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_3:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 12;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_3;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_3:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_3;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 3)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_3:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_3;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_3;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 3)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_3;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_3:
+    // Phase 6: finalize + output store (q_tile_iter = 3)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 12;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 4 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 4)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_4;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 16;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 16;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_4:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 4)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_4;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_4:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 4
+    add.u32 %r0, %warp_id, 16;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_4:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_4:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_4;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 4)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_4:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 16;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_4;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_4:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_4;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 4)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_4:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_4;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_4;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 4)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_4;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_4:
+    // Phase 6: finalize + output store (q_tile_iter = 4)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 16;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 5 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 5)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_5;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 20;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 20;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_5:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 5)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_5;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_5:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 5
+    add.u32 %r0, %warp_id, 20;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_5:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_5:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_5;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 5)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_5:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 20;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_5;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_5:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_5;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 5)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_5:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_5;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_5;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 5)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_5;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_5:
+    // Phase 6: finalize + output store (q_tile_iter = 5)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 20;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 6 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 6)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_6;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 24;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 24;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_6:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 6)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_6;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_6:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 6
+    add.u32 %r0, %warp_id, 24;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_6:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_6:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_6;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 6)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_6:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 24;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_6;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_6:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_6;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 6)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_6:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_6;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_6;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 6)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_6;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_6:
+    // Phase 6: finalize + output store (q_tile_iter = 6)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 24;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    // ====== q_tile_iter = 7 / 8 ======
+    mov.f32 %row_max, 0fFF800000;              // -inf
+    mov.f32 %row_sum, 0f00000000;
+    mov.f32 %f48, 0f00000000;                  // O_acc[0] = 0
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 7)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_7;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 28;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 28;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_7:
+    bar.sync 0;  // FENCE: all prologue writes complete
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 7)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_7;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_7:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
+    // Phase 1: Q load, q_tile_iter = 7
+    add.u32 %r0, %warp_id, 28;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
+    // RoPE: cos/sin bases for q_row_global
+    ld.param.u64 %rd25, [cos_ptr];
+    ld.param.u64 %rd26, [sin_ptr];
+    mul.lo.u64 %rd27, %rd21, 32;          // q_row_global * head_dim
+    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes
+    add.u64 %rd25, %rd25, %rd27;              // cos row base
+    add.u64 %rd26, %rd26, %rd27;              // sin row base
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    // rope halfsplit slice 0: pair across (lane ^ 16)
+    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row
+    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos
+    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin
+    shfl.sync.bfly.b32 %f2, %f32, 16, 31, 0xFFFFFFFF;  // partner Q
+    setp.lt.u32 %p0, %lane, 16;
+    @%p0  fma.rn.f32 %f32, %f32, %f0, %f1;
+    @!%p0 fma.rn.f32 %f32, %f32, %f0, %f1;
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;                        // seq_len
+V2_LOOP_KV_START_7:
+    // K tile load: 128 threads cooperatively load block_kv*head_dim elems
+    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd58, %rd58, %head_idx;         // + head
+    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len
+    add.u64 %rd58, %rd58, %k_start;           // + k_start
+    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim
+    shl.b64 %rd58, %rd58, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd58, %rd1, %rd58;               // k_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_K_LOAD_7:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;                 // + kv_offset
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_K_LOAD_7;
+    bar.sync 0;  // FENCE: K tile in shmem
+    // Phase 2: S = Q*K^T (q_tile_iter = 7)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 32;                           // block_kv
+V2_LOOP_S_OVER_K_7:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 32;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 2048;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 28;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_7;
+    bar.sync 0;  // FENCE: all warps finished S writes
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place
+    // V tile load: cooperative, reuses K region
+    mul.lo.u64 %rd58, %batch_idx, %rd5;
+    add.u64 %rd58, %rd58, %head_idx;
+    mul.lo.u64 %rd58, %rd58, %rd6;
+    add.u64 %rd58, %rd58, %k_start;
+    mul.lo.u64 %rd58, %rd58, %rd7;
+    shl.b64 %rd58, %rd58, 2;
+    add.u64 %rd58, %rd2, %rd58;               // v_base global
+    cvt.u64.u32 %rd59, %tid_x;
+V2_LOOP_V_LOAD_7:
+    shl.b64 %rd60, %rd59, 2;
+    add.u64 %rd61, %rd58, %rd60;
+    ld.global.f32 %f0, [%rd61];
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd60, %rd59, 1;
+    add.u64 %rd60, %rd60, 2048;
+    add.u64 %smem_addr, %rd60, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    add.u64 %rd59, %rd59, 128;
+    setp.lt.u64 %p0, %rd59, 1024;
+    @%p0 bra V2_LOOP_V_LOAD_7;
+    bar.sync 0;  // FENCE: V tile in shmem
+    // Phase 5: O_acc += P * V (q_tile_iter = 7)
+    mul.f32 %f48, %f48, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 32;                           // block_kv
+V2_LOOP_PV_OVER_K_7:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 32;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 2048;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_7;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_LOOP_KV_START_7;
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 7)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_7;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_7:
+    // Phase 6: finalize + output store (q_tile_iter = 7)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 28;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
+    ret;
+}
+ 

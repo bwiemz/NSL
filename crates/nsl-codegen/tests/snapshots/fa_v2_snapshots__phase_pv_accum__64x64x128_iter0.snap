@@ -1,0 +1,55 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // Phase 5: O_acc += P * V (q_tile_iter = 0)
+    mul.f32 %f48, %f48, %correction;
+    mul.f32 %f49, %f49, %correction;
+    mul.f32 %f50, %f50, %correction;
+    mul.f32 %f51, %f51, %correction;
+    mov.u32 %r5, 0;                           // k = 0
+    mov.u32 %r6, 64;                           // block_kv
+V2_LOOP_PV_OVER_K_0:
+    cvt.u64.u32 %rd42, %warp_id;
+    mul.lo.u64 %rd42, %rd42, 64;              // warp_id * block_kv
+    cvt.u64.u32 %rd43, %r5;
+    add.u64 %rd42, %rd42, %rd43;              // + k
+    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
+    add.u64 %rd42, %rd42, 32768;                 // + sp_offset
+    add.u64 %smem_addr, %rd42, %shmem_base;
+    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
+    cvt.u64.u32 %rd44, %r5;
+    mul.lo.u64 %rd44, %rd44, 128;              // k * head_dim
+    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16
+    add.u64 %rd44, %rd44, 16384;
+    add.u64 %rd44, %rd44, %shmem_base;
+    cvt.u64.u32 %rd45, %lane;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f48, %f0, %f1, %f48;          // O_acc[i] += P*V
+    cvt.u64.u32 %rd45, %lane;
+    add.u64 %rd45, %rd45, 32;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f49, %f0, %f1, %f49;          // O_acc[i] += P*V
+    cvt.u64.u32 %rd45, %lane;
+    add.u64 %rd45, %rd45, 64;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f50, %f0, %f1, %f50;          // O_acc[i] += P*V
+    cvt.u64.u32 %rd45, %lane;
+    add.u64 %rd45, %rd45, 96;
+    shl.b64 %rd45, %rd45, 1;                  // * 2 bytes f16
+    add.u64 %smem_addr, %rd44, %rd45;
+    ld.shared.b16 %h0, [%smem_addr];
+    cvt.f32.f16 %f1, %h0;                     // V[k, d]
+    fma.rn.f32 %f51, %f0, %f1, %f51;          // O_acc[i] += P*V
+    add.u32 %r5, %r5, 1;
+    setp.lt.u32 %p0, %r5, %r6;
+    @%p0 bra V2_LOOP_PV_OVER_K_0;

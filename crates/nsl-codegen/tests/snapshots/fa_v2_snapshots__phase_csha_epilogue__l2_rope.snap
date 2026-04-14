@@ -1,0 +1,12 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 0)
+    ld.param.u64 %rd62, [cos_ptr];
+    setp.eq.u64 %p0, %rd62, 0;
+    @%p0 bra V2_CSHA_EPILOGUE_SKIP_0;
+    // TODO(fa-v2-rope-epilogue): real rotation body
+    // Same shape as q_load's emit_rope_rotation_inline but
+    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
+V2_CSHA_EPILOGUE_SKIP_0:

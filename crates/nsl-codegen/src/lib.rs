@@ -50,6 +50,8 @@ pub mod fase_clip;
 pub mod fase_memory;
 pub mod fase_optimizer;
 pub mod flash_attention;
+pub mod flash_attention_v2;
+pub mod flash_attention_selector;
 pub mod fp8;
 pub mod func;
 pub mod fusion;

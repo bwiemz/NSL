@@ -1321,7 +1321,7 @@ impl Compiler<'_> {
         let block_q = ctx.config.block_q;
         let block_kv = ctx.config.block_kv;
         let is_causal = ctx.config.causal;
-        let shmem_bytes = crate::flash_attention::shared_mem_bytes(&ctx.config) as i64;
+        let shmem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected(&ctx.config) as i64;
 
         // Allocate output tensor (same shape as Q, same device)
         let out_val = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[q_val])?;

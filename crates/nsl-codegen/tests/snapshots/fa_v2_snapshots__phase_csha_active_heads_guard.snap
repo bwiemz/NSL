@@ -1,0 +1,12 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // CSHA A.4: active_heads guard
+    ld.param.u32 %r10, [csha_active_heads];
+    setp.eq.u32 %p0, %r10, 0;
+    @%p0 bra V2_CSHA_ACTIVE_HEADS_SKIP;
+    cvt.u32.u64 %r11, %head_idx;
+    setp.ge.u32 %p0, %r11, %r10;
+    @%p0 ret;
+V2_CSHA_ACTIVE_HEADS_SKIP:

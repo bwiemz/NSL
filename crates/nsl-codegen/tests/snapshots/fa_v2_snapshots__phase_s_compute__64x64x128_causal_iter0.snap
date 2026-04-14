@@ -1,0 +1,73 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // Phase 2: S = Q*K^T (q_tile_iter = 0)
+    mov.u32 %r1, 0;                           // k = 0
+    mov.u32 %r2, 64;                           // block_kv
+V2_LOOP_S_OVER_K_0:
+    cvt.u64.u32 %rd32, %r1;
+    mul.lo.u64 %rd32, %rd32, 128;              // k * head_dim
+    shl.b64 %rd32, %rd32, 1;                  // * 2 bytes f16
+    add.u64 %rd32, %rd32, 16384;                 // + kv_offset
+    add.u64 %rd32, %rd32, %shmem_base;
+    mov.f32 %f0, 0f00000000;                  // partial = 0
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f32, %f1, %f0;           // partial += Q*K
+    cvt.u64.u32 %rd33, %lane;
+    add.u64 %rd33, %rd33, 32;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f33, %f1, %f0;           // partial += Q*K
+    cvt.u64.u32 %rd33, %lane;
+    add.u64 %rd33, %rd33, 64;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f34, %f1, %f0;           // partial += Q*K
+    cvt.u64.u32 %rd33, %lane;
+    add.u64 %rd33, %rd33, 96;
+    shl.b64 %rd33, %rd33, 1;                  // * 2 bytes f16
+    add.u64 %rd33, %rd33, %rd32;              // + K row base
+    ld.shared.b16 %h0, [%rd33];
+    cvt.f32.f16 %f1, %h0;                     // K[k, d]
+    fma.rn.f32 %f0, %f35, %f1, %f0;           // partial += Q*K
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)
+    // causal: if k_global > q_row_global -> S = -inf
+    cvt.u64.u32 %rd34, %r1;                   // k
+    add.u64 %rd34, %rd34, %k_start;           // k_global
+    add.u32 %r3, %warp_id, 0;                // q_row_local
+    cvt.u64.u32 %rd35, %r3;
+    add.u64 %rd35, %q_start, %rd35;            // q_row_global
+    setp.gt.u64 %p0, %rd34, %rd35;
+    @%p0 mov.f32 %f0, 0fFF800000;             // -inf
+    setp.eq.u32 %p1, %lane, 0;
+    cvt.u64.u32 %rd36, %warp_id;
+    mul.lo.u64 %rd36, %rd36, 64;              // warp_id * block_kv
+    cvt.u64.u32 %rd37, %r1;
+    add.u64 %rd36, %rd36, %rd37;              // + k
+    shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
+    add.u64 %rd36, %rd36, 32768;                 // + sp_offset
+    add.u64 %smem_addr, %rd36, %shmem_base;
+    @%p1 st.shared.f32 [%smem_addr], %f0;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, %r2;
+    @%p0 bra V2_LOOP_S_OVER_K_0;
+    bar.sync 0;  // FENCE: all warps finished S writes
