@@ -9,7 +9,62 @@
 
 use std::collections::BTreeMap;
 
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{types as cl_types, InstBuilder, MemFlags, Value};
+use cranelift_frontend::FunctionBuilder;
+
 use crate::calibration::observation::ProjectionRef;
+
+/// Emit Cranelift IR that copies `nbytes` from `src_ptr` into
+/// `arena_ptr + offset`.  Emits a byte-at-a-time loop — correct for
+/// any size, though slower than a `memcpy` libcall for large copies.
+/// Task 11 may add a libcall fast path once the Module is available
+/// at the splice point.
+///
+/// Zero-byte copies are a no-op (emits nothing).
+pub fn emit_splice_memcpy(
+    fb: &mut FunctionBuilder,
+    arena_ptr: Value,
+    offset: u64,
+    src_ptr: Value,
+    nbytes: u64,
+) {
+    if nbytes == 0 {
+        return;
+    }
+    let off_val = fb.ins().iconst(cl_types::I64, offset as i64);
+    let dst = fb.ins().iadd(arena_ptr, off_val);
+
+    let header = fb.create_block();
+    let body = fb.create_block();
+    let tail = fb.create_block();
+    fb.append_block_param(header, cl_types::I64);
+
+    let zero = fb.ins().iconst(cl_types::I64, 0);
+    fb.ins().jump(header, &[zero.into()]);
+
+    // header: if i < nbytes goto body else goto tail
+    fb.switch_to_block(header);
+    let i = fb.block_params(header)[0];
+    let limit = fb.ins().iconst(cl_types::I64, nbytes as i64);
+    let cmp = fb.ins().icmp(IntCC::UnsignedLessThan, i, limit);
+    fb.ins().brif(cmp, body, &[], tail, &[]);
+
+    // body: *(dst + i) = *(src + i); i += 1; goto header
+    fb.switch_to_block(body);
+    fb.seal_block(body);
+    let src_i = fb.ins().iadd(src_ptr, i);
+    let dst_i = fb.ins().iadd(dst, i);
+    let b = fb.ins().load(cl_types::I8, MemFlags::new(), src_i, 0);
+    fb.ins().store(MemFlags::new(), b, dst_i, 0);
+    let one = fb.ins().iconst(cl_types::I64, 1);
+    let i2 = fb.ins().iadd(i, one);
+    fb.ins().jump(header, &[i2.into()]);
+
+    fb.seal_block(header);
+    fb.switch_to_block(tail);
+    fb.seal_block(tail);
+}
 
 /// Shape of the tensor feeding into a projection.  `[batch, seq,
 /// in_channels]` for the common transformer case.
@@ -153,5 +208,81 @@ mod tests {
         let names: Vec<String> = t.iter().map(|e| e.projection.0.clone()).collect();
         // BTreeMap sorts by key
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn splice_memcpy_ir_copies_bytes_from_src_to_arena_offset() {
+        use cranelift_codegen::ir::{
+            types as cl_types, AbiParam, Function, InstBuilder, Signature, UserFuncName,
+        };
+        use cranelift_codegen::isa::CallConv;
+        use cranelift_codegen::settings;
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let flags = settings::Flags::new(settings::builder());
+
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(cl_types::I64));
+        sig.params.push(AbiParam::new(cl_types::I64));
+
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut fb = FunctionBuilder::new(&mut func, &mut fb_ctx);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        let arena = fb.block_params(entry)[0];
+        let src = fb.block_params(entry)[1];
+
+        emit_splice_memcpy(&mut fb, arena, 128, src, 64);
+        fb.ins().return_(&[]);
+        fb.finalize();
+
+        cranelift_codegen::verifier::verify_function(&func, &flags)
+            .expect("IR should verify");
+
+        let ir = format!("{}", func.display());
+        assert!(
+            ir.contains("load") && ir.contains("store"),
+            "IR should load from src + store to arena: {ir}"
+        );
+        assert!(
+            ir.contains("128") || ir.contains("0x80"),
+            "IR should reference the arena offset: {ir}"
+        );
+    }
+
+    #[test]
+    fn splice_memcpy_zero_bytes_is_safe() {
+        use cranelift_codegen::ir::{
+            types as cl_types, AbiParam, Function, InstBuilder, Signature, UserFuncName,
+        };
+        use cranelift_codegen::isa::CallConv;
+        use cranelift_codegen::settings;
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let flags = settings::Flags::new(settings::builder());
+
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(cl_types::I64));
+        sig.params.push(AbiParam::new(cl_types::I64));
+
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut fb = FunctionBuilder::new(&mut func, &mut fb_ctx);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        let arena = fb.block_params(entry)[0];
+        let src = fb.block_params(entry)[1];
+
+        emit_splice_memcpy(&mut fb, arena, 0, src, 0);
+        fb.ins().return_(&[]);
+        fb.finalize();
+
+        cranelift_codegen::verifier::verify_function(&func, &flags)
+            .expect("zero-byte IR should verify");
     }
 }
