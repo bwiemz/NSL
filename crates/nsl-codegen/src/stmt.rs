@@ -3707,7 +3707,16 @@ impl Compiler<'_> {
                 // when no consumers are registered.  Real consumers
                 // (AWQ/WGGO Phase 2/FP8/GPTQ) land in follow-up plans.
                 if let Some(ref data_path) = self.compile_options.calibration_data {
-                    let registry = crate::calibration::registry::HookRegistry::new();
+                    let mut registry = crate::calibration::registry::HookRegistry::new();
+                    if let Some(awq_projections) = self.discover_awq_projections() {
+                        if !awq_projections.is_empty() {
+                            registry.register(Box::new(
+                                crate::calibration::awq_hook::AwqCalibrationHook::new(
+                                    awq_projections,
+                                ),
+                            ));
+                        }
+                    }
                     if registry.is_empty() {
                         eprintln!(
                             "warning: --calibration-data {} supplied but no calibration hooks registered (no consumers yet — this is a no-op in MVP)",
@@ -3736,16 +3745,15 @@ impl Compiler<'_> {
                             timeout_secs: self.compile_options.calibration_timeout_secs,
                             mode,
                         };
-                        match crate::calibration::run_harness_simulated(
-                            &registry,
-                            &cfg,
-                            crate::calibration::binary_codegen::real_subprocess_entry,
-                        ) {
-                            Ok(out) => eprintln!(
-                                "[calibration] {} ({} hooks)",
-                                out.outcome_repr,
-                                out.sidecar.hooks.len()
-                            ),
+                        match crate::calibration::run_harness_production(&registry, &cfg) {
+                            Ok(out) => {
+                                eprintln!(
+                                    "[calibration] {} ({} hooks)",
+                                    out.outcome_repr,
+                                    out.sidecar.hooks.len()
+                                );
+                                self.compile_options.calibration_sidecar = Some(out.sidecar);
+                            }
                             Err(e) => {
                                 return Err(crate::error::CodegenError::new(format!(
                                     "calibration failed: {e}"
@@ -6388,6 +6396,22 @@ impl Compiler<'_> {
         state.variables.insert(quant.name, (var, cl_types::I64));
 
         Ok(())
+    }
+
+    /// Walk the compiled model's `quant { ... }` blocks and produce the
+    /// list of ProjectionRefs that AWQ needs calibration data for.
+    /// Returns `None` when no AWQ quant block is present.
+    ///
+    /// MVP scope: projection enumeration is deferred — Task 13's AWQ
+    /// quant pass reads `compile_options.calibration_sidecar` when a
+    /// sidecar exists and builds its own projection set from the quant
+    /// AST directly.  Returning `None` here keeps the registry empty so
+    /// the harness logs the "no calibration hooks registered" notice
+    /// and proceeds as a no-op until downstream wiring lands.
+    fn discover_awq_projections(
+        &self,
+    ) -> Option<Vec<crate::calibration::ProjectionRef>> {
+        None
     }
 }
 
