@@ -28,9 +28,11 @@ use crate::fase::{FaseOptimizer, UpdateRecipe};
 pub enum Register {
     /// Parameter tensor θ.
     Theta,
-    /// First-moment accumulator buffer (FASE-Deferred: `m_partial`, the
-    /// deferred gradient sum; standard: the AdamW `m`).
+    /// First-moment state `m` for AdamW / Adam / SGD-momentum / Lion.
     M,
+    /// Deferred-mode accumulator: the running mean gradient
+    /// `m_partial = (1/N) Σ gᵢ` across the micro-batch window.
+    MPartial,
     /// Second-moment accumulator buffer (AdamW only).
     V,
     /// Per-micro-batch gradient, live only within one backward-step worth
@@ -355,5 +357,14 @@ mod tests {
         let prog = emit_final_step(&adamw_recipe());
         assert!(!prog.pseudocode.is_empty());
         assert!(prog.pseudocode.contains("θ"));
+    }
+
+    #[test]
+    fn m_partial_is_distinct_from_m() {
+        // Register::MPartial must exist as a separate variant so AdamW's
+        // final step can read m_old and m_partial simultaneously.
+        let m = Register::M;
+        let mp = Register::MPartial;
+        assert_ne!(m, mp);
     }
 }
