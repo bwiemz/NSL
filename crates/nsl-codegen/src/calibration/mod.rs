@@ -2,6 +2,7 @@
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
 pub mod awq_hook;
+pub mod discovery;
 pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
@@ -12,15 +13,21 @@ pub mod identity_hook;
 pub mod observation;
 pub mod registry;
 pub mod retention;
+pub mod retention_pass;
 pub mod sidecar;
 pub mod subprocess;
 
 pub use ctx::{BufferHandle, CalibCtx};
+pub use discovery::{
+    discover_awq_projections, discover_awq_projections_from_state, DiscoveredProjection,
+    DiscoveryError,
+};
 pub use hooks::{CalibrationHook, CalibrationResult};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
-pub use retention::{RetentionTable, TensorShape};
+pub use retention::{ArenaLayout, RetentionTable, TensorShape};
+pub use retention_pass::build_arena_layout;
 
 use std::collections::BTreeMap;
 
@@ -122,6 +129,9 @@ pub struct HarnessConfig {
     pub batch_size: u32,
     pub timeout_secs: u64,
     pub mode: HarnessMode,
+    /// Per-projection `(path, weight_shape)` used to extend the cache-key
+    /// digest.  Empty when no AWQ projections are present.
+    pub projections: Vec<crate::calibration::discovery::DiscoveredProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +176,7 @@ pub fn run_harness_simulated(
         hook_ids_sorted: registry.enabled_ids_sorted(),
         samples: cfg.samples,
         batch_size: cfg.batch_size,
+        projections: cfg.projections.clone(),
     };
     let cache_key_digest = cache_key.digest();
 
@@ -206,43 +217,15 @@ pub fn run_harness_simulated(
     }
 }
 
-/// Production calibration entry point.  Routes to the real subprocess
-/// when all registered hooks can be served by it (i.e., none require
-/// forward activations that the current MVP doesn't emit into
-/// calibration_main), otherwise falls back to the in-process stub.
-/// This makes scope-reduction transparent to callers — when a follow-
-/// up plan lands full model-forward emission, this routing will flip
-/// over to always-real without changing caller code.
+/// Production calibration entry point.  Routes all hooks — including
+/// those requiring `LinearInputActivations` (AWQ) — through the real
+/// subprocess entry.  The `needs_forward_pass` rejection that existed
+/// in Task 11's MVP is gone; `real_subprocess_entry` handles both paths.
 pub fn run_harness_production(
     registry: &HookRegistry,
     cfg: &HarnessConfig,
 ) -> Result<HarnessOutput, HarnessError> {
-    let any_forward = registry.iter().any(|h| h.requires().needs_forward_pass());
-
-    if any_forward {
-        eprintln!(
-            "[calibration] routing through in-process stub (full model-forward emission is a follow-up plan)"
-        );
-        let ckpt_path = cfg.checkpoints.first().ok_or_else(|| {
-            HarnessError::Infrastructure {
-                reason: "no checkpoint paths supplied".into(),
-            }
-        })?;
-        let ckpt_bytes = std::fs::read(ckpt_path).map_err(|e| HarnessError::Infrastructure {
-            reason: format!("reading checkpoint {}: {e}", ckpt_path.display()),
-        })?;
-        let data_bytes = std::fs::read(&cfg.calibration_data).map_err(|e| {
-            HarnessError::Infrastructure {
-                reason: format!(
-                    "reading calibration data {}: {e}",
-                    cfg.calibration_data.display()
-                ),
-            }
-        })?;
-        run_harness_stub(registry, &ckpt_bytes, &data_bytes, cfg.samples)
-    } else {
-        run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
-    }
+    run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
 }
 
 fn empty_sidecar_for_fallback(
@@ -283,6 +266,21 @@ fn hex_digest_ids(ids: &[String]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibration::identity_hook::IdentityHook;
+
+    #[test]
+    fn identity_hook_observe_batch_is_noop() {
+        let hook = IdentityHook::new(b"payload".to_vec());
+        let mut ctx = CalibCtx::stub_for_tests();
+        let arena = ArenaLayout::empty();
+        hook.emit_observe_batch(&mut ctx, &arena);
+        // If we reach here without panic, the no-op default worked.
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +358,7 @@ mod driver_tests {
             batch_size: 2,
             timeout_secs: 5,
             mode: HarnessMode::Required,
+            projections: vec![],
         };
 
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess)
@@ -398,6 +397,7 @@ mod driver_tests {
             batch_size: 1,
             timeout_secs: 1,
             mode: HarnessMode::Required,
+            projections: vec![],
         };
         match run_harness_simulated(&registry, &cfg, simulated_infra_error) {
             Err(HarnessError::Infrastructure { reason }) => {
@@ -424,6 +424,7 @@ mod driver_tests {
             batch_size: 1,
             timeout_secs: 1,
             mode: HarnessMode::BestEffort,
+            projections: vec![],
         };
         let r = run_harness_simulated(&registry, &cfg, simulated_infra_error)
             .expect("best-effort should not error");
@@ -451,6 +452,7 @@ mod driver_tests {
             batch_size: 1,
             timeout_secs: 1,
             mode: HarnessMode::BestEffort,
+            projections: vec![],
         };
         let err = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap_err();
         match err {
@@ -480,6 +482,7 @@ mod driver_tests {
             batch_size: 2,
             timeout_secs: 5,
             mode: HarnessMode::Required,
+            projections: vec![],
         };
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
         assert_eq!(r1.outcome_repr, "clean");

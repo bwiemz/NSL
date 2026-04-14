@@ -57,6 +57,7 @@ fn e2e_single_hook_round_trip() {
         batch_size: 1,
         timeout_secs: 5,
         mode: HarnessMode::Required,
+        projections: vec![],
     };
 
     let first = run_harness_simulated(&registry, &cfg, identity_seam).expect("first run");
@@ -129,6 +130,7 @@ fn e2e_multi_hook_sidecar_isolation() {
         batch_size: 1,
         timeout_secs: 5,
         mode: HarnessMode::Required,
+        projections: vec![],
     };
 
     let out = run_harness_simulated(&registry, &cfg, identity_seam).unwrap();

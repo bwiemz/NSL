@@ -1044,6 +1044,11 @@ fn main_inner() {
                 calibration_batch_size,
                 calibration_timeout_secs: calibration_timeout,
                 calibration_sidecar: None,
+                calibration_retention: None,
+                // Task 6: peek_batch_seq is called inside the compiler when
+                // calibration_data is set; the CLI passes None here and the
+                // compiler resolves the real (batch, seq) from the data header.
+                calibration_batch_seq: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1320,6 +1325,8 @@ fn main_inner() {
                 calibration_batch_size: 8,
                 calibration_timeout_secs: 600,
                 calibration_sidecar: None,
+                calibration_retention: None,
+                calibration_batch_seq: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

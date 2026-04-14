@@ -66,6 +66,22 @@ pub fn emit_splice_memcpy(
     fb.seal_block(tail);
 }
 
+/// Flat memory layout of the per-projection scratch-buffer arena baked
+/// into the calibration binary.  Built once during codegen; handed to
+/// `emit_observe_batch` so hooks know where each projection's activations
+/// land at calibration runtime.
+#[derive(Debug, Default, Clone)]
+pub struct ArenaLayout {
+    pub entries: Vec<(ProjectionRef, u32 /* byte offset */, u32 /* nbytes */)>,
+}
+
+impl ArenaLayout {
+    pub fn empty() -> Self { Self::default() }
+    pub fn total_bytes(&self) -> u32 {
+        self.entries.last().map(|(_, off, n)| off + n).unwrap_or(0)
+    }
+}
+
 /// Shape of the tensor feeding into a projection.  `[batch, seq,
 /// in_channels]` for the common transformer case.
 #[derive(Debug, Clone, PartialEq, Eq)]
