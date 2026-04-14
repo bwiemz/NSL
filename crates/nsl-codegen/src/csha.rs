@@ -86,6 +86,11 @@ pub struct CshaInput<'a> {
     /// Number of attention heads.  Used for per-head specialization.
     pub n_heads: u32,
     pub spec_cfg: SpecConfig,
+    /// Per-layer WGGO preferences. `None` → CSHA's internal planner runs
+    /// unchanged. `Some` → per-layer `active_heads` is applied verbatim;
+    /// `requested_csha_level` is a preference subject to SMEM-feasibility
+    /// downgrade at per-layer emission time (Task 4).
+    pub wggo_overrides: Option<&'a crate::wggo_overrides::WggoOverrides>,
 }
 
 /// Records a WGGO override that CSHA had to downgrade because it violated
@@ -342,6 +347,7 @@ pub fn run_on_wengert(
     weights: Option<&WeightMap>,
     shape: Option<LayerShape>,
     n_heads: u32,
+    wggo_overrides: Option<&crate::wggo_overrides::WggoOverrides>,
 ) -> Option<CshaPlan> {
     let mode = CshaMode::parse(mode_str)?;
     let shape = shape.unwrap_or(LayerShape {
@@ -360,6 +366,7 @@ pub fn run_on_wengert(
         shape,
         n_heads: n_heads.max(1),
         spec_cfg: SpecConfig::default(),
+        wggo_overrides,
     }))
 }
 
@@ -421,6 +428,7 @@ mod tests {
             },
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
+            wggo_overrides: None,
         }
     }
 
@@ -508,18 +516,18 @@ mod tests {
         let w = attn_block();
         for mode in ["auto", "boundary", "pipeline", "block", "off", "L2", "3"] {
             assert!(
-                run_on_wengert(&w, "H100", mode, None, None, 8).is_some(),
+                run_on_wengert(&w, "H100", mode, None, None, 8, None).is_some(),
                 "'{}' should parse",
                 mode
             );
         }
-        assert!(run_on_wengert(&w, "H100", "wat", None, None, 8).is_none());
+        assert!(run_on_wengert(&w, "H100", "wat", None, None, 8, None).is_none());
     }
 
     #[test]
     fn unknown_target_falls_back_to_default_gpu() {
         let w = attn_block();
-        let plan = run_on_wengert(&w, "nonexistent-gpu-xyz", "auto", None, None, 8).unwrap();
+        let plan = run_on_wengert(&w, "nonexistent-gpu-xyz", "auto", None, None, 8, None).unwrap();
         assert!(!plan.target_gpu.is_empty());
     }
 
@@ -561,5 +569,22 @@ mod tests {
         assert_eq!(plan.boundary.num_chains(), 0);
         assert!(plan.per_layer.is_empty());
         assert!(plan.render_report().contains("nothing to do"));
+    }
+
+    #[test]
+    fn run_on_wengert_accepts_wggo_overrides_argument() {
+        // Smoke-test: the new signature accepts Option<&WggoOverrides> without
+        // error. Uses the existing attn_block() Wengert helper.
+        let w = attn_block();
+        let overrides = crate::wggo_overrides::WggoOverrides { per_layer: vec![] };
+
+        // Both calls must compile and produce a plan (or None — we don't care,
+        // we care the signature accepts both None and Some(...)):
+        let _none = run_on_wengert(&w, "A100", "full", None, None, 8, None);
+        let _some = run_on_wengert(&w, "A100", "full", None, None, 8, Some(&overrides));
+
+        // Verify both arms return Some (the mode "full" maps to Auto which is valid).
+        assert!(_none.is_some(), "None arm should produce a plan");
+        assert!(_some.is_some(), "Some arm should produce a plan");
     }
 }

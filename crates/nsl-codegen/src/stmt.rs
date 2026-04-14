@@ -3688,6 +3688,7 @@ impl Compiler<'_> {
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
                             None, // shape override — defaults are fine for diagnostic
                             8,    // default head count; weight-informed path refines this
+                            None, // wggo_overrides — wired in Task 4
                         ) {
                             if self.compile_options.csha_report {
                                 eprintln!("{}", plan.render_report());
