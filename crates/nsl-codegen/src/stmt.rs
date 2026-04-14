@@ -3716,17 +3716,10 @@ impl Compiler<'_> {
                         if let Some(f) = self.compile_options.wggo_prune_fraction {
                             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
                         }
-                        // Honour `--wggo-importance=none` by clearing the
-                        // weights path — the analyzer then runs against
-                        // NullWeightProvider and produces uniform scores.
-                        let weights_path = match self
-                            .compile_options
-                            .wggo_importance
-                            .as_deref()
-                        {
-                            Some("none") => None,
-                            _ => self.compile_options.wggo_weights.as_deref(),
-                        };
+                        // Pass the weights path for magnitude-based scoring
+                        // (NullWeightProvider is used in run_on_wengert_with_weights
+                        // when weights_path is None, producing uniform scores).
+                        let weights_path = self.compile_options.wggo_weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
                             &self.compile_options.target,

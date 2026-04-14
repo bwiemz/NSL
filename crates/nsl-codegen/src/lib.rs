@@ -358,6 +358,20 @@ pub enum AdapterKind {
     GatedLora,
 }
 
+/// User-facing knob that gates how WGGO scores head importance.
+/// - `Auto`: use gradient scoring when a calibration sidecar is present
+///   (with per-layer magnitude fallback); otherwise pure magnitude.
+/// - `Magnitude`: force pure magnitude scoring even if calibration is available.
+/// - `Grad`: require gradient scoring; error if no calibration sidecar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WggoImportance {
+    #[default]
+    Auto,
+    Magnitude,
+    Grad,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -459,8 +473,8 @@ pub struct CompileOptions {
     pub inspect_enabled: bool,
     /// WGGO Stage 3: path to a `.nslweights` sidecar file.
     pub wggo_weights: Option<std::path::PathBuf>,
-    /// WGGO Stage 3: scoring mode ("none", "magnitude").
-    pub wggo_importance: Option<String>,
+    /// WGGO Stage 3: scoring mode (Auto/Magnitude/Grad).
+    pub wggo_importance: WggoImportance,
     /// WGGO Stage 3: default fraction of heads allowed to be pruned.
     pub wggo_prune_fraction: Option<f64>,
     /// CSHA: fusion mode.
@@ -533,7 +547,7 @@ impl Default for CompileOptions {
             health_flush_interval: None,
             inspect_enabled: false,
             wggo_weights: None,
-            wggo_importance: None,
+            wggo_importance: WggoImportance::Auto,
             wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,

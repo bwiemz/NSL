@@ -110,12 +110,58 @@ impl GradientScorer for CalibratedGradientScorer {
 }
 
 // ---------------------------------------------------------------------------
+// build_scorer dispatcher
+// ---------------------------------------------------------------------------
+
+/// Constructs the appropriate `GradientScorer` given compile options and a
+/// weight provider for the magnitude fallback path.
+///
+/// Selection logic:
+/// - `Magnitude` (any calibration state) → `NullGradientScorer`
+///   (pure magnitude via `run_on_wengert_with_weights` caller path)
+/// - `Grad` + no calibration_sidecar → `CodegenError`
+/// - `Grad`/`Auto` + calibration_sidecar present → `CalibratedGradientScorer`
+///   wrapping `MagnitudeFallbackScorer`
+/// - `Auto` + no calibration_sidecar → `NullGradientScorer`
+pub fn build_scorer(
+    opts: &crate::CompileOptions,
+    weight_provider: Arc<dyn WeightProvider + Send + Sync>,
+) -> Result<Box<dyn GradientScorer>, crate::CodegenError> {
+    use crate::WggoImportance;
+    match (opts.wggo_importance, opts.calibration_sidecar.as_ref()) {
+        (WggoImportance::Magnitude, _) => Ok(Box::new(NullGradientScorer)),
+        (WggoImportance::Grad, None) => Err(crate::CodegenError::new(
+            "--wggo-importance=grad requires --calibration-data",
+        )),
+        (WggoImportance::Grad, Some(sc)) | (WggoImportance::Auto, Some(sc)) => {
+            let scores: BTreeMap<String, Vec<f32>> = sc
+                .wggo_head_gradients
+                .as_ref()
+                .map(|g| {
+                    g.by_layer
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.per_head_score.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Box::new(CalibratedGradientScorer::new(
+                scores,
+                MagnitudeFallbackScorer::new(weight_provider),
+            )))
+        }
+        (WggoImportance::Auto, None) => Ok(Box::new(NullGradientScorer)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibration::sidecar::{PerLayerGradient, Sidecar, WggoHeadGradients};
+    use crate::{CompileOptions, WggoImportance};
     use crate::wggo_weight_analysis::NullWeightProvider;
 
     fn fixture_shape() -> LayerShape {
@@ -196,5 +242,97 @@ mod tests {
         assert!(results[0].is_none());  // Null
         assert!(results[1].is_some());  // Magnitude
         assert!(results[2].is_some());  // Calibrated (empty sidecar → fallback)
+    }
+
+    // -----------------------------------------------------------------------
+    // build_scorer tests
+    // -----------------------------------------------------------------------
+
+    fn sidecar_with_grads() -> Sidecar {
+        let mut by_layer = BTreeMap::new();
+        by_layer.insert(
+            "x".to_string(),
+            PerLayerGradient {
+                per_head_score: vec![1.0],
+                batches_observed: 1,
+            },
+        );
+        Sidecar {
+            version: crate::calibration::sidecar::SIDECAR_VERSION,
+            checkpoint_sha256: String::new(),
+            calibration_data_sha256: String::new(),
+            hook_set_sha256: String::new(),
+            cache_key_digest: String::new(),
+            num_samples_used: 1,
+            hooks: BTreeMap::new(),
+            wggo_head_gradients: Some(WggoHeadGradients { by_layer }),
+        }
+    }
+
+    fn opts(importance: WggoImportance, sidecar: Option<Sidecar>) -> CompileOptions {
+        let mut o = CompileOptions::default();
+        o.wggo_importance = importance;
+        o.calibration_sidecar = sidecar;
+        o
+    }
+
+    #[test]
+    fn build_auto_no_calibration_yields_null() {
+        let s = build_scorer(
+            &opts(WggoImportance::Auto, None),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap();
+        assert!(s.score_layer("k", &fixture_shape()).is_none());
+    }
+
+    #[test]
+    fn build_magnitude_override_yields_null_even_with_sidecar() {
+        let s = build_scorer(
+            &opts(WggoImportance::Magnitude, Some(sidecar_with_grads())),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap();
+        assert!(s.score_layer("k", &fixture_shape()).is_none());
+    }
+
+    #[test]
+    fn build_grad_without_calibration_errors() {
+        let err = build_scorer(
+            &opts(WggoImportance::Grad, None),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("requires --calibration-data"),
+            "expected --calibration-data error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_auto_with_sidecar_yields_calibrated() {
+        let s = build_scorer(
+            &opts(WggoImportance::Auto, Some(sidecar_with_grads())),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap();
+        // Calibrated scorer: "x" resolves from sidecar, others fall back to magnitude.
+        let hit = s.score_layer("x", &fixture_shape()).unwrap();
+        assert_eq!(hit.per_head, vec![1.0]);
+        // Missing key falls back to magnitude — uniform with null provider.
+        let miss = s.score_layer("y", &fixture_shape()).unwrap();
+        assert!(miss.per_head.iter().all(|&v| (v - miss.per_head[0]).abs() < 1e-6));
+    }
+
+    #[test]
+    fn build_grad_with_sidecar_yields_calibrated() {
+        let s = build_scorer(
+            &opts(WggoImportance::Grad, Some(sidecar_with_grads())),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap();
+        let hit = s.score_layer("x", &fixture_shape()).unwrap();
+        assert_eq!(hit.per_head, vec![1.0]);
     }
 }
