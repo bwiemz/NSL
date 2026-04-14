@@ -3,7 +3,7 @@
 //! snapshot. Use `cargo insta review` to accept snapshot changes.
 
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax};
+use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax, pv_accum};
 
 fn csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
@@ -93,4 +93,34 @@ fn phase_softmax__64x64x128_snapshot() {
     let mut ptx = String::new();
     softmax::emit(&mut ptx, &non_csha_canonical());
     insta::assert_snapshot!("phase_softmax__64x64x128", ptx);
+}
+
+#[test]
+fn phase_pv_accum__32x32x32_snapshot() {
+    let mut ptx = String::new();
+    pv_accum::emit(&mut ptx, &csha_canonical(), 0);
+    insta::assert_snapshot!("phase_pv_accum__32x32x32_iter0", ptx);
+}
+
+#[test]
+fn phase_pv_accum__64x64x128_snapshot() {
+    let mut ptx = String::new();
+    pv_accum::emit(&mut ptx, &non_csha_canonical(), 0);
+    insta::assert_snapshot!("phase_pv_accum__64x64x128_iter0", ptx);
+}
+
+/// Regression test: the k-loop label must be parameterised on
+/// `q_tile_iter` so the orchestrator can call emit() multiple times
+/// without producing duplicate labels ptxas would reject.
+/// (Same pattern as phase_s_compute__label_uniqueness_across_iters.)
+#[test]
+fn phase_pv_accum__label_uniqueness_across_iters() {
+    let mut ptx0 = String::new();
+    let mut ptx1 = String::new();
+    pv_accum::emit(&mut ptx0, &csha_canonical(), 0);
+    pv_accum::emit(&mut ptx1, &csha_canonical(), 1);
+    assert!(ptx0.contains("V2_LOOP_PV_OVER_K_0:"), "iter 0 label missing");
+    assert!(ptx1.contains("V2_LOOP_PV_OVER_K_1:"), "iter 1 label missing");
+    assert!(!ptx0.contains("V2_LOOP_PV_OVER_K_1"), "iter 0 leaks iter 1 label");
+    assert!(!ptx1.contains("V2_LOOP_PV_OVER_K_0"), "iter 1 leaks iter 0 label");
 }
