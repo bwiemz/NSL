@@ -29,3 +29,4 @@ tempfile = "3"
 default = []
 cuda = ["dep:cudarc"]
 interop = ["dep:safetensors", "dep:hf-hub", "dep:prost", "dep:half", "dep:regex-lite"]
+test-hooks = []
