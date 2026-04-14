@@ -219,3 +219,30 @@ fn phase_csha_hooks__label_uniqueness_across_iters() {
     assert!(epi1.contains("V2_CSHA_EPILOGUE_SKIP_1"), "epilogue iter 1 label missing");
     assert!(!epi0.contains("V2_CSHA_EPILOGUE_SKIP_1"), "epilogue iter 0 leaks iter 1");
 }
+
+// ---------------------------------------------------------------------------
+// Full-kernel orchestrator snapshot tests (Task 11)
+// ---------------------------------------------------------------------------
+
+use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+
+#[test]
+fn kernel_full__32x32x32_nocsha() {
+    let ptx = synthesize_flash_attention_ptx_v2(&csha_canonical());
+    let s = String::from_utf8(ptx).expect("PTX must be valid UTF-8");
+    insta::assert_snapshot!("kernel_full__32x32x32_nocsha", s);
+}
+
+#[test]
+fn kernel_full__64x64x128_nocsha() {
+    let ptx = synthesize_flash_attention_ptx_v2(&non_csha_canonical());
+    let s = String::from_utf8(ptx).expect("PTX must be valid UTF-8");
+    insta::assert_snapshot!("kernel_full__64x64x128_nocsha", s);
+}
+
+#[test]
+fn kernel_full__32x32x32_csha_l2_rope() {
+    let ptx = synthesize_flash_attention_ptx_v2(&csha_l2_rope_config());
+    let s = String::from_utf8(ptx).expect("PTX must be valid UTF-8");
+    insta::assert_snapshot!("kernel_full__32x32x32_csha_l2_rope", s);
+}
