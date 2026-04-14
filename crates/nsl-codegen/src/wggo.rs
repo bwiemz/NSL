@@ -479,6 +479,11 @@ pub fn run_on_wengert(
 ///
 /// When `weights_path` fails to load, emits a warning on stderr and
 /// falls back to uniform scores rather than failing the compile.
+///
+/// When `compile_options` is `Some`, [`build_scorer`] is invoked to
+/// construct the appropriate [`GradientScorer`] and wire it into
+/// `WggoInput`.  Passing `None` preserves the Phase 1 magnitude-only
+/// path (used in tests that don't need gradient scoring).
 pub fn run_on_wengert_with_weights(
     wengert: &WengertList,
     target: &str,
@@ -486,7 +491,11 @@ pub fn run_on_wengert_with_weights(
     world_size: usize,
     weights_path: Option<&std::path::Path>,
     analysis_config: AnalysisConfig,
+    compile_options: Option<&crate::CompileOptions>,
 ) -> Option<WggoPlan> {
+    use crate::wggo_gradient_scorer::build_scorer;
+    use std::sync::Arc;
+
     let mode = WggoMode::parse(mode_str)?;
     let cluster = ClusterSpec {
         num_gpus: world_size.max(1) as u32,
@@ -521,6 +530,27 @@ pub fn run_on_wengert_with_weights(
         .as_ref()
         .map(|ck| ck as &dyn WeightProvider);
 
+    // Build the gradient scorer when compile options are present.
+    // `build_scorer` selects Null/Magnitude/Calibrated based on
+    // `wggo_importance` and `calibration_sidecar`.  A `Grad` mode
+    // without a sidecar is a hard error propagated as `None` (the
+    // compile pipeline will have already caught this via its own
+    // validation, but we guard here too).
+    let scorer: Option<Box<dyn crate::wggo_gradient_scorer::GradientScorer>> =
+        if let Some(opts) = compile_options {
+            let provider: Arc<dyn WeightProvider + Send + Sync> =
+                Arc::new(NullWeightProvider);
+            match build_scorer(opts, provider) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("[wggo] error: {e:?}");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
     let input = WggoInput {
         mode,
         target,
@@ -539,7 +569,7 @@ pub fn run_on_wengert_with_weights(
         ilp_constraints: Vec::new(),
         weights: weights_ref,
         analysis_config,
-        scorer: None,
+        scorer,
     };
     let mut plan = run(input);
 
@@ -763,6 +793,7 @@ mod tests {
             1,
             Some(std::path::Path::new("/nonexistent/path.nslweights")),
             crate::wggo_weight_analysis::AnalysisConfig::default(),
+            None,
         )
         .expect("plan");
         // Every layer should be counted as without_weights since the
@@ -916,6 +947,171 @@ mod tests {
         assert!(
             p.iter().all(|&v| (v - p[0]).abs() < 1e-6),
             "magnitude path with null provider must yield uniform scores; got {p:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8: fallback-dominance regression guards
+    //
+    // These tests prove that gradient scores, when present, actually change
+    // ILP/scoring behaviour compared to pure magnitude.  If Phase 2 ever
+    // regresses to magnitude-only, the assertions will catch it because
+    // NullWeightProvider produces uniform scores and the dominance check
+    // would fail.
+    // -----------------------------------------------------------------------
+
+    /// When a `CalibratedGradientScorer` with a strongly skewed sidecar is
+    /// wired in, the highest-ranked head must dominate (>10x) the lowest-ranked
+    /// head in `weight_analysis.per_layer[*].head_scores`.  Regression to
+    /// magnitude-only would yield uniform scores (NullWeightProvider) and the
+    /// assertion would fail.
+    #[test]
+    fn calibrated_gradient_scores_dominate_magnitude_when_sidecar_present() {
+        use crate::wggo_gradient_scorer::{
+            CalibratedGradientScorer, GradientScorer, MagnitudeFallbackScorer,
+        };
+        use crate::wggo_weight_analysis::NullWeightProvider;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        // Sidecar: "blocks.0" head 0 score=100, heads 1-7 score=1.
+        // With NullWeightProvider the magnitude path would yield uniform [x; 8].
+        let mut scores = BTreeMap::new();
+        scores.insert(
+            "blocks.0".to_string(),
+            vec![100.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        );
+        scores.insert(
+            "blocks.1".to_string(),
+            vec![100.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        );
+        let scorer: Box<dyn GradientScorer> = Box::new(CalibratedGradientScorer::new(
+            scores,
+            MagnitudeFallbackScorer::new(
+                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>,
+            ),
+        ));
+
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.scorer = Some(scorer);
+        let plan = run(inp);
+
+        // Locate blocks.0 by name (graph builder may prepend an "other" layer).
+        let blocks0_idx = plan
+            .weight_analysis
+            .per_layer
+            .iter()
+            .enumerate()
+            .zip(plan.graph.layers.iter())
+            .find(|((_, _), gl)| gl.name == "blocks.0")
+            .map(|((i, _), _)| i)
+            .expect("blocks.0 must be present in the weight_analysis report");
+
+        let per_head = &plan.weight_analysis.per_layer[blocks0_idx].head_scores;
+        // Gradient signal must dominate — head 0 must be at least 10x head 1.
+        assert!(
+            per_head[0] > per_head[1] * 10.0,
+            "gradient signal should dominate magnitude fallback; got {per_head:?}"
+        );
+        // If Phase 2 regresses to magnitude-only, per_head would be uniform
+        // (null provider → all equal), and the assertion above would fail.
+    }
+
+    /// When `scorer = NullGradientScorer` (no gradient signal), the run must
+    /// produce uniform head scores — proving Phase 1 is preserved.  This is
+    /// the symmetric guard: if Phase 2 accidentally always overrides to a
+    /// non-null scorer, this would fail.
+    #[test]
+    fn phase1_preserved_when_no_sidecar() {
+        use crate::wggo_gradient_scorer::{GradientScorer, NullGradientScorer};
+
+        let scorer: Box<dyn GradientScorer> = Box::new(NullGradientScorer);
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.scorer = Some(scorer);
+        let plan = run(inp);
+
+        assert!(!plan.weight_analysis.per_layer.is_empty());
+        // NullGradientScorer → run_weight_analysis falls back to magnitude for
+        // every layer → NullWeightProvider → uniform scores.
+        for entry in &plan.weight_analysis.per_layer {
+            let per_head = &entry.head_scores;
+            if !per_head.is_empty() {
+                assert!(
+                    per_head.iter().all(|&v| (v - per_head[0]).abs() < 1e-6),
+                    "Phase 1 path must yield uniform scores with null provider; got {per_head:?}"
+                );
+            }
+        }
+    }
+
+    /// Verify `run_on_wengert_with_weights` wires the scorer when
+    /// `compile_options` carrying a `calibration_sidecar` is passed.
+    /// Checks that the `importance_source=gradient (calibrated)` log path
+    /// fires by inspecting the plan's weight_analysis scores — the gradient
+    /// signal must be non-uniform for the layer named in the sidecar.
+    #[test]
+    fn run_on_wengert_with_weights_wires_scorer_from_compile_options() {
+        use crate::calibration::sidecar::{PerLayerGradient, Sidecar, WggoHeadGradients};
+        use crate::{CompileOptions, WggoImportance};
+        use std::collections::BTreeMap;
+
+        // Construct a sidecar with a strongly-skewed gradient signal for
+        // blocks.0 and blocks.1 (the two layers in two_block_wengert).
+        let mut by_layer = BTreeMap::new();
+        for name in ["blocks.0", "blocks.1"] {
+            by_layer.insert(
+                name.to_string(),
+                PerLayerGradient {
+                    per_head_score: vec![100.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                    batches_observed: 4,
+                },
+            );
+        }
+        let sidecar = Sidecar {
+            version: crate::calibration::sidecar::SIDECAR_VERSION,
+            checkpoint_sha256: String::new(),
+            calibration_data_sha256: String::new(),
+            hook_set_sha256: String::new(),
+            cache_key_digest: String::new(),
+            num_samples_used: 4,
+            hooks: BTreeMap::new(),
+            wggo_head_gradients: Some(WggoHeadGradients { by_layer }),
+        };
+
+        let mut opts = CompileOptions::default();
+        opts.wggo_importance = WggoImportance::Auto;
+        opts.calibration_sidecar = Some(sidecar);
+
+        let w = two_block_wengert();
+        let plan = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            None, // no weight file needed; scorer uses sidecar
+            crate::wggo_weight_analysis::AnalysisConfig::default(),
+            Some(&opts),
+        )
+        .expect("plan");
+
+        // The calibrated scorer should have replaced magnitude scores for
+        // blocks.0 — head 0 (100.0) must dominate head 1 (1.0).
+        let blocks0_idx = plan
+            .weight_analysis
+            .per_layer
+            .iter()
+            .enumerate()
+            .zip(plan.graph.layers.iter())
+            .find(|((_, _), gl)| gl.name == "blocks.0")
+            .map(|((i, _), _)| i)
+            .expect("blocks.0 must be present");
+
+        let per_head = &plan.weight_analysis.per_layer[blocks0_idx].head_scores;
+        assert!(
+            per_head[0] > per_head[1] * 10.0,
+            "build_scorer wiring via compile_options must produce dominant gradient scores; got {per_head:?}"
         );
     }
 

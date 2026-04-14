@@ -3719,6 +3719,8 @@ impl Compiler<'_> {
                         // Pass the weights path for magnitude-based scoring
                         // (NullWeightProvider is used in run_on_wengert_with_weights
                         // when weights_path is None, producing uniform scores).
+                        // compile_options is forwarded so build_scorer can wire the
+                        // GradientScorer appropriate for --wggo-importance + --calibration-data.
                         let weights_path = self.compile_options.wggo_weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
@@ -3727,6 +3729,7 @@ impl Compiler<'_> {
                             self.compile_options.world_size,
                             weights_path,
                             analysis_config,
+                            Some(&self.compile_options),
                         );
                         if let Some(plan) = plan {
                             if self.compile_options.wggo_report {
