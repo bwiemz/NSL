@@ -940,6 +940,7 @@ fn main_inner() {
                 calibration_samples,
                 calibration_batch_size,
                 calibration_timeout_secs: calibration_timeout,
+                calibration_sidecar: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1122,6 +1123,7 @@ fn main_inner() {
                 calibration_samples: 512,
                 calibration_batch_size: 8,
                 calibration_timeout_secs: 600,
+                calibration_sidecar: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
