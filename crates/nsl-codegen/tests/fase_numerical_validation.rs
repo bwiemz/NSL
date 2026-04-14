@@ -12,6 +12,10 @@ use common::nslm_reader::read_nslm;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+fn fixture(name: &str) -> PathBuf {
+    fixture_path(name)
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests/fixtures");
@@ -165,6 +169,133 @@ fn sgd_exact_equivalence() {
         assert!(
             diff / scale < 1e-5,
             "SGD θ[{}] diverged: compiled={} reference={} rel_err={}",
+            i,
+            w_compiled[i],
+            w_ref[i],
+            diff / scale
+        );
+    }
+}
+
+/// Rust reference for FASE-Deferred AdamW with W windows, N=4 micro-batches
+/// each, constant inputs across every micro-batch.
+///
+/// Matches the `emit_adamw` recipe in `fase_optimizer.rs` exactly — note that
+/// NSL's FASE AdamW does NOT apply Adam's standard bias-correction divisors
+/// (1 - β^t).  The update rule is:
+///
+///   m_partial = mean(g_1..g_N) = g (constant inputs → constant g per window)
+///   m  = β₁·m + (1-β₁)·m_partial
+///   v  = β₂·v + (1-β₂)·m_partial²   (FASE approximation, no correction)
+///   denom = sqrt(v) + ε
+///   tmp = m / denom
+///   θ -= lr · (tmp + wd·θ)
+fn adamw_fase_deferred_reference(
+    w_init: &[f32; 2],
+    x: &[[f32; 2]; 4],
+    y: &[[f32; 1]; 4],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    wd: f32,
+    windows: u32,
+) -> [f32; 2] {
+    let mut w = *w_init;
+    let mut m_state = [0.0_f32; 2];
+    let mut v_state = [0.0_f32; 2];
+
+    for _step in 0..windows {
+        // Gradient with current w (constant across all 4 micro-batches in this
+        // window, so m_partial = g).
+        let mut pred = [0.0_f32; 4];
+        for i in 0..4 {
+            pred[i] = x[i][0] * w[0] + x[i][1] * w[1];
+        }
+        let mut r = [0.0_f32; 4];
+        for i in 0..4 {
+            r[i] = pred[i] - y[i][0];
+        }
+        let n = 4.0_f32;
+        let mut g = [0.0_f32; 2];
+        for j in 0..2 {
+            for i in 0..4 {
+                g[j] += x[i][j] * r[i];
+            }
+            g[j] *= 2.0 / n;
+        }
+
+        let m_partial = g;
+
+        for j in 0..2 {
+            // m = β₁·m + (1-β₁)·m_partial
+            m_state[j] = beta1 * m_state[j] + (1.0 - beta1) * m_partial[j];
+            // v = β₂·v + (1-β₂)·m_partial²  (no bias correction)
+            v_state[j] =
+                beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
+            // denom = sqrt(v) + eps
+            let denom = v_state[j].sqrt() + eps;
+            // tmp = m / denom
+            let tmp = m_state[j] / denom;
+            // θ -= lr * (tmp + wd·θ)
+            w[j] -= lr * (tmp + wd * w[j]);
+        }
+    }
+    w
+}
+
+#[test]
+fn adamw_fase_deferred_pipeline_equivalence() {
+    let tmp = TempDir::new().expect("tempdir");
+    nsl_run(
+        &fixture("fase_deferred_adamw_equivalence.nsl"),
+        tmp.path(),
+    );
+
+    let checkpoint = tmp.path().join("adamw_out.nslm");
+    assert!(
+        checkpoint.exists(),
+        "expected checkpoint at {:?}",
+        checkpoint
+    );
+    let tensors = read_nslm(&checkpoint).expect("read nslm");
+
+    let w_compiled = tensors
+        .get("w")
+        .or_else(|| tensors.get("m.w"))
+        .expect(&format!(
+            "w tensor not in checkpoint; available: {:?}",
+            tensors.keys().collect::<Vec<_>>()
+        ));
+    assert_eq!(w_compiled.len(), 2);
+
+    // Match fixture init: ones([2,1]) → [1.0, 1.0]
+    let w_init = [1.0_f32, 1.0_f32];
+    // Match fixture data: ones([4,2]) and zeros([4,1]).
+    let x = [[1.0, 1.0]; 4];
+    let y = [[0.0]; 4];
+    let w_ref = adamw_fase_deferred_reference(
+        &w_init,
+        &x,
+        &y,
+        /*lr=*/ 0.001,
+        /*beta1=*/ 0.9,
+        /*beta2=*/ 0.999,
+        /*eps=*/ 1e-8,
+        /*wd=*/ 0.01,
+        /*windows=*/ 3,
+    );
+
+    println!("AdamW FASE-Deferred equivalence check:");
+    println!("  compiled w[0]={} w[1]={}", w_compiled[0], w_compiled[1]);
+    println!("  reference w[0]={} w[1]={}", w_ref[0], w_ref[1]);
+
+    for i in 0..2 {
+        let diff = (w_compiled[i] - w_ref[i]).abs();
+        let scale = w_ref[i].abs().max(1.0);
+        assert!(
+            diff / scale < 1e-5,
+            "AdamW θ[{}] diverged: compiled={} reference={} rel_err={}",
             i,
             w_compiled[i],
             w_ref[i],

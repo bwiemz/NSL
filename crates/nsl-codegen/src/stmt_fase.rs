@@ -220,9 +220,15 @@ impl Compiler<'_> {
                 }
 
                 // ── SqrtPlusEps: dst = sqrt(src) + eps ─────────────────────
-                // sqrt returns a new owned tensor; add_scalar with relinquish_a
-                // may mutate in-place (FBIP) or return a fresh owned tensor —
-                // either way the result is owned.
+                // IMPORTANT: nsl_tensor_sqrt uses FBIP (mutates in-place when
+                // refcount==1).  Persistent state registers (V, M, MPartial,
+                // Theta) have refcount=1 when fetched via nsl_list_get, so a
+                // direct call would corrupt the stored optimizer state.  We
+                // therefore make an explicit copy of the source tensor first
+                // (add_scalar with +0 and flags=0 forces allocation of a fresh
+                // owned tensor), then call sqrt on that copy.  The copy is
+                // transient (owned by this scope) and is freed after the Div step
+                // when tmp_val is replaced.
                 UpdateOp::SqrtPlusEps { dst, src, eps } => {
                     let src_ptr = if *src == Register::Tmp {
                         tmp_val.ok_or_else(|| crate::error::CodegenError::new(
@@ -232,10 +238,25 @@ impl Compiler<'_> {
                         reg_ptr(*src)?
                     };
 
-                    // sqrt_val = sqrt(src)  (owned)
-                    let sqrt_val = self.compile_call_by_name(
-                        builder, "nsl_tensor_sqrt", &[src_ptr]
+                    // Force a non-FBIP copy of src so the persistent V buffer is not
+                    // mutated by the subsequent nsl_tensor_sqrt call.
+                    // add_scalar with flags=0 (no relinquish) always allocates a fresh tensor.
+                    let zero_val = builder.ins().f64const(0.0);
+                    let src_copy = self.compile_call_by_name(
+                        builder, "nsl_tensor_add_scalar", &[src_ptr, zero_val, flags_zero]
                     )?;
+
+                    // sqrt_val = sqrt(src_copy).  nsl_tensor_sqrt may FBIP if refcount==1.
+                    // src_copy.refcount is 1 (freshly allocated above), so FBIP fires:
+                    //   sqrt_val == src_copy, src_copy.refcount bumped to 2.
+                    // We then free our own hold (src_copy) to drop refcount back to 1,
+                    // leaving sqrt_val alive with refcount=1.
+                    // If FBIP does NOT fire (future-proofing), sqrt_val is a fresh tensor
+                    // and freeing src_copy correctly drops it to 0.
+                    let sqrt_val = self.compile_call_by_name(
+                        builder, "nsl_tensor_sqrt", &[src_copy]
+                    )?;
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[src_copy])?;
                     // eps_result = sqrt_val + eps  (relinquish sqrt_val → FBIP may mutate in-place)
                     let eps_val = builder.ins().f64const(*eps);
                     let flags_relinq = builder.ins().iconst(cl_types::I8, 0b0000_0001);
