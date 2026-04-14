@@ -1,0 +1,22 @@
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+# 12 epochs × 1 step/epoch (no dataloader) = 12 steps.
+# grad_accumulation = 4 → optimizer fires 3 times (after steps 3, 7, 11).
+train(model = m, epochs = 12, grad_accumulation = 4):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "adamw_source_ad_out.nslm")

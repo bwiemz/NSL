@@ -44,24 +44,35 @@ fn workspace_root() -> PathBuf {
 ///
 /// Panics on non-zero exit.
 fn nsl_run(fixture: &Path, workdir: &Path) {
+    nsl_run_with_args(fixture, workdir, &[]);
+}
+
+/// Like `nsl_run` but appends `extra` CLI flags after `run <fixture>`.
+///
+/// Use this to pass flags such as `--source-ad` that exercise specific
+/// compiler paths (e.g. the FASE consume-per-param hook in source-AD mode).
+fn nsl_run_with_args(fixture: &Path, workdir: &Path, extra: &[&str]) {
     let root = workspace_root();
     let cargo_toml = root.join("Cargo.toml");
     let stdlib_path = root.join("stdlib");
 
-    let status = std::process::Command::new(env!("CARGO"))
-        .args(["run", "-q", "--manifest-path"])
+    let mut cmd = std::process::Command::new(env!("CARGO"));
+    cmd.args(["run", "-q", "--manifest-path"])
         .arg(&cargo_toml)
         .args(["-p", "nsl-cli", "--", "run"])
         .arg(fixture)
         .current_dir(workdir)
-        .env("NSL_STDLIB_PATH", &stdlib_path)
-        .status()
-        .expect("failed to spawn cargo run nsl-cli");
+        .env("NSL_STDLIB_PATH", &stdlib_path);
+    for a in extra {
+        cmd.arg(a);
+    }
+    let status = cmd.status().expect("failed to spawn cargo run nsl-cli");
 
     assert!(
         status.success(),
-        "nsl run failed on {:?}",
-        fixture
+        "nsl run failed on {:?} with extra args {:?}",
+        fixture,
+        extra
     );
 }
 
@@ -425,6 +436,68 @@ fn adamw_deferred_with_grad_clip() {
         assert!(
             diff / scale < 1e-5,
             "AdamW+clip θ[{}] diverged: compiled={} reference={} rel_err={}",
+            i,
+            w_compiled[i],
+            w_ref[i],
+            diff / scale
+        );
+    }
+}
+
+#[test]
+fn adamw_fase_deferred_source_ad_pipeline_equivalence() {
+    // Item #4: exercises the consume-per-param hook.  Source-AD + FASE
+    // Deferred invokes the callback per parameter gradient during
+    // compile_wengert_ops.  Final parameter values must match the same
+    // reference as the tape-AD variant.
+    let tmp = TempDir::new().expect("tempdir");
+    nsl_run_with_args(
+        &fixture("fase_deferred_adamw_source_ad.nsl"),
+        tmp.path(),
+        &["--source-ad"],
+    );
+
+    let checkpoint = tmp.path().join("adamw_source_ad_out.nslm");
+    assert!(
+        checkpoint.exists(),
+        "expected checkpoint at {:?}",
+        checkpoint
+    );
+    let tensors = read_nslm(&checkpoint).expect("read nslm");
+    let w_compiled = tensors
+        .get("w")
+        .or_else(|| tensors.get("m.w"))
+        .expect(&format!(
+            "w tensor not in checkpoint; available: {:?}",
+            tensors.keys().collect::<Vec<_>>()
+        ));
+    assert_eq!(w_compiled.len(), 2);
+
+    let w_init = [1.0_f32, 1.0_f32];
+    let x = [[1.0, 1.0]; 4];
+    let y = [[0.0]; 4];
+    let w_ref = adamw_fase_deferred_reference(
+        &w_init,
+        &x,
+        &y,
+        /*lr=*/ 0.001,
+        /*beta1=*/ 0.9,
+        /*beta2=*/ 0.999,
+        /*eps=*/ 1e-8,
+        /*wd=*/ 0.01,
+        /*windows=*/ 3,
+    );
+
+    println!("AdamW FASE-Deferred (source-AD) equivalence check:");
+    println!("  compiled w[0]={} w[1]={}", w_compiled[0], w_compiled[1]);
+    println!("  reference w[0]={} w[1]={}", w_ref[0], w_ref[1]);
+
+    for i in 0..2 {
+        let diff = (w_compiled[i] - w_ref[i]).abs();
+        let scale = w_ref[i].abs().max(1.0);
+        assert!(
+            diff / scale < 1e-5,
+            "AdamW (source-AD) θ[{}] diverged: compiled={} reference={} rel_err={}",
             i,
             w_compiled[i],
             w_ref[i],

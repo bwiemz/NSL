@@ -4022,7 +4022,15 @@ impl Compiler<'_> {
                     }
                 };
                 let grad_vars = &grad_lowered.var_map;
-                let freed_adjoint_vars = std::collections::HashSet::new();
+                // When the FASE hook is active, each parameter gradient was
+                // already consumed (accumulated into m_partial) and freed by
+                // the per-param callback during adjoint lowering.  Add those
+                // VarIds to freed_adjoint_vars so free_wengert_owned_values
+                // skips them and does not emit a second nsl_tensor_free.
+                let mut freed_adjoint_vars = std::collections::HashSet::new();
+                if fase_hook_active {
+                    freed_adjoint_vars.extend(param_adj_set.iter().copied());
+                }
 
                 if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {
                     let summarize_owned = |label: &str,
