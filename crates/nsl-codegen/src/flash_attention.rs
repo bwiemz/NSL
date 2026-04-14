@@ -62,23 +62,18 @@ const MMA_MIN_SM: u32 = 80;
 
 /// Format a u32 bit pattern as a PTX f32 literal: `0f########`.
 /// PTX rejects `0x########` for f32 immediates.
-#[allow(dead_code)]
 fn f32_bits(bits: u32) -> String {
     format!("0f{:08X}", bits)
 }
 
-#[allow(dead_code)]
 const F32_ZERO: u32    = 0x0000_0000;
-#[allow(dead_code)]
 const F32_NEG_INF: u32 = 0xFF80_0000;
-#[allow(dead_code)]
 const F32_LOG2E: u32   = 0x3FB8_AA3B;
 
 /// Emit a shared-memory store through `%smem_addr` / `%shmem_base`.
 /// Callers must have emitted `.reg .u64 %smem_addr` + `.reg .u64 %shmem_base`
 /// and `cvta.shared.u64 %shmem_base, shmem;` in the kernel prolog
 /// (see `emit_register_declarations`).
-#[allow(dead_code)]
 fn emit_smem_store(ptx: &mut String, ty: &str, offset_reg: &str, val_reg: &str) {
     use std::fmt::Write;
     writeln!(ptx, "    add.s64 %smem_addr, %shmem_base, {};", offset_reg).unwrap();
@@ -86,7 +81,6 @@ fn emit_smem_store(ptx: &mut String, ty: &str, offset_reg: &str, val_reg: &str) 
 }
 
 /// Emit a shared-memory load through `%smem_addr` / `%shmem_base`.
-#[allow(dead_code)]
 fn emit_smem_load(ptx: &mut String, ty: &str, dst_reg: &str, offset_reg: &str) {
     use std::fmt::Write;
     writeln!(ptx, "    add.s64 %smem_addr, %shmem_base, {};", offset_reg).unwrap();
