@@ -507,10 +507,10 @@ pub fn allocate_ranks(
 
         let target_rank = match ov {
             Some(ov) if ov.adapter_rank == 0 => {
-                // Hard forbid.  Emit diagnostic only when spectral would have placed.
-                let spectral_rank =
-                    compute_spectral_rank(s, scores[i], total_score, r_total, r_min, r_max);
-                if spectral_rank >= r_min {
+                // Hard forbid.  Emit diagnostic only when spectral would have placed
+                // (i.e., the layer has a non-zero effective-rank score — it is not
+                // a degenerate / zero-weight projection that spectral would also skip).
+                if scores[i] > 1e-30 {
                     diags.push(OverrideDiagnostic {
                         layer_index: ov.layer_index,
                         layer_name: s.name.clone(),
@@ -791,5 +791,296 @@ mod tests {
         let mem = plan.iter().find(|r| r.name == "memory_bound").unwrap();
         let com = plan.iter().find(|r| r.name == "compute_bound").unwrap();
         assert!(mem.rank > com.rank);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Override tests (Task 5)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    use crate::wggo_overrides::{OverrideRejectReason, PerLayerOverride, WggoOverrides};
+
+    /// 4-layer spectral fixture with decreasing effective rank.
+    /// All layers use shape [32, 32] so m+n = 64.
+    fn spectral_fixture_4_layers() -> Vec<SpectralAnalysis> {
+        vec![
+            SpectralAnalysis {
+                name: "blocks.0.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 10],
+                effective_rank: 10.0,
+                truncated_rank: 10,
+            },
+            SpectralAnalysis {
+                name: "blocks.1.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 8],
+                effective_rank: 8.0,
+                truncated_rank: 8,
+            },
+            SpectralAnalysis {
+                name: "blocks.2.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 6],
+                effective_rank: 6.0,
+                truncated_rank: 6,
+            },
+            SpectralAnalysis {
+                name: "blocks.3.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 4],
+                effective_rank: 4.0,
+                truncated_rank: 4,
+            },
+        ]
+    }
+
+    /// Build a WggoOverrides where each entry's layer_name is the prefix
+    /// ("blocks.0", "blocks.1", …) so `find_by_layer_containing` matches
+    /// the full projection name ("blocks.0.attn.wq").
+    fn overrides_with_ranks(entries: &[(&str, u64)]) -> WggoOverrides {
+        WggoOverrides {
+            per_layer: entries
+                .iter()
+                .enumerate()
+                .map(|(i, (name, rank))| PerLayerOverride {
+                    layer_index: i as u32,
+                    layer_name: name.to_string(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: *rank,
+                    fase_fused: false,
+                    packing_mode: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// Sum of adapter_params across allocations.
+    fn total_params(allocs: &[RankAllocation]) -> usize {
+        allocs.iter().map(|a| a.adapter_params).sum()
+    }
+
+    // ── Test 1: No overrides → spectral behavior preserved (byte-identical) ─
+
+    #[test]
+    fn allocate_ranks_no_overrides_preserves_spectral_behavior() {
+        let spectral = spectral_fixture_4_layers();
+        let (alloc, diags) = allocate_ranks(&spectral, 256, 2, 16, None, None);
+        assert!(diags.is_empty(), "no overrides → no diagnostics");
+        assert_eq!(alloc.len(), 4);
+        for a in &alloc {
+            assert!(a.rank >= 2 && a.rank <= 16, "rank {} out of [2,16]", a.rank);
+        }
+    }
+
+    // ── Test 2: Feasible WGGO ranks applied verbatim ──────────────────────
+
+    #[test]
+    fn allocate_ranks_honors_feasible_override() {
+        let spectral = spectral_fixture_4_layers();
+        let over = overrides_with_ranks(&[
+            ("blocks.0", 8),
+            ("blocks.1", 8),
+            ("blocks.2", 4),
+            ("blocks.3", 4),
+        ]);
+        // Budget large enough that no downgrade fires.
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        assert!(diags.is_empty(), "all requests fit; no diagnostics, got: {diags:?}");
+        let ranks: Vec<usize> = alloc.iter().map(|a| a.rank).collect();
+        assert_eq!(ranks, vec![8, 8, 4, 4]);
+    }
+
+    // ── Test 3: Clamp above r_max ─────────────────────────────────────────
+
+    #[test]
+    fn allocate_ranks_clamps_rank_exceeding_r_max() {
+        let spectral = spectral_fixture_4_layers();
+        let over = overrides_with_ranks(&[
+            ("blocks.0", 32), // > r_max=16 → clamped
+            ("blocks.1", 8),
+            ("blocks.2", 4),
+            ("blocks.3", 4),
+        ]);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        assert_eq!(alloc[0].rank, 16, "clamped to r_max");
+        let clamp_diag = diags
+            .iter()
+            .find(|d| {
+                d.layer_name == "blocks.0.attn.wq"
+                    && matches!(
+                        d.reason,
+                        OverrideRejectReason::RankClampedToBounds { r_max: 16, .. }
+                    )
+            })
+            .expect("expected clamp diagnostic for blocks.0.attn.wq");
+        assert_eq!(clamp_diag.requested, "32");
+        assert_eq!(clamp_diag.applied, "16");
+    }
+
+    // ── Test 4: Clamp below r_min ─────────────────────────────────────────
+
+    #[test]
+    fn allocate_ranks_clamps_rank_below_r_min() {
+        let spectral = spectral_fixture_4_layers();
+        let over = overrides_with_ranks(&[
+            ("blocks.0", 1), // < r_min=2 → clamped
+            ("blocks.1", 8),
+            ("blocks.2", 4),
+            ("blocks.3", 4),
+        ]);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        assert_eq!(alloc[0].rank, 2, "clamped to r_min");
+        assert!(
+            diags.iter().any(|d| {
+                d.layer_name == "blocks.0.attn.wq"
+                    && matches!(
+                        d.reason,
+                        OverrideRejectReason::RankClampedToBounds { r_min: 2, .. }
+                    )
+            }),
+            "expected r_min clamp diagnostic"
+        );
+    }
+
+    // ── Test 5: adapter_rank == 0 forbids when spectral would have placed ─
+
+    #[test]
+    fn allocate_ranks_forbids_when_adapter_rank_zero_and_spectral_wanted_placement() {
+        let spectral = spectral_fixture_4_layers();
+        let over = overrides_with_ranks(&[
+            ("blocks.0", 0), // hard forbid
+            ("blocks.1", 8),
+            ("blocks.2", 4),
+            ("blocks.3", 4),
+        ]);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        assert!(
+            alloc.iter().all(|a| a.name != "blocks.0.attn.wq"),
+            "blocks.0 projection must be excluded from allocation"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.layer_name == "blocks.0.attn.wq"
+                    && matches!(d.reason, OverrideRejectReason::RankForbiddenByWggo)
+            }),
+            "expected RankForbiddenByWggo diagnostic"
+        );
+    }
+
+    // ── Test 6: adapter_rank == 0 is silent when spectral also rejected ───
+
+    #[test]
+    fn allocate_ranks_forbids_silently_when_spectral_also_rejected() {
+        let mut spectral = spectral_fixture_4_layers();
+        // Make blocks.0 degenerate so spectral_rank < r_min — spectral wouldn't place.
+        // r_total is tiny so share ≈ 0 → spectral_rank = 0 < r_min=2.
+        spectral[0].effective_rank = 0.0;
+        spectral[0].singular_values = vec![0.0; 4];
+
+        let over = overrides_with_ranks(&[
+            ("blocks.0", 0), // forbid on a degenerate site
+            ("blocks.1", 8),
+            ("blocks.2", 4),
+            ("blocks.3", 4),
+        ]);
+        // r_total large enough that non-degenerate layers aren't clamped.
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        assert!(
+            alloc.iter().all(|a| a.name != "blocks.0.attn.wq"),
+            "blocks.0 excluded"
+        );
+        let blocks_0_diags = diags
+            .iter()
+            .filter(|d| d.layer_name == "blocks.0.attn.wq")
+            .count();
+        assert_eq!(
+            blocks_0_diags, 0,
+            "no diagnostic when spectral wouldn't have placed anyway"
+        );
+    }
+
+    // ── Test 7: Budget-exceeded triggers downgrade diagnostics ───────────
+
+    #[test]
+    fn allocate_ranks_downgrades_layers_when_over_budget() {
+        let spectral = spectral_fixture_4_layers();
+        // Request rank 16 on all layers. shape=[32,32] → m+n=64.
+        // Total at rank 16: 4 * 16 * 64 = 4096 params.
+        // Set budget to half: 2048.
+        let over = overrides_with_ranks(&[
+            ("blocks.0", 16),
+            ("blocks.1", 16),
+            ("blocks.2", 16),
+            ("blocks.3", 16),
+        ]);
+        let tight_budget = 4 * 16 * 64 / 2; // = 2048
+        let (alloc, diags) = allocate_ranks(&spectral, tight_budget, 2, 16, None, Some(&over));
+        assert!(
+            total_params(&alloc) <= tight_budget,
+            "final total {} must fit budget {}",
+            total_params(&alloc),
+            tight_budget
+        );
+        let downgrades: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.reason,
+                    OverrideRejectReason::BudgetExceededDowngraded { .. }
+                )
+            })
+            .collect();
+        assert!(!downgrades.is_empty(), "expected ≥1 downgrade diagnostic");
+        for d in &downgrades {
+            if let OverrideRejectReason::BudgetExceededDowngraded {
+                original_rank,
+                final_rank,
+            } = d.reason
+            {
+                assert_eq!(original_rank, 16, "original_rank must be 16");
+                assert!(final_rank < 16, "final_rank {final_rank} must be < 16");
+            }
+        }
+    }
+
+    // ── Test 8: Downgrade targets lowest-priority layer first ────────────
+
+    #[test]
+    fn allocate_ranks_downgrade_targets_lowest_priority_first() {
+        // Two layers, same shape [32,32] → m+n=64.
+        // blocks.0 has effective_rank=2.0 (lower priority).
+        // blocks.1 has effective_rank=10.0 (higher priority).
+        // Both requested rank=8. total_at_8 = 2 * 8 * 64 = 1024.
+        // Set budget = 1024 - 64 = 960 (exactly one rank-step under).
+        // Expected: blocks.0 (lower priority) loses 1 rank → 7; blocks.1 stays at 8.
+        let spectral = vec![
+            SpectralAnalysis {
+                name: "blocks.0.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 2],
+                effective_rank: 2.0,
+                truncated_rank: 2,
+            },
+            SpectralAnalysis {
+                name: "blocks.1.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 10],
+                effective_rank: 10.0,
+                truncated_rank: 10,
+            },
+        ];
+        let over = overrides_with_ranks(&[("blocks.0", 8), ("blocks.1", 8)]);
+        let total_at_8 = 2 * 8 * 64_usize;  // 1024
+        let tight = total_at_8 - 64;        // 960 — exactly 1 rank step under
+        let (alloc, _diags) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over));
+        let b0 = alloc.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap();
+        let b1 = alloc.iter().find(|a| a.name == "blocks.1.attn.wq").unwrap();
+        assert_eq!(b0.rank, 7, "lower-priority layer loses 1 rank");
+        assert_eq!(b1.rank, 8, "higher-priority layer keeps full rank");
     }
 }
