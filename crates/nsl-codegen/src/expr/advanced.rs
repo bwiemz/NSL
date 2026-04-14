@@ -1267,6 +1267,40 @@ impl Compiler<'_> {
         }
     }
 
+    /// A.2.1g: find a tensor-typed parameter of the enclosing
+    /// `@flash_attention` function by conventional name (`x`,
+    /// `hidden_states`, `input`, `inputs`) — the pre-norm input the
+    /// CSHA fused kernel's prologue consumes.
+    ///
+    /// Returns the first match with `Type::Tensor` semantic type, in
+    /// the priority order above. Returns `None` when no convention
+    /// hits; the FA call site then threads null and A.2.2's runtime
+    /// null-check falls through to the classic Q-from-HBM path.
+    ///
+    /// Extracted as a plan-pure method so the name-resolution logic
+    /// is directly unit-testable without a `FunctionBuilder`. The
+    /// caller turns the returned `Variable` into a Cranelift `Value`
+    /// via `builder.use_var`.
+    pub(crate) fn find_csha_x_param(
+        &self,
+        state: &FuncState,
+    ) -> Option<cranelift_frontend::Variable> {
+        for candidate in ["x", "hidden_states", "input", "inputs"] {
+            for (sym, (var, _)) in state.variables.iter() {
+                if self.resolve_sym(*sym) != candidate {
+                    continue;
+                }
+                if matches!(
+                    state.variable_types.get(sym),
+                    Some(Type::Tensor { .. })
+                ) {
+                    return Some(*var);
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn compile_flash_attention_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1390,11 +1424,21 @@ impl Compiler<'_> {
             // (`<layer>.attn_norm.weight` and friends) since it isn't
             // carried as an explicit Wengert op input.
             //
+            // A.2.1g: also probe `state.variables` for a tensor
+            // parameter named `x` / `hidden_states` / `input` /
+            // `inputs` to resolve x_ptr. This only works because the
+            // FA call site runs inside the `@flash_attention`
+            // function body — the same FunctionBuilder that declared
+            // the params — so `builder.use_var(var)` produces a Value
+            // that's local to this scope (no cross-function-body
+            // issue).
+            //
             // Any pointer that fails to resolve stays null and the
             // runtime scaffolds (A.2.2/A.2.3/A.2.4) short-circuit to
             // the classic path via their own null-checks.
             let (mut wq_v, mut wk_v, mut wv_v, mut wo_v) = (null, null, null, null);
             let mut norm_w_v = null;
+            let mut x_v = null;
             if let (Some(bridge), Some(layer)) =
                 (self.last_csha_bridge.as_ref(), csha_layer.as_deref())
             {
@@ -1423,6 +1467,17 @@ impl Compiler<'_> {
                 }
             }
 
+            // A.2.1g: probe `state.variables` for a tensor-typed
+            // parameter named by one of the common conventions the
+            // `@flash_attention` function body would use for its
+            // pre-norm input. Delegates to `find_csha_x_param` for
+            // the plan-pure Symbol/Variable resolution; `builder.use_var`
+            // here turns the Variable into a Cranelift Value local to
+            // this scope.
+            if let Some(var) = self.find_csha_x_param(state) {
+                x_v = builder.use_var(var);
+            }
+
             let _err = self.compile_call_by_name(
                 builder,
                 "nsl_flash_attention_csha",
@@ -1438,23 +1493,25 @@ impl Compiler<'_> {
                     ptx_ptr, name_ptr,
                     block_q_val, block_kv_val,
                     causal_val,
-                    // CSHA extras (A.2.1a + A.2.1e + A.2.1f):
+                    // CSHA extras (A.2.1a + A.2.1e + A.2.1g):
                     //
-                    // x_ptr stays null here because Cranelift `Value`s
-                    // are `FunctionBuilder`-scoped: the Wengert VarId→
-                    // Value map is built inside the train-block's
-                    // forward-pass lowering, while this FA call site
-                    // fires inside the separately-compiled
-                    // `@flash_attention` function body. The plan-level
-                    // resolution (`csha_apply::collect_norm_input_varids`)
-                    // is in place so future work can thread the
-                    // pointer once a cross-function-body value-sharing
-                    // mechanism lands (e.g. a layer-keyed stash
-                    // populated before the decorated function is
-                    // invoked). The A.2.2 prologue's runtime
-                    // null-check keeps the kernel correct in the
-                    // interim.
-                    null,                      // x_ptr  (cross-fn blocker; see above)
+                    // x_v comes from a `state.variables` probe for a
+                    // tensor-typed parameter named by one of the
+                    // common conventions (`x`, `hidden_states`, ...).
+                    // Works without cross-function-body machinery
+                    // because the FA call site runs inside the same
+                    // FunctionBuilder that declared the
+                    // `@flash_attention` function's params. Null when
+                    // no conventional name hits — A.2.2 prologue's
+                    // runtime null-check falls through to the classic
+                    // Q-from-HBM path.
+                    //
+                    // The plan-level VarId resolver from A.2.1f
+                    // (`csha_apply::collect_norm_input_varids`)
+                    // remains available for future callers that need
+                    // to resolve x by Wengert position rather than
+                    // Cranelift-parameter name.
+                    x_v,                       // A.2.1g: param probe
                     norm_w_v,                  // resolved via conventional-name probe
                     wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                     eps_bits,
