@@ -419,6 +419,12 @@ pub struct Compiler<'a> {
     /// Per-projection byte offsets inside the retention arena.
     /// Populated at the same time as `retention_arena_data_id`.
     pub retention_offsets: std::collections::HashMap<String, u32>,
+
+    // ── WGGO override side-channel (Task 3) ─────────────────────
+    /// Per-layer WGGO decisions for consumer passes.  Populated in the
+    /// diagnostics section of `compile_quant_block` when `--wggo` is on;
+    /// read by CSHA, WRGA, and (future) FASE/Prune/Sharding consumers.
+    pub(crate) wggo_overrides: Option<crate::wggo_overrides::WggoOverrides>,
 }
 
 /// Quantization configuration for a model.
@@ -559,6 +565,7 @@ impl<'a> Compiler<'a> {
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
+            wggo_overrides: None,
         })
     }
 
