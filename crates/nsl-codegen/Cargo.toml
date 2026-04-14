@@ -30,6 +30,7 @@ base64 = "0.22"
 [features]
 default = []
 cuda = ["nsl-runtime/cuda"]
+test-helpers = []
 
 [dev-dependencies]
 string-interner.workspace = true

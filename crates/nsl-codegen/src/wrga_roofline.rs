@@ -17,9 +17,10 @@ use crate::cost_model::{
     BoundClassification,
 };
 use crate::gpu_specs::GpuSpec;
+use serde::{Deserialize, Serialize};
 
 /// Kind of operation at an adapter candidate site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SiteKind {
     /// Dense matmul such as Q/K/V/O projections or FFN gate/up/down.
     Matmul,

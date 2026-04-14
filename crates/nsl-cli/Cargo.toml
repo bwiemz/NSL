@@ -9,6 +9,10 @@ repository.workspace = true
 keywords = ["ml", "compiler", "tensor", "neural-network", "language"]
 categories = ["compilers", "science"]
 
+[lib]
+name = "nsl_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nsl"
 path = "src/main.rs"
@@ -20,6 +24,7 @@ nsl-ast.workspace = true
 nsl-parser.workspace = true
 nsl-semantic.workspace = true
 nsl-codegen.workspace = true
+nsl-runtime = { path = "../nsl-runtime" }
 clap.workspace = true
 serde_json.workspace = true
 safetensors = "0.4"

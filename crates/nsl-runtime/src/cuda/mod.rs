@@ -678,6 +678,37 @@ pub(crate) mod inner {
         cuEventRecord(event as CUevent, stream as CUstream);
     }
 
+    /// Returns the CUstream that `kernel_launch` issues work onto. `kernel_launch`
+    /// currently passes `std::ptr::null_mut()` (the NULL/default stream) to
+    /// `cuLaunchKernel`, so events recorded on this stream correctly serialize
+    /// with kernel execution rather than capturing host-submit latency.
+    ///
+    /// Exposed for the Phase 2 kernel-timing profiler (see
+    /// `crate::profiler::cuda_clock::CudaEventClock`) so that begin/end event
+    /// recording uses the *same* stream as the launch.
+    pub fn current_stream() -> CUstream {
+        std::ptr::null_mut()
+    }
+
+    pub unsafe fn cu_event_synchronize_raw(event: u64) -> CUresult {
+        cuEventSynchronize(event as CUevent)
+    }
+
+    pub unsafe fn cu_event_elapsed_time_raw(ms: *mut f32, start: u64, stop: u64) -> CUresult {
+        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent)
+    }
+
+    pub unsafe fn cu_event_create_checked() -> Result<u64, CUresult> {
+        let mut e: CUevent = std::ptr::null_mut();
+        let res = cuEventCreate(&mut e, 0);
+        if res != CUresult::CUDA_SUCCESS { return Err(res); }
+        Ok(e as u64)
+    }
+
+    pub unsafe fn cu_event_record_on_current_stream(event: u64) -> CUresult {
+        cuEventRecord(event as CUevent, current_stream())
+    }
+
     pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) {
         cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent);
     }
@@ -792,6 +823,9 @@ pub(crate) mod inner {
 
 #[cfg(feature = "cuda")]
 pub(crate) use inner::{cu_event_create, cu_event_record, cu_event_elapsed_time, cu_event_destroy, cu_ctx_synchronize};
+
+#[cfg(feature = "cuda")]
+pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
 
 // === GPU op helpers ===
 

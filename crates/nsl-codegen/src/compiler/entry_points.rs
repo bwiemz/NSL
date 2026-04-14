@@ -9,6 +9,140 @@ use nsl_semantic::checker::TypeMap;
 use super::{Compiler, StandaloneConfig};
 use crate::error::CodegenError;
 
+/// Dev Tools Phase 2, Task 4: run the profiling walker once and stash its
+/// output on the compiler so kernel-launch sites can attach compile-time
+/// predictions by `NodeId`.  Non-fatal: a walker error is logged to stderr
+/// (under `NSL_DEBUG`) and leaves the maps empty — profiling is advisory and
+/// must never break a build.
+fn run_profile_pre_pass(
+    compiler: &mut Compiler<'_>,
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    options: &crate::CompileOptions,
+) {
+    use crate::gpu_specs::find_gpu;
+    use crate::profiling::instrument::ManifestBuilder;
+    use crate::profiling::shape_env::ShapeEnv;
+    use crate::profiling::types::EntryKind;
+    use crate::profiling::walker::walk_ops;
+
+    let env = ShapeEnv::with_defaults();
+    let target_gpu = options.target_gpu.as_str();
+    let dtype = options.dtype.as_str();
+
+    let gpu = match find_gpu(target_gpu) {
+        Some(g) => g,
+        None => {
+            if std::env::var("NSL_DEBUG").is_ok() {
+                eprintln!(
+                    "[nsl] profile_kernels: unknown GPU target {:?}, skipping pre-pass",
+                    target_gpu
+                );
+            }
+            return;
+        }
+    };
+
+    // The walker expects an `&AnalysisResult` but only reads `type_map`.
+    // Construct a minimal synthetic result from the `TypeMap` we already have.
+    let analysis = nsl_semantic::AnalysisResult {
+        diagnostics: Vec::new(),
+        type_map: type_map.clone(),
+        scopes: nsl_semantic::scope::ScopeMap::new(),
+        ownership_info: std::collections::HashMap::new(),
+        wrga_configs: Vec::new(),
+        freeze_configs: Vec::new(),
+        adapter_configs: Vec::new(),
+    };
+
+    // Task 6 + Phase 2.5 Task 4: populate source text/name so
+    // SourceSpanJson::from_span produces real line numbers in manifest records.
+    // Source-text priority: explicit options → disk fallback → empty.  Runs
+    // before walk_ops so source context is ready even if the walker fails,
+    // and before any fusion decisions are made.
+    compiler.source_text = match &options.profile_source_text {
+        Some(s) => s.clone(),
+        None => options
+            .profile_source_file_name
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default(),
+    };
+    compiler.source_file_name = options
+        .profile_source_file_name
+        .clone()
+        .unwrap_or_default();
+
+    match walk_ops(ast, &analysis, interner, EntryKind::Auto, &env, gpu, dtype) {
+        Ok(report) => {
+            compiler.prediction_map = report
+                .ops
+                .iter()
+                .filter_map(|op| op.origin_node.map(|nid| (nid, op.clone())))
+                .collect();
+            compiler.manifest_builder = Some(ManifestBuilder::new(target_gpu, dtype));
+            // Phase 2.5 Task 3: seed the Compiler-owned plan so later fusion
+            // passes (apply_epilogue_fusion, apply_reduction_fusion) can write
+            // into the same instance that `fusion_constituents` reads at
+            // launch-emit time. Copy WRGA-level adapter-fusion groups if a
+            // recent @train compile produced them; otherwise start empty.
+            let seeded = compiler
+                .last_wrga_plan
+                .as_ref()
+                .map(|p| p.fusion.clone())
+                .unwrap_or_default();
+            compiler.fusion_plan_for_profile = Some(seeded);
+        }
+        Err(e) => {
+            if std::env::var("NSL_DEBUG").is_ok() {
+                eprintln!(
+                    "[nsl] profile_kernels: walker failed ({}), continuing without predictions",
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
+/// write the resulting kernel-profile manifest to
+/// `options.manifest_output_path`.  Non-fatal on any failure — profiling is
+/// advisory and must never break a build.  Called from each codegen entry
+/// function's latest reliable success path.
+fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::CompileOptions) {
+    let Some(mb) = compiler.manifest_builder.take() else {
+        return;
+    };
+    let manifest = mb.finish();
+    if let Some(out_path) = &options.manifest_output_path {
+        match crate::profiling::instrument::write_manifest(out_path, &manifest) {
+            Ok(_) => {
+                if std::env::var("NSL_DEBUG").is_ok() {
+                    eprintln!(
+                        "[profile] wrote manifest with {} kernels to {}",
+                        manifest.kernels.len(),
+                        out_path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to write profile manifest to {}: {}",
+                    out_path.display(),
+                    e
+                );
+            }
+        }
+    } else if std::env::var("NSL_DEBUG").is_ok() {
+        eprintln!(
+            "[profile] manifest_builder set but no manifest_output_path — \
+             skipping write ({} kernels)",
+            manifest.kernels.len()
+        );
+    }
+}
+
 /// Main entry point (single-file, backward compatible).
 pub fn compile(
     ast: &nsl_ast::Module,
@@ -108,6 +242,14 @@ pub fn compile_returning_plan(
     }
 
     compiler.dump_ir = dump_ir;
+
+    // Dev Tools Phase 2, Task 4/6: run the kernel-profile pre-pass before any
+    // body codegen so downstream kernel-launch sites can record manifest
+    // entries keyed by `NodeId`.
+    if options.profile_kernels {
+        run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
+    }
+
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
@@ -183,6 +325,9 @@ pub fn compile_returning_plan(
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize
+    // consumes the compiler.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, plan))
 }
@@ -403,6 +548,8 @@ fn compile_with_zk_info_best_effort_plan(
         }
     }
 
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize();
     (bytes, zk_proof_fns, zk_results, plan)
 }
@@ -475,6 +622,10 @@ fn compile_standalone_best_effort_plan(
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    if pre_finalize.is_ok() {
+        write_manifest_if_needed(&mut compiler, options);
+    }
     let result = pre_finalize.and_then(|()| compiler.finalize());
     (result, plan)
 }
@@ -512,6 +663,8 @@ pub fn compile_test(
         return Err(CodegenError::new("no @test functions found".to_string()));
     }
     compiler.compile_test_main()?;
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, test_fns))
 }
@@ -623,6 +776,14 @@ pub fn compile_module_with_imports_best_effort_plan(
     for name in imported_model_names {
         compiler.models.imported_model_names.insert(name);
     }
+
+    // Dev Tools Phase 2, Task 4: run the kernel-profile pre-pass once at the
+    // start of codegen so downstream kernel-launch sites can attach
+    // compile-time predictions by `NodeId`.
+    if options.profile_kernels {
+        run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
+    }
+
     // Run every pass up to (but not including) `finalize`, so we can observe
     // `last_wrga_plan` even on an error path before consuming the compiler.
     let pre_finalize = (|| -> Result<(), CodegenError> {
@@ -646,6 +807,10 @@ pub fn compile_module_with_imports_best_effort_plan(
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    if pre_finalize.is_ok() {
+        write_manifest_if_needed(&mut compiler, options);
+    }
     let result = pre_finalize.and_then(|()| compiler.finalize());
     (result, plan)
 }
@@ -721,6 +886,12 @@ pub fn compile_entry_returning_plan(
         compiler.types.enum_defs.insert(name, variants);
     }
 
+    // Dev Tools Phase 2, Task 4/6: run the kernel-profile pre-pass before any
+    // body codegen.
+    if options.profile_kernels {
+        run_profile_pre_pass(&mut compiler, ast, interner, type_map, options);
+    }
+
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
@@ -772,6 +943,8 @@ pub fn compile_entry_returning_plan(
         );
     }
     let plan = compiler.last_wrga_plan.clone();
+    // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
+    write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, plan))
 }

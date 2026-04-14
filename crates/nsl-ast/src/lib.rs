@@ -7,7 +7,7 @@ pub mod stmt;
 pub mod types;
 pub mod visitor;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use nsl_errors::Span;
@@ -30,7 +30,7 @@ impl From<string_interner::DefaultSymbol> for Symbol {
 }
 
 /// Unique identifier for each AST node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
 
 static NEXT_NODE_ID: AtomicU32 = AtomicU32::new(0);

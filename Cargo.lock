@@ -1167,6 +1167,7 @@ dependencies = [
  "nsl-errors",
  "nsl-lexer",
  "nsl-parser",
+ "nsl-runtime",
  "nsl-semantic",
  "predicates",
  "safetensors",
@@ -1231,14 +1232,17 @@ dependencies = [
 name = "nsl-runtime"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
  "cudarc",
  "half",
  "hf-hub",
  "memmap2",
+ "once_cell",
  "prost",
  "rand 0.8.5",
  "regex-lite",
  "safetensors",
+ "serde",
  "serde_json",
  "tempfile",
  "tokenizers",

@@ -132,6 +132,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_min: 2,
         r_max: 16,
         seed: 0xC0DE_FACE,
+        inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
     };
     let mut plan = crate::wrga::run(wrga_input);
 
@@ -178,6 +179,16 @@ pub(crate) fn invoke_wrga_if_enabled(
     }
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)
+}
+
+/// Dev Tools Phase 4 Task 4: extract a layer index from a parameter path.
+/// Finds the last numeric segment (e.g. "blocks.3.attn.wq" -> 3).  Returns
+/// `u32::MAX` when no numeric segment is present.
+fn parse_layer_idx_for_health(path: &str) -> u32 {
+    path.split('.')
+        .rev()
+        .find_map(|seg| seg.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
 }
 
 fn classify_source_ad_param_name(
@@ -1237,6 +1248,24 @@ impl Compiler<'_> {
                     }
                 }
                 self.compile_stmt(builder, state, stmt)?;
+
+                // Phase 5 Task 7: after the inner VarDecl has bound the
+                // target, emit @inspect hooks.  Only active when
+                // `compile_options.inspect_enabled` is true and the stmt
+                // is a `let x = ...`.
+                if self.compile_options.inspect_enabled {
+                    if let StmtKind::VarDecl { pattern, .. } = &stmt.kind {
+                        if let PatternKind::Ident(target_sym) = &pattern.kind {
+                            for d in decorators {
+                                if d.name.len() == 1
+                                    && self.resolve_sym(d.name[0]) == "inspect"
+                                {
+                                    self.emit_inspect_hook(builder, state, d, *target_sym)?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             _ => {
@@ -3322,6 +3351,19 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // Dev Tools Phase 5 Task 7: publish step-counter variable so
+        // `@inspect` emission inside the step body can gate on `step % N`.
+        // Cleared at end of compile_train_block.
+        self.inspect_train_step_var = Some(step_count_var);
+
+        // ── 5a. Dev Tools Phase 4 Task 4: optional health flush-interval setter ──
+        if self.compile_options.health_monitor {
+            if let Some(n) = self.compile_options.health_flush_interval {
+                let n_val = builder.ins().iconst(cl_types::I64, n as i64);
+                self.compile_call_by_name(builder, "nsl_health_set_flush_interval", &[n_val])?;
+            }
+        }
+
         // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
         // These persist across batches within each accumulation window. Each buffer
         // is zeros_like(param) and gets += each batch's grads, then zeroed after
@@ -4212,6 +4254,151 @@ impl Compiler<'_> {
             )?;
         }
 
+        // 7e1c. Dev Tools Phase 4 Task 4: health-monitor hooks.
+        // Emits per-step loss, per-parameter gradient norm, per-parameter
+        // weight norm (step 0 + every 100 steps), and a snapshot flush every
+        // 100 steps.  Gated entirely on `health_monitor`; when off the IR is
+        // byte-identical to pre-phase-4.
+        //
+        // TODO(phase4-fase): splice grad-norm emission into the FASE per-layer
+        // loop when FASE is active.  Phase 4 Task 4 ships the standard-
+        // backward-only path — grads_list is indexed the same whether the
+        // primary backward was tape-AD or source-AD.
+        if self.compile_options.health_monitor {
+            use cranelift_codegen::ir::{types as cl_types, MemFlags};
+            let _ = MemFlags::trusted(); // keep import valid across cfgs
+
+            // (a) Record loss: scalarize loss_val and call
+            //     nsl_health_record_loss(loss_scalar, step).
+            let loss_scalar = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_item",
+                &[loss_val],
+            )?;
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_health_record_loss",
+                &[loss_scalar, step_now],
+            )?;
+
+            // Precompute step-gating flags shared by grad/weight/flush hooks.
+            let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
+            let step_h = builder.use_var(step_count_var);
+            let hundred = builder.ins().iconst(cl_types::I64, 100);
+            let step_mod = builder.ins().srem(step_h, hundred);
+            let is_flush_due = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                step_mod,
+                zero_i64_h,
+            );
+            // Init == step 0.  We reuse `is_flush_due` for the weight-norm
+            // periodic check (step 0 also satisfies step % 100 == 0), so a
+            // single gate covers both "init" and "every 100".
+
+            // (b) Per-parameter gradient norms (unrolled over compile-time
+            //     param_paths; grads_list / param_list are indexed by idx).
+            for (i, path) in param_paths.iter().enumerate() {
+                let path_data_id = self.intern_string(path)?;
+                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                let path_len = builder
+                    .ins()
+                    .iconst(cl_types::I64, path.len() as i64);
+                let layer_idx = parse_layer_idx_for_health(path);
+                let layer_idx_val = builder
+                    .ins()
+                    .iconst(cl_types::I32, layer_idx as i64);
+
+                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                let grad = self.compile_call_by_name(
+                    builder,
+                    "nsl_list_get",
+                    &[grads_list, idx_val],
+                )?;
+                let gnorm = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_l2_norm",
+                    &[grad],
+                )?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_health_record_grad_norm",
+                    &[path_ptr, path_len, layer_idx_val, gnorm],
+                )?;
+            }
+
+            // (c) Per-parameter weight norms — gated by step % 100 == 0
+            //     (which includes step 0 as the initial weight snapshot).
+            let wnorm_block = builder.create_block();
+            let after_wnorm = builder.create_block();
+            builder
+                .ins()
+                .brif(is_flush_due, wnorm_block, &[], after_wnorm, &[]);
+
+            builder.switch_to_block(wnorm_block);
+            builder.seal_block(wnorm_block);
+            state.current_block = Some(wnorm_block);
+
+            for (i, path) in param_paths.iter().enumerate() {
+                let path_data_id = self.intern_string(path)?;
+                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                let path_len = builder
+                    .ins()
+                    .iconst(cl_types::I64, path.len() as i64);
+                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                let param = self.compile_call_by_name(
+                    builder,
+                    "nsl_list_get",
+                    &[param_list, idx_val],
+                )?;
+                let wnorm = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_l2_norm",
+                    &[param],
+                )?;
+                // is_init flag: 1 iff step == 0.
+                let step_cmp = builder.use_var(step_count_var);
+                let zero_cmp = builder.ins().iconst(cl_types::I64, 0);
+                let is_init_b1 = builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    step_cmp,
+                    zero_cmp,
+                );
+                let is_init_i8 = builder.ins().uextend(cl_types::I8, is_init_b1);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_health_record_weight_norm",
+                    &[path_ptr, path_len, wnorm, is_init_i8],
+                )?;
+            }
+
+            // (d) Snapshot flush (reuses is_flush_due — we're still in wnorm_block).
+            let snap_path = self
+                .compile_options
+                .profile_source_file_name
+                .as_ref()
+                .map(|p| format!("{}.nsl-health.json", p))
+                .unwrap_or_else(|| "nsl-health.json".to_string());
+            let snap_data_id = self.intern_string(&snap_path)?;
+            let snap_gv = self.module.declare_data_in_func(snap_data_id, builder.func);
+            let snap_ptr = builder.ins().symbol_value(cl_types::I64, snap_gv);
+            let snap_len = builder
+                .ins()
+                .iconst(cl_types::I64, snap_path.len() as i64);
+            self.compile_call_by_name(
+                builder,
+                "nsl_health_flush_snapshot",
+                &[snap_ptr, snap_len],
+            )?;
+
+            builder.ins().jump(after_wnorm, &[]);
+            builder.switch_to_block(after_wnorm);
+            builder.seal_block(after_wnorm);
+            state.current_block = Some(after_wnorm);
+        }
+
         // 7e2. Gradient clipping (only if grad_clip was specified)
         if grad_clip < f64::MAX {
             let max_norm_val = builder.ins().f64const(grad_clip);
@@ -5016,6 +5203,9 @@ impl Compiler<'_> {
         state.dataloader_symbols = saved_dataloader_symbols;
         state.borrowed_batch_symbols = saved_borrowed_batch_symbols;
 
+        // Phase 5 Task 7: clear train-scope @inspect context on exit.
+        self.inspect_train_step_var = None;
+
         Ok(())
     }
 
@@ -5567,6 +5757,9 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // Phase 5 Task 7: publish step counter for @inspect in pipelined train.
+        self.inspect_train_step_var = Some(step_count_var);
+
         let lr_var = state.new_variable();
         builder.declare_var(lr_var, cl_types::F64);
         let lr_const = builder.ins().f64const(lr_value);
@@ -5903,6 +6096,9 @@ impl Compiler<'_> {
         state.variable_types = saved_variable_types;
         state.dataloader_symbols = saved_dataloader_symbols;
         state.borrowed_batch_symbols = saved_borrowed_batch_symbols;
+
+        // Phase 5 Task 7: clear train-scope @inspect context on exit.
+        self.inspect_train_step_var = None;
 
         Ok(())
     }
@@ -6412,6 +6608,239 @@ impl Compiler<'_> {
         &self,
     ) -> Option<Vec<crate::calibration::ProjectionRef>> {
         None
+    }
+
+
+    /// Dev Tools Phase 5 Task 7: emit IR for one `@inspect(target, every=?, condition=?)`
+    /// decorator attached to a `let` binding.
+    ///
+    /// Ship-first scope:
+    ///   * Only fires inside a train block (requires `inspect_train_step_var`).
+    ///     Outside train scope, emits nothing.
+    ///   * `every=N` → step-gated call to `nsl_tensor_stats` +
+    ///     `nsl_inspect_record_stats`.
+    ///   * `condition="..."` → predicate-gated `nsl_inspect_dump_full`.
+    ///     Predicate AST is lowered via `inspect::predicate::lower_predicate`.
+    ///   * The `loss` identifier in predicates always evaluates to `0.0` —
+    ///     the loss value isn't in scope at @inspect emission time (inspect
+    ///     fires at the let-binding site, typically before the loss compute).
+    ///     TODO(phase-5-fase): thread loss through once it's available.
+    ///
+    /// All emission gated on `compile_options.inspect_enabled`.  When that
+    /// flag is off, this method is never called.
+    fn emit_inspect_hook(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        decorator: &nsl_ast::decl::Decorator,
+        target_sym: nsl_ast::Symbol,
+    ) -> Result<(), CodegenError> {
+        // Outside a train block we skip entirely for Phase 5 ship-first.
+        let step_count_var = match self.inspect_train_step_var {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        // Resolve target tensor: prefer decorator arg[0] (which semantic
+        // guarantees is a positional Ident), fall back to the let binding's
+        // own LHS symbol when argument extraction fails.
+        let (resolved_sym, tensor_name) = {
+            let mut s = target_sym;
+            if let Some(args) = &decorator.args {
+                if let Some(first) = args.first() {
+                    if first.name.is_none() {
+                        if let ExprKind::Ident(sym) = &first.value.kind {
+                            s = *sym;
+                        }
+                    }
+                }
+            }
+            let name = self.resolve_sym(s).to_string();
+            (s, name)
+        };
+        let tensor_val = match state.variables.get(&resolved_sym) {
+            Some((var, _)) => builder.use_var(*var),
+            None => return Ok(()),
+        };
+
+        // Extract every=N and condition="..." from decorator args.
+        let mut every_n: Option<i64> = None;
+        let mut cond_str: Option<String> = None;
+        if let Some(args) = &decorator.args {
+            // args[0] is the positional tensor target — resolved above.
+            for arg in args.iter().skip(1) {
+                let kw = arg.name.map(|s| self.resolve_sym(s).to_string());
+                match kw.as_deref() {
+                    Some("every") => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            if *n > 0 {
+                                every_n = Some(*n);
+                            }
+                        }
+                    }
+                    Some("condition") => {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                            cond_str = Some(s.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Intern the tensor name once — shared by stats + dump branches.
+        let name_data_id = self.intern_string(&tensor_name)?;
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data_id, builder.func);
+
+        // ── (a) Stats branch: every=N ────────────────────────────────────
+        if let Some(n) = every_n {
+            let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
+            let step_loaded = builder.use_var(step_count_var);
+            let n_val = builder.ins().iconst(cl_types::I64, n);
+            let rem = builder.ins().srem(step_loaded, n_val);
+            let due = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                rem,
+                zero_i64,
+            );
+
+            let do_block = builder.create_block();
+            let after_block = builder.create_block();
+            builder.ins().brif(due, do_block, &[], after_block, &[]);
+
+            builder.switch_to_block(do_block);
+            builder.seal_block(do_block);
+            state.current_block = Some(do_block);
+
+            // Allocate a 48-byte 8-aligned stack slot for the stats struct
+            // (matches the runtime's NslTensorStats layout — 6 × f64).
+            let slot = builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    48,
+                    3,
+                ),
+            );
+            let stats_ptr = builder.ins().stack_addr(cl_types::I64, slot, 0);
+
+            self.compile_call_by_name(
+                builder,
+                "nsl_tensor_stats",
+                &[tensor_val, stats_ptr],
+            )?;
+
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+            let name_len = builder
+                .ins()
+                .iconst(cl_types::I64, tensor_name.len() as i64);
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_inspect_record_stats",
+                &[stats_ptr, step_now, name_ptr, name_len],
+            )?;
+
+            builder.ins().jump(after_block, &[]);
+            builder.switch_to_block(after_block);
+            builder.seal_block(after_block);
+            state.current_block = Some(after_block);
+        }
+
+        // ── (b) Dump branch: condition="..." ──────────────────────────────
+        if let Some(cond_src) = cond_str {
+            let ast = match crate::inspect::predicate::parse_predicate(&cond_src) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[@inspect] predicate parse failed for {:?}: {}",
+                        cond_src, e
+                    );
+                    return Ok(());
+                }
+            };
+
+            // Resolve FuncRefs for all health getters.  Any missing symbol
+            // means builtins.rs / Phase 4+5 runtime didn't register — bail.
+            let (lema_id, _) = match self.registry.runtime_fns.get("nsl_health_get_loss_ema") {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_loss_ema_ref =
+                self.module.declare_func_in_func(lema_id, builder.func);
+            let (lslope_id, _) = match self
+                .registry
+                .runtime_fns
+                .get("nsl_health_get_loss_ema_slope")
+            {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_loss_ema_slope_ref =
+                self.module.declare_func_in_func(lslope_id, builder.func);
+            let (gnt_id, _) = match self
+                .registry
+                .runtime_fns
+                .get("nsl_health_get_grad_norm_total")
+            {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_grad_norm_total_ref =
+                self.module.declare_func_in_func(gnt_id, builder.func);
+            let (nic_id, _) = match self
+                .registry
+                .runtime_fns
+                .get("nsl_health_get_nan_inf_count_window")
+            {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_nan_inf_count_window_ref =
+                self.module.declare_func_in_func(nic_id, builder.func);
+
+            let step_loaded = builder.use_var(step_count_var);
+            // Placeholder for `loss` identifier in predicate — see TODO above.
+            let loss_placeholder = builder.ins().f64const(0.0);
+
+            let ctx = crate::inspect::predicate::PredicateLowerCtx {
+                step_val: step_loaded,
+                loss_val: loss_placeholder,
+                get_loss_ema_ref,
+                get_loss_ema_slope_ref,
+                get_grad_norm_total_ref,
+                get_nan_inf_count_window_ref,
+            };
+            let pred_val =
+                crate::inspect::predicate::lower_predicate(&ast, builder, &ctx);
+
+            let do_block = builder.create_block();
+            let after_block = builder.create_block();
+            builder.ins().brif(pred_val, do_block, &[], after_block, &[]);
+
+            builder.switch_to_block(do_block);
+            builder.seal_block(do_block);
+            state.current_block = Some(do_block);
+
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+            let name_len = builder
+                .ins()
+                .iconst(cl_types::I64, tensor_name.len() as i64);
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_inspect_dump_full",
+                &[tensor_val, step_now, name_ptr, name_len],
+            )?;
+
+            builder.ins().jump(after_block, &[]);
+            builder.switch_to_block(after_block);
+            builder.seal_block(after_block);
+            state.current_block = Some(after_block);
+        }
+
+        Ok(())
     }
 }
 

@@ -1117,12 +1117,25 @@ pub fn apply_reduction_fusion(
     graph: &mut FusionGraph,
     matches: &[ReductionMatch],
     base_kernel_id: FusedKernelId,
+    plan: &mut crate::wrga_fusion::FusionPlan,
 ) {
     for (i, m) in matches.iter().enumerate() {
         let kid = base_kernel_id + i as FusedKernelId;
         for &node_id in &m.all_matched_nodes {
             graph.nodes[node_id as usize].fused_into = Some(kid);
         }
+
+        // Record constituent NodeIds for prediction-sum lookup.
+        // `fusion_graph::NodeId` is `u32`; `FusionPlan.fused_node_groups` is keyed
+        // by `nsl_ast::NodeId`, so wrap the raw ids.
+        let constituents: Vec<nsl_ast::NodeId> = m
+            .all_matched_nodes
+            .iter()
+            .copied()
+            .map(nsl_ast::NodeId)
+            .collect();
+        plan.fused_node_groups
+            .insert(nsl_ast::NodeId(m.root_node), constituents);
     }
 }
 
@@ -1332,7 +1345,8 @@ mod tests {
     fn test_apply_reduction_marks_fused_into() {
         let (mut g, _) = make_stable_softmax();
         let matches = detect_reduction_patterns(&g);
-        apply_reduction_fusion(&mut g, &matches, 100);
+        let mut _scratch_fusion_plan = crate::wrga_fusion::FusionPlan::default();
+        apply_reduction_fusion(&mut g, &matches, 100, &mut _scratch_fusion_plan);
 
         // All matched nodes should be marked
         for &nid in &matches[0].all_matched_nodes {

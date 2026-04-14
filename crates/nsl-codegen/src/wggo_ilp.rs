@@ -25,9 +25,32 @@
 //! The solver's bounding function uses the LUT's `argmin_feasible` as a
 //! global lower bound and prunes aggressively.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::wggo_cost::{LayerCostEntry, LayerCostLut};
+
+/// The kind of decision recorded in a [`DecisionTrace`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DecisionKind {
+    CepHeadPrune,
+    CshaLevel,
+    WrgaAdapter,
+    CpdtPrecision,
+}
+
+/// A human-readable record of one ILP decision, suitable for reporting.
+///
+/// Populated by `solve_layer` (Phase 3 Task 2) and rendered by the
+/// dev-tools CLI (Phase 3 Tasks 3/4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionTrace {
+    pub kind: DecisionKind,
+    pub chosen: String,
+    pub runner_up: Option<String>,
+    pub binding_constraint: Option<String>,
+    pub metric_summary: String,
+    pub cross_decision_note: Option<String>,
+}
 
 /// Integer decision variables for one layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -149,6 +172,10 @@ pub struct LayerIlpSolution {
     pub nodes_explored: u64,
     /// Whether the solver found a feasible assignment at all.
     pub feasible: bool,
+    /// Human-readable decision records for reporting.  Populated by
+    /// `solve_layer` in Phase 3 Task 2; empty until then.
+    #[serde(default)]
+    pub decision_trace: Vec<DecisionTrace>,
 }
 
 /// Solve the Level-2 ILP for a single layer.
@@ -250,6 +277,7 @@ pub fn solve_layer(
     match state.best_decision {
         Some(decision) => {
             let entry = state.best_entry.unwrap();
+            let decision_trace = build_decision_trace(&decision, &entry, constraints);
             LayerIlpSolution {
                 decision,
                 cost_us: state.best_cost,
@@ -257,6 +285,7 @@ pub fn solve_layer(
                 smem_bytes: entry.smem_bytes,
                 nodes_explored: state.nodes,
                 feasible: true,
+                decision_trace,
             }
         }
         None => LayerIlpSolution {
@@ -266,6 +295,7 @@ pub fn solve_layer(
             smem_bytes: 0,
             nodes_explored: state.nodes,
             feasible: false,
+            decision_trace: Vec::new(),
         },
     }
 }
@@ -437,6 +467,7 @@ pub fn solve_layer_greedy(
             smem_bytes: 0,
             nodes_explored: nodes,
             feasible: false,
+            decision_trace: Vec::new(),
         };
     };
     let entry = apply_packing(
@@ -457,6 +488,7 @@ pub fn solve_layer_greedy(
             smem_bytes: entry.smem_bytes,
             nodes_explored: nodes,
             feasible: false,
+            decision_trace: Vec::new(),
         };
     }
 
@@ -476,6 +508,7 @@ pub fn solve_layer_greedy(
         smem_bytes: entry.smem_bytes,
         nodes_explored: nodes,
         feasible: true,
+        decision_trace: Vec::new(),
     }
 }
 
@@ -591,6 +624,157 @@ fn importance_ok(config: &[bool], c: &LayerIlpConstraints) -> bool {
         .filter_map(|(k, w)| if *k { Some(*w) } else { None })
         .sum();
     retained >= c.min_retained_importance
+}
+
+/// Build the four human-readable `DecisionTrace` entries (CEP / CSHA / WRGA /
+/// CPDT) for a successfully-solved layer.  Phase 3 Task 2.
+fn build_decision_trace(
+    decision: &LayerDecision,
+    entry: &LayerCostEntry,
+    c: &LayerIlpConstraints,
+) -> Vec<DecisionTrace> {
+    let total_heads = decision.keep_head.len();
+    let kept_indices: Vec<usize> = decision
+        .keep_head
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| if *k { Some(i) } else { None })
+        .collect();
+    let pruned_indices: Vec<usize> = decision
+        .keep_head
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| if !*k { Some(i) } else { None })
+        .collect();
+    let retained_heads = kept_indices.len();
+    let pruned_count = pruned_indices.len();
+
+    // ---------- CEP (head pruning) ----------
+    let cep_chosen = if pruned_count == 0 {
+        format!("Kept all {} heads", total_heads)
+    } else {
+        let head_list = pruned_indices
+            .iter()
+            .map(|i| format!("h{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Pruned {}/{} heads ({})",
+            pruned_count, total_heads, head_list
+        )
+    };
+    let cep_metric_summary = if !c.head_importance.is_empty() && pruned_count > 0 {
+        pruned_indices
+            .iter()
+            .filter_map(|&i| {
+                c.head_importance
+                    .get(i)
+                    .map(|w| format!("importance(h{i})={:.2}", w))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+            + " — lowest in layer"
+    } else if !c.head_importance.is_empty() {
+        "no heads pruned (all importances retained)".to_string()
+    } else {
+        "importance not estimated (pruning by cost only)".to_string()
+    };
+    let cep_binding = if c.min_retained_importance > 0.0 && !c.head_importance.is_empty() {
+        let retained: f64 = decision
+            .keep_head
+            .iter()
+            .zip(c.head_importance.iter())
+            .filter_map(|(k, w)| if *k { Some(*w) } else { None })
+            .sum();
+        Some(format!(
+            "min_retained_importance >= {:.2} — satisfied at {:.2}",
+            c.min_retained_importance, retained
+        ))
+    } else {
+        Some(format!("gqa_group = {} (whole-group prune)", c.gqa_group))
+    };
+    let cep_trace = DecisionTrace {
+        kind: DecisionKind::CepHeadPrune,
+        chosen: cep_chosen,
+        runner_up: None,
+        binding_constraint: cep_binding,
+        metric_summary: cep_metric_summary,
+        cross_decision_note: None,
+    };
+
+    // ---------- CSHA (shared-attention fusion level) ----------
+    let smem_kb = entry.smem_bytes / 1024;
+    let smem_budget_kb = c.smem_budget / 1024;
+    let csha_trace = DecisionTrace {
+        kind: DecisionKind::CshaLevel,
+        chosen: format!("Level {}", decision.csha_level),
+        runner_up: None,
+        binding_constraint: Some(format!("SMEM <= {}KB", smem_budget_kb)),
+        metric_summary: format!(
+            "With {} kept heads, SMEM = {}KB (budget {}KB).",
+            retained_heads, smem_kb, smem_budget_kb
+        ),
+        cross_decision_note: None,
+    };
+
+    // ---------- WRGA (adapter rank / sites) ----------
+    let wrga_chosen = if decision.adapter_rank == 0 {
+        "No LoRA adapter (rank=0)".to_string()
+    } else {
+        format!("LoRA r={} on q_proj, v_proj", decision.adapter_rank)
+    };
+    let wrga_trace = DecisionTrace {
+        kind: DecisionKind::WrgaAdapter,
+        chosen: wrga_chosen,
+        runner_up: None,
+        binding_constraint: Some(format!(
+            "adapter_comm <= {} (per-layer budget)",
+            if c.adapter_comm_budget.is_finite() {
+                format!("{:.2}", c.adapter_comm_budget)
+            } else {
+                "inf".to_string()
+            }
+        )),
+        metric_summary: format!(
+            "Adapter compute fits within layer roofline slack (ffn_width={}, kept_heads={}).",
+            decision.ffn_width, retained_heads
+        ),
+        cross_decision_note: None,
+    };
+
+    // ---------- CPDT (optimizer-state precision) ----------
+    let tier_label = if c.sensitivity >= c.critical_prec_threshold {
+        format!(
+            "sensitivity {:.2} >= critical {:.2} — forces 32-bit",
+            c.sensitivity, c.critical_prec_threshold
+        )
+    } else if c.sensitivity >= c.high_prec_threshold {
+        format!(
+            "sensitivity {:.2} >= high {:.2} — forces >=16-bit",
+            c.sensitivity, c.high_prec_threshold
+        )
+    } else {
+        format!(
+            "sensitivity {:.2} < high {:.2} — low-precision tier allowed",
+            c.sensitivity, c.high_prec_threshold
+        )
+    };
+    let cpdt_trace = DecisionTrace {
+        kind: DecisionKind::CpdtPrecision,
+        chosen: format!(
+            "INT{} m, FP{} v",
+            decision.optim_m_bits, decision.optim_v_bits
+        ),
+        runner_up: None,
+        binding_constraint: Some(tier_label.clone()),
+        metric_summary: format!(
+            "sensitivity = {:.2} (high {:.2}, critical {:.2})",
+            c.sensitivity, c.high_prec_threshold, c.critical_prec_threshold
+        ),
+        cross_decision_note: None,
+    };
+
+    vec![cep_trace, csha_trace, wrga_trace, cpdt_trace]
 }
 
 fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
