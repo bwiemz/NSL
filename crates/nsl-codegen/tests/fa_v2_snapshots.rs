@@ -3,7 +3,7 @@
 //! snapshot. Use `cargo insta review` to accept snapshot changes.
 
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax, pv_accum};
+use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax, pv_accum, finalize};
 
 fn csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
@@ -107,6 +107,20 @@ fn phase_pv_accum__64x64x128_snapshot() {
     let mut ptx = String::new();
     pv_accum::emit(&mut ptx, &non_csha_canonical(), 0);
     insta::assert_snapshot!("phase_pv_accum__64x64x128_iter0", ptx);
+}
+
+#[test]
+fn phase_finalize__32x32x32_snapshot() {
+    let mut ptx = String::new();
+    finalize::emit(&mut ptx, &csha_canonical(), 0);
+    insta::assert_snapshot!("phase_finalize__32x32x32_iter0", ptx);
+}
+
+#[test]
+fn phase_finalize__64x64x128_snapshot() {
+    let mut ptx = String::new();
+    finalize::emit(&mut ptx, &non_csha_canonical(), 0);
+    insta::assert_snapshot!("phase_finalize__64x64x128_iter0", ptx);
 }
 
 /// Regression test: the k-loop label must be parameterised on

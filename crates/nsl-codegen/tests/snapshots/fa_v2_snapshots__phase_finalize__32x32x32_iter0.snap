@@ -1,0 +1,37 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // Phase 6: finalize + output store (q_tile_iter = 0)
+    rcp.approx.f32 %f0, %row_sum;
+    mul.f32 %f48, %f48, %f0;
+    add.u32 %r7, %warp_id, 0;             // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd46, %r7;
+    add.u64 %rd47, %q_start, %rd46;           // q_row_global
+    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
+    add.u64 %rd48, %rd48, %head_idx;          // + head
+    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
+    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
+    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    add.u64 %rd48, %rd3, %rd48;               // out_base_global
+    cvt.rn.f16.f32 %h0, %f48;
+    cvt.u64.u32 %rd49, %lane;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
+    st.global.b16 [%rd49], %h0;
+    // LSE store (lane 0 only, null-guarded)
+    setp.eq.u32 %p1, %lane, 0;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
+    and.pred %p1, %p1, %p_has_lse;
+    lg2.approx.f32 %log_sum, %row_sum;
+    mov.f32 %f1, 0f3F317218;                  // ln(2)
+    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
+    add.f32 %lse, %row_max, %log_sum;
+    mul.lo.u64 %rd50, %batch_idx, %rd5;
+    add.u64 %rd50, %rd50, %head_idx;
+    mul.lo.u64 %rd50, %rd50, %rd6;
+    add.u64 %rd50, %rd50, %rd47;
+    shl.b64 %rd50, %rd50, 2;
+    add.u64 %rd50, %logsumexp_base, %rd50;
+    @%p1 st.global.f32 [%rd50], %lse;
