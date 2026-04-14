@@ -873,6 +873,11 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
     // the top of each (m, n) iteration and lives across the K loop.
     ptx.push_str("    .reg .u32 %ts_m, %ts_n, %ts_k;\n");
     ptx.push_str("    .reg .u32 %ts_a_base, %ts_b_base, %ts_out_base;\n");
+    // A.2.3.2 lane-coherent scatter scratch: per-thread row/col derived
+    // from `%mma_laneid` (set by `emit_mma_temp_registers`), plus the
+    // two per-pack addresses.
+    ptx.push_str("    .reg .u32 %ts_row_lo, %ts_col_pair, %ts_col_off, %ts_row_off;\n");
+    ptx.push_str("    .reg .u32 %ts_pack0_addr, %ts_pack1_addr;\n");
     let m_tiles = (block_q / 16).max(1);
     let n_tiles = (head_dim / 8).max(1);
     let k_tiles = (d_model.min(256) as i64 / 16).max(1);
@@ -996,11 +1001,7 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
         let c_pack_dsts = vec!["proj_c_pack0".to_string(), "proj_c_pack1".to_string()];
         emit_f32_to_f16_pack(ptx, &c_names, &c_pack_dsts);
 
-        // Tile-origin SMEM address: out_offset + m*16*a_stride + n*8*2.
-        // Per-thread lane offset left at 0 for now (see scatter note
-        // above) — all 32 threads in a warp contend for the same
-        // address in this scaffold, but the store pattern is visible
-        // to tests and will cleanly extend when the scatter lands.
+        // Tile-base SMEM address: out_offset + m*16*a_stride + n*8*2.
         ptx.push_str(&format!(
             "    mul.lo.u32 %ts_out_base, %ts_m, {};  // m * 16 * a_stride\n",
             16 * a_stride_bytes
@@ -1010,8 +1011,31 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
             out_offset_bytes
         ));
         ptx.push_str("    mad.lo.u32 %ts_out_base, %ts_n, 16, %ts_out_base; // + n*8*2\n");
-        ptx.push_str("    st.shared.b32 [%ts_out_base + 0], %proj_c_pack0;   // f16x2 low pair\n");
-        ptx.push_str("    st.shared.b32 [%ts_out_base + 4], %proj_c_pack1;   // f16x2 high pair\n");
+
+        // A.2.3.2 lane-coherent scatter (per mma.sync.m16n8k16 f32 accumulator layout):
+        //   pack0 holds (regs[0], regs[1]) → (row = laneid/4,        col = 2*(laneid%4)+{0,1})
+        //   pack1 holds (regs[2], regs[3]) → (row = laneid/4 + 8,    col = 2*(laneid%4)+{0,1})
+        // Each thread computes its own scatter address from the tile
+        // base + per-lane row/col offsets, so the 32 threads in a warp
+        // cover the full 16×8 output tile with no bank conflicts on
+        // aligned SMEM.
+        ptx.push_str(&format!(
+            "    shr.u32 %ts_row_lo, %mma_laneid, 2;              // row_lo = laneid / 4 (0..7)\n"
+        ));
+        ptx.push_str("    and.b32 %ts_col_pair, %mma_laneid, 3;            // col_pair = laneid % 4 (0..3)\n");
+        ptx.push_str("    shl.b32 %ts_col_off, %ts_col_pair, 2;            // col_off = col_pair * 2*f16 = *4\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %ts_row_off, %ts_row_lo, {};          // row_off = row_lo * stride\n",
+            a_stride_bytes
+        ));
+        ptx.push_str("    add.u32 %ts_pack0_addr, %ts_out_base, %ts_row_off;\n");
+        ptx.push_str("    add.u32 %ts_pack0_addr, %ts_pack0_addr, %ts_col_off;\n");
+        ptx.push_str("    st.shared.b32 [%ts_pack0_addr], %proj_c_pack0;   // (row_lo, col_pair)\n");
+        ptx.push_str(&format!(
+            "    add.u32 %ts_pack1_addr, %ts_pack0_addr, {};       // +8 rows = 8 * stride\n",
+            8 * a_stride_bytes
+        ));
+        ptx.push_str("    st.shared.b32 [%ts_pack1_addr], %proj_c_pack1;   // (row_lo+8, col_pair)\n");
 
         ptx.push_str("    add.u32 %ts_n, %ts_n, 1;\n");
         ptx.push_str(&format!(
@@ -1062,15 +1086,10 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
         &a_regs, &b_regs, &c_regs, &d_regs,
     );
 
-    ptx.push_str(
-        "    // TODO(A.2.3.2): lane-coherent thread-coord scatter replacing the\n",
-    );
-    ptx.push_str(
-        "    // tile-origin store above (requires real-hardware validation\n",
-    );
-    ptx.push_str(
-        "    // against an mma.sync f32-accumulator test vector).\n",
-    );
+    // A.2.3.2: lane-coherent scatter now emitted per iteration above.
+    // Real-hardware numerical validation (mma.sync f32-accumulator test
+    // vector) is the remaining follow-up — the scatter math matches the
+    // documented layout but has not been run on GPU.
 
     ptx.push_str("CSHA_PROJECTION_END:\n");
     ptx.push_str("    bar.sync 0;                       // Q/K/V SMEM tiles consistent\n");
@@ -6594,12 +6613,46 @@ mod tests {
             6,
             "two f32→f16 conversion calls per projection × 3 projections"
         );
-        // Packed SMEM stores replace the old raw-f32 stores.
-        assert!(ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c_pack0;"));
-        assert!(ptx.contains("st.shared.b32 [%ts_out_base + 4], %proj_c_pack1;"));
-        // Old per-accumulator raw-f32 store pattern must be gone.
-        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c0"));
-        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c1"));
+        // A.2.3.2 lane-coherent scatter: each pack is stored via a
+        // per-lane address (%ts_pack0_addr / %ts_pack1_addr), not the
+        // bare tile origin. The tile-origin stores of the old
+        // scaffold must be gone.
+        assert!(ptx.contains("st.shared.b32 [%ts_pack0_addr], %proj_c_pack0;"));
+        assert!(ptx.contains("st.shared.b32 [%ts_pack1_addr], %proj_c_pack1;"));
+        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c_pack0"));
+        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 4], %proj_c_pack1"));
+    }
+
+    #[test]
+    fn a232_lane_coherent_scatter_matches_mma_layout() {
+        // A.2.3.2: the per-(m, n) tile closure must emit the scatter
+        // address math documented for mma.sync.m16n8k16 f32-accumulator
+        // layout — thread t holds (row=t/4, col=2*(t%4)+{0,1}) and
+        // (row+8, same col). Pack0 stores the low row, pack1 the high
+        // row.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // Lane → row / col math
+        assert!(ptx.contains("shr.u32 %ts_row_lo, %mma_laneid, 2;"));
+        assert!(ptx.contains("and.b32 %ts_col_pair, %mma_laneid, 3;"));
+        assert!(ptx.contains("shl.b32 %ts_col_off, %ts_col_pair, 2;"));
+        // Row offset = row_lo * stride (stride = head_dim*2 = 256 here).
+        assert!(ptx.contains("mul.lo.u32 %ts_row_off, %ts_row_lo, 256;"));
+        // pack0 = out_base + row_off + col_off
+        assert!(ptx.contains("add.u32 %ts_pack0_addr, %ts_out_base, %ts_row_off;"));
+        assert!(ptx.contains("add.u32 %ts_pack0_addr, %ts_pack0_addr, %ts_col_off;"));
+        // pack1 = pack0 + 8*stride (8 rows lower)
+        assert!(ptx.contains("add.u32 %ts_pack1_addr, %ts_pack0_addr, 2048;"));
+        // Per-lane scatter stores (not tile-origin stores)
+        assert_eq!(
+            ptx.matches("st.shared.b32 [%ts_pack0_addr], %proj_c_pack0;").count(),
+            3,
+            "one pack0 scatter store per projection (Q/K/V)"
+        );
+        assert_eq!(
+            ptx.matches("st.shared.b32 [%ts_pack1_addr], %proj_c_pack1;").count(),
+            3,
+            "one pack1 scatter store per projection"
+        );
     }
 
     #[test]
