@@ -3,7 +3,7 @@
 //! snapshot. Use `cargo insta review` to accept snapshot changes.
 
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::phases::prelude;
+use nsl_codegen::flash_attention_v2::phases::{prelude, q_load};
 
 fn csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
@@ -35,4 +35,18 @@ fn phase_prelude__64x64x128_snapshot() {
     let mut ptx = String::new();
     prelude::emit(&mut ptx, &non_csha_canonical());
     insta::assert_snapshot!("phase_prelude__64x64x128", ptx);
+}
+
+#[test]
+fn phase_q_load__32x32x32_snapshot() {
+    let mut ptx = String::new();
+    q_load::emit(&mut ptx, &csha_canonical(), 0);
+    insta::assert_snapshot!("phase_q_load__32x32x32_iter0", ptx);
+}
+
+#[test]
+fn phase_q_load__64x64x128_snapshot() {
+    let mut ptx = String::new();
+    q_load::emit(&mut ptx, &non_csha_canonical(), 0);
+    insta::assert_snapshot!("phase_q_load__64x64x128_iter0", ptx);
 }
