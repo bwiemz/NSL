@@ -27,6 +27,26 @@ fn has_train_block(module: &nsl_ast::Module) -> bool {
         .any(|s| matches!(s.kind, nsl_ast::stmt::StmtKind::TrainBlock(_)))
 }
 
+/// CLI wrapper for `nsl_codegen::WggoImportance` — keeps `clap` out of `nsl-codegen`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+#[clap(rename_all = "lower")]
+enum CliWggoImportance {
+    #[default]
+    Auto,
+    Magnitude,
+    Grad,
+}
+
+impl From<CliWggoImportance> for nsl_codegen::WggoImportance {
+    fn from(v: CliWggoImportance) -> Self {
+        match v {
+            CliWggoImportance::Auto => Self::Auto,
+            CliWggoImportance::Magnitude => Self::Magnitude,
+            CliWggoImportance::Grad => Self::Grad,
+        }
+    }
+}
+
 // The clap command enum carries many subcommand-specific flags, so keeping it
 // as a single enum is clearer than splitting every large variant into boxes.
 #[allow(clippy::large_enum_variant)]
@@ -437,12 +457,12 @@ enum Cli {
         #[arg(long, value_name = "PATH")]
         wggo_weights: Option<PathBuf>,
 
-        /// WGGO Stage 3 importance-scoring mode ("none" or
-        /// "magnitude").  "grad" is reserved for a future milestone
-        /// (blocked on a compile-time execution harness).  Defaults
-        /// to "magnitude" when `--wggo-weights` is set, else "none".
-        #[arg(long, value_name = "MODE")]
-        wggo_importance: Option<String>,
+        /// WGGO head-importance scoring mode.
+        /// - `auto` (default): gradient scoring when calibration sidecar present, else magnitude.
+        /// - `magnitude`: force magnitude scoring even with calibration data.
+        /// - `grad`: require gradient scoring; errors if no calibration sidecar present.
+        #[arg(long, value_enum, default_value_t = CliWggoImportance::Auto)]
+        wggo_importance: CliWggoImportance,
 
         /// WGGO Stage 3: fraction of heads the default
         /// `min_retained_importance` threshold allows to be pruned.
@@ -1034,7 +1054,7 @@ fn main_inner() {
                 health_flush_interval: None,
                 inspect_enabled: false,
                 wggo_weights: wggo_weights.clone(),
-                wggo_importance: wggo_importance.clone(),
+                wggo_importance: nsl_codegen::WggoImportance::from(wggo_importance),
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
@@ -1062,24 +1082,10 @@ fn main_inner() {
                     process::exit(1);
                 }
             }
-            if let Some(ref m) = wggo_importance {
-                match m.as_str() {
-                    "none" | "magnitude" => {}
-                    "grad" => {
-                        eprintln!(
-                            "error: --wggo-importance=grad is reserved for a future milestone (blocked on a compile-time execution harness); use 'magnitude' or 'none' for now"
-                        );
-                        process::exit(1);
-                    }
-                    other => {
-                        eprintln!(
-                            "error: --wggo-importance value '{}' is not one of none|magnitude",
-                            other
-                        );
-                        process::exit(1);
-                    }
-                }
-            }
+            // wggo_importance is now a typed CliWggoImportance enum; clap
+            // rejects unknown values before we get here.  The Grad variant
+            // requires a calibration sidecar — build_scorer enforces that at
+            // compile time and emits the --calibration-data error message.
             if let Some(f) = wggo_prune_fraction {
                 if !(0.0..=0.9).contains(&f) {
                     eprintln!(
@@ -1315,7 +1321,7 @@ fn main_inner() {
                 health_flush_interval: None,
                 inspect_enabled: inspect,
                 wggo_weights: None,
-                wggo_importance: None,
+                wggo_importance: nsl_codegen::WggoImportance::Auto,
                 wggo_prune_fraction: None,
                 csha_mode: None,
                 csha_report: false,

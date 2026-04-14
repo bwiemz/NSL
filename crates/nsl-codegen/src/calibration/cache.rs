@@ -227,6 +227,7 @@ mod tests {
             cache_key_digest: digest.into(),
             num_samples_used: 10,
             hooks,
+            wggo_head_gradients: None,
         }
     }
 

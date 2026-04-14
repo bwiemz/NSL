@@ -3,6 +3,7 @@
 
 pub mod awq_hook;
 pub mod discovery;
+pub mod wggo_gradient_hook;
 pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
@@ -23,6 +24,7 @@ pub use discovery::{
     DiscoveryError,
 };
 pub use hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
+pub use wggo_gradient_hook::{discover_loss_anchor, LayerGradTarget, WggoAnchorError, WggoGradientHook};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
@@ -112,6 +114,7 @@ pub fn run_harness_stub(
         cache_key_digest: String::new(),
         num_samples_used: num_samples,
         hooks: hooks_out,
+        wggo_head_gradients: None,
     };
     Ok(HarnessOutput {
         sidecar,
@@ -240,6 +243,7 @@ fn empty_sidecar_for_fallback(
         cache_key_digest: String::new(),
         num_samples_used: 0,
         hooks: BTreeMap::new(),
+        wggo_head_gradients: None,
     }
 }
 

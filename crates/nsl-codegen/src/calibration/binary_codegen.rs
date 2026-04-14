@@ -194,6 +194,7 @@ fn build_sidecar_from_stub(
         cache_key_digest: String::new(),
         num_samples_used: cfg.samples,
         hooks: hooks_out,
+        wggo_head_gradients: None,
     })
 }
 

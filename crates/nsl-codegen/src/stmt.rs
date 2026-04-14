@@ -3698,56 +3698,13 @@ impl Compiler<'_> {
                     }
                 }
 
-                // WGGO: run the global optimization planner if enabled.  The
-                // planner is pure data-in/data-out and does not mutate the
-                // Wengert list — it produces a report describing the
-                // globally-optimal per-layer decisions that downstream
-                // passes SHOULD honour.  Wiring the decisions back into
-                // codegen is a future step; the planner itself is
-                // independently useful as a diagnostic and is exercised by
-                // the test suite and CLI integration tests.
-                if let Some(ref mode_str) = self.compile_options.wggo_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        // Build AnalysisConfig from CLI overrides; clamp is
-                        // also applied in analyze(), but applying it here
-                        // keeps the --wggo-report line honest.
-                        let mut analysis_config =
-                            crate::wggo_weight_analysis::AnalysisConfig::default();
-                        if let Some(f) = self.compile_options.wggo_prune_fraction {
-                            analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
-                        }
-                        // Honour `--wggo-importance=none` by clearing the
-                        // weights path — the analyzer then runs against
-                        // NullWeightProvider and produces uniform scores.
-                        let weights_path = match self
-                            .compile_options
-                            .wggo_importance
-                            .as_deref()
-                        {
-                            Some("none") => None,
-                            _ => self.compile_options.wggo_weights.as_deref(),
-                        };
-                        let plan = crate::wggo::run_on_wengert_with_weights(
-                            extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
-                            self.compile_options.world_size,
-                            weights_path,
-                            analysis_config,
-                        );
-                        if let Some(plan) = plan {
-                            if self.compile_options.wggo_report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[wggo] {}", plan.summary());
-                            }
-                        }
-                    }
-                }
-
-                // Calibration harness (MVP): currently a pass-through
-                // when no consumers are registered.  Real consumers
-                // (AWQ/WGGO Phase 2/FP8/GPTQ) land in follow-up plans.
+                // Calibration harness MUST run before WGGO: WGGO Phase 2's
+                // gradient-scoring path reads `compile_options.calibration_sidecar`
+                // via `build_scorer`. If WGGO ran first, the sidecar would
+                // still be `None` and Phase 2 would silently fall back to
+                // magnitude scoring even when `--calibration-data` was
+                // supplied. Calibration does not depend on WGGO output, so
+                // running it first is a safe one-way reorder.
                 if let Some(ref data_path) = self.compile_options.calibration_data {
                     let mut registry = crate::calibration::registry::HookRegistry::new();
                     if let Some(awq_projections) = self.discover_awq_projections() {
@@ -3817,6 +3774,51 @@ impl Compiler<'_> {
                                 return Err(crate::error::CodegenError::new(format!(
                                     "calibration failed: {e}"
                                 )));
+                            }
+                        }
+                    }
+                }
+
+                // WGGO: run the global optimization planner if enabled.  The
+                // planner is pure data-in/data-out and does not mutate the
+                // Wengert list — it produces a report describing the
+                // globally-optimal per-layer decisions that downstream
+                // passes SHOULD honour.  Wiring the decisions back into
+                // codegen is a future step; the planner itself is
+                // independently useful as a diagnostic and is exercised by
+                // the test suite and CLI integration tests.
+                if let Some(ref mode_str) = self.compile_options.wggo_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        // Build AnalysisConfig from CLI overrides; clamp is
+                        // also applied in analyze(), but applying it here
+                        // keeps the --wggo-report line honest.
+                        let mut analysis_config =
+                            crate::wggo_weight_analysis::AnalysisConfig::default();
+                        if let Some(f) = self.compile_options.wggo_prune_fraction {
+                            analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
+                        }
+                        // Pass the weights path for magnitude-based scoring
+                        // (NullWeightProvider is used in run_on_wengert_with_weights
+                        // when weights_path is None, producing uniform scores).
+                        // compile_options is forwarded so build_scorer can wire the
+                        // GradientScorer appropriate for --wggo-importance + --calibration-data.
+                        // The calibration pass above populated calibration_sidecar if
+                        // --calibration-data was supplied and hooks were registered.
+                        let weights_path = self.compile_options.wggo_weights.as_deref();
+                        let plan = crate::wggo::run_on_wengert_with_weights(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            self.compile_options.world_size,
+                            weights_path,
+                            analysis_config,
+                            Some(&self.compile_options),
+                        );
+                        if let Some(plan) = plan {
+                            if self.compile_options.wggo_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[wggo] {}", plan.summary());
                             }
                         }
                     }

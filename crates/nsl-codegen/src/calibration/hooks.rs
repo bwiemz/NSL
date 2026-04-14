@@ -32,6 +32,8 @@ pub enum CalibrationResult {
     Degenerate { reason: String },
 }
 
+// ── CalibrationHook trait ────────────────────────────────────────────────────
+
 /// A compiler pass's participation in calibration.  See the design doc
 /// §4 for semantics.
 pub trait CalibrationHook: Send + Sync {
