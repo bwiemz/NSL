@@ -1010,7 +1010,22 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
             "%ts_b_base",
             b_stride_bytes,
         );
-        crate::matmul_mma::emit_mma_instruction(ptx, d_regs, a_regs, b_regs, c_regs);
+        // The load helpers take bare register names (they prepend `%`
+        // internally), but `emit_mma_instruction` embeds names
+        // verbatim — prefix them here before the MMA issue.
+        let pct = |regs: &[String]| -> Vec<String> {
+            regs.iter().map(|r| format!("%{}", r)).collect()
+        };
+        let a_pct_vec = pct(a_regs);
+        let b_pct_vec = pct(b_regs);
+        let a_pct: [String; 4] = [
+            a_pct_vec[0].clone(),
+            a_pct_vec[1].clone(),
+            a_pct_vec[2].clone(),
+            a_pct_vec[3].clone(),
+        ];
+        let b_pct: [String; 2] = [b_pct_vec[0].clone(), b_pct_vec[1].clone()];
+        crate::matmul_mma::emit_mma_instruction(ptx, d_regs, &a_pct, &b_pct, c_regs);
 
         // D is the new accumulator — copy into C for the next K iter.
         for i in 0..4 {

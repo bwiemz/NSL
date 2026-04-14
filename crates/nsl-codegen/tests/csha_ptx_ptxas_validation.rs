@@ -105,10 +105,15 @@ fn assemble_ptx(ptxas_path: &str, ptx_bytes: &[u8], sm_arch: &str) -> Result<(),
 }
 
 fn csha_l2_rope_config() -> FlashAttentionConfig {
+    // Small tile sizes keep SMEM under the default 48 KB static cap.
+    // base (32+32)*32*2 = 4 KB + prologue 32*32*2 = 2 KB + projection
+    // 3*32*32*2 = 6 KB + output 32*32*2 = 2 KB  ⇒  14 KB total — well
+    // within the sm_120 default budget. Production configs typically
+    // opt into the extended dynamic-shared regime via cudaFuncSetAttr.
     FlashAttentionConfig {
-        block_q: 64,
-        block_kv: 64,
-        head_dim: 128,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
         causal: true,
         paged: false,
         rope_q: true,
@@ -116,7 +121,7 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
         gqa_group_size: 1,
         tree_mask: false,
         gpu_sm: 120,
-        csha: Some(CshaExtras::level2(1e-5, 512)),
+        csha: Some(CshaExtras::level2(1e-5, 32)),
     }
 }
 
@@ -140,7 +145,6 @@ fn non_csha_config() -> FlashAttentionConfig {
 /// Any failure here indicates the test harness is broken (wrong ptxas
 /// arch, CUDA install mismatch) rather than a CSHA emission defect.
 #[test]
-#[ignore = "baseline non-CSHA FA emitter has pre-existing ptxas defects (hex-float + shmem+reg syntax); fix those first"]
 fn non_csha_ptx_assembles_on_sm120() {
     let Some(ptxas) = find_ptxas() else {
         eprintln!("skipping: ptxas not found in PATH or standard CUDA install");
@@ -166,7 +170,6 @@ fn non_csha_ptx_assembles_on_sm120() {
 /// A.2.3.2 (lane-coherent scatter address math), A.2.4 (RoPE
 /// epilogue), and A.4 (active_heads guard) end-to-end.
 #[test]
-#[ignore = "gated on non-CSHA baseline passing — see module-level status"]
 fn csha_l2_rope_ptx_assembles_on_sm120() {
     let Some(ptxas) = find_ptxas() else {
         eprintln!("skipping: ptxas not found");
@@ -175,6 +178,9 @@ fn csha_l2_rope_ptx_assembles_on_sm120() {
     let mut cfg = csha_l2_rope_config();
     cfg.csha.as_mut().unwrap().active_heads = 5; // exercise A.4 guard
     let ptx = synthesize_flash_attention_ptx(&cfg);
+    let dump = std::env::temp_dir().join("csha_l2rope_dump.ptx");
+    std::fs::write(&dump, &ptx).ok();
+    eprintln!("CSHA L2 PTX dumped to: {}", dump.display());
 
     if let Err(stderr) = assemble_ptx(&ptxas, &ptx, "sm_120") {
         // Include a PTX tail to make errors diagnostic — the ptxas
