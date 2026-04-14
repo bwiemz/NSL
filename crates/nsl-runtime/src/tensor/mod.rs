@@ -1256,6 +1256,64 @@ pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     }
 }
 
+/// Elementwise in-place scale: `tensor *= scalar`.
+///
+/// No allocation.  CPU tensors mutate their storage directly; GPU tensors
+/// round-trip through CPU for correctness (if this shows up in a profile,
+/// add a dedicated GPU scale kernel — for now the path is unused by
+/// FASE Deferred, which runs clipping on CPU-resident accumulator slots).
+///
+/// Used by FASE Deferred's two-phase gradient clip (Phase B) to apply
+/// the global clip factor to each parameter's `m_partial` without
+/// allocating a fresh tensor per parameter.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
+    if tensor_ptr == 0 {
+        return;
+    }
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 {
+        // Round-trip: pull to CPU, scale, push back.
+        let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
+        nsl_tensor_mul_scalar_inplace(cpu_ptr, scalar);
+        let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
+        let byte_count = (tensor.len as usize) * tensor.element_size();
+        crate::cuda::inner::memcpy_htod(tensor.data, cpu_tensor.data, byte_count);
+        nsl_tensor_free(cpu_ptr);
+        return;
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    if tensor.device > 0 {
+        eprintln!("nsl: mul_scalar_inplace: GPU path requires cuda feature");
+        std::process::abort();
+    }
+
+    if !tensor.has_writable_storage() {
+        eprintln!("nsl: mul_scalar_inplace cannot write into borrowed CPU storage");
+        std::process::abort();
+    }
+
+    if tensor.dtype == 1 {
+        let s = scalar as f32;
+        for i in 0..tensor.len as usize {
+            unsafe {
+                let p = tensor.data_f32().add(i);
+                *p *= s;
+            }
+        }
+    } else {
+        for i in 0..tensor.len as usize {
+            unsafe {
+                let p = tensor.data_f64().add(i);
+                *p *= scalar;
+            }
+        }
+    }
+}
+
 /// Create a zeros tensor on a specific device.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
@@ -3904,6 +3962,54 @@ mod tests {
     fn sum_sq_null_pointer_returns_zero() {
         let got = nsl_tensor_sum_sq(0);
         assert_eq!(got, 0.0);
+    }
+
+    #[test]
+    fn mul_scalar_inplace_f32_scales_values() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = nsl_tensor_zeros(shape_list);
+        let tensor = NslTensor::from_ptr(t);
+        unsafe {
+            *tensor.data_f32().add(0) = 2.0;
+            *tensor.data_f32().add(1) = -1.5;
+            *tensor.data_f32().add(2) = 0.0;
+        }
+        nsl_tensor_mul_scalar_inplace(t, 0.5);
+        unsafe {
+            assert!(((*tensor.data_f32().add(0)) - 1.0).abs() < 1e-6);
+            assert!(((*tensor.data_f32().add(1)) - (-0.75)).abs() < 1e-6);
+            assert!((*tensor.data_f32().add(2)).abs() < 1e-6);
+        }
+        nsl_tensor_free(t);
+        crate::list::nsl_list_free(shape_list);
+    }
+
+    #[test]
+    fn mul_scalar_inplace_by_zero_clears_tensor() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = nsl_tensor_zeros(shape_list);
+        let tensor = NslTensor::from_ptr(t);
+        unsafe {
+            for i in 0..4 {
+                *tensor.data_f32().add(i) = (i + 1) as f32;
+            }
+        }
+        nsl_tensor_mul_scalar_inplace(t, 0.0);
+        unsafe {
+            for i in 0..4 {
+                assert_eq!(*tensor.data_f32().add(i), 0.0);
+            }
+        }
+        nsl_tensor_free(t);
+        crate::list::nsl_list_free(shape_list);
+    }
+
+    #[test]
+    fn mul_scalar_inplace_null_pointer_is_noop() {
+        // Null pointer must not panic or abort.
+        nsl_tensor_mul_scalar_inplace(0, 2.0);
     }
 }
 
