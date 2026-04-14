@@ -66,6 +66,10 @@ pub struct WrgaInput<'a> {
     /// inspector stream memcpy can read them without UAF.  Empty when
     /// `@inspect` is disabled.
     pub inspect_pinned_vars: BTreeSet<VarId>,
+    /// Per-layer WGGO preferences for adapter rank.  `None` → WRGA's
+    /// spectral allocator runs unchanged.  `Some` → per-layer ranks honored
+    /// subject to `[r_min, r_max]` clamp and `budget_params` downgrade.
+    pub wggo_overrides: Option<&'a crate::wggo_overrides::WggoOverrides>,
 }
 
 /// Compiled WRGA plan — consumed by downstream codegen stages.
@@ -79,6 +83,10 @@ pub struct WrgaPlan {
     pub ranks: Vec<RankAllocation>,
     pub fusion: FusionPlan,
     pub memory: MemoryPlan,
+    /// WGGO overrides that were clamped, forbidden, or downgraded due to
+    /// rank bounds or parameter budget.  Empty when no WggoOverrides were
+    /// supplied or every override was applied verbatim.
+    pub override_diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic>,
 }
 
 impl WrgaPlan {
@@ -108,6 +116,7 @@ impl WrgaPlan {
             ranks: Vec::new(),
             fusion: FusionPlan::default(),
             memory: MemoryPlan::default(),
+            override_diagnostics: Vec::new(),
         }
     }
 
@@ -215,6 +224,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         ranks,
         fusion,
         memory,
+        override_diagnostics: Vec::new(),
     }
 }
 
@@ -433,6 +443,7 @@ mod tests {
             r_max: 16,
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
         };
         let plan = run(input);
         // Exactly one param (blocks.7.wq) is trainable → exactly one site.
@@ -461,6 +472,7 @@ mod tests {
             r_max: 16,
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
         };
         let plan = run(input);
         assert_eq!(plan.prune.stats.gradient_targets, 1);
@@ -483,6 +495,7 @@ mod tests {
             r_max: 16,
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
         };
         let plan = run(input);
         // Both blocks.6.wq and blocks.6.wk match the layer scope.
@@ -507,7 +520,36 @@ mod tests {
             r_max: 16,
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
         };
         assert_eq!(run(make()).render_report(), run(make()).render_report());
+    }
+
+    #[test]
+    fn wrga_plan_default_has_empty_override_diagnostics() {
+        // Smoke test: default plan from run() has empty diagnostics when no
+        // overrides supplied.
+        let w = tiny_transformer_like();
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 7,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 0,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+        };
+        let plan = run(input);
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "default WrgaPlan must have empty override_diagnostics"
+        );
     }
 }

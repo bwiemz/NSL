@@ -133,6 +133,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
+        wggo_overrides: None,
     };
     let mut plan = crate::wrga::run(wrga_input);
 
