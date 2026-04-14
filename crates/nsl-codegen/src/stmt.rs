@@ -4284,7 +4284,7 @@ impl Compiler<'_> {
                     // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
                     m
                 };
-                self.fase_emit_final_step(builder, theta, m, m_partial, v, &fase_plan.recipe)?;
+                self.fase_emit_final_step(builder, theta, m, m_partial, v, &fase_plan.recipe, None)?;  // bc_params supplied in Task 5
                 // fase_emit_final_step zeroed m_partial already — no Site E needed.
                 let fs_one = builder.ins().iconst(cl_types::I64, 1);
                 let fs_next = builder.ins().iadd(fs_i, fs_one);

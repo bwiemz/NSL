@@ -65,6 +65,7 @@ impl Compiler<'_> {
         m_partial_ptr: Value,
         v_ptr: Value,
         recipe: &crate::fase::UpdateRecipe,
+        bc_params: Option<(Value, Value)>,  // (bc1_inv, bc2_inv) — None for non-AdamW
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
 
@@ -74,29 +75,43 @@ impl Compiler<'_> {
         // on first write, freed at end.
         let mut tmp_val: Option<Value> = None;
 
-        // Map symbolic registers → live Cranelift Values.
-        // `Tmp` must be accessed via `tmp_val` directly (not through this closure)
-        // because it is allocated lazily and changes over time.
-        let reg_ptr = |r: Register| -> Result<Value, crate::error::CodegenError> {
+        // Lazy MHat / VHat scratch slots for bias-corrected moment views.
+        // Allocated on first write by `ScalarMulByBc`; freed before returning.
+        let mut m_hat_ptr: Option<Value> = None;
+        let mut v_hat_ptr: Option<Value> = None;
+
+        // Resolve a non-scratch symbolic register to a Cranelift Value.
+        // Tmp, MHat, and VHat are handled inline in each op arm because they
+        // require mutable access to `tmp_val`, `m_hat_ptr`, `v_hat_ptr`.
+        #[inline(always)]
+        fn resolve_reg(
+            r: Register,
+            theta_ptr: Value,
+            m_ptr: Value,
+            m_partial_ptr: Value,
+            v_ptr: Value,
+            m_hat_ptr: Option<Value>,
+            v_hat_ptr: Option<Value>,
+        ) -> Result<Value, crate::error::CodegenError> {
             match r {
                 Register::Theta    => Ok(theta_ptr),
                 Register::M        => Ok(m_ptr),
                 Register::MPartial => Ok(m_partial_ptr),
                 Register::V        => Ok(v_ptr),
-                Register::MHat => Err(crate::error::CodegenError::new(
-                    "Register::MHat not yet handled (Task 4)"
+                Register::MHat     => m_hat_ptr.ok_or_else(|| crate::error::CodegenError::new(
+                    "Register::MHat read before ScalarMulByBc wrote it"
                 )),
-                Register::VHat => Err(crate::error::CodegenError::new(
-                    "Register::VHat not yet handled (Task 4)"
+                Register::VHat     => v_hat_ptr.ok_or_else(|| crate::error::CodegenError::new(
+                    "Register::VHat read before ScalarMulByBc wrote it"
                 )),
                 Register::G => Err(crate::error::CodegenError::new(
                     "final-step recipe must not reference Register::G"
                 )),
                 Register::Tmp => Err(crate::error::CodegenError::new(
-                    "Tmp register must be resolved via tmp_val, not reg_ptr"
+                    "Tmp register must be resolved via tmp_val, not resolve_reg"
                 )),
             }
-        };
+        }
 
         // Constant used when calling helpers that borrow their argument (flags=0).
         let flags_zero = builder.ins().iconst(cl_types::I8, 0);
@@ -105,7 +120,7 @@ impl Compiler<'_> {
             match op {
                 // ── Zero ────────────────────────────────────────────────────
                 UpdateOp::Zero(r) => {
-                    let ptr = reg_ptr(*r)?;
+                    let ptr = resolve_reg(*r, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                     self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[ptr])?;
                 }
 
@@ -115,12 +130,12 @@ impl Compiler<'_> {
                 // Strategy: compute each scaled term into an owned temp, copy
                 // the first term into dst, then add_inplace the second.
                 UpdateOp::ScalarMulAdd { dst, src, a, b_src, b_scale } => {
-                    let src_ptr = reg_ptr(*src)?;
+                    let src_ptr = resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                     let dst_ptr = if *dst == Register::Tmp {
                         // If dst is Tmp, we'll handle the pointer below.
                         None
                     } else {
-                        Some(reg_ptr(*dst)?)
+                        Some(resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?)
                     };
 
                     // tmp1 = a * src  (owned)
@@ -136,7 +151,7 @@ impl Compiler<'_> {
                                 "ScalarMulAdd: Tmp register read before first write"
                             ))?
                         } else {
-                            reg_ptr(*b_reg)?
+                            resolve_reg(*b_reg, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                         };
                         let b_scale_val = builder.ins().f64const(*b_scale);
                         let tmp2 = self.compile_call_by_name(
@@ -165,7 +180,7 @@ impl Compiler<'_> {
 
                 // ── Square: dst = src * src ──────────────────────────────────
                 UpdateOp::Square { dst, src } => {
-                    let src_ptr = reg_ptr(*src)?;
+                    let src_ptr = resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                     // flags=0: do not consume src (borrowed)
                     let sq = self.compile_call_by_name(
                         builder, "nsl_tensor_mul", &[src_ptr, src_ptr, flags_zero]
@@ -175,7 +190,7 @@ impl Compiler<'_> {
                             self.compile_call_by_name(builder, "nsl_tensor_free", &[old])?;
                         }
                     } else {
-                        let dst_ptr = reg_ptr(*dst)?;
+                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, sq])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[sq])?;
                     }
@@ -191,7 +206,7 @@ impl Compiler<'_> {
                             "SquaredAccumulate: Tmp operand read before first write"
                         ))?
                     } else {
-                        reg_ptr(*operand)?
+                        resolve_reg(*operand, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
 
                     // sq = operand * operand  (owned)
@@ -210,8 +225,8 @@ impl Compiler<'_> {
                     // If dst != src, copy src into dst first (shouldn't happen in
                     // the current optimizer programs, but handle for safety).
                     if dst != src {
-                        let src_ptr = reg_ptr(*src)?;
-                        let dst_ptr = reg_ptr(*dst)?;
+                        let src_ptr = resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
+                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, src_ptr])?;
                     }
                     let dst_ptr = if *dst == Register::Tmp {
@@ -219,7 +234,7 @@ impl Compiler<'_> {
                             "SquaredAccumulate: Tmp dst not yet allocated"
                         ))?
                     } else {
-                        reg_ptr(*dst)?
+                        resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
                     self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dst_ptr, scaled_sq])?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_sq])?;
@@ -241,7 +256,7 @@ impl Compiler<'_> {
                             "SqrtPlusEps: Tmp src read before first write"
                         ))?
                     } else {
-                        reg_ptr(*src)?
+                        resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
 
                     // Force a non-FBIP copy of src so the persistent V buffer is not
@@ -275,7 +290,7 @@ impl Compiler<'_> {
                             self.compile_call_by_name(builder, "nsl_tensor_free", &[old])?;
                         }
                     } else {
-                        let dst_ptr = reg_ptr(*dst)?;
+                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, eps_result])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[eps_result])?;
                     }
@@ -288,14 +303,14 @@ impl Compiler<'_> {
                             "Div: Tmp src read before first write"
                         ))?
                     } else {
-                        reg_ptr(*src)?
+                        resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
                     let divisor_ptr = if *divisor == Register::Tmp {
                         tmp_val.ok_or_else(|| crate::error::CodegenError::new(
                             "Div: Tmp divisor read before first write"
                         ))?
                     } else {
-                        reg_ptr(*divisor)?
+                        resolve_reg(*divisor, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
 
                     // result = src / divisor  (owned; flags=0 — borrow both)
@@ -309,7 +324,7 @@ impl Compiler<'_> {
                             self.compile_call_by_name(builder, "nsl_tensor_free", &[old])?;
                         }
                     } else {
-                        let dst_ptr = reg_ptr(*dst)?;
+                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, result])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[result])?;
                     }
@@ -328,7 +343,7 @@ impl Compiler<'_> {
                             "Update: Tmp scaled_m read before first write"
                         ))?
                     } else {
-                        reg_ptr(*scaled_m)?
+                        resolve_reg(*scaled_m, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
 
                     // adj = -lr * scaled_m  (owned)
@@ -374,11 +389,52 @@ impl Compiler<'_> {
                 }
 
                 // ── ScalarMulByBc ─────────────────────────────────────────────
-                // Bias-corrected moment scratch: emitter not yet wired (Task 4).
-                UpdateOp::ScalarMulByBc { .. } => {
-                    return Err(crate::error::CodegenError::new(
-                        "UpdateOp::ScalarMulByBc not yet handled (Task 4)"
-                    ));
+                // Bias-corrected moment scratch: dst = src * bc_val.
+                // bc_params must be Some when this op is emitted (AdamW only).
+                // Allocates an owned tensor stored in m_hat_ptr / v_hat_ptr;
+                // freed at the end of this function.
+                UpdateOp::ScalarMulByBc { dst, src, kind } => {
+                    let (bc1, bc2) = bc_params.ok_or_else(|| crate::error::CodegenError::new(
+                        "ScalarMulByBc emitted but bc_params is None — dispatcher must supply bias-correction scalars"
+                    ))?;
+                    let bc_val = match kind {
+                        crate::fase_optimizer::BcKind::Beta1 => bc1,
+                        crate::fase_optimizer::BcKind::Beta2 => bc2,
+                    };
+                    let src_ptr = match src {
+                        Register::M => m_ptr,
+                        Register::V => v_ptr,
+                        other => return Err(crate::error::CodegenError::new(
+                            &format!("ScalarMulByBc src must be M or V, got {:?}", other)
+                        )),
+                    };
+
+                    // Allocate owned tensor: out = src * bc_val.
+                    // flags_zero forces a new allocation without relinquishing src —
+                    // we must NOT mutate the persistent m/v buffers.
+                    let out = self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[src_ptr, bc_val, flags_zero],
+                    )?;
+
+                    match dst {
+                        Register::MHat => {
+                            if let Some(prev) = m_hat_ptr {
+                                self.compile_call_by_name(builder, "nsl_tensor_free", &[prev])?;
+                            }
+                            m_hat_ptr = Some(out);
+                        }
+                        Register::VHat => {
+                            if let Some(prev) = v_hat_ptr {
+                                self.compile_call_by_name(builder, "nsl_tensor_free", &[prev])?;
+                            }
+                            v_hat_ptr = Some(out);
+                        }
+                        other => return Err(crate::error::CodegenError::new(
+                            &format!("ScalarMulByBc dst must be MHat or VHat, got {:?}", other)
+                        )),
+                    }
                 }
             }
         }
@@ -389,6 +445,14 @@ impl Compiler<'_> {
         // Free any live Tmp tensor.
         if let Some(t) = tmp_val {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[t])?;
+        }
+
+        // Free bias-corrected moment scratches.
+        if let Some(p) = m_hat_ptr {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[p])?;
+        }
+        if let Some(p) = v_hat_ptr {
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[p])?;
         }
 
         Ok(())
