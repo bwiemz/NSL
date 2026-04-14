@@ -780,6 +780,12 @@ fn link_shared_msvc(
         }
     }
 
+    // Export the program entry point so dlopen callers can invoke it.
+    // On MSVC, Linkage::Export in the .obj is not enough — we must add
+    // /EXPORT explicitly.  argc/argv params are passed as i32/i64 so the
+    // MSVC decorated name remains plain `main`.
+    cmd.arg("/EXPORT:main");
+
     // Item #5: re-export test-hooks peak FFIs.
     // /INCLUDE forces the staticlib symbol to be linked in;
     // /EXPORT adds it to the DLL's export table.
