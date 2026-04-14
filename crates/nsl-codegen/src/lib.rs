@@ -478,6 +478,10 @@ pub struct CompileOptions {
     /// their sidecar key from here.  `None` when calibration didn't
     /// run or produced no usable output.
     pub calibration_sidecar: Option<crate::calibration::sidecar::Sidecar>,
+    /// When `Some`, codegen runs the retention pass on `model_forward`, splicing
+    /// memcpys of input activations before matched linear sites. `None` = shipped
+    /// binary, zero IR impact.
+    pub calibration_retention: Option<Vec<crate::calibration::ProjectionRef>>,
 }
 
 impl Default for CompileOptions {
@@ -542,6 +546,7 @@ impl Default for CompileOptions {
             calibration_batch_size: 8,
             calibration_timeout_secs: 600,
             calibration_sidecar: None,
+            calibration_retention: None,
         }
     }
 }
@@ -558,5 +563,11 @@ mod calib_options_tests {
         assert_eq!(o.calibration_samples, 512);
         assert_eq!(o.calibration_batch_size, 8);
         assert_eq!(o.calibration_timeout_secs, 600);
+    }
+
+    #[test]
+    fn compile_options_default_has_no_calibration_retention() {
+        let opts = CompileOptions::default();
+        assert!(opts.calibration_retention.is_none());
     }
 }
