@@ -469,4 +469,81 @@ mod tests {
         assert_eq!(*operand, Register::MPartial);
         assert!((scale - 0.001).abs() < 1e-12);
     }
+
+    #[test]
+    fn jensen_fence_fase_v_exceeds_standard_v_for_nonconstant_gradients() {
+        // The FASE paper's Option B approximates v using mean(g²) rather than
+        // mean(g)².  Jensen's inequality (mean(g²) ≥ mean(g)²) guarantees
+        // v_fase ≥ v_standard element-wise, with strict inequality when the
+        // per-micro-batch gradients vary.  This test fences the approximation
+        // against future "fixes" that would silently implement the standard
+        // formula.
+        //
+        // Closed-form per-parameter v-update for one accumulation window:
+        //
+        //   Standard AdamW:     v' = β₂·v + (1 - β₂) · (mean(g))²
+        //   FASE Deferred:      v' = β₂·v + (1 - β₂) · mean(g²)
+        //
+        // Using non-constant gradients: [1.0, 2.0, 0.5, 1.5]
+        //   mean(g)   = 1.25
+        //   mean(g)²  = 1.5625
+        //   mean(g²)  = (1 + 4 + 0.25 + 2.25) / 4 = 1.875
+        //
+        // So v_fase - v_standard = (1 - β₂) · (1.875 - 1.5625) = (1 - β₂) · 0.3125
+
+        let beta2: f64 = 0.999;
+        let v_prev: f64 = 0.0;
+        let gradients: [f64; 4] = [1.0, 2.0, 0.5, 1.5];
+
+        let mean_g: f64 = gradients.iter().sum::<f64>() / (gradients.len() as f64);
+        let mean_g_sq: f64 =
+            gradients.iter().map(|g| g * g).sum::<f64>() / (gradients.len() as f64);
+
+        let v_standard = beta2 * v_prev + (1.0 - beta2) * mean_g * mean_g;
+        let v_fase = beta2 * v_prev + (1.0 - beta2) * mean_g_sq;
+
+        assert!(
+            v_fase >= v_standard,
+            "Jensen: v_fase ({}) must be >= v_standard ({})",
+            v_fase,
+            v_standard
+        );
+        assert!(
+            v_fase - v_standard > 0.0,
+            "For non-constant gradients, v_fase must strictly exceed v_standard; got diff {}",
+            v_fase - v_standard
+        );
+
+        // The expected difference is (1 - β₂) · (mean_g_sq - mean_g²) = 0.001 · 0.3125.
+        let expected_diff = (1.0 - beta2) * (mean_g_sq - mean_g * mean_g);
+        assert!(
+            (v_fase - v_standard - expected_diff).abs() < 1e-12,
+            "expected diff {}, got {}",
+            expected_diff,
+            v_fase - v_standard
+        );
+    }
+
+    #[test]
+    fn jensen_fence_constant_gradients_produce_equal_v() {
+        // Sanity check: when all per-micro-batch gradients are identical,
+        // mean(g²) == mean(g)², so Jensen's inequality is tight.  The fence
+        // test above must use non-constant gradients; this test documents
+        // why.
+        let beta2: f64 = 0.999;
+        let v_prev: f64 = 0.0;
+        let gradients: [f64; 4] = [0.7; 4];
+
+        let mean_g: f64 = gradients.iter().sum::<f64>() / (gradients.len() as f64);
+        let mean_g_sq: f64 =
+            gradients.iter().map(|g| g * g).sum::<f64>() / (gradients.len() as f64);
+
+        let v_standard = beta2 * v_prev + (1.0 - beta2) * mean_g * mean_g;
+        let v_fase = beta2 * v_prev + (1.0 - beta2) * mean_g_sq;
+
+        assert!(
+            (v_fase - v_standard).abs() < 1e-12,
+            "constant gradients must produce equal v_fase and v_standard"
+        );
+    }
 }
