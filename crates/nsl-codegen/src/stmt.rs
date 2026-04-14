@@ -3172,6 +3172,23 @@ impl Compiler<'_> {
         let (step_body, step_param_sym) =
             step_body.ok_or_else(|| CodegenError::new("train block requires a step section"))?;
 
+        // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
+        // (Lion, Unknown, or grad_clip set) fall through to the existing
+        // accum-buffer path below.  Deferred routes through stmt_fase.
+        let fase_plan = crate::fase::plan(&crate::fase::FaseConfig {
+            accumulation: grad_accumulation_steps.max(1) as u32,
+            optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
+            grad_clip: if grad_clip < f64::MAX { Some(grad_clip) } else { None },
+            lr: lr_value,
+            beta1: beta1_value,
+            beta2: beta2_value,
+            eps: eps_value,
+            weight_decay: weight_decay_value,
+            momentum: momentum_value,
+            allow_v_approx: true,
+        });
+        let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
+
         // ── 3. Resolve model type and build param list ──────────────────
         // Get the model pointer from state
         let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
@@ -4182,12 +4199,23 @@ impl Compiler<'_> {
             builder.seal_block(ga_body);
             let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
             let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
-            let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-            self.compile_call_by_name(
-                builder,
-                "nsl_grad_accumulate_add",
-                &[accum_buf, grad, n_elems],
-            )?;
+            if fase_deferred {
+                // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
+                self.fase_emit_accumulate(
+                    builder,
+                    accum_buf,
+                    grad,
+                    fase_plan.recipe.accum_scale,
+                )?;
+            } else {
+                // Existing path: raw gradient sum (divided / zeroed after optimizer step)
+                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_grad_accumulate_add",
+                    &[accum_buf, grad, n_elems],
+                )?;
+            }
             self.compile_call_by_name(builder, "nsl_tensor_free", &[grad])?;
             let ga_one = builder.ins().iconst(cl_types::I64, 1);
             let ga_next = builder.ins().iadd(gai, ga_one);
@@ -4228,6 +4256,53 @@ impl Compiler<'_> {
         }
 
         // 7f. Optimizer step: for each param, call optimizer step function
+        // FASE Deferred: emit fused per-parameter step; otherwise use existing path.
+        if fase_deferred {
+            if let Some(accum) = accum_list {
+                // Per-parameter fused final step (Deferred mode).
+                // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
+                let fs_i_var = state.new_variable();
+                builder.declare_var(fs_i_var, cl_types::I64);
+                let fs_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(fs_i_var, fs_zero);
+                let fs_hdr = builder.create_block();
+                let fs_body = builder.create_block();
+                let fs_exit = builder.create_block();
+                builder.ins().jump(fs_hdr, &[]);
+                builder.switch_to_block(fs_hdr);
+                let fs_i = builder.use_var(fs_i_var);
+                let fs_cont = builder.ins().icmp(IntCC::SignedLessThan, fs_i, num_params_val);
+                builder.ins().brif(fs_cont, fs_body, &[], fs_exit, &[]);
+                builder.switch_to_block(fs_body);
+                builder.seal_block(fs_body);
+                let theta = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fs_i])?;
+                let m = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, fs_i])?;
+                let m_partial = self.compile_call_by_name(builder, "nsl_list_get", &[accum, fs_i])?;
+                let v = if num_state_buffers >= 2 {
+                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fs_i])?
+                } else {
+                    // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
+                    m
+                };
+                self.fase_emit_final_step(builder, theta, m, m_partial, v, &fase_plan.recipe)?;
+                // fase_emit_final_step zeroed m_partial already — no Site E needed.
+                let fs_one = builder.ins().iconst(cl_types::I64, 1);
+                let fs_next = builder.ins().iadd(fs_i, fs_one);
+                builder.def_var(fs_i_var, fs_next);
+                builder.ins().jump(fs_hdr, &[]);
+                builder.seal_block(fs_hdr);
+                builder.switch_to_block(fs_exit);
+                builder.seal_block(fs_exit);
+                state.current_block = Some(fs_exit);
+
+                // Jump to post-optimizer block (merges optimizer and skip paths)
+                builder.ins().jump(post_optimizer_block, &[]);
+                builder.switch_to_block(post_optimizer_block);
+                builder.seal_block(post_optimizer_block);
+                state.current_block = Some(post_optimizer_block);
+            }
+        } else {
+
         // When accumulating, use accum_list (accumulated grads); otherwise use grads_list directly.
         let opt_grads = if let Some(accum) = accum_list {
             accum
@@ -4504,6 +4579,7 @@ impl Compiler<'_> {
         builder.switch_to_block(post_optimizer_block);
         builder.seal_block(post_optimizer_block);
         state.current_block = Some(post_optimizer_block);
+        } // end else (non-FASE-Deferred optimizer path)
 
         // 7g2. Scheduler: update learning rate if scheduler is configured
         // NOTE: step_count is incremented AFTER the scheduler call so that

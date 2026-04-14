@@ -18,7 +18,6 @@ fn fixture(name: &str) -> String {
 }
 
 #[test]
-#[ignore = "enabled after Task 9 lands the stmt.rs dispatch"]
 fn fase_deferred_compiles_adamw_grad_accum_4() {
     let src = fixture("fase_deferred_grad_accum_4.nsl");
     let opts = CompileOptions {
