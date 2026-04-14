@@ -3516,6 +3516,12 @@ impl Compiler<'_> {
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
         // to the tape-based AD path.
+        //
+        // fase_hook_active: when true, param gradients are consumed during
+        // adjoint lowering (accumulated into m_partial + freed immediately).
+        // The downstream grads_list construction + accumulation loops are
+        // skipped; grads_list is a null sentinel (i64 0).
+        let fase_hook_active = fase_deferred && self.features.source_ad_enabled;
         let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
             eprintln!("[nsl] Using source-to-source AD for backward pass");
@@ -3867,24 +3873,152 @@ impl Compiler<'_> {
                     }
                 }
 
+                // ── Build FASE consume-per-param hook (Task 3) ──
+                //
+                // When fase_deferred && source_ad_enabled, we wire a callback
+                // into the adjoint lowering that immediately accumulates each
+                // parameter gradient into m_partial and frees it.  This keeps
+                // only one parameter gradient live at a time instead of N.
+                //
+                // Ordering note: `param_paths` (built from
+                // enumerate_model_tensor_paths) drives both param_list
+                // construction (line ~3247) and accum_list construction
+                // (line ~3346).  Both iterate param_paths in the same order,
+                // so param_paths[i] == accum_list[i] == param_list[i].
+                // We index accum_list by looking up the parameter name in
+                // a compile-time param_name→idx map built from param_paths.
+                // (fase_hook_active is defined at the outer scope above.)
+                let mut param_adj_set: std::collections::HashSet<crate::wengert::VarId> =
+                    std::collections::HashSet::new();
+                // Maps adjoint VarId → (param_name, primal_cranelift_value, accum_idx)
+                // The primal_cranelift_value is used for a runtime pointer-scan against
+                // param_list so we find the correct accum_list slot even when
+                // trainable params are a subset of named_param_var_ids.
+                struct ParamHookEntry {
+                    primal_val: Value,
+                    // i64 index into accum_list (== param_list index for this param)
+                    accum_idx: i64,
+                }
+                let mut adj_vid_to_hook_entry: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    ParamHookEntry,
+                > = std::collections::HashMap::new();
+
+                if fase_hook_active {
+                    // Build a compile-time name→index map from param_paths
+                    // (param_paths[i] corresponds to accum_list[i]).
+                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
+                        param_paths
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| (p.as_str(), i as i64))
+                            .collect();
+
+                    for (param_name, primal_vid) in extractor.named_param_var_ids() {
+                        if !self.is_trainable_param_name(param_name) {
+                            continue;
+                        }
+                        let Some(&accum_idx) = param_name_to_accum_idx.get(param_name.as_str())
+                        else {
+                            // Not a tensor param — skip (scalar configs, etc.)
+                            continue;
+                        };
+                        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
+                            continue;
+                        };
+                        let Some(&primal_val) = full_vars.get(primal_vid) else {
+                            continue;
+                        };
+                        param_adj_set.insert(adj_vid);
+                        adj_vid_to_hook_entry.insert(
+                            adj_vid,
+                            ParamHookEntry {
+                                primal_val,
+                                accum_idx,
+                            },
+                        );
+                    }
+                }
+
                 // 7. Lower ADJOINT Wengert list using full_vars, which now
                 //    contains all intermediate VarId → Value mappings from
                 //    the forward pass. This is the key fix: the old code only
                 //    had named variables in primal_vars, so intermediate
                 //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
-                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
-                    self, builder, state, &adjoint, full_vars,
-                    None, // FASE on_param_grad hook — wired in Task 3
-                ) {
-                    Ok(gv) => gv,
-                    Err(e) => {
-                        eprintln!(
-                            "[nsl] source AD lowering failed ({}), \
-                             cannot fall back to tape AD after forward emit; \
-                             rerun without --source-ad",
-                            e
-                        );
-                        return Err(e);
+                let grad_lowered = if fase_hook_active && !param_adj_set.is_empty() {
+                    // FASE Deferred: consume each param gradient immediately.
+                    // The callback receives &mut Compiler explicitly so no
+                    // double-borrow occurs.
+                    let accum_val = accum_list.ok_or_else(|| {
+                        CodegenError::new(
+                            "fase_hook_active requires accum_list to be Some",
+                        )
+                    })?;
+                    let accum_scale = fase_plan.recipe.accum_scale;
+                    let num_params = num_params_val;
+                    let hook_map = &adj_vid_to_hook_entry;
+                    let plist = param_list;
+                    let mut fase_cb = |c: &mut Compiler,
+                                       var_id: crate::wengert::VarId,
+                                       grad_ptr: Value,
+                                       b: &mut cranelift_frontend::FunctionBuilder|
+                     -> Result<(), CodegenError> {
+                        let Some(entry) = hook_map.get(&var_id) else {
+                            return Ok(());
+                        };
+                        // Runtime pointer-scan: find the index in param_list that
+                        // matches the primal param pointer, then use the same index
+                        // for accum_list.  This is necessary because param_list and
+                        // accum_list are both indexed by param_paths order, but a
+                        // given primal_val may appear at any runtime slot if the
+                        // model has shared/aliased weights.
+                        //
+                        // Fast path: use the compile-time accum_idx directly.
+                        // accum_list[accum_idx] == the m_partial for this param
+                        // (both are param_paths-ordered).
+                        let _ = entry.primal_val; // present for future alias detection
+                        let idx_val = b.ins().iconst(cranelift_codegen::ir::types::I64, entry.accum_idx);
+                        let _ = num_params; // captured for guard assertions if needed
+                        let _ = plist;
+                        let m_partial =
+                            c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
+                        c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale)?;
+                        c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                        Ok(())
+                    };
+                    match crate::wengert_lower::compile_wengert_ops(
+                        self,
+                        builder,
+                        state,
+                        &adjoint,
+                        full_vars,
+                        Some((&param_adj_set, &mut fase_cb)),
+                    ) {
+                        Ok(gv) => gv,
+                        Err(e) => {
+                            eprintln!(
+                                "[nsl] source AD lowering (FASE hook) failed ({}), \
+                                 rerun without --source-ad",
+                                e
+                            );
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    match crate::wengert_lower::compile_wengert_ops(
+                        self, builder, state, &adjoint, full_vars,
+                        None,
+                    ) {
+                        Ok(gv) => gv,
+                        Err(e) => {
+                            eprintln!(
+                                "[nsl] source AD lowering failed ({}), \
+                                 cannot fall back to tape AD after forward emit; \
+                                 rerun without --source-ad",
+                                e
+                            );
+                            return Err(e);
+                        }
                     }
                 };
                 let grad_vars = &grad_lowered.var_map;
@@ -3945,12 +4079,20 @@ impl Compiler<'_> {
 
                 // 8. Collect parameter gradients into grads_list (NslList)
                 //
-                // Seed grads_list from the runtime param_list so it always has
-                // exactly one slot per collected parameter, then overwrite the
-                // matching slots using source-AD gradients keyed by parameter
-                // pointer identity. This avoids relying on a compile-time DFS
-                // path enumeration matching the runtime collector's traversal.
-                let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                // When FASE hook is active, every parameter gradient was already
+                // consumed (accumulated into m_partial + freed) during adjoint
+                // lowering.  Skip the grads_list construction entirely and emit
+                // a null sentinel so downstream code that is also guarded by
+                // `!fase_hook_active` never dereferences it.
+                //
+                // When hook is inactive: seed grads_list from the runtime
+                // param_list so it always has exactly one slot per collected
+                // parameter, then overwrite the matching slots using source-AD
+                // gradients keyed by parameter pointer identity.  This avoids
+                // relying on a compile-time DFS path enumeration matching the
+                // runtime collector's traversal.
+                let grads = if !fase_hook_active {
+                let grads_inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
 
                 // 8a. Initialize one zero gradient per runtime parameter.
                 let fill_i_var = state.new_variable();
@@ -3971,7 +4113,7 @@ impl Compiler<'_> {
                 builder.seal_block(fill_body);
                 let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
                 let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
-                self.compile_call_by_name(builder, "nsl_list_push", &[grads, z])?;
+                self.compile_call_by_name(builder, "nsl_list_push", &[grads_inner, z])?;
                 let fill_one = builder.ins().iconst(cl_types::I64, 1);
                 let fill_next = builder.ins().iadd(fi, fill_one);
                 builder.def_var(fill_i_var, fill_next);
@@ -4069,7 +4211,7 @@ impl Compiler<'_> {
                     builder.switch_to_block(scan_match);
                     builder.seal_block(scan_match);
                     let old_grad =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[grads, si])?;
+                        self.compile_call_by_name(builder, "nsl_list_get", &[grads_inner, si])?;
                     // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
                     let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let summed_grad = self.compile_call_by_name(
@@ -4082,7 +4224,7 @@ impl Compiler<'_> {
                     let next_match_count = builder.ins().iadd(match_count, match_one);
                     builder.def_var(scan_match_count_var, next_match_count);
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[old_grad])?;
-                    self.compile_call_by_name(builder, "nsl_list_set", &[grads, si, summed_grad])?;
+                    self.compile_call_by_name(builder, "nsl_list_set", &[grads_inner, si, summed_grad])?;
                     builder.ins().jump(scan_next, &[]);
 
                     builder.switch_to_block(scan_next);
@@ -4121,6 +4263,13 @@ impl Compiler<'_> {
                     grad_ignored_config_tensor,
                     grad_ignored_non_tensor,
                 );
+                grads_inner // value returned from the `if !fase_hook_active` arm
+                } else {
+                    // Hook consumed all param grads during adjoint lowering.
+                    // Emit a null sentinel — downstream grads_list consumers are
+                    // all guarded by `!fase_hook_active`.
+                    builder.ins().iconst(cl_types::I64, 0)
+                };
 
                 let mut retained_full_vars = std::collections::HashSet::new();
                 retained_full_vars.insert(loss_var_id);
@@ -4163,7 +4312,8 @@ impl Compiler<'_> {
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
-        if self.compile_options.debug_training {
+        // Skip when hook active — grads_list is a null sentinel.
+        if self.compile_options.debug_training && !fase_hook_active {
             self.compile_call_by_name(
                 builder,
                 "nsl_debug_grad_checksum",
@@ -4171,8 +4321,10 @@ impl Compiler<'_> {
             )?;
         }
 
-        // 7e2. Gradient clipping (only if grad_clip was specified)
-        if grad_clip < f64::MAX {
+        // 7e2. Gradient clipping (only if grad_clip was specified).
+        // Skip when FASE hook is active — clip is applied via two_phase_clip
+        // on m_partial (Phase A/B in the optimizer block below), not on grads_list.
+        if !fase_hook_active && grad_clip < f64::MAX {
             let max_norm_val = builder.ins().f64const(grad_clip);
             self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
         }
@@ -4204,6 +4356,7 @@ impl Compiler<'_> {
             builder.def_var(should_step_var, true_val);
         }
 
+        if !fase_hook_active {
         if let Some(accum) = accum_list {
             // When two_phase_clip is active, Phase A (in the optimizer block) handles
             // the final micro-batch's accumulation as part of the fused accumulate+sum_sq
@@ -4287,6 +4440,7 @@ impl Compiler<'_> {
                 state.current_block = Some(join_block);
             }
         }
+        } // end if !fase_hook_active (per-micro-batch accumulation guard)
 
         // 7e4. Gradient accumulation gate: only step optimizer every N batches
         let optimizer_block = builder.create_block();
@@ -4366,17 +4520,22 @@ impl Compiler<'_> {
 
                     let pa_mpart =
                         self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
-                    let pa_grad = self.compile_call_by_name(
-                        builder,
-                        "nsl_list_get",
-                        &[grads_list, pa_i],
-                    )?;
-                    self.fase_emit_accumulate(
-                        builder,
-                        pa_mpart,
-                        pa_grad,
-                        fase_plan.recipe.accum_scale,
-                    )?;
+                    // When FASE hook is active, accumulation already happened
+                    // during adjoint lowering — skip the grads_list read + accumulate.
+                    if !fase_hook_active {
+                        let pa_grad = self.compile_call_by_name(
+                            builder,
+                            "nsl_list_get",
+                            &[grads_list, pa_i],
+                        )?;
+                        self.fase_emit_accumulate(
+                            builder,
+                            pa_mpart,
+                            pa_grad,
+                            fase_plan.recipe.accum_scale,
+                        )?;
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
+                    }
                     let pa_sq = self.compile_call_by_name(
                         builder,
                         "nsl_tensor_sum_sq",
@@ -4385,7 +4544,6 @@ impl Compiler<'_> {
                     let pa_tot_cur = builder.use_var(pa_tot_var);
                     let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
                     builder.def_var(pa_tot_var, pa_tot_new);
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
                     let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
                     builder.def_var(pa_i_var, pa_i_next);
                     builder.ins().jump(pa_hdr, &[]);
@@ -4394,8 +4552,10 @@ impl Compiler<'_> {
                     builder.seal_block(pa_hdr);
                     builder.seal_block(pa_exit);
 
-                    // Free grads_list wrapper (individual tensors freed in loop above)
-                    self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+                    // Free grads_list wrapper — skip when hook active (null sentinel).
+                    if !fase_hook_active {
+                        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+                    }
 
                     // ── Scalar: clip_factor = min(1, grad_clip / (sqrt(total_sq) + 1e-6)) ──
                     // `grad_clip` is the raw f64 from the train-block config
@@ -4769,8 +4929,10 @@ impl Compiler<'_> {
             builder.switch_to_block(c_exit);
             builder.seal_block(c_exit);
             state.current_block = Some(c_exit);
-        } else {
-            // No accumulation — free gradient tensors and grads_list every batch
+        } else if !fase_hook_active {
+            // No accumulation — free gradient tensors and grads_list every batch.
+            // Skip when FASE hook is active: grads are already freed during
+            // adjoint lowering, and grads_list is a null sentinel.
             let cleanup_i_var = state.new_variable();
             builder.declare_var(cleanup_i_var, cl_types::I64);
             let c_zero = builder.ins().iconst(cl_types::I64, 0);

@@ -28,11 +28,13 @@ pub struct LoweredWengert {
 ///
 /// `on_param_grad`, when `Some((set, cb))`, causes `cb` to be invoked
 /// immediately after any op whose `result` VarId is in `set`.  The callback
-/// receives the VarId and the just-produced Cranelift Value (a tensor
-/// pointer).  The gradient is then REMOVED from `var_map` — the callback
-/// is responsible for freeing or otherwise owning that tensor.  Used by
-/// FASE Deferred to consume parameter gradients during backward lowering
-/// so only one gradient is live at a time.
+/// receives `(&mut Compiler, VarId, Value, &mut FunctionBuilder)` — the
+/// compiler is passed explicitly so the closure does NOT need to capture it,
+/// avoiding a double-mutable-borrow with the `compiler` parameter above.
+/// The gradient is then REMOVED from `var_map` — the callback is responsible
+/// for freeing or otherwise owning that tensor.  Used by FASE Deferred to
+/// consume parameter gradients during backward lowering so only one gradient
+/// is live at a time.
 pub fn compile_wengert_ops(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
@@ -41,7 +43,12 @@ pub fn compile_wengert_ops(
     primal_vars: &VarMap,
     mut on_param_grad: Option<(
         &std::collections::HashSet<VarId>,
-        &mut dyn FnMut(VarId, Value, &mut FunctionBuilder) -> Result<(), CodegenError>,
+        &mut dyn FnMut(
+            &mut Compiler,
+            VarId,
+            Value,
+            &mut FunctionBuilder,
+        ) -> Result<(), CodegenError>,
     )>,
 ) -> Result<LoweredWengert, CodegenError> {
     let mut var_map = primal_vars.clone();
@@ -76,7 +83,7 @@ pub fn compile_wengert_ops(
         if let Some(ref mut hook) = on_param_grad {
             let (param_set, cb) = hook;
             if param_set.contains(&op.result) {
-                cb(op.result, result_val, builder)?;
+                cb(compiler, op.result, result_val, builder)?;
                 // Callback owns/freed the tensor — remove from var_map so
                 // downstream code can't accidentally re-use it.
                 var_map.remove(&op.result);
@@ -1515,6 +1522,7 @@ mod tests {
             _hook: Option<(
                 &std::collections::HashSet<VarId>,
                 &mut dyn FnMut(
+                    &mut crate::compiler::Compiler,
                     VarId,
                     Value,
                     &mut FunctionBuilder,
