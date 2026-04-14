@@ -2,6 +2,7 @@
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
 pub mod awq_hook;
+pub mod wggo_gradient_hook;
 pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
@@ -16,7 +17,8 @@ pub mod sidecar;
 pub mod subprocess;
 
 pub use ctx::{BufferHandle, CalibCtx};
-pub use hooks::{CalibrationHook, CalibrationResult};
+pub use hooks::{ArenaLayout, CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
+pub use wggo_gradient_hook::{discover_loss_anchor, LayerGradTarget, WggoAnchorError, WggoGradientHook};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
