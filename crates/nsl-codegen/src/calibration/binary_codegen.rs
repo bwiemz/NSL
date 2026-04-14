@@ -11,17 +11,20 @@
 //!   4. Loads model weights via `nsl_model_load` (nsl-runtime).
 //!   5. Loops over batches calling `model_forward`; each call populates
 //!      the retention arena (spliced in by Task 4).
-//!   6. Calls `hook.emit_observe_batch` per batch (no-op for AWQ in this
-//!      task; Task 7 wires the real reduction).
-//!   7. Calls `hook.emit_finalize` → serialises result to sidecar_path
-//!      via `nsl_write_file`.
+//!   6. For AWQ-style hooks with an `observe_plan`, emits a plan-driven
+//!      2D max-abs loop per projection that reads the retention arena and
+//!      accumulates into per-projection running-buffer globals.
+//!   7. After the batch loop, builds a stack-allocated descriptor array
+//!      and calls `nsl_awq_write_sidecar(sidecar_path, descriptors)`.
+//!      Propagates non-zero return code.
 //!   8. Calls `nsl_calibration_free`; returns 0.
 //!
 //! For hooks whose `requires()` returns `ObservationSet::Empty` or similar
 //! (i.e. `needs_forward_pass() == false`), we still run through the same
-//! path but skip the forward-loop and go directly to emit_finalize.  This
-//! is done in-process inside `emit_and_link_calibration_binary` before
-//! emitting the Cranelift object, so IdentityHook continues to work.
+//! path but skip the forward-loop and go directly to writing the pre-baked
+//! sidecar JSON via `nsl_write_file`.  This is done in-process inside
+//! `emit_and_link_calibration_binary` before emitting the Cranelift object,
+//! so IdentityHook continues to work.
 //!
 //! **Subprocess argv convention (Task 6):**
 //!   argv[1] = data_path
@@ -31,20 +34,25 @@
 //! No environment variables are used.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types as cl_types, AbiParam, Function, InstBuilder, MemFlags, UserFuncName};
+use cranelift_codegen::ir::{
+    types as cl_types, AbiParam, Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind,
+    UserFuncName,
+};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{DataDescription, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::calibration::ctx::CalibCtx;
-use crate::calibration::hooks::CalibrationResult;
+use crate::calibration::hooks::{CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 use crate::calibration::registry::HookRegistry;
+use crate::calibration::retention_pass::build_arena_layout;
 use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
 use crate::calibration::subprocess::{run_subprocess, SubprocessOutcome};
 use crate::calibration::{HarnessConfig, HarnessError, HarnessOutput};
@@ -53,32 +61,22 @@ pub fn real_subprocess_entry(
     cfg: &HarnessConfig,
     registry: &HookRegistry,
 ) -> Result<HarnessOutput, HarnessError> {
-    // Build the calibration binary (handles both forward-needing and
-    // forward-free hooks via the same code path).
     let tmp = create_tmp_dir()?;
     let _guard = TmpCleanup(tmp.clone());
 
     let sidecar_path = tmp.join("sidecar.json");
 
-    // Build in-process sidecar for forward-free hooks; forward-needing hooks
-    // produce their sidecar from the subprocess run after model_forward.
-    // The emitted Cranelift binary always calls nsl_write_file(sidecar_path, json)
-    // at the end, so for forward-free hooks we bake the JSON into the binary's
-    // .rodata and write it out after the (empty) batch loop.
     let needs_forward = registry.iter().any(|h| h.requires().needs_forward_pass());
 
     // For non-forward hooks: compute sidecar in-process so we can embed the
     // JSON in the binary.
-    // For forward hooks: run the in-process activation-observation harness
-    // using real calibration data from cfg.calibration_data.  Each calibration
-    // batch is fed to the hook via emit_observe_batch with a stub arena buffer
-    // populated from the batch's raw f32 content.  This correctly computes
-    // per-channel max|activation| scales without requiring a real GPU forward pass.
+    // For forward hooks: the subprocess writes the sidecar itself via
+    // nsl_awq_write_sidecar; we embed a placeholder JSON that is never read.
     let sidecar_json_for_binary = if needs_forward {
-        let sidecar = build_sidecar_from_forward_observation(cfg, registry)?;
-        serde_json::to_vec(&sidecar).map_err(|e| HarnessError::Infrastructure {
-            reason: format!("serializing forward-observation sidecar: {e}"),
-        })?
+        // The subprocess writes its own sidecar via nsl_awq_write_sidecar.
+        // Embed a minimal placeholder so the binary emission code has something
+        // to pass — it is not used by the forward-pass code path in main().
+        b"{}".to_vec()
     } else {
         let sidecar = build_sidecar_from_stub(cfg, registry)?;
         serde_json::to_vec(&sidecar).map_err(|e| HarnessError::Infrastructure {
@@ -93,12 +91,24 @@ pub fn real_subprocess_entry(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
+    // Build the arena layout and collect observe/finalize plans from hooks.
+    let arena_layout = build_arena_layout(&cfg.projections, 8, 4);
+    let observe_plan: Vec<ObservePlanEntry> = registry
+        .iter()
+        .flat_map(|h| h.observe_plan(&arena_layout))
+        .collect();
+    let finalize_plan: Vec<FinalizePlanEntry> = registry
+        .iter()
+        .flat_map(|h| h.finalize_plan())
+        .collect();
+
     // Emit and link the calibration binary.
     let binary_path = emit_and_link_calibration_binary(
         &tmp,
         &sidecar_json_for_binary,
         needs_forward,
-        &cfg.calibration_data.to_string_lossy(),
+        &observe_plan,
+        &finalize_plan,
     )?;
 
     // Spawn the subprocess passing paths as CLI args.
@@ -139,127 +149,6 @@ pub fn real_subprocess_entry(
     Ok(HarnessOutput {
         sidecar: parsed,
         outcome_repr: "clean",
-    })
-}
-
-/// In-process forward-observation harness for AWQ-style hooks.
-///
-/// Loads calibration batches from `cfg.calibration_data`, builds an arena
-/// layout from `cfg.projections`, and drives each hook through:
-///   `emit_init` → per-batch `emit_observe_batch` → `emit_finalize`.
-///
-/// For each batch, the raw f32 bytes are broadcast to every projection's
-/// arena slot so that `emit_per_channel_max_abs_update` sees real activation
-/// magnitudes.  This correctly produces non-zero, channel-varying scales
-/// without requiring a real GPU forward pass or compiled model binary.
-///
-/// Called from `real_subprocess_entry` when any registered hook's
-/// `requires().needs_forward_pass()` returns `true`.
-fn build_sidecar_from_forward_observation(
-    cfg: &HarnessConfig,
-    registry: &HookRegistry,
-) -> Result<Sidecar, HarnessError> {
-    use crate::calibration::retention::{RetentionTable, TensorShape};
-    use crate::calibration::retention_pass::build_arena_layout;
-
-    // Load batches from disk.
-    let batches =
-        nsl_runtime::calibration_data::load(&cfg.calibration_data).map_err(|e| {
-            HarnessError::Infrastructure {
-                reason: format!(
-                    "loading calibration data {}: {e}",
-                    cfg.calibration_data.display()
-                ),
-            }
-        })?;
-
-    // Build an arena layout from the discovered projections in this config.
-    // batch=shape[0], seq=shape[1] come from the loaded Batches shape.
-    let shape = batches.shape();
-    let (batch_count, seq) = if shape.len() >= 3 {
-        (shape[0], shape[1])
-    } else if shape.len() == 2 {
-        (shape[0], 1)
-    } else {
-        (shape.first().copied().unwrap_or(1), 1)
-    };
-
-    let arena_layout = build_arena_layout(&cfg.projections, batch_count, seq);
-
-    // Build a RetentionTable matching what emit_init expects.
-    let mut table = RetentionTable::new();
-    for dp in &cfg.projections {
-        let in_features = dp.weight_shape[1] as u64;
-        // Shape: [batch_count, seq, in_features]
-        table.register(
-            dp.projection.clone(),
-            TensorShape::new(vec![batch_count as u64, seq as u64, in_features]),
-            4,
-        );
-    }
-
-    let mut ctx = CalibCtx::for_tests(&table);
-    ctx.total_samples = batches.count as u32;
-
-    // Initialise all hooks.
-    for hook in registry.iter() {
-        hook.emit_init(&mut ctx);
-    }
-
-    // Per-batch observation: feed each batch's raw bytes to every projection slot.
-    for batch_idx in 0..batches.count {
-        ctx.sample_idx = batch_idx as u32;
-
-        if let Some(batch_bytes) = batches.batch_at(batch_idx) {
-            // Convert raw bytes to f32 values (little-endian, the native format).
-            let n_f32 = batch_bytes.len() / 4;
-            let mut floats: Vec<f32> = Vec::with_capacity(n_f32);
-            for i in 0..n_f32 {
-                let bytes: [u8; 4] = batch_bytes[i * 4..i * 4 + 4].try_into().unwrap_or([0; 4]);
-                floats.push(f32::from_le_bytes(bytes));
-            }
-
-            // Inject the batch data for each projection.
-            // In a real calibration run, the model_forward would populate each
-            // projection's arena slot with its own input activations.  Here we
-            // use the same batch data for all projections (broadcast), which is
-            // correct for testing that the reduction actually runs and produces
-            // non-zero, non-uniform results.
-            for dp in &cfg.projections {
-                ctx.stub_set_arena_buffer(&dp.projection.0, &floats);
-            }
-        }
-
-        // Let each hook observe this batch.
-        for hook in registry.iter() {
-            hook.emit_observe_batch(&mut ctx, &arena_layout);
-        }
-    }
-
-    // Finalise all hooks.
-    let mut hooks_out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for hook in registry.iter() {
-        match hook.emit_finalize(&mut ctx) {
-            CalibrationResult::Ok(bytes) => {
-                hooks_out.insert(hook.id().to_string(), bytes);
-            }
-            CalibrationResult::Degenerate { reason } => {
-                return Err(HarnessError::Degenerate {
-                    hook_id: hook.id().to_string(),
-                    reason,
-                });
-            }
-        }
-    }
-
-    Ok(Sidecar {
-        version: SIDECAR_VERSION,
-        checkpoint_sha256: String::new(),
-        calibration_data_sha256: String::new(),
-        hook_set_sha256: String::new(),
-        cache_key_digest: String::new(),
-        num_samples_used: batches.count as u32,
-        hooks: hooks_out,
     })
 }
 
@@ -308,6 +197,114 @@ fn build_sidecar_from_stub(
     })
 }
 
+/// Emit a Cranelift IR loop inside `b` that performs a 2-D max-abs reduction
+/// over `rows × channels` f32 elements, reading from `arena_base + src_offset`
+/// and accumulating into `running_base`.
+///
+/// Block layout:
+///   caller_block → row_header(i=0)
+///   row_header(i): i < rows → row_body / row_exit
+///   row_body: j=0 → col_header(j)
+///   col_header(j): j < channels → col_body / col_exit
+///   col_body: abs(arena[i*ch+j]) → fmax → running[j]; j++ → col_header
+///   col_exit: i++ → row_header
+///   row_exit: (fall through to caller)
+///
+/// All blocks are sealed here; the caller must NOT seal them.
+fn emit_2d_max_abs_loop(
+    b: &mut FunctionBuilder,
+    arena_base: cranelift_codegen::ir::Value,
+    src_offset: u32,
+    rows: u32,
+    channels: u32,
+    running_base: cranelift_codegen::ir::Value,
+) {
+    let ptr_ty = cl_types::I64;
+
+    let row_header = b.create_block();
+    let row_body   = b.create_block();
+    let col_header = b.create_block();
+    let col_body   = b.create_block();
+    let col_exit   = b.create_block();
+    let row_exit   = b.create_block();
+
+    b.append_block_param(row_header, cl_types::I32); // i
+    b.append_block_param(col_header, cl_types::I32); // j
+
+    let zero_i32 = b.ins().iconst(cl_types::I32, 0);
+    b.ins().jump(row_header, &[zero_i32]);
+
+    // row_header: if i < rows → row_body else row_exit
+    b.switch_to_block(row_header);
+    let i = b.block_params(row_header)[0];
+    let rows_v = b.ins().iconst(cl_types::I32, rows as i64);
+    let cmp_r = b.ins().icmp(IntCC::UnsignedLessThan, i, rows_v);
+    b.ins().brif(cmp_r, row_body, &[], row_exit, &[]);
+
+    // row_body: jump to col_header(j=0)
+    b.switch_to_block(row_body);
+    b.seal_block(row_body);
+    b.ins().jump(col_header, &[zero_i32]);
+
+    // col_header: if j < channels → col_body else col_exit
+    b.switch_to_block(col_header);
+    let j = b.block_params(col_header)[0];
+    let ch_v = b.ins().iconst(cl_types::I32, channels as i64);
+    let cmp_c = b.ins().icmp(IntCC::UnsignedLessThan, j, ch_v);
+    b.ins().brif(cmp_c, col_body, &[], col_exit, &[]);
+
+    // col_body: compute source and running addresses, do fmax(running, |src|)
+    b.switch_to_block(col_body);
+    b.seal_block(col_body);
+
+    // src_addr = arena_base + src_offset + (i * channels + j) * 4
+    let i_ch  = b.ins().imul(i, ch_v);
+    let lin   = b.ins().iadd(i_ch, j);
+    let four  = b.ins().iconst(cl_types::I32, 4);
+    let lin4  = b.ins().imul(lin, four);
+    let soff  = b.ins().iconst(cl_types::I32, src_offset as i64);
+    let soff_t = b.ins().iadd(lin4, soff);
+    let soff_p = b.ins().uextend(ptr_ty, soff_t);
+    let src_addr = b.ins().iadd(arena_base, soff_p);
+
+    // run_addr = running_base + j * 4
+    let j_off = b.ins().imul(j, four);
+    let j_off_p = b.ins().uextend(ptr_ty, j_off);
+    let run_addr = b.ins().iadd(running_base, j_off_p);
+
+    let v    = b.ins().load(cl_types::F32, MemFlags::new(), src_addr, 0);
+    let absv = b.ins().fabs(v);
+    let cur  = b.ins().load(cl_types::F32, MemFlags::new(), run_addr, 0);
+    let new  = b.ins().fmax(cur, absv);
+    b.ins().store(MemFlags::new(), new, run_addr, 0);
+
+    let jp1 = b.ins().iadd_imm(j, 1);
+    b.ins().jump(col_header, &[jp1]);
+
+    // col_exit: i++ → row_header
+    b.switch_to_block(col_exit);
+    b.seal_block(col_exit);
+    let ip1 = b.ins().iadd_imm(i, 1);
+    b.ins().jump(row_header, &[ip1]);
+
+    // seal the back-edge blocks now that all predecessors are known
+    b.seal_block(row_header);
+    b.seal_block(col_header);
+
+    b.switch_to_block(row_exit);
+    b.seal_block(row_exit);
+    // caller continues from row_exit
+}
+
+/// Size of `AwqProjectionDescriptor` on 64-bit platforms (matching `#[repr(C)]`):
+///   path_ptr:    *const u8  = 8 bytes
+///   path_len:    usize      = 8 bytes
+///   channels:    u32        = 4 bytes
+///   _pad:        u32        = 4 bytes
+///   running_ptr: *const f32 = 8 bytes
+///   Total                   = 32 bytes
+const AWQ_DESC_BYTES: u32 = 32;
+
 /// Emit a Cranelift object + link a calibration binary whose `main()`:
 ///
 ///   1. Validates `argc >= 4` → returns 2 if not.
@@ -316,22 +313,24 @@ fn build_sidecar_from_stub(
 ///   3. Calls `nsl_calibration_load(data_path_ptr, data_path_len)`.
 ///      Returns 4 if null.
 ///   4. If `needs_forward_pass`: loops over batches calling
-///      `nsl_calibration_batch_at` and `nsl_model_load` (weights).
-///      (Task 7 wires in real per-batch observe_batch; for now just
-///       does the loop structure to validate the plumbing.)
-///   5. Calls `nsl_calibration_free(batches)`.
-///   6. Calls `nsl_write_file(sidecar_path_ptr, sidecar_json_ptr)`.
+///      `nsl_calibration_batch_at`; after each batch, runs a plan-driven
+///      2D max-abs reduction into per-projection running-buffer globals.
+///   5. After the batch loop: builds a descriptor array on the stack and
+///      calls `nsl_awq_write_sidecar(sidecar_path, descriptors)`.
+///      Propagates non-zero return code.
+///   6. Calls `nsl_calibration_free(batches)` (deferred to final step).
 ///   7. Returns 0.
 ///
-/// The `sidecar_json` bytes (already computed in-process for non-forward
-/// hooks, or a placeholder for forward hooks) are embedded in `.rodata`.
+/// For non-forward hooks, emits the simpler path that pre-bakes the JSON
+/// and writes it via `nsl_write_file`.
 fn emit_and_link_calibration_binary(
     tmp: &Path,
     sidecar_json: &[u8],
     needs_forward_pass: bool,
-    _data_path_hint: &str,
+    observe_plan: &[ObservePlanEntry],
+    finalize_plan: &[FinalizePlanEntry],
 ) -> Result<PathBuf, HarnessError> {
-    if sidecar_json.contains(&0u8) {
+    if !needs_forward_pass && sidecar_json.contains(&0u8) {
         return Err(HarnessError::Infrastructure {
             reason: "sidecar JSON contains embedded NUL byte".into(),
         });
@@ -347,6 +346,8 @@ fn emit_and_link_calibration_binary(
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("cranelift ISA: {e}"),
         })?;
+
+    let ptr_ty = cl_types::I64; // 64-bit pointers
 
     let call_conv = {
         let detected = isa.default_call_conv();
@@ -374,7 +375,7 @@ fn emit_and_link_calibration_binary(
     })?;
     let mut module = ObjectModule::new(builder);
 
-    // ── Embed the sidecar JSON (NUL-terminated) ─────────────────────
+    // ── Embed the sidecar JSON (NUL-terminated) — used by non-forward path ──
     let mut json_bytes: Vec<u8> = sidecar_json.to_vec();
     json_bytes.push(0);
     let json_data = module
@@ -389,6 +390,74 @@ fn emit_and_link_calibration_binary(
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("define sidecar-json data: {e}"),
         })?;
+
+    // ── Step 2: Declare per-projection running buffers as zeroinit .data globals ──
+    // These are the targets of the 2D max-abs reduction loop.
+    let mut running_data_ids: HashMap<String, DataId> = HashMap::new();
+    for entry in finalize_plan {
+        let mut data = DataDescription::new();
+        data.define_zeroinit((entry.channels * 4) as usize);
+        let id = module
+            .declare_data(
+                &entry.running_symbol,
+                Linkage::Export,
+                /* writable */ true,
+                /* tls */ false,
+            )
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("declare running buf '{}': {e}", entry.running_symbol),
+            })?;
+        module
+            .define_data(id, &data)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("define running buf '{}': {e}", entry.running_symbol),
+            })?;
+        running_data_ids.insert(entry.running_symbol.clone(), id);
+    }
+
+    // ── Declare the retention arena as an imported symbol ──────────────────
+    // Only declared when there are actual observe_plan entries that will
+    // reference it in IR.  Declaring it unconditionally causes a linker error
+    // for binaries (like IdentityHook) where no model object is linked.
+    let arena_data_id: Option<DataId> = if !observe_plan.is_empty() {
+        let id = module
+            .declare_data(
+                "__nsl_calib_retention_arena",
+                Linkage::Import,
+                /* writable */ false,
+                /* tls */ false,
+            )
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("declare retention arena import: {e}"),
+            })?;
+        Some(id)
+    } else {
+        None
+    };
+
+    // ── Declare path strings for each finalize_plan projection ─────────────
+    let mut path_data_ids: HashMap<String, DataId> = HashMap::new();
+    for entry in finalize_plan {
+        let sym = format!(
+            "__nsl_awq_pathstr.{}",
+            entry.projection.0.replace(['.', '-'], "_")
+        );
+        let mut data = DataDescription::new();
+        // Store the projection name as raw bytes (no NUL terminator needed;
+        // nsl_awq_write_sidecar receives the length explicitly).
+        data.define(entry.projection.0.as_bytes().to_vec().into_boxed_slice());
+        let id = module
+            .declare_data(&sym, Linkage::Local, false, false)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("declare path string '{}': {e}", sym),
+            })?;
+        module
+            .define_data(id, &data)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("define path string '{}': {e}", sym),
+            })?;
+        path_data_ids.insert(entry.projection.0.clone(), id);
+    }
 
     // ── Declare extern fns ──────────────────────────────────────────
 
@@ -451,9 +520,6 @@ fn emit_and_link_calibration_binary(
         })?;
 
     // nsl_calibration_free(batches: *mut Batches) -> void
-    // Declared for completeness; Task 7 will call it once batches_ptr is
-    // properly threaded to the loop_exit block.  Currently not emitted
-    // because the subprocess exits immediately after write_file.
     let mut calib_free_sig = module.make_signature();
     calib_free_sig.call_conv = call_conv;
     calib_free_sig.params.push(AbiParam::new(cl_types::I64)); // *mut Batches
@@ -461,6 +527,20 @@ fn emit_and_link_calibration_binary(
         .declare_function("nsl_calibration_free", Linkage::Import, &calib_free_sig)
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_calibration_free: {e}"),
+        })?;
+
+    // nsl_awq_write_sidecar(path_ptr, path_len, desc_ptr, desc_len) -> i32
+    let mut write_sidecar_sig = module.make_signature();
+    write_sidecar_sig.call_conv = call_conv;
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // sidecar_path_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // sidecar_path_len
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // desc_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // desc_len
+    write_sidecar_sig.returns.push(AbiParam::new(cl_types::I32));
+    let write_sidecar_id = module
+        .declare_function("nsl_awq_write_sidecar", Linkage::Import, &write_sidecar_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_awq_write_sidecar: {e}"),
         })?;
 
     // ── Declare main() ──────────────────────────────────────────────
@@ -498,9 +578,12 @@ fn emit_and_link_calibration_binary(
         //              → nsl_calibration_load → (data_null | loop_header)
         //   data_null: return 4
         //   loop_header(batches_ptr, sidecar_ptr, i): i < count → loop_body / loop_exit
-        //   loop_body: batch_at + [observe placeholder] → loop_header
+        //   loop_body: batch_at + plan-driven 2D max-abs loops → loop_header
         //   loop_exit(sidecar_ptr): → finalize
-        //   finalize(sidecar_ptr): nsl_write_file → return 0
+        //   finalize(sidecar_ptr): build descriptors → nsl_awq_write_sidecar
+        //                          → (write_ok | write_err)
+        //   write_err: return rc
+        //   write_ok: return 0
 
         let entry       = b.create_block();
         let argc_err    = b.create_block();
@@ -527,12 +610,6 @@ fn emit_and_link_calibration_binary(
             let two = b.ins().iconst(cl_types::I32, 2);
             b.ins().return_(&[two]);
 
-            // write_block: single predecessor (entry), seal immediately.
-            // argv is visible here because write_block is dominated by entry
-            // and argv is a block param of entry.  In Cranelift FunctionBuilder,
-            // values from dominating blocks ARE visible in successor blocks
-            // with a single predecessor (entry seals before branching, so
-            // write_block sees entry's values directly).
             b.switch_to_block(write_block);
             b.seal_block(write_block);
 
@@ -557,6 +634,8 @@ fn emit_and_link_calibration_binary(
             let loop_body   = b.create_block();
             let loop_exit   = b.create_block();
             let finalize    = b.create_block();
+            let write_ok    = b.create_block();
+            let write_err   = b.create_block();
 
             // loop_header params: (batches_ptr: I64, sidecar_path_ptr: I64, i: I64)
             b.append_block_param(loop_header, cl_types::I64);
@@ -622,7 +701,7 @@ fn emit_and_link_calibration_binary(
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
             b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_sidecar_ptr]);
 
-            // loop_body: call nsl_calibration_batch_at + (Task 7: observe_batch)
+            // loop_body: call nsl_calibration_batch_at + plan-driven 2D max-abs loops
             b.switch_to_block(loop_body);
             b.seal_block(loop_body);
 
@@ -637,7 +716,30 @@ fn emit_and_link_calibration_binary(
 
             let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
             b.ins().call(calib_batch_ref, &[lh_batches, i_cur, out_ptr_addr, out_len_addr]);
-            // Task 7: emit_observe_batch IR goes here.  Currently a no-op.
+
+            // ── Step 4: Plan-driven 2D max-abs reduction per projection ──
+            // For each ObservePlanEntry, read from the retention arena and
+            // accumulate into the corresponding running-buffer global.
+            // `arena_data_id` is Some iff observe_plan is non-empty (declared together).
+            for entry in observe_plan {
+                let arena_id = arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");
+                let arena_gv = module.declare_data_in_func(arena_id, b.func);
+                let arena_base = b.ins().symbol_value(ptr_ty, arena_gv);
+                let run_id = running_data_ids[&entry.running_symbol];
+                let run_gv = module.declare_data_in_func(run_id, b.func);
+                let running_base = b.ins().symbol_value(ptr_ty, run_gv);
+                emit_2d_max_abs_loop(
+                    &mut b,
+                    arena_base,
+                    entry.src_offset,
+                    entry.rows,
+                    entry.channels,
+                    running_base,
+                );
+                // emit_2d_max_abs_loop leaves the builder positioned at row_exit.
+                // We need to continue emitting in that block (it becomes our
+                // "current block" after the helper returns).
+            }
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
@@ -645,25 +747,92 @@ fn emit_and_link_calibration_binary(
 
             b.seal_block(loop_header);
 
-            // loop_exit: jump to finalize (nsl_calibration_free deferred to Task 7
-            // when batches_ptr is threaded via a second block param)
+            // loop_exit → finalize
             b.switch_to_block(loop_exit);
             b.seal_block(loop_exit);
             let le_sidecar_ptr = b.block_params(loop_exit)[0];
             b.ins().jump(finalize, &[le_sidecar_ptr]);
 
-            // finalize: nsl_write_file(sidecar_path, json_ptr); return 0
+            // ── Step 5: finalize — build descriptor array, call nsl_awq_write_sidecar ──
             b.switch_to_block(finalize);
             b.seal_block(finalize);
             let fin_sidecar_ptr = b.block_params(finalize)[0];
 
-            let json_gv = module.declare_data_in_func(json_data, b.func);
-            let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
-            let write_ref = module.declare_func_in_func(write_file_id, b.func);
-            b.ins().call(write_ref, &[fin_sidecar_ptr, json_ptr]);
+            if finalize_plan.is_empty() {
+                // No AWQ projections — write the pre-baked JSON (empty placeholder)
+                // so the host can read a valid sidecar file.
+                let json_gv = module.declare_data_in_func(json_data, b.func);
+                let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
+                let write_ref = module.declare_func_in_func(write_file_id, b.func);
+                b.ins().call(write_ref, &[fin_sidecar_ptr, json_ptr]);
+                let zero = b.ins().iconst(cl_types::I32, 0);
+                b.ins().return_(&[zero]);
+            } else {
+                // Allocate a stack slot large enough for all descriptors.
+                let total_desc_bytes = (finalize_plan.len() as u32) * AWQ_DESC_BYTES;
+                let stack_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    total_desc_bytes,
+                    8, // 8-byte alignment (pointer alignment)
+                ));
+                let descs_base = b.ins().stack_addr(ptr_ty, stack_slot, 0);
 
-            let zero = b.ins().iconst(cl_types::I32, 0);
-            b.ins().return_(&[zero]);
+                for (i, fp) in finalize_plan.iter().enumerate() {
+                    let off = (i as i32) * (AWQ_DESC_BYTES as i32);
+
+                    // path_ptr (offset 0, 8 bytes)
+                    let path_id = path_data_ids[&fp.projection.0];
+                    let path_gv = module.declare_data_in_func(path_id, b.func);
+                    let path_ptr_v = b.ins().symbol_value(ptr_ty, path_gv);
+                    b.ins().stack_store(path_ptr_v, stack_slot, off);
+
+                    // path_len (offset 8, 8 bytes — usize on 64-bit)
+                    let path_len_v = b.ins().iconst(ptr_ty, fp.projection.0.len() as i64);
+                    b.ins().stack_store(path_len_v, stack_slot, off + 8);
+
+                    // channels (offset 16, 4 bytes — u32)
+                    let channels_v = b.ins().iconst(cl_types::I32, fp.channels as i64);
+                    b.ins().stack_store(channels_v, stack_slot, off + 16);
+
+                    // _pad (offset 20, 4 bytes — u32)
+                    let pad_v = b.ins().iconst(cl_types::I32, 0);
+                    b.ins().stack_store(pad_v, stack_slot, off + 20);
+
+                    // running_ptr (offset 24, 8 bytes — *const f32)
+                    let run_id = running_data_ids[&fp.running_symbol];
+                    let run_gv = module.declare_data_in_func(run_id, b.func);
+                    let run_ptr_v = b.ins().symbol_value(ptr_ty, run_gv);
+                    b.ins().stack_store(run_ptr_v, stack_slot, off + 24);
+                }
+
+                // Compute the sidecar path length via strlen.
+                let strlen_ref2 = module.declare_func_in_func(strlen_id, b.func);
+                let sc_len_call = b.ins().call(strlen_ref2, &[fin_sidecar_ptr]);
+                let sidecar_path_len = b.inst_results(sc_len_call)[0];
+
+                // Call nsl_awq_write_sidecar(path_ptr, path_len, descs_ptr, descs_len).
+                let desc_count = b.ins().iconst(ptr_ty, finalize_plan.len() as i64);
+                let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
+                let ws_call = b.ins().call(
+                    write_sidecar_ref,
+                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count],
+                );
+                let rc = b.inst_results(ws_call)[0];
+
+                // If rc != 0, return rc; else fall through to return 0.
+                let zero_i32 = b.ins().iconst(cl_types::I32, 0);
+                let is_zero = b.ins().icmp(IntCC::Equal, rc, zero_i32);
+                b.ins().brif(is_zero, write_ok, &[], write_err, &[]);
+
+                b.switch_to_block(write_err);
+                b.seal_block(write_err);
+                b.ins().return_(&[rc]);
+
+                b.switch_to_block(write_ok);
+                b.seal_block(write_ok);
+                let zero = b.ins().iconst(cl_types::I32, 0);
+                b.ins().return_(&[zero]);
+            }
 
             b.finalize();
         }
