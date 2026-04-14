@@ -105,6 +105,7 @@ pub fn run_harness_stub(
         cache_key_digest: String::new(),
         num_samples_used: num_samples,
         hooks: hooks_out,
+        wggo_head_gradients: None,
     };
     Ok(HarnessOutput {
         sidecar,
@@ -257,6 +258,7 @@ fn empty_sidecar_for_fallback(
         cache_key_digest: String::new(),
         num_samples_used: 0,
         hooks: BTreeMap::new(),
+        wggo_head_gradients: None,
     }
 }
 
