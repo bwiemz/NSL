@@ -322,6 +322,7 @@ mod tests {
             },
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
+            wggo_overrides: None,
         })
     }
 
