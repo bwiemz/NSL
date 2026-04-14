@@ -24,7 +24,11 @@ impl AwqCalibrationHook {
         Self { projections, handles: Mutex::new(BTreeMap::new()) }
     }
 
-    #[cfg(test)]
+    /// Test-only handle inspection.  Exposed (no `#[cfg(test)]`) so
+    /// integration tests in `tests/` — which compile against the crate
+    /// as an external dependency — can drive the stub reduction path.
+    /// Not intended for production callers.
+    #[doc(hidden)]
     pub fn handles_for_test(&self) -> std::sync::MutexGuard<'_, BTreeMap<ProjectionRef, BufferHandle>> {
         self.handles.lock().unwrap()
     }
