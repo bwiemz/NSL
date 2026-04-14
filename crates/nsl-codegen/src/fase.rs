@@ -229,22 +229,6 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         }
     }
 
-    // Pass #1 scope: two-phase gradient clipping is not yet emitted.
-    // When the user sets grad_clip, fall back to FullBuffer so the
-    // backward emitter keeps the standard accumulation+clip+step path.
-    // Tracked as item #3 in the FASE roadmap.
-    let (mode, rationale) = if cfg.grad_clip.is_some() && mode == FaseMode::Deferred {
-        (
-            FaseMode::FullBuffer,
-            format!(
-                "grad_clip set — two-phase clipping codegen not yet implemented; falling back to FullBuffer ({})",
-                rationale
-            ),
-        )
-    } else {
-        (mode, rationale)
-    };
-
     FasePlan {
         mode,
         accumulation,
@@ -395,7 +379,9 @@ mod tests {
     }
 
     #[test]
-    fn grad_clip_downgrades_deferred_to_full_buffer_for_now() {
+    fn grad_clip_with_adamw_now_returns_deferred() {
+        // Reverses the item #1 Task 5 temporary downgrade.  Item #3 emits
+        // two-phase clip codegen, so grad_clip + Deferred is now valid.
         let cfg = FaseConfig {
             accumulation: 4,
             optimizer: FaseOptimizer::AdamW,
@@ -404,16 +390,12 @@ mod tests {
             ..Default::default()
         };
         let p = plan(&cfg);
-        assert_eq!(
-            p.mode,
-            FaseMode::FullBuffer,
-            "pass #1 does not implement two-phase clipping; grad_clip must force FullBuffer"
-        );
-        assert!(
-            p.rationale.contains("grad_clip"),
-            "rationale must mention grad_clip; got: {}",
-            p.rationale
-        );
+        assert_eq!(p.mode, FaseMode::Deferred);
+        assert!(p.two_phase_clip);
+        assert!(matches!(
+            p.backward_phases.last(),
+            Some(BackwardPhase::FinalTwoPhase)
+        ));
     }
 
     #[test]
