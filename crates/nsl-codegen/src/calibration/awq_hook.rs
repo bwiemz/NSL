@@ -8,9 +8,15 @@ use std::sync::Mutex;
 use crate::calibration::awq_sidecar;
 use crate::calibration::ctx::{BufferHandle, CalibCtx};
 use crate::calibration::discovery::DiscoveredProjection;
-use crate::calibration::hooks::{CalibrationHook, CalibrationResult};
+use crate::calibration::hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::retention::ArenaLayout;
+
+/// Produces a valid Cranelift data symbol name for a projection's running buffer.
+/// Replaces `.` with `_` since Cranelift symbol names can't contain periods.
+pub(crate) fn running_symbol_for(projection: &ProjectionRef) -> String {
+    format!("__nsl_awq_running.{}", projection.0.replace('.', "_"))
+}
 
 // NOTE: spec §7 text says "RefCell-backed state", but the
 // `CalibrationHook` trait requires `Send + Sync` so the registry can
@@ -109,6 +115,35 @@ impl CalibrationHook for AwqCalibrationHook {
             let rows = total_floats / in_feat;
             ctx.emit_per_channel_max_abs_update(&projection.0, *offset, rows, in_feat, handle);
         }
+    }
+
+    fn observe_plan(&self, arena: &ArenaLayout) -> Vec<ObservePlanEntry> {
+        arena.entries.iter().filter_map(|(proj, offset, nbytes)| {
+            let channels = *self.in_features.get(proj)?;
+            if channels == 0 { return None; }
+            let total = nbytes / 4;
+            if total % channels != 0 { return None; }
+            let rows = total / channels;
+            Some(ObservePlanEntry {
+                projection: proj.clone(),
+                src_offset: *offset,
+                rows,
+                channels,
+                running_symbol: running_symbol_for(proj),
+            })
+        }).collect()
+    }
+
+    fn finalize_plan(&self) -> Vec<FinalizePlanEntry> {
+        let mut entries: Vec<FinalizePlanEntry> = self.in_features.iter()
+            .map(|(proj, &channels)| FinalizePlanEntry {
+                projection: proj.clone(),
+                running_symbol: running_symbol_for(proj),
+                channels,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+        entries
     }
 
     fn emit_finalize(&self, ctx: &mut CalibCtx) -> CalibrationResult {
@@ -317,6 +352,47 @@ mod tests {
 
         let running = ctx.stub_running_max_abs_named("model.down");
         assert_eq!(running, vec![3.0, 5.0, 2.0]);
+    }
+
+    #[test]
+    fn awq_observe_plan_has_one_entry_per_projection() {
+        use crate::calibration::build_arena_layout;
+        use crate::calibration::observation::ProjectionRef;
+        use crate::calibration::discovery::DiscoveredProjection;
+
+        let ps = vec![
+            DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            },
+            DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.down_proj".into()),
+                weight_shape: [64, 128],
+            },
+        ];
+        let hook = AwqCalibrationHook::from_discovered(&ps);
+        let layout = build_arena_layout(&ps, 8, 4);
+
+        let observe = hook.observe_plan(&layout);
+        assert_eq!(observe.len(), 2);
+
+        // Look up entries by projection (order is arena-entry order, which is insertion order).
+        let up_entry = observe.iter().find(|e| e.projection.0 == "TinyMLP.up_proj").unwrap();
+        assert_eq!(up_entry.running_symbol, "__nsl_awq_running.TinyMLP_up_proj");
+        assert_eq!(up_entry.channels, 64);
+        assert_eq!(up_entry.rows, 32);
+        let down_entry = observe.iter().find(|e| e.projection.0 == "TinyMLP.down_proj").unwrap();
+        assert_eq!(down_entry.running_symbol, "__nsl_awq_running.TinyMLP_down_proj");
+        assert_eq!(down_entry.channels, 128);
+
+        let finalize = hook.finalize_plan();
+        assert_eq!(finalize.len(), 2);
+        // Finalize entries are sorted by projection path for determinism.
+        assert_eq!(finalize[0].projection.0, "TinyMLP.down_proj");
+        assert_eq!(finalize[0].channels, 128);
+        assert_eq!(finalize[0].running_symbol, "__nsl_awq_running.TinyMLP_down_proj");
+        assert_eq!(finalize[1].projection.0, "TinyMLP.up_proj");
+        assert_eq!(finalize[1].channels, 64);
     }
 
     #[test]

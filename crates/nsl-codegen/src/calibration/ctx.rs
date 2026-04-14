@@ -1,10 +1,9 @@
 //! Runtime context passed to `CalibrationHook::emit_*` methods.
 //!
-//! In production (Task 9), `CalibCtx` wraps a Cranelift
-//! `FunctionBuilder` + retention table + running-buffer map, and the
-//! API methods emit IR directly.  In unit-test mode, the same API is
-//! backed by concrete Rust state so hooks can be exercised without
-//! Cranelift.
+//! The stub-mode path (`stub_*` methods) is used by unit tests so
+//! hooks can be exercised without Cranelift.  The real IR emission for
+//! the 2D max-abs reduction is in `binary_codegen::emit_2d_max_abs_loop`
+//! and is driven by `ObservePlanEntry` / `FinalizePlanEntry` from Task 5.
 
 use std::collections::BTreeMap;
 
@@ -28,7 +27,6 @@ pub struct CalibCtx<'a> {
     /// Populated by `stub_set_arena_buffer`; consumed by
     /// `emit_per_channel_max_abs_update` in stub mode.
     stub_arena_data: BTreeMap<String, Vec<f32>>,
-    // Task 9 adds: fbuilder: &'a mut cranelift::FunctionBuilder,
 }
 
 impl<'a> CalibCtx<'a> {
@@ -174,11 +172,9 @@ impl<'a> CalibCtx<'a> {
             return;
         }
 
-        // ── Stub path ────────────────────────────────────────────────────────
+        // ── Stub path (unit tests only) ─────────────────────────────────────
+        // The real IR path is in binary_codegen::emit_2d_max_abs_loop.
         {
-            // We're always on the stub path until Task 9 adds a real
-            // FunctionBuilder.  Separate the borrow of stub_arena_data from
-            // running_buffers.
             let src = self.stub_arena_data.get(src_name).cloned().unwrap_or_default();
             let buf = self
                 .running_buffers
@@ -203,42 +199,6 @@ impl<'a> CalibCtx<'a> {
             }
             return;
         }
-
-        // ── Real IR path (Task 9) — unreachable until FunctionBuilder is wired
-        // TODO(task-9): remove the `return` above and emit Cranelift IR here.
-        // The outer loop structure should be:
-        //   for r in 0..rows {
-        //       emit_running_max_abs_f32(
-        //           fb, running_buf_ptr, arena_ptr + src_offset + r*channels*4, channels_val,
-        //       );
-        //   }
-        // Use `emit_nested_max_abs_loop` below once a FunctionBuilder is available.
-        #[allow(unreachable_code)]
-        {
-            // Silence unused-variable warnings on the real-IR parameters.
-            let _ = (_src_offset, rows, channels, running);
-        }
-    }
-
-    /// Emit a Cranelift outer loop over `rows`, calling
-    /// `emit_running_max_abs_f32` for each row.  Only callable once a real
-    /// `FunctionBuilder` is threaded through (Task 9).
-    ///
-    /// This method is intentionally `#[allow(dead_code)]` until Task 9.
-    #[allow(dead_code)]
-    fn emit_nested_max_abs_loop(
-        &mut self,
-        _src_offset: u32,
-        _rows: u32,
-        _channels: u32,
-        _running: BufferHandle,
-    ) {
-        // TODO(task-9): thread &mut FunctionBuilder through CalibCtx and emit:
-        //   iconst src_offset_i64, iconst channels_i32, iconst rows_i32
-        //   for r_val in 0..rows_val:
-        //       row_ptr = arena_ptr + src_offset + r_val*(channels*4)
-        //       emit_running_max_abs_f32(fb, running_buf_ptr, row_ptr, channels_val)
-        unimplemented!("Task 9: wire FunctionBuilder into CalibCtx before calling emit_nested_max_abs_loop")
     }
 }
 
@@ -317,6 +277,7 @@ use cranelift_frontend::FunctionBuilder;
 /// (AWQ activation scales, FP8 amax tracking, GPTQ activation-stats inputs).
 /// Task 11 will wire this into the per-step loop of the production calibration
 /// binary; this helper is self-contained IR emission.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn emit_running_max_abs_f32(
     fb: &mut FunctionBuilder,
     buf_ptr: Value,
