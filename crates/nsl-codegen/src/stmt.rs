@@ -133,7 +133,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
-        wggo_overrides: None,
+        wggo_overrides: compiler.wggo_overrides.as_ref(),
     };
     let mut plan = crate::wrga::run(wrga_input);
 
@@ -3892,6 +3892,32 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // Task 6: render any override-rejected diagnostics to stderr so
+                // the Phase 3 decision explainer and the user can see which
+                // WGGO-requested ranks were adjusted.  Format matches the CSHA
+                // renderer so both can be parsed uniformly.
+                if let Some(ref plan) = wrga_plan {
+                    for diag in &plan.override_diagnostics {
+                        let reason_str = match &diag.reason {
+                            crate::wggo_overrides::OverrideRejectReason::RankClampedToBounds {
+                                r_min,
+                                r_max,
+                            } => format!("rank_out_of_bounds_[{r_min},{r_max}]"),
+                            crate::wggo_overrides::OverrideRejectReason::RankForbiddenByWggo => {
+                                "rank_forbidden_by_wggo".to_string()
+                            }
+                            crate::wggo_overrides::OverrideRejectReason::BudgetExceededDowngraded {
+                                original_rank,
+                                final_rank,
+                            } => format!("budget_exceeded_{original_rank}_to_{final_rank}"),
+                            other => format!("{:?}", other),
+                        };
+                        eprintln!(
+                            "[wrga] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                            diag.layer_index, diag.requested, diag.applied, reason_str
+                        );
+                    }
+                }
                 // B.2.1 Task 2.5: materialise adapter tensors into the model
                 // struct's side-table slot now that the plan is known. Task 2
                 // reserved the slot + zero-initialised it; this call allocates
