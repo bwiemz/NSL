@@ -20,7 +20,7 @@ pub use hooks::{CalibrationHook, CalibrationResult};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
-pub use retention::{RetentionTable, TensorShape};
+pub use retention::{ArenaLayout, RetentionTable, TensorShape};
 
 use std::collections::BTreeMap;
 
@@ -283,6 +283,21 @@ fn hex_digest_ids(ids: &[String]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibration::identity_hook::IdentityHook;
+
+    #[test]
+    fn identity_hook_observe_batch_is_noop() {
+        let hook = IdentityHook::new(b"payload".to_vec());
+        let mut ctx = CalibCtx::stub_for_tests();
+        let arena = ArenaLayout::empty();
+        hook.emit_observe_batch(&mut ctx, &arena);
+        // If we reach here without panic, the no-op default worked.
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::observation::ObservationSet;
+use crate::calibration::retention::ArenaLayout;
 
 /// Outcome of a hook's `emit_finalize` call.
 #[derive(Debug, Clone)]
@@ -20,6 +21,11 @@ pub trait CalibrationHook: Send + Sync {
     fn emit_init(&self, ctx: &mut CalibCtx);
     fn emit_per_step(&self, ctx: &mut CalibCtx);
     fn emit_finalize(&self, ctx: &mut CalibCtx) -> CalibrationResult;
+
+    /// Called once per calibration batch, after model_forward has populated
+    /// the retention arena.  Default impl is a no-op for hooks that don't
+    /// observe per-batch activations (e.g. IdentityHook).
+    fn emit_observe_batch(&self, _ctx: &mut CalibCtx, _arena: &ArenaLayout) {}
 }
 
 #[cfg(test)]
