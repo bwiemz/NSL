@@ -70,11 +70,20 @@ pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), Co
     Ok(())
 }
 
-pub fn total_bytes(_config: &FlashAttentionConfig) -> u32 {
-    // Populated in Task 3.
-    0
+/// Q tile always starts at byte 0 (parameter intentionally unused — offset is a constant).
+pub fn q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+
+/// KV tile starts immediately after the Q tile (block_q × head_dim × 2 bytes, f16).
+pub fn kv_offset(config: &FlashAttentionConfig) -> u32 {
+    (config.block_q * config.head_dim * 2) as u32
 }
 
-pub fn q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn kv_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn sp_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+/// S/P scratch region starts immediately after the KV tile (block_kv × head_dim × 2 bytes, f16).
+pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
+    kv_offset(config) + (config.block_kv * config.head_dim * 2) as u32
+}
+
+/// Total SMEM bytes: Q tile + KV tile + S/P rows (4 warps × block_kv × 4 bytes, f32).
+pub fn total_bytes(config: &FlashAttentionConfig) -> u32 {
+    sp_offset(config) + 4 * (config.block_kv as u32) * 4
+}

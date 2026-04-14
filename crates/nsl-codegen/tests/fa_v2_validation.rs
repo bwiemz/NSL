@@ -67,3 +67,72 @@ fn rejects_gqa_group_size_not_power_of_two() {
     let err = validate_scalar_v2_config(&c).unwrap_err();
     assert!(err.0.contains("gqa_group_size"), "error: {}", err.0);
 }
+
+use nsl_codegen::flash_attention_v2::smem_layout::{
+    q_offset, kv_offset, sp_offset, total_bytes,
+    ALLOWED_BLOCK_Q, ALLOWED_BLOCK_KV, ALLOWED_HEAD_DIM,
+};
+use nsl_codegen::flash_attention_v2::register_budget::{count_registers, SM75_REGISTER_CAP};
+
+fn supported_matrix() -> Vec<FlashAttentionConfig> {
+    let mut out = Vec::new();
+    for &bq in ALLOWED_BLOCK_Q {
+        for &bkv in ALLOWED_BLOCK_KV {
+            for &hd in ALLOWED_HEAD_DIM {
+                let c = FlashAttentionConfig {
+                    block_q: bq, block_kv: bkv, head_dim: hd, ..base_config()
+                };
+                if validate_scalar_v2_config(&c).is_ok() { out.push(c); }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn smem_regions_do_not_overlap() {
+    for c in supported_matrix() {
+        let q_end = q_offset(&c) + (c.block_q * c.head_dim * 2) as u32;
+        assert_eq!(q_end, kv_offset(&c),
+            "Q tile end must equal KV tile start for {:?}",
+            (c.block_q, c.block_kv, c.head_dim));
+        let kv_end = kv_offset(&c) + (c.block_kv * c.head_dim * 2) as u32;
+        assert_eq!(kv_end, sp_offset(&c),
+            "KV tile end must equal SP region start for {:?}",
+            (c.block_q, c.block_kv, c.head_dim));
+    }
+}
+
+#[test]
+fn smem_total_matches_sum_of_regions() {
+    for c in supported_matrix() {
+        let q  = (c.block_q  * c.head_dim * 2) as u32;
+        let kv = (c.block_kv * c.head_dim * 2) as u32;
+        let sp = 4 * c.block_kv as u32 * 4;
+        assert_eq!(total_bytes(&c), q + kv + sp,
+            "total_bytes mismatch for {:?}",
+            (c.block_q, c.block_kv, c.head_dim));
+    }
+}
+
+#[test]
+fn smem_total_under_48kb_for_all_supported() {
+    for c in supported_matrix() {
+        assert!(total_bytes(&c) <= 48 * 1024,
+            "SMEM overflow for {:?}: {} bytes",
+            (c.block_q, c.block_kv, c.head_dim), total_bytes(&c));
+    }
+}
+
+#[test]
+fn register_budget_under_32_per_thread() {
+    for c in supported_matrix() {
+        let n = count_registers(&c);
+        assert!(n <= 32,
+            "register budget {} exceeds 32 for {:?}",
+            n, (c.block_q, c.block_kv, c.head_dim));
+        assert!(n <= SM75_REGISTER_CAP,
+            "register budget {} exceeds sm_75 cap for {:?}",
+            n, (c.block_q, c.block_kv, c.head_dim));
+    }
+}
