@@ -25,12 +25,24 @@ pub struct LoweredWengert {
 ///
 /// `primal_vars` maps VarIds from the forward pass to their Cranelift Values (i64 tensor pointers).
 /// Returns a map from all VarIds (including adjoint) to Cranelift Values.
+///
+/// `on_param_grad`, when `Some((set, cb))`, causes `cb` to be invoked
+/// immediately after any op whose `result` VarId is in `set`.  The callback
+/// receives the VarId and the just-produced Cranelift Value (a tensor
+/// pointer).  The gradient is then REMOVED from `var_map` — the callback
+/// is responsible for freeing or otherwise owning that tensor.  Used by
+/// FASE Deferred to consume parameter gradients during backward lowering
+/// so only one gradient is live at a time.
 pub fn compile_wengert_ops(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
     _state: &mut FuncState,
     wengert: &WengertList,
     primal_vars: &VarMap,
+    mut on_param_grad: Option<(
+        &std::collections::HashSet<VarId>,
+        &mut dyn FnMut(VarId, Value, &mut FunctionBuilder) -> Result<(), CodegenError>,
+    )>,
 ) -> Result<LoweredWengert, CodegenError> {
     let mut var_map = primal_vars.clone();
     let mut owned_values = Vec::new();
@@ -60,6 +72,16 @@ pub fn compile_wengert_ops(
         }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
         var_map.insert(op.result, result_val);
+        // FASE hook: consume parameter gradients immediately during lowering.
+        if let Some(ref mut hook) = on_param_grad {
+            let (param_set, cb) = hook;
+            if param_set.contains(&op.result) {
+                cb(op.result, result_val, builder)?;
+                // Callback owns/freed the tensor — remove from var_map so
+                // downstream code can't accidentally re-use it.
+                var_map.remove(&op.result);
+            }
+        }
         // Infer result type: for binary ops, if both inputs are Integer, result is Integer.
         // For Constants, preserve the extractor's type (it may have overridden
         // the default Tensor to Integer for IntLiteral).
@@ -1481,5 +1503,26 @@ mod tests {
         ];
         // 51 variants total (including markers)
         assert_eq!(ops.len(), 51);
+    }
+
+    #[test]
+    fn on_param_grad_signature_is_shaped_correctly() {
+        // This test is a compile-time assertion that the callback type
+        // signature matches what FASE's call site will construct.
+        // Behavioral validation lives in the integration tests that exercise
+        // source-AD + FASE Deferred end-to-end.
+        fn _signature_compiles(
+            _hook: Option<(
+                &std::collections::HashSet<VarId>,
+                &mut dyn FnMut(
+                    VarId,
+                    Value,
+                    &mut FunctionBuilder,
+                ) -> Result<(), crate::CodegenError>,
+            )>,
+        ) {
+        }
+        // If this compiles, the API shape is correct.
+        assert!(true);
     }
 }

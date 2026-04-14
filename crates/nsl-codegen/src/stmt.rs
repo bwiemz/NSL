@@ -3826,6 +3826,7 @@ impl Compiler<'_> {
                     state,
                     &effective_primal,
                     &primal_vars,
+                    None, // FASE on_param_grad hook — wired in Task 3
                 )?;
                 let full_vars = &full_lowered.var_map;
 
@@ -3873,6 +3874,7 @@ impl Compiler<'_> {
                 //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
                 let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, &adjoint, full_vars,
+                    None, // FASE on_param_grad hook — wired in Task 3
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
@@ -6308,6 +6310,7 @@ impl Compiler<'_> {
             state,
             extractor.wengert_list(),
             &primal_vars,
+            None, // FASE on_param_grad hook — wired in Task 3
         )?;
         let full_vars = &full_lowered.var_map;
 
@@ -6332,6 +6335,7 @@ impl Compiler<'_> {
             if !adjoint.ops.is_empty() {
                 let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, &adjoint, full_vars,
+                    None, // FASE on_param_grad hook — wired in Task 3
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
