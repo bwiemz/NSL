@@ -4179,7 +4179,53 @@ impl Compiler<'_> {
         // persistent buffers, then free the per-batch grads immediately.
         // When not accumulating (steps == 1), grads_list is used directly
         // by the optimizer and freed after the step.
+
+        // Compute should_step ONCE here (for grad_accumulation_steps > 1 paths)
+        // so it can be reused both to gate the accumulation loop (when two_phase_clip
+        // is active) and at the optimizer-gate branch below.
+        // For steps == 1 the value is unused; define it anyway to keep the Variable
+        // live (its value is never read in that branch).
+        let should_step_var = state.new_variable();
+        builder.declare_var(should_step_var, cl_types::I8);
+        if grad_accumulation_steps > 1 {
+            let sc_early = builder.use_var(step_count_var);
+            let one_early = builder.ins().iconst(cl_types::I64, 1);
+            let sc_p1_early = builder.ins().iadd(sc_early, one_early);
+            let accum_const_early = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+            let rem_early = builder.ins().srem(sc_p1_early, accum_const_early);
+            let zero_early = builder.ins().iconst(cl_types::I64, 0);
+            let ss_val = builder.ins().icmp(IntCC::Equal, rem_early, zero_early);
+            builder.def_var(should_step_var, ss_val);
+        } else {
+            // steps == 1 → always step; store a constant true (1i8)
+            let true_val = builder.ins().iconst(cl_types::I8, 1);
+            builder.def_var(should_step_var, true_val);
+        }
+
         if let Some(accum) = accum_list {
+            // When two_phase_clip is active, Phase A (in the optimizer block) handles
+            // the final micro-batch's accumulation as part of the fused accumulate+sum_sq
+            // pass.  Skip the standard accumulation loop on the final micro-batch to
+            // avoid double-accumulating.
+            let run_standard_accum = if fase_plan.two_phase_clip {
+                // Emit a runtime conditional: skip the loop when should_step == true.
+                let pre_accum_skip = builder.create_block();
+                let pre_accum_run = builder.create_block();
+                let pre_accum_join = builder.create_block();
+                let ss_check = builder.use_var(should_step_var);
+                builder.ins().brif(ss_check, pre_accum_skip, &[], pre_accum_run, &[]);
+
+                builder.switch_to_block(pre_accum_run);
+                builder.seal_block(pre_accum_run);
+                // Standard accumulation loop lives here; we fall into the shared
+                // emission below via the `run_standard_accum` flag.
+                // (We use a sentinel to tell the loop-emission code which block to
+                // land in after the loop; the join block is pre_accum_join.)
+                Some((pre_accum_skip, pre_accum_join))
+            } else {
+                None
+            };
+
             // Runtime loop: accum[i] += grads[i], then free grads[i]
             let ga_i_var = state.new_variable();
             builder.declare_var(ga_i_var, cl_types::I64);
@@ -4226,6 +4272,18 @@ impl Compiler<'_> {
             builder.seal_block(ga_exit);
             state.current_block = Some(ga_exit);
             self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+
+            // If two_phase_clip gated the loop: jump to join, then wire the skip
+            // path in, and continue from join.
+            if let Some((skip_block, join_block)) = run_standard_accum {
+                builder.ins().jump(join_block, &[]);
+                builder.switch_to_block(skip_block);
+                builder.seal_block(skip_block);
+                builder.ins().jump(join_block, &[]);
+                builder.switch_to_block(join_block);
+                builder.seal_block(join_block);
+                state.current_block = Some(join_block);
+            }
         }
 
         // 7e4. Gradient accumulation gate: only step optimizer every N batches
@@ -4233,13 +4291,8 @@ impl Compiler<'_> {
         let post_optimizer_block = builder.create_block();
 
         if grad_accumulation_steps > 1 {
-            let sc = builder.use_var(step_count_var);
-            let accum_val = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
-            let one_ga = builder.ins().iconst(cl_types::I64, 1);
-            let sc_plus_one = builder.ins().iadd(sc, one_ga);
-            let rem = builder.ins().srem(sc_plus_one, accum_val);
-            let zero_check = builder.ins().iconst(cl_types::I64, 0);
-            let should_step = builder.ins().icmp(IntCC::Equal, rem, zero_check);
+            // Reuse the already-computed should_step value (defined above).
+            let should_step = builder.use_var(should_step_var);
             builder
                 .ins()
                 .brif(should_step, optimizer_block, &[], post_optimizer_block, &[]);
@@ -4281,41 +4334,190 @@ impl Compiler<'_> {
                     &[beta2_const, opt_step],
                 )?;
 
-                // Per-parameter fused final step (Deferred mode).
-                // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
-                let fs_i_var = state.new_variable();
-                builder.declare_var(fs_i_var, cl_types::I64);
-                let fs_zero = builder.ins().iconst(cl_types::I64, 0);
-                builder.def_var(fs_i_var, fs_zero);
-                let fs_hdr = builder.create_block();
-                let fs_body = builder.create_block();
-                let fs_exit = builder.create_block();
-                builder.ins().jump(fs_hdr, &[]);
-                builder.switch_to_block(fs_hdr);
-                let fs_i = builder.use_var(fs_i_var);
-                let fs_cont = builder.ins().icmp(IntCC::SignedLessThan, fs_i, num_params_val);
-                builder.ins().brif(fs_cont, fs_body, &[], fs_exit, &[]);
-                builder.switch_to_block(fs_body);
-                builder.seal_block(fs_body);
-                let theta = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fs_i])?;
-                let m = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, fs_i])?;
-                let m_partial = self.compile_call_by_name(builder, "nsl_list_get", &[accum, fs_i])?;
-                let v = if num_state_buffers >= 2 {
-                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fs_i])?
+                if fase_plan.two_phase_clip {
+                    // ── Phase A: fused accumulation + sum_sq loop ──
+                    // Accumulate the final micro-batch's gradients into m_partial
+                    // (the standard accumulation loop was skipped for this batch),
+                    // and simultaneously accumulate sum(||g_i||^2) for the global
+                    // L2 norm.
+                    let pa_tot_var = state.new_variable();
+                    builder.declare_var(pa_tot_var, cl_types::F64);
+                    let pa_zero_f = builder.ins().f64const(0.0);
+                    builder.def_var(pa_tot_var, pa_zero_f);
+
+                    let pa_i_var = state.new_variable();
+                    builder.declare_var(pa_i_var, cl_types::I64);
+                    let pa_i_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(pa_i_var, pa_i_zero);
+
+                    let pa_hdr = builder.create_block();
+                    let pa_body = builder.create_block();
+                    let pa_exit = builder.create_block();
+                    builder.ins().jump(pa_hdr, &[]);
+                    builder.switch_to_block(pa_hdr);
+                    let pa_i = builder.use_var(pa_i_var);
+                    let pa_cont =
+                        builder.ins().icmp(IntCC::SignedLessThan, pa_i, num_params_val);
+                    builder.ins().brif(pa_cont, pa_body, &[], pa_exit, &[]);
+                    builder.switch_to_block(pa_body);
+                    builder.seal_block(pa_body);
+
+                    let pa_mpart =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+                    let pa_grad = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_get",
+                        &[grads_list, pa_i],
+                    )?;
+                    self.fase_emit_accumulate(
+                        builder,
+                        pa_mpart,
+                        pa_grad,
+                        fase_plan.recipe.accum_scale,
+                    )?;
+                    let pa_sq = self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_sum_sq",
+                        &[pa_mpart],
+                    )?;
+                    let pa_tot_cur = builder.use_var(pa_tot_var);
+                    let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
+                    builder.def_var(pa_tot_var, pa_tot_new);
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
+                    let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
+                    builder.def_var(pa_i_var, pa_i_next);
+                    builder.ins().jump(pa_hdr, &[]);
+
+                    builder.switch_to_block(pa_exit);
+                    builder.seal_block(pa_hdr);
+                    builder.seal_block(pa_exit);
+
+                    // Free grads_list wrapper (individual tensors freed in loop above)
+                    self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+
+                    // ── Scalar: clip_factor = min(1, grad_clip / (sqrt(total_sq) + 1e-6)) ──
+                    // `grad_clip` is the raw f64 from the train-block config
+                    // (f64::MAX when not set, but two_phase_clip is only true when it IS set).
+                    let grad_clip_threshold = grad_clip;
+                    let total_sq = builder.use_var(pa_tot_var);
+                    let norm = builder.ins().sqrt(total_sq);
+                    let eps_v = builder.ins().f64const(1e-6_f64);
+                    let denom = builder.ins().fadd(norm, eps_v);
+                    let tau_v = builder.ins().f64const(grad_clip_threshold);
+                    let ratio = builder.ins().fdiv(tau_v, denom);
+                    let one_f = builder.ins().f64const(1.0_f64);
+                    let clip_factor = builder.ins().fmin(one_f, ratio);
+
+                    // ── Phase B: scale m_partial in place, then fused optimizer step ──
+                    let pb_i_var = state.new_variable();
+                    builder.declare_var(pb_i_var, cl_types::I64);
+                    let pb_i_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(pb_i_var, pb_i_zero);
+
+                    let pb_hdr = builder.create_block();
+                    let pb_body = builder.create_block();
+                    let pb_exit = builder.create_block();
+                    builder.ins().jump(pb_hdr, &[]);
+                    builder.switch_to_block(pb_hdr);
+                    let pb_i = builder.use_var(pb_i_var);
+                    let pb_cont =
+                        builder.ins().icmp(IntCC::SignedLessThan, pb_i, num_params_val);
+                    builder.ins().brif(pb_cont, pb_body, &[], pb_exit, &[]);
+                    builder.switch_to_block(pb_body);
+                    builder.seal_block(pb_body);
+
+                    let pb_mpart =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[accum, pb_i])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_mul_scalar_inplace",
+                        &[pb_mpart, clip_factor],
+                    )?;
+                    let pb_theta = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_get",
+                        &[param_list, pb_i],
+                    )?;
+                    let pb_m = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_get",
+                        &[state_list_1, pb_i],
+                    )?;
+                    let pb_v = if num_state_buffers >= 2 {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_list_get",
+                            &[state_list_2, pb_i],
+                        )?
+                    } else {
+                        pb_m
+                    };
+                    self.fase_emit_final_step(
+                        builder,
+                        pb_theta,
+                        pb_m,
+                        pb_mpart,
+                        pb_v,
+                        &fase_plan.recipe,
+                        Some((bc1_inv, bc2_inv)),
+                    )?;
+                    let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
+                    builder.def_var(pb_i_var, pb_i_next);
+                    builder.ins().jump(pb_hdr, &[]);
+
+                    builder.switch_to_block(pb_exit);
+                    builder.seal_block(pb_hdr);
+                    builder.seal_block(pb_exit);
+                    state.current_block = Some(pb_exit);
                 } else {
-                    // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
-                    m
-                };
-                self.fase_emit_final_step(builder, theta, m, m_partial, v, &fase_plan.recipe, Some((bc1_inv, bc2_inv)))?;
-                // fase_emit_final_step zeroed m_partial already — no Site E needed.
-                let fs_one = builder.ins().iconst(cl_types::I64, 1);
-                let fs_next = builder.ins().iadd(fs_i, fs_one);
-                builder.def_var(fs_i_var, fs_next);
-                builder.ins().jump(fs_hdr, &[]);
-                builder.seal_block(fs_hdr);
-                builder.switch_to_block(fs_exit);
-                builder.seal_block(fs_exit);
-                state.current_block = Some(fs_exit);
+                    // ── Non-clip Deferred path: per-parameter fused final step ──
+                    // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
+                    let fs_i_var = state.new_variable();
+                    builder.declare_var(fs_i_var, cl_types::I64);
+                    let fs_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(fs_i_var, fs_zero);
+                    let fs_hdr = builder.create_block();
+                    let fs_body = builder.create_block();
+                    let fs_exit = builder.create_block();
+                    builder.ins().jump(fs_hdr, &[]);
+                    builder.switch_to_block(fs_hdr);
+                    let fs_i = builder.use_var(fs_i_var);
+                    let fs_cont =
+                        builder.ins().icmp(IntCC::SignedLessThan, fs_i, num_params_val);
+                    builder.ins().brif(fs_cont, fs_body, &[], fs_exit, &[]);
+                    builder.switch_to_block(fs_body);
+                    builder.seal_block(fs_body);
+                    let theta =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fs_i])?;
+                    let m =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, fs_i])?;
+                    let m_partial =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[accum, fs_i])?;
+                    let v = if num_state_buffers >= 2 {
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fs_i])?
+                    } else {
+                        // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
+                        m
+                    };
+                    self.fase_emit_final_step(
+                        builder,
+                        theta,
+                        m,
+                        m_partial,
+                        v,
+                        &fase_plan.recipe,
+                        Some((bc1_inv, bc2_inv)),
+                    )?;
+                    // fase_emit_final_step zeroed m_partial already — no Site E needed.
+                    let fs_one = builder.ins().iconst(cl_types::I64, 1);
+                    let fs_next = builder.ins().iadd(fs_i, fs_one);
+                    builder.def_var(fs_i_var, fs_next);
+                    builder.ins().jump(fs_hdr, &[]);
+                    builder.seal_block(fs_hdr);
+                    builder.switch_to_block(fs_exit);
+                    builder.seal_block(fs_exit);
+                    state.current_block = Some(fs_exit);
+                }
 
                 // Jump to post-optimizer block (merges optimizer and skip paths)
                 builder.ins().jump(post_optimizer_block, &[]);
