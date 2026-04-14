@@ -4259,6 +4259,28 @@ impl Compiler<'_> {
         // FASE Deferred: emit fused per-parameter step; otherwise use existing path.
         if fase_deferred {
             if let Some(accum) = accum_list {
+                // ── FASE Deferred: compute bias-correction scalars once per step ──
+                // opt_step = (step_count + 1) / grad_accumulation_steps
+                // bc_inv = nsl_bias_correction_inv(β, opt_step)
+                let sc_val = builder.use_var(step_count_var);
+                let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+                let sc_plus_one = builder.ins().iadd(sc_val, one_i64);
+                let grad_accum_const = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+                let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
+
+                let beta1_const = builder.ins().f64const(fase_plan.recipe.beta1);
+                let beta2_const = builder.ins().f64const(fase_plan.recipe.beta2);
+                let bc1_inv = self.compile_call_by_name(
+                    builder,
+                    "nsl_bias_correction_inv",
+                    &[beta1_const, opt_step],
+                )?;
+                let bc2_inv = self.compile_call_by_name(
+                    builder,
+                    "nsl_bias_correction_inv",
+                    &[beta2_const, opt_step],
+                )?;
+
                 // Per-parameter fused final step (Deferred mode).
                 // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
                 let fs_i_var = state.new_variable();
@@ -4284,7 +4306,7 @@ impl Compiler<'_> {
                     // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
                     m
                 };
-                self.fase_emit_final_step(builder, theta, m, m_partial, v, &fase_plan.recipe, None)?;  // bc_params supplied in Task 5
+                self.fase_emit_final_step(builder, theta, m, m_partial, v, &fase_plan.recipe, Some((bc1_inv, bc2_inv)))?;
                 // fase_emit_final_step zeroed m_partial already — no Site E needed.
                 let fs_one = builder.ins().iconst(cl_types::I64, 1);
                 let fs_next = builder.ins().iadd(fs_i, fs_one);

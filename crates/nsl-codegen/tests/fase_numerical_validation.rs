@@ -186,9 +186,11 @@ fn sgd_exact_equivalence() {
 ///
 ///   m_partial = mean(g_1..g_N) = g (constant inputs → constant g per window)
 ///   m  = β₁·m + (1-β₁)·m_partial
-///   v  = β₂·v + (1-β₂)·m_partial²   (FASE approximation, no correction)
-///   denom = sqrt(v) + ε
-///   tmp = m / denom
+///   v  = β₂·v + (1-β₂)·m_partial²   (FASE approximation)
+///   m_hat = m / (1 - β₁^t)
+///   v_hat = v / (1 - β₂^t)
+///   denom = sqrt(v_hat) + ε
+///   tmp = m_hat / denom
 ///   θ -= lr · (tmp + wd·θ)
 fn adamw_fase_deferred_reference(
     w_init: &[f32; 2],
@@ -205,7 +207,7 @@ fn adamw_fase_deferred_reference(
     let mut m_state = [0.0_f32; 2];
     let mut v_state = [0.0_f32; 2];
 
-    for _step in 0..windows {
+    for step in 1..=windows {
         // Gradient with current w (constant across all 4 micro-batches in this
         // window, so m_partial = g).
         let mut pred = [0.0_f32; 4];
@@ -230,13 +232,18 @@ fn adamw_fase_deferred_reference(
         for j in 0..2 {
             // m = β₁·m + (1-β₁)·m_partial
             m_state[j] = beta1 * m_state[j] + (1.0 - beta1) * m_partial[j];
-            // v = β₂·v + (1-β₂)·m_partial²  (no bias correction)
+            // v = β₂·v + (1-β₂)·m_partial²  (FASE approximation)
             v_state[j] =
                 beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
-            // denom = sqrt(v) + eps
-            let denom = v_state[j].sqrt() + eps;
-            // tmp = m / denom
-            let tmp = m_state[j] / denom;
+            // Bias correction
+            let bc1 = 1.0 - beta1.powi(step as i32);
+            let bc2 = 1.0 - beta2.powi(step as i32);
+            let m_hat = m_state[j] / bc1;
+            let v_hat = v_state[j] / bc2;
+            // denom = sqrt(v_hat) + eps
+            let denom = v_hat.sqrt() + eps;
+            // tmp = m_hat / denom
+            let tmp = m_hat / denom;
             // θ -= lr * (tmp + wd·θ)
             w[j] -= lr * (tmp + wd * w[j]);
         }

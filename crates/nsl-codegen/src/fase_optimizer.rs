@@ -180,15 +180,17 @@ pub fn emit_reset() -> UpdateProgram {
 fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
     // Assumes the caller has already accumulated `m_partial` across all
     // micro-batches.  Now:
-    //   1. m = β₁·m + (1-β₁)·m_partial
-    //   2. v = β₂·v + (1-β₂)·m_partial²           (or approx: per-step avg)
-    //   3. denom = sqrt(v) + ε
-    //   4. tmp = m / denom
-    //   5. θ -= lr * (tmp + wd·θ)    [AdamW]   or   θ -= lr·tmp; θ *= (1-lr·wd) [Adam, coupled]
+    //   0. m = β₁·m + (1-β₁)·m_partial             [moment state update]
+    //   1. v = β₂·v + (1-β₂)·m_partial²            [variance state update]
+    //   2. m_hat = m * bc1_inv                      [bias-corrected first moment]
+    //   3. v_hat = v * bc2_inv                      [bias-corrected second moment]
+    //   4. tmp = sqrt(v_hat) + ε
+    //   5. tmp = m_hat / tmp
+    //   6. θ -= lr * (tmp + wd·θ)    [AdamW]   or   θ -= lr·tmp [Adam, coupled]
     let wd = if decoupled_wd { recipe.weight_decay } else { 0.0 };
 
     let ops = vec![
-        // m = β₁·m + (1-β₁)·m_partial
+        // 0. m = β₁·m + (1-β₁)·m_partial     [persistent state update]
         UpdateOp::ScalarMulAdd {
             dst: Register::M,
             src: Register::M,
@@ -196,26 +198,38 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
             b_src: Some(Register::MPartial),
             b_scale: recipe.one_minus_beta1,
         },
-        // v = β₂·v + (1-β₂)·m_partial²
+        // 1. v = β₂·v + (1-β₂)·m_partial²    [persistent state update]
         UpdateOp::SquaredAccumulate {
             dst: Register::V,
             src: Register::V,
             operand: Register::MPartial,
             scale: recipe.one_minus_beta2,
         },
-        // tmp = sqrt(v) + eps
+        // 2. m_hat = m * bc1_inv              [bias-corrected first moment]
+        UpdateOp::ScalarMulByBc {
+            dst: Register::MHat,
+            src: Register::M,
+            kind: BcKind::Beta1,
+        },
+        // 3. v_hat = v * bc2_inv              [bias-corrected second moment]
+        UpdateOp::ScalarMulByBc {
+            dst: Register::VHat,
+            src: Register::V,
+            kind: BcKind::Beta2,
+        },
+        // 4. tmp = sqrt(v_hat) + eps
         UpdateOp::SqrtPlusEps {
             dst: Register::Tmp,
-            src: Register::V,
+            src: Register::VHat,
             eps: recipe.eps,
         },
-        // tmp = m / tmp
+        // 5. tmp = m_hat / tmp
         UpdateOp::Div {
             dst: Register::Tmp,
-            src: Register::M,
+            src: Register::MHat,
             divisor: Register::Tmp,
         },
-        // θ -= lr * (tmp + wd·θ)
+        // 6. θ -= lr * (tmp + wd·θ)
         UpdateOp::Update {
             lr: recipe.lr,
             wd,
@@ -226,7 +240,7 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
         optimizer: recipe.optimizer,
         ops,
         pseudocode: format!(
-            "m=β₁·m+(1-β₁)·m_partial; v{}=β₂·v+(1-β₂)·m_partial²; θ -= lr·(m/(√v+ε) + wd·θ)",
+            "m=β₁·m+(1-β₁)·m_partial; v{}=β₂·v+(1-β₂)·m_partial²; m̂=m·bc1_inv; v̂=v·bc2_inv; θ -= lr·(m̂/(√v̂+ε) + wd·θ)",
             if recipe.v_uses_approx { "≈" } else { "=" }
         ),
     }
@@ -328,9 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn adamw_program_has_five_ops() {
+    fn adamw_program_has_seven_ops_with_bias_correction() {
         let prog = emit_final_step(&adamw_recipe());
-        assert_eq!(prog.ops.len(), 5);
+        assert_eq!(prog.ops.len(), 7);
         // Must end in a parameter update.
         assert!(matches!(prog.ops.last().unwrap(), UpdateOp::Update { .. }));
     }
@@ -610,6 +624,57 @@ mod tests {
                 assert_eq!(kind, BcKind::Beta1);
             }
             _ => panic!("variant mismatch"),
+        }
+    }
+
+    #[test]
+    fn adamw_recipe_emits_bias_correction() {
+        let recipe = UpdateRecipe {
+            optimizer: FaseOptimizer::AdamW,
+            lr: 0.001,
+            beta1: 0.9,
+            one_minus_beta1: 0.1,
+            beta2: 0.999,
+            one_minus_beta2: 0.001,
+            eps: 1e-8,
+            weight_decay: 0.01,
+            accum_scale: 0.25,
+            v_uses_approx: true,
+        };
+        let prog = emit_adamw(&recipe, /*decoupled_wd=*/ true);
+
+        assert_eq!(prog.ops.len(), 7, "expected 7 ops, got {:?}", prog.ops);
+
+        match &prog.ops[2] {
+            UpdateOp::ScalarMulByBc { dst, src, kind } => {
+                assert_eq!(*dst, Register::MHat);
+                assert_eq!(*src, Register::M);
+                assert_eq!(*kind, BcKind::Beta1);
+            }
+            other => panic!("op 2 expected ScalarMulByBc, got {:?}", other),
+        }
+
+        match &prog.ops[3] {
+            UpdateOp::ScalarMulByBc { dst, src, kind } => {
+                assert_eq!(*dst, Register::VHat);
+                assert_eq!(*src, Register::V);
+                assert_eq!(*kind, BcKind::Beta2);
+            }
+            other => panic!("op 3 expected ScalarMulByBc, got {:?}", other),
+        }
+
+        match &prog.ops[4] {
+            UpdateOp::SqrtPlusEps { src, .. } => {
+                assert_eq!(*src, Register::VHat, "sqrt must read bias-corrected v");
+            }
+            other => panic!("op 4 expected SqrtPlusEps, got {:?}", other),
+        }
+
+        match &prog.ops[5] {
+            UpdateOp::Div { src, .. } => {
+                assert_eq!(*src, Register::MHat, "div must read bias-corrected m");
+            }
+            other => panic!("op 5 expected Div, got {:?}", other),
         }
     }
 }
