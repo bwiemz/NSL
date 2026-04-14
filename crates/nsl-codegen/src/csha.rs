@@ -88,6 +88,29 @@ pub struct CshaInput<'a> {
     pub spec_cfg: SpecConfig,
 }
 
+/// Records a WGGO override that CSHA had to downgrade because it violated
+/// a hardware constraint. Populated during per-layer planning; rendered by
+/// both the `--csha-report` CLI path and the Phase 3 decision explainer.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideDiagnostic {
+    pub layer_index: u32,
+    pub layer_name: String,
+    pub requested: crate::cfie_persistent::FusionLevel,
+    pub applied: crate::cfie_persistent::FusionLevel,
+    pub reason: OverrideRejectReason,
+}
+
+/// Why CSHA refused to honor a WGGO requested_csha_level.
+///
+/// Extension point: additional variants (RegisterPressure,
+/// WeightShapeIncompatible, ...) land as CSHA's feasibility model grows.
+/// Exhaustive `match` sites should use `#[non_exhaustive]` semantics —
+/// today the only variant is SmemBudgetExceeded.
+#[derive(Debug, Clone, Serialize)]
+pub enum OverrideRejectReason {
+    SmemBudgetExceeded { actual_kb: u32, limit_kb: u32 },
+}
+
 /// Aggregate plan emitted by the driver.
 #[derive(Debug, Clone, Serialize)]
 pub struct CshaPlan {
@@ -105,6 +128,11 @@ pub struct CshaPlan {
     pub marks: Vec<crate::csha_apply::FusionMark>,
     /// Total driver wall-clock time (microseconds).
     pub solve_us: u64,
+    /// WGGO overrides that CSHA had to downgrade due to hardware
+    /// infeasibility. Empty when WGGO produced no overrides or all
+    /// overrides were applied verbatim. Stable wire shape; consumed by
+    /// `--csha-report` and the Phase 3 decision explainer.
+    pub override_diagnostics: Vec<OverrideDiagnostic>,
 }
 
 impl CshaPlan {
@@ -264,6 +292,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
             kernels: Vec::new(),
             marks: Vec::new(),
             solve_us: t0.elapsed().as_micros() as u64,
+            override_diagnostics: Vec::new(),
         };
     }
 
@@ -287,6 +316,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         kernels: Vec::new(),
         marks: Vec::new(),
         solve_us: 0,
+        override_diagnostics: Vec::new(),
     };
     let bridge = crate::csha_apply::bridge(&interim, input.shape.head_dim as i64);
 
@@ -299,6 +329,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         kernels: bridge.kernels,
         marks: bridge.marks,
         solve_us: t0.elapsed().as_micros() as u64,
+        override_diagnostics: Vec::new(),
     }
 }
 
@@ -490,6 +521,27 @@ mod tests {
         let w = attn_block();
         let plan = run_on_wengert(&w, "nonexistent-gpu-xyz", "auto", None, None, 8).unwrap();
         assert!(!plan.target_gpu.is_empty());
+    }
+
+    #[test]
+    fn csha_plan_has_empty_override_diagnostics_by_default() {
+        // Regression marker: override_diagnostics must be Vec::new() when no
+        // WggoOverrides are passed to the driver.  Task 4 will populate the
+        // field; this test will catch any future change that accidentally
+        // pre-populates it before that wiring is complete.
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Auto));
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "CshaPlan must have no override diagnostics when no WggoOverrides were passed"
+        );
+
+        // Also verify Off mode initialises the field correctly.
+        let off_plan = run(toy_input(&w, CshaMode::Off));
+        assert!(
+            off_plan.override_diagnostics.is_empty(),
+            "CshaPlan (Off mode) must have no override diagnostics"
+        );
     }
 
     #[test]
