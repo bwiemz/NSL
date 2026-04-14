@@ -846,45 +846,25 @@ pub extern "C" fn nsl_awq_write_sidecar(
         unsafe { std::slice::from_raw_parts(projections_ptr, projections_len) }
     };
 
-    // Build the AWQ binary blob (version=1 header + per-projection records).
-    // Format matches AwqScales::from_blob / awq_sidecar::serialize:
-    //   [u32 version=1][u32 num_projections]
-    //   per projection: [u32 name_len][name bytes][u32 channel_count][f32 * channel_count]
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(&1u32.to_le_bytes()); // AWQ_SIDECAR_VERSION = 1
-    blob.extend_from_slice(&(projections_len as u32).to_le_bytes());
+    let mut by_projection = std::collections::BTreeMap::<String, Vec<f32>>::new();
     for d in descs {
         let name_bytes = unsafe { std::slice::from_raw_parts(d.path_ptr, d.path_len) };
         let name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s,
+            Ok(s) => s.to_string(),
             Err(_) => return 2,
         };
-        blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        blob.extend_from_slice(name.as_bytes());
-        blob.extend_from_slice(&d.channels.to_le_bytes());
-        let scales = unsafe {
-            std::slice::from_raw_parts(d.running_ptr, d.channels as usize)
+        let values = unsafe {
+            std::slice::from_raw_parts(d.running_ptr, d.channels as usize).to_vec()
         };
-        for &v in scales {
-            blob.extend_from_slice(&v.to_le_bytes());
-        }
+        by_projection.insert(name, values);
     }
 
-    // Base64-encode the blob so it embeds cleanly in JSON.
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    let b64_blob = B64.encode(&blob);
-
-    // Write the sidecar in the Sidecar struct format expected by
-    // real_subprocess_entry (version=2 + base64 hooks map).
     let json = serde_json::json!({
-        "version": 2u32,
-        "checkpoint_sha256": "",
-        "calibration_data_sha256": "",
-        "hook_set_sha256": "",
-        "cache_key_digest": "",
-        "num_samples_used": 0u32,
+        "version": 2,
         "hooks": {
-            "awq_activation_scales": b64_blob,
+            "awq_activation_scales": {
+                "by_projection": by_projection,
+            },
         },
     });
 

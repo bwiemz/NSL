@@ -415,35 +415,20 @@ fn emit_and_link_calibration_binary(
         running_data_ids.insert(entry.running_symbol.clone(), id);
     }
 
-    // ── Define the retention arena locally inside the calibration binary ──────
-    // The calibration binary owns its own writable arena global (zeroinit).
-    // The arena layout size is already known from `arena_layout.total_bytes()`.
-    // Previously this was declared as Import (expecting the model object), but
-    // the model object is not linked into the calibration binary — the arena must
-    // be self-contained.
+    // ── Declare the retention arena as an imported symbol ──────────────────
+    // Only declared when there are actual observe_plan entries that will
+    // reference it in IR.  Declaring it unconditionally causes a linker error
+    // for binaries (like IdentityHook) where no model object is linked.
     let arena_data_id: Option<DataId> = if !observe_plan.is_empty() {
-        // Compute total arena size from observe_plan: max of (offset + rows*channels*4).
-        let total = observe_plan
-            .iter()
-            .map(|e| e.src_offset as usize + e.rows as usize * e.channels as usize * 4)
-            .max()
-            .unwrap_or(0);
         let id = module
             .declare_data(
                 "__nsl_calib_retention_arena",
-                Linkage::Local,
-                /* writable */ true,
+                Linkage::Import,
+                /* writable */ false,
                 /* tls */ false,
             )
             .map_err(|e| HarnessError::Infrastructure {
-                reason: format!("declare retention arena: {e}"),
-            })?;
-        let mut arena_desc = DataDescription::new();
-        arena_desc.define_zeroinit(total.max(1)); // min 1 byte to avoid empty section issues
-        module
-            .define_data(id, &arena_desc)
-            .map_err(|e| HarnessError::Infrastructure {
-                reason: format!("define retention arena: {e}"),
+                reason: format!("declare retention arena import: {e}"),
             })?;
         Some(id)
     } else {

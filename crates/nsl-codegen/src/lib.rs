@@ -565,16 +565,15 @@ impl Default for CompileOptions {
 /// 2. Sets up `CompileOptions` with `calibration_data`, `weight_file`,
 ///    `calibration_batch_seq`, and `calibration_mode = "required"`.
 /// 3. Lexes, parses, and semantically analyses the source.
-/// 4. Constructs a `Compiler` directly and runs all passes.  During
-///    `compile_train_block`, `discover_awq_projections` fires and stores the
-///    discovered projections in `compile_options.calibration_retention`.
-/// 5. After codegen succeeds, loads calibration data and weights from
-///    the supplied safetensors files and runs the in-process AWQ observation
-///    loop (per-projection forward-pass + per-channel max-abs reduction).
-/// 6. Wraps the resulting scales in a `Sidecar` and returns it.
+/// 4. Constructs a `Compiler` directly and runs all passes, which triggers
+///    `discover_awq_projections` and `run_harness_production` as side effects
+///    inside `compile_train_block` (the calibration harness fires when a
+///    `train` block is compiled and `calibration_data` is set).
+/// 5. Reads back `compiler.compile_options.calibration_sidecar` and returns it.
 ///
-/// The NSL source must contain a `train` block and at least one model decorated
-/// with `@quantize(dtype="awq4")` whose `forward` method uses `|>` pipe syntax.
+/// The NSL source must contain a `train` block for the calibration harness
+/// to fire; models decorated with `@quantize(dtype="awq4")` and using `|>`
+/// pipe syntax in `forward` will have their projections discovered automatically.
 pub fn compile_and_calibrate(
     source_path: &std::path::Path,
     data_path: &std::path::Path,
@@ -666,281 +665,22 @@ pub fn compile_and_calibrate(
         Ok(())
     })();
 
-    // Propagate codegen errors.
+    // The calibration sidecar is stored in the Compiler's copy of compile_options.
+    // Extract it before handling errors (the sidecar may have been populated even
+    // if a later codegen pass failed, but we want the sidecar from a successful run).
+    let sidecar = compiler.compile_options.calibration_sidecar.take();
+
+    // Propagate codegen errors only after extracting the sidecar.
     pre_finalize?;
 
-    // Step 6: In-process AWQ scale computation.
-    //
-    // After all compiler passes, `calibration_retention` holds the list of
-    // discovered projections (populated by `compile_train_block` →
-    // `discover_awq_projections`).  We now load the calibration data and
-    // weights from the supplied safetensors files and compute per-input-channel
-    // max-abs activation scales analytically, matching the formula used by the
-    // reference test (`reference_awq_scales`):
-    //
-    //   up_proj scales   = per-channel max|calib[row, c]|  (c in [0, in_features))
-    //   down_proj scales = per-channel max|relu(calib @ prev_weight.T)[row, c]|
-    //
-    // This replaces the previous subprocess-based approach which had an
-    // architectural gap (model_forward never called → retention arena stayed zero).
-    let projections = compiler
-        .compile_options
-        .calibration_retention
-        .take()
-        .ok_or_else(|| {
-            CodegenError::new(
-                "compile_and_calibrate: no AWQ projections discovered. \
-                 Ensure the NSL source contains a train block and at least one \
-                 @quantize(dtype=\"awq4\")-decorated model with |>-pipe forward method."
-                    .to_string(),
-            )
-        })?;
-
-    if projections.is_empty() {
-        return Err(CodegenError::new(
-            "compile_and_calibrate: AWQ discovery returned an empty projection list."
+    sidecar.ok_or_else(|| {
+        CodegenError::new(
+            "compile_and_calibrate: calibration harness ran but produced no sidecar. \
+             Ensure the NSL source contains a train block and at least one \
+             @quantize(dtype=\"awq4\")-decorated model with |>-pipe forward method."
                 .to_string(),
-        ));
-    }
-
-    // Load calibration data: tensor "calibration" with shape [count, seq, hidden].
-    let calib_bytes = std::fs::read(data_path).map_err(|e| {
-        CodegenError::new(format!("reading calibration data {}: {e}", data_path.display()))
-    })?;
-    let calib_st = safetensors::SafeTensors::deserialize(&calib_bytes).map_err(|e| {
-        CodegenError::new(format!("parsing calibration safetensors {}: {e}", data_path.display()))
-    })?;
-    let calib_tv = calib_st.tensor("calibration").map_err(|e| {
-        CodegenError::new(format!(
-            "calibration safetensors {} has no tensor 'calibration': {e}",
-            data_path.display()
-        ))
-    })?;
-    let calib_shape = calib_tv.shape();
-    // calib_shape = [count, seq, hidden]  (rank 3, all dims >= 1)
-    if calib_shape.len() != 3 {
-        return Err(CodegenError::new(format!(
-            "calibration tensor must be rank 3 [count, seq, hidden], got rank {}",
-            calib_shape.len()
-        )));
-    }
-    let calib_count  = calib_shape[0];
-    let calib_seq    = calib_shape[1];
-    let calib_hidden = calib_shape[2];
-    let calib_rows   = calib_count * calib_seq; // collapsed batch dimension
-    let calib_data_raw = calib_tv.data();
-    let calib_f32: Vec<f32> = calib_data_raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    if calib_f32.len() != calib_rows * calib_hidden {
-        return Err(CodegenError::new(format!(
-            "calibration tensor byte count mismatch: expected {}×{}×4 bytes, got {}",
-            calib_rows, calib_hidden,
-            calib_data_raw.len()
-        )));
-    }
-
-    // Load weights safetensors.
-    let weights_bytes = std::fs::read(weights_path).map_err(|e| {
-        CodegenError::new(format!("reading weights {}: {e}", weights_path.display()))
-    })?;
-    let weights_st = safetensors::SafeTensors::deserialize(&weights_bytes).map_err(|e| {
-        CodegenError::new(format!("parsing weights safetensors {}: {e}", weights_path.display()))
-    })?;
-
-    // Helper: load a named weight as Vec<f32>.
-    let load_weight = |name: &str| -> Result<(Vec<usize>, Vec<f32>), CodegenError> {
-        let tv = weights_st.tensor(name).map_err(|e| {
-            CodegenError::new(format!(
-                "weights safetensors {} has no tensor {name}: {e}",
-                weights_path.display()
-            ))
-        })?;
-        let shape: Vec<usize> = tv.shape().iter().map(|&d| d).collect();
-        let data = tv.data();
-        let floats: Vec<f32> = data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        Ok((shape, floats))
-    };
-
-    // Determine the execution order of projections from the AST.
-    //
-    // `calibration_retention` holds projections in alphabetical order (for
-    // deterministic sidecar output) but the forward pass must be simulated in
-    // **execution order** — i.e. the order the matmul sites appear in the
-    // model's `forward` body.  Build a lookup map from projection name →
-    // DiscoveredProjection, then derive the execution-order list via
-    // `projection_execution_order`.
-    let proj_by_name: HashMap<String, &crate::calibration::DiscoveredProjection> = projections
-        .iter()
-        .map(|p| (p.projection.0.clone(), p))
-        .collect();
-
-    // Walk the parsed AST to find the AWQ-decorated model and its forward body.
-    let execution_order: Vec<String> = {
-        use nsl_ast::stmt::StmtKind;
-        use nsl_ast::decl::{ModelMember};
-
-        let mut order = Vec::new();
-        'outer: for stmt in &parsed.module.stmts {
-            // Look for Decorated { @quantize(dtype="awq4", ...), ModelDef { ... } }
-            let model_def = match &stmt.kind {
-                StmtKind::Decorated { stmt: inner, .. } => {
-                    if let StmtKind::ModelDef(md) = &inner.kind { Some(md) } else { None }
-                }
-                StmtKind::ModelDef(md) => Some(md),
-                _ => None,
-            };
-            let Some(model_def) = model_def else { continue };
-
-            let model_name_str = interner.resolve(model_def.name.0).unwrap_or("");
-            // Collect valid field names for this model (from the projections list).
-            let valid_fields: std::collections::HashSet<String> = projections
-                .iter()
-                .filter_map(|p| {
-                    // projection name is "ModelName.field_name"; extract field_name
-                    p.projection.0.strip_prefix(&format!("{}.", model_name_str))
-                        .map(str::to_string)
-                })
-                .collect();
-            if valid_fields.is_empty() { continue; }
-
-            // Find the forward method body.
-            let forward_body = model_def.members.iter().find_map(|m| {
-                if let ModelMember::Method(fn_def, _) = m {
-                    if interner.resolve(fn_def.name.0).unwrap_or("") == "forward" {
-                        return Some(&fn_def.body);
-                    }
-                }
-                None
-            });
-
-            order = crate::calibration::projection_execution_order(
-                model_name_str,
-                forward_body,
-                &valid_fields,
-                &interner,
-            );
-            if !order.is_empty() { break 'outer; }
-        }
-        order
-    };
-
-    // Fall back to alphabetical order if execution order couldn't be determined.
-    let ordered_proj_names = if execution_order.is_empty() {
-        projections.iter().map(|p| p.projection.0.clone()).collect::<Vec<_>>()
-    } else {
-        execution_order
-    };
-
-    // Run in-process forward pass per projection in execution order,
-    // accumulating per-channel max-abs scales.
-    //
-    // `current_act` tracks the activation feeding the current projection.
-    // For the first projection, it equals the raw calibration data.
-    // For subsequent projections, it is `relu(current_act @ prev_weight.T)`.
-    let mut current_act: Vec<f32> = calib_f32.clone();
-    let mut current_cols = calib_hidden;
-    let mut prev_weight_opt: Option<(Vec<usize>, Vec<f32>)> = None;
-
-    let mut scales_map: std::collections::BTreeMap<String, Vec<f32>> =
-        std::collections::BTreeMap::new();
-
-    for proj_name in &ordered_proj_names {
-        let proj = match proj_by_name.get(proj_name) {
-            Some(p) => *p,
-            None => continue, // projection not in retention list; skip
-        };
-        let proj_name = &proj.projection.0; // e.g. "TinyMLP.up_proj"
-        let in_features = proj.weight_shape[1] as usize;
-
-        // If we have a previous weight, compute the intermediate activation:
-        //   act = relu(current_act @ prev_weight.T)
-        // prev_weight shape: [out, in_prev] → T shape: [in_prev, out]
-        if let Some((ref pw_shape, ref pw_data)) = prev_weight_opt {
-            let out_prev = pw_shape[0]; // = in_features of THIS projection
-            let in_prev  = pw_shape[1]; // = current_cols
-            // Sanity: out_prev must equal current_cols of previous activation.
-            // (current_cols should already equal in_prev after the last step.)
-            let rows = calib_rows;
-            let mut next_act = vec![0f32; rows * out_prev];
-            for r in 0..rows {
-                for o in 0..out_prev {
-                    let mut acc = 0f32;
-                    for k in 0..in_prev {
-                        acc += current_act[r * current_cols + k] * pw_data[o * in_prev + k];
-                    }
-                    // relu
-                    next_act[r * out_prev + o] = if acc > 0.0 { acc } else { 0.0 };
-                }
-            }
-            current_act = next_act;
-            current_cols = out_prev;
-        }
-
-        // Per-channel max-abs over current_act ([calib_rows, current_cols]).
-        // The activation's channel count must match in_features for this projection.
-        if current_cols != in_features {
-            return Err(CodegenError::new(format!(
-                "compile_and_calibrate: projection {proj_name} expects in_features={in_features} \
-                 but activation has {current_cols} columns"
-            )));
-        }
-        let mut channel_scales = vec![0f32; in_features];
-        for r in 0..calib_rows {
-            for c in 0..in_features {
-                let v = current_act[r * in_features + c].abs();
-                if v > channel_scales[c] {
-                    channel_scales[c] = v;
-                }
-            }
-        }
-        scales_map.insert(proj_name.clone(), channel_scales);
-
-        // Load weight for this projection so the NEXT iteration can compute
-        // relu(act @ weight.T).
-        let weight_result = load_weight(proj_name);
-        match weight_result {
-            Ok(w) => { prev_weight_opt = Some(w); }
-            Err(_) => {
-                // Weight not found — subsequent projections will use the
-                // current activation unchanged (no relu step).
-                prev_weight_opt = None;
-            }
-        }
-    }
-
-    // Validate: all projections must have at least one non-zero scale.
-    for (name, scales) in &scales_map {
-        if scales.iter().all(|&v| v == 0.0) {
-            return Err(CodegenError::new(format!(
-                "compile_and_calibrate: projection {name} produced all-zero scales \
-                 (calibration data has no variance in its channels?)"
-            )));
-        }
-    }
-
-    // Serialize scales into the AWQ binary blob.
-    let blob = crate::calibration::awq_sidecar::serialize(&scales_map);
-
-    // Wrap in a Sidecar.
-    let mut hooks = std::collections::BTreeMap::new();
-    hooks.insert("awq_activation_scales".to_string(), blob);
-
-    let sidecar = crate::calibration::sidecar::Sidecar {
-        version: crate::calibration::sidecar::SIDECAR_VERSION,
-        checkpoint_sha256: String::new(),
-        calibration_data_sha256: String::new(),
-        hook_set_sha256: String::new(),
-        cache_key_digest: String::new(),
-        num_samples_used: calib_count as u32,
-        hooks,
-    };
-
-    Ok(sidecar)
+        )
+    })
 }
 
 /// Compile a source string with the given options (convenience wrapper for

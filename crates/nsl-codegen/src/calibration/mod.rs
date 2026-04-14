@@ -19,8 +19,8 @@ pub mod subprocess;
 
 pub use ctx::{BufferHandle, CalibCtx};
 pub use discovery::{
-    discover_awq_projections, discover_awq_projections_from_state, projection_execution_order,
-    DiscoveredProjection, DiscoveryError,
+    discover_awq_projections, discover_awq_projections_from_state, DiscoveredProjection,
+    DiscoveryError,
 };
 pub use hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 pub use identity_hook::IdentityHook;

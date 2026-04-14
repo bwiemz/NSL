@@ -191,31 +191,6 @@ fn collect_rhs_expr(expr: &nsl_ast::expr::Expr, interner: &Interner, out: &mut V
                 }
             }
         }
-        // Also collect `x @ self.field_name` patterns (standard matmul syntax
-        // used when forward() is written with explicit self-field access rather
-        // than the pipe shorthand).  We recognise the right-hand side of `@`
-        // as a linear-projection weight when it is `self.field_name`.
-        ExprKind::BinaryOp { left, op: nsl_ast::operator::BinOp::MatMul, right } => {
-            collect_rhs_expr(left, interner, out);
-            if let ExprKind::MemberAccess { object, member } = &right.kind {
-                if matches!(object.kind, ExprKind::SelfRef) {
-                    if let Some(name) = interner.resolve(member.0) {
-                        out.push(name.to_string());
-                    }
-                }
-            }
-        }
-        // Recurse into other binary ops (e.g. chained arithmetic).
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_rhs_expr(left, interner, out);
-            collect_rhs_expr(right, interner, out);
-        }
-        // Recurse into calls so activation functions wrapping matmuls are traversed.
-        ExprKind::Call { callee: _, args } => {
-            for arg in args {
-                collect_rhs_expr(&arg.value, interner, out);
-            }
-        }
         ExprKind::Paren(inner) => collect_rhs_expr(inner, interner, out),
         ExprKind::BlockExpr(b) => {
             for s in &b.stmts {
@@ -224,41 +199,6 @@ fn collect_rhs_expr(expr: &nsl_ast::expr::Expr, interner: &Interner, out: &mut V
         }
         _ => {}
     }
-}
-
-// ── execution-order helper ────────────────────────────────────────────────────
-
-/// Return the qualified projection names (`"ModelName.field"`) in **execution
-/// order** as they appear in the `forward` body — i.e. the order the matmul
-/// sites are encountered during AST traversal, before alphabetical sorting.
-///
-/// Used by `compile_and_calibrate` to chain activations through the in-process
-/// forward pass in the correct sequence.  Builtins (relu, gelu, …) are excluded.
-/// Projections absent from `valid_fields` are also excluded (they are not
-/// registered linear sites).
-pub fn projection_execution_order(
-    model_name: &str,
-    forward_body: Option<&nsl_ast::stmt::Block>,
-    valid_fields: &std::collections::HashSet<String>,
-    interner: &nsl_lexer::Interner,
-) -> Vec<String> {
-    let raw_names = match forward_body {
-        Some(body) => collect_pipe_rhs_names(body, interner),
-        None => return Vec::new(),
-    };
-
-    // Deduplicate while preserving first-occurrence order; filter builtins +
-    // unknown fields.
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for field_name in raw_names {
-        if field_name.is_empty() { continue; }
-        if !seen.insert(field_name.clone()) { continue; }
-        if is_builtin_fn(&field_name) { continue; }
-        if !valid_fields.contains(&field_name) { continue; }
-        out.push(format!("{}.{}", model_name, field_name));
-    }
-    out
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -423,14 +363,7 @@ pub fn discover_awq_projections_from_state(
         if is_builtin_fn(&field_name) {
             continue;
         }
-        // A field is a valid static projection if it is either:
-        //   (a) in model_field_types (sub-model / Linear field), OR
-        //   (b) in tensor_shapes (raw Tensor weight like `up_proj: Tensor = zeros([128, 64])`)
-        // Tensor-typed fields are NOT in model_field_types (by design — that map is used
-        // for sub-model traversal in source-AD and must not contain raw Tensor fields).
-        if !model_field_types.contains_key(&field_name)
-            && !tensor_shapes.contains_key(&field_name)
-        {
+        if !model_field_types.contains_key(&field_name) {
             let qualified = format!("{}.{}", model_name, field_name);
             return Err(DiscoveryError::NonStaticWeight { path: qualified });
         }

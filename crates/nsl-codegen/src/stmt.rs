@@ -1173,13 +1173,6 @@ impl Compiler<'_> {
             }
 
             StmtKind::Decorated { decorators, stmt } => {
-                // `@quantize model TinyMLP: ...` and other model-level decorators are
-                // handled in the collect_models / declare_user_functions passes, not here.
-                // Skip silently so module-level decorated model defs don't trigger
-                // "unsupported statement" errors during main() compilation.
-                if matches!(stmt.kind, StmtKind::ModelDef(_)) {
-                    return Ok(());
-                }
                 // Check for @no_grad and @fuse on nested function definitions
                 if let StmtKind::FnDef(fn_def) = &stmt.kind {
                     for d in decorators {
@@ -3752,6 +3745,83 @@ impl Compiler<'_> {
                     }
                 }
 
+                // Calibration harness (MVP): currently a pass-through
+                // when no consumers are registered.  Real consumers
+                // (AWQ/WGGO Phase 2/FP8/GPTQ) land in follow-up plans.
+                if let Some(ref data_path) = self.compile_options.calibration_data {
+                    let mut registry = crate::calibration::registry::HookRegistry::new();
+                    if let Some(awq_projections) = self.discover_awq_projections() {
+                        if !awq_projections.is_empty() {
+                            // Extract just the ProjectionRef for the hook; the full
+                            // DiscoveredProjection (with weight_shape) lives in
+                            // compile_options.calibration_retention for codegen.
+                            let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
+                                .iter()
+                                .map(|dp| dp.projection.clone())
+                                .collect();
+                            registry.register(Box::new(
+                                crate::calibration::awq_hook::AwqCalibrationHook::new(
+                                    proj_refs,
+                                ),
+                            ));
+                            // Store the full DiscoveredProjection vec so the retention
+                            // pass can use weight_shape for arena-layout sizing.
+                            self.compile_options.calibration_retention = Some(awq_projections);
+                        }
+                    }
+                    if registry.is_empty() {
+                        eprintln!(
+                            "warning: --calibration-data {} supplied but no calibration hooks registered (no consumers yet — this is a no-op in MVP)",
+                            data_path.display()
+                        );
+                    } else {
+                        let mode = match self
+                            .compile_options
+                            .calibration_mode
+                            .as_deref()
+                            .unwrap_or("required")
+                        {
+                            "best-effort" => crate::calibration::HarnessMode::BestEffort,
+                            _ => crate::calibration::HarnessMode::Required,
+                        };
+                        let cfg = crate::calibration::HarnessConfig {
+                            checkpoints: self
+                                .compile_options
+                                .weight_file
+                                .as_ref()
+                                .map(|p| vec![p.clone()])
+                                .unwrap_or_default(),
+                            calibration_data: data_path.clone(),
+                            samples: self.compile_options.calibration_samples,
+                            batch_size: self.compile_options.calibration_batch_size,
+                            timeout_secs: self.compile_options.calibration_timeout_secs,
+                            mode,
+                            // Wire per-projection (path, weight_shape) into the
+                            // cache key so renames and shape changes invalidate it.
+                            projections: self
+                                .compile_options
+                                .calibration_retention
+                                .clone()
+                                .unwrap_or_default(),
+                        };
+                        match crate::calibration::run_harness_production(&registry, &cfg) {
+                            Ok(out) => {
+                                eprintln!(
+                                    "[calibration] {} ({} hooks)",
+                                    out.outcome_repr,
+                                    out.sidecar.hooks.len()
+                                );
+                                self.compile_options.calibration_sidecar = Some(out.sidecar);
+                            }
+                            Err(e) => {
+                                return Err(crate::error::CodegenError::new(format!(
+                                    "calibration failed: {e}"
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 // 5. Lower PRIMAL Wengert list to Cranelift IR.
                 //    This IS the forward pass — each WengertOp is compiled to
                 //    its runtime FFI call, and ALL intermediate VarId → Value
@@ -4190,20 +4260,6 @@ impl Compiler<'_> {
                 self.compile_tape_backward(builder, state, step_body, param_list)?;
             (grads, loss, false, std::collections::HashSet::new())
         };
-
-        // Discover AWQ projections and store them for:
-        //   (a) emit_retention_arena — sizes the arena global in the model object
-        //   (b) the calibration harness — fired from compile_and_calibrate after
-        //       the model object is emitted (so it can be linked into the subprocess)
-        if self.compile_options.calibration_data.is_some() {
-            if let Some(awq_projections) = self.discover_awq_projections() {
-                if !awq_projections.is_empty() {
-                    // Store in calibration_retention; the harness fires later
-                    // (from compile_and_calibrate) once the model object is ready.
-                    self.compile_options.calibration_retention = Some(awq_projections);
-                }
-            }
-        }
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
