@@ -2,8 +2,8 @@
 //! fixed config and diffs the generated PTX string against a stored
 //! snapshot. Use `cargo insta review` to accept snapshot changes.
 
-use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax, pv_accum, finalize};
+use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax, pv_accum, finalize, csha_hooks};
 
 fn csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
@@ -137,4 +137,85 @@ fn phase_pv_accum__label_uniqueness_across_iters() {
     assert!(ptx1.contains("V2_LOOP_PV_OVER_K_1:"), "iter 1 label missing");
     assert!(!ptx0.contains("V2_LOOP_PV_OVER_K_1"), "iter 0 leaks iter 1 label");
     assert!(!ptx1.contains("V2_LOOP_PV_OVER_K_0"), "iter 1 leaks iter 0 label");
+}
+
+// ---------------------------------------------------------------------------
+// CSHA Tier A hook tests (Task 10)
+// ---------------------------------------------------------------------------
+
+fn csha_l2_rope_config() -> FlashAttentionConfig {
+    FlashAttentionConfig {
+        block_q: 32, block_kv: 32, head_dim: 32,
+        causal: true, paged: false, rope_q: true,
+        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+        tree_mask: false, gpu_sm: 75,
+        csha: Some(CshaExtras::level2(1e-5, 32)),
+    }
+}
+
+#[test]
+fn phase_csha_hooks__prologue_null_config() {
+    // With csha: None, emit_prologue should produce empty / comment-only output.
+    let mut ptx = String::new();
+    csha_hooks::emit_prologue(&mut ptx, &csha_canonical(), 0);
+    insta::assert_snapshot!("phase_csha_prologue__null", ptx);
+}
+
+#[test]
+fn phase_csha_hooks__prologue_active_l2_rope() {
+    let mut ptx = String::new();
+    csha_hooks::emit_prologue(&mut ptx, &csha_l2_rope_config(), 0);
+    insta::assert_snapshot!("phase_csha_prologue__l2_rope", ptx);
+}
+
+#[test]
+fn phase_csha_hooks__projection_skeleton_l2_rope() {
+    let mut ptx = String::new();
+    csha_hooks::emit_matmul_projection(&mut ptx, &csha_l2_rope_config(), 0);
+    insta::assert_snapshot!("phase_csha_projection__l2_rope_skeleton", ptx);
+}
+
+#[test]
+fn phase_csha_hooks__epilogue_l2_rope() {
+    let mut ptx = String::new();
+    csha_hooks::emit_rope_epilogue(&mut ptx, &csha_l2_rope_config(), 0);
+    insta::assert_snapshot!("phase_csha_epilogue__l2_rope", ptx);
+}
+
+#[test]
+fn phase_csha_hooks__active_heads_guard() {
+    let mut ptx = String::new();
+    csha_hooks::emit_active_heads_guard(&mut ptx, &csha_l2_rope_config());
+    insta::assert_snapshot!("phase_csha_active_heads_guard", ptx);
+}
+
+/// Label uniqueness regression: each CSHA hook's skip-label must be
+/// parameterised on `q_tile_iter` so the orchestrator can call each
+/// hook multiple times for block_q > 4 configs.
+#[test]
+fn phase_csha_hooks__label_uniqueness_across_iters() {
+    let cfg = csha_l2_rope_config();
+    let mut prologue0 = String::new();
+    let mut prologue1 = String::new();
+    csha_hooks::emit_prologue(&mut prologue0, &cfg, 0);
+    csha_hooks::emit_prologue(&mut prologue1, &cfg, 1);
+    assert!(prologue0.contains("V2_CSHA_PROLOGUE_SKIP_0"), "prologue iter 0 label missing");
+    assert!(prologue1.contains("V2_CSHA_PROLOGUE_SKIP_1"), "prologue iter 1 label missing");
+    assert!(!prologue0.contains("V2_CSHA_PROLOGUE_SKIP_1"), "prologue iter 0 leaks iter 1");
+
+    let mut proj0 = String::new();
+    let mut proj1 = String::new();
+    csha_hooks::emit_matmul_projection(&mut proj0, &cfg, 0);
+    csha_hooks::emit_matmul_projection(&mut proj1, &cfg, 1);
+    assert!(proj0.contains("V2_CSHA_PROJECTION_SKIP_0"), "projection iter 0 label missing");
+    assert!(proj1.contains("V2_CSHA_PROJECTION_SKIP_1"), "projection iter 1 label missing");
+    assert!(!proj0.contains("V2_CSHA_PROJECTION_SKIP_1"), "projection iter 0 leaks iter 1");
+
+    let mut epi0 = String::new();
+    let mut epi1 = String::new();
+    csha_hooks::emit_rope_epilogue(&mut epi0, &cfg, 0);
+    csha_hooks::emit_rope_epilogue(&mut epi1, &cfg, 1);
+    assert!(epi0.contains("V2_CSHA_EPILOGUE_SKIP_0"), "epilogue iter 0 label missing");
+    assert!(epi1.contains("V2_CSHA_EPILOGUE_SKIP_1"), "epilogue iter 1 label missing");
+    assert!(!epi0.contains("V2_CSHA_EPILOGUE_SKIP_1"), "epilogue iter 0 leaks iter 1");
 }

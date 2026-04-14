@@ -1,0 +1,18 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = 0)
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_0;
+    // TODO(fa-v2-projection): full Q/K/V/O matmul body
+    // Port v1's emit_csha_matmul_projection to warp-per-row:
+    //   for each output element (q_row, d) owned by this lane:
+    //     acc = 0
+    //     for in_dim in 0..d_model:
+    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]
+    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)
+    // See plan Task 10 step 4 + spec Section 1 for full algorithm.
+V2_CSHA_PROJECTION_SKIP_0:
+    bar.sync 0;  // FENCE: all projection writes complete (skeleton)
