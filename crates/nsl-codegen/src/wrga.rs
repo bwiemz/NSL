@@ -193,7 +193,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
     let placements = place_adapters(&sites, gpu, input.r_min, input.r_max);
 
     // ── Stage 4: Spectral rank allocation (if weights supplied) ───────────
-    let (spectral, ranks) = run_spectral(input.weights, &placements, &input);
+    let (spectral, ranks, override_diags) = run_spectral(input.weights, &placements, &input);
 
     // ── Stage 5: Fusion integration ───────────────────────────────────────
     let rank_overrides: Vec<usize> =
@@ -224,7 +224,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         ranks,
         fusion,
         memory,
-        override_diagnostics: Vec::new(),
+        override_diagnostics: override_diags,
     }
 }
 
@@ -335,7 +335,7 @@ fn run_spectral(
     weights: Option<&WeightMap>,
     placements: &[AdapterPlacement],
     input: &WrgaInput,
-) -> (Vec<SpectralAnalysis>, Vec<RankAllocation>) {
+) -> (Vec<SpectralAnalysis>, Vec<RankAllocation>, Vec<crate::wggo_overrides::OverrideDiagnostic>) {
     let Some(wm) = weights else {
         // Without weights, fall back to uniform r_max (clamped by budget) per
         // non-skipped placement.
@@ -348,7 +348,7 @@ fn run_spectral(
                 adapter_params: p.suggested_rank * 1024, // rough guess
             })
             .collect();
-        return (Vec::new(), ranks);
+        return (Vec::new(), ranks, Vec::new());
     };
 
     // Collect analyses only for sites we actually plan to adapt.
@@ -373,9 +373,10 @@ fn run_spectral(
     } else {
         spectral.len().max(1) * input.r_max
     };
-    let ranks = allocate_ranks(&spectral, budget, input.r_min, input.r_max, Some(&slack));
+    let (ranks, override_diags) =
+        allocate_ranks(&spectral, budget, input.r_min, input.r_max, Some(&slack), input.wggo_overrides);
 
-    (spectral, ranks)
+    (spectral, ranks, override_diags)
 }
 
 // ---------------------------------------------------------------------------
