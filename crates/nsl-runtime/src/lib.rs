@@ -29,7 +29,15 @@ pub mod tokenizer;
 pub mod quantize;
 pub mod fp8;
 pub mod awq;
+pub use awq::{nsl_awq_write_sidecar, AwqProjectionDescriptor};
 pub mod gptq;
+
+// Calibration-data loader: .bin and .safetensors dispatch (unconditional)
+pub mod calibration_data;
+pub use calibration_data::{
+    nsl_calibration_load, nsl_calibration_batch_at,
+    nsl_calibration_count, nsl_calibration_free,
+};
 
 // M18b: Interop modules (feature-gated)
 #[cfg(feature = "interop")]

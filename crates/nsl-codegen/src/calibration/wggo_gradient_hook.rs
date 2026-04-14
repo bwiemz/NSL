@@ -198,7 +198,7 @@ impl CalibrationHook for WggoGradientHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::hooks::ArenaLayout;
+    use crate::calibration::retention::ArenaLayout;
     use crate::wggo_cost::LayerShape;
 
     fn proj(name: &str) -> ProjectionRef {

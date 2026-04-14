@@ -1,10 +1,9 @@
 //! Runtime context passed to `CalibrationHook::emit_*` methods.
 //!
-//! In production (Task 9), `CalibCtx` wraps a Cranelift
-//! `FunctionBuilder` + retention table + running-buffer map, and the
-//! API methods emit IR directly.  In unit-test mode, the same API is
-//! backed by concrete Rust state so hooks can be exercised without
-//! Cranelift.
+//! The stub-mode path (`stub_*` methods) is used by unit tests so
+//! hooks can be exercised without Cranelift.  The real IR emission for
+//! the 2D max-abs reduction is in `binary_codegen::emit_2d_max_abs_loop`
+//! and is driven by `ObservePlanEntry` / `FinalizePlanEntry` from Task 5.
 
 use std::collections::BTreeMap;
 
@@ -24,7 +23,10 @@ pub struct CalibCtx<'a> {
     running_buffers: BTreeMap<BufferHandle, Vec<f32>>,
     running_names: BTreeMap<String, BufferHandle>,
     next_handle: u32,
-    // Task 9 adds: fbuilder: &'a mut cranelift::FunctionBuilder,
+    /// Stub-mode per-projection arena data (keyed by projection name).
+    /// Populated by `stub_set_arena_buffer`; consumed by
+    /// `emit_per_channel_max_abs_update` in stub mode.
+    stub_arena_data: BTreeMap<String, Vec<f32>>,
 }
 
 impl<'a> CalibCtx<'a> {
@@ -38,6 +40,7 @@ impl<'a> CalibCtx<'a> {
             running_buffers: BTreeMap::new(),
             running_names: BTreeMap::new(),
             next_handle: 0,
+            stub_arena_data: BTreeMap::new(),
         }
     }
 
@@ -54,6 +57,7 @@ impl<'a> CalibCtx<'a> {
             running_buffers: BTreeMap::new(),
             running_names: BTreeMap::new(),
             next_handle: 0,
+            stub_arena_data: BTreeMap::new(),
         }
     }
 
@@ -112,6 +116,88 @@ impl<'a> CalibCtx<'a> {
         assert_eq!(buf.len(), src.len(), "src length mismatch for running_max_abs");
         for (b, v) in buf.iter_mut().zip(src.iter()) {
             *b = b.max(v.abs());
+        }
+    }
+
+    // ---- emit_observe_batch helpers ------------------------------------------
+
+    /// Stub-mode: write arena activation data for a projection, keyed by
+    /// projection name.  In production (Task 9) the arena is a `.bss` global
+    /// filled by the splice-point IR; in tests we inject it here so that
+    /// `emit_per_channel_max_abs_update` can find it.
+    ///
+    /// Named `stub_set_arena_buffer` to distinguish from the handle-based
+    /// `stub_set_buffer` used for running-max buffers.
+    pub fn stub_set_arena_buffer(&mut self, name: &str, values: &[f32]) {
+        self.stub_arena_data.insert(name.to_string(), values.to_vec());
+    }
+
+    /// Stub-mode: read back the running-max-abs vector for a named projection.
+    /// Returns an empty `Vec` when the name is unknown.
+    pub fn stub_running_max_abs_named(&self, name: &str) -> Vec<f32> {
+        let h = match self.running_names.get(name) {
+            Some(&h) => h,
+            None => return Vec::new(),
+        };
+        self.running_buffers.get(&h).cloned().unwrap_or_default()
+    }
+
+    /// Emit a per-input-channel max-abs reduction over a 2-D slice of the
+    /// arena with shape `[rows, channels]` (row-major, f32).
+    ///
+    /// Parameters:
+    /// - `src_name`   — projection name used in stub mode to look up the
+    ///                  in-memory arena buffer (populated via `stub_set_arena_buffer`).
+    /// - `src_offset` — byte offset into the `.bss` arena global; used only
+    ///                  on the real Cranelift IR path (Task 9+).
+    /// - `rows`       — first dimension of the activation slice
+    ///                  (batch × seq, collapsed).
+    /// - `channels`   — in-features (second dimension).
+    /// - `running`    — handle to the running-max buffer (length == channels).
+    ///
+    /// Stub path: iterates the concrete buffer in `stub_arena_data[src_name]`
+    /// and updates `running_buffers[running]` element-wise with `max(|v|, cur)`.
+    ///
+    /// Real IR path: emits a Cranelift outer loop over `rows`, calling
+    /// `emit_running_max_abs_f32` for each row's sub-slice.
+    pub fn emit_per_channel_max_abs_update(
+        &mut self,
+        src_name: &str,
+        _src_offset: u32,
+        rows: u32,
+        channels: u32,
+        running: BufferHandle,
+    ) {
+        if channels == 0 {
+            return;
+        }
+
+        // ── Stub path (unit tests only) ─────────────────────────────────────
+        // The real IR path is in binary_codegen::emit_2d_max_abs_loop.
+        {
+            let src = self.stub_arena_data.get(src_name).cloned().unwrap_or_default();
+            let buf = self
+                .running_buffers
+                .get_mut(&running)
+                .expect("emit_per_channel_max_abs_update: unknown BufferHandle");
+
+            if buf.len() < channels as usize {
+                buf.resize(channels as usize, 0.0);
+            }
+
+            for r in 0..rows as usize {
+                for c in 0..channels as usize {
+                    let idx = r * channels as usize + c;
+                    if idx >= src.len() {
+                        break;
+                    }
+                    let a = src[idx].abs();
+                    if a > buf[c] {
+                        buf[c] = a;
+                    }
+                }
+            }
+            return;
         }
     }
 }
@@ -191,6 +277,7 @@ use cranelift_frontend::FunctionBuilder;
 /// (AWQ activation scales, FP8 amax tracking, GPTQ activation-stats inputs).
 /// Task 11 will wire this into the per-step loop of the production calibration
 /// binary; this helper is self-contained IR emission.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn emit_running_max_abs_f32(
     fb: &mut FunctionBuilder,
     buf_ptr: Value,

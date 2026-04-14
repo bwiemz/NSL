@@ -493,6 +493,15 @@ pub struct CompileOptions {
     /// their sidecar key from here.  `None` when calibration didn't
     /// run or produced no usable output.
     pub calibration_sidecar: Option<crate::calibration::sidecar::Sidecar>,
+    /// When `Some`, codegen runs the retention pass on `model_forward`, splicing
+    /// memcpys of input activations before matched linear sites. `None` = shipped
+    /// binary, zero IR impact.
+    pub calibration_retention: Option<Vec<crate::calibration::DiscoveredProjection>>,
+    /// Batch count and sequence length read from the calibration-data header
+    /// (`peek_batch_seq`).  Must be set whenever `calibration_retention` is
+    /// `Some`.  Callers that exercise retention in tests without real calib
+    /// data fall back to (8, 4) when this is `None`.
+    pub calibration_batch_seq: Option<(u32, u32)>,
 }
 
 impl Default for CompileOptions {
@@ -557,8 +566,166 @@ impl Default for CompileOptions {
             calibration_batch_size: 8,
             calibration_timeout_secs: 600,
             calibration_sidecar: None,
+            calibration_retention: None,
+            calibration_batch_seq: None,
         }
     }
+}
+
+/// Compile an NSL source file, run the AWQ calibration harness, and return
+/// the resulting `Sidecar`.
+///
+/// This is a convenience wrapper that:
+/// 1. Reads the calibration-data header to obtain `(batch, seq)`.
+/// 2. Sets up `CompileOptions` with `calibration_data`, `weight_file`,
+///    `calibration_batch_seq`, and `calibration_mode = "required"`.
+/// 3. Lexes, parses, and semantically analyses the source.
+/// 4. Constructs a `Compiler` directly and runs all passes, which triggers
+///    `discover_awq_projections` and `run_harness_production` as side effects
+///    inside `compile_train_block` (the calibration harness fires when a
+///    `train` block is compiled and `calibration_data` is set).
+/// 5. Reads back `compiler.compile_options.calibration_sidecar` and returns it.
+///
+/// The NSL source must contain a `train` block for the calibration harness
+/// to fire; models decorated with `@quantize(dtype="awq4")` and using `|>`
+/// pipe syntax in `forward` will have their projections discovered automatically.
+pub fn compile_and_calibrate(
+    source_path: &std::path::Path,
+    data_path: &std::path::Path,
+    weights_path: &std::path::Path,
+) -> Result<crate::calibration::sidecar::Sidecar, CodegenError> {
+    let source = std::fs::read_to_string(source_path).map_err(|e| {
+        CodegenError::new(format!("reading source {}: {e}", source_path.display()))
+    })?;
+
+    // Step 1: peek at the calibration data to get (batch, seq).
+    let (batch, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
+        .map_err(|e| CodegenError::new(format!("reading calibration data header: {e}")))?;
+
+    // Step 2: lex, parse, and semantically analyse.
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "lex errors in {}: {:?}",
+            source_path.display(),
+            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "parse errors in {}: {:?}",
+            source_path.display(),
+            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    if analysis.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "semantic errors in {}: {:?}",
+            source_path.display(),
+            analysis.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+
+    // Step 3: assemble options.
+    let mut opts = CompileOptions::default();
+    opts.calibration_data = Some(data_path.to_path_buf());
+    opts.weight_file = Some(weights_path.to_path_buf());
+    opts.calibration_batch_seq = Some((batch, seq));
+    opts.calibration_mode = Some("required".to_string());
+
+    // Step 4: Run stdlib imports for any train block references.
+    let imported_fns = crate::stdlib_loader::build_imported_fns_for_entry(
+        &parsed.module,
+        &mut interner,
+        &analysis.type_map,
+        &opts,
+    )?;
+
+    // Step 5: construct the Compiler directly so we can read back
+    // `compiler.compile_options.calibration_sidecar` after all passes run.
+    // (This is Blocker A's fix: compile_module takes &CompileOptions so the
+    // sidecar written into the Compiler's internal copy cannot be recovered
+    // via the public API.  Driving Compiler directly avoids this limitation.)
+    let mut compiler = crate::compiler::Compiler::new(&interner, &analysis.type_map, &opts)?;
+
+    let pre_finalize = (|| -> Result<(), CodegenError> {
+        compiler.intern_string("")?;
+        compiler.collect_strings(&parsed.module.stmts)?;
+        compiler.collect_enums(&parsed.module.stmts)?;
+        compiler.collect_structs(&parsed.module.stmts)?;
+        compiler.collect_models(&parsed.module.stmts)?;
+        compiler.declare_runtime_functions()?;
+        compiler.declare_imported_functions(&imported_fns)?;
+        compiler.declare_user_functions_with_linkage(
+            &parsed.module.stmts,
+            cranelift_module::Linkage::Export,
+        )?;
+        let vmap_results = compiler.apply_vmap_transforms(&parsed.module);
+        compiler.register_batched_functions(&vmap_results);
+        compiler.compile_datatype_defs(&parsed.module.stmts)?;
+        compiler.compile_kernels(&parsed.module.stmts)?;
+        compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        compiler.compile_user_functions(&parsed.module.stmts)?;
+        compiler.compile_batched_functions(&vmap_results)?;
+        // compile_main triggers compile_train_block which fires the calibration
+        // harness (AWQ discovery + run_harness_production) as a side-effect,
+        // populating compiler.compile_options.calibration_sidecar.
+        compiler.compile_main(&parsed.module.stmts)?;
+        compiler.compile_pending_lambdas()?;
+        compiler.emit_retention_arena()?;
+        Ok(())
+    })();
+
+    // The calibration sidecar is stored in the Compiler's copy of compile_options.
+    // Extract it before handling errors (the sidecar may have been populated even
+    // if a later codegen pass failed, but we want the sidecar from a successful run).
+    let sidecar = compiler.compile_options.calibration_sidecar.take();
+
+    // Propagate codegen errors only after extracting the sidecar.
+    pre_finalize?;
+
+    sidecar.ok_or_else(|| {
+        CodegenError::new(
+            "compile_and_calibrate: calibration harness ran but produced no sidecar. \
+             Ensure the NSL source contains a train block and at least one \
+             @quantize(dtype=\"awq4\")-decorated model with |>-pipe forward method."
+                .to_string(),
+        )
+    })
+}
+
+/// Compile a source string with the given options (convenience wrapper for
+/// tests that already hold a populated `CompileOptions::calibration_sidecar`
+/// and want to verify the final compile path).
+pub fn compile_with_options(source: &str, opts: &CompileOptions) -> Result<Vec<u8>, CodegenError> {
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "lex errors: {:?}",
+            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "parse errors: {:?}",
+            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    compile_module(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        opts,
+    )
 }
 
 #[cfg(test)]
@@ -573,5 +740,11 @@ mod calib_options_tests {
         assert_eq!(o.calibration_samples, 512);
         assert_eq!(o.calibration_batch_size, 8);
         assert_eq!(o.calibration_timeout_secs, 600);
+    }
+
+    #[test]
+    fn compile_options_default_has_no_calibration_retention() {
+        let opts = CompileOptions::default();
+        assert!(opts.calibration_retention.is_none());
     }
 }

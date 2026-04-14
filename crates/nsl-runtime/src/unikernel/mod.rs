@@ -229,7 +229,7 @@ pub fn parse_boot_config(json: &str) -> BootConfig {
                 }
                 "listen_host" => {
                     let octets: Vec<u8> = value.split('.')
-                        .filter_map(|o| o.trim_matches('"').parse().ok())
+                        .filter_map(|o| o.trim_matches('"').parse::<u8>().ok())
                         .collect();
                     if octets.len() == 4 {
                         config.listen_host = [octets[0], octets[1], octets[2], octets[3]];

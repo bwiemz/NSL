@@ -1,5 +1,25 @@
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
+use crate::calibration::retention::ArenaLayout;
+
+/// Describes a single per-batch reduction to emit inline in `calibration_main`.
+#[derive(Debug, Clone)]
+pub struct ObservePlanEntry {
+    pub projection: ProjectionRef,
+    pub src_offset: u32,
+    pub rows: u32,
+    pub channels: u32,
+    pub running_symbol: String,
+}
+
+/// A per-projection running buffer to declare as a `.data` global and to
+/// serialize at finalize time.  Paired with `ObservePlanEntry`.
+#[derive(Debug, Clone)]
+pub struct FinalizePlanEntry {
+    pub projection: ProjectionRef,
+    pub running_symbol: String,
+    pub channels: u32,
+}
 
 /// Outcome of a hook's `emit_finalize` call.
 #[derive(Debug, Clone)]
@@ -10,42 +30,6 @@ pub enum CalibrationResult {
     /// insufficient samples).  ALWAYS triggers a hard error regardless
     /// of `--calibrate` mode — see spec §6.1.
     Degenerate { reason: String },
-}
-
-// ── Arena-layout plan types ───────────────────────────────────────────────────
-//
-// These are used by hooks that operate over a pre-built retention arena
-// (e.g. `WggoGradientHook`).  The arena maps each projection to a byte
-// offset and size inside a flat buffer; hooks can query this to decide
-// which projections to observe and how to slice the running buffers.
-
-/// Flat byte-offset map of a retention arena produced by the allocator.
-/// Each entry is `(projection, byte_offset, nbytes)`.
-#[derive(Debug, Clone, Default)]
-pub struct ArenaLayout {
-    pub entries: Vec<(ProjectionRef, u32, u32)>,
-}
-
-/// One hook's per-projection observation: read `rows × channels` f32
-/// elements starting at `src_offset` bytes and accumulate into
-/// `running_symbol`.
-#[derive(Debug, Clone)]
-pub struct ObservePlanEntry {
-    pub projection: ProjectionRef,
-    pub src_offset: u32,
-    pub rows: u32,
-    pub channels: u32,
-    pub running_symbol: String,
-}
-
-/// One hook's per-layer finalisation: write the aggregated `channels`-wide
-/// running buffer named `running_symbol` into the sidecar under
-/// `projection`.
-#[derive(Debug, Clone)]
-pub struct FinalizePlanEntry {
-    pub projection: ProjectionRef,
-    pub running_symbol: String,
-    pub channels: u32,
 }
 
 // ── CalibrationHook trait ────────────────────────────────────────────────────
@@ -59,18 +43,21 @@ pub trait CalibrationHook: Send + Sync {
     fn emit_per_step(&self, ctx: &mut CalibCtx);
     fn emit_finalize(&self, ctx: &mut CalibCtx) -> CalibrationResult;
 
-    /// Optional: hooks that operate over a pre-built retention arena
-    /// return the set of per-projection observations they want.
-    /// Default: no arena observations.
+    /// Called once per calibration batch, after model_forward has populated
+    /// the retention arena.  Default impl is a no-op for hooks that don't
+    /// observe per-batch activations (e.g. IdentityHook).
+    fn emit_observe_batch(&self, _ctx: &mut CalibCtx, _arena: &ArenaLayout) {}
+
+    /// Describes per-batch reductions to emit inline in `calibration_main`.
+    /// Default empty — hooks with no forward-pass observation (e.g. IdentityHook).
     fn observe_plan(&self, _arena: &ArenaLayout) -> Vec<ObservePlanEntry> {
-        vec![]
+        Vec::new()
     }
 
-    /// Optional: hooks that aggregate arena observations return one
-    /// finalisation entry per logical output dimension (e.g. per layer).
-    /// Default: no finalization entries.
+    /// Per-projection running buffers to declare as `.data` globals AND to
+    /// serialize at finalize time.  Paired with `observe_plan`.
     fn finalize_plan(&self) -> Vec<FinalizePlanEntry> {
-        vec![]
+        Vec::new()
     }
 }
 

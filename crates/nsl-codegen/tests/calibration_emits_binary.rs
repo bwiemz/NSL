@@ -33,6 +33,7 @@ fn real_subprocess_entry_produces_runnable_binary_with_identity_hook() {
         batch_size: 1,
         timeout_secs: 30,
         mode: HarnessMode::Required,
+        projections: vec![],
     };
 
     let result = real_subprocess_entry(&cfg, &registry);
@@ -47,8 +48,13 @@ fn real_subprocess_entry_produces_runnable_binary_with_identity_hook() {
     );
 }
 
+/// Task 6: hooks that require forward activations (AWQ) now go through the
+/// real subprocess entry instead of being rejected.  The subprocess emits a
+/// `calibration_main` that calls `nsl_calibration_load`; invalid calibration
+/// data (8 zero bytes, no NSLB magic) causes the load to return null and the
+/// binary to exit with status 4 → Infrastructure.
 #[test]
-fn real_subprocess_entry_rejects_linear_input_activations_hooks() {
+fn real_subprocess_entry_accepts_linear_input_activations_hooks() {
     use nsl_codegen::calibration::hooks::{CalibrationHook, CalibrationResult};
     use nsl_codegen::calibration::observation::{ObservationSet, ProjectionRef};
     use nsl_codegen::calibration::CalibCtx;
@@ -69,11 +75,14 @@ fn real_subprocess_entry_rejects_linear_input_activations_hooks() {
     }
 
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let tmp_dir = std::env::temp_dir().join(format!("nsl-calib-reject-test-{nanos}"));
+    let tmp_dir = std::env::temp_dir().join(format!("nsl-calib-accept-test-{nanos}"));
     fs::create_dir_all(&tmp_dir).unwrap();
     let ckpt = tmp_dir.join("ckpt.safetensors");
     let data = tmp_dir.join("data.bin");
     fs::write(&ckpt, b"x").unwrap();
+    // Invalid calibration data (bad magic) → nsl_calibration_load returns null
+    // → subprocess exits 4 → Infrastructure.  This tests that the hook is
+    // ACCEPTED (no rejection at the entry gate) and goes through the forward path.
     fs::write(&data, [0u8; 8]).unwrap();
 
     let mut registry = HookRegistry::new();
@@ -86,18 +95,23 @@ fn real_subprocess_entry_rejects_linear_input_activations_hooks() {
         batch_size: 1,
         timeout_secs: 30,
         mode: HarnessMode::Required,
+        projections: vec![],
     };
 
     let result = real_subprocess_entry(&cfg, &registry);
     let _ = fs::remove_dir_all(&tmp_dir);
 
+    // The binary was emitted and run (no early rejection), but the data load
+    // failed → Infrastructure (subprocess status 4), NOT a rejection at the
+    // gate with a "LinearInputActivations" message.
     match result {
         Err(nsl_codegen::calibration::HarnessError::Infrastructure { reason }) => {
+            // Must NOT be the old "LinearInputActivations" rejection — that gate is gone.
             assert!(
-                reason.contains("LinearInputActivations"),
-                "expected LinearInputActivations rejection, got: {reason}"
+                !reason.contains("LinearInputActivations"),
+                "should not see old rejection message; got: {reason}"
             );
         }
-        other => panic!("expected Infrastructure error, got {other:?}"),
+        other => panic!("expected Infrastructure error (data load failed), got {other:?}"),
     }
 }
