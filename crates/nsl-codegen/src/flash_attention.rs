@@ -58,6 +58,41 @@ const MMA_K: usize = 16;
 /// Minimum SM version required for f16 MMA tensor core instructions.
 const MMA_MIN_SM: u32 = 80;
 
+// ---- PTX literal helpers (see docs/superpowers/specs/2026-04-13-fa-emitter-ptx-fix-design.md) ----
+
+/// Format a u32 bit pattern as a PTX f32 literal: `0f########`.
+/// PTX rejects `0x########` for f32 immediates.
+#[allow(dead_code)]
+fn f32_bits(bits: u32) -> String {
+    format!("0f{:08X}", bits)
+}
+
+#[allow(dead_code)]
+const F32_ZERO: u32    = 0x0000_0000;
+#[allow(dead_code)]
+const F32_NEG_INF: u32 = 0xFF80_0000;
+#[allow(dead_code)]
+const F32_LOG2E: u32   = 0x3FB8_AA3B;
+
+/// Emit a shared-memory store through `%smem_addr` / `%shmem_base`.
+/// Callers must have emitted `.reg .u64 %smem_addr` + `.reg .u64 %shmem_base`
+/// and `cvta.shared.u64 %shmem_base, shmem;` in the kernel prolog
+/// (see `emit_register_declarations`).
+#[allow(dead_code)]
+fn emit_smem_store(ptx: &mut String, ty: &str, offset_reg: &str, val_reg: &str) {
+    use std::fmt::Write;
+    writeln!(ptx, "    add.s64 %smem_addr, %shmem_base, {};", offset_reg).unwrap();
+    writeln!(ptx, "    st.shared.{} [%smem_addr], {};", ty, val_reg).unwrap();
+}
+
+/// Emit a shared-memory load through `%smem_addr` / `%shmem_base`.
+#[allow(dead_code)]
+fn emit_smem_load(ptx: &mut String, ty: &str, dst_reg: &str, offset_reg: &str) {
+    use std::fmt::Write;
+    writeln!(ptx, "    add.s64 %smem_addr, %shmem_base, {};", offset_reg).unwrap();
+    writeln!(ptx, "    ld.shared.{} {}, [%smem_addr];", ty, dst_reg).unwrap();
+}
+
 /// Check whether the MMA path should be used for this GPU.
 pub fn use_mma_path(gpu_sm: u32) -> bool {
     gpu_sm >= MMA_MIN_SM
@@ -461,6 +496,13 @@ fn emit_register_declarations(ptx: &mut String, config: &FlashAttentionConfig) {
     // Example: block_q=64, head_dim=128, blockDim.x=128 → 64 registers
     // Declared dynamically based on config in emit_accumulator_init
     let _ = config;
+
+    // SMEM addressing prolog — used by emit_smem_store / emit_smem_load helpers (Tasks 3–5).
+    // %shmem_base holds the generic address of the shared memory window; %smem_addr is a
+    // per-access scratch register reused for each [shmem + %reg] computation.
+    ptx.push_str("    .reg .u64 %smem_addr;\n");
+    ptx.push_str("    .reg .u64 %shmem_base;\n");
+    ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
 }
 
 fn emit_param_loads(ptx: &mut String, config: &FlashAttentionConfig) {
