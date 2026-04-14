@@ -255,6 +255,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::F64, types::I64],
         Some(types::F64),
     ),
+    // FASE Deferred two-phase grad clip: sum of squared elements, in-place scale.
+    (
+        "nsl_tensor_sum_sq",
+        &[types::I64],
+        Some(types::F64),
+    ),
+    (
+        "nsl_tensor_mul_scalar_inplace",
+        &[types::I64, types::F64],
+        None,
+    ),
     // Tensor matmul
     (
         "nsl_tensor_matmul",
