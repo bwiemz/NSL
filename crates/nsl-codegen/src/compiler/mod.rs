@@ -943,9 +943,7 @@ impl<'a> Compiler<'a> {
             _ => return Ok(()),
         };
 
-        // TODO(Task 6): read batch/seq from calibration-data header.
-        let batch: u32 = 8;
-        let seq: u32 = 4;
+        let (batch, seq) = self.compile_options.calibration_batch_seq.unwrap_or((8, 4));
         let layout = crate::calibration::build_arena_layout(&projections, batch, seq);
         let total = layout.total_bytes() as usize;
         if total == 0 {

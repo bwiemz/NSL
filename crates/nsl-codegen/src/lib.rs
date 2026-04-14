@@ -482,6 +482,11 @@ pub struct CompileOptions {
     /// memcpys of input activations before matched linear sites. `None` = shipped
     /// binary, zero IR impact.
     pub calibration_retention: Option<Vec<crate::calibration::DiscoveredProjection>>,
+    /// Batch count and sequence length read from the calibration-data header
+    /// (`peek_batch_seq`).  Must be set whenever `calibration_retention` is
+    /// `Some`.  Callers that exercise retention in tests without real calib
+    /// data fall back to (8, 4) when this is `None`.
+    pub calibration_batch_seq: Option<(u32, u32)>,
 }
 
 impl Default for CompileOptions {
@@ -547,8 +552,95 @@ impl Default for CompileOptions {
             calibration_timeout_secs: 600,
             calibration_sidecar: None,
             calibration_retention: None,
+            calibration_batch_seq: None,
         }
     }
+}
+
+/// Compile an NSL source file, run the AWQ calibration harness, and return
+/// the resulting `Sidecar`.
+///
+/// This is a convenience wrapper that:
+/// 1. Reads the calibration-data header to obtain `(batch, seq)`.
+/// 2. Sets up `CompileOptions` with `calibration_data`, `weight_file`,
+///    `calibration_batch_seq`, and `calibration_mode = "required"`.
+/// 3. Lexes, parses, and semantically analyses the source.
+/// 4. Invokes `compile_module` which triggers `discover_awq_projections`
+///    and `run_harness_production` as side effects in `stmt.rs`.
+/// 5. Returns the sidecar from `compile_options.calibration_sidecar`.
+///
+/// # Blocked dependencies
+///
+/// The sidecar is written back into `CompileOptions::calibration_sidecar`
+/// by `stmt.rs`'s calibration harness side-effect, but the current
+/// `compile_module` API takes `CompileOptions` by reference so the mutated
+/// field cannot be recovered by the caller.  Until `compile_module` is
+/// updated to return the sidecar (Task 10 integration), this function
+/// returns a `BLOCKED` error describing exactly what is missing.
+///
+/// Callers that need the sidecar TODAY should invoke the `Compiler` directly
+/// (as `stmt.rs` does) and recover `compiler.compile_options.calibration_sidecar`.
+pub fn compile_and_calibrate(
+    source_path: &std::path::Path,
+    data_path: &std::path::Path,
+    weights_path: &std::path::Path,
+) -> Result<crate::calibration::sidecar::Sidecar, CodegenError> {
+    let source = std::fs::read_to_string(source_path).map_err(|e| {
+        CodegenError::new(format!("reading source {}: {e}", source_path.display()))
+    })?;
+
+    // Step 1: peek at the calibration data to get (batch, seq).
+    let (batch, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
+        .map_err(|e| CodegenError::new(format!("reading calibration data header: {e}")))?;
+
+    // Step 2: lex, parse, and semantically analyse.
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "lex errors in {}: {:?}",
+            source_path.display(),
+            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "parse errors in {}: {:?}",
+            source_path.display(),
+            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    if analysis.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "semantic errors in {}: {:?}",
+            source_path.display(),
+            analysis.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+
+    // Step 3: assemble options.
+    let mut opts = CompileOptions::default();
+    opts.calibration_data = Some(data_path.to_path_buf());
+    opts.weight_file = Some(weights_path.to_path_buf());
+    opts.calibration_batch_seq = Some((batch, seq));
+    opts.calibration_mode = Some("required".to_string());
+
+    // Step 4: compile (side-effects: AWQ discovery + harness run).
+    compile_module(&parsed.module, &interner, &analysis.type_map, "", false, &opts)?;
+
+    // BLOCKED: `compile_module` takes `&CompileOptions` (immutable reference),
+    // so the sidecar written to the Compiler's internal copy of options cannot
+    // be recovered here.  Task 10's integration driver should call the Compiler
+    // struct directly and extract `compiler.compile_options.calibration_sidecar`
+    // after `compile_module_body` returns.
+    Err(CodegenError::new(
+        "compile_and_calibrate: calibration sidecar is produced inside the Compiler but \
+         cannot be retrieved via the current compile_module() API \
+         (BLOCKED: Task 10 integration — call Compiler directly to recover \
+         compile_options.calibration_sidecar)".to_string(),
+    ))
 }
 
 #[cfg(test)]

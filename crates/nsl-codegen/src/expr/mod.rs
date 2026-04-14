@@ -486,10 +486,9 @@ impl Compiler<'_> {
 
         // Compute nbytes: batch * seq * in_features * 4.
         // These were baked into the arena layout at emit_retention_arena time.
-        // TODO(Task 6): read batch/seq from calibration-data header; for now
-        // they are hard-coded to (8, 4) matching the Task 10 fixture.
-        let batch: u32 = 8;
-        let seq: u32 = 4;
+        // Read from CompileOptions; fall back to (8, 4) for tests that set
+        // calibration_retention without providing real calibration data.
+        let (batch, seq) = self.compile_options.calibration_batch_seq.unwrap_or((8, 4));
         let in_features = hit.weight_shape[1];
         let nbytes = (batch * seq * in_features * 4) as u64;
 

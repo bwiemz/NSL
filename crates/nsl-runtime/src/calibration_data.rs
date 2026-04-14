@@ -93,6 +93,19 @@ pub fn peek_shape(path: &Path) -> Result<Vec<u32>, CalibDataError> {
     load(path).map(|b| b.shape)
 }
 
+/// For rank-3 calibration tensors `[count, seq, hidden]`, returns `(count, seq)`.
+/// Errors if rank is not exactly 3.
+pub fn peek_batch_seq(path: &Path) -> Result<(u32, u32), CalibDataError> {
+    let shape = peek_shape(path)?;
+    if shape.len() != 3 {
+        return Err(CalibDataError::BinHeader(format!(
+            "expected rank-3 calibration tensor, got rank {}",
+            shape.len()
+        )));
+    }
+    Ok((shape[0], shape[1]))
+}
+
 // ── .bin loader ───────────────────────────────────────────────────────────────
 //
 // Binary format:
@@ -341,6 +354,49 @@ mod tests {
             load(tmp.path()),
             Err(CalibDataError::UnsupportedExt(_))
         ));
+    }
+
+    // ── peek_batch_seq tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn peek_batch_seq_returns_count_and_seq_for_rank3() {
+        let mut tmp = NamedTempFile::with_suffix(".bin").unwrap();
+        tmp.write_all(b"NSLB").unwrap();
+        tmp.write_all(&3u32.to_le_bytes()).unwrap();
+        for d in [5u32, 7, 32] {
+            tmp.write_all(&d.to_le_bytes()).unwrap();
+        }
+        let payload_floats: usize = 5 * 7 * 32;
+        for i in 0..payload_floats {
+            tmp.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        tmp.flush().unwrap();
+
+        let (count, seq) = peek_batch_seq(tmp.path()).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(seq, 7);
+    }
+
+    #[test]
+    fn peek_batch_seq_rejects_rank2() {
+        let mut tmp = NamedTempFile::with_suffix(".bin").unwrap();
+        tmp.write_all(b"NSLB").unwrap();
+        tmp.write_all(&2u32.to_le_bytes()).unwrap();
+        for d in [4u32, 8] {
+            tmp.write_all(&d.to_le_bytes()).unwrap();
+        }
+        let payload_floats: usize = 4 * 8;
+        for i in 0..payload_floats {
+            tmp.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        tmp.flush().unwrap();
+
+        match peek_batch_seq(tmp.path()) {
+            Err(CalibDataError::BinHeader(msg)) => {
+                assert!(msg.contains("rank"), "expected rank error, got: {msg}");
+            }
+            other => panic!("expected BinHeader rank error, got {other:?}"),
+        }
     }
 
     // ── peek_shape tests ────────────────────────────────────────────────────

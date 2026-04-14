@@ -213,43 +213,15 @@ pub fn run_harness_simulated(
     }
 }
 
-/// Production calibration entry point.  Routes to the real subprocess
-/// when all registered hooks can be served by it (i.e., none require
-/// forward activations that the current MVP doesn't emit into
-/// calibration_main), otherwise falls back to the in-process stub.
-/// This makes scope-reduction transparent to callers — when a follow-
-/// up plan lands full model-forward emission, this routing will flip
-/// over to always-real without changing caller code.
+/// Production calibration entry point.  Routes all hooks — including
+/// those requiring `LinearInputActivations` (AWQ) — through the real
+/// subprocess entry.  The `needs_forward_pass` rejection that existed
+/// in Task 11's MVP is gone; `real_subprocess_entry` handles both paths.
 pub fn run_harness_production(
     registry: &HookRegistry,
     cfg: &HarnessConfig,
 ) -> Result<HarnessOutput, HarnessError> {
-    let any_forward = registry.iter().any(|h| h.requires().needs_forward_pass());
-
-    if any_forward {
-        eprintln!(
-            "[calibration] routing through in-process stub (full model-forward emission is a follow-up plan)"
-        );
-        let ckpt_path = cfg.checkpoints.first().ok_or_else(|| {
-            HarnessError::Infrastructure {
-                reason: "no checkpoint paths supplied".into(),
-            }
-        })?;
-        let ckpt_bytes = std::fs::read(ckpt_path).map_err(|e| HarnessError::Infrastructure {
-            reason: format!("reading checkpoint {}: {e}", ckpt_path.display()),
-        })?;
-        let data_bytes = std::fs::read(&cfg.calibration_data).map_err(|e| {
-            HarnessError::Infrastructure {
-                reason: format!(
-                    "reading calibration data {}: {e}",
-                    cfg.calibration_data.display()
-                ),
-            }
-        })?;
-        run_harness_stub(registry, &ckpt_bytes, &data_bytes, cfg.samples)
-    } else {
-        run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
-    }
+    run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
 }
 
 fn empty_sidecar_for_fallback(
