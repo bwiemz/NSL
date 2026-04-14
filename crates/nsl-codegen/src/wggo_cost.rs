@@ -53,6 +53,23 @@ pub struct LayerShape {
     pub dtype_bytes: u64,
 }
 
+impl LayerShape {
+    /// Minimal 4-head fixture for unit tests.
+    ///
+    /// `d_model=256`, `head_dim=64` → `num_heads = 4`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn default_for_test_4heads() -> Self {
+        Self {
+            batch: 1,
+            seq: 64,
+            d_model: 256,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        }
+    }
+}
+
 /// Decision dimensions the LUT spans.  Each dimension has a small discrete
 /// domain — the LUT stores the full cross-product.
 #[derive(Debug, Clone)]
