@@ -310,3 +310,125 @@ fn adamw_fase_deferred_pipeline_equivalence() {
         );
     }
 }
+
+/// Rust reference: FASE-Deferred AdamW with two-phase global-L2 grad clip.
+/// Same fixture shape as `adamw_fase_deferred_reference`, plus clipping:
+/// compute global L2 norm of m_partial across all parameters, scale by
+/// clip_factor = min(1, τ / (norm + 1e-6)).
+fn adamw_fase_deferred_clipped_reference(
+    w_init: &[f32; 2],
+    x: &[[f32; 2]; 4],
+    y: &[[f32; 1]; 4],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    wd: f32,
+    tau: f32,
+    windows: u32,
+) -> [f32; 2] {
+    let mut w = *w_init;
+    let mut m_state = [0.0_f32; 2];
+    let mut v_state = [0.0_f32; 2];
+
+    for step in 1..=windows {
+        // Gradient (constant across window).
+        let mut pred = [0.0_f32; 4];
+        for i in 0..4 {
+            pred[i] = x[i][0] * w[0] + x[i][1] * w[1];
+        }
+        let mut r = [0.0_f32; 4];
+        for i in 0..4 {
+            r[i] = pred[i] - y[i][0];
+        }
+        let n = 4.0_f32;
+        let mut g = [0.0_f32; 2];
+        for j in 0..2 {
+            for i in 0..4 {
+                g[j] += x[i][j] * r[i];
+            }
+            g[j] *= 2.0 / n;
+        }
+
+        // m_partial = mean(g) = g (constant inputs across micro-batches).
+        let mut m_partial = g;
+
+        // Phase A: global L2 norm of m_partial.
+        let total_sq: f32 = m_partial.iter().map(|&v| v * v).sum();
+        let norm = total_sq.sqrt();
+        let clip_factor = 1.0_f32.min(tau / (norm + 1e-6));
+
+        // Phase B: scale, then AdamW step with bias correction.
+        for j in 0..2 {
+            m_partial[j] *= clip_factor;
+            m_state[j] = beta1 * m_state[j] + (1.0 - beta1) * m_partial[j];
+            v_state[j] =
+                beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
+            let bc1 = 1.0 - beta1.powi(step as i32);
+            let bc2 = 1.0 - beta2.powi(step as i32);
+            let m_hat = m_state[j] / bc1;
+            let v_hat = v_state[j] / bc2;
+            w[j] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * w[j]);
+        }
+    }
+    w
+}
+
+#[test]
+fn adamw_deferred_with_grad_clip() {
+    let tmp = TempDir::new().expect("tempdir");
+    nsl_run(
+        &fixture("fase_deferred_grad_accum_4_clipped.nsl"),
+        tmp.path(),
+    );
+
+    let checkpoint = tmp.path().join("adamw_clipped_out.nslm");
+    assert!(
+        checkpoint.exists(),
+        "expected checkpoint at {:?}",
+        checkpoint
+    );
+    let tensors = read_nslm(&checkpoint).expect("read nslm");
+
+    let w_compiled = tensors
+        .get("w")
+        .or_else(|| tensors.get("m.w"))
+        .expect(&format!(
+            "w tensor not in checkpoint; available: {:?}",
+            tensors.keys().collect::<Vec<_>>()
+        ));
+    assert_eq!(w_compiled.len(), 2);
+
+    let w_init = [1.0_f32, 1.0_f32];
+    let x = [[1.0, 1.0]; 4];
+    let y = [[0.0]; 4];
+    let w_ref = adamw_fase_deferred_clipped_reference(
+        &w_init,
+        &x,
+        &y,
+        /*lr=*/ 0.001,
+        /*beta1=*/ 0.9,
+        /*beta2=*/ 0.999,
+        /*eps=*/ 1e-8,
+        /*wd=*/ 0.01,
+        /*tau=*/ 0.01,
+        /*windows=*/ 3,
+    );
+
+    println!("AdamW+clip FASE-Deferred equivalence check:");
+    println!("  compiled w[0]={} w[1]={}", w_compiled[0], w_compiled[1]);
+    println!("  reference w[0]={} w[1]={}", w_ref[0], w_ref[1]);
+
+    for i in 0..2 {
+        let diff = (w_compiled[i] - w_ref[i]).abs();
+        let scale = w_ref[i].abs().max(1.0);
+        assert!(
+            diff / scale < 1e-5,
+            "AdamW+clip θ[{}] diverged: compiled={} reference={} rel_err={}",
+            i,
+            w_compiled[i],
+            w_ref[i],
+            diff / scale
+        );
+    }
+}
