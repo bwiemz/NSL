@@ -3752,11 +3752,21 @@ impl Compiler<'_> {
                     let mut registry = crate::calibration::registry::HookRegistry::new();
                     if let Some(awq_projections) = self.discover_awq_projections() {
                         if !awq_projections.is_empty() {
+                            // Extract just the ProjectionRef for the hook; the full
+                            // DiscoveredProjection (with weight_shape) lives in
+                            // compile_options.calibration_retention for codegen.
+                            let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
+                                .iter()
+                                .map(|dp| dp.projection.clone())
+                                .collect();
                             registry.register(Box::new(
                                 crate::calibration::awq_hook::AwqCalibrationHook::new(
-                                    awq_projections,
+                                    proj_refs,
                                 ),
                             ));
+                            // Store the full DiscoveredProjection vec so the retention
+                            // pass can use weight_shape for arena-layout sizing.
+                            self.compile_options.calibration_retention = Some(awq_projections);
                         }
                     }
                     if registry.is_empty() {
@@ -6608,7 +6618,7 @@ impl Compiler<'_> {
     /// its no-op path rather than crashing the compile.
     fn discover_awq_projections(
         &self,
-    ) -> Option<Vec<crate::calibration::ProjectionRef>> {
+    ) -> Option<Vec<crate::calibration::DiscoveredProjection>> {
         use crate::calibration::discover_awq_projections_from_state;
 
         // Collect all AWQ-quantised model names.
@@ -6624,7 +6634,7 @@ impl Compiler<'_> {
             return None;
         }
 
-        let mut all_projections: Vec<crate::calibration::ProjectionRef> = Vec::new();
+        let mut all_projections: Vec<crate::calibration::DiscoveredProjection> = Vec::new();
 
         for model_name in &awq_models {
             // Retrieve the forward method body (if stored).
@@ -6661,7 +6671,7 @@ impl Compiler<'_> {
             ) {
                 Ok(discovered) => {
                     for dp in discovered {
-                        all_projections.push(dp.projection);
+                        all_projections.push(dp);
                     }
                 }
                 Err(e) => {
@@ -6673,9 +6683,9 @@ impl Compiler<'_> {
         if all_projections.is_empty() {
             None
         } else {
-            // Sort + dedup across models.
-            all_projections.sort();
-            all_projections.dedup();
+            // Sort + dedup across models (by qualified path for determinism).
+            all_projections.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+            all_projections.dedup_by(|a, b| a.projection.0 == b.projection.0);
             Some(all_projections)
         }
     }

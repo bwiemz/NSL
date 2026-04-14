@@ -481,7 +481,7 @@ pub struct CompileOptions {
     /// When `Some`, codegen runs the retention pass on `model_forward`, splicing
     /// memcpys of input activations before matched linear sites. `None` = shipped
     /// binary, zero IR impact.
-    pub calibration_retention: Option<Vec<crate::calibration::ProjectionRef>>,
+    pub calibration_retention: Option<Vec<crate::calibration::DiscoveredProjection>>,
 }
 
 impl Default for CompileOptions {

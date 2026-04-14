@@ -13,6 +13,7 @@ pub mod identity_hook;
 pub mod observation;
 pub mod registry;
 pub mod retention;
+pub mod retention_pass;
 pub mod sidecar;
 pub mod subprocess;
 
@@ -26,6 +27,7 @@ pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
 pub use retention::{ArenaLayout, RetentionTable, TensorShape};
+pub use retention_pass::build_arena_layout;
 
 use std::collections::BTreeMap;
 

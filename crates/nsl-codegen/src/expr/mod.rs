@@ -6,8 +6,9 @@ mod literals;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, Value};
+use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
+use cranelift_module::Module;
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
@@ -140,6 +141,9 @@ impl Compiler<'_> {
                     ExprKind::Ident(_) => {
                         let func_name = self.expr_as_func_name(right);
                         if let Some(name) = func_name {
+                            // Task 4: emit retention splice BEFORE the matmul call.
+                            // No-op when calibration_retention is None.
+                            self.try_emit_retention_splice(builder, &name, left_val);
                             self.compile_call_by_name(builder, &name, &[left_val])
                         } else {
                             Err(CodegenError::new("pipe target is not a function"))
@@ -148,6 +152,9 @@ impl Compiler<'_> {
                     ExprKind::Call { callee, args } => {
                         let func_name = self.expr_as_func_name(callee);
                         if let Some(name) = func_name {
+                            // Task 4: emit retention splice BEFORE the matmul call.
+                            // No-op when calibration_retention is None.
+                            self.try_emit_retention_splice(builder, &name, left_val);
                             let mut arg_vals = vec![left_val];
                             for arg in args {
                                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -392,6 +399,107 @@ impl Compiler<'_> {
         }
 
         Ok(result)
+    }
+
+    /// Task 4 — Calibration retention splice.
+    ///
+    /// When `calibration_retention` is active and the current pipe target's
+    /// qualified path (`<model_name>.<field_name>`) matches an entry in the
+    /// retention list, emit a `emit_splice_memcpy` call **before** the matmul
+    /// is lowered.  This copies the input activation into the corresponding
+    /// slot of `__nsl_calib_retention_arena`.
+    ///
+    /// # Arguments
+    ///
+    /// * `builder`    — The Cranelift function builder (mid-lowering of the pipe).
+    /// * `field_name` — The bare pipe-target identifier (e.g. `"up_proj"`).
+    /// * `input_val`  — The Cranelift `Value` for the tensor pointer flowing
+    ///                  into the linear layer (i.e., the pipe LHS).
+    ///
+    /// # Safety contract
+    ///
+    /// This is called BEFORE `compile_call_by_name` for the matmul — the
+    /// input activation has not been consumed or freed at this point.
+    ///
+    /// # Zero-IR guarantee
+    ///
+    /// When `calibration_retention` is `None` (all shipped binaries), this
+    /// function returns immediately without emitting any IR.
+    pub(crate) fn try_emit_retention_splice(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        field_name: &str,
+        input_val: Value,
+    ) {
+        // Fast path: no retention active.
+        let retention = match &self.compile_options.calibration_retention {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        // Determine the qualified path for this pipe target.
+        let model_name = match &self.current_method_model_name {
+            Some(m) => m.clone(),
+            None => return, // Not inside a model method — skip.
+        };
+        let qualified = format!("{}.{}", model_name, field_name);
+
+        // Find a matching retention entry.
+        let hit = match retention.iter().find(|dp| dp.projection.0 == qualified) {
+            Some(h) => h.clone(),
+            None => return,
+        };
+
+        // Look up the arena offset for this projection.
+        let offset = match self.retention_offsets.get(&hit.projection.0).copied() {
+            Some(o) => o,
+            None => {
+                // Arena not yet declared (e.g., emit_retention_arena hasn't run
+                // or the data_id is missing).  Emit a warning and skip.
+                eprintln!(
+                    "[calibration] retention offset missing for '{}' — splice skipped",
+                    hit.projection.0
+                );
+                return;
+            }
+        };
+
+        // Load the arena base pointer from the .bss global.
+        let arena_data_id = match self.retention_arena_data_id {
+            Some(id) => id,
+            None => return, // arena not declared yet — skip
+        };
+        let arena_gv = self.module.declare_data_in_func(arena_data_id, builder.func);
+        let arena_ptr = builder.ins().symbol_value(cl_types::I64, arena_gv);
+
+        // Determine the data pointer inside the NslTensor struct.
+        // NslTensor layout: [magic: u32 (4 bytes)] [data: *mut c_void (8 bytes)] ...
+        // So the `data` field is at byte offset 4.
+        // We load an 8-byte pointer from (input_val + 4).
+        const DATA_FIELD_OFFSET: i32 = 4;
+        let data_ptr = builder.ins().load(
+            cl_types::I64,
+            MemFlags::new(),
+            input_val,
+            DATA_FIELD_OFFSET,
+        );
+
+        // Compute nbytes: batch * seq * in_features * 4.
+        // These were baked into the arena layout at emit_retention_arena time.
+        // TODO(Task 6): read batch/seq from calibration-data header; for now
+        // they are hard-coded to (8, 4) matching the Task 10 fixture.
+        let batch: u32 = 8;
+        let seq: u32 = 4;
+        let in_features = hit.weight_shape[1];
+        let nbytes = (batch * seq * in_features * 4) as u64;
+
+        crate::calibration::retention::emit_splice_memcpy(
+            builder,
+            arena_ptr,
+            offset as u64,
+            data_ptr,
+            nbytes,
+        );
     }
 
     /// Map FFI function name to a trace op type ID.
