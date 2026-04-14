@@ -90,6 +90,14 @@ fn no_shmem_plus_reg_addressing() {
             bad_count, 0,
             "Config[{i}]: found {bad_count} illegal `[%reg + offset]` shared-memory address expression(s)"
         );
+
+        // Defect class 2b: `[shmem + %reg]` — ptxas rejects named-symbol + register addressing.
+        // This pattern was missed by the original grep (which only searched st/ld.shared).
+        let bad_shmem = src.matches("[shmem + %").count();
+        assert_eq!(
+            bad_shmem, 0,
+            "Config[{i}]: found {bad_shmem} illegal `[shmem + %reg]` addressing site(s)"
+        );
     }
 }
 

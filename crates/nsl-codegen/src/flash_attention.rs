@@ -87,6 +87,14 @@ fn emit_smem_load(ptx: &mut String, ty: &str, dst_reg: &str, offset_reg: &str) {
     writeln!(ptx, "    ld.shared.{} {}, [%smem_addr];", ty, dst_reg).unwrap();
 }
 
+/// Emit an `atom.shared.add.f32` through `%smem_addr` / `%shmem_base`.
+/// The `offset_reg` must be a `.u64` register (widen with `cvt.u64.u32` first if needed).
+fn emit_smem_atom_add_f32(ptx: &mut String, dst_reg: &str, offset_reg: &str, val_reg: &str) {
+    use std::fmt::Write;
+    writeln!(ptx, "    add.s64 %smem_addr, %shmem_base, {};", offset_reg).unwrap();
+    writeln!(ptx, "    atom.shared.add.f32 {}, [%smem_addr], {};", dst_reg, val_reg).unwrap();
+}
+
 /// Check whether the MMA path should be used for this GPU.
 pub fn use_mma_path(gpu_sm: u32) -> bool {
     gpu_sm >= MMA_MIN_SM
@@ -2975,7 +2983,8 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
     // sm_52 minimum but correctness on sm_52 would need a bar.sync restructure.
     // For the target hardware (RTX 5070 Ti, sm_120) this is optimal.
     ptx.push_str("    mul.f32 %f_tmp, %f_p, %f_val;     // P * dO[d]\n");
-    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd36], %f_tmp;  // dV[nj][d] += P * dO[d]\n");
+    ptx.push_str("    // dV[nj][d] += P * dO[d]\n");
+    emit_smem_atom_add_f32(ptx, "%f_discard", "%rd36", "%f_tmp");
     ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
     ptx.push_str("    bra BWD_MAIN_DV_ACCUM;\n");
     ptx.push_str("BWD_MAIN_DV_ACCUM_DONE:\n\n");
@@ -3086,7 +3095,8 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
     ));
     // Atomic add to shared memory — same race condition as dV: multiple
     // threads (different mi) accumulate to the same dK[nj][d] slot.
-    ptx.push_str("    atom.shared.add.f32 %f_discard, [shmem + %rd37], %f_tmp;  // dK[nj][d] += dS * Q[d] * scale\n");
+    ptx.push_str("    // dK[nj][d] += dS * Q[d] * scale\n");
+    emit_smem_atom_add_f32(ptx, "%f_discard", "%rd37", "%f_tmp");
     ptx.push_str("    add.u64 %rd34, %rd34, 1;\n");
     ptx.push_str("    bra BWD_MAIN_DK_ACCUM;\n");
     ptx.push_str("BWD_MAIN_DK_ACCUM_DONE:\n\n");
@@ -3174,6 +3184,7 @@ fn emit_bwd_mma_registers(ptx: &mut String, config: &FlashAttentionBackwardConfi
     ptx.push_str("    .reg .u32 %bwd_mma_store_row;             // row for storing MMA results\n");
     ptx.push_str("    .reg .u32 %bwd_mma_store_col;             // col for storing MMA results\n");
     ptx.push_str("    .reg .u32 %bwd_mma_store_addr;            // shmem addr for MMA result store\n");
+    ptx.push_str("    .reg .u64 %bwd_mma_store_addr_64;         // widened copy of %bwd_mma_store_addr for add.s64\n");
     // Additional temps for transposed loads and global atomics
     ptx.push_str("    .reg .u32 %bwd_mma_addr2;                 // second address temp\n");
     ptx.push_str("    .reg .u64 %bwd_mma_gaddr;                 // global address for atomicAdd\n");
@@ -4340,7 +4351,8 @@ fn emit_scale_and_store_mma_tile(
                 "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
                 shmem_base
             ));
-            emit_smem_store(ptx, "f32", "%bwd_mma_store_addr", &format!("{acc_prefix}_{nt}_{r}"));
+            ptx.push_str("    cvt.u64.u32 %bwd_mma_store_addr_64, %bwd_mma_store_addr;\n");
+            emit_smem_store(ptx, "f32", "%bwd_mma_store_addr_64", &format!("{acc_prefix}_{nt}_{r}"));
         }
     }
 }
@@ -4392,9 +4404,8 @@ fn emit_accumulate_mma_to_shmem(
                 "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
                 shmem_base
             ));
-            ptx.push_str(&format!(
-                "    atom.shared.add.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_store_addr], {acc_prefix}_{nt}_{r};\n"
-            ));
+            ptx.push_str("    cvt.u64.u32 %bwd_mma_store_addr_64, %bwd_mma_store_addr;\n");
+            emit_smem_atom_add_f32(ptx, "%bwd_mma_f32_lo", "%bwd_mma_store_addr_64", &format!("{acc_prefix}_{nt}_{r}"));
         }
     }
 }
@@ -4447,9 +4458,8 @@ fn emit_accumulate_mma_to_shmem_scaled(
                 "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
                 shmem_base
             ));
-            ptx.push_str(&format!(
-                "    atom.shared.add.f32 %bwd_mma_f32_lo, [shmem + %bwd_mma_store_addr], {acc_prefix}_{nt}_{r};\n"
-            ));
+            ptx.push_str("    cvt.u64.u32 %bwd_mma_store_addr_64, %bwd_mma_store_addr;\n");
+            emit_smem_atom_add_f32(ptx, "%bwd_mma_f32_lo", "%bwd_mma_store_addr_64", &format!("{acc_prefix}_{nt}_{r}"));
         }
     }
 }
