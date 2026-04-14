@@ -22,7 +22,7 @@ pub use discovery::{
     discover_awq_projections, discover_awq_projections_from_state, DiscoveredProjection,
     DiscoveryError,
 };
-pub use hooks::{CalibrationHook, CalibrationResult};
+pub use hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
@@ -272,6 +272,15 @@ fn hex_digest_ids(ids: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::calibration::identity_hook::IdentityHook;
+
+    #[test]
+    fn identity_hook_observe_plan_defaults_to_empty() {
+        use crate::calibration::ArenaLayout;
+        let hook = IdentityHook::new(b"ignored".to_vec());
+        let arena = ArenaLayout::empty();
+        assert!(hook.observe_plan(&arena).is_empty());
+        assert!(hook.finalize_plan().is_empty());
+    }
 
     #[test]
     fn identity_hook_observe_batch_is_noop() {

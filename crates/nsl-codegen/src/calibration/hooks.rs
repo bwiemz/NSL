@@ -1,6 +1,25 @@
 use crate::calibration::ctx::CalibCtx;
-use crate::calibration::observation::ObservationSet;
+use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::retention::ArenaLayout;
+
+/// Describes a single per-batch reduction to emit inline in `calibration_main`.
+#[derive(Debug, Clone)]
+pub struct ObservePlanEntry {
+    pub projection: ProjectionRef,
+    pub src_offset: u32,
+    pub rows: u32,
+    pub channels: u32,
+    pub running_symbol: String,
+}
+
+/// A per-projection running buffer to declare as a `.data` global and to
+/// serialize at finalize time.  Paired with `ObservePlanEntry`.
+#[derive(Debug, Clone)]
+pub struct FinalizePlanEntry {
+    pub projection: ProjectionRef,
+    pub running_symbol: String,
+    pub channels: u32,
+}
 
 /// Outcome of a hook's `emit_finalize` call.
 #[derive(Debug, Clone)]
@@ -26,6 +45,18 @@ pub trait CalibrationHook: Send + Sync {
     /// the retention arena.  Default impl is a no-op for hooks that don't
     /// observe per-batch activations (e.g. IdentityHook).
     fn emit_observe_batch(&self, _ctx: &mut CalibCtx, _arena: &ArenaLayout) {}
+
+    /// Describes per-batch reductions to emit inline in `calibration_main`.
+    /// Default empty — hooks with no forward-pass observation (e.g. IdentityHook).
+    fn observe_plan(&self, _arena: &ArenaLayout) -> Vec<ObservePlanEntry> {
+        Vec::new()
+    }
+
+    /// Per-projection running buffers to declare as `.data` globals AND to
+    /// serialize at finalize time.  Paired with `observe_plan`.
+    fn finalize_plan(&self) -> Vec<FinalizePlanEntry> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
