@@ -35,11 +35,27 @@ pub enum Register {
     MPartial,
     /// Second-moment accumulator buffer (AdamW only).
     V,
+    /// Bias-corrected first moment scratch: `m_hat = m * (1/(1 - β₁^t))`.
+    /// Owned tensor allocated lazily in `fase_emit_final_step`; freed at
+    /// end of the per-parameter step.
+    MHat,
+    /// Bias-corrected second moment scratch: `v_hat = v * (1/(1 - β₂^t))`.
+    /// Same lifetime as `MHat`.
+    VHat,
     /// Per-micro-batch gradient, live only within one backward-step worth
     /// of register scope.
     G,
     /// Scratch (temporary) register.
     Tmp,
+}
+
+/// Which bias-correction base to multiply by.  Identifies one of the
+/// two runtime scalars (bc1_inv for β₁, bc2_inv for β₂) that the
+/// dispatcher passes to `fase_emit_final_step`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BcKind {
+    Beta1,
+    Beta2,
 }
 
 /// A single op in the update program.  These are the *only* mathematical
@@ -90,6 +106,15 @@ pub enum UpdateOp {
     Sign { dst: Register, src: Register },
     /// Zero the register.
     Zero(Register),
+    /// `dst = src * bc_inv[kind]`.  The runtime scalar `bc_inv` is
+    /// supplied to the emitter as an f64 Cranelift Value by the
+    /// dispatcher.  Used by AdamW / Adam to compute bias-corrected
+    /// moment views before the sqrt/div/update ops.
+    ScalarMulByBc {
+        dst: Register,
+        src: Register,
+        kind: BcKind,
+    },
 }
 
 /// A linear sequence of [`UpdateOp`]s describing one optimizer step.
@@ -545,5 +570,46 @@ mod tests {
             (v_fase - v_standard).abs() < 1e-12,
             "constant gradients must produce equal v_fase and v_standard"
         );
+    }
+
+    #[test]
+    fn m_hat_v_hat_registers_exist_and_are_distinct() {
+        let regs = [
+            Register::Theta,
+            Register::M,
+            Register::MPartial,
+            Register::V,
+            Register::MHat,
+            Register::VHat,
+            Register::G,
+            Register::Tmp,
+        ];
+        for (i, a) in regs.iter().enumerate() {
+            for b in regs.iter().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?} must be distinct", a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn bc_kind_beta1_distinct_from_beta2() {
+        assert_ne!(BcKind::Beta1, BcKind::Beta2);
+    }
+
+    #[test]
+    fn update_op_scalar_mul_by_bc_constructs() {
+        let op = UpdateOp::ScalarMulByBc {
+            dst: Register::MHat,
+            src: Register::M,
+            kind: BcKind::Beta1,
+        };
+        match op {
+            UpdateOp::ScalarMulByBc { dst, src, kind } => {
+                assert_eq!(dst, Register::MHat);
+                assert_eq!(src, Register::M);
+                assert_eq!(kind, BcKind::Beta1);
+            }
+            _ => panic!("variant mismatch"),
+        }
     }
 }

@@ -83,6 +83,12 @@ impl Compiler<'_> {
                 Register::M        => Ok(m_ptr),
                 Register::MPartial => Ok(m_partial_ptr),
                 Register::V        => Ok(v_ptr),
+                Register::MHat => Err(crate::error::CodegenError::new(
+                    "Register::MHat not yet handled (Task 4)"
+                )),
+                Register::VHat => Err(crate::error::CodegenError::new(
+                    "Register::VHat not yet handled (Task 4)"
+                )),
                 Register::G => Err(crate::error::CodegenError::new(
                     "final-step recipe must not reference Register::G"
                 )),
@@ -364,6 +370,14 @@ impl Compiler<'_> {
                 UpdateOp::Sign { .. } => {
                     return Err(crate::error::CodegenError::new(
                         "Sign op reached in Deferred path — Lion should be FullBuffer"
+                    ));
+                }
+
+                // ── ScalarMulByBc ─────────────────────────────────────────────
+                // Bias-corrected moment scratch: emitter not yet wired (Task 4).
+                UpdateOp::ScalarMulByBc { .. } => {
+                    return Err(crate::error::CodegenError::new(
+                        "UpdateOp::ScalarMulByBc not yet handled (Task 4)"
                     ));
                 }
             }
