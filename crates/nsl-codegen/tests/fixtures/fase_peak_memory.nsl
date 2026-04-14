@@ -1,0 +1,21 @@
+from nsl.nn.losses import mse_loss
+
+# Two 256x256 weight matrices: each gradient is 256*256*8 = 512 KB.
+# Peak-memory delta between source-AD and tape-AD is unambiguous at this scale.
+model Mlp:
+    w1: Tensor = ones([256, 256])
+    w2: Tensor = ones([256, 256])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.w1
+        return h @ self.w2
+
+let m = Mlp()
+let x = ones([1, 256])
+let y = zeros([1, 256])
+
+train(model = m, epochs = 4, grad_accumulation = 4):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
