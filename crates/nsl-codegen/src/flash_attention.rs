@@ -460,7 +460,7 @@ fn emit_register_declarations(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // LOG2E constant for exp() via ex2.approx
     ptx.push_str("    .reg .f32 %log2e;\n");
-    ptx.push_str("    mov.f32 %log2e, 0x3FB8AA3B;  // 1.4426950408 (log2(e))\n");
+    ptx.push_str(&format!("    mov.f32 %log2e, {};  // 1.4426950408 (log2(e))\n", f32_bits(F32_LOG2E)));
 
     // Loop counter for K/V tile iteration
     ptx.push_str("    .reg .u64 %k_start, %k_max;\n");
@@ -693,8 +693,8 @@ fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
 fn emit_accumulator_init(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Initialize accumulators\n");
     ptx.push_str("    // O_acc = 0, row_max = -inf, row_sum = 0\n");
-    ptx.push_str("    mov.f32 %row_max, 0xFF800000;  // -inf as IEEE 754\n");
-    ptx.push_str("    mov.f32 %row_sum, 0x00000000;  // 0.0\n");
+    ptx.push_str(&format!("    mov.f32 %row_max, {};  // -inf as IEEE 754\n", f32_bits(F32_NEG_INF)));
+    ptx.push_str(&format!("    mov.f32 %row_sum, {};  // 0.0\n", f32_bits(F32_ZERO)));
 
     // Zero O_acc registers: each thread owns (block_q * head_dim) / 128 output elements
     let num_oacc = (config.block_q * config.head_dim / 128) as usize;
@@ -704,7 +704,7 @@ fn emit_accumulator_init(ptx: &mut String, config: &FlashAttentionConfig) {
         64 + num_oacc - 1
     ));
     for i in 0..num_oacc {
-        ptx.push_str(&format!("    mov.f32 %f{}, 0x00000000;\n", 64 + i));
+        ptx.push_str(&format!("    mov.f32 %f{}, {};\n", 64 + i, f32_bits(F32_ZERO)));
     }
 
     // Compute k_max (upper bound for KV tile loop)
@@ -863,7 +863,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     ));
 
     // Dot product: S[q_row][k_col] = sum_d(Q[q_row][d] * K[k_col][d])
-    ptx.push_str("    mov.f32 %f0, 0x00000000;               // S accumulator = 0\n");
+    ptx.push_str(&format!("    mov.f32 %f0, {};               // S accumulator = 0\n", f32_bits(F32_ZERO)));
     ptx.push_str("    mov.u32 %r6, 0;                        // d = 0\n");
     ptx.push_str(&format!(
         "    mov.u32 %r7, {};                      // head_dim\n",
@@ -937,7 +937,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    setp.gt.u32 %p1, %dfs_k_enter, %dfs_q_enter;  // key enters AFTER query → not ancestor\n");
         ptx.push_str("    setp.lt.u32 %p_ancestor, %dfs_k_exit, %dfs_q_exit;  // key exits BEFORE query → not ancestor\n");
         ptx.push_str("    or.pred %p1, %p1, %p_ancestor;    // either condition → mask out\n");
-        ptx.push_str("    @%p1 mov.f32 %f0, 0xFF800000;     // -inf for non-ancestor positions\n");
+        ptx.push_str(&format!("    @%p1 mov.f32 %f0, {};     // -inf for non-ancestor positions\n", f32_bits(F32_NEG_INF)));
     } else if config.causal {
         ptx.push_str("    // Partial causal mask on diagonal tile: S[i][j] = -inf where k_start+j > q_start+i\n");
         ptx.push_str("    cvt.u64.u32 %rd43, %r5;           // k_col as u64\n");
@@ -945,7 +945,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    cvt.u64.u32 %rd44, %r4;           // q_row as u64\n");
         ptx.push_str("    add.u64 %rd44, %rd16, %rd44;      // q_abs = q_start + q_row\n");
         ptx.push_str("    setp.gt.u64 %p1, %rd43, %rd44;    // k_abs > q_abs?\n");
-        ptx.push_str("    @%p1 mov.f32 %f0, 0xFF800000;     // -inf for masked positions\n");
+        ptx.push_str(&format!("    @%p1 mov.f32 %f0, {};     // -inf for masked positions\n", f32_bits(F32_NEG_INF)));
     }
 
     // Store S value in a temp register indexed by s_iter (we use %f3..%f3+num_s-1)
@@ -969,7 +969,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // Find local max across this thread's S values
     ptx.push_str("    // Local max from this thread's S values\n");
-    ptx.push_str("    mov.f32 %f0, 0xFF800000;               // f_local_max = -inf\n");
+    ptx.push_str(&format!("    mov.f32 %f0, {};               // f_local_max = -inf\n", f32_bits(F32_NEG_INF)));
     for i in 0..num_s_per_thread {
         ptx.push_str(&format!(
             "    max.f32 %f0, %f0, %f{};              // max with S[{}]\n",
@@ -1017,7 +1017,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // Compute P = exp(S - new_max) and accumulate row_sum
     ptx.push_str("    // P = exp(S - new_max)  // overwrites S registers in-place\n");
-    ptx.push_str("    mov.f32 %f1, 0x00000000;               // partial_sum = 0\n");
+    ptx.push_str(&format!("    mov.f32 %f1, {};               // partial_sum = 0\n", f32_bits(F32_ZERO)));
     for i in 0..num_s_per_thread {
         ptx.push_str(&format!(
             "    sub.f32 %f{}, %f{}, %new_max;\n",
@@ -1136,7 +1136,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // P value for (q_row, k_iter): stored in %f3..
     // We load from the S/P register using conditional moves
-    ptx.push_str("    mov.f32 %f2, 0x00000000;               // default P = 0\n");
+    ptx.push_str(&format!("    mov.f32 %f2, {};               // default P = 0\n", f32_bits(F32_ZERO)));
     for i in 0..num_s_per_thread {
         ptx.push_str(&format!("    setp.eq.u32 %p2, %r12, {};\n", i));
         ptx.push_str(&format!("    @%p2 mov.f32 %f2, %f{};\n", 3 + i));
@@ -1480,7 +1480,7 @@ fn emit_qk_matmul_mma(
     // Zero S accumulators for current m-tile (n_tiles_s * 4 f32 registers)
     for nt in 0..n_tiles_s {
         for r in 0..4 {
-            ptx.push_str(&format!("    mov.f32 %acc_s_{}_{}, 0x00000000;\n", nt, r));
+            ptx.push_str(&format!("    mov.f32 %acc_s_{}_{}, {};\n", nt, r, f32_bits(F32_ZERO)));
         }
     }
 
@@ -1821,7 +1821,7 @@ fn emit_mma_online_softmax(ptx: &mut String, block_kv: usize, head_dim: usize) {
     ptx.push_str("    // === Online softmax (MMA layout) ===\n");
 
     // Step 1: Find local max across this thread's S accumulator values
-    ptx.push_str("    mov.f32 %mma_local_max, 0xFF800000;  // -inf\n");
+    ptx.push_str(&format!("    mov.f32 %mma_local_max, {};  // -inf\n", f32_bits(F32_NEG_INF)));
     for nt in 0..n_tiles_s {
         for r in 0..4 {
             ptx.push_str(&format!(
@@ -1864,7 +1864,7 @@ fn emit_mma_online_softmax(ptx: &mut String, block_kv: usize, head_dim: usize) {
     }
 
     // Step 4: P = exp(S - new_max), accumulate row_sum
-    ptx.push_str("    mov.f32 %mma_partial_sum, 0x00000000;  // 0.0\n");
+    ptx.push_str(&format!("    mov.f32 %mma_partial_sum, {};  // 0.0\n", f32_bits(F32_ZERO)));
     for nt in 0..n_tiles_s {
         for r in 0..4 {
             ptx.push_str(&format!(
@@ -1907,8 +1907,8 @@ fn emit_mma_softmax_registers(ptx: &mut String) {
     ptx.push_str("    .reg .f32 %mma_correction, %mma_partial_sum;\n");
     ptx.push_str("    .reg .f32 %mma_shfl_tmp;\n");
     // Initialize
-    ptx.push_str("    mov.f32 %mma_row_max, 0xFF800000;  // -inf\n");
-    ptx.push_str("    mov.f32 %mma_row_sum, 0x00000000;  // 0.0\n");
+    ptx.push_str(&format!("    mov.f32 %mma_row_max, {};  // -inf\n", f32_bits(F32_NEG_INF)));
+    ptx.push_str(&format!("    mov.f32 %mma_row_sum, {};  // 0.0\n", f32_bits(F32_ZERO)));
 }
 
 /// Emit register declarations for shared memory swizzle temporaries.
@@ -3405,8 +3405,8 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     for nt in 0..n_tiles_s {
         for r in 0..4 {
             ptx.push_str(&format!(
-                "    mov.f32 %bwd_acc_s_{}_{}, 0x00000000;\n",
-                nt, r
+                "    mov.f32 %bwd_acc_s_{}_{}, {};\n",
+                nt, r, f32_bits(F32_ZERO)
             ));
         }
     }
@@ -3561,8 +3561,8 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     for nt in 0..n_tiles_s {
         for r in 0..4 {
             ptx.push_str(&format!(
-                "    mov.f32 %bwd_acc_dp_{}_{}, 0x00000000;\n",
-                nt, r
+                "    mov.f32 %bwd_acc_dp_{}_{}, {};\n",
+                nt, r, f32_bits(F32_ZERO)
             ));
         }
     }
@@ -3656,8 +3656,8 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     for nt in 0..n_tiles_hd {
         for r in 0..4 {
             ptx.push_str(&format!(
-                "    mov.f32 %bwd_acc_g_{}_{}, 0x00000000;\n",
-                nt, r
+                "    mov.f32 %bwd_acc_g_{}_{}, {};\n",
+                nt, r, f32_bits(F32_ZERO)
             ));
         }
     }
@@ -3815,8 +3815,8 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     for nt in 0..n_tiles_hd {
         for r in 0..4 {
             ptx.push_str(&format!(
-                "    mov.f32 %bwd_acc_g_{}_{}, 0x00000000;\n",
-                nt, r
+                "    mov.f32 %bwd_acc_g_{}_{}, {};\n",
+                nt, r, f32_bits(F32_ZERO)
             ));
         }
     }
@@ -3913,8 +3913,8 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     for nt in 0..n_tiles_hd {
         for r in 0..4 {
             ptx.push_str(&format!(
-                "    mov.f32 %bwd_acc_g_{}_{}, 0x00000000;\n",
-                nt, r
+                "    mov.f32 %bwd_acc_g_{}_{}, {};\n",
+                nt, r, f32_bits(F32_ZERO)
             ));
         }
     }
