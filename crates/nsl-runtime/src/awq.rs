@@ -803,3 +803,133 @@ mod awq_quantize_with_scales_tests {
         assert!(result.is_err(), "mismatched scales length must panic");
     }
 }
+
+// ---------------------------------------------------------------------------
+// nsl_awq_write_sidecar — subprocess-side serialization FFI
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct AwqProjectionDescriptor {
+    pub path_ptr:     *const u8,
+    pub path_len:     usize,
+    pub channels:     u32,
+    pub _pad:         u32,
+    pub running_ptr:  *const f32,
+}
+
+/// Write an AWQ activation-scales sidecar JSON file.
+///
+/// Return codes:
+///   0 = success
+///   1 = sidecar_path is null or not valid UTF-8
+///   2 = a projection name is not valid UTF-8, or JSON serialization failed
+///   3 = disk write failed
+#[no_mangle]
+pub extern "C" fn nsl_awq_write_sidecar(
+    sidecar_path_ptr: *const u8,
+    sidecar_path_len: usize,
+    projections_ptr:  *const AwqProjectionDescriptor,
+    projections_len:  usize,
+) -> i32 {
+    if sidecar_path_ptr.is_null() { return 1; }
+    let path_bytes = unsafe {
+        std::slice::from_raw_parts(sidecar_path_ptr, sidecar_path_len)
+    };
+    let path_str = match std::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+
+    let descs: &[AwqProjectionDescriptor] = if projections_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(projections_ptr, projections_len) }
+    };
+
+    let mut by_projection = std::collections::BTreeMap::<String, Vec<f32>>::new();
+    for d in descs {
+        let name_bytes = unsafe { std::slice::from_raw_parts(d.path_ptr, d.path_len) };
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return 2,
+        };
+        let values = unsafe {
+            std::slice::from_raw_parts(d.running_ptr, d.channels as usize).to_vec()
+        };
+        by_projection.insert(name, values);
+    }
+
+    let json = serde_json::json!({
+        "version": 2,
+        "hooks": {
+            "awq_activation_scales": {
+                "by_projection": by_projection,
+            },
+        },
+    });
+
+    let bytes = match serde_json::to_vec(&json) {
+        Ok(b) => b,
+        Err(_) => return 2,
+    };
+    match std::fs::write(path_str, bytes) {
+        Ok(_) => 0,
+        Err(_) => 3,
+    }
+}
+
+#[cfg(test)]
+mod write_sidecar_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn writes_sidecar_with_two_projections() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+
+        let up_path = "TinyMLP.up_proj";
+        let down_path = "TinyMLP.down_proj";
+        let up_buf: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let down_buf: Vec<f32> = (0..128).map(|i| (i as f32) * 0.5).collect();
+
+        let descs = vec![
+            AwqProjectionDescriptor {
+                path_ptr: up_path.as_ptr(),
+                path_len: up_path.len(),
+                channels: 64,
+                _pad: 0,
+                running_ptr: up_buf.as_ptr(),
+            },
+            AwqProjectionDescriptor {
+                path_ptr: down_path.as_ptr(),
+                path_len: down_path.len(),
+                channels: 128,
+                _pad: 0,
+                running_ptr: down_buf.as_ptr(),
+            },
+        ];
+
+        let rc = nsl_awq_write_sidecar(
+            path_str.as_ptr(), path_str.len(),
+            descs.as_ptr(), descs.len(),
+        );
+        assert_eq!(rc, 0);
+
+        let raw = std::fs::read(tmp.path()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let scales = &v["hooks"]["awq_activation_scales"];
+        assert_eq!(scales["by_projection"]["TinyMLP.up_proj"].as_array().unwrap().len(), 64);
+        assert_eq!(scales["by_projection"]["TinyMLP.down_proj"].as_array().unwrap().len(), 128);
+    }
+
+    #[test]
+    fn returns_1_on_invalid_utf8_path() {
+        let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
+        let rc = nsl_awq_write_sidecar(
+            bad.as_ptr(), bad.len(),
+            std::ptr::null(), 0,
+        );
+        assert_eq!(rc, 1);
+    }
+}

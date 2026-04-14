@@ -29,6 +29,7 @@ pub mod tokenizer;
 pub mod quantize;
 pub mod fp8;
 pub mod awq;
+pub use awq::{nsl_awq_write_sidecar, AwqProjectionDescriptor};
 pub mod gptq;
 
 // Calibration-data loader: .bin and .safetensors dispatch (unconditional)
