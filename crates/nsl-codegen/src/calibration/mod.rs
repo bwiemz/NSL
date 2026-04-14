@@ -1,6 +1,8 @@
 //! Compile-time calibration harness — see
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
+pub mod awq_hook;
+pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
 pub mod ctx;
@@ -9,13 +11,16 @@ pub mod hooks;
 pub mod identity_hook;
 pub mod observation;
 pub mod registry;
+pub mod retention;
 pub mod sidecar;
 pub mod subprocess;
 
-pub use ctx::CalibCtx;
+pub use ctx::{BufferHandle, CalibCtx};
 pub use hooks::{CalibrationHook, CalibrationResult};
-pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef};
+pub use identity_hook::IdentityHook;
+pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
+pub use retention::{RetentionTable, TensorShape};
 
 use std::collections::BTreeMap;
 
@@ -65,10 +70,8 @@ pub fn run_harness_stub(
     calibration_data_bytes: &[u8],
     num_samples: u32,
 ) -> Result<HarnessOutput, HarnessError> {
-    let mut ctx = CalibCtx {
-        sample_idx: 0,
-        total_samples: num_samples,
-    };
+    let mut ctx = CalibCtx::stub_for_tests();
+    ctx.total_samples = num_samples;
     for hook in registry.iter() {
         hook.emit_init(&mut ctx);
     }
@@ -200,6 +203,45 @@ pub fn run_harness_simulated(
                 })
             }
         },
+    }
+}
+
+/// Production calibration entry point.  Routes to the real subprocess
+/// when all registered hooks can be served by it (i.e., none require
+/// forward activations that the current MVP doesn't emit into
+/// calibration_main), otherwise falls back to the in-process stub.
+/// This makes scope-reduction transparent to callers — when a follow-
+/// up plan lands full model-forward emission, this routing will flip
+/// over to always-real without changing caller code.
+pub fn run_harness_production(
+    registry: &HookRegistry,
+    cfg: &HarnessConfig,
+) -> Result<HarnessOutput, HarnessError> {
+    let any_forward = registry.iter().any(|h| h.requires().needs_forward_pass());
+
+    if any_forward {
+        eprintln!(
+            "[calibration] routing through in-process stub (full model-forward emission is a follow-up plan)"
+        );
+        let ckpt_path = cfg.checkpoints.first().ok_or_else(|| {
+            HarnessError::Infrastructure {
+                reason: "no checkpoint paths supplied".into(),
+            }
+        })?;
+        let ckpt_bytes = std::fs::read(ckpt_path).map_err(|e| HarnessError::Infrastructure {
+            reason: format!("reading checkpoint {}: {e}", ckpt_path.display()),
+        })?;
+        let data_bytes = std::fs::read(&cfg.calibration_data).map_err(|e| {
+            HarnessError::Infrastructure {
+                reason: format!(
+                    "reading calibration data {}: {e}",
+                    cfg.calibration_data.display()
+                ),
+            }
+        })?;
+        run_harness_stub(registry, &ckpt_bytes, &data_bytes, cfg.samples)
+    } else {
+        run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
     }
 }
 

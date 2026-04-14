@@ -411,3 +411,295 @@ mod tests {
         unsafe { awq_free_packed(&packed) };
     }
 }
+
+// ---------------------------------------------------------------------------
+// AWQ sidecar reader (calibration harness → runtime)
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::path::Path;
+
+const AWQ_SIDECAR_KEY: &str = "awq_activation_scales";
+const AWQ_SIDECAR_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct AwqScales {
+    /// Projection name → per-output-channel max|activation| values.
+    pub by_projection: HashMap<String, Vec<f32>>,
+}
+
+#[derive(Debug)]
+pub enum AwqScalesError {
+    Io(std::io::Error),
+    BadJson(String),
+    MissingAwqKey,
+    BadBase64(String),
+    BlobTooSmall { need: usize, got: usize },
+    UnsupportedVersion { got: u32 },
+    BlobTruncated { at: &'static str },
+    BadUtf8,
+}
+
+impl std::fmt::Display for AwqScalesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::BadJson(e) => write!(f, "bad sidecar JSON: {e}"),
+            Self::MissingAwqKey => write!(f, "sidecar has no '{AWQ_SIDECAR_KEY}' key"),
+            Self::BadBase64(e) => write!(f, "bad base64 for awq blob: {e}"),
+            Self::BlobTooSmall { need, got } => write!(f, "blob too small: need {need}, got {got}"),
+            Self::UnsupportedVersion { got } => write!(f, "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"),
+            Self::BlobTruncated { at } => write!(f, "blob truncated at {at}"),
+            Self::BadUtf8 => write!(f, "invalid UTF-8 in projection name"),
+        }
+    }
+}
+
+impl std::error::Error for AwqScalesError {}
+
+impl From<std::io::Error> for AwqScalesError {
+    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+}
+
+impl AwqScales {
+    /// Parse the raw AWQ-format blob produced by the calibration harness.
+    pub fn from_blob(blob: &[u8]) -> Result<Self, AwqScalesError> {
+        if blob.len() < 8 {
+            return Err(AwqScalesError::BlobTooSmall { need: 8, got: blob.len() });
+        }
+        let version = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+        if version != AWQ_SIDECAR_VERSION {
+            return Err(AwqScalesError::UnsupportedVersion { got: version });
+        }
+        let num_projections = u32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize;
+        let mut by_projection = HashMap::with_capacity(num_projections);
+        let mut cursor = 8;
+        for _ in 0..num_projections {
+            if blob.len() < cursor + 4 {
+                return Err(AwqScalesError::BlobTruncated { at: "name_len" });
+            }
+            let name_len = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if blob.len() < cursor + name_len {
+                return Err(AwqScalesError::BlobTruncated { at: "name bytes" });
+            }
+            let name = std::str::from_utf8(&blob[cursor..cursor + name_len])
+                .map_err(|_| AwqScalesError::BadUtf8)?
+                .to_string();
+            cursor += name_len;
+            if blob.len() < cursor + 4 {
+                return Err(AwqScalesError::BlobTruncated { at: "channel_count" });
+            }
+            let channel_count = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let scale_bytes = channel_count.checked_mul(4).ok_or(AwqScalesError::BlobTruncated { at: "scales (channel_count overflow)" })?;
+            if blob.len() < cursor + scale_bytes {
+                return Err(AwqScalesError::BlobTruncated { at: "scales" });
+            }
+            let mut scales = Vec::with_capacity(channel_count);
+            for i in 0..channel_count {
+                let off = cursor + i * 4;
+                scales.push(f32::from_le_bytes(blob[off..off + 4].try_into().unwrap()));
+            }
+            cursor += scale_bytes;
+            by_projection.insert(name, scales);
+        }
+        Ok(Self { by_projection })
+    }
+
+    /// Read the sidecar JSON at `path`, base64-decode the
+    /// `"awq_activation_scales"` key, and parse into `AwqScales`.
+    pub fn from_sidecar_json_path(path: &Path) -> Result<Self, AwqScalesError> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let json = std::fs::read_to_string(path)?;
+        let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| AwqScalesError::BadJson(e.to_string()))?;
+        let b64 = v
+            .get("hooks")
+            .and_then(|h| h.get(AWQ_SIDECAR_KEY))
+            .and_then(|s| s.as_str())
+            .ok_or(AwqScalesError::MissingAwqKey)?;
+        let blob = STANDARD.decode(b64).map_err(|e| AwqScalesError::BadBase64(e.to_string()))?;
+        Self::from_blob(&blob)
+    }
+}
+
+#[cfg(test)]
+mod awq_sidecar_reader_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Produce a valid v1 AWQ sidecar blob for testing.
+    fn valid_sidecar_blob(entries: &[(&str, &[f32])]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // version
+        blob.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (name, scales) in entries {
+            let nb = name.as_bytes();
+            blob.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            blob.extend_from_slice(nb);
+            blob.extend_from_slice(&(scales.len() as u32).to_le_bytes());
+            for v in *scales {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        blob
+    }
+
+    #[test]
+    fn parse_blob_produces_named_lookup() {
+        let blob = valid_sidecar_blob(&[
+            ("blocks.0.attn.wq", &[1.0, 2.0]),
+            ("blocks.0.attn.wk", &[0.5, 0.25, 0.125]),
+        ]);
+        let scales = AwqScales::from_blob(&blob).unwrap();
+        assert_eq!(scales.by_projection.get("blocks.0.attn.wq").unwrap(), &vec![1.0, 2.0]);
+        assert_eq!(scales.by_projection.get("blocks.0.attn.wk").unwrap(), &vec![0.5, 0.25, 0.125]);
+        assert!(scales.by_projection.get("missing").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_bad_version() {
+        let mut blob = valid_sidecar_blob(&[("x", &[1.0])]);
+        blob[0..4].copy_from_slice(&7u32.to_le_bytes());
+        assert!(AwqScales::from_blob(&blob).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_truncated_blob() {
+        let full = valid_sidecar_blob(&[("long_name", &[1.0, 2.0, 3.0])]);
+        let truncated = &full[..full.len() / 2];
+        assert!(AwqScales::from_blob(truncated).is_err());
+    }
+
+    #[test]
+    fn from_sidecar_reads_base64_key() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let blob = valid_sidecar_blob(&[("p", &[0.5])]);
+        let b64 = STANDARD.encode(&blob);
+        let sidecar_json = format!(
+            r#"{{"version":1,"checkpoint_sha256":"","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{{"awq_activation_scales":"{b64}"}}}}"#
+        );
+        let tmp = std::env::temp_dir().join(format!("nsl-awq-sidecar-{}.json", std::process::id()));
+        std::fs::File::create(&tmp).unwrap().write_all(sidecar_json.as_bytes()).unwrap();
+        let scales = AwqScales::from_sidecar_json_path(&tmp).unwrap();
+        assert_eq!(scales.by_projection.get("p").unwrap(), &vec![0.5]);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn from_sidecar_errors_when_awq_key_absent() {
+        let sidecar_json = r#"{"version":1,"checkpoint_sha256":"","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{}}"#;
+        let tmp = std::env::temp_dir().join(format!("nsl-awq-sidecar-empty-{}.json", std::process::id()));
+        std::fs::write(&tmp, sidecar_json).unwrap();
+        assert!(AwqScales::from_sidecar_json_path(&tmp).is_err());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Lightweight output suitable for round-trip tests without requiring
+/// a full `AwqPackedWeight` comparison.  The real packed-weight path
+/// can layer on top of this helper once the wider AWQ codegen plumbing
+/// is in place (Task 13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AwqQuantizedChecked {
+    pub dequantized_check_bytes: Vec<u8>,
+}
+
+/// Quantize a weight matrix using optional calibrated per-input-channel
+/// scales.  When `scales` is `None`, uses a vector of 1.0s (equivalent
+/// to uncalibrated AWQ).  Otherwise applies `s[c]^alpha` per input
+/// channel to protect salient channels during quantization.
+///
+/// `weight` is `[out_channels, in_channels]` in row-major layout.
+/// `scales`, when provided, has length `in_channels`.
+///
+/// This helper is the entry point for calibration-driven AWQ scaling.
+/// It replaces the `_calibration_ptr` placeholder in the existing AWQ
+/// runtime — callers that have calibration data supply it; callers
+/// that don't pass `None` and get the uncalibrated baseline.
+pub fn awq_quantize_with_scales(
+    weight: &[f32],
+    in_channels: usize,
+    out_channels: usize,
+    scales: Option<&[f32]>,
+    alpha: f32,
+) -> AwqQuantizedChecked {
+    assert_eq!(weight.len(), in_channels * out_channels, "weight length mismatch");
+    let effective: Vec<f32> = match scales {
+        Some(s) => {
+            assert_eq!(s.len(), in_channels, "scales length must equal in_channels");
+            s.iter().map(|v| v.powf(alpha)).collect()
+        }
+        None => vec![1.0; in_channels],
+    };
+    // Apply per-input-channel scaling to the weight matrix.
+    let mut scaled = Vec::with_capacity(weight.len());
+    for row in 0..out_channels {
+        for col in 0..in_channels {
+            let v = weight[row * in_channels + col] * effective[col];
+            scaled.push(v);
+        }
+    }
+    // Minimal quantization: absmax per row, scale to int8 range.
+    // Real AWQ would do groupwise; this is enough to expose scale
+    // differences in tests and serves as the integration surface for
+    // Task 13's quant-pass wiring.
+    let mut out_bytes = Vec::with_capacity(weight.len());
+    for row in 0..out_channels {
+        let start = row * in_channels;
+        let amax = scaled[start..start + in_channels]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f32, f32::max)
+            .max(1e-9);
+        for i in 0..in_channels {
+            let q = ((scaled[start + i] / amax) * 127.0).round().clamp(-128.0, 127.0);
+            out_bytes.push(q as i8 as u8);
+        }
+    }
+    AwqQuantizedChecked {
+        dequantized_check_bytes: out_bytes,
+    }
+}
+
+#[cfg(test)]
+mod awq_quantize_with_scales_tests {
+    use super::*;
+
+    fn toy_weight(out_channels: usize, in_channels: usize) -> Vec<f32> {
+        (0..out_channels * in_channels)
+            .map(|i| (i as f32 - (out_channels * in_channels) as f32 / 2.0) * 0.01)
+            .collect()
+    }
+
+    #[test]
+    fn quantize_with_none_scales_matches_all_ones_baseline() {
+        let weight = toy_weight(8, 16);
+        let out_none = awq_quantize_with_scales(&weight, 16, 8, None, 0.5);
+        let ones = vec![1.0_f32; 16];
+        let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
+        assert_eq!(out_none.dequantized_check_bytes, out_ones.dequantized_check_bytes,
+            "None scales must equal [1.0; in_channels] scales after s^alpha (1^x = 1)");
+    }
+
+    #[test]
+    fn quantize_with_nontrivial_scales_differs_from_baseline() {
+        let weight = toy_weight(8, 16);
+        let ones = vec![1.0_f32; 16];
+        let varied: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 * 0.2).collect();
+        let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
+        let out_varied = awq_quantize_with_scales(&weight, 16, 8, Some(&varied), 0.5);
+        assert_ne!(out_ones.dequantized_check_bytes, out_varied.dequantized_check_bytes,
+            "Non-trivial scales must change quantization output");
+    }
+
+    #[test]
+    fn quantize_rejects_wrong_length_scales() {
+        let weight = toy_weight(8, 16);
+        let bad = vec![1.0_f32; 99]; // wrong length
+        let result = std::panic::catch_unwind(|| {
+            awq_quantize_with_scales(&weight, 16, 8, Some(&bad), 0.5)
+        });
+        assert!(result.is_err(), "mismatched scales length must panic");
+    }
+}
