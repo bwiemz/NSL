@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/snapshot_tests.rs
-assertion_line: 72
 expression: ptx_str
 ---
 .version 7.0
@@ -49,7 +48,7 @@ expression: ptx_str
     .reg .u32 %r<32>;
     .reg .f32 %scale;
     .reg .f32 %log2e;
-    mov.f32 %log2e, 0x3FB8AA3B;  // 1.4426950408 (log2(e))
+    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))
     .reg .u64 %k_start, %k_max;
     .reg .f32 %row_max, %row_sum, %correction;
     .reg .f32 %new_max, %old_max;
@@ -60,6 +59,9 @@ expression: ptx_str
     .reg .f32 %log_sum, %lse;
     .reg .u64 %lse_addr;
     .reg .pred %p_has_lse;
+    .reg .u64 %smem_addr;
+    .reg .u64 %shmem_base;
+    cvta.shared.u64 %shmem_base, shmem;
     ld.param.u64 %rd0, [q_ptr];
     ld.param.u64 %rd1, [k_ptr];
     ld.param.u64 %rd2, [v_ptr];
@@ -135,9 +137,11 @@ LOOP_Q_LOAD_ROPE:
     mul.f32 %f0, %q_b, %cos_val;
     add.f32 %q_rot_b, %q_rot_b, %f0;
     shl.b64 %rd29, %rd22, 2;        // shmem byte offset
-    st.shared.f32 [shmem + %rd29], %q_rot_a;
+    add.s64 %smem_addr, %shmem_base, %rd29;
+    st.shared.f32 [%smem_addr], %q_rot_a;
     add.u64 %rd35, %rd29, 256;          // offset_b in shmem
-    st.shared.f32 [shmem + %rd35], %q_rot_b;
+    add.s64 %smem_addr, %shmem_base, %rd35;
+    st.shared.f32 [%smem_addr], %q_rot_b;
     add.u64 %rd22, %rd22, 128;      // elem_idx += blockDim.x
     setp.lt.u64 %p0, %rd22, %rd23;
     @%p0 bra LOOP_Q_LOAD_ROPE;
@@ -145,73 +149,73 @@ LOOP_Q_LOAD_ROPE:
     // Q tile now in shmem[0 .. block_q * head_dim * 4]
     // Initialize accumulators
     // O_acc = 0, row_max = -inf, row_sum = 0
-    mov.f32 %row_max, 0xFF800000;  // -inf as IEEE 754
-    mov.f32 %row_sum, 0x00000000;  // 0.0
+    mov.f32 %row_max, 0fFF800000;  // -inf as IEEE 754
+    mov.f32 %row_sum, 0f00000000;  // 0.0
     // O_acc: 64 registers per thread (f64..f127)
-    mov.f32 %f64, 0x00000000;
-    mov.f32 %f65, 0x00000000;
-    mov.f32 %f66, 0x00000000;
-    mov.f32 %f67, 0x00000000;
-    mov.f32 %f68, 0x00000000;
-    mov.f32 %f69, 0x00000000;
-    mov.f32 %f70, 0x00000000;
-    mov.f32 %f71, 0x00000000;
-    mov.f32 %f72, 0x00000000;
-    mov.f32 %f73, 0x00000000;
-    mov.f32 %f74, 0x00000000;
-    mov.f32 %f75, 0x00000000;
-    mov.f32 %f76, 0x00000000;
-    mov.f32 %f77, 0x00000000;
-    mov.f32 %f78, 0x00000000;
-    mov.f32 %f79, 0x00000000;
-    mov.f32 %f80, 0x00000000;
-    mov.f32 %f81, 0x00000000;
-    mov.f32 %f82, 0x00000000;
-    mov.f32 %f83, 0x00000000;
-    mov.f32 %f84, 0x00000000;
-    mov.f32 %f85, 0x00000000;
-    mov.f32 %f86, 0x00000000;
-    mov.f32 %f87, 0x00000000;
-    mov.f32 %f88, 0x00000000;
-    mov.f32 %f89, 0x00000000;
-    mov.f32 %f90, 0x00000000;
-    mov.f32 %f91, 0x00000000;
-    mov.f32 %f92, 0x00000000;
-    mov.f32 %f93, 0x00000000;
-    mov.f32 %f94, 0x00000000;
-    mov.f32 %f95, 0x00000000;
-    mov.f32 %f96, 0x00000000;
-    mov.f32 %f97, 0x00000000;
-    mov.f32 %f98, 0x00000000;
-    mov.f32 %f99, 0x00000000;
-    mov.f32 %f100, 0x00000000;
-    mov.f32 %f101, 0x00000000;
-    mov.f32 %f102, 0x00000000;
-    mov.f32 %f103, 0x00000000;
-    mov.f32 %f104, 0x00000000;
-    mov.f32 %f105, 0x00000000;
-    mov.f32 %f106, 0x00000000;
-    mov.f32 %f107, 0x00000000;
-    mov.f32 %f108, 0x00000000;
-    mov.f32 %f109, 0x00000000;
-    mov.f32 %f110, 0x00000000;
-    mov.f32 %f111, 0x00000000;
-    mov.f32 %f112, 0x00000000;
-    mov.f32 %f113, 0x00000000;
-    mov.f32 %f114, 0x00000000;
-    mov.f32 %f115, 0x00000000;
-    mov.f32 %f116, 0x00000000;
-    mov.f32 %f117, 0x00000000;
-    mov.f32 %f118, 0x00000000;
-    mov.f32 %f119, 0x00000000;
-    mov.f32 %f120, 0x00000000;
-    mov.f32 %f121, 0x00000000;
-    mov.f32 %f122, 0x00000000;
-    mov.f32 %f123, 0x00000000;
-    mov.f32 %f124, 0x00000000;
-    mov.f32 %f125, 0x00000000;
-    mov.f32 %f126, 0x00000000;
-    mov.f32 %f127, 0x00000000;
+    mov.f32 %f64, 0f00000000;
+    mov.f32 %f65, 0f00000000;
+    mov.f32 %f66, 0f00000000;
+    mov.f32 %f67, 0f00000000;
+    mov.f32 %f68, 0f00000000;
+    mov.f32 %f69, 0f00000000;
+    mov.f32 %f70, 0f00000000;
+    mov.f32 %f71, 0f00000000;
+    mov.f32 %f72, 0f00000000;
+    mov.f32 %f73, 0f00000000;
+    mov.f32 %f74, 0f00000000;
+    mov.f32 %f75, 0f00000000;
+    mov.f32 %f76, 0f00000000;
+    mov.f32 %f77, 0f00000000;
+    mov.f32 %f78, 0f00000000;
+    mov.f32 %f79, 0f00000000;
+    mov.f32 %f80, 0f00000000;
+    mov.f32 %f81, 0f00000000;
+    mov.f32 %f82, 0f00000000;
+    mov.f32 %f83, 0f00000000;
+    mov.f32 %f84, 0f00000000;
+    mov.f32 %f85, 0f00000000;
+    mov.f32 %f86, 0f00000000;
+    mov.f32 %f87, 0f00000000;
+    mov.f32 %f88, 0f00000000;
+    mov.f32 %f89, 0f00000000;
+    mov.f32 %f90, 0f00000000;
+    mov.f32 %f91, 0f00000000;
+    mov.f32 %f92, 0f00000000;
+    mov.f32 %f93, 0f00000000;
+    mov.f32 %f94, 0f00000000;
+    mov.f32 %f95, 0f00000000;
+    mov.f32 %f96, 0f00000000;
+    mov.f32 %f97, 0f00000000;
+    mov.f32 %f98, 0f00000000;
+    mov.f32 %f99, 0f00000000;
+    mov.f32 %f100, 0f00000000;
+    mov.f32 %f101, 0f00000000;
+    mov.f32 %f102, 0f00000000;
+    mov.f32 %f103, 0f00000000;
+    mov.f32 %f104, 0f00000000;
+    mov.f32 %f105, 0f00000000;
+    mov.f32 %f106, 0f00000000;
+    mov.f32 %f107, 0f00000000;
+    mov.f32 %f108, 0f00000000;
+    mov.f32 %f109, 0f00000000;
+    mov.f32 %f110, 0f00000000;
+    mov.f32 %f111, 0f00000000;
+    mov.f32 %f112, 0f00000000;
+    mov.f32 %f113, 0f00000000;
+    mov.f32 %f114, 0f00000000;
+    mov.f32 %f115, 0f00000000;
+    mov.f32 %f116, 0f00000000;
+    mov.f32 %f117, 0f00000000;
+    mov.f32 %f118, 0f00000000;
+    mov.f32 %f119, 0f00000000;
+    mov.f32 %f120, 0f00000000;
+    mov.f32 %f121, 0f00000000;
+    mov.f32 %f122, 0f00000000;
+    mov.f32 %f123, 0f00000000;
+    mov.f32 %f124, 0f00000000;
+    mov.f32 %f125, 0f00000000;
+    mov.f32 %f126, 0f00000000;
+    mov.f32 %f127, 0f00000000;
     // Causal: k_max = min(q_start + block_q, seq_len)
     add.u64 %k_max, %rd16, 64;  // q_start + block_q
     min.u64 %k_max, %k_max, %rd6;  // min(..., seq_len)
@@ -247,7 +251,8 @@ LOOP_K_LOAD:
     add.u64 %rd44, %rd40, %rd43;           // global addr
     ld.global.f32 %f0, [%rd44];
     add.u64 %rd45, %rd43, 32768;             // shmem_K byte offset
-    st.shared.f32 [shmem + %rd45], %f0;
+    add.s64 %smem_addr, %shmem_base, %rd45;
+    st.shared.f32 [%smem_addr], %f0;
     add.u64 %rd41, %rd41, 128;             // elem_idx += blockDim.x
     setp.lt.u64 %p0, %rd41, %rd42;
     @%p0 bra LOOP_K_LOAD;
@@ -262,7 +267,7 @@ LOOP_S_OUTER:
     add.u32 %r3, %r3, %tid_x;
     div.u32 %r4, %r3, 64;                 // q_row = linear_idx / block_kv
     rem.u32 %r5, %r3, 64;                 // k_col = linear_idx % block_kv
-    mov.f32 %f0, 0x00000000;               // S accumulator = 0
+    mov.f32 %f0, 0f00000000;               // S accumulator = 0
     mov.u32 %r6, 0;                        // d = 0
     mov.u32 %r7, 128;                      // head_dim
 LOOP_HD:
@@ -271,14 +276,16 @@ LOOP_HD:
     cvt.u64.u32 %rd44, %r6;               // d as u64
     add.u64 %rd43, %rd43, %rd44;           // q_row * head_dim + d
     shl.b64 %rd43, %rd43, 2;              // * 4 bytes
-    ld.shared.f32 %f1, [shmem + %rd43];   // Q[q_row][d]
+    add.s64 %smem_addr, %shmem_base, %rd43;
+    ld.shared.f32 %f1, [%smem_addr];
     cvt.u64.u32 %rd44, %r5;               // k_col as u64
     mul.lo.u64 %rd44, %rd44, 128;          // k_col * head_dim
     cvt.u64.u32 %rd45, %r6;               // d as u64
     add.u64 %rd44, %rd44, %rd45;           // k_col * head_dim + d
     shl.b64 %rd44, %rd44, 2;              // * 4 bytes
     add.u64 %rd44, %rd44, 32768;             // + shmem_K base offset
-    ld.shared.f32 %f2, [shmem + %rd44];   // K[k_col][d]
+    add.s64 %smem_addr, %shmem_base, %rd44;
+    ld.shared.f32 %f2, [%smem_addr];
     fma.rn.f32 %f0, %f1, %f2, %f0;       // S += Q[d] * K[d]
     add.u32 %r6, %r6, 1;                  // d++
     setp.lt.u32 %p0, %r6, %r7;
@@ -291,7 +298,7 @@ LOOP_HD:
     cvt.u64.u32 %rd44, %r4;           // q_row as u64
     add.u64 %rd44, %rd16, %rd44;      // q_abs = q_start + q_row
     setp.gt.u64 %p1, %rd43, %rd44;    // k_abs > q_abs?
-    @%p1 mov.f32 %f0, 0xFF800000;     // -inf for masked positions
+    @%p1 mov.f32 %f0, 0fFF800000;     // -inf for masked positions
     // Store S value for this thread's s_iter
     setp.eq.u32 %p2, %r1, 0;
     @%p2 mov.f32 %f3, %f0;
@@ -363,7 +370,7 @@ LOOP_HD:
     bar.sync 0;  // FENCE 2: all warps done reading K before SRAM overwrite
     // Phase 3: Online softmax — S→P in-place in registers
     // Local max from this thread's S values
-    mov.f32 %f0, 0xFF800000;               // f_local_max = -inf
+    mov.f32 %f0, 0fFF800000;               // f_local_max = -inf
     max.f32 %f0, %f0, %f3;              // max with S[0]
     max.f32 %f0, %f0, %f4;              // max with S[1]
     max.f32 %f0, %f0, %f5;              // max with S[2]
@@ -483,7 +490,7 @@ LOOP_HD:
     mul.f32 %f126, %f126, %correction;
     mul.f32 %f127, %f127, %correction;
     // P = exp(S - new_max)  // overwrites S registers in-place
-    mov.f32 %f1, 0x00000000;               // partial_sum = 0
+    mov.f32 %f1, 0f00000000;               // partial_sum = 0
     sub.f32 %f3, %f3, %new_max;
     mul.f32 %f3, %f3, %log2e;
     ex2.approx.f32 %f3, %f3;
@@ -636,7 +643,8 @@ LOOP_V_LOAD:
     add.u64 %rd49, %rd46, %rd48;           // global addr
     ld.global.f32 %f0, [%rd49];
     add.u64 %rd50, %rd48, 32768;             // shmem_K byte offset (V reuses K region)
-    st.shared.f32 [shmem + %rd50], %f0;
+    add.s64 %smem_addr, %shmem_base, %rd50;
+    st.shared.f32 [%smem_addr], %f0;
     add.u64 %rd47, %rd47, 128;             // elem_idx += blockDim.x
     setp.lt.u64 %p0, %rd47, 8192;
     @%p0 bra LOOP_V_LOAD;
@@ -659,8 +667,9 @@ LOOP_PV:
     add.u64 %rd48, %rd48, %rd49;           // k_iter * head_dim + d_col
     shl.b64 %rd48, %rd48, 2;              // * 4 bytes
     add.u64 %rd48, %rd48, 32768;             // + shmem_K base
-    ld.shared.f32 %f1, [shmem + %rd48];   // V[k][d_col]
-    mov.f32 %f2, 0x00000000;               // default P = 0
+    add.s64 %smem_addr, %shmem_base, %rd48;
+    ld.shared.f32 %f1, [%smem_addr];
+    mov.f32 %f2, 0f00000000;               // default P = 0
     setp.eq.u32 %p2, %r12, 0;
     @%p2 mov.f32 %f2, %f3;
     setp.eq.u32 %p2, %r12, 1;
