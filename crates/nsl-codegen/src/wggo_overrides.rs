@@ -9,6 +9,30 @@
 use crate::cfie_persistent::FusionLevel;
 use serde::Serialize;
 
+/// Consumer diagnostic: one override that was rejected or adjusted.
+/// Shared across CSHA, WRGA, and future consumers of `WggoOverrides`.
+/// `requested` and `applied` are stringified at the producer so the
+/// decision explainer has a uniform wire format across consumers.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideDiagnostic {
+    pub layer_index: u32,
+    pub layer_name: String,
+    pub reason: OverrideRejectReason,
+    pub requested: String,
+    pub applied: String,
+}
+
+/// Why a consumer refused or adjusted a WGGO override.
+#[derive(Debug, Clone, Serialize)]
+pub enum OverrideRejectReason {
+    // CSHA:
+    SmemBudgetExceeded { actual_kb: u32, limit_kb: u32 },
+    // WRGA:
+    RankClampedToBounds { r_min: u32, r_max: u32 },
+    RankForbiddenByWggo,
+    BudgetExceededDowngraded { original_rank: u32, final_rank: u32 },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WggoOverrides {
     pub per_layer: Vec<PerLayerOverride>,
@@ -125,5 +149,28 @@ mod tests {
         assert_eq!(map_csha_level(2), Some(FusionLevel::Level2));
         assert_eq!(map_csha_level(3), Some(FusionLevel::Level3));
         assert_eq!(map_csha_level(99), None);
+    }
+
+    #[test]
+    fn override_diagnostic_has_string_requested_and_applied() {
+        let d = OverrideDiagnostic {
+            layer_index: 3,
+            layer_name: "blocks.3".into(),
+            reason: OverrideRejectReason::RankClampedToBounds { r_min: 2, r_max: 16 },
+            requested: "32".to_string(),
+            applied: "16".to_string(),
+        };
+        assert_eq!(d.requested, "32");
+        assert_eq!(d.applied, "16");
+    }
+
+    #[test]
+    fn override_reject_reason_covers_csha_and_wrga_variants() {
+        let _csha = OverrideRejectReason::SmemBudgetExceeded { actual_kb: 52, limit_kb: 48 };
+        let _wrga_clamp = OverrideRejectReason::RankClampedToBounds { r_min: 2, r_max: 16 };
+        let _wrga_forbid = OverrideRejectReason::RankForbiddenByWggo;
+        let _wrga_budget = OverrideRejectReason::BudgetExceededDowngraded {
+            original_rank: 16, final_rank: 8,
+        };
     }
 }

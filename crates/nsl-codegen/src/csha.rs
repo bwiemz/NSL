@@ -16,6 +16,7 @@
 use serde::Serialize;
 
 use crate::csha_boundary::{scan as scan_boundaries, BoundaryScan, ProjKind};
+use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
 use crate::csha_pipeline::{
     block_smem_bytes, pipeline_smem_bytes, plan_all, plan_layer, roofline_tile_config,
     smem_budget_bytes, FusionLevel, LayerPlan, TileConfig,
@@ -96,28 +97,6 @@ pub struct CshaInput<'a> {
     pub wggo_overrides: Option<&'a crate::wggo_overrides::WggoOverrides>,
 }
 
-/// Records a WGGO override that CSHA had to downgrade because it violated
-/// a hardware constraint. Populated during per-layer planning; rendered by
-/// both the `--csha-report` CLI path and the Phase 3 decision explainer.
-#[derive(Debug, Clone, Serialize)]
-pub struct OverrideDiagnostic {
-    pub layer_index: u32,
-    pub layer_name: String,
-    pub requested: crate::cfie_persistent::FusionLevel,
-    pub applied: crate::cfie_persistent::FusionLevel,
-    pub reason: OverrideRejectReason,
-}
-
-/// Why CSHA refused to honor a WGGO requested_csha_level.
-///
-/// Extension point: additional variants (RegisterPressure,
-/// WeightShapeIncompatible, ...) land as CSHA's feasibility model grows.
-/// Exhaustive `match` sites should use `#[non_exhaustive]` semantics —
-/// today the only variant is SmemBudgetExceeded.
-#[derive(Debug, Clone, Serialize)]
-pub enum OverrideRejectReason {
-    SmemBudgetExceeded { actual_kb: u32, limit_kb: u32 },
-}
 
 /// Aggregate plan emitted by the driver.
 #[derive(Debug, Clone, Serialize)]
@@ -455,8 +434,8 @@ pub fn run(input: CshaInput) -> CshaPlan {
                             layer_name: layer_override
                                 .map(|o| o.layer_name.clone())
                                 .unwrap_or_else(|| key.clone()),
-                            requested: requested_wggo,
-                            applied: pipeline_to_wggo_level(applied),
+                            requested: format!("{:?}", requested_wggo),
+                            applied: format!("{:?}", pipeline_to_wggo_level(applied)),
                             reason: OverrideRejectReason::SmemBudgetExceeded {
                                 actual_kb: (smem_needed / 1024) as u32,
                                 limit_kb: (budget / 1024) as u32,
@@ -922,7 +901,7 @@ mod override_tests {
         );
         let diag = &plan.override_diagnostics[0];
         assert_eq!(diag.layer_index, 0);
-        assert_eq!(diag.requested, WggoLevel::Level3);
+        assert_eq!(diag.requested, "Level3");
         assert!(
             matches!(diag.reason, OverrideRejectReason::SmemBudgetExceeded { .. }),
             "reject reason must be SmemBudgetExceeded"
@@ -930,26 +909,23 @@ mod override_tests {
 
         // Applied must be strictly less aggressive than requested.
         assert!(
-            diag.applied.as_str() != diag.requested.as_str(),
+            diag.applied != diag.requested,
             "applied level must differ from requested"
         );
         // applied ordinal < requested ordinal (Level3=3 is most aggressive).
-        let applied_ord = match diag.applied {
-            WggoLevel::None => 0u8,
-            WggoLevel::Level1 => 1,
-            WggoLevel::Level2 => 2,
-            WggoLevel::Level3 => 3,
-        };
-        let req_ord = match diag.requested {
-            WggoLevel::None => 0u8,
-            WggoLevel::Level1 => 1,
-            WggoLevel::Level2 => 2,
-            WggoLevel::Level3 => 3,
-        };
+        fn wggo_level_ordinal(level_str: &str) -> u8 {
+            match level_str {
+                "None" => 0,
+                "Level1" => 1,
+                "Level2" => 2,
+                "Level3" => 3,
+                _ => panic!("unknown level string: {level_str}"),
+            }
+        }
         assert!(
-            applied_ord < req_ord,
+            wggo_level_ordinal(&diag.applied) < wggo_level_ordinal(&diag.requested),
             "applied ({}) must be strictly less aggressive than requested ({})",
-            diag.applied.as_str(), diag.requested.as_str()
+            diag.applied, diag.requested
         );
     }
 

@@ -3842,21 +3842,22 @@ impl Compiler<'_> {
                             // Emit override-rejection diagnostics after the summary line
                             // so CLI readers see summary first, per-layer details after.
                             for diag in &plan.override_diagnostics {
-                                match diag.reason {
-                                    crate::csha::OverrideRejectReason::SmemBudgetExceeded {
+                                let reason_str = match &diag.reason {
+                                    crate::wggo_overrides::OverrideRejectReason::SmemBudgetExceeded {
                                         actual_kb,
                                         limit_kb,
                                     } => {
-                                        eprintln!(
-                                            "[csha] layer:{} wggo-override-rejected requested={:?} applied={:?} reason=smem_{}kb_exceeds_{}kb",
-                                            diag.layer_index,
-                                            diag.requested,
-                                            diag.applied,
-                                            actual_kb,
-                                            limit_kb
-                                        );
+                                        format!("smem_{}kb_exceeds_{}kb", actual_kb, limit_kb)
                                     }
-                                }
+                                    other => format!("{:?}", other),
+                                };
+                                eprintln!(
+                                    "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                                    diag.layer_index,
+                                    diag.requested,
+                                    diag.applied,
+                                    reason_str
+                                );
                             }
                         }
                     }
