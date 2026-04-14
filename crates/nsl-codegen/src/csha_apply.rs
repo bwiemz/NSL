@@ -113,6 +113,48 @@ impl BridgeResult {
         self.marks.iter().filter(move |m| m.layer == layer)
     }
 
+    /// A.2.1e: candidate norm-weight parameter names for a CSHA layer.
+    ///
+    /// RMSNorm's gamma isn't carried as an explicit Wengert input — the
+    /// runtime RMSNorm op loads it from the enclosing module field. To
+    /// resolve the Cranelift `Value` at the FA call site we probe
+    /// `FuncState.weights_by_name` against a set of conventional keys
+    /// built from the bridge's layer prefix and well-known field names.
+    ///
+    /// Returns the candidates in priority order. The caller picks the
+    /// first one that hits `weights_by_name`; all others are silently
+    /// skipped. Keeping the list explicit (rather than walking the
+    /// module AST) keeps A.2.1e self-contained and plan-pure; if a
+    /// real model names its norm weight something exotic, the FA
+    /// FFI's null-check fallback still fires and no harm is done.
+    ///
+    /// Conventions covered (priority order):
+    ///   1. LLaMA / Mistral style — `<layer>.attn_norm.weight`
+    ///   2. Generic — `<layer>.norm.weight`
+    ///   3. HuggingFace transformers — `<layer>.input_layernorm.weight`
+    ///   4. GPT-2 style — `<layer>.ln_1.weight`
+    ///   5. Alt naming — `<layer>.attention_norm.weight`
+    ///
+    /// All five are also tried with `.gamma` in place of `.weight` for
+    /// frameworks that expose the RMSNorm scale under its canonical name.
+    pub fn norm_weight_candidates(layer: &str) -> Vec<String> {
+        let fields = [
+            "attn_norm",
+            "norm",
+            "input_layernorm",
+            "ln_1",
+            "attention_norm",
+        ];
+        let suffixes = ["weight", "gamma"];
+        let mut out = Vec::with_capacity(fields.len() * suffixes.len());
+        for f in fields {
+            for s in suffixes {
+                out.push(format!("{}.{}.{}", layer, f, s));
+            }
+        }
+        out
+    }
+
     /// A.2.1b: name-based extras resolver — given the Cranelift
     /// function name currently being compiled (typically mangled as
     /// `"ModelName__method_name"`, or for loop-unrolled per-block
@@ -682,6 +724,32 @@ mod tests {
         // call site's name-based resolver (A.2.1b) relies on this
         // consistency to look up extras by the enclosing function name.
         assert!(r.extras.contains_key("TransformerBlock"));
+    }
+
+    #[test]
+    fn a21e_norm_weight_candidates_covers_common_conventions() {
+        let cands = BridgeResult::norm_weight_candidates("blocks.0");
+        // LLaMA-style (priority 1) must come first.
+        assert_eq!(cands[0], "blocks.0.attn_norm.weight");
+        // Every convention is tried with both `.weight` and `.gamma`.
+        assert!(cands.contains(&"blocks.0.norm.weight".to_string()));
+        assert!(cands.contains(&"blocks.0.norm.gamma".to_string()));
+        assert!(cands.contains(&"blocks.0.input_layernorm.weight".to_string()));
+        assert!(cands.contains(&"blocks.0.ln_1.weight".to_string()));
+        assert!(cands.contains(&"blocks.0.attention_norm.weight".to_string()));
+        // Exactly 5 field names × 2 suffixes = 10 candidates total.
+        assert_eq!(cands.len(), 10);
+    }
+
+    #[test]
+    fn a21e_norm_weight_candidates_respects_flat_model_layer_fallback() {
+        // A.2.1c's last-dot fallback produces layer keys like
+        // `TransformerBlock` for single-class models. The conventions
+        // helper must compose cleanly with that — no canonical prefix
+        // required.
+        let cands = BridgeResult::norm_weight_candidates("TransformerBlock");
+        assert_eq!(cands[0], "TransformerBlock.attn_norm.weight");
+        assert!(cands.contains(&"TransformerBlock.input_layernorm.weight".to_string()));
     }
 
     #[test]

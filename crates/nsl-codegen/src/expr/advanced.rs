@@ -1382,24 +1382,24 @@ impl Compiler<'_> {
                 .ins()
                 .iconst(cl_types::I64, extras.d_model as i64);
 
-            // A.2.1a: resolve bridge marks' `param_name` strings against
+            // A.2.1a/e: resolve bridge marks' `param_name` strings against
             // `FuncState.weights_by_name` — this gives the Cranelift
             // Value of the already-loaded Wq/Wk/Wv/Wo weight tensor
-            // without re-emitting the field load. For marks whose
-            // param_name isn't in the forward map (weight never loaded,
-            // or named differently than `model.member`), we fall back to
-            // null — the CSHA runtime forwarder tolerates null weight
-            // pointers in A.2.1 and delegates to the non-fused path.
+            // without re-emitting the field load. A.2.1e additionally
+            // probes conventional names for the RMSNorm gamma
+            // (`<layer>.attn_norm.weight` and friends) since it isn't
+            // carried as an explicit Wengert op input.
             //
-            // A.2.1b will extend this to suppress the separately-lowered
-            // matmul launches when all four weights resolve, and will
-            // thread `x` + `norm_weight` via a norm-layer-name resolver.
+            // Any pointer that fails to resolve stays null and the
+            // runtime scaffolds (A.2.2/A.2.3/A.2.4) short-circuit to
+            // the classic path via their own null-checks.
             let (mut wq_v, mut wk_v, mut wv_v, mut wo_v) = (null, null, null, null);
+            let mut norm_w_v = null;
             if let (Some(bridge), Some(layer)) =
                 (self.last_csha_bridge.as_ref(), csha_layer.as_deref())
             {
                 use crate::csha_boundary::ProjKind;
-                use crate::csha_apply::MarkRole;
+                use crate::csha_apply::{MarkRole, BridgeResult};
                 for mark in bridge.marks_for_layer(layer) {
                     let v = match state.weights_by_name.get(&mark.param_name) {
                         Some(v) => *v,
@@ -1411,6 +1411,14 @@ impl Compiler<'_> {
                         (MarkRole::NormPrologue, Some(ProjKind::V)) => wv_v = v,
                         (MarkRole::OutputProjEpilogue, _) => wo_v = v,
                         _ => {}
+                    }
+                }
+                // A.2.1e: probe conventional norm-weight names. First
+                // hit in priority order wins; miss stays null.
+                for candidate in BridgeResult::norm_weight_candidates(layer) {
+                    if let Some(v) = state.weights_by_name.get(&candidate) {
+                        norm_w_v = *v;
+                        break;
                     }
                 }
             }
@@ -1430,9 +1438,9 @@ impl Compiler<'_> {
                     ptx_ptr, name_ptr,
                     block_q_val, block_kv_val,
                     causal_val,
-                    // CSHA extras (A.2.1a):
-                    null,                      // x_ptr  (A.2.1b: needs norm-input resolver)
-                    null,                      // norm_weight_ptr (A.2.1b)
+                    // CSHA extras (A.2.1a + A.2.1e):
+                    null,                      // x_ptr  (deferred: needs VarId→Value map)
+                    norm_w_v,                  // resolved via conventional-name probe
                     wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                     eps_bits,
                     active_heads_val,
