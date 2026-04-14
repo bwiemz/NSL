@@ -663,12 +663,12 @@ fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
 
         // Store rotated values to shared memory
         ptx.push_str("    shl.b64 %rd29, %rd22, 2;        // shmem byte offset\n");
-        ptx.push_str("    st.shared.f32 [shmem + %rd29], %q_rot_a;\n");
+        emit_smem_store(ptx, "f32", "%rd29", "%q_rot_a");
         ptx.push_str(&format!(
             "    add.u64 %rd35, %rd29, {};          // offset_b in shmem\n",
             stride_val * 4
         ));
-        ptx.push_str("    st.shared.f32 [shmem + %rd35], %q_rot_b;\n");
+        emit_smem_store(ptx, "f32", "%rd35", "%q_rot_b");
 
         // Advance and loop
         ptx.push_str("    add.u64 %rd22, %rd22, 128;      // elem_idx += blockDim.x\n");
@@ -680,7 +680,7 @@ fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    shl.b64 %rd24, %rd22, 2;        // byte offset = elem_idx * 4\n");
         ptx.push_str("    add.u64 %rd25, %rd21, %rd24;    // global addr\n");
         ptx.push_str("    ld.global.f32 %f0, [%rd25];\n");
-        ptx.push_str("    st.shared.f32 [shmem + %rd24], %f0;\n");
+        emit_smem_store(ptx, "f32", "%rd24", "%f0");
         ptx.push_str("    add.u64 %rd22, %rd22, 128;      // elem_idx += blockDim.x\n");
         ptx.push_str("    setp.lt.u64 %p0, %rd22, %rd23;\n");
         ptx.push_str("    @%p0 bra LOOP_Q_LOAD;\n");
@@ -820,7 +820,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         "    add.u64 %rd45, %rd43, {};             // shmem_K byte offset\n",
         shmem_k_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd45], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd45", "%f0");
     ptx.push_str("    add.u64 %rd41, %rd41, 128;             // elem_idx += blockDim.x\n");
     ptx.push_str("    setp.lt.u64 %p0, %rd41, %rd42;\n");
     ptx.push_str("    @%p0 bra LOOP_K_LOAD;\n");
@@ -1080,7 +1080,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         "    add.u64 %rd50, %rd48, {};             // shmem_K byte offset (V reuses K region)\n",
         shmem_k_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd50], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd50", "%f0");
     ptx.push_str("    add.u64 %rd47, %rd47, 128;             // elem_idx += blockDim.x\n");
     ptx.push_str(&format!("    setp.lt.u64 %p0, %rd47, {};\n", total_k_elems));
     ptx.push_str("    @%p0 bra LOOP_V_LOAD;\n");
@@ -2563,7 +2563,7 @@ fn emit_bwd_main_load_kv_tiles(ptx: &mut String, config: &FlashAttentionBackward
     ));
     ptx.push_str("    add.u64 %rd23, %rd23, %rd21;\n");
     ptx.push_str("    shl.b64 %rd23, %rd23, 2;\n");
-    ptx.push_str("    st.shared.f32 [shmem + %rd23], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd23", "%f0");
     ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
     ptx.push_str("    bra BWD_MAIN_LOAD_K_D;\n");
     ptx.push_str("BWD_MAIN_LOAD_K_D_DONE:\n");
@@ -2607,7 +2607,7 @@ fn emit_bwd_main_load_kv_tiles(ptx: &mut String, config: &FlashAttentionBackward
         "    add.u64 %rd23, %rd23, {};  // + V tile shmem offset\n",
         v_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd23], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd23", "%f0");
     ptx.push_str("    add.u64 %rd21, %rd21, 1;\n");
     ptx.push_str("    bra BWD_MAIN_LOAD_V_D;\n");
     ptx.push_str("BWD_MAIN_LOAD_V_D_DONE:\n");
@@ -2646,7 +2646,7 @@ fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCon
         "    add.u64 %rd21, %rd21, {};  // + dK shmem offset\n",
         dk_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd21], 0f00000000;\n");
+    emit_smem_store(ptx, "f32", "%rd21", "0f00000000");
     ptx.push_str(&format!(
         "    add.u64 %rd20, %rd20, {};  // stride by block_q threads\n",
         config.block_q
@@ -2666,7 +2666,7 @@ fn emit_bwd_main_init_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCon
         "    add.u64 %rd21, %rd21, {};  // + dV shmem offset\n",
         dv_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd21], 0f00000000;\n");
+    emit_smem_store(ptx, "f32", "%rd21", "0f00000000");
     ptx.push_str(&format!(
         "    add.u64 %rd20, %rd20, {};  // stride by block_q threads\n",
         config.block_q
@@ -2749,7 +2749,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "    add.u64 %rd30, %rd30, {};\n",
         q_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd30", "%f0");
     ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
     ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
     ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
@@ -2796,7 +2796,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "    add.u64 %rd30, %rd30, {};\n",
         do_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd30", "%f0");
     ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
     ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
     ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
@@ -2827,7 +2827,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "    add.u64 %rd28, %rd28, {};  // + D_vec shmem offset\n",
         d_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd28", "%f0");
     // L[bh * seq_len + q_start + tid]
     ptx.push_str("    add.u64 %rd27, %rd8, %rd26;   // lse_ptr + offset\n");
     ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
@@ -2836,7 +2836,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "    add.u64 %rd28, %rd28, {};  // + L_vec shmem offset\n",
         l_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd28", "%f0");
     ptx.push_str("BWD_MAIN_LOAD_DL_DONE:\n");
     ptx.push_str("    bar.sync 0;  // Q, dO, D, L loaded\n\n");
 
@@ -2941,7 +2941,8 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "    add.u64 %rd35, %rd35, {};  // + S_tile shmem offset\n",
         s_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd35], %f_p;\n\n");
+    emit_smem_store(ptx, "f32", "%rd35", "%f_p");
+
 
     // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]
     ptx.push_str("    // Step 3c: dV_local[nj][d] += P[mi][nj] * dO[mi][d]\n");
@@ -3295,7 +3296,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "    add.u64 %rd30, %rd30, {};\n",
         q_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd30", "%f0");
     ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
     ptx.push_str("    bra BWD_MAIN_LOAD_Q_D;\n");
     ptx.push_str("BWD_MAIN_LOAD_Q_D_DONE:\n");
@@ -3342,7 +3343,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "    add.u64 %rd30, %rd30, {};\n",
         do_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd30], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd30", "%f0");
     ptx.push_str("    add.u64 %rd28, %rd28, 1;\n");
     ptx.push_str("    bra BWD_MAIN_LOAD_DO_D;\n");
     ptx.push_str("BWD_MAIN_LOAD_DO_D_DONE:\n");
@@ -3370,7 +3371,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "    add.u64 %rd28, %rd28, {};  // + D_vec shmem offset\n",
         d_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd28", "%f0");
     ptx.push_str("    add.u64 %rd27, %rd8, %rd26;   // lse_ptr + offset\n");
     ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
     ptx.push_str("    shl.b64 %rd28, %rd11, 2;\n");
@@ -3378,7 +3379,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "    add.u64 %rd28, %rd28, {};  // + L_vec shmem offset\n",
         l_shmem_offset
     ));
-    ptx.push_str("    st.shared.f32 [shmem + %rd28], %f0;\n");
+    emit_smem_store(ptx, "f32", "%rd28", "%f0");
     ptx.push_str("BWD_MAIN_LOAD_DL_DONE:\n");
     ptx.push_str("    bar.sync 0;  // Q, dO, D, L loaded\n\n");
 
@@ -3533,7 +3534,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     }
 
     // Overwrite S_tile with P
-    ptx.push_str("    st.shared.f32 [shmem + %rd35], %f_p;\n");
+    emit_smem_store(ptx, "f32", "%rd35", "%f_p");
     ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
     ptx.push_str("    bra BWD_MAIN_MMA_P_NJ;\n");
     ptx.push_str("BWD_MAIN_MMA_P_NJ_DONE:\n\n");
@@ -3782,7 +3783,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
 
     // Overwrite S_tile with dS (reuse same location)
-    ptx.push_str("    st.shared.f32 [shmem + %rd36], %f_ds;\n");
+    emit_smem_store(ptx, "f32", "%rd36", "%f_ds");
     ptx.push_str("    add.u64 %rd32, %rd32, 1;\n");
     ptx.push_str("    bra BWD_MAIN_MMA_DS_NJ;\n");
     ptx.push_str("BWD_MAIN_MMA_DS_NJ_DONE:\n\n");
@@ -4342,9 +4343,7 @@ fn emit_scale_and_store_mma_tile(
                 "    add.u32 %bwd_mma_store_addr, %bwd_mma_store_addr, {};\n",
                 shmem_base
             ));
-            ptx.push_str(&format!(
-                "    st.shared.f32 [shmem + %bwd_mma_store_addr], {acc_prefix}_{nt}_{r};\n"
-            ));
+            emit_smem_store(ptx, "f32", "%bwd_mma_store_addr", &format!("{acc_prefix}_{nt}_{r}"));
         }
     }
 }
