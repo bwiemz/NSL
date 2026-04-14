@@ -103,7 +103,9 @@ pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
 pub mod wggo_overrides;
-pub use wggo_overrides::{PerLayerOverride, WggoOverrides};
+pub use wggo_overrides::{
+    OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
+};
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;

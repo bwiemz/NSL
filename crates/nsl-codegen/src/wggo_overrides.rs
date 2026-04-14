@@ -9,6 +9,30 @@
 use crate::cfie_persistent::FusionLevel;
 use serde::Serialize;
 
+/// Consumer diagnostic: one override that was rejected or adjusted.
+/// Shared across CSHA, WRGA, and future consumers of `WggoOverrides`.
+/// `requested` and `applied` are stringified at the producer so the
+/// decision explainer has a uniform wire format across consumers.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideDiagnostic {
+    pub layer_index: u32,
+    pub layer_name: String,
+    pub reason: OverrideRejectReason,
+    pub requested: String,
+    pub applied: String,
+}
+
+/// Why a consumer refused or adjusted a WGGO override.
+#[derive(Debug, Clone, Serialize)]
+pub enum OverrideRejectReason {
+    // CSHA:
+    SmemBudgetExceeded { actual_kb: u32, limit_kb: u32 },
+    // WRGA:
+    RankClampedToBounds { r_min: u32, r_max: u32 },
+    RankForbiddenByWggo,
+    BudgetExceededDowngraded { original_rank: u32, final_rank: u32 },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WggoOverrides {
     pub per_layer: Vec<PerLayerOverride>,
@@ -54,6 +78,22 @@ impl WggoOverrides {
     /// so linear scan is fine.
     pub fn find(&self, layer_index: u32) -> Option<&PerLayerOverride> {
         self.per_layer.iter().find(|o| o.layer_index == layer_index)
+    }
+
+    /// Look up the override for the layer containing a given projection
+    /// name.  WRGA's `SpectralAnalysis.name` is per-projection (e.g.
+    /// `blocks.0.attn.wq`); WGGO's `layer_name` is per-layer (e.g. `blocks.0`).
+    /// All projections within a layer share its override.
+    ///
+    /// Match is **prefix + dot boundary**: `blocks.1` matches `blocks.1.attn.wq`
+    /// but NOT `blocks.10.attn.wq`.
+    pub fn find_by_layer_containing(&self, projection_name: &str) -> Option<&PerLayerOverride> {
+        self.per_layer.iter().find(|o| {
+            let ln = &o.layer_name;
+            projection_name == ln
+                || (projection_name.starts_with(ln.as_str())
+                    && projection_name[ln.len()..].starts_with('.'))
+        })
     }
 }
 
@@ -125,5 +165,74 @@ mod tests {
         assert_eq!(map_csha_level(2), Some(FusionLevel::Level2));
         assert_eq!(map_csha_level(3), Some(FusionLevel::Level3));
         assert_eq!(map_csha_level(99), None);
+    }
+
+    #[test]
+    fn override_diagnostic_has_string_requested_and_applied() {
+        let d = OverrideDiagnostic {
+            layer_index: 3,
+            layer_name: "blocks.3".into(),
+            reason: OverrideRejectReason::RankClampedToBounds { r_min: 2, r_max: 16 },
+            requested: "32".to_string(),
+            applied: "16".to_string(),
+        };
+        assert_eq!(d.requested, "32");
+        assert_eq!(d.applied, "16");
+    }
+
+    #[test]
+    fn override_reject_reason_covers_csha_and_wrga_variants() {
+        let _csha = OverrideRejectReason::SmemBudgetExceeded { actual_kb: 52, limit_kb: 48 };
+        let _wrga_clamp = OverrideRejectReason::RankClampedToBounds { r_min: 2, r_max: 16 };
+        let _wrga_forbid = OverrideRejectReason::RankForbiddenByWggo;
+        let _wrga_budget = OverrideRejectReason::BudgetExceededDowngraded {
+            original_rank: 16, final_rank: 8,
+        };
+    }
+
+    fn overrides_with_layers(layers: &[(&str, u32)]) -> WggoOverrides {
+        WggoOverrides {
+            per_layer: layers
+                .iter()
+                .enumerate()
+                .map(|(i, (name, rank))| PerLayerOverride {
+                    layer_index: i as u32,
+                    layer_name: name.to_string(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: *rank as u64,
+                    fase_fused: false,
+                    packing_mode: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn find_by_layer_containing_matches_projections_in_layer() {
+        let over = overrides_with_layers(&[("blocks.0", 8)]);
+        assert_eq!(over.find_by_layer_containing("blocks.0.attn.wq").unwrap().adapter_rank, 8);
+        assert_eq!(over.find_by_layer_containing("blocks.0.attn.wk").unwrap().adapter_rank, 8);
+        assert_eq!(over.find_by_layer_containing("blocks.0.mlp.fc1").unwrap().adapter_rank, 8);
+    }
+
+    #[test]
+    fn find_by_layer_containing_respects_dot_boundary() {
+        let over = overrides_with_layers(&[("blocks.1", 4)]);
+        assert!(over.find_by_layer_containing("blocks.10.attn.wq").is_none(),
+            "'blocks.1' must NOT match 'blocks.10.attn.wq' — dot boundary required");
+        assert_eq!(over.find_by_layer_containing("blocks.1.attn.wq").unwrap().adapter_rank, 4);
+    }
+
+    #[test]
+    fn find_by_layer_containing_matches_bare_layer_name() {
+        let over = overrides_with_layers(&[("blocks.2", 6)]);
+        assert_eq!(over.find_by_layer_containing("blocks.2").unwrap().adapter_rank, 6);
+    }
+
+    #[test]
+    fn find_by_layer_containing_returns_none_on_no_match() {
+        let over = overrides_with_layers(&[("blocks.0", 8)]);
+        assert!(over.find_by_layer_containing("blocks.99.attn.wq").is_none());
     }
 }

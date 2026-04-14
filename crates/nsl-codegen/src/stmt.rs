@@ -133,6 +133,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
+        wggo_overrides: compiler.wggo_overrides.as_ref(),
     };
     let mut plan = crate::wrga::run(wrga_input);
 
@@ -3762,12 +3763,6 @@ impl Compiler<'_> {
                 // independently useful as a diagnostic and is exercised by
                 // the test suite and CLI integration tests.
                 //
-                // `wggo_applied` is declared here so it outlives the WGGO
-                // block and is visible to the CSHA block below.  When WGGO
-                // is disabled or absent it remains `None` and CSHA receives
-                // `None` — identical to pre-Task-5 behaviour.
-                let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
-
                 if let Some(ref mode_str) = self.compile_options.wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
@@ -3801,8 +3796,10 @@ impl Compiler<'_> {
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
                             }
-                            // CAPTURE for downstream consumers (CSHA, future: WRGA, FASE, ...).
-                            wggo_applied = Some(plan.applied.clone());
+                            // Stash for all downstream consumers (CSHA, WRGA, ...).
+                            self.wggo_overrides = Some(
+                                crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
+                            );
                         }
                     }
                 }
@@ -3817,12 +3814,9 @@ impl Compiler<'_> {
                 //
                 // Pass order: Calibration → WGGO → CSHA.
                 // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
-                // so that per-layer fusion-level decisions from WGGO are
-                // honoured (or rejected with a diagnostic) by CSHA.
-                let wggo_overrides: Option<crate::wggo_overrides::WggoOverrides> = wggo_applied
-                    .as_ref()
-                    .map(crate::wggo_overrides::WggoOverrides::from_applied);
-
+                // (via self.wggo_overrides) so that per-layer fusion-level
+                // decisions from WGGO are honoured (or rejected with a
+                // diagnostic) by CSHA.
                 if let Some(ref mode_str) = self.compile_options.csha_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         if let Some(plan) = crate::csha::run_on_wengert(
@@ -3832,7 +3826,7 @@ impl Compiler<'_> {
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
                             None, // shape override — defaults are fine for diagnostic
                             8,    // default head count; weight-informed path refines this
-                            wggo_overrides.as_ref(),
+                            self.wggo_overrides.as_ref(),
                         ) {
                             if self.compile_options.csha_report {
                                 eprintln!("{}", plan.render_report());
@@ -3842,21 +3836,22 @@ impl Compiler<'_> {
                             // Emit override-rejection diagnostics after the summary line
                             // so CLI readers see summary first, per-layer details after.
                             for diag in &plan.override_diagnostics {
-                                match diag.reason {
-                                    crate::csha::OverrideRejectReason::SmemBudgetExceeded {
+                                let reason_str = match &diag.reason {
+                                    crate::wggo_overrides::OverrideRejectReason::SmemBudgetExceeded {
                                         actual_kb,
                                         limit_kb,
                                     } => {
-                                        eprintln!(
-                                            "[csha] layer:{} wggo-override-rejected requested={:?} applied={:?} reason=smem_{}kb_exceeds_{}kb",
-                                            diag.layer_index,
-                                            diag.requested,
-                                            diag.applied,
-                                            actual_kb,
-                                            limit_kb
-                                        );
+                                        format!("smem_{}kb_exceeds_{}kb", actual_kb, limit_kb)
                                     }
-                                }
+                                    other => format!("{:?}", other),
+                                };
+                                eprintln!(
+                                    "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                                    diag.layer_index,
+                                    diag.requested,
+                                    diag.applied,
+                                    reason_str
+                                );
                             }
                         }
                     }
@@ -3897,6 +3892,32 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // Task 6: render any override-rejected diagnostics to stderr so
+                // the Phase 3 decision explainer and the user can see which
+                // WGGO-requested ranks were adjusted.  Format matches the CSHA
+                // renderer so both can be parsed uniformly.
+                if let Some(ref plan) = wrga_plan {
+                    for diag in &plan.override_diagnostics {
+                        let reason_str = match &diag.reason {
+                            crate::wggo_overrides::OverrideRejectReason::RankClampedToBounds {
+                                r_min,
+                                r_max,
+                            } => format!("rank_out_of_bounds_[{r_min},{r_max}]"),
+                            crate::wggo_overrides::OverrideRejectReason::RankForbiddenByWggo => {
+                                "rank_forbidden_by_wggo".to_string()
+                            }
+                            crate::wggo_overrides::OverrideRejectReason::BudgetExceededDowngraded {
+                                original_rank,
+                                final_rank,
+                            } => format!("budget_exceeded_{original_rank}_to_{final_rank}"),
+                            other => format!("{:?}", other),
+                        };
+                        eprintln!(
+                            "[wrga] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                            diag.layer_index, diag.requested, diag.applied, reason_str
+                        );
+                    }
+                }
                 // B.2.1 Task 2.5: materialise adapter tensors into the model
                 // struct's side-table slot now that the plan is known. Task 2
                 // reserved the slot + zero-initialised it; this call allocates
