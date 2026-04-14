@@ -208,15 +208,17 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
 }
 
 fn emit_sgd(recipe: &UpdateRecipe, with_momentum: bool) -> UpdateProgram {
-    // For SGD+momentum, m already contains the running momentum.  Plain
-    // SGD uses g (== m_partial) directly.
+    // In Deferred mode the caller has accumulated the mean gradient into
+    // m_partial.  Plain SGD applies it directly (θ -= lr·m_partial, via the
+    // SgdUpdate op which reads m_partial implicitly).  SGD+momentum folds
+    // m_partial into the running momentum buffer first.
     let mut ops = Vec::new();
     if with_momentum {
         ops.push(UpdateOp::ScalarMulAdd {
             dst: Register::M,
             src: Register::M,
             a: 1.0,
-            b_src: Some(Register::G),
+            b_src: Some(Register::MPartial),
             b_scale: 1.0,
         });
     }
@@ -225,9 +227,9 @@ fn emit_sgd(recipe: &UpdateRecipe, with_momentum: bool) -> UpdateProgram {
         optimizer: recipe.optimizer,
         ops,
         pseudocode: if with_momentum {
-            format!("m = m + g; θ -= {}·m", recipe.lr)
+            format!("m = m + m_partial; θ -= {}·m", recipe.lr)
         } else {
-            format!("θ -= {}·g", recipe.lr)
+            format!("θ -= {}·m_partial", recipe.lr)
         },
     }
 }
@@ -392,6 +394,44 @@ mod tests {
         let prog = emit_reset();
         assert_eq!(prog.ops.len(), 1);
         assert_eq!(prog.ops[0], UpdateOp::Zero(Register::MPartial));
+    }
+
+    #[test]
+    fn sgd_plain_uses_m_partial_in_deferred_mode() {
+        let recipe = UpdateRecipe {
+            optimizer: FaseOptimizer::Sgd,
+            lr: 0.01,
+            beta1: 0.0, beta2: 0.0,
+            one_minus_beta1: 0.0, one_minus_beta2: 0.0,
+            eps: 0.0, weight_decay: 0.0,
+            accum_scale: 0.25,
+            v_uses_approx: false,
+        };
+        let prog = emit_sgd(&recipe, /*with_momentum=*/ false);
+        match &prog.ops[0] {
+            UpdateOp::SgdUpdate { lr } => assert!((lr - 0.01).abs() < 1e-12),
+            op => panic!("expected SgdUpdate, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn sgd_momentum_accumulates_from_m_partial() {
+        let recipe = UpdateRecipe {
+            optimizer: FaseOptimizer::SgdMomentum,
+            lr: 0.01,
+            beta1: 0.0, beta2: 0.0,
+            one_minus_beta1: 0.0, one_minus_beta2: 0.0,
+            eps: 0.0, weight_decay: 0.0,
+            accum_scale: 0.25,
+            v_uses_approx: false,
+        };
+        let prog = emit_sgd(&recipe, /*with_momentum=*/ true);
+        let UpdateOp::ScalarMulAdd { dst, src, b_src, .. } = &prog.ops[0] else {
+            panic!("op 0 should be ScalarMulAdd");
+        };
+        assert_eq!(*dst, Register::M);
+        assert_eq!(*src, Register::M);
+        assert_eq!(*b_src, Some(Register::MPartial));
     }
 
     #[test]
