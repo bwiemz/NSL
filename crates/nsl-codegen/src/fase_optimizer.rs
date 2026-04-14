@@ -168,14 +168,14 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
             dst: Register::M,
             src: Register::M,
             a: recipe.beta1,
-            b_src: Some(Register::M),
-            b_scale: 0.0, // placeholder — we use m_partial via recipe semantics
+            b_src: Some(Register::MPartial),
+            b_scale: recipe.one_minus_beta1,
         },
         // v = β₂·v + (1-β₂)·m_partial²
         UpdateOp::SquaredAccumulate {
             dst: Register::V,
             src: Register::V,
-            operand: Register::M,
+            operand: Register::MPartial,
             scale: recipe.one_minus_beta2,
         },
         // tmp = sqrt(v) + eps
@@ -392,5 +392,41 @@ mod tests {
         let prog = emit_reset();
         assert_eq!(prog.ops.len(), 1);
         assert_eq!(prog.ops[0], UpdateOp::Zero(Register::MPartial));
+    }
+
+    #[test]
+    fn adamw_reads_m_partial_for_first_and_second_moments() {
+        let recipe = UpdateRecipe {
+            optimizer: FaseOptimizer::AdamW,
+            lr: 0.001,
+            beta1: 0.9,
+            one_minus_beta1: 0.1,
+            beta2: 0.999,
+            one_minus_beta2: 0.001,
+            eps: 1e-8,
+            weight_decay: 0.01,
+            accum_scale: 0.25,
+            v_uses_approx: true,
+        };
+        let prog = emit_adamw(&recipe, /*decoupled_wd=*/ true);
+
+        // Op 0: m = β₁·m + (1-β₁)·m_partial
+        let UpdateOp::ScalarMulAdd { dst, src, a, b_src, b_scale } = &prog.ops[0] else {
+            panic!("op 0 should be ScalarMulAdd");
+        };
+        assert_eq!(*dst, Register::M);
+        assert_eq!(*src, Register::M);
+        assert!((a - 0.9).abs() < 1e-12);
+        assert_eq!(*b_src, Some(Register::MPartial));
+        assert!((b_scale - 0.1).abs() < 1e-12, "b_scale must be one_minus_beta1, no extra 1/N");
+
+        // Op 1: v = β₂·v + (1-β₂)·m_partial²
+        let UpdateOp::SquaredAccumulate { dst, src, operand, scale } = &prog.ops[1] else {
+            panic!("op 1 should be SquaredAccumulate");
+        };
+        assert_eq!(*dst, Register::V);
+        assert_eq!(*src, Register::V);
+        assert_eq!(*operand, Register::MPartial);
+        assert!((scale - 0.001).abs() < 1e-12);
     }
 }
