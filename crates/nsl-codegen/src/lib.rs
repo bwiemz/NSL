@@ -46,6 +46,7 @@ pub mod fase;
 pub mod fase_clip;
 pub mod fase_memory;
 pub mod fase_optimizer;
+pub mod stmt_fase;
 pub mod flash_attention;
 pub mod fp8;
 pub mod func;
