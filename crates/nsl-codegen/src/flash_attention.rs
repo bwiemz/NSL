@@ -4999,8 +4999,8 @@ mod tests {
 
         assert!(ptx.contains("%mma_row_max"), "row_max declared");
         assert!(ptx.contains("%mma_row_sum"), "row_sum declared");
-        assert!(ptx.contains("0xFF800000"), "row_max initialized to -inf");
-        assert!(ptx.contains("0x00000000"), "row_sum initialized to 0");
+        assert!(ptx.contains("0fFF800000"), "row_max initialized to -inf");
+        assert!(ptx.contains("0f00000000"), "row_sum initialized to 0");
     }
 
     #[test]
