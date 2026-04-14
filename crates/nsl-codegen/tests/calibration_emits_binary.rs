@@ -33,6 +33,7 @@ fn real_subprocess_entry_produces_runnable_binary_with_identity_hook() {
         batch_size: 1,
         timeout_secs: 30,
         mode: HarnessMode::Required,
+        projections: vec![],
     };
 
     let result = real_subprocess_entry(&cfg, &registry);
@@ -94,6 +95,7 @@ fn real_subprocess_entry_accepts_linear_input_activations_hooks() {
         batch_size: 1,
         timeout_secs: 30,
         mode: HarnessMode::Required,
+        projections: vec![],
     };
 
     let result = real_subprocess_entry(&cfg, &registry);

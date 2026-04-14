@@ -3796,6 +3796,13 @@ impl Compiler<'_> {
                             batch_size: self.compile_options.calibration_batch_size,
                             timeout_secs: self.compile_options.calibration_timeout_secs,
                             mode,
+                            // Wire per-projection (path, weight_shape) into the
+                            // cache key so renames and shape changes invalidate it.
+                            projections: self
+                                .compile_options
+                                .calibration_retention
+                                .clone()
+                                .unwrap_or_default(),
                         };
                         match crate::calibration::run_harness_production(&registry, &cfg) {
                             Ok(out) => {

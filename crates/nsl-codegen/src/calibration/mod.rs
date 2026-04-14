@@ -129,6 +129,9 @@ pub struct HarnessConfig {
     pub batch_size: u32,
     pub timeout_secs: u64,
     pub mode: HarnessMode,
+    /// Per-projection `(path, weight_shape)` used to extend the cache-key
+    /// digest.  Empty when no AWQ projections are present.
+    pub projections: Vec<crate::calibration::discovery::DiscoveredProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +176,7 @@ pub fn run_harness_simulated(
         hook_ids_sorted: registry.enabled_ids_sorted(),
         samples: cfg.samples,
         batch_size: cfg.batch_size,
+        projections: cfg.projections.clone(),
     };
     let cache_key_digest = cache_key.digest();
 
@@ -354,6 +358,7 @@ mod driver_tests {
             batch_size: 2,
             timeout_secs: 5,
             mode: HarnessMode::Required,
+            projections: vec![],
         };
 
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess)
@@ -392,6 +397,7 @@ mod driver_tests {
             batch_size: 1,
             timeout_secs: 1,
             mode: HarnessMode::Required,
+            projections: vec![],
         };
         match run_harness_simulated(&registry, &cfg, simulated_infra_error) {
             Err(HarnessError::Infrastructure { reason }) => {
@@ -418,6 +424,7 @@ mod driver_tests {
             batch_size: 1,
             timeout_secs: 1,
             mode: HarnessMode::BestEffort,
+            projections: vec![],
         };
         let r = run_harness_simulated(&registry, &cfg, simulated_infra_error)
             .expect("best-effort should not error");
@@ -445,6 +452,7 @@ mod driver_tests {
             batch_size: 1,
             timeout_secs: 1,
             mode: HarnessMode::BestEffort,
+            projections: vec![],
         };
         let err = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap_err();
         match err {
@@ -474,6 +482,7 @@ mod driver_tests {
             batch_size: 2,
             timeout_secs: 5,
             mode: HarnessMode::Required,
+            projections: vec![],
         };
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
         assert_eq!(r1.outcome_repr, "clean");
