@@ -473,6 +473,11 @@ pub struct CompileOptions {
     pub calibration_samples: u32,
     pub calibration_batch_size: u32,
     pub calibration_timeout_secs: u64,
+    /// Populated by the harness after a successful calibration run.
+    /// Downstream passes (AWQ quantizer, future hooks' consumers) read
+    /// their sidecar key from here.  `None` when calibration didn't
+    /// run or produced no usable output.
+    pub calibration_sidecar: Option<crate::calibration::sidecar::Sidecar>,
 }
 
 impl Default for CompileOptions {
@@ -536,6 +541,7 @@ impl Default for CompileOptions {
             calibration_samples: 512,
             calibration_batch_size: 8,
             calibration_timeout_secs: 600,
+            calibration_sidecar: None,
         }
     }
 }
