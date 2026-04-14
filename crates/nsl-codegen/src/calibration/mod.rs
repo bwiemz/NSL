@@ -15,10 +15,12 @@ pub mod retention;
 pub mod sidecar;
 pub mod subprocess;
 
-pub use ctx::CalibCtx;
+pub use ctx::{BufferHandle, CalibCtx};
 pub use hooks::{CalibrationHook, CalibrationResult};
+pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
+pub use retention::{RetentionTable, TensorShape};
 
 use std::collections::BTreeMap;
 
@@ -215,14 +217,7 @@ pub fn run_harness_production(
     registry: &HookRegistry,
     cfg: &HarnessConfig,
 ) -> Result<HarnessOutput, HarnessError> {
-    let any_forward = registry.iter().any(|h| match h.requires() {
-        ObservationSet::Empty => false,
-        ObservationSet::ForwardActivations(v) => !v.is_empty(),
-        ObservationSet::BackwardGradients(_) => false,
-        ObservationSet::Weights(_) => false,
-        ObservationSet::LinearInputActivations(v) => !v.is_empty(),
-        ObservationSet::Union(children) => children.iter().any(requires_forward_like),
-    });
+    let any_forward = registry.iter().any(|h| h.requires().needs_forward_pass());
 
     if any_forward {
         eprintln!(
@@ -247,15 +242,6 @@ pub fn run_harness_production(
         run_harness_stub(registry, &ckpt_bytes, &data_bytes, cfg.samples)
     } else {
         run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
-    }
-}
-
-fn requires_forward_like(obs: &ObservationSet) -> bool {
-    match obs {
-        ObservationSet::ForwardActivations(v) => !v.is_empty(),
-        ObservationSet::LinearInputActivations(v) => !v.is_empty(),
-        ObservationSet::Union(children) => children.iter().any(requires_forward_like),
-        _ => false,
     }
 }
 

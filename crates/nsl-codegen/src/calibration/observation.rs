@@ -101,6 +101,25 @@ impl ObservationPlan {
     }
 }
 
+impl ObservationSet {
+    /// Returns `true` if any variant inside this set requires the
+    /// forward pass to produce observable intermediate tensors
+    /// (i.e. `ForwardActivations` or `LinearInputActivations` with
+    /// at least one target).  Used by the calibration driver to
+    /// decide whether the real subprocess codegen path (which emits
+    /// model-forward IR) is required vs. the in-process stub.
+    pub fn needs_forward_pass(&self) -> bool {
+        match self {
+            ObservationSet::Empty
+            | ObservationSet::BackwardGradients(_)
+            | ObservationSet::Weights(_) => false,
+            ObservationSet::ForwardActivations(v) => !v.is_empty(),
+            ObservationSet::LinearInputActivations(v) => !v.is_empty(),
+            ObservationSet::Union(children) => children.iter().any(Self::needs_forward_pass),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +198,26 @@ mod tests {
         ]);
         let plan = ObservationPlan::union_of(&[inner]);
         assert_eq!(plan.linear_input_activations.len(), 2);
+    }
+
+    #[test]
+    fn needs_forward_pass_detects_every_variant_correctly() {
+        assert!(!ObservationSet::Empty.needs_forward_pass());
+        assert!(!ObservationSet::BackwardGradients(vec![LayerRef::new("x")]).needs_forward_pass());
+        assert!(!ObservationSet::Weights(vec![ParamRef::new("w")]).needs_forward_pass());
+        assert!(!ObservationSet::ForwardActivations(vec![]).needs_forward_pass());
+        assert!(ObservationSet::ForwardActivations(vec![LayerRef::new("l")]).needs_forward_pass());
+        assert!(!ObservationSet::LinearInputActivations(vec![]).needs_forward_pass());
+        assert!(ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p")]).needs_forward_pass());
+        // Union: true if any child needs it
+        assert!(ObservationSet::Union(vec![
+            ObservationSet::Weights(vec![ParamRef::new("w")]),
+            ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p")]),
+        ]).needs_forward_pass());
+        assert!(!ObservationSet::Union(vec![
+            ObservationSet::Empty,
+            ObservationSet::BackwardGradients(vec![LayerRef::new("x")]),
+        ]).needs_forward_pass());
     }
 
     #[test]

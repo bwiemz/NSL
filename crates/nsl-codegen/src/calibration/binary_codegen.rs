@@ -43,7 +43,6 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::hooks::CalibrationResult;
-use crate::calibration::observation::ObservationSet;
 use crate::calibration::registry::HookRegistry;
 use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
 use crate::calibration::subprocess::{run_subprocess, SubprocessOutcome};
@@ -59,7 +58,7 @@ pub fn real_subprocess_entry(
     // linear-input activations.  Full model-forward emission lands in
     // a follow-up plan.
     for hook in registry.iter() {
-        if requires_forward_activations(&hook.requires()) {
+        if hook.requires().needs_forward_pass() {
             return Err(HarnessError::Infrastructure {
                 reason: format!(
                     "hook '{}' requires LinearInputActivations which is not yet supported by real_subprocess_entry (follow-up plan)",
@@ -127,17 +126,6 @@ pub fn real_subprocess_entry(
         sidecar: parsed,
         outcome_repr: "clean",
     })
-}
-
-fn requires_forward_activations(obs: &ObservationSet) -> bool {
-    match obs {
-        ObservationSet::Empty => false,
-        ObservationSet::ForwardActivations(v) => !v.is_empty(),
-        ObservationSet::BackwardGradients(_) => false,
-        ObservationSet::Weights(_) => false,
-        ObservationSet::LinearInputActivations(v) => !v.is_empty(),
-        ObservationSet::Union(children) => children.iter().any(requires_forward_activations),
-    }
 }
 
 /// Run each hook's init/per-step/finalize against a stub ctx and
