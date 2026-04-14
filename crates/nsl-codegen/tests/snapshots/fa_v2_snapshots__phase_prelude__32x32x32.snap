@@ -1,0 +1,77 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+.version 8.7
+.target sm_75
+.address_size 64
+
+.visible .entry flash_attn_p0_r0_hs_g1_c1_t0_q32_kv32_v2 (
+    .param .u64 q_ptr,
+    .param .u64 k_ptr,
+    .param .u64 v_ptr,
+    .param .u64 out_ptr,
+    .param .f32 scale,
+    .param .u64 batch,
+    .param .u64 heads,
+    .param .u64 seq_len,
+    .param .u64 head_dim,
+    .param .u64 block_table_ptr,
+    .param .u64 k_pool_ptr,
+    .param .u64 v_pool_ptr,
+    .param .u64 block_size,
+    .param .u64 cos_ptr,
+    .param .u64 sin_ptr,
+    .param .u64 seq_ids_ptr,
+    .param .u64 seq_lens_ptr,
+    .param .u64 dfs_enter_ptr,
+    .param .u64 dfs_exit_ptr,
+    .param .u64 num_tree_nodes,
+    .param .u64 param_logsumexp,
+    .param .u64 csha_x_ptr,
+    .param .u64 csha_norm_weight_ptr,
+    .param .u64 csha_wq_ptr,
+    .param .u64 csha_wk_ptr,
+    .param .u64 csha_wv_ptr,
+    .param .u64 csha_wo_ptr,
+    .param .f32 csha_eps,
+    .param .u32 csha_active_heads,
+    .param .u32 csha_d_model
+)
+{
+    .shared .align 16 .b8 shmem[4608];
+    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;
+    .reg .u64 %rd<64>;
+    .reg .f32 %f<49>;
+    .reg .b16 %h<32>;
+    .reg .pred %p<8>;
+    .reg .u32 %r<16>;
+    .reg .f32 %scale, %log2e, %row_max, %row_sum, %correction;
+    .reg .f32 %new_max, %old_max, %shfl_tmp;
+    .reg .u64 %q_start, %head_idx, %batch_idx, %k_start, %k_max;
+    .reg .u64 %shmem_base, %smem_addr;
+    .reg .f32 %log_sum, %lse;
+    .reg .u64 %logsumexp_base;
+    .reg .pred %p_has_lse;
+    cvta.shared.u64 %shmem_base, shmem;
+    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))
+    ld.param.f32 %scale, [scale];
+    ld.param.u64 %rd0, [q_ptr];
+    ld.param.u64 %rd1, [k_ptr];
+    ld.param.u64 %rd2, [v_ptr];
+    ld.param.u64 %rd3, [out_ptr];
+    ld.param.u64 %rd4, [batch];
+    ld.param.u64 %rd5, [heads];
+    ld.param.u64 %rd6, [seq_len];
+    ld.param.u64 %rd7, [head_dim];
+    ld.param.u64 %logsumexp_base, [param_logsumexp];
+    mov.u32 %tid_x, %tid.x;
+    shr.u32 %warp_id, %tid_x, 5;       // warp_id = tid_x / 32
+    and.b32 %lane, %tid_x, 31;          // lane = tid_x % 32
+    mov.u32 %bid_x, %ctaid.x;
+    mov.u32 %bid_y, %ctaid.y;
+    cvt.u64.u32 %q_start, %bid_x;
+    mul.lo.u64 %q_start, %q_start, 32;   // * block_q
+    cvt.u64.u32 %rd16, %bid_y;
+    rem.u64 %head_idx,  %rd16, %rd5;   // head_idx  = bid_y % heads
+    div.u64 %batch_idx, %rd16, %rd5;   // batch_idx = bid_y / heads
