@@ -1,0 +1,65 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // Phase 3: online softmax + P writeback
+    mov.f32 %f0, 0fFF800000;                  // local_max = -inf
+    // row_max chunk 0: lane sees k = lane + 32*0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;              // warp_id * block_kv
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
+    add.u64 %rd41, %rd41, %rd40;              // warp_base + k
+    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
+    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf
+    max.f32 %f0, %f0, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    max.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %old_max, %row_max;
+    max.f32 %new_max, %row_max, %f0;
+    mov.f32 %row_max, %new_max;
+    sub.f32 %f0, %old_max, %new_max;
+    mul.f32 %f0, %f0, %log2e;
+    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
+    mul.f32 %row_sum, %row_sum, %correction;
+    mov.f32 %f2, 0f00000000;                  // partial_sum = 0
+    // P writeback chunk 0
+    cvt.u64.u32 %rd40, %warp_id;
+    mul.lo.u64 %rd40, %rd40, 32;
+    cvt.u64.u32 %rd41, %lane;
+    setp.lt.u64 %p0, %rd41, 32;
+    add.u64 %rd41, %rd41, %rd40;
+    shl.b64 %rd41, %rd41, 2;
+    add.u64 %rd41, %rd41, 4096;
+    add.u64 %smem_addr, %rd41, %shmem_base;
+    mov.f32 %f1, 0fFF800000;
+    @%p0 ld.shared.f32 %f1, [%smem_addr];
+    sub.f32 %f1, %f1, %new_max;
+    mul.f32 %f1, %f1, %log2e;
+    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    @!%p0 mov.f32 %f1, 0f00000000;
+    @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
+    add.f32 %f2, %f2, %f1;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f2, %f2, %shfl_tmp;
+    add.f32 %row_sum, %row_sum, %f2;
+    bar.sync 0;  // FENCE: all warps done writing P in-place

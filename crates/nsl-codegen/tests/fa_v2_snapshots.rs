@@ -3,7 +3,7 @@
 //! snapshot. Use `cargo insta review` to accept snapshot changes.
 
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute};
+use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax};
 
 fn csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
@@ -79,4 +79,18 @@ fn phase_s_compute__label_uniqueness_across_iters() {
     assert!(ptx1.contains("V2_LOOP_S_OVER_K_1:"), "iter 1 label missing");
     assert!(!ptx0.contains("V2_LOOP_S_OVER_K_1"), "iter 0 leaks iter 1 label");
     assert!(!ptx1.contains("V2_LOOP_S_OVER_K_0"), "iter 1 leaks iter 0 label");
+}
+
+#[test]
+fn phase_softmax__32x32x32_snapshot() {
+    let mut ptx = String::new();
+    softmax::emit(&mut ptx, &csha_canonical());
+    insta::assert_snapshot!("phase_softmax__32x32x32", ptx);
+}
+
+#[test]
+fn phase_softmax__64x64x128_snapshot() {
+    let mut ptx = String::new();
+    softmax::emit(&mut ptx, &non_csha_canonical());
+    insta::assert_snapshot!("phase_softmax__64x64x128", ptx);
 }
