@@ -272,6 +272,51 @@ pub fn collect_claimed_ops(plan: &CshaPlan) -> std::collections::HashSet<u32> {
     out
 }
 
+/// A.2.1f: resolve each CSHA-active layer's `x` input VarId — the
+/// Wengert VarId feeding the RMSNorm op at the start of the boundary
+/// chain. Pure plan-level helper: consumes the `CshaPlan`'s
+/// `BoundaryChain.norm_op` indices and looks up each op's first input
+/// in the supplied Wengert list.
+///
+/// Returned map is keyed by layer name (matching `BridgeResult.extras`
+/// / `BridgeResult.marks_for_layer`). When multiple chains for the
+/// same layer disagree on the norm input (shouldn't happen — Q/K/V
+/// typically share a single RMSNorm), the first-seen VarId wins.
+///
+/// **Why this helper doesn't thread the Cranelift `Value` itself:**
+/// Cranelift Values are `FunctionBuilder`-scoped. The Wengert VarId →
+/// Value map is built inside the train-block function body's lowering
+/// (`wengert_lower::compile_wengert_ops`), while the FA call site
+/// fires inside the separately-compiled `@flash_attention` function
+/// body. Using Values across FunctionBuilder boundaries is unsound.
+/// Full x_ptr threading at the FA call site needs either (a) to
+/// happen inside the train-block function's lowering when FA ops are
+/// decomposed, or (b) a tensor-pointer-sharing mechanism that
+/// survives across function boundaries (e.g. a name-keyed global or
+/// per-call stash populated before the `@flash_attention` function is
+/// invoked). Both are architectural changes beyond the scope of this
+/// helper, which stays plan-pure so the infrastructure is ready when
+/// that design lands.
+pub fn collect_norm_input_varids(
+    plan: &CshaPlan,
+    wengert: &crate::wengert::WengertList,
+) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    for chain in &plan.boundary.chains {
+        let Some(layer) = chain.layer.as_ref() else {
+            continue;
+        };
+        let Some(norm_op) = wengert.ops.get(chain.norm_op as usize) else {
+            continue;
+        };
+        let Some(&x_varid) = norm_op.inputs.first() else {
+            continue;
+        };
+        out.entry(layer.clone()).or_insert(x_varid);
+    }
+    out
+}
+
 /// Build the downstream artefacts from a CSHA plan.
 pub fn bridge(plan: &CshaPlan, shape_head_dim: i64) -> BridgeResult {
     let mut out = BridgeResult::default();
@@ -724,6 +769,57 @@ mod tests {
         // call site's name-based resolver (A.2.1b) relies on this
         // consistency to look up extras by the enclosing function name.
         assert!(r.extras.contains_key("TransformerBlock"));
+    }
+
+    #[test]
+    fn a21f_collect_norm_input_varids_extracts_rmsnorm_input_per_layer() {
+        // Toy three-chain plan (Q/K/V) shares a single RMSNorm whose
+        // input is VarId 0 (the `Input("x")` op at index 0). All three
+        // chains point at norm_op=1 (the RMSNorm). The helper returns
+        // `layer → x_varid`, first-seen wins when chains for the same
+        // layer agree.
+        let w = attn_wengert();
+        let plan = toy_plan(CshaMode::Auto);
+        let norm_inputs = collect_norm_input_varids(&plan, &w);
+        // Toy plan yields one CSHA-active layer `blocks.0` with three
+        // chains, all referencing the same RMSNorm whose input is 0.
+        assert_eq!(norm_inputs.len(), 1);
+        assert_eq!(norm_inputs.get("blocks.0").copied(), Some(0));
+    }
+
+    #[test]
+    fn a21f_collect_norm_input_varids_empty_when_csha_off() {
+        // Off-mode short-circuits in `run` → no per_layer entries and
+        // no boundary chains. Helper returns an empty map, matching
+        // the null-fallback contract at the FA call site.
+        let w = attn_wengert();
+        let plan = toy_plan(CshaMode::Off);
+        let norm_inputs = collect_norm_input_varids(&plan, &w);
+        assert!(norm_inputs.is_empty());
+    }
+
+    #[test]
+    fn a21f_collect_norm_input_varids_skips_chains_without_layer() {
+        // `BoundaryChain.layer = None` is the "floating chain"
+        // case (`layer_key_with_fallback` returned None, typically
+        // for top-level parameters). These chains still exist in the
+        // scan but don't contribute to per-layer x-input resolution —
+        // the FA call site keys on layer name, so unlayered chains
+        // are inaccessible anyway.
+        use crate::csha_boundary::{BoundaryChain, BoundaryScan, ProjKind};
+        let mut plan = toy_plan(CshaMode::Off);
+        plan.boundary = BoundaryScan {
+            chains: vec![BoundaryChain {
+                layer: None,
+                kind: ProjKind::Q,
+                norm_op: 1,
+                matmul_op: 3,
+                rope_op: None,
+                weight_param: "unrooted.wq".to_string(),
+            }],
+        };
+        let norm_inputs = collect_norm_input_varids(&plan, &attn_wengert());
+        assert!(norm_inputs.is_empty());
     }
 
     #[test]

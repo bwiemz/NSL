@@ -1438,8 +1438,23 @@ impl Compiler<'_> {
                     ptx_ptr, name_ptr,
                     block_q_val, block_kv_val,
                     causal_val,
-                    // CSHA extras (A.2.1a + A.2.1e):
-                    null,                      // x_ptr  (deferred: needs VarId→Value map)
+                    // CSHA extras (A.2.1a + A.2.1e + A.2.1f):
+                    //
+                    // x_ptr stays null here because Cranelift `Value`s
+                    // are `FunctionBuilder`-scoped: the Wengert VarId→
+                    // Value map is built inside the train-block's
+                    // forward-pass lowering, while this FA call site
+                    // fires inside the separately-compiled
+                    // `@flash_attention` function body. The plan-level
+                    // resolution (`csha_apply::collect_norm_input_varids`)
+                    // is in place so future work can thread the
+                    // pointer once a cross-function-body value-sharing
+                    // mechanism lands (e.g. a layer-keyed stash
+                    // populated before the decorated function is
+                    // invoked). The A.2.2 prologue's runtime
+                    // null-check keeps the kernel correct in the
+                    // interim.
+                    null,                      // x_ptr  (cross-fn blocker; see above)
                     norm_w_v,                  // resolved via conventional-name probe
                     wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                     eps_bits,
