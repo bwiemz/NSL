@@ -827,6 +827,11 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
     ptx.push_str("    .reg .b32 %proj_b0, %proj_b1;\n");
     ptx.push_str("    .reg .f32 %proj_d0, %proj_d1, %proj_d2, %proj_d3;\n");
     ptx.push_str("    .reg .f32 %proj_c0, %proj_c1, %proj_c2, %proj_c3;\n");
+    // A.2.3 fragment-pack: 2 .b32 regs carry the 4 f16 output values per
+    // (m, n) tile iteration. `%mma_h0` / `%mma_h1` (declared by
+    // `emit_mma_temp_registers` earlier in the kernel) are the f16
+    // conversion temps used by `emit_f32_to_f16_pack`.
+    ptx.push_str("    .reg .b32 %proj_c_pack0, %proj_c_pack1;\n");
     ptx.push_str("    // Zero accumulator for this proof-of-structure iteration\n");
     ptx.push_str("    mov.f32 %proj_c0, 0.0;\n");
     ptx.push_str("    mov.f32 %proj_c1, 0.0;\n");
@@ -970,13 +975,34 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
         ));
         ptx.push_str(&format!("    @%p7 bra CSHA_PROJ_{}_K_LOOP;\n", proj_tag));
 
-        // Placeholder per-thread accumulator store — proper fragment
-        // packing (f32→f16 + 16×8 scatter across lanes) is the
-        // A.2.3-follow-up step. Each thread stores its 4 f32 accumulator
-        // lanes to a row-addressed SMEM slot so the store pattern is
-        // visible to ptxas and downstream tests.
+        // Fragment pack: f32 accumulator (4 f32 per thread) → 2 .b32
+        // registers holding 4 packed f16 values, stored to SMEM at the
+        // per-(m, n) tile origin. Uses the shared `emit_f32_to_f16_pack`
+        // helper so ptxas sees the same conversion pattern as the
+        // existing attention-body epilogue.
+        //
+        // Lane-scatter note: mma.sync.m16n8k16 f32 output has each
+        // thread holding (row=t/4, col=2*(t%4)+{0,1}) and (row+8,
+        // same col) fragment entries. The per-thread SMEM address
+        // computed here stages the 4 packed f16 values at the tile
+        // base — a thread-local scatter-to-lane-coords pass lands in
+        // the A.2.3.2 follow-up once real-hardware validation is in
+        // place. The dtype is now correct (f16), which was the blocker
+        // for A.2.4's f16-reading tile-sweep.
+        let c_names: Vec<String> = c_regs
+            .iter()
+            .map(|r| r.trim_start_matches('%').to_string())
+            .collect();
+        let c_pack_dsts = vec!["proj_c_pack0".to_string(), "proj_c_pack1".to_string()];
+        emit_f32_to_f16_pack(ptx, &c_names, &c_pack_dsts);
+
+        // Tile-origin SMEM address: out_offset + m*16*a_stride + n*8*2.
+        // Per-thread lane offset left at 0 for now (see scatter note
+        // above) — all 32 threads in a warp contend for the same
+        // address in this scaffold, but the store pattern is visible
+        // to tests and will cleanly extend when the scatter lands.
         ptx.push_str(&format!(
-            "    mul.lo.u32 %ts_out_base, %ts_m, {};  // m * 16 * head_dim * 2\n",
+            "    mul.lo.u32 %ts_out_base, %ts_m, {};  // m * 16 * a_stride\n",
             16 * a_stride_bytes
         ));
         ptx.push_str(&format!(
@@ -984,14 +1010,8 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
             out_offset_bytes
         ));
         ptx.push_str("    mad.lo.u32 %ts_out_base, %ts_n, 16, %ts_out_base; // + n*8*2\n");
-        for i in 0..4 {
-            ptx.push_str(&format!(
-                "    st.shared.b32 [%ts_out_base + {}], {};  // acc[{}] placeholder\n",
-                i * 4,
-                c_regs[i],
-                i
-            ));
-        }
+        ptx.push_str("    st.shared.b32 [%ts_out_base + 0], %proj_c_pack0;   // f16x2 low pair\n");
+        ptx.push_str("    st.shared.b32 [%ts_out_base + 4], %proj_c_pack1;   // f16x2 high pair\n");
 
         ptx.push_str("    add.u32 %ts_n, %ts_n, 1;\n");
         ptx.push_str(&format!(
@@ -1043,13 +1063,13 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
     );
 
     ptx.push_str(
-        "    // TODO(A.2.3-follow-up): replace per-thread st.shared.b32 with the\n",
+        "    // TODO(A.2.3.2): lane-coherent thread-coord scatter replacing the\n",
     );
     ptx.push_str(
-        "    // fragment-pack helper (f32→f16 + lane scatter) so SMEM receives\n",
+        "    // tile-origin store above (requires real-hardware validation\n",
     );
     ptx.push_str(
-        "    // the MMA output in the layout the attention body expects.\n",
+        "    // against an mma.sync f32-accumulator test vector).\n",
     );
 
     ptx.push_str("CSHA_PROJECTION_END:\n");
@@ -1173,22 +1193,24 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    ld.shared.f32 %rope_q_a, [%rope_elem_a_off];\n");
     ptx.push_str("    ld.shared.f32 %rope_q_b, [%rope_elem_b_off];\n");
 
-    // cos/sin address: (q_start+row)*head_dim + d, times 4 bytes
+    // cos/sin address: base_ptr + ((q_start + row) * head_dim + d) * 4.
+    // Mirrors the math in `emit_q_tile_load`'s LOOP_Q_LOAD_ROPE branch
+    // (%rd25 = cos_base, %rd26 = sin_base in that emitter); here we
+    // compute the offset from cos_ptr (%rd12) / sin_ptr (%rd13)
+    // directly per loop iteration so the scaffold stays self-contained.
     ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_row;\n");
-    ptx.push_str("    add.u64 %rope_row_u64, %rope_row_u64, %rd16;  // + q_start\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rope_row_u64, %rd16;        // + q_start\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rope_cs_addr, %rope_row_u64, {};\n",
+        "    mul.lo.u64 %rope_cs_addr, %rope_row_u64, {}; // * head_dim\n",
         head_dim
     ));
-    ptx.push_str("    cvt.u64.u32 %rope_tmp, %rope_d; shl.b64 %rope_cs_addr, %rope_cs_addr, 2; // placeholder\n");
-    // NOTE: above line is a loose scaffold — real indexing requires a
-    // separate u64 temp reg; the real addr math is performed through
-    // %rd32-%rd34 in the original RoPE path. For the tile-sweep
-    // emission we reuse a local path so the loop structure is
-    // reviewable. Full indexing harmonises with the A.2.3 fragment-pack
-    // follow-up when addresses become lane-coherent.
-    ptx.push_str("    ld.global.f32 %rope_cos, [%rd12];\n");
-    ptx.push_str("    ld.global.f32 %rope_sin, [%rd13];\n");
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_d;                  // reuse as d temp\n");
+    ptx.push_str("    add.u64 %rope_cs_addr, %rope_cs_addr, %rope_row_u64; // + d\n");
+    ptx.push_str("    shl.b64 %rope_cs_addr, %rope_cs_addr, 2;             // * 4 bytes\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd12, %rope_cs_addr;         // cos addr\n");
+    ptx.push_str("    ld.global.f32 %rope_cos, [%rope_row_u64];\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd13, %rope_cs_addr;         // sin addr\n");
+    ptx.push_str("    ld.global.f32 %rope_sin, [%rope_row_u64];\n");
 
     ptx.push_str("    mul.f32 %rope_q_rot_a, %rope_q_a, %rope_cos;\n");
     ptx.push_str("    mul.f32 %rope_tmp, %rope_q_b, %rope_sin;\n");
@@ -1240,8 +1262,21 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
 
     ptx.push_str("    ld.shared.f32 %rope_k_a, [%rope_elem_a_off];\n");
     ptx.push_str("    ld.shared.f32 %rope_k_b, [%rope_elem_b_off];\n");
-    ptx.push_str("    ld.global.f32 %rope_cos, [%rd12];\n");
-    ptx.push_str("    ld.global.f32 %rope_sin, [%rd13];\n");
+
+    // Per-(row, d) cos/sin indexing — same pattern as the Q sweep.
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_row;\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rope_row_u64, %rd16;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rope_cs_addr, %rope_row_u64, {};\n",
+        head_dim
+    ));
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_d;\n");
+    ptx.push_str("    add.u64 %rope_cs_addr, %rope_cs_addr, %rope_row_u64;\n");
+    ptx.push_str("    shl.b64 %rope_cs_addr, %rope_cs_addr, 2;\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd12, %rope_cs_addr;\n");
+    ptx.push_str("    ld.global.f32 %rope_cos, [%rope_row_u64];\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd13, %rope_cs_addr;\n");
+    ptx.push_str("    ld.global.f32 %rope_sin, [%rope_row_u64];\n");
 
     ptx.push_str("    mul.f32 %rope_k_rot_a, %rope_k_a, %rope_cos;\n");
     ptx.push_str("    mul.f32 %rope_tmp, %rope_k_b, %rope_sin;\n");
@@ -1255,18 +1290,6 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    add.u32 %rope_pair_idx, %rope_pair_idx, 128;\n");
     ptx.push_str("    bra CSHA_ROPE_K_LOOP;\n");
 
-    ptx.push_str(
-        "    // TODO(A.2.4-follow-up): couple cos/sin addressing with the full\n",
-    );
-    ptx.push_str(
-        "    // (q_start+row, d) index math once A.2.3 fragment-pack lands and\n",
-    );
-    ptx.push_str(
-        "    // SMEM holds f16 Q/K in the MMA-output layout (vs today's f32\n",
-    );
-    ptx.push_str(
-        "    // placeholder stores).\n",
-    );
 
     ptx.push_str("CSHA_ROPE_EPILOGUE_END:\n");
     ptx.push_str("    // ── end CSHA RoPE epilogue ─────────────────────────────────\n");
@@ -6554,6 +6577,63 @@ mod tests {
             3,
             "one K-loop increment per projection"
         );
+    }
+
+    #[test]
+    fn a23_fragment_pack_converts_f32_accumulator_to_f16_before_smem_store() {
+        // A.2.3 follow-up: per-(m, n) tile closure packs the 4 f32
+        // accumulator lanes into 2 .b32 registers (each holding 2
+        // packed f16 values) via `emit_f32_to_f16_pack`. Verifies the
+        // conversion is actually emitted rather than the old
+        // placeholder `st.shared.b32 %proj_c0` raw-f32 store.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // Three projections × 2 f32→f16 conversion pairs each
+        // (emit_f32_to_f16_pack emits one cvt per f32 src, 4 per call).
+        assert_eq!(
+            ptx.matches("cvt.rn.f16.f32 %mma_h0, %proj_c").count(),
+            6,
+            "two f32→f16 conversion calls per projection × 3 projections"
+        );
+        // Packed SMEM stores replace the old raw-f32 stores.
+        assert!(ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c_pack0;"));
+        assert!(ptx.contains("st.shared.b32 [%ts_out_base + 4], %proj_c_pack1;"));
+        // Old per-accumulator raw-f32 store pattern must be gone.
+        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c0"));
+        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c1"));
+    }
+
+    #[test]
+    fn a24_rope_cos_sin_indexing_uses_per_row_per_d_addressing() {
+        // A.2.4 follow-up: cos/sin addresses now compute
+        // `cos_ptr + ((q_start + row) * head_dim + d) * 4` per pair,
+        // rather than sampling position 0 like the original scaffold.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        // Two sweeps (Q, K), each computes `(q_start + row) * head_dim`,
+        // adds `d`, shifts << 2, and adds to cos_ptr / sin_ptr.
+        assert_eq!(
+            ptx.matches("add.u64 %rope_row_u64, %rope_row_u64, %rd16;").count(),
+            2,
+            "q_start added once per sweep (Q + K)"
+        );
+        assert_eq!(
+            ptx.matches("shl.b64 %rope_cs_addr, %rope_cs_addr, 2;").count(),
+            2,
+            "* 4 bytes indexing shift per sweep"
+        );
+        assert_eq!(
+            ptx.matches("add.u64 %rope_row_u64, %rd12, %rope_cs_addr;").count(),
+            2,
+            "cos_ptr-relative addr computed per sweep"
+        );
+        assert_eq!(
+            ptx.matches("add.u64 %rope_row_u64, %rd13, %rope_cs_addr;").count(),
+            2,
+            "sin_ptr-relative addr computed per sweep"
+        );
+        // The old placeholder-load pattern (sampling %rd12 directly
+        // without offset computation) must no longer appear.
+        assert!(!ptx.contains("ld.global.f32 %rope_cos, [%rd12];"));
+        assert!(!ptx.contains("ld.global.f32 %rope_sin, [%rd13];"));
     }
 
     #[test]
