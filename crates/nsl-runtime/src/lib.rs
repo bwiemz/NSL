@@ -22,6 +22,18 @@ pub mod args;
 pub mod tensor;
 pub(crate) mod cpu;
 pub(crate) mod cuda;
+
+// Doc-hidden re-exports for cross-crate integration tests
+// (see crates/nsl-codegen/tests/csha_cuda_launch_*). Keeping the cuda
+// module pub(crate) otherwise avoids leaking the driver API.
+#[doc(hidden)]
+pub use cuda::{
+    nsl_cuda_init,
+    nsl_test_cuda_alloc, nsl_test_cuda_free,
+    nsl_test_cuda_h2d, nsl_test_cuda_d2h,
+    nsl_test_cuda_jit_log,
+};
+
 pub mod autodiff;
 pub mod checkpoint;
 pub mod inspect;
