@@ -3672,33 +3672,6 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
-                // CSHA: Compiler-Synthesized Holistic Attention planner.
-                // Runs the boundary-fusion scan, SMEM feasibility model,
-                // and weight-informed specialization.  Emits either the
-                // full paper-§6.3 report or a compact one-line summary
-                // gated by the `--csha` / `--csha-report` flags.  The
-                // planner is pure data-in/data-out; wiring the kernel
-                // decisions back into codegen is a follow-up step.
-                if let Some(ref mode_str) = self.compile_options.csha_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        if let Some(plan) = crate::csha::run_on_wengert(
-                            extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
-                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-                            None, // shape override — defaults are fine for diagnostic
-                            8,    // default head count; weight-informed path refines this
-                            None, // wggo_overrides — wired in Task 4
-                        ) {
-                            if self.compile_options.csha_report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[csha] {}", plan.summary());
-                            }
-                        }
-                    }
-                }
-
                 // Calibration harness MUST run before WGGO: WGGO Phase 2's
                 // gradient-scoring path reads `compile_options.calibration_sidecar`
                 // via `build_scorer`. If WGGO ran first, the sidecar would
@@ -3788,6 +3761,13 @@ impl Compiler<'_> {
                 // codegen is a future step; the planner itself is
                 // independently useful as a diagnostic and is exercised by
                 // the test suite and CLI integration tests.
+                //
+                // `wggo_applied` is declared here so it outlives the WGGO
+                // block and is visible to the CSHA block below.  When WGGO
+                // is disabled or absent it remains `None` and CSHA receives
+                // `None` — identical to pre-Task-5 behaviour.
+                let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
+
                 if let Some(ref mode_str) = self.compile_options.wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
@@ -3820,6 +3800,63 @@ impl Compiler<'_> {
                                 eprintln!("{}", plan.render_report());
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
+                            }
+                            // CAPTURE for downstream consumers (CSHA, future: WRGA, FASE, ...).
+                            wggo_applied = Some(plan.applied.clone());
+                        }
+                    }
+                }
+
+                // CSHA: Compiler-Synthesized Holistic Attention planner.
+                // Runs the boundary-fusion scan, SMEM feasibility model,
+                // and weight-informed specialization.  Emits either the
+                // full paper-§6.3 report or a compact one-line summary
+                // gated by the `--csha` / `--csha-report` flags.  The
+                // planner is pure data-in/data-out; wiring the kernel
+                // decisions back into codegen is a follow-up step.
+                //
+                // Pass order: Calibration → WGGO → CSHA.
+                // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
+                // so that per-layer fusion-level decisions from WGGO are
+                // honoured (or rejected with a diagnostic) by CSHA.
+                let wggo_overrides: Option<crate::wggo_overrides::WggoOverrides> = wggo_applied
+                    .as_ref()
+                    .map(crate::wggo_overrides::WggoOverrides::from_applied);
+
+                if let Some(ref mode_str) = self.compile_options.csha_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        if let Some(plan) = crate::csha::run_on_wengert(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
+                            None, // shape override — defaults are fine for diagnostic
+                            8,    // default head count; weight-informed path refines this
+                            wggo_overrides.as_ref(),
+                        ) {
+                            if self.compile_options.csha_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[csha] {}", plan.summary());
+                            }
+                            // Emit override-rejection diagnostics after the summary line
+                            // so CLI readers see summary first, per-layer details after.
+                            for diag in &plan.override_diagnostics {
+                                match diag.reason {
+                                    crate::csha::OverrideRejectReason::SmemBudgetExceeded {
+                                        actual_kb,
+                                        limit_kb,
+                                    } => {
+                                        eprintln!(
+                                            "[csha] layer:{} wggo-override-rejected requested={:?} applied={:?} reason=smem_{}kb_exceeds_{}kb",
+                                            diag.layer_index,
+                                            diag.requested,
+                                            diag.applied,
+                                            actual_kb,
+                                            limit_kb
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
