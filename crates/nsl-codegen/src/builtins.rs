@@ -249,6 +249,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
+    // FASE Deferred bias correction: 1/(1 - base^step).  Scalar, no tensor args.
+    (
+        "nsl_bias_correction_inv",
+        &[types::F64, types::I64],
+        Some(types::F64),
+    ),
     // Tensor matmul
     (
         "nsl_tensor_matmul",
