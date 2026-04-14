@@ -397,7 +397,19 @@ impl Compiler<'_> {
                 }
             }
 
-            if let StmtKind::ModelDef(md) = &stmt.kind {
+            // Resolve the ModelDef from either a plain ModelDef or a decorated one
+            // (e.g. `@quantize(dtype="awq4") model TinyMLP: ...`).  The `@quantize`
+            // branch above already recorded the QuantConfig; this branch registers the
+            // struct layout so the model constructor is reachable from main().
+            let model_def_opt: Option<&nsl_ast::decl::ModelDef> =
+                match &stmt.kind {
+                    StmtKind::ModelDef(md) => Some(md),
+                    StmtKind::Decorated { stmt: inner, .. } => {
+                        if let StmtKind::ModelDef(md) = &inner.kind { Some(md) } else { None }
+                    }
+                    _ => None,
+                };
+            if let Some(md) = model_def_opt {
                 let name = self.resolve_sym(md.name).to_string();
                 let mut fields = Vec::new();
                 let mut offset = 0usize;

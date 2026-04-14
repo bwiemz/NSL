@@ -57,15 +57,20 @@ impl Compiler<'_> {
             self.compile_struct_constructor(name, fields, *total_size)?;
         }
 
-        // Compile model constructors and methods
+        // Compile model constructors and methods.
+        // Also unwrap `@quantize`-decorated model definitions (Decorated { stmt: ModelDef }).
         let model_defs: Vec<_> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(md.clone())
-                } else {
-                    None
+            .filter_map(|s| match &s.kind {
+                StmtKind::ModelDef(md) => Some(md.clone()),
+                StmtKind::Decorated { stmt: inner, .. } => {
+                    if let StmtKind::ModelDef(md) = &inner.kind {
+                        Some(md.clone())
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             })
             .collect();
         for md in &model_defs {
@@ -431,14 +436,19 @@ impl Compiler<'_> {
     }
 
     fn compile_model_methods(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        // Also unwrap `@quantize`-decorated model definitions (Decorated { stmt: ModelDef }).
         let model_defs: Vec<_> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(md.clone())
-                } else {
-                    None
+            .filter_map(|s| match &s.kind {
+                StmtKind::ModelDef(md) => Some(md.clone()),
+                StmtKind::Decorated { stmt: inner, .. } => {
+                    if let StmtKind::ModelDef(md) = &inner.kind {
+                        Some(md.clone())
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             })
             .collect();
 

@@ -148,15 +148,20 @@ impl Compiler<'_> {
             }
         }
 
-        // Collect model names so we skip them in the struct constructor loop
+        // Collect model names so we skip them in the struct constructor loop.
+        // Also unwrap `@quantize`-decorated model definitions (Decorated { stmt: ModelDef }).
         let model_name_set: std::collections::HashSet<String> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(self.resolve_sym(md.name).to_string())
-                } else {
-                    None
+            .filter_map(|s| match &s.kind {
+                StmtKind::ModelDef(md) => Some(self.resolve_sym(md.name).to_string()),
+                StmtKind::Decorated { stmt: inner, .. } => {
+                    if let StmtKind::ModelDef(md) = &inner.kind {
+                        Some(self.resolve_sym(md.name).to_string())
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             })
             .collect();
 
@@ -186,15 +191,20 @@ impl Compiler<'_> {
             self.registry.functions.insert(sname, (func_id, sig));
         }
 
-        // Declare model constructors and methods
+        // Declare model constructors and methods.
+        // Also unwrap `@quantize`-decorated model definitions (Decorated { stmt: ModelDef }).
         let model_defs: Vec<_> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(md.clone())
-                } else {
-                    None
+            .filter_map(|s| match &s.kind {
+                StmtKind::ModelDef(md) => Some(md.clone()),
+                StmtKind::Decorated { stmt: inner, .. } => {
+                    if let StmtKind::ModelDef(md) = &inner.kind {
+                        Some(md.clone())
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             })
             .collect();
 
@@ -419,7 +429,15 @@ impl Compiler<'_> {
         let mut result = Vec::new();
 
         for stmt in stmts {
-            if let StmtKind::ModelDef(md) = &stmt.kind {
+            // Resolve ModelDef from either plain or @-decorated form.
+            let md_opt: Option<&nsl_ast::decl::ModelDef> = match &stmt.kind {
+                StmtKind::ModelDef(md) => Some(md),
+                StmtKind::Decorated { stmt: inner, .. } => {
+                    if let StmtKind::ModelDef(md) = &inner.kind { Some(md) } else { None }
+                }
+                _ => None,
+            };
+            if let Some(md) = md_opt {
                 let model_name = self.resolve_sym(md.name).to_string();
 
                 // Constructor signature: (params...) -> ptr

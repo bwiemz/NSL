@@ -1,19 +1,19 @@
-from nsl.nn.losses import mse_loss
-
-@quantize(dtype="awq4")
+@quantize(dtype="awq4", group_size=128)
 model TinyMLP:
     up_proj: Tensor = zeros([128, 64])
     down_proj: Tensor = zeros([64, 128])
 
     fn forward(self, x: Tensor) -> Tensor:
-        return x |> up_proj |> relu |> down_proj
+        let h = relu(x @ self.up_proj)
+        return h @ self.down_proj
 
-fn main():
-    let m = TinyMLP()
-    let x = zeros([1, 64])
-    let y = m.forward(x)
-    train(model = m, epochs = 1):
-        optimizer: SGD(lr = 0.01)
-        step(batch):
-            let pred = m.forward(x)
-            let loss = mse_loss(pred, y)
+let m = TinyMLP()
+let x = zeros([1, 64])
+let y = zeros([1, 64])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let diff = pred - y
+        let loss = mean(diff * diff)
