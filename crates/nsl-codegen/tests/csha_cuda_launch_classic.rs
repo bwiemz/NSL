@@ -6,39 +6,25 @@
 //! ## What this test proves
 //!
 //! * `nsl_flash_attention_csha` resolves through the cudarc FFI boundary
-//! * The PTX synthesized by `synthesize_flash_attention_ptx` loads on sm_120
-//!   after three driver-JIT adaptations (documented below)
+//! * The v2 PTX synthesized by `flash_attention_selector` loads on the GPU
+//!   natively — v2 emits `.target sm_75` / `.version 8.7` / ASCII-only, so
+//!   none of the driver-JIT workarounds required for the v1 emitter apply.
+//!   PTX targeting sm_75 is forward-compatible on sm_89 (RTX 5070 Ti) per
+//!   NVIDIA forward-compat rules.
 //! * cuLaunchKernel accepts the 30-arg CSHA launch list
 //! * The output buffer receives finite f16 values (kernel actually wrote)
+//! * Numerical output matches the CPU naive-attention reference within 5e-3
 //!
-//! ## Driver-JIT adaptations needed for sm_120
+//! ## Task context
 //!
-//! The emitter targets sm_90 / PTX ISA 8.0 and embeds em-dashes ("—") in
-//! some structural comments. The CUDA 13.2 Blackwell driver rejects this:
+//! This test pins `NSL_FA_EMITTER=v2` (Task 12). It uses `gpu_sm: 75` so the
+//! selector routes to the v2 scalar emitter (MMA path requires sm >= 80).
+//! Task 15 will flip the default; until then the env-var pin is the gate.
 //!
-//! 1. `.target sm_90` JITed onto sm_120 → `CUDA_ERROR_INVALID_PTX` (218)
-//!    even though sm_90 is forward-compatible in principle. Patched to
-//!    `.target sm_120` at test time.
-//! 2. `.version 8.0` + `.target sm_120` → "PTX .version 8.5 does not
-//!    support .target sm_120". Bumped to `.version 8.7`.
-//! 3. Non-ASCII em-dashes in comments → "Unexpected non-ASCII character".
-//!    Stripped to `-`.
+//! ## Numerical correctness (now gated)
 //!
-//! These are emitter-side issues that belong in `emit_ptx_header`; fixing
-//! them there would remove the post-processing block below. Tracked as a
-//! follow-up outside this test's scope.
-//!
-//! ## Numerical correctness (Part 2 — *not* gated by this test)
-//!
-//! Comparing the kernel output to a CPU naive-attention reference surfaces
-//! a pre-existing FA emitter defect: the output-store PTX uses a hard-coded
-//! stride of 128 (= `block_x` thread count) regardless of `head_dim`. For
-//! `head_dim == 128` the stride aligns with the row boundary; for other
-//! `head_dim` values, one thread's computed value is broadcast across 4–8
-//! query rows instead of each row receiving its own softmax(Q_i K^T) V.
-//! We log the divergence as diagnostic output but do *not* fail the test
-//! on it — that's a separate defect to track. A follow-up test exercises
-//! the fused CSHA path with non-NULL extras once this baseline is clean.
+//! v2 fixes the output-store stride defect present in v1. The max-abs
+//! tolerance is 5e-3 (f16 mantissa ≈ 10^-3 + online-softmax renorm jitter).
 //!
 //! ## Running
 //!
@@ -51,9 +37,10 @@
 
 #![cfg(feature = "cuda")]
 
-use nsl_codegen::flash_attention::{
-    flash_attention_kernel_name, shared_mem_bytes, synthesize_flash_attention_ptx,
-    FlashAttentionConfig, RopeStyle,
+use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
+use nsl_codegen::flash_attention_selector::{
+    flash_attention_kernel_name_selected, shared_mem_bytes_selected,
+    synthesize_flash_attention_ptx_selected, Emitter, select_emitter,
 };
 use std::ffi::{c_void, CString};
 
@@ -175,6 +162,10 @@ fn cuda_available() -> bool {
 #[test]
 #[ignore = "requires a live CUDA device; run with --ignored on a GPU box"]
 fn csha_ffi_classic_path_matches_cpu_reference() {
+    // Pin selector to v2. Until Task 15 flips the default, this is how
+    // Part 1 exercises the rewrite.
+    std::env::set_var("NSL_FA_EMITTER", "v2");
+
     if !cuda_available() { return; }
 
     // ── Problem geometry ──────────────────────────────────────────────
@@ -226,6 +217,8 @@ fn csha_ffi_classic_path_matches_cpu_reference() {
     // ── Kernel synthesis ──────────────────────────────────────────────
     // Classic-path config: no CSHA extras, no RoPE, no paging, no GQA.
     // block_q/kv = seq_len keeps the kernel to a single tile per dim.
+    // gpu_sm: 75 so the selector routes to v2 (MMA path requires sm >= 80).
+    // PTX targeting sm_75 is forward-compatible on newer GPUs per NVIDIA rules.
     let config = FlashAttentionConfig {
         block_q: seq_len as i64,
         block_kv: seq_len as i64,
@@ -236,40 +229,31 @@ fn csha_ffi_classic_path_matches_cpu_reference() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 120,
+        gpu_sm: 75,
         csha: None,
     };
-    let mut ptx = synthesize_flash_attention_ptx(&config);
-    // The emitter's sm tier table only knows sm_52/sm_80/sm_90 and falls
-    // back to sm_90 for anything newer. On Blackwell (sm_120) the driver
-    // JIT of sm_90 PTX returns CUDA_ERROR_INVALID_PTX on some CUDA 13.x
-    // builds. Force-upgrade the target line so cuModuleLoadData sees
-    // sm_120 directly — ptxas 13.2 accepts it end-to-end.
-    let src = String::from_utf8_lossy(&ptx).into_owned();
-    // TODO(csha-emitter): drop these substitutions once `emit_ptx_header`
-    // honours gpu_sm and emits ASCII-only comments. Each is a driver-JIT
-    // workaround, not a permanent test concern.
-    let src = src
-        .replacen(".version 8.0", ".version 8.7", 1)   // TODO(csha-emitter)
-        .replacen(".target sm_90", ".target sm_120", 1); // TODO(csha-emitter)
-    ptx = src.into_bytes();
-    // TODO(csha-emitter): replace em-dashes with '-' in the emitter's
-    // comment strings; ptxas 13.2 bundled with the driver rejects any byte
-    // ≥ 0x80 ("Unexpected non-ASCII character").
-    for b in ptx.iter_mut() {
-        if *b >= 0x80 { *b = b'-'; }
-    }
-    // TODO(csha-emitter): emit exactly one trailing newline + single NUL.
-    // `synthesize_flash_attention_ptx` currently places the NUL *before*
-    // the last newline, which cuModuleLoadData treats as premature EOF.
+
+    // Sanity: confirm the selector is routing to v2 after the set_var above.
+    assert_eq!(
+        select_emitter(&config),
+        Emitter::V2,
+        "selector must route to v2 after NSL_FA_EMITTER=v2 set — got v1, test would be meaningless"
+    );
+
+    // v2 emits clean sm_75 / .version 8.7 / ASCII-only natively — no
+    // TODO(csha-emitter) post-processing needed. The NUL/newline normalizer
+    // remains as a defensive no-op on correct v2 output.
+    let mut ptx = synthesize_flash_attention_ptx_selected(&config);
+    // Defensive: ensure exactly one trailing newline + single NUL
+    // (v2 emitter already does this, but keep as safety belt).
     while ptx.last() == Some(&0) { ptx.pop(); }
     if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
     let dump = std::env::temp_dir().join("csha_launch_classic.ptx");
     std::fs::write(&dump, &ptx).ok();
     eprintln!("PTX dumped to: {}", dump.display());
     ptx.push(0); // null-terminate for cuModuleLoadData
-    let kernel_name = CString::new(flash_attention_kernel_name(&config)).unwrap();
-    let smem = shared_mem_bytes(&config) as i64;
+    let kernel_name = CString::new(flash_attention_kernel_name_selected(&config)).unwrap();
+    let smem = shared_mem_bytes_selected(&config) as i64;
 
     // ── Launch ────────────────────────────────────────────────────────
     // All nine CSHA extras = 0 — the kernel's runtime null-checks skip the
@@ -358,12 +342,10 @@ fn csha_ffi_classic_path_matches_cpu_reference() {
     // f16 output has ~3 decimal digits of mantissa precision (2^-10 ≈ 1e-3).
     // Online-softmax renormalisation can add a few ulps on top; 5e-3 absorbs
     // both without making the test pass trivially.
-    // ── Plumbing assertions (the real gate) ───────────────────────────
+    // ── Plumbing assertions ───────────────────────────────────────────
     // Every output must be finite (no NaN/Inf leaking out of softmax or
     // the f16 store path) and non-trivially different from zero (proves
-    // the kernel actually wrote to the buffer). These are the invariants
-    // this test is designed to guarantee — the pure numerical match is
-    // a Part-2 concern blocked by the emitter's output-store stride defect.
+    // the kernel actually wrote to the buffer).
     let all_finite = out_host.iter().all(|x| x.is_finite());
     let nonzero_count = out_host.iter().filter(|x| x.abs() > 1e-6).count();
     assert!(all_finite, "kernel produced non-finite outputs");
@@ -371,23 +353,20 @@ fn csha_ffi_classic_path_matches_cpu_reference() {
         "kernel output looks empty: only {}/{} elements non-zero",
         nonzero_count, total);
 
-    // ── Numerical divergence (diagnostic only) ───────────────────────
-    // The pre-existing output-store defect broadcasts one thread's value
-    // across several query rows; CPU reference computes every row
-    // independently. Log but don't panic — Part 2 will gate this.
-    if max_abs > 5e-3 {
-        eprintln!(
-            "NUMERICAL DIVERGENCE (Part-2 concern, not gated here):\n\
-             max_abs={} at idx={} (gpu={}, cpu={})\n\
-             first 4 GPU:  {:?}\n\
-             first 4 CPU:  {:?}\n\
-             This is a pre-existing FA emitter defect (output-store stride \
-             hard-coded to 128; only correct when head_dim == 128).",
-            max_abs, max_idx, out_host[max_idx], ref_out[max_idx],
-            &out_host[..4.min(out_host.len())],
-            &ref_out[..4.min(ref_out.len())],
-        );
-    }
+    // ── Numerical gate (Part 1 — canonical config) ────────────────────
+    // v2 fixes the output-store stride defect present in v1. Assert that
+    // the max-abs deviation from the CPU naive-attention reference is
+    // within f16 + online-softmax tolerance.
+    // numerical gate on canonical config only; commit 13 extends to full matrix.
+    assert!(
+        max_abs <= 5e-3,
+        "v2 numerical gate FAILED: max_abs={} at idx={} (gpu={}, cpu={})\n\
+         first 4 GPU: {:?}\n\
+         first 4 CPU: {:?}",
+        max_abs, max_idx, out_host[max_idx], ref_out[max_idx],
+        &out_host[..4.min(out_host.len())],
+        &ref_out[..4.min(ref_out.len())],
+    );
 
     // Guard against unused-import on non-cuda builds (even though the file
     // is cfg-gated, keep c_void wired so the FFI signatures validate).

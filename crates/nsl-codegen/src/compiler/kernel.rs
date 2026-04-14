@@ -628,7 +628,7 @@ impl Compiler<'_> {
                 };
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
-                let shmem = crate::flash_attention::shared_mem_bytes(&test_config);
+                let shmem = crate::flash_attention_selector::shared_mem_bytes_selected(&test_config);
                 if shmem > 49152 {
                     return Err(CodegenError::new(format!(
                         "@autotune variant (block_q={}, block_kv={}) requires {}KB shared memory, exceeds 48KB limit for sm_52",
@@ -646,9 +646,9 @@ impl Compiler<'_> {
 
                 // Synthesize and embed PTX for this variant
                 let ptx_bytes =
-                    crate::flash_attention::synthesize_flash_attention_ptx(&test_config);
+                    crate::flash_attention_selector::synthesize_flash_attention_ptx_selected(&test_config);
                 let variant_kernel_name =
-                    crate::flash_attention::flash_attention_kernel_name(&test_config);
+                    crate::flash_attention_selector::flash_attention_kernel_name_selected(&test_config);
                 self.embed_flash_ptx(&variant_kernel_name, ptx_bytes)?;
             }
 
@@ -679,7 +679,7 @@ impl Compiler<'_> {
                 csha: None,
             };
 
-            let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected(&config);
 
             // The primary variant's PTX was already embedded in the loop above.
             // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
@@ -745,8 +745,8 @@ impl Compiler<'_> {
                 csha: None,
             };
 
-            let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);
-            let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+            let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected(&config);
+            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected(&config);
 
             // Embed PTX bytes in .rodata
             let ptx_data_id = self

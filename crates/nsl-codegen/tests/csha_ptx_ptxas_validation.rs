@@ -163,6 +163,57 @@ fn non_csha_ptx_assembles_on_sm120() {
     }
 }
 
+/// v2 scalar emitter: assemble a representative corner of the supported-config
+/// matrix through ptxas --gpu-name sm_75. Catches emission-level defects
+/// (undeclared registers, malformed operands, invalid labels, SMEM overflow)
+/// that snapshot tests cannot see. Skipped gracefully when ptxas isn't in PATH.
+#[test]
+#[ignore = "requires ptxas in PATH"]
+fn v2_kernel_assembles_on_sm75_full_matrix() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("skipping: ptxas not found"); return;
+    };
+    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+    use nsl_codegen::flash_attention_v2::smem_layout::validate_scalar_v2_config;
+
+    let base = FlashAttentionConfig {
+        block_q: 32, block_kv: 32, head_dim: 32,
+        causal: false, paged: false, rope_q: false,
+        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+        tree_mask: false, gpu_sm: 75, csha: None,
+    };
+
+    // Subset of the supported matrix that exercises the corners.
+    let matrix: &[(i64, i64, i64)] = &[
+        (4,   32,  32),
+        (32,  32,  32),
+        (64,  64,  128),
+        (16,  16,  64),
+        (128, 128, 128),
+    ];
+
+    let mut failures = Vec::new();
+    for &(bq, bkv, hd) in matrix {
+        let c = FlashAttentionConfig { block_q: bq, block_kv: bkv, head_dim: hd, ..base.clone() };
+        if validate_scalar_v2_config(&c).is_err() { continue; }
+        let ptx = synthesize_flash_attention_ptx_v2(&c);
+        // Drop trailing NUL for file write; ptxas wants text input.
+        let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
+        let dump = std::env::temp_dir()
+            .join(format!("v2_{}x{}x{}.ptx", bq, bkv, hd));
+        std::fs::write(&dump, &ptx[..text_end]).ok();
+        if let Err(stderr) = assemble_ptx(&ptxas, &ptx[..text_end], "sm_75") {
+            failures.push(format!(
+                "v2 PTX {}x{}x{} failed to assemble (dump: {}):\n{}",
+                bq, bkv, hd, dump.display(), stderr
+            ));
+        }
+    }
+    assert!(failures.is_empty(),
+        "v2 ptxas assembly failures:\n\n{}",
+        failures.join("\n---\n"));
+}
+
 /// The headline Tier A validation: the CSHA L2 + RoPE kernel variant
 /// (RMSNorm prologue + matmul projection with lane-coherent scatter +
 /// RoPE epilogue + active_heads guard) must assemble on sm_120. This

@@ -327,8 +327,8 @@ pub fn bridge(plan: &CshaPlan, shape_head_dim: i64) -> BridgeResult {
     for layer_plan in &plan.per_layer {
         let pat = plan.patterns.get(&layer_plan.layer);
         let cfg = build_flash_config(layer_plan, &plan.specialization, pat, shape_head_dim);
-        let kernel_name = crate::flash_attention::flash_attention_kernel_name(&cfg);
-        let smem = crate::flash_attention::shared_mem_bytes(&cfg);
+        let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected(&cfg);
+        let smem = crate::flash_attention_selector::shared_mem_bytes_selected(&cfg);
 
         out.kernels.push(KernelSpec {
             layer: layer_plan.layer.clone(),
