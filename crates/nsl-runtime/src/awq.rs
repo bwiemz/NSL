@@ -309,6 +309,106 @@ pub extern "C" fn nsl_awq_matmul(
     Box::into_raw(tensor) as i64
 }
 
+/// Apply AWQ calibration per-channel scaling to a weight tensor.
+///
+/// Used by the final-compile AWQ lowering pass when a calibration sidecar is
+/// present.  Multiplies each input-channel column of the weight matrix by
+/// `scale[col]^alpha`.  Returns a new NslTensor (f32, CPU, [k, n]) with the
+/// scaled values; the caller is responsible for freeing it.
+///
+/// Parameters:
+///   * `weight_ptr`  — pointer to an NslTensor of shape `[k, n]` (f32 or f64)
+///   * `scales_ptr`  — pointer to a C array of `scales_len` f32 scale values;
+///                     must have length == `n` (number of input channels)
+///   * `scales_len`  — number of elements in the scales array (must equal `n`)
+///   * `alpha`       — exponent applied to each scale (typically 0.5)
+///
+/// Returns 0 on error (null weight, shape mismatch).
+#[no_mangle]
+pub extern "C" fn nsl_awq_pre_scale_weight(
+    weight_ptr: i64,
+    scales_ptr: i64,
+    scales_len: i64,
+    alpha: f64,
+) -> i64 {
+    if weight_ptr == 0 {
+        eprintln!("nsl_awq_pre_scale_weight: null weight tensor");
+        return 0;
+    }
+    let t = unsafe { &*(weight_ptr as *const NslTensor) };
+    if t.ndim < 2 {
+        eprintln!("nsl_awq_pre_scale_weight: weight must be 2D (got {}D)", t.ndim);
+        return 0;
+    }
+
+    let k = unsafe { *t.shape } as usize;
+    let n = unsafe { *t.shape.add(1) } as usize;
+    let len = t.len as usize;
+
+    if scales_ptr == 0 || scales_len as usize != n {
+        // No scaling — clone the weight as-is.
+        let data: Vec<f32> = if t.dtype == 1 {
+            let raw = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
+            raw.to_vec()
+        } else {
+            let raw = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
+            raw.iter().map(|&v| v as f32).collect()
+        };
+        let shape_arr = [k as i64, n as i64];
+        return make_f32_tensor(&data, &shape_arr);
+    }
+
+    let scales_raw =
+        unsafe { std::slice::from_raw_parts(scales_ptr as *const f32, scales_len as usize) };
+
+    let data: Vec<f32> = if t.dtype == 1 {
+        let raw = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
+        raw.to_vec()
+    } else {
+        let raw = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
+        raw.iter().map(|&v| v as f32).collect()
+    };
+
+    let alpha_f32 = alpha as f32;
+    let mut scaled = Vec::with_capacity(len);
+    for row in 0..k {
+        for col in 0..n {
+            let s = scales_raw[col].powf(alpha_f32);
+            scaled.push(data[row * n + col] * s);
+        }
+    }
+
+    let shape_arr = [k as i64, n as i64];
+    make_f32_tensor(&scaled, &shape_arr)
+}
+
+/// Helper: allocate a new f32 NslTensor from `data` with the given `shape`.
+fn make_f32_tensor(data: &[f32], shape: &[i64]) -> i64 {
+    let ndim = shape.len() as i64;
+    let total = data.len();
+    let shape_ptr =
+        crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
+    for (i, &s) in shape.iter().enumerate() {
+        unsafe { *shape_ptr.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape_ptr, ndim);
+    let data_size = total * std::mem::size_of::<f32>();
+    let data_ptr = crate::memory::checked_alloc(data_size) as *mut f32;
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, total) };
+    let t = Box::new(NslTensor::new(
+        data_ptr as *mut std::ffi::c_void,
+        shape_ptr,
+        strides,
+        ndim,
+        total as i64,
+        0,  // device: CPU
+        1,  // dtype: f32
+        1,  // owns_data
+        0,  // data_owner
+    ));
+    Box::into_raw(t) as i64
+}
+
 /// Free an AWQ packed weight.
 #[no_mangle]
 pub extern "C" fn nsl_awq_free(packed_ptr: i64) {

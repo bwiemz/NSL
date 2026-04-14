@@ -6558,6 +6558,43 @@ impl Compiler<'_> {
             .iconst(cl_types::I64, layout.total_size.max(8) as i64);
         let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
 
+        // 4b. If this is an AWQ quant block and a calibration sidecar is present,
+        //     decode the AWQ activation scales once.  We'll use them per-field below.
+        //
+        //     Key: "awq_activation_scales" in sidecar.hooks (binary blob).
+        //     Projection path format: "{model_type_name}.{field_name}" — same
+        //     cache key as Task 8's discovery pass.
+        //
+        //     Hard error when sidecar present but projection missing:
+        //     silent fallback to uncalibrated is a correctness trap.
+        let is_awq = matches!(quant.default_dtype, Some(QuantDtype::Awq4));
+        let awq_scales_opt: Option<nsl_runtime::awq::AwqScales> = if is_awq {
+            match self.compile_options.calibration_sidecar.as_ref() {
+                None => None,
+                Some(sidecar) => {
+                    match sidecar.hooks.get("awq_activation_scales") {
+                        None => None, // Sidecar present but no AWQ hook blob → treat as uncalibrated.
+                        Some(blob) => {
+                            match nsl_runtime::awq::AwqScales::from_blob(blob) {
+                                Ok(scales) => Some(scales),
+                                Err(e) => {
+                                    // Blob present but malformed → hard error.
+                                    return Err(CodegenError::new(format!(
+                                        "AWQ calibration sidecar blob is malformed: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        // AWQ calibration alpha (matches awq_quantize_with_scales default).
+        let awq_alpha: f64 = 0.5;
+
         // 5. For each field: quantize→dequantize (or clone if excluded)
         for field in &layout.fields {
             let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
@@ -6575,17 +6612,103 @@ impl Compiler<'_> {
                     .ins()
                     .store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
             } else {
+                // For AWQ with a calibration sidecar, pre-scale the weight tensor using
+                // the per-input-channel activation statistics before quantizing.
+                // This embeds the scale data as compile-time constants in the object file
+                // and calls nsl_awq_pre_scale_weight at runtime to apply them.
+                let weight_for_quantize: Value = if is_awq {
+                    match awq_scales_opt.as_ref() {
+                        None => {
+                            // No sidecar → uncalibrated, pass weight through unchanged.
+                            src_val
+                        }
+                        Some(scales_map) => {
+                            // Sidecar present — projection MUST have scales.
+                            let projection_path =
+                                format!("{}.{}", model_type_name, field.name);
+                            let field_scales = scales_map
+                                .by_projection
+                                .get(&projection_path)
+                                .ok_or_else(|| {
+                                    CodegenError::missing_scales(&projection_path)
+                                })?;
+
+                            // Embed scale data as a compile-time constant in .rodata.
+                            let data_label = format!(
+                                "__nsl_awq_scales_{}_{}",
+                                model_type_name, field.name
+                            );
+                            let scale_bytes: Vec<u8> = field_scales
+                                .iter()
+                                .flat_map(|v: &f32| v.to_le_bytes())
+                                .collect();
+                            let scale_data_id = self
+                                .module
+                                .declare_data(
+                                    &data_label,
+                                    cranelift_module::Linkage::Local,
+                                    false,
+                                    false,
+                                )
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to declare AWQ scale data for \
+                                         '{projection_path}': {e}"
+                                    ))
+                                })?;
+                            let mut data_desc = cranelift_module::DataDescription::new();
+                            data_desc.define(scale_bytes.into_boxed_slice());
+                            self.module
+                                .define_data(scale_data_id, &data_desc)
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to define AWQ scale data for \
+                                         '{projection_path}': {e}"
+                                    ))
+                                })?;
+
+                            // Get a pointer to the scale data in this function.
+                            let scale_gv = self
+                                .module
+                                .declare_data_in_func(scale_data_id, builder.func);
+                            let scales_ptr =
+                                builder.ins().symbol_value(cl_types::I64, scale_gv);
+                            let scales_len = builder
+                                .ins()
+                                .iconst(cl_types::I64, field_scales.len() as i64);
+                            let alpha_v = builder.ins().f64const(awq_alpha);
+
+                            // Apply calibration scaling: returns a new NslTensor.
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_awq_pre_scale_weight",
+                                &[src_val, scales_ptr, scales_len, alpha_v],
+                            )?
+                        }
+                    }
+                } else {
+                    src_val
+                };
+
                 // Quantize then immediately dequantize — validates the roundtrip and
                 // shows quantization effects (precision loss) while storing a regular
                 // NslTensor that the original forward method can consume directly.
                 let qt = self.compile_call_by_name(
                     builder,
                     "nsl_qtensor_quantize",
-                    &[src_val, dtype_v, gran_v, axis_v, gs_v],
+                    &[weight_for_quantize, dtype_v, gran_v, axis_v, gs_v],
                 )?;
                 let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
                 // Release the intermediate QuantizedTensor (refcount-aware)
                 self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
+                // If we pre-scaled the weight, release the intermediate scaled tensor too.
+                if is_awq && awq_scales_opt.is_some() {
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_release",
+                        &[weight_for_quantize],
+                    )?;
+                }
                 builder
                     .ins()
                     .store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);

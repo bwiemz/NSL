@@ -1422,6 +1422,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     ("nsl_awq_free", &[types::I64], None),
+    // AWQ calibration sidecar: apply per-channel scales to weight tensor before quantizing.
+    // Signature: (weight_ptr, scales_ptr, scales_len, alpha) -> scaled_weight_ptr
+    (
+        "nsl_awq_pre_scale_weight",
+        &[types::I64, types::I64, types::I64, types::F64],
+        Some(types::I64),
+    ),
     // --- M35: GPTQ quantization ---
     (
         "nsl_gptq_quantize",
