@@ -79,6 +79,22 @@ impl WggoOverrides {
     pub fn find(&self, layer_index: u32) -> Option<&PerLayerOverride> {
         self.per_layer.iter().find(|o| o.layer_index == layer_index)
     }
+
+    /// Look up the override for the layer containing a given projection
+    /// name.  WRGA's `SpectralAnalysis.name` is per-projection (e.g.
+    /// `blocks.0.attn.wq`); WGGO's `layer_name` is per-layer (e.g. `blocks.0`).
+    /// All projections within a layer share its override.
+    ///
+    /// Match is **prefix + dot boundary**: `blocks.1` matches `blocks.1.attn.wq`
+    /// but NOT `blocks.10.attn.wq`.
+    pub fn find_by_layer_containing(&self, projection_name: &str) -> Option<&PerLayerOverride> {
+        self.per_layer.iter().find(|o| {
+            let ln = &o.layer_name;
+            projection_name == ln
+                || (projection_name.starts_with(ln.as_str())
+                    && projection_name[ln.len()..].starts_with('.'))
+        })
+    }
 }
 
 fn map_csha_level(raw: u8) -> Option<FusionLevel> {
@@ -172,5 +188,51 @@ mod tests {
         let _wrga_budget = OverrideRejectReason::BudgetExceededDowngraded {
             original_rank: 16, final_rank: 8,
         };
+    }
+
+    fn overrides_with_layers(layers: &[(&str, u32)]) -> WggoOverrides {
+        WggoOverrides {
+            per_layer: layers
+                .iter()
+                .enumerate()
+                .map(|(i, (name, rank))| PerLayerOverride {
+                    layer_index: i as u32,
+                    layer_name: name.to_string(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: *rank as u64,
+                    fase_fused: false,
+                    packing_mode: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn find_by_layer_containing_matches_projections_in_layer() {
+        let over = overrides_with_layers(&[("blocks.0", 8)]);
+        assert_eq!(over.find_by_layer_containing("blocks.0.attn.wq").unwrap().adapter_rank, 8);
+        assert_eq!(over.find_by_layer_containing("blocks.0.attn.wk").unwrap().adapter_rank, 8);
+        assert_eq!(over.find_by_layer_containing("blocks.0.mlp.fc1").unwrap().adapter_rank, 8);
+    }
+
+    #[test]
+    fn find_by_layer_containing_respects_dot_boundary() {
+        let over = overrides_with_layers(&[("blocks.1", 4)]);
+        assert!(over.find_by_layer_containing("blocks.10.attn.wq").is_none(),
+            "'blocks.1' must NOT match 'blocks.10.attn.wq' — dot boundary required");
+        assert_eq!(over.find_by_layer_containing("blocks.1.attn.wq").unwrap().adapter_rank, 4);
+    }
+
+    #[test]
+    fn find_by_layer_containing_matches_bare_layer_name() {
+        let over = overrides_with_layers(&[("blocks.2", 6)]);
+        assert_eq!(over.find_by_layer_containing("blocks.2").unwrap().adapter_rank, 6);
+    }
+
+    #[test]
+    fn find_by_layer_containing_returns_none_on_no_match() {
+        let over = overrides_with_layers(&[("blocks.0", 8)]);
+        assert!(over.find_by_layer_containing("blocks.99.attn.wq").is_none());
     }
 }
