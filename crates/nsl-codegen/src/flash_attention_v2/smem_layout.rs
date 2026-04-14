@@ -57,10 +57,15 @@ pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), Co
         )));
     }
 
-    let q_bytes  = (config.block_q  * config.head_dim * 2) as u32;
-    let kv_bytes = (config.block_kv * config.head_dim * 2) as u32;
-    let sp_bytes = 4 * (config.block_kv as u32) * 4;
-    let total    = q_bytes + kv_bytes + sp_bytes;
+    // Derive region sizes from the layout helpers so the validator and
+    // emitter stay in sync automatically if f16/f32 storage decisions
+    // ever shift.
+    let kv_start = kv_offset(config);
+    let sp_start = sp_offset(config);
+    let total    = total_bytes(config);
+    let q_bytes  = kv_start;              // Q region: [0, kv_start)
+    let kv_bytes = sp_start - kv_start;   // KV region: [kv_start, sp_start)
+    let sp_bytes = total - sp_start;      // SP region: [sp_start, total)
     if total > SMEM_BUDGET_BYTES {
         return Err(ConfigError(format!(
             "SMEM total {} bytes exceeds 48 KB budget (Q={} KV={} SP={})",

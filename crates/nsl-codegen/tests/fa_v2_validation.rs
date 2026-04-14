@@ -124,15 +124,23 @@ fn smem_total_under_48kb_for_all_supported() {
     }
 }
 
+/// Register budget sanity: all supported configs stay comfortably under
+/// the sm_75 hardware cap of 255.
+///
+/// The upper bound of 40 is a sanity ceiling, not a hardware limit — it
+/// absorbs the canonical head_dim=256 case (32 regs) plus the RoPE
+/// extras (+4, reaches 36) plus margin for future additions like
+/// backward-pass accumulators. When rope_q=true enters `supported_matrix`
+/// via the Task 14 soak configs, this test already accommodates it.
 #[test]
-fn register_budget_under_32_per_thread() {
+fn register_budget_under_sm75_cap() {
     for c in supported_matrix() {
         let n = count_registers(&c);
-        assert!(n <= 32,
-            "register budget {} exceeds 32 for {:?}",
+        assert!(n <= 40,
+            "register budget {} exceeds sanity ceiling of 40 for {:?}",
             n, (c.block_q, c.block_kv, c.head_dim));
         assert!(n <= SM75_REGISTER_CAP,
-            "register budget {} exceeds sm_75 cap for {:?}",
-            n, (c.block_q, c.block_kv, c.head_dim));
+            "register budget {} exceeds sm_75 hardware cap {} for {:?}",
+            n, SM75_REGISTER_CAP, (c.block_q, c.block_kv, c.head_dim));
     }
 }
