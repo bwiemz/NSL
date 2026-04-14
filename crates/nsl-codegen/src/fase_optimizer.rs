@@ -125,8 +125,8 @@ pub fn emit_final_step(recipe: &UpdateRecipe) -> UpdateProgram {
 /// mode the equivalent op is a plain gradient-buffer add instead.
 pub fn emit_accumulate(recipe: &UpdateRecipe) -> UpdateProgram {
     let ops = vec![UpdateOp::ScalarMulAdd {
-        dst: Register::M,
-        src: Register::M,
+        dst: Register::MPartial,
+        src: Register::MPartial,
         a: 1.0,
         b_src: Some(Register::G),
         b_scale: recipe.accum_scale,
@@ -143,7 +143,7 @@ pub fn emit_accumulate(recipe: &UpdateRecipe) -> UpdateProgram {
 pub fn emit_reset() -> UpdateProgram {
     UpdateProgram {
         optimizer: FaseOptimizer::Unknown,
-        ops: vec![UpdateOp::Zero(Register::M)],
+        ops: vec![UpdateOp::Zero(Register::MPartial)],
         pseudocode: "m_partial = 0".to_string(),
     }
 }
@@ -297,14 +297,7 @@ mod tests {
     fn accumulate_is_single_scalar_add() {
         let prog = emit_accumulate(&adamw_recipe());
         assert_eq!(prog.ops.len(), 1);
-        assert!(matches!(prog.ops[0], UpdateOp::ScalarMulAdd { .. }));
-    }
-
-    #[test]
-    fn reset_zeros_m() {
-        let prog = emit_reset();
-        assert_eq!(prog.ops.len(), 1);
-        assert_eq!(prog.ops[0], UpdateOp::Zero(Register::M));
+        assert!(matches!(prog.ops[0], UpdateOp::ScalarMulAdd { dst: Register::MPartial, src: Register::MPartial, .. }));
     }
 
     #[test]
@@ -366,5 +359,38 @@ mod tests {
         let m = Register::M;
         let mp = Register::MPartial;
         assert_ne!(m, mp);
+    }
+
+    #[test]
+    fn accumulate_targets_m_partial() {
+        let recipe = UpdateRecipe {
+            optimizer: FaseOptimizer::AdamW,
+            lr: 0.001,
+            beta1: 0.9,
+            one_minus_beta1: 0.1,
+            beta2: 0.999,
+            one_minus_beta2: 0.001,
+            eps: 1e-8,
+            weight_decay: 0.01,
+            accum_scale: 0.25, // 1/N for N=4
+            v_uses_approx: true,
+        };
+        let prog = emit_accumulate(&recipe);
+        // m_partial += 0.25 * g
+        let UpdateOp::ScalarMulAdd { dst, src, a, b_src, b_scale } = &prog.ops[0] else {
+            panic!("expected ScalarMulAdd, got {:?}", prog.ops[0]);
+        };
+        assert_eq!(*dst, Register::MPartial);
+        assert_eq!(*src, Register::MPartial);
+        assert_eq!(*a, 1.0);
+        assert_eq!(*b_src, Some(Register::G));
+        assert!((b_scale - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reset_zeroes_m_partial() {
+        let prog = emit_reset();
+        assert_eq!(prog.ops.len(), 1);
+        assert_eq!(prog.ops[0], UpdateOp::Zero(Register::MPartial));
     }
 }
