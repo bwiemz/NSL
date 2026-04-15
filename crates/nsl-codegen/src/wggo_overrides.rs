@@ -36,6 +36,14 @@ pub enum OverrideRejectReason {
     ShardFactorIncompatibleWithWorldSize { recommended: u32, world_size: u32 },
     /// Memory budget required more aggressive sharding than WGGO recommended.
     ShardFactorOverriddenByMemory { recommended: u32, applied: u32 },
+    // FASE:
+    /// WGGO requested Deferred mode on a layer whose global FASE plan is
+    /// FullBuffer because the optimizer does not support deferred accumulation
+    /// (Lion, Unknown, or AdamW/Adam with allow_v_approx=false).
+    FaseModeInfeasible {
+        optimizer: crate::fase::FaseOptimizer,
+        global_mode: crate::fase::FaseMode,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,6 +212,18 @@ mod tests {
         };
         assert_eq!(d.requested, "32");
         assert_eq!(d.applied, "16");
+    }
+
+    #[test]
+    fn fase_mode_infeasible_round_trips_debug() {
+        let r = OverrideRejectReason::FaseModeInfeasible {
+            optimizer: crate::fase::FaseOptimizer::Lion,
+            global_mode: crate::fase::FaseMode::FullBuffer,
+        };
+        let s = format!("{:?}", r);
+        assert!(s.contains("FaseModeInfeasible"));
+        assert!(s.contains("Lion"));
+        assert!(s.contains("FullBuffer"));
     }
 
     #[test]
