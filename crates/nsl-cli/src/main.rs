@@ -14,6 +14,13 @@ use clap::Parser as ClapParser;
 use nsl_errors::{Level, SourceMap};
 use nsl_lexer::Interner;
 
+/// Output format for `--training-report`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingReportFormat {
+    Text,
+    Json,
+}
+
 // The clap command enum carries many subcommand-specific flags, so keeping it
 // as a single enum is clearer than splitting every large variant into boxes.
 #[allow(clippy::large_enum_variant)]
@@ -100,6 +107,11 @@ enum Cli {
         /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
         #[arg(long)]
         fpga_device: Option<String>,
+
+        /// Emit a training-pipeline decision audit for every train block in the file.
+        /// Pass without value for text output, or `--training-report=json` for JSON.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
+        training_report: Option<TrainingReportFormat>,
     },
 
     /// Compile and execute an NSL program
@@ -616,6 +628,7 @@ fn main_inner() {
             do178c_report: _do178c_report,
             wcet_target: _wcet_target,
             fpga_device: _fpga_device,
+            training_report,
         } => {
             run_check(&file, dump_tokens, dump_ast, dump_types, linear_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
@@ -704,6 +717,31 @@ fn main_inner() {
                 } else {
                     eprintln!("error: --weight-analysis requires --weights <path>");
                     process::exit(1);
+                }
+            }
+
+            // FASE: Training-pipeline decision audit
+            if let Some(format) = training_report {
+                let source = std::fs::read_to_string(&file).unwrap_or_default();
+                let mut tr_interner = Interner::new();
+                let mut tr_source_map = SourceMap::new();
+                let tr_file_id = tr_source_map.add_file(file.display().to_string(), source.clone());
+                let (tr_tokens, _) = nsl_lexer::tokenize(&source, tr_file_id, &mut tr_interner);
+                let tr_parse = nsl_parser::parse(&tr_tokens, &mut tr_interner);
+                let report = nsl_codegen::training_report::build_report(
+                    &tr_parse.module,
+                    &tr_interner,
+                    file.as_path(),
+                );
+                match format {
+                    TrainingReportFormat::Text => {
+                        println!("{}", report);
+                    }
+                    TrainingReportFormat::Json => {
+                        let json = serde_json::to_string_pretty(&report)
+                            .expect("serialize training report");
+                        println!("{}", json);
+                    }
                 }
             }
         }
