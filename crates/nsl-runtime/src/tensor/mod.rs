@@ -2703,6 +2703,16 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     panic!("GPU-to-GPU transfer not yet supported");
 }
 
+/// Migrate `src` to match `ref_tensor`'s device. Returns a new refcounted tensor
+/// (either `src` with incremented refcount if devices already match, or a
+/// device-migrated copy). Used by FASE Deferred to reconcile CPU tape-AD
+/// gradients with GPU-resident m_partial buffers before in-place accumulation.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
+    let r = unsafe { &*(ref_ptr as *const NslTensor) };
+    nsl_tensor_to_device(src_ptr, r.device as i64)
+}
+
 /// Prefetch a unified-memory tensor to a GPU device asynchronously.
 /// This starts the page migration before the GPU actually accesses the data,
 /// reducing first-access latency from page faults. No-op on CPU tensors.

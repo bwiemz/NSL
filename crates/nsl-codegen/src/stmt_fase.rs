@@ -477,13 +477,22 @@ impl Compiler<'_> {
         grad_ptr: Value,
         accum_scale: f64,
     ) -> Result<(), crate::error::CodegenError> {
-        // Step 1: scaled_grad = grad * accum_scale  (owned new tensor)
+        // Step 0: migrate grad to m_partial's (device, dtype). Tape-AD produces
+        // CPU f64 gradients while m_partial is GPU f32 (it was allocated via
+        // zeros_like(param), inheriting the parameter's placement). Without
+        // this, `nsl_tensor_add_inplace` below hits a device/dtype mismatch
+        // (CPU f64 src into GPU f32 dst) and panics inside the runtime.
+        // `to_device_like` is a no-op (refcount++) when placements already match.
+        let grad_migrated =
+            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[grad_ptr, m_partial_ptr])?;
+
+        // Step 1: scaled_grad = grad_migrated * accum_scale  (owned new tensor)
         let scale_val = builder.ins().f64const(accum_scale);
-        // flags=0: do NOT relinquish `grad_ptr` — the caller owns it and will
-        // free it after this call returns.
-        let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+        // flags=1: relinquish `grad_migrated` — we own the refcount bump from
+        // to_device_like and mul_scalar can reuse the buffer when unique.
+        let flags_relinq = builder.ins().iconst(cl_types::I8, 1);
         let scaled_grad =
-            self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_ptr, scale_val, flags_zero])?;
+            self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_migrated, scale_val, flags_relinq])?;
 
         // Step 2: m_partial += scaled_grad  (in-place, void)
         self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[m_partial_ptr, scaled_grad])?;
