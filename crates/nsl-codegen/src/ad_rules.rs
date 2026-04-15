@@ -1,6 +1,83 @@
 //! M40: Reverse-mode AD rules — maps each primal operation to its adjoint computation.
 
+use crate::csha_apply::FusionMark;
+use crate::flash_attention_v2::smem_layout::{self, Direction};
 use crate::wengert::{PrimalOp, VarId, WengertOp};
+
+/// Tier C (T5.2): decision the reverse-walk dispatcher makes when it
+/// encounters a Wengert op that belongs to a CSHA-claimed chain.
+///
+/// The dispatcher's contract is: walk the Wengert list in reverse
+/// topological order; on the FIRST claimed op it sees (which must be
+/// the chain's output op per spec §5.4), decide how to handle the
+/// chain's entire backward pass. Subsequent claimed ops for the same
+/// chain are no-ops (the fused backward already emitted gradients for
+/// all of them in one kernel).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CshaDispatchDecision {
+    /// Emit the fused Tier C backward kernel for this mark. The caller
+    /// is expected to:
+    ///   1. Invoke `synthesize_backward(&mark.config)` + launch via
+    ///      `nsl_flash_attention_csha_backward`.
+    ///   2. Register the 7 output VarIds (dQ/dK/dV/dWq/dWk/dWv/dx) in
+    ///      the tape's gradient map.
+    /// After emission, `mark.backward_emitted` is set to true so the
+    /// same chain's other claimed ops return `AlreadyEmitted`.
+    EmitFused,
+    /// This claimed op belongs to a chain whose fused backward has
+    /// already been emitted earlier in the reverse walk. The
+    /// dispatcher does nothing — gradients are already in the tape.
+    AlreadyEmitted,
+    /// The config validator rejected this chain for the backward
+    /// direction (e.g. SMEM budget exceeded). Caller must fall back to
+    /// per-op adjoint rules (`apply_ad_rule` for each individual op).
+    /// The diagnostic string is propagated so the user sees WHY the
+    /// fused path was rejected.
+    Fallback { diagnostic: String },
+}
+
+/// Dispatch decision for a single reverse-walk encounter of a claimed
+/// op. See `CshaDispatchDecision` for the contract.
+///
+/// `op_idx` is the Wengert op index currently being processed. It is
+/// NOT used to select the mark (the caller supplies the matching mark
+/// already) but is kept in the signature so a future orchestrator can
+/// verify the spec §5.4 reverse-walk invariant via debug_assert — i.e.
+/// the FIRST claimed op the walk hits must be the chain's output op.
+pub fn csha_dispatch_for_op(mark: &FusionMark, op_idx: u32) -> CshaDispatchDecision {
+    let _ = op_idx; // reserved for spec §5.4 reverse-walk invariant check
+
+    if mark.backward_emitted.get() {
+        return CshaDispatchDecision::AlreadyEmitted;
+    }
+
+    // The mark must carry a config — Tier C dispatchers need the full
+    // FlashAttentionConfig to run the backward-direction validator.
+    // Without it we can't safely emit the fused path; fall back.
+    let Some(cfg) = mark.config.as_ref() else {
+        return CshaDispatchDecision::Fallback {
+            diagnostic: format!(
+                "CSHA fused backward unavailable for layer {}: \
+                 mark carries no FlashAttentionConfig (pre-Tier-C plan)",
+                mark.layer
+            ),
+        };
+    };
+
+    match smem_layout::validate_scalar_v2_config(cfg, Direction::Backward) {
+        Ok(()) => {
+            mark.backward_emitted.set(true);
+            CshaDispatchDecision::EmitFused
+        }
+        Err(e) => CshaDispatchDecision::Fallback {
+            diagnostic: format!(
+                "CSHA fused backward rejected for layer {}: {e}; \
+                 falling back to per-op adjoints",
+                mark.layer
+            ),
+        },
+    }
+}
 
 /// Primitive and compound backward operations used in adjoint expressions.
 #[derive(Debug, Clone, PartialEq)]
@@ -1308,6 +1385,120 @@ mod tests {
         assert_eq!(adj.len(), 1);
         assert_eq!(adj[0].input_var, 0);
         assert!(matches!(adj[0].expr, AdjointExpr::ReshapeLike(100, 0)));
+    }
+
+    // ── T5.2 CSHA fused-backward dispatcher tests ─────────────────────────
+
+    fn mark_with_cfg(cfg: Option<crate::flash_attention::FlashAttentionConfig>) -> FusionMark {
+        FusionMark {
+            layer: "blocks.0".into(),
+            kind: Some(crate::csha_boundary::ProjKind::Q),
+            param_name: "blocks.0.attn.wq".into(),
+            role: crate::csha_apply::MarkRole::NormPrologue,
+            config: cfg,
+            backward_emitted: std::cell::Cell::new(false),
+        }
+    }
+
+    fn base_cfg_fused_backward(
+        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+    ) -> crate::flash_attention::FlashAttentionConfig {
+        let _ = heads;
+        crate::flash_attention::FlashAttentionConfig {
+            block_q, block_kv, head_dim,
+            causal: false, paged: false, rope_q: false,
+            rope_style: crate::flash_attention::RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            csha: Some(crate::flash_attention::CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model,
+                ..crate::flash_attention::CshaExtras::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn ad_dispatcher_emits_fused_backward_on_claimed_chain_output_op() {
+        let mark = mark_with_cfg(Some(base_cfg_fused_backward(32, 32, 32, 4, 32)));
+        // First encounter (topological output op): EmitFused + flag flips.
+        match csha_dispatch_for_op(&mark, /*op_idx=*/ 99) {
+            CshaDispatchDecision::EmitFused => {}
+            other => panic!("expected EmitFused, got {other:?}"),
+        }
+        assert!(
+            mark.backward_emitted.get(),
+            "backward_emitted flag must be set after EmitFused"
+        );
+        // Second encounter (same chain, different claimed op): no-op.
+        match csha_dispatch_for_op(&mark, /*op_idx=*/ 98) {
+            CshaDispatchDecision::AlreadyEmitted => {}
+            other => panic!("expected AlreadyEmitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ad_dispatcher_falls_back_on_validator_reject_with_diagnostic() {
+        // (64,64,64,8,64) exceeds the backward SMEM budget (T2.1 test).
+        let mark = mark_with_cfg(Some(base_cfg_fused_backward(64, 64, 64, 8, 64)));
+        match csha_dispatch_for_op(&mark, 99) {
+            CshaDispatchDecision::Fallback { diagnostic } => {
+                assert!(
+                    diagnostic.contains("CSHA fused backward rejected"),
+                    "diagnostic missing rejection prefix: {diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains("Backward"),
+                    "diagnostic must name direction: {diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains("blocks.0"),
+                    "diagnostic must name the layer: {diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains("bytes >"),
+                    "diagnostic must surface T2.1 byte-comparison: {diagnostic}"
+                );
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
+        // Validator rejected — backward_emitted MUST NOT be flipped so
+        // the fallback per-op dispatch path still fires on all
+        // constituent ops.
+        assert!(
+            !mark.backward_emitted.get(),
+            "validator-reject must leave backward_emitted=false"
+        );
+    }
+
+    #[test]
+    fn ad_dispatcher_falls_back_when_mark_has_no_config() {
+        // Pre-Tier-C plans create FusionMark with config=None. Dispatcher
+        // must recognise this and fall back cleanly instead of panicking.
+        let mark = mark_with_cfg(None);
+        match csha_dispatch_for_op(&mark, 99) {
+            CshaDispatchDecision::Fallback { diagnostic } => {
+                assert!(
+                    diagnostic.contains("no FlashAttentionConfig"),
+                    "diagnostic must explain missing-config: {diagnostic}"
+                );
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ad_dispatcher_is_idempotent_under_repeated_calls() {
+        let mark = mark_with_cfg(Some(base_cfg_fused_backward(32, 32, 32, 4, 32)));
+        let first = csha_dispatch_for_op(&mark, 99);
+        assert!(matches!(first, CshaDispatchDecision::EmitFused));
+        for _ in 0..10 {
+            let d = csha_dispatch_for_op(&mark, 99);
+            assert!(
+                matches!(d, CshaDispatchDecision::AlreadyEmitted),
+                "repeated dispatch must be idempotent, got {d:?}"
+            );
+        }
     }
 
     #[test]
