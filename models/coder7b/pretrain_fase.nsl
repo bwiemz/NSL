@@ -1,0 +1,56 @@
+# models/coder7b/pretrain_fase.nsl
+#
+# FASE demo at 7B-parameter scale.
+#
+# Memory budget (f32): params ~28.7 GB + AdamW state ~57.4 GB +
+# FASE grad peak ~0.8 GB = ~87 GB. Will OOM on <80 GB VRAM.
+#
+# What you CAN do on smaller hardware:
+#   # See the planner's FASE decision without running the model:
+#   nsl check --training-report models/coder7b/pretrain_fase.nsl
+#
+#   # Compare against coder500m's training report to confirm the
+#   # FASE plan scales (same backward_phases shape, just wider tensors).
+#
+# What you need for execution:
+#   - ≥80 GB VRAM (H100, A100 80GB), or
+#   - CPU-offload of AdamW state (roadmap item M36 memory planner), or
+#   - fp16/bf16 cut to ~44 GB, or
+#   - shrink n_layers / d_ff / vocab.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+print("NSL-Coder-7B FASE pretraining demo")
+print("Config: d_model=4096, n_layers=32, ~7.2B params, f32")
+
+let m = NSLCoder()
+m.to(cuda)
+print("Model on GPU")
+
+# Synthetic tokens — 10 optimizer steps × grad_accum=8 × batch=1 × seq=2048
+#   = 163840 tokens worth of micro-batches.  Round up to 262144 for a
+#   clean power-of-2 shape.
+let tokens = full([262144], 1.0)
+let loader = DataLoader(tokens, batch_size=1, seq_len=2048, shuffle=false, drop_last=true)
+
+print("Starting FASE-gated training...")
+print("  grad_accumulation=8 → FASE Deferred mode activates")
+print("  grad_clip=1.0       → two-phase clip path activates")
+print("")
+
+train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("")
+print("FASE pretraining demo complete.")

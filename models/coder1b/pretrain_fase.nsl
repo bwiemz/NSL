@@ -1,0 +1,55 @@
+# models/coder1b/pretrain_fase.nsl
+#
+# FASE demo at 1B-parameter scale.
+#
+# This is the scale where FASE Deferred is load-bearing: tape AD's all-
+# gradients-simultaneously peak pushes past 16 GB VRAM and OOMs, while
+# source-AD's consume-per-param hook keeps peak under 14 GB.
+#
+# How to run (from repo root):
+#
+#   # Tape AD (expected: OOM on 16 GB VRAM):
+#   nsl run --profile-memory models/coder1b/pretrain_fase.nsl
+#
+#   # Source AD (FASE Deferred fires, peak stays under 14 GB):
+#   nsl run --source-ad --profile-memory models/coder1b/pretrain_fase.nsl
+#
+# Measure peak VRAM via nvidia-smi in a separate terminal, or via
+# `nsl run --profile-memory` which writes memory_profile.json on exit.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+print("NSL-Coder-1B FASE pretraining demo")
+print("Config: d_model=2048, n_layers=16, ~1.07B params, f32")
+
+let m = NSLCoder()
+m.to(cuda)
+print("Model on GPU")
+
+# Synthetic tokens — 10 optimizer steps × grad_accum=8 × batch=2 × seq=512
+#   = 81920 tokens worth of micro-batches.  Round up to 131072 for a
+#   clean power-of-2 shape.
+let tokens = full([131072], 1.0)
+let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+
+print("Starting FASE-gated training...")
+print("  grad_accumulation=8 → FASE Deferred mode activates")
+print("  grad_clip=1.0       → two-phase clip path activates")
+print("")
+
+train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("")
+print("FASE pretraining demo complete.")
