@@ -6,3 +6,4 @@
 //! T3.2..T3.8 as Phase 3 progresses.
 pub mod prelude;
 pub mod q_load;
+pub mod ds_compute;

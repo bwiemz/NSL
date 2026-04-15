@@ -74,6 +74,16 @@ fn synth_prelude_q_load_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     ptx.into_bytes()
 }
 
+fn synth_prelude_qload_ds_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
+    let mut ptx = String::new();
+    backward::prelude::emit(&mut ptx, config);
+    backward::q_load::emit(&mut ptx, config, 0);
+    backward::ds_compute::emit(&mut ptx, config, 0);
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+    ptx.into_bytes()
+}
+
 #[test]
 fn backward_prelude_ptxas_clean_sm75_sm90_sm120() {
     let Some(ptxas) = find_ptxas() else {
@@ -153,4 +163,44 @@ fn backward_prelude_plus_q_load_ptxas_clean_sm75_sm90_sm120() {
         "backward prelude+q_load ptxas failures:\n{}",
         failures.join("\n---\n")
     );
+}
+
+#[test]
+fn backward_prelude_qload_ds_compute_ptxas_clean_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("skipping: ptxas not found");
+        return;
+    };
+    for (causal, tag) in [(false, "nocausal"), (true, "causal")] {
+        let base = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model: 32,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut failures = Vec::new();
+        for sm in &["sm_75", "sm_90", "sm_120"] {
+            let mut c = base.clone();
+            c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+            let ptx = synth_prelude_qload_ds_with_ret(&c);
+            let dump = std::env::temp_dir()
+                .join(format!("bwd_prelude_qload_ds_{tag}_{sm}.ptx"));
+            std::fs::write(&dump, &ptx).ok();
+            if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
+                failures.push(format!("tag={tag} sm={sm} dump={} ptxas:\n{err}",
+                    dump.display()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "backward prelude+qload+ds ({tag}) ptxas failures:\n{}",
+            failures.join("\n---\n")
+        );
+    }
 }
