@@ -154,6 +154,8 @@ mod tests {
                 fase_fused: true,
                 packing_mode: 1,
                 estimated_us: 42.0,
+                param_bytes: 0,
+                activation_bytes: 0,
             }],
             total_us: 42.0,
             peak_memory_bytes: 0,

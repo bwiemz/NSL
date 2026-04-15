@@ -490,6 +490,17 @@ pub struct CompileOptions {
     pub csha_mode: Option<String>,
     /// CSHA: print the attention-fusion report.
     pub csha_report: bool,
+    /// CPDT: planner mode (Off/ZeroOnly/Full).
+    pub cpdt_mode: crate::cpdt::CpdtMode,
+    /// CPDT: cluster topology.  Required when `cpdt_mode != Off`.
+    pub cpdt_cluster: Option<crate::cpdt_zero::ClusterSpec>,
+    /// CPDT: whether `--cpdt-report` was requested (stdout full plan).
+    pub cpdt_report_requested: bool,
+    /// CPDT: shared output slot the CLI reads after compile returns.
+    /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
+    /// can render it without extending every entry-point return type.
+    pub cpdt_plan_out:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
     /// Path to calibration dataset.
     pub calibration_data: Option<std::path::PathBuf>,
     /// Failure-handling mode: `"required"` or `"best-effort"`.
@@ -569,6 +580,10 @@ impl Default for CompileOptions {
             wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
+            cpdt_mode: crate::cpdt::CpdtMode::Off,
+            cpdt_cluster: None,
+            cpdt_report_requested: false,
+            cpdt_plan_out: None,
             calibration_data: None,
             calibration_mode: Some("required".to_string()),
             calibration_samples: 512,

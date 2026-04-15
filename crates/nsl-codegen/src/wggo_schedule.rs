@@ -257,6 +257,8 @@ mod tests {
                     shard_optim: 1,
                     estimated_us: 10.0,
                     estimated_bytes: 1_000_000,
+                    param_bytes: 0,
+                    activation_bytes: 0,
                 })
                 .collect(),
             total_us: 30.0,

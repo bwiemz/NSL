@@ -10,6 +10,10 @@
 
 use serde::Serialize;
 
+/// AdamW optimizer-state multiplier for FP32 params: m-buffer (fp32) +
+/// v-buffer (fp32) = 2 × 4 bytes = 8 × param-fp32 bytes.
+pub const ADAMW_FP32_OPTIM_MULTIPLIER: f64 = 8.0;
+
 /// Cluster / interconnect description.
 #[derive(Debug, Clone)]
 pub struct ClusterSpec {
@@ -64,6 +68,19 @@ impl ModelSize {
     }
     pub fn n_layers(&self) -> usize {
         self.per_layer_param_bytes.len()
+    }
+
+    /// Build a `ModelSize` from an `AppliedPlan`. Sums per-layer bytes
+    /// directly from `AppliedLayer.param_bytes` / `activation_bytes` and
+    /// uses `estimated_us` as the compute-time proxy. `optim_state_multiplier`
+    /// defaults to 8.0 (AdamW m+v state = 2 × 4 bytes = 8 × param-fp32).
+    pub fn from_applied_plan(plan: &crate::wggo_apply::AppliedPlan) -> Self {
+        Self {
+            per_layer_param_bytes: plan.layers.iter().map(|l| l.param_bytes).collect(),
+            per_layer_activation_bytes: plan.layers.iter().map(|l| l.activation_bytes).collect(),
+            per_layer_compute_us: plan.layers.iter().map(|l| l.estimated_us).collect(),
+            optim_state_multiplier: ADAMW_FP32_OPTIM_MULTIPLIER,
+        }
     }
 }
 
@@ -311,6 +328,61 @@ mod tests {
             optim_state_multiplier: 8.0, // AdamW FP32 m+v
             per_layer_compute_us: vec![10.0; 8],
         }
+    }
+
+    #[test]
+    fn model_size_from_applied_plan_sums_per_layer_bytes() {
+        use crate::wggo_apply::{AppliedLayer, AppliedPlan};
+        use crate::wggo_dp::LayerDecision as CoarseDecision;
+
+        let plan = AppliedPlan {
+            layers: vec![
+                AppliedLayer {
+                    layer_index: 0,
+                    layer_name: "blocks.0".into(),
+                    coarse: CoarseDecision::KeepFull,
+                    pipeline_stage: 0,
+                    shard_factor: 1,
+                    active_heads: 8,
+                    ffn_width: 4096,
+                    csha_level: 0,
+                    adapter_rank: 0,
+                    optim_m_bits: 32,
+                    optim_v_bits: 32,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    estimated_us: 12.5,
+                    param_bytes: 6_000_000,
+                    activation_bytes: 2_000_000,
+                },
+                AppliedLayer {
+                    layer_index: 1,
+                    layer_name: "blocks.1".into(),
+                    coarse: CoarseDecision::KeepFull,
+                    pipeline_stage: 0,
+                    shard_factor: 1,
+                    active_heads: 8,
+                    ffn_width: 4096,
+                    csha_level: 0,
+                    adapter_rank: 0,
+                    optim_m_bits: 32,
+                    optim_v_bits: 32,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    estimated_us: 14.0,
+                    param_bytes: 8_000_000,
+                    activation_bytes: 3_000_000,
+                },
+            ],
+            total_us: 26.5,
+            peak_memory_bytes: 0,
+        };
+
+        let ms = ModelSize::from_applied_plan(&plan);
+        assert_eq!(ms.per_layer_param_bytes, vec![6_000_000, 8_000_000]);
+        assert_eq!(ms.per_layer_activation_bytes, vec![2_000_000, 3_000_000]);
+        assert_eq!(ms.per_layer_compute_us, vec![12.5, 14.0]);
+        assert!((ms.optim_state_multiplier - 8.0).abs() < 1e-9);
     }
 
     #[test]

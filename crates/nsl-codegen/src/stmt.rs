@@ -39,6 +39,63 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
 ///
 /// When a plan is produced, it is stashed on `compiler.last_wrga_plan` for
 /// later observability (`nsl check --wrga-report`).
+/// CPDT driver bridge — mirrors `invoke_wrga_if_enabled`. Builds a `CpdtInput`
+/// from the WGGO `AppliedPlan`, the optional `@train` block (for AdamW hyper-
+/// parameters), and the cluster topology stashed on the Compiler, then stores
+/// the resulting plan on `compiler.cpdt_plan`.
+///
+/// No-op when `compiler.cpdt_mode == CpdtMode::Off` or when no cluster is
+/// configured.
+pub(crate) fn invoke_cpdt_if_enabled(
+    compiler: &mut crate::compiler::Compiler,
+    applied_plan: &crate::wggo_apply::AppliedPlan,
+    train_block: Option<&nsl_ast::block::TrainBlock>,
+) {
+    use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
+    use crate::cpdt_expert::ExpertConfig;
+    use crate::cpdt_joint::JointConfig;
+    use crate::cpdt_precision::PrecisionConfig;
+    use crate::cpdt_zero::ModelSize;
+    use crate::wggo_overrides::WggoOverrides;
+
+    if compiler.cpdt_mode == CpdtMode::Off {
+        return;
+    }
+    let Some(cluster) = compiler.cpdt_cluster.clone() else {
+        return;
+    };
+
+    let overrides = WggoOverrides::from_applied(applied_plan);
+    let model = ModelSize::from_applied_plan(applied_plan);
+    let adamw = adamw_from_train_block(train_block, compiler.interner);
+
+    let input = CpdtInput {
+        mode: compiler.cpdt_mode,
+        model,
+        cluster,
+        weights: None,
+        precision_cfg: PrecisionConfig::default(),
+        adamw,
+        moe_shape: None,
+        moe_router: None,
+        moe_roofline_slack: 0.0,
+        expert_cfg: ExpertConfig::default(),
+        joint_cfg: JointConfig::default(),
+        wggo_recommended_shard: overrides.min_shard_factor(),
+    };
+
+    let plan = cpdt_run(input);
+    // Publish to the CLI-owned output slot (if any) so `nsl build` can
+    // render the plan after compile returns without threading it through
+    // every entry-point's return tuple.
+    if let Some(slot) = compiler.compile_options.cpdt_plan_out.as_ref() {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(plan.clone());
+        }
+    }
+    compiler.cpdt_plan = Some(plan);
+}
+
 pub(crate) fn invoke_wrga_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
@@ -3786,6 +3843,7 @@ impl Compiler<'_> {
                 // independently useful as a diagnostic and is exercised by
                 // the test suite and CLI integration tests.
                 //
+                let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
                 if let Some(ref mode_str) = self.compile_options.wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
@@ -3823,6 +3881,7 @@ impl Compiler<'_> {
                             self.wggo_overrides = Some(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
                             );
+                            wggo_applied = Some(plan.applied);
                         }
                     }
                 }
@@ -3939,6 +3998,17 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // CPDT pipeline planner — runs immediately after WRGA so the
+                // AppliedPlan produced by WGGO (if any) flows through as the
+                // ModelSize source + wggo_recommended_shard. No-op when
+                // `cpdt_mode == Off` or no cluster topology was configured.
+                // NOTE: CPDT runs only when WGGO produced a plan. If `--cpdt` is enabled
+                // without `--wggo`, `cpdt_plan` remains `None` and no diagnostics fire.
+                // The CLI post-compile layer should warn when `cpdt_mode != Off` but
+                // `cpdt_plan.is_none()` to surface this silent-skip case.
+                if let Some(ref applied) = wggo_applied {
+                    crate::stmt::invoke_cpdt_if_enabled(self, applied, Some(train));
+                }
                 // Task 6: render any override-rejected diagnostics to stderr so
                 // the Phase 3 decision explainer and the user can see which
                 // WGGO-requested ranks were adjusted.  Format matches the CSHA
@@ -7651,10 +7721,87 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == pb.len()
 }
 
+/// Derive [`crate::cpdt_optim::AdamWHyperparams`] from a `@train` block's
+/// optimizer section.
+///
+/// Returns library defaults when:
+/// - `train` is `None`
+/// - the optimizer section is missing
+/// - the optimizer is not `AdamW` (case-insensitive, matches the FASE
+///   optimizer-name lookup at the top of `compile_train_block`)
+/// - the optimizer expression is not a direct call
+///
+/// For β1, β2, ε: any field present as a `FloatLiteral` keyword arg overrides
+/// the default; missing or non-literal values retain the default. `lr` and
+/// `weight_decay` are intentionally NOT read here — CPDT's hyperparams cover
+/// only the running-moment constants. Unknown kwargs are silently ignored for
+/// forward compatibility.
+///
+/// Takes the `Interner` directly so this helper stays free-standing (callable
+/// from `invoke_cpdt_if_enabled` via `&compiler.interner`) and is
+/// straightforward to unit-test with a local `Interner`. Missing symbols
+/// resolve to `"<unknown>"` to mirror `Compiler::resolve_sym`.
+pub(crate) fn adamw_from_train_block(
+    train: Option<&nsl_ast::block::TrainBlock>,
+    interner: &nsl_lexer::Interner,
+) -> crate::cpdt_optim::AdamWHyperparams {
+    let mut hp = crate::cpdt_optim::AdamWHyperparams::default();
+
+    let Some(train) = train else {
+        return hp;
+    };
+
+    // Find the Optimizer section (there should be at most one meaningful one).
+    let opt_expr = train.sections.iter().find_map(|s| match s {
+        TrainSection::Optimizer(e) => Some(e),
+        _ => None,
+    });
+    let Some(opt_expr) = opt_expr else {
+        return hp;
+    };
+
+    // Pattern-match Call { callee=Ident("AdamW"), args }.
+    let ExprKind::Call { callee, args } = &opt_expr.kind else {
+        return hp;
+    };
+    let ExprKind::Ident(name_sym) = &callee.kind else {
+        return hp;
+    };
+    // Mirror the FASE site: lowercase compare ("AdamW" → "adamw").
+    if interner
+        .resolve(name_sym.0)
+        .unwrap_or("<unknown>")
+        .to_lowercase()
+        != "adamw"
+    {
+        return hp;
+    }
+
+    for arg in args {
+        let Some(name_sym) = arg.name else { continue };
+        let kw = interner.resolve(name_sym.0).unwrap_or("<unknown>");
+        // Accept FloatLiteral; also tolerate IntLiteral for eps (e.g. eps=0).
+        let val = match &arg.value.kind {
+            ExprKind::FloatLiteral(f) => *f,
+            ExprKind::IntLiteral(n) => *n as f64,
+            _ => continue,
+        };
+        match kw {
+            "beta1" => hp.beta1 = val,
+            "beta2" => hp.beta2 = val,
+            "eps" => hp.eps = val,
+            _ => {} // unknown kwargs silently ignored
+        }
+    }
+
+    hp
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_source_ad_param_name, is_trainable_param_leaf_name, SourceAdParamDiagnosticKind,
+        adamw_from_train_block, classify_source_ad_param_name, is_trainable_param_leaf_name,
+        SourceAdParamDiagnosticKind,
     };
     use std::collections::HashSet;
 
@@ -7690,5 +7837,96 @@ mod tests {
             classify_source_ad_param_name("m.blocks.0.attn_norm.eps", &tensor_paths),
             SourceAdParamDiagnosticKind::IgnoredNonTensor,
         );
+    }
+
+    // ── Task 2: adamw_from_train_block helper ───────────────────────────
+    //
+    // Build small TrainBlock fixtures directly (simpler than running the
+    // parser + semantic passes just to get AST shape we control).
+    use nsl_ast::block::{TrainBlock, TrainSection};
+    use nsl_ast::expr::{Arg, Expr, ExprKind};
+    use nsl_ast::{NodeId, Span, Symbol};
+    use nsl_lexer::Interner;
+
+    fn mk_expr(kind: ExprKind) -> Expr {
+        Expr {
+            kind,
+            span: Span::dummy(),
+            id: NodeId::next(),
+        }
+    }
+
+    fn mk_arg(name: Option<Symbol>, value: Expr) -> Arg {
+        Arg {
+            name,
+            value,
+            span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn adamw_hyperparams_default_when_no_train_block() {
+        let interner: Interner = Interner::new();
+        let hp = adamw_from_train_block(None, &interner);
+        let d = crate::cpdt_optim::AdamWHyperparams::default();
+        assert!((hp.beta1 - d.beta1).abs() < 1e-12);
+        assert!((hp.beta2 - d.beta2).abs() < 1e-12);
+        assert!((hp.eps - d.eps).abs() < 1e-12);
+    }
+
+    #[test]
+    fn adamw_hyperparams_derived_from_train_block() {
+        let mut interner: Interner = Interner::new();
+        let adamw_sym = Symbol(interner.get_or_intern("AdamW"));
+        let beta1_sym = Symbol(interner.get_or_intern("beta1"));
+        let beta2_sym = Symbol(interner.get_or_intern("beta2"));
+
+        // optimizer = AdamW(beta1=0.85, beta2=0.99)
+        let callee = Box::new(mk_expr(ExprKind::Ident(adamw_sym)));
+        let args = vec![
+            mk_arg(Some(beta1_sym), mk_expr(ExprKind::FloatLiteral(0.85))),
+            mk_arg(Some(beta2_sym), mk_expr(ExprKind::FloatLiteral(0.99))),
+        ];
+        let opt_call = mk_expr(ExprKind::Call { callee, args });
+
+        let train = TrainBlock {
+            config: vec![],
+            sections: vec![TrainSection::Optimizer(opt_call)],
+            span: Span::dummy(),
+        };
+
+        let hp = adamw_from_train_block(Some(&train), &interner);
+        let d = crate::cpdt_optim::AdamWHyperparams::default();
+        assert!((hp.beta1 - 0.85).abs() < 1e-12, "beta1 = {}", hp.beta1);
+        assert!((hp.beta2 - 0.99).abs() < 1e-12, "beta2 = {}", hp.beta2);
+        // eps was not overridden — should stay at library default.
+        assert!((hp.eps - d.eps).abs() < 1e-12, "eps = {}", hp.eps);
+    }
+
+    #[test]
+    fn adamw_hyperparams_falls_back_for_non_adamw_optimizer() {
+        // SGD(momentum=0.9) should yield library defaults — no silent β1 override.
+        let mut interner: Interner = Interner::new();
+        let sgd_sym = Symbol(interner.get_or_intern("SGD"));
+        let momentum_sym = Symbol(interner.get_or_intern("momentum"));
+
+        let callee = Box::new(mk_expr(ExprKind::Ident(sgd_sym)));
+        let args = vec![mk_arg(
+            Some(momentum_sym),
+            mk_expr(ExprKind::FloatLiteral(0.9)),
+        )];
+        let opt_call = mk_expr(ExprKind::Call { callee, args });
+
+        let train = TrainBlock {
+            config: vec![],
+            sections: vec![TrainSection::Optimizer(opt_call)],
+            span: Span::dummy(),
+        };
+
+        let hp = adamw_from_train_block(Some(&train), &interner);
+        let d = crate::cpdt_optim::AdamWHyperparams::default();
+        assert!((hp.beta1 - d.beta1).abs() < 1e-12);
+        assert!((hp.beta2 - d.beta2).abs() < 1e-12);
+        assert!((hp.eps - d.eps).abs() < 1e-12);
     }
 }

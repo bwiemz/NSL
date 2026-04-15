@@ -492,6 +492,27 @@ enum Cli {
         #[arg(long)]
         csha_report: bool,
 
+        /// CPDT: planner mode ("full", "zero_only", or "off").
+        /// Passing `--cpdt` without a value enables full mode.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        cpdt: Option<String>,
+
+        /// CPDT: number of GPUs in the target cluster. Required when `--cpdt` is set.
+        #[arg(long, value_name = "N")]
+        cpdt_num_gpus: Option<u32>,
+
+        /// CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s).
+        #[arg(long, value_name = "BPS", default_value_t = 9e11)]
+        cpdt_intra_bw: f64,
+
+        /// CPDT: inter-node bandwidth in bytes/sec (default 1e11 = 100 GB/s).
+        #[arg(long, value_name = "BPS", default_value_t = 1e11)]
+        cpdt_inter_bw: f64,
+
+        /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
+        #[arg(long, default_value_t = false)]
+        cpdt_report: bool,
+
         /// Path to calibration dataset (.bin or .safetensors).  When
         /// omitted, calibration is skipped entirely.
         #[arg(long, value_name = "PATH")]
@@ -935,6 +956,11 @@ fn main_inner() {
             wggo_prune_fraction,
             csha,
             csha_report,
+            cpdt,
+            cpdt_num_gpus,
+            cpdt_intra_bw,
+            cpdt_inter_bw,
+            cpdt_report,
             calibration_data,
             calibrate,
             calibration_samples,
@@ -1033,6 +1059,55 @@ fn main_inner() {
                 process::exit(1);
             }
 
+            // CPDT: --cpdt-report implies --cpdt (full mode unless explicit).
+            let cpdt_mode_str: Option<String> = match (cpdt.as_deref(), cpdt_report) {
+                (Some(s), _) => Some(s.to_string()),
+                (None, true) => Some("full".to_string()),
+                (None, false) => None,
+            };
+            let cpdt_mode = match cpdt_mode_str.as_deref() {
+                None => nsl_codegen::cpdt::CpdtMode::Off,
+                Some(s) => match nsl_codegen::cpdt::CpdtMode::parse(s) {
+                    Some(m) => m,
+                    None => {
+                        eprintln!(
+                            "error: --cpdt value '{}' is not one of full|zero_only|off",
+                            s
+                        );
+                        process::exit(2);
+                    }
+                },
+            };
+            let cpdt_cluster = if cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off {
+                let n = match cpdt_num_gpus {
+                    Some(n) if n >= 1 => n,
+                    Some(_) => {
+                        eprintln!("nsl: --cpdt-num-gpus must be >= 1");
+                        process::exit(2);
+                    }
+                    None => {
+                        eprintln!("nsl: --cpdt requires --cpdt-num-gpus N");
+                        process::exit(2);
+                    }
+                };
+                Some(nsl_codegen::cpdt_zero::ClusterSpec {
+                    num_gpus: n,
+                    memory_budget_bytes: 80u64 * 1024 * 1024 * 1024,
+                    intra_bw_bps: cpdt_intra_bw,
+                    inter_bw_bps: cpdt_inter_bw,
+                    gpus_per_node: n.min(8),
+                })
+            } else {
+                None
+            };
+            let cpdt_plan_out: Option<
+                std::sync::Arc<std::sync::Mutex<Option<nsl_codegen::cpdt::CpdtPlan>>>,
+            > = if cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off {
+                Some(std::sync::Arc::new(std::sync::Mutex::new(None)))
+            } else {
+                None
+            };
+
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
@@ -1096,6 +1171,10 @@ fn main_inner() {
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
+                cpdt_mode,
+                cpdt_cluster: cpdt_cluster.clone(),
+                cpdt_report_requested: cpdt_report,
+                cpdt_plan_out: cpdt_plan_out.clone(),
                 calibration_data: calibration_data.clone(),
                 calibration_mode: Some(calibrate.clone()),
                 calibration_samples,
@@ -1194,6 +1273,29 @@ fn main_inner() {
                 );
             } else {
                 run_build(&file, output, emit_obj, dump_ir, &compile_opts, wrga_report.as_deref());
+            }
+
+            // CPDT: post-compile rendering. Stderr diagnostics always fire
+            // when CPDT ran; stdout plan only with --cpdt-report.
+            if let Some(slot) = cpdt_plan_out.as_ref() {
+                if let Some(plan) = slot.lock().ok().and_then(|g| g.clone()) {
+                    for diag in &plan.override_diagnostics {
+                        eprintln!(
+                            "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
+                            diag.requested, diag.applied, diag.reason
+                        );
+                    }
+                    if cpdt_report {
+                        print!("{}", plan.render_report());
+                        println!();
+                        println!("=== Defaults Assumed ===");
+                        println!("precision_cfg: BF16-mixed (override: --cpdt-precision, future)");
+                        let jc = nsl_codegen::cpdt_joint::JointConfig::default();
+                        println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
+                        println!("expert_cfg:    none (no MoE block detected)");
+                        println!("weights:       none (weight-aware refinement deferred)");
+                    }
+                }
             }
         }
         Cli::Run {
@@ -1363,6 +1465,10 @@ fn main_inner() {
                 wggo_prune_fraction: None,
                 csha_mode: None,
                 csha_report: false,
+                cpdt_mode: nsl_codegen::cpdt::CpdtMode::Off,
+                cpdt_cluster: None,
+                cpdt_report_requested: false,
+                cpdt_plan_out: None,
                 calibration_data: None,
                 calibration_mode: Some("required".to_string()),
                 calibration_samples: 512,

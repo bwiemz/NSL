@@ -39,6 +39,10 @@ pub struct AppliedLayer {
     pub packing_mode: u8,
     /// Estimated layer cost post-application (μs).
     pub estimated_us: f64,
+    /// Parameter bytes for this layer (sum of all weights).
+    pub param_bytes: u64,
+    /// Peak activation bytes during forward pass for this layer.
+    pub activation_bytes: u64,
 }
 
 /// Aggregate applied plan.
@@ -109,6 +113,8 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
             fase_fused,
             packing_mode,
             estimated_us: cost,
+            param_bytes: coarse.param_bytes,
+            activation_bytes: coarse.activation_bytes,
         });
     }
     AppliedPlan {
@@ -163,6 +169,8 @@ mod tests {
                     shard_optim: 4,
                     estimated_us: 10.0,
                     estimated_bytes: 1_000_000,
+                    param_bytes: if i == 0 { 6_000_000 } else { 500_000 },
+                    activation_bytes: if i == 0 { 2_000_000 } else { 300_000 },
                 })
                 .collect(),
             total_us: 30.0,
@@ -256,6 +264,19 @@ mod tests {
         let applied = apply(&inter_plan(3), &ilp);
         assert!(!applied.layers[2].fase_fused, "pruned layer must not fuse");
         assert!(applied.layers[0].fase_fused, "kept layer preserves choice");
+    }
+
+    #[test]
+    fn applied_layer_carries_param_and_activation_bytes() {
+        let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
+        let ilp: Vec<_> = (0..3)
+            .map(|_| solve_layer(&lut, &LayerIlpConstraints::default()))
+            .collect();
+        let applied = apply(&inter_plan(3), &ilp);
+        assert_eq!(applied.layers[0].param_bytes, 6_000_000);
+        assert_eq!(applied.layers[0].activation_bytes, 2_000_000);
+        assert_eq!(applied.layers[1].param_bytes, 500_000);
+        assert_eq!(applied.layers[1].activation_bytes, 300_000);
     }
 
     #[test]

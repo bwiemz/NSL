@@ -187,7 +187,7 @@ mod tests {
         ModelSize {
             per_layer_param_bytes: vec![6_000_000; 8],
             per_layer_activation_bytes: vec![2_000_000; 8],
-            optim_state_multiplier: 8.0,
+            optim_state_multiplier: crate::cpdt_zero::ADAMW_FP32_OPTIM_MULTIPLIER,
             per_layer_compute_us: vec![10.0; 8],
         }
     }
