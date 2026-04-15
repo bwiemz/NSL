@@ -31,6 +31,11 @@ pub enum OverrideRejectReason {
     RankClampedToBounds { r_min: u32, r_max: u32 },
     RankForbiddenByWggo,
     BudgetExceededDowngraded { original_rank: u32, final_rank: u32 },
+    // CPDT:
+    /// WGGO's recommended shard factor doesn't divide world_size.
+    ShardFactorIncompatibleWithWorldSize { recommended: u32, world_size: u32 },
+    /// Memory budget required more aggressive sharding than WGGO recommended.
+    ShardFactorOverriddenByMemory { recommended: u32, applied: u32 },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +57,10 @@ pub struct PerLayerOverride {
     pub adapter_rank: u64,   // WRGA
     pub fase_fused: bool,    // FASE
     pub packing_mode: u8,    // PCA / fusion
+    /// CPDT: per-layer ZeRO shard factor recommendation. Aggregated to a
+    /// single global recommendation via `WggoOverrides::min_shard_factor`.
+    /// `0` is the uninitialized sentinel — meaning "no recommendation."
+    pub shard_factor: u32,
 }
 
 impl WggoOverrides {
@@ -69,6 +78,7 @@ impl WggoOverrides {
                     adapter_rank: l.adapter_rank,
                     fase_fused: l.fase_fused,
                     packing_mode: l.packing_mode,
+                    shard_factor: l.shard_factor,
                 })
                 .collect(),
         }
@@ -78,6 +88,20 @@ impl WggoOverrides {
     /// so linear scan is fine.
     pub fn find(&self, layer_index: u32) -> Option<&PerLayerOverride> {
         self.per_layer.iter().find(|o| o.layer_index == layer_index)
+    }
+
+    /// Minimum shard factor across layers with a meaningful recommendation
+    /// (`shard_factor > 0`).  Returns `None` when no override carries a
+    /// recommendation.
+    ///
+    /// Uses MIN because the most-sensitive layer constrains the global
+    /// decision: ZeRO's collective ops require uniform sharding, so a layer
+    /// that only tolerates factor 2 forces every layer to factor 2.
+    pub fn min_shard_factor(&self) -> Option<u32> {
+        self.per_layer
+            .iter()
+            .filter_map(|p| if p.shard_factor > 0 { Some(p.shard_factor) } else { None })
+            .min()
     }
 
     /// Look up the override for the layer containing a given projection
@@ -203,6 +227,7 @@ mod tests {
                     adapter_rank: *rank as u64,
                     fase_fused: false,
                     packing_mode: 0,
+                    shard_factor: 0,
                 })
                 .collect(),
         }
@@ -234,5 +259,48 @@ mod tests {
     fn find_by_layer_containing_returns_none_on_no_match() {
         let over = overrides_with_layers(&[("blocks.0", 8)]);
         assert!(over.find_by_layer_containing("blocks.99.attn.wq").is_none());
+    }
+
+    fn overrides_with_shards(shards: &[u32]) -> WggoOverrides {
+        WggoOverrides {
+            per_layer: shards.iter().enumerate().map(|(i, &s)| PerLayerOverride {
+                layer_index: i as u32,
+                layer_name: format!("blocks.{i}"),
+                active_heads: 8,
+                requested_csha_level: None,
+                adapter_rank: 0,
+                fase_fused: false,
+                packing_mode: 0,
+                shard_factor: s,
+            }).collect(),
+        }
+    }
+
+    #[test]
+    fn min_shard_factor_returns_none_when_all_zero() {
+        let over = overrides_with_shards(&[0, 0, 0]);
+        assert!(over.min_shard_factor().is_none());
+    }
+
+    #[test]
+    fn min_shard_factor_returns_minimum_of_nonzero_values() {
+        let over = overrides_with_shards(&[8, 4, 2, 8]);
+        assert_eq!(over.min_shard_factor(), Some(2));
+    }
+
+    #[test]
+    fn min_shard_factor_skips_zero_sentinels() {
+        let over = overrides_with_shards(&[8, 0, 4, 0]);
+        assert_eq!(over.min_shard_factor(), Some(4));
+    }
+
+    #[test]
+    fn shard_factor_reject_variants_construct() {
+        let _incompat = OverrideRejectReason::ShardFactorIncompatibleWithWorldSize {
+            recommended: 4, world_size: 2,
+        };
+        let _mem = OverrideRejectReason::ShardFactorOverriddenByMemory {
+            recommended: 2, applied: 8,
+        };
     }
 }

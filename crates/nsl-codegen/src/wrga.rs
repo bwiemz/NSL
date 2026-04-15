@@ -585,6 +585,7 @@ mod tests {
                 adapter_rank: 32, // would clamp to r_max if weights were present
                 fase_fused: false,
                 packing_mode: 0,
+                shard_factor: 0,
             }],
         };
         let input = WrgaInput {
@@ -663,6 +664,7 @@ mod tests {
                 adapter_rank: 32, // > r_max=16 → RankClampedToBounds
                 fase_fused: false,
                 packing_mode: 0,
+                shard_factor: 0,
             }],
         };
         let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over));
