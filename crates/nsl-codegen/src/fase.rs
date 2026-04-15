@@ -261,6 +261,60 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
     }
 }
 
+/// WGGO-aware variant of [`plan`]. Given a per-layer `fase_fused` vector,
+/// returns a plan with `per_layer_mode` populated and any infeasible
+/// overrides clamped + logged in `override_diagnostics`.
+///
+/// Semantics:
+/// - Empty input (`wggo_fused_per_layer.is_empty()`) → same as `plan(cfg)`.
+///   `per_layer_mode` stays `None`; no diagnostics.
+/// - Passthrough global (accumulation=1) → overrides ignored. FASE isn't
+///   rewriting the backward, so per-layer variation is meaningless.
+///   `per_layer_mode` stays `None`; no diagnostics.
+/// - Deferred global → overrides feasible either way; `per_layer_mode` is
+///   `Some(vec![Deferred | FullBuffer, ...])` mapped from the input.
+/// - FullBuffer global (Lion/Unknown/allow_v_approx=false) → `Deferred`
+///   requests clamp to `FullBuffer` with a `FaseModeInfeasible` diagnostic.
+///   `FullBuffer` requests apply verbatim.
+pub fn plan_with_overrides(
+    cfg: &FaseConfig,
+    wggo_fused_per_layer: &[bool],
+) -> FasePlan {
+    let mut p = plan(cfg);
+
+    if wggo_fused_per_layer.is_empty() || p.mode == FaseMode::Passthrough {
+        return p;
+    }
+
+    let mut per_layer = Vec::with_capacity(wggo_fused_per_layer.len());
+    let mut diagnostics = Vec::new();
+
+    for (i, &fused) in wggo_fused_per_layer.iter().enumerate() {
+        let requested = if fused { FaseMode::Deferred } else { FaseMode::FullBuffer };
+        let applied = match (p.mode, requested) {
+            (FaseMode::FullBuffer, FaseMode::Deferred) => {
+                diagnostics.push(crate::wggo_overrides::OverrideDiagnostic {
+                    layer_index: i as u32,
+                    layer_name: format!("layer_{i}"),
+                    reason: crate::wggo_overrides::OverrideRejectReason::FaseModeInfeasible {
+                        optimizer: cfg.optimizer,
+                        global_mode: p.mode,
+                    },
+                    requested: "Deferred".into(),
+                    applied: "FullBuffer".into(),
+                });
+                FaseMode::FullBuffer
+            }
+            _ => requested,
+        };
+        per_layer.push(applied);
+    }
+
+    p.per_layer_mode = Some(per_layer);
+    p.override_diagnostics = diagnostics;
+    p
+}
+
 fn optimizer_name(o: FaseOptimizer) -> &'static str {
     match o {
         FaseOptimizer::AdamW => "AdamW",
@@ -467,5 +521,95 @@ mod tests {
         assert_eq!(p.mode_for_layer(1), FaseMode::Deferred);
         // Out-of-range falls back to global.
         assert_eq!(p.mode_for_layer(2), FaseMode::Deferred);
+    }
+
+    #[test]
+    fn plan_with_overrides_empty_input_matches_plan() {
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::AdamW,
+            accumulation: 4,
+            ..Default::default()
+        };
+        let baseline = plan(&cfg);
+        let overridden = plan_with_overrides(&cfg, &[]);
+        assert_eq!(overridden.mode, baseline.mode);
+        assert_eq!(overridden.accumulation, baseline.accumulation);
+        assert!(overridden.per_layer_mode.is_none());
+        assert!(overridden.override_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn plan_with_overrides_passthrough_ignores_all() {
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::AdamW,
+            accumulation: 1,
+            ..Default::default()
+        };
+        let p = plan_with_overrides(&cfg, &[true, false, true]);
+        assert_eq!(p.mode, FaseMode::Passthrough);
+        assert!(p.per_layer_mode.is_none());
+        assert!(p.override_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn plan_with_overrides_adamw_deferred_mixes_modes() {
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::AdamW,
+            accumulation: 4,
+            ..Default::default()
+        };
+        let p = plan_with_overrides(&cfg, &[true, false, true, false]);
+        assert_eq!(p.mode, FaseMode::Deferred);
+        assert_eq!(
+            p.per_layer_mode,
+            Some(vec![
+                FaseMode::Deferred,
+                FaseMode::FullBuffer,
+                FaseMode::Deferred,
+                FaseMode::FullBuffer,
+            ])
+        );
+        assert!(p.override_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn plan_with_overrides_lion_global_clamps_deferred_requests() {
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::Lion,
+            accumulation: 4,
+            ..Default::default()
+        };
+        let p = plan_with_overrides(&cfg, &[true, false]);
+        assert_eq!(p.mode, FaseMode::FullBuffer);
+        assert_eq!(
+            p.per_layer_mode,
+            Some(vec![FaseMode::FullBuffer, FaseMode::FullBuffer])
+        );
+        assert_eq!(p.override_diagnostics.len(), 1);
+        let diag = &p.override_diagnostics[0];
+        assert_eq!(diag.layer_index, 0);
+        assert_eq!(diag.requested, "Deferred");
+        assert_eq!(diag.applied, "FullBuffer");
+        assert!(matches!(
+            diag.reason,
+            crate::wggo_overrides::OverrideRejectReason::FaseModeInfeasible {
+                optimizer: FaseOptimizer::Lion,
+                global_mode: FaseMode::FullBuffer,
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_with_overrides_allow_v_approx_false_clamps() {
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::AdamW,
+            accumulation: 4,
+            allow_v_approx: false,
+            ..Default::default()
+        };
+        let p = plan_with_overrides(&cfg, &[true]);
+        assert_eq!(p.mode, FaseMode::FullBuffer);
+        assert_eq!(p.per_layer_mode, Some(vec![FaseMode::FullBuffer]));
+        assert_eq!(p.override_diagnostics.len(), 1);
     }
 }
