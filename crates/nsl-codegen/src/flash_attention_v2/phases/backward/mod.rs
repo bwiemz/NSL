@@ -8,3 +8,4 @@ pub mod prelude;
 pub mod q_load;
 pub mod ds_compute;
 pub mod dv_accum;
+pub mod dqdk_accum;
