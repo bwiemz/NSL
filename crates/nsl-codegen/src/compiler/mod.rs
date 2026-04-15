@@ -373,6 +373,12 @@ pub struct Compiler<'a> {
     /// Access via `self.features.field_name`.
     pub features: FeatureConfigs,
 
+    // ── FASE Codegen Phase 2: per-param mode table suffix counter ──
+    /// Monotonic counter used by `compile_train_block` to disambiguate
+    /// `nsl_fase_param_modes_*` rodata symbols when multiple `@train`
+    /// blocks exist in a single compile unit.
+    pub fase_table_counter: u32,
+
     // ── FlashAttention backward side-channel ────────────────────────
     /// Maps the Cranelift Value of a forward SDPA output to (out_val, lse_val)
     /// so the backward lowering can retrieve the logsumexp buffer.
@@ -586,6 +592,7 @@ impl<'a> Compiler<'a> {
             memory: MemoryPlanState::new(),
             vmap: VmapState::new(),
             features: FeatureConfigs::new(options),
+            fase_table_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),

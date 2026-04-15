@@ -3384,6 +3384,36 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
 
+        // FASE Codegen Phase 2: build per-parameter mode table from WGGO's
+        // per-layer decisions and emit it as a .rodata byte array. The
+        // backward loop below loads `modes[gai]` to choose Deferred vs
+        // FullBuffer per param. When None (no WGGO active), the loops use
+        // today's monolithic `fase_deferred` branch (byte-identical to
+        // pre-Phase-2 codegen).
+        let mode_table_base: Option<cranelift_codegen::ir::Value> = {
+            let modes = crate::fase_codegen_table::build_param_mode_table(
+                &param_paths,
+                &model_var_name,
+                &fase_plan,
+                self.wggo_overrides.as_ref(),
+            );
+            match modes {
+                Some(bytes) => {
+                    let suffix = self.fase_table_counter;
+                    self.fase_table_counter += 1;
+                    let func_suffix = format!("t{suffix}");
+                    let data_id = self.emit_param_mode_table_rodata(&bytes, &func_suffix)?;
+                    let global = self.module.declare_data_in_func(data_id, builder.func);
+                    Some(
+                        builder
+                            .ins()
+                            .symbol_value(cranelift_codegen::ir::types::I64, global),
+                    )
+                }
+                None => None,
+            }
+        };
+
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
         //   SGD/Lion/Muon: 1 (velocity/momentum)
