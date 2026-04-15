@@ -39,6 +39,54 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
 ///
 /// When a plan is produced, it is stashed on `compiler.last_wrga_plan` for
 /// later observability (`nsl check --wrga-report`).
+/// CPDT driver bridge — mirrors `invoke_wrga_if_enabled`. Builds a `CpdtInput`
+/// from the WGGO `AppliedPlan`, the optional `@train` block (for AdamW hyper-
+/// parameters), and the cluster topology stashed on the Compiler, then stores
+/// the resulting plan on `compiler.cpdt_plan`.
+///
+/// No-op when `compiler.cpdt_mode == CpdtMode::Off` or when no cluster is
+/// configured.
+pub(crate) fn invoke_cpdt_if_enabled(
+    compiler: &mut crate::compiler::Compiler,
+    applied_plan: &crate::wggo_apply::AppliedPlan,
+    train_block: Option<&nsl_ast::block::TrainBlock>,
+) {
+    use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
+    use crate::cpdt_expert::ExpertConfig;
+    use crate::cpdt_joint::JointConfig;
+    use crate::cpdt_precision::PrecisionConfig;
+    use crate::cpdt_zero::ModelSize;
+    use crate::wggo_overrides::WggoOverrides;
+
+    if compiler.cpdt_mode == CpdtMode::Off {
+        return;
+    }
+    let Some(cluster) = compiler.cpdt_cluster.clone() else {
+        return;
+    };
+
+    let overrides = WggoOverrides::from_applied(applied_plan);
+    let model = ModelSize::from_applied_plan(applied_plan);
+    let adamw = adamw_from_train_block(train_block, compiler.interner);
+
+    let input = CpdtInput {
+        mode: compiler.cpdt_mode,
+        model,
+        cluster,
+        weights: None,
+        precision_cfg: PrecisionConfig::default(),
+        adamw,
+        moe_shape: None,
+        moe_router: None,
+        moe_roofline_slack: 0.0,
+        expert_cfg: ExpertConfig::default(),
+        joint_cfg: JointConfig::default(),
+        wggo_recommended_shard: overrides.min_shard_factor(),
+    };
+
+    compiler.cpdt_plan = Some(cpdt_run(input));
+}
+
 pub(crate) fn invoke_wrga_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
@@ -3786,6 +3834,7 @@ impl Compiler<'_> {
                 // independently useful as a diagnostic and is exercised by
                 // the test suite and CLI integration tests.
                 //
+                let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
                 if let Some(ref mode_str) = self.compile_options.wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
@@ -3823,6 +3872,7 @@ impl Compiler<'_> {
                             self.wggo_overrides = Some(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
                             );
+                            wggo_applied = Some(plan.applied);
                         }
                     }
                 }
@@ -3915,6 +3965,17 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // CPDT pipeline planner — runs immediately after WRGA so the
+                // AppliedPlan produced by WGGO (if any) flows through as the
+                // ModelSize source + wggo_recommended_shard. No-op when
+                // `cpdt_mode == Off` or no cluster topology was configured.
+                // NOTE: CPDT runs only when WGGO produced a plan. If `--cpdt` is enabled
+                // without `--wggo`, `cpdt_plan` remains `None` and no diagnostics fire.
+                // The CLI post-compile layer should warn when `cpdt_mode != Off` but
+                // `cpdt_plan.is_none()` to surface this silent-skip case.
+                if let Some(ref applied) = wggo_applied {
+                    crate::stmt::invoke_cpdt_if_enabled(self, applied, Some(train));
+                }
                 // Task 6: render any override-rejected diagnostics to stderr so
                 // the Phase 3 decision explainer and the user can see which
                 // WGGO-requested ranks were adjusted.  Format matches the CSHA

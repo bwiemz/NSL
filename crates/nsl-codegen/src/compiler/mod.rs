@@ -392,6 +392,17 @@ pub struct Compiler<'a> {
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 
+    // ── CPDT side-channel (pipeline integration) ─────────────────────
+    /// CPDT mode requested via CLI. `Off` → planner does not run.
+    pub cpdt_mode: crate::cpdt::CpdtMode,
+    /// Cluster topology supplied via `--cpdt-num-gpus` / `--cpdt-intra-bw` / `--cpdt-inter-bw`.
+    /// `None` when CPDT is off.
+    pub cpdt_cluster: Option<crate::cpdt_zero::ClusterSpec>,
+    /// Resulting plan after `invoke_cpdt_if_enabled` runs.
+    pub cpdt_plan: Option<crate::cpdt::CpdtPlan>,
+    /// Whether `--cpdt-report` was requested.
+    pub cpdt_report_requested: bool,
+
     // ── Dev Tools Phase 2: kernel-profile pre-pass ─────────────────────
     pub prediction_map: HashMap<NodeId, crate::cost_model::OpCost>,
     pub manifest_builder: Option<crate::profiling::instrument::ManifestBuilder>,
@@ -550,6 +561,10 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            cpdt_mode: crate::cpdt::CpdtMode::Off,
+            cpdt_cluster: None,
+            cpdt_plan: None,
+            cpdt_report_requested: false,
             prediction_map: HashMap::new(),
             manifest_builder: None,
             fusion_plan_for_profile: None,
