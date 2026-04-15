@@ -57,6 +57,10 @@ pub struct LayerPlan {
     pub estimated_us: f64,
     /// Estimated memory contribution (bytes).
     pub estimated_bytes: u64,
+    /// Parameter bytes for this layer (weights only).
+    pub param_bytes: u64,
+    /// Peak activation bytes during forward pass for this layer.
+    pub activation_bytes: u64,
 }
 
 /// Full inter-layer plan.
@@ -153,7 +157,7 @@ fn candidate_decisions(layer: &Layer, cfg: &DpConfig) -> Vec<LayerDecision> {
 }
 
 /// Approximate cost contribution of one layer under a decision.
-fn layer_cost(decision: LayerDecision, lut_best: Option<LayerCostEntry>) -> (f64, u64) {
+fn layer_cost(decision: LayerDecision, lut_best: Option<LayerCostEntry>) -> (f64, u64, u64, u64) {
     let best = lut_best.unwrap_or(LayerCostEntry {
         forward_us: 0.0,
         backward_us: 0.0,
@@ -164,9 +168,19 @@ fn layer_cost(decision: LayerDecision, lut_best: Option<LayerCostEntry>) -> (f64
         classification: crate::cost_model::BoundClassification::Unknown,
     });
     match decision {
-        LayerDecision::KeepFull => (best.total_us(), best.param_bytes + best.activation_bytes),
-        LayerDecision::Thin => (best.total_us() * 0.6, best.param_bytes * 60 / 100 + best.activation_bytes),
-        LayerDecision::Prune => (0.1, 0), // tiny residual identity
+        LayerDecision::KeepFull => (
+            best.total_us(),
+            best.param_bytes + best.activation_bytes,
+            best.param_bytes,
+            best.activation_bytes,
+        ),
+        LayerDecision::Thin => (
+            best.total_us() * 0.6,
+            best.param_bytes * 60 / 100 + best.activation_bytes,
+            best.param_bytes * 60 / 100,
+            best.activation_bytes,
+        ),
+        LayerDecision::Prune => (0.1, 0, 0, 0), // tiny residual identity
     }
 }
 
@@ -191,8 +205,10 @@ pub fn solve(graph: &OptGraph, luts: &[LayerCostLut], cfg: &DpConfig) -> InterLa
         let mut best_decision = LayerDecision::KeepFull;
         let mut best_cost = f64::INFINITY;
         let mut best_bytes = 0u64;
+        let mut best_param_bytes = 0u64;
+        let mut best_activation_bytes = 0u64;
         for decision in candidate_decisions(layer, cfg) {
-            let (cost_us, bytes) = layer_cost(decision, lut_best);
+            let (cost_us, bytes, pb, ab) = layer_cost(decision, lut_best);
             if bytes / shard as u64 > cfg.cluster.memory_budget {
                 continue;
             }
@@ -200,13 +216,17 @@ pub fn solve(graph: &OptGraph, luts: &[LayerCostLut], cfg: &DpConfig) -> InterLa
                 best_cost = cost_us;
                 best_decision = decision;
                 best_bytes = bytes;
+                best_param_bytes = pb;
+                best_activation_bytes = ab;
             }
         }
         if best_cost == f64::INFINITY {
             // No feasible option: default to KeepFull, record its raw cost.
-            let (cost_us, bytes) = layer_cost(LayerDecision::KeepFull, lut_best);
+            let (cost_us, bytes, pb, ab) = layer_cost(LayerDecision::KeepFull, lut_best);
             best_cost = cost_us;
             best_bytes = bytes;
+            best_param_bytes = pb;
+            best_activation_bytes = ab;
         }
 
         total_us += best_cost;
@@ -222,6 +242,8 @@ pub fn solve(graph: &OptGraph, luts: &[LayerCostLut], cfg: &DpConfig) -> InterLa
             shard_optim: shard,
             estimated_us: best_cost,
             estimated_bytes: best_bytes,
+            param_bytes: best_param_bytes,
+            activation_bytes: best_activation_bytes,
         });
     }
 
