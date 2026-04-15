@@ -378,15 +378,23 @@ impl Compiler<'_> {
             let op_id = builder
                 .ins()
                 .iconst(cl_types::I64, self.trace_op_id(fn_name) as i64);
-            let in0 = if !args.is_empty() {
+            // Only forward pointer-typed (I64) args — scalar-op FFI calls like
+            // `nsl_tensor_mul_scalar(tensor, f64)` would otherwise pass an f64
+            // where the trace hook expects an i64, tripping Cranelift's verifier.
+            let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
+            let in0 = if !args.is_empty()
+                && builder.func.dfg.value_type(args[0]) == cl_types::I64
+            {
                 args[0]
             } else {
-                builder.ins().iconst(cl_types::I64, 0)
+                zero_i64
             };
-            let in1 = if args.len() > 1 {
+            let in1 = if args.len() > 1
+                && builder.func.dfg.value_type(args[1]) == cl_types::I64
+            {
                 args[1]
             } else {
-                builder.ins().iconst(cl_types::I64, 0)
+                zero_i64
             };
             let nan_flag = self.compile_call_by_name(
                 builder,
