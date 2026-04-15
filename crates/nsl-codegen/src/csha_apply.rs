@@ -579,6 +579,7 @@ mod tests {
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
             pattern_cfg: crate::csha_patterns::PatternConfig::default(),
+            wggo_overrides: None,
         })
     }
 
@@ -763,6 +764,7 @@ mod tests {
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
             pattern_cfg: crate::csha_patterns::PatternConfig::default(),
+            wggo_overrides: None,
         });
         let r = bridge(&plan, 64, &mut Vec::new());
 

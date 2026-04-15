@@ -7,8 +7,16 @@ use std::sync::Mutex;
 
 use crate::calibration::awq_sidecar;
 use crate::calibration::ctx::{BufferHandle, CalibCtx};
-use crate::calibration::hooks::{CalibrationHook, CalibrationResult};
+use crate::calibration::discovery::DiscoveredProjection;
+use crate::calibration::hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
+use crate::calibration::retention::ArenaLayout;
+
+/// Produces a valid Cranelift data symbol name for a projection's running buffer.
+/// Replaces `.` with `_` since Cranelift symbol names can't contain periods.
+pub(crate) fn running_symbol_for(projection: &ProjectionRef) -> String {
+    format!("__nsl_awq_running.{}", projection.0.replace('.', "_"))
+}
 
 // NOTE: spec §7 text says "RefCell-backed state", but the
 // `CalibrationHook` trait requires `Send + Sync` so the registry can
@@ -17,11 +25,39 @@ use crate::calibration::observation::{ObservationSet, ProjectionRef};
 pub struct AwqCalibrationHook {
     projections: Vec<ProjectionRef>,
     handles: Mutex<BTreeMap<ProjectionRef, BufferHandle>>,
+    /// Per-projection in-features count (`weight_shape[1]`).  Populated
+    /// from `DiscoveredProjection` data; used by `emit_observe_batch` to
+    /// determine the column stride of the arena slice.
+    in_features: BTreeMap<ProjectionRef, u32>,
 }
 
 impl AwqCalibrationHook {
+    /// Construct from a bare list of projection refs (no weight-shape
+    /// information).  `emit_observe_batch` will skip any projection whose
+    /// `in_features` is unknown; use `from_discovered` when the full
+    /// shape context is available.
     pub fn new(projections: Vec<ProjectionRef>) -> Self {
-        Self { projections, handles: Mutex::new(BTreeMap::new()) }
+        Self {
+            projections,
+            handles: Mutex::new(BTreeMap::new()),
+            in_features: BTreeMap::new(),
+        }
+    }
+
+    /// Construct from the output of `discover_awq_projections`, which
+    /// carries weight-shape metadata.  `emit_observe_batch` is fully
+    /// operational when constructed via this path.
+    pub fn from_discovered(projections: &[DiscoveredProjection]) -> Self {
+        let refs: Vec<ProjectionRef> = projections.iter().map(|p| p.projection.clone()).collect();
+        let in_features = projections
+            .iter()
+            .map(|p| (p.projection.clone(), p.weight_shape[1]))
+            .collect();
+        Self {
+            projections: refs,
+            handles: Mutex::new(BTreeMap::new()),
+            in_features,
+        }
     }
 
     /// Test-only handle inspection.  Exposed (no `#[cfg(test)]`) so
@@ -57,6 +93,57 @@ impl CalibrationHook for AwqCalibrationHook {
         // ctx.running_max_abs.  In stub mode this is a no-op; tests
         // drive the reduction via ctx.stub_running_max_abs with the
         // handle retrieved from handles_for_test().
+    }
+
+    /// Per-batch max-abs reduction over the retention arena.
+    ///
+    /// For each projection registered in `arena.entries`, computes the
+    /// row-wise max|activation| and accumulates it into the running buffer
+    /// allocated during `emit_init`.
+    ///
+    /// - `rows`     = `nbytes / (in_features * 4)` (batch×seq collapsed).
+    /// - Projections missing from `self.in_features` or with `in_features == 0`
+    ///   are skipped silently (log-and-continue; not a hard error).
+    fn emit_observe_batch(&self, ctx: &mut CalibCtx, arena: &ArenaLayout) {
+        let handles = self.handles.lock().unwrap();
+        for (projection, offset, nbytes) in &arena.entries {
+            let Some(&handle) = handles.get(projection) else { continue };
+            let Some(&in_feat) = self.in_features.get(projection) else { continue };
+            if in_feat == 0 { continue; }
+            let total_floats = nbytes / 4;
+            if total_floats % in_feat != 0 { continue; }
+            let rows = total_floats / in_feat;
+            ctx.emit_per_channel_max_abs_update(&projection.0, *offset, rows, in_feat, handle);
+        }
+    }
+
+    fn observe_plan(&self, arena: &ArenaLayout) -> Vec<ObservePlanEntry> {
+        arena.entries.iter().filter_map(|(proj, offset, nbytes)| {
+            let channels = *self.in_features.get(proj)?;
+            if channels == 0 { return None; }
+            let total = nbytes / 4;
+            if total % channels != 0 { return None; }
+            let rows = total / channels;
+            Some(ObservePlanEntry {
+                projection: proj.clone(),
+                src_offset: *offset,
+                rows,
+                channels,
+                running_symbol: running_symbol_for(proj),
+            })
+        }).collect()
+    }
+
+    fn finalize_plan(&self) -> Vec<FinalizePlanEntry> {
+        let mut entries: Vec<FinalizePlanEntry> = self.in_features.iter()
+            .map(|(proj, &channels)| FinalizePlanEntry {
+                projection: proj.clone(),
+                running_symbol: running_symbol_for(proj),
+                channels,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+        entries
     }
 
     fn emit_finalize(&self, ctx: &mut CalibCtx) -> CalibrationResult {
@@ -200,5 +287,136 @@ mod tests {
             CalibrationResult::Ok(_) => {}
             other => panic!("expected Ok after full cycle, got {other:?}"),
         }
+    }
+
+    // ── Task 7 test: emit_observe_batch ────────────────────────────────────────
+
+    #[test]
+    fn observe_batch_updates_running_max_abs_per_channel() {
+        // Build a hook via from_discovered so in_features is populated.
+        let discovered = vec![DiscoveredProjection {
+            projection: ProjectionRef::new("model.up"),
+            weight_shape: [8, 4], // out=8, in_features=4
+        }];
+        let hook = AwqCalibrationHook::from_discovered(&discovered);
+
+        // ctx doesn't need a retention table for this test; alloc the
+        // running buffer manually by calling emit_init via a stub table
+        // that knows about model.up with shape [1, 2, 4] (so in_channels=4).
+        let mut table = RetentionTable::new();
+        table.register(ProjectionRef::new("model.up"), TensorShape::new(vec![1, 2, 4]), 4);
+        let mut ctx = CalibCtx::for_tests(&table);
+        hook.emit_init(&mut ctx);
+
+        // Build an arena layout: 2 rows × 4 channels = 32 bytes.
+        let layout = ArenaLayout {
+            entries: vec![(ProjectionRef::new("model.up"), 0, 2 * 4 * 4)],
+        };
+
+        // 2 rows (batch*seq=2) × 4 channels.
+        // Channel-wise max-abs should end up [1.0, 2.0, 7.0, 4.0].
+        ctx.stub_set_arena_buffer("model.up", &[
+            1.0,  2.0,  3.0,  4.0,   // row 0
+           -1.0, -2.0, -7.0, -4.0,   // row 1
+        ]);
+        hook.emit_observe_batch(&mut ctx, &layout);
+
+        let running = ctx.stub_running_max_abs_named("model.up");
+        assert_eq!(running, vec![1.0, 2.0, 7.0, 4.0]);
+    }
+
+    #[test]
+    fn observe_batch_accumulates_across_multiple_calls() {
+        let discovered = vec![DiscoveredProjection {
+            projection: ProjectionRef::new("model.down"),
+            weight_shape: [4, 3], // in_features=3
+        }];
+        let hook = AwqCalibrationHook::from_discovered(&discovered);
+
+        let mut table = RetentionTable::new();
+        table.register(ProjectionRef::new("model.down"), TensorShape::new(vec![1, 1, 3]), 4);
+        let mut ctx = CalibCtx::for_tests(&table);
+        hook.emit_init(&mut ctx);
+
+        let layout = ArenaLayout {
+            entries: vec![(ProjectionRef::new("model.down"), 0, 1 * 3 * 4)],
+        };
+
+        // First batch: [1.0, -5.0, 2.0] → running = [1.0, 5.0, 2.0]
+        ctx.stub_set_arena_buffer("model.down", &[1.0, -5.0, 2.0]);
+        hook.emit_observe_batch(&mut ctx, &layout);
+
+        // Second batch: [-3.0, 4.0, -1.5] → running = [3.0, 5.0, 2.0]
+        ctx.stub_set_arena_buffer("model.down", &[-3.0, 4.0, -1.5]);
+        hook.emit_observe_batch(&mut ctx, &layout);
+
+        let running = ctx.stub_running_max_abs_named("model.down");
+        assert_eq!(running, vec![3.0, 5.0, 2.0]);
+    }
+
+    #[test]
+    fn awq_observe_plan_has_one_entry_per_projection() {
+        use crate::calibration::build_arena_layout;
+        use crate::calibration::observation::ProjectionRef;
+        use crate::calibration::discovery::DiscoveredProjection;
+
+        let ps = vec![
+            DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            },
+            DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.down_proj".into()),
+                weight_shape: [64, 128],
+            },
+        ];
+        let hook = AwqCalibrationHook::from_discovered(&ps);
+        let layout = build_arena_layout(&ps, 8, 4);
+
+        let observe = hook.observe_plan(&layout);
+        assert_eq!(observe.len(), 2);
+
+        // Look up entries by projection (order is arena-entry order, which is insertion order).
+        let up_entry = observe.iter().find(|e| e.projection.0 == "TinyMLP.up_proj").unwrap();
+        assert_eq!(up_entry.running_symbol, "__nsl_awq_running.TinyMLP_up_proj");
+        assert_eq!(up_entry.channels, 64);
+        assert_eq!(up_entry.rows, 32);
+        let down_entry = observe.iter().find(|e| e.projection.0 == "TinyMLP.down_proj").unwrap();
+        assert_eq!(down_entry.running_symbol, "__nsl_awq_running.TinyMLP_down_proj");
+        assert_eq!(down_entry.channels, 128);
+
+        let finalize = hook.finalize_plan();
+        assert_eq!(finalize.len(), 2);
+        // Finalize entries are sorted by projection path for determinism.
+        assert_eq!(finalize[0].projection.0, "TinyMLP.down_proj");
+        assert_eq!(finalize[0].channels, 128);
+        assert_eq!(finalize[0].running_symbol, "__nsl_awq_running.TinyMLP_down_proj");
+        assert_eq!(finalize[1].projection.0, "TinyMLP.up_proj");
+        assert_eq!(finalize[1].channels, 64);
+    }
+
+    #[test]
+    fn observe_batch_skips_projection_with_unknown_in_features() {
+        // Hook built via new() has empty in_features map.
+        let proj = ProjectionRef::new("model.x");
+        let hook = AwqCalibrationHook::new(vec![proj.clone()]);
+
+        let mut table = RetentionTable::new();
+        table.register(proj.clone(), TensorShape::new(vec![1, 2, 8]), 4);
+        let mut ctx = CalibCtx::for_tests(&table);
+        hook.emit_init(&mut ctx);
+
+        let layout = ArenaLayout {
+            entries: vec![(proj.clone(), 0, 2 * 8 * 4)],
+        };
+        ctx.stub_set_arena_buffer("model.x", &vec![1.0f32; 16]);
+
+        // Should silently skip (no panic).
+        hook.emit_observe_batch(&mut ctx, &layout);
+
+        // Running buffer stays all-zero.
+        let h = *hook.handles_for_test().get(&proj).unwrap();
+        let out = ctx.finalize_read(h);
+        assert!(out.iter().all(|v| *v == 0.0));
     }
 }

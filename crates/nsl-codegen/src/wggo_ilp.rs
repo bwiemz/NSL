@@ -52,6 +52,33 @@ pub struct DecisionTrace {
     pub cross_decision_note: Option<String>,
 }
 
+/// Gradient-informed per-head importance scores for WGGO Phase 2.
+///
+/// Built from a sidecar-provided `Vec<f32>` of per-head gradient norms (or
+/// any other scalar importance signal) gathered during a calibration forward
+/// pass.  The ILP solver consumes this in Phase 2 Task 2 to bias head-keep
+/// decisions toward high-importance heads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadImportance {
+    /// Per-head scalar importance score, one entry per attention head.
+    /// Higher values indicate more important heads that should be
+    /// preserved under memory pressure.
+    pub per_head: Vec<f32>,
+}
+
+impl HeadImportance {
+    /// Construct a [`HeadImportance`] from a slice of per-head `f32` scores.
+    ///
+    /// # Arguments
+    /// * `scores` — one importance score per attention head.  The slice is
+    ///   copied into an owned `Vec`; no calibration pass is run here.
+    pub fn from_per_head_f32(scores: &[f32]) -> Self {
+        Self {
+            per_head: scores.to_vec(),
+        }
+    }
+}
+
 /// Integer decision variables for one layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LayerDecision {
@@ -1191,6 +1218,13 @@ mod tests {
             },
         );
         assert!(with_pack.cost_us < without_pack.cost_us);
+    }
+
+    #[test]
+    fn head_importance_from_per_head_f32_roundtrips() {
+        let input = vec![1.0f32, 2.5, 3.75, 0.0];
+        let hi = HeadImportance::from_per_head_f32(&input);
+        assert_eq!(hi.per_head, input);
     }
 
     #[test]

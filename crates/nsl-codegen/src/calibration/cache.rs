@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::calibration::discovery::DiscoveredProjection;
 use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
 
 const CACHE_SUFFIX: &str = ".calibration.json";
@@ -26,6 +27,11 @@ pub struct CacheKey {
     pub hook_ids_sorted: Vec<String>,
     pub samples: u32,
     pub batch_size: u32,
+    /// Per-projection `(path, weight_shape)` included in the digest so
+    /// that renaming a projection path or changing `in_features` /
+    /// `out_features` under the same name both invalidate the cache.
+    /// Order-insensitive: `digest` sorts by path internally.
+    pub projections: Vec<DiscoveredProjection>,
 }
 
 impl CacheKey {
@@ -47,6 +53,18 @@ impl CacheKey {
         }
         h.update(self.samples.to_le_bytes());
         h.update(self.batch_size.to_le_bytes());
+        // Sort projections by path for determinism (order-insensitive).
+        let mut ps = self.projections.clone();
+        ps.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+        h.update((ps.len() as u64).to_le_bytes());
+        for p in &ps {
+            // length-prefixed path string — same framing as other fields.
+            h.update((p.projection.0.len() as u64).to_le_bytes());
+            h.update(p.projection.0.as_bytes());
+            // concrete shape dimensions (fixed 8 bytes total, no prefix needed).
+            h.update(p.weight_shape[0].to_le_bytes());
+            h.update(p.weight_shape[1].to_le_bytes());
+        }
         hex(&h.finalize())
     }
 }
@@ -113,6 +131,59 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod projection_key_tests {
+    use super::*;
+    use crate::calibration::discovery::DiscoveredProjection;
+    use crate::calibration::observation::ProjectionRef;
+
+    fn proj(path: &str, out_f: u32, in_f: u32) -> DiscoveredProjection {
+        DiscoveredProjection {
+            projection: ProjectionRef(path.into()),
+            weight_shape: [out_f, in_f],
+        }
+    }
+
+    fn base_key() -> CacheKey {
+        CacheKey {
+            checkpoint_hashes: vec!["ckpt-abc".into()],
+            calibration_data_hash: "data-xyz".into(),
+            hook_ids_sorted: vec!["awq".into()],
+            samples: 128,
+            batch_size: 4,
+            projections: vec![proj("model.up_proj", 128, 64)],
+        }
+    }
+
+    #[test]
+    fn shape_change_changes_digest() {
+        let a = base_key();
+        let mut b = a.clone();
+        b.projections = vec![proj("model.up_proj", 128, 96)]; // in_f changed
+        assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn path_rename_changes_digest() {
+        let a = base_key();
+        let mut b = a.clone();
+        b.projections = vec![proj("model.u_proj", 128, 64)];
+        assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn projection_order_does_not_affect_digest() {
+        let mut a = base_key();
+        a.projections = vec![
+            proj("model.down_proj", 64, 128),
+            proj("model.up_proj", 128, 64),
+        ];
+        let mut b = a.clone();
+        b.projections.reverse();
+        assert_eq!(a.digest(), b.digest(), "digest must be order-insensitive");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -156,6 +227,7 @@ mod tests {
             cache_key_digest: digest.into(),
             num_samples_used: 10,
             hooks,
+            wggo_head_gradients: None,
         }
     }
 
@@ -167,6 +239,7 @@ mod tests {
             hook_ids_sorted: vec!["h1".into(), "h2".into()],
             samples: 128,
             batch_size: 4,
+            projections: vec![],
         };
         let k2 = CacheKey {
             checkpoint_hashes: vec!["b".into(), "a".into()],
@@ -174,6 +247,7 @@ mod tests {
             hook_ids_sorted: vec!["h2".into(), "h1".into()],
             samples: 128,
             batch_size: 4,
+            projections: vec![],
         };
         assert_eq!(k1.digest(), k2.digest());
     }
@@ -186,6 +260,7 @@ mod tests {
             hook_ids_sorted: vec!["h1".into()],
             samples: 128,
             batch_size: 4,
+            projections: vec![],
         };
         let changed = CacheKey {
             samples: 129,
@@ -253,6 +328,7 @@ mod tests {
             hook_ids_sorted: vec!["h1\0h2".into()],
             samples: 1,
             batch_size: 1,
+            projections: vec![],
         };
         let split = CacheKey {
             checkpoint_hashes: vec!["c".into()],
@@ -260,6 +336,7 @@ mod tests {
             hook_ids_sorted: vec!["h1".into(), "h2".into()],
             samples: 1,
             batch_size: 1,
+            projections: vec![],
         };
         assert_ne!(combined.digest(), split.digest());
     }
@@ -275,6 +352,7 @@ mod tests {
             hook_ids_sorted: vec![],
             samples: 1,
             batch_size: 1,
+            projections: vec![],
         };
         let b = CacheKey {
             checkpoint_hashes: vec!["a".into()],
@@ -282,6 +360,7 @@ mod tests {
             hook_ids_sorted: vec![],
             samples: 1,
             batch_size: 1,
+            projections: vec![],
         };
         assert_ne!(a.digest(), b.digest());
     }

@@ -133,6 +133,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_max: 16,
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
+        wggo_overrides: compiler.wggo_overrides.as_ref(),
     };
     let mut plan = crate::wrga::run(wrga_input);
 
@@ -3201,6 +3202,23 @@ impl Compiler<'_> {
         let (step_body, step_param_sym) =
             step_body.ok_or_else(|| CodegenError::new("train block requires a step section"))?;
 
+        // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
+        // (Lion, Unknown, or grad_clip set) fall through to the existing
+        // accum-buffer path below.  Deferred routes through stmt_fase.
+        let fase_plan = crate::fase::plan(&crate::fase::FaseConfig {
+            accumulation: grad_accumulation_steps.max(1) as u32,
+            optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
+            grad_clip: if grad_clip < f64::MAX { Some(grad_clip) } else { None },
+            lr: lr_value,
+            beta1: beta1_value,
+            beta2: beta2_value,
+            eps: eps_value,
+            weight_decay: weight_decay_value,
+            momentum: momentum_value,
+            allow_v_approx: true,
+        });
+        let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
+
         // ── 3. Resolve model type and build param list ──────────────────
         // Get the model pointer from state
         let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
@@ -3541,6 +3559,12 @@ impl Compiler<'_> {
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
         // to the tape-based AD path.
+        //
+        // fase_hook_active: when true, param gradients are consumed during
+        // adjoint lowering (accumulated into m_partial + freed immediately).
+        // The downstream grads_list construction + accumulation loops are
+        // skipped; grads_list is a null sentinel (i64 0).
+        let fase_hook_active = fase_deferred && self.features.source_ad_enabled;
         let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
             eprintln!("[nsl] Using source-to-source AD for backward pass");
@@ -3672,115 +3696,32 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
-                // CSHA: Compiler-Synthesized Holistic Attention planner.
-                // Runs the boundary-fusion scan, SMEM feasibility model,
-                // and weight-informed specialization.  Emits either the
-                // full paper-§6.3 report or a compact one-line summary
-                // gated by the `--csha` / `--csha-report` flags.  The
-                // planner is pure data-in/data-out; wiring the kernel
-                // decisions back into codegen is a follow-up step.
-                if let Some(ref mode_str) = self.compile_options.csha_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        if let Some(plan) = crate::csha::run_on_wengert(
-                            extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
-                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-                            None, // shape override — defaults are fine for diagnostic
-                            8,    // default head count; weight-informed path refines this
-                        ) {
-                            if self.compile_options.csha_report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[csha] {}", plan.summary());
-                            }
-                            // A.1: persist the bridge result so the FA call
-                            // site can route CSHA-active layers through the
-                            // CSHA-aware FFI. `csha::run` already called
-                            // `csha_apply::bridge`; we reconstruct it here
-                            // to keep the kernels / marks / configs map
-                            // available to downstream code.
-                            let mut diags = Vec::<String>::new();
-                            self.last_csha_bridge = Some(crate::csha_apply::bridge(
-                                &plan,
-                                plan.per_layer
-                                    .first()
-                                    .map(|lp| lp.tiles.head_dim as i64)
-                                    .unwrap_or(64),
-                                &mut diags,
-                            ));
-                            for d in diags { eprintln!("warning: {d}"); }
-                            // A.2.1d: record the Wengert op indices CSHA
-                            // has claimed across all boundary chains so
-                            // downstream passes (A.2.2 RMSNorm prologue,
-                            // A.2.3 matmul projection, A.2.4 RoPE
-                            // epilogue) can ask `is_csha_claimed(op)`
-                            // before emitting a redundant launch.
-                            self.csha_claimed_ops =
-                                crate::csha_apply::collect_claimed_ops(&plan);
-                        }
-                    }
-                }
-
-                // WGGO: run the global optimization planner if enabled.  The
-                // planner is pure data-in/data-out and does not mutate the
-                // Wengert list — it produces a report describing the
-                // globally-optimal per-layer decisions that downstream
-                // passes SHOULD honour.  Wiring the decisions back into
-                // codegen is a future step; the planner itself is
-                // independently useful as a diagnostic and is exercised by
-                // the test suite and CLI integration tests.
-                if let Some(ref mode_str) = self.compile_options.wggo_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        // Build AnalysisConfig from CLI overrides; clamp is
-                        // also applied in analyze(), but applying it here
-                        // keeps the --wggo-report line honest.
-                        let mut analysis_config =
-                            crate::wggo_weight_analysis::AnalysisConfig::default();
-                        if let Some(f) = self.compile_options.wggo_prune_fraction {
-                            analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
-                        }
-                        // Honour `--wggo-importance=none` by clearing the
-                        // weights path — the analyzer then runs against
-                        // NullWeightProvider and produces uniform scores.
-                        let weights_path = match self
-                            .compile_options
-                            .wggo_importance
-                            .as_deref()
-                        {
-                            Some("none") => None,
-                            _ => self.compile_options.wggo_weights.as_deref(),
-                        };
-                        let plan = crate::wggo::run_on_wengert_with_weights(
-                            extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
-                            self.compile_options.world_size,
-                            weights_path,
-                            analysis_config,
-                        );
-                        if let Some(plan) = plan {
-                            if self.compile_options.wggo_report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[wggo] {}", plan.summary());
-                            }
-                        }
-                    }
-                }
-
-                // Calibration harness (MVP): currently a pass-through
-                // when no consumers are registered.  Real consumers
-                // (AWQ/WGGO Phase 2/FP8/GPTQ) land in follow-up plans.
+                // Calibration harness MUST run before WGGO: WGGO Phase 2's
+                // gradient-scoring path reads `compile_options.calibration_sidecar`
+                // via `build_scorer`. If WGGO ran first, the sidecar would
+                // still be `None` and Phase 2 would silently fall back to
+                // magnitude scoring even when `--calibration-data` was
+                // supplied. Calibration does not depend on WGGO output, so
+                // running it first is a safe one-way reorder.
                 if let Some(ref data_path) = self.compile_options.calibration_data {
                     let mut registry = crate::calibration::registry::HookRegistry::new();
                     if let Some(awq_projections) = self.discover_awq_projections() {
                         if !awq_projections.is_empty() {
+                            // Extract just the ProjectionRef for the hook; the full
+                            // DiscoveredProjection (with weight_shape) lives in
+                            // compile_options.calibration_retention for codegen.
+                            let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
+                                .iter()
+                                .map(|dp| dp.projection.clone())
+                                .collect();
                             registry.register(Box::new(
                                 crate::calibration::awq_hook::AwqCalibrationHook::new(
-                                    awq_projections,
+                                    proj_refs,
                                 ),
                             ));
+                            // Store the full DiscoveredProjection vec so the retention
+                            // pass can use weight_shape for arena-layout sizing.
+                            self.compile_options.calibration_retention = Some(awq_projections);
                         }
                     }
                     if registry.is_empty() {
@@ -3810,6 +3751,13 @@ impl Compiler<'_> {
                             batch_size: self.compile_options.calibration_batch_size,
                             timeout_secs: self.compile_options.calibration_timeout_secs,
                             mode,
+                            // Wire per-projection (path, weight_shape) into the
+                            // cache key so renames and shape changes invalidate it.
+                            projections: self
+                                .compile_options
+                                .calibration_retention
+                                .clone()
+                                .unwrap_or_default(),
                         };
                         match crate::calibration::run_harness_production(&registry, &cfg) {
                             Ok(out) => {
@@ -3825,6 +3773,133 @@ impl Compiler<'_> {
                                     "calibration failed: {e}"
                                 )));
                             }
+                        }
+                    }
+                }
+
+                // WGGO: run the global optimization planner if enabled.  The
+                // planner is pure data-in/data-out and does not mutate the
+                // Wengert list — it produces a report describing the
+                // globally-optimal per-layer decisions that downstream
+                // passes SHOULD honour.  Wiring the decisions back into
+                // codegen is a future step; the planner itself is
+                // independently useful as a diagnostic and is exercised by
+                // the test suite and CLI integration tests.
+                //
+                if let Some(ref mode_str) = self.compile_options.wggo_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        // Build AnalysisConfig from CLI overrides; clamp is
+                        // also applied in analyze(), but applying it here
+                        // keeps the --wggo-report line honest.
+                        let mut analysis_config =
+                            crate::wggo_weight_analysis::AnalysisConfig::default();
+                        if let Some(f) = self.compile_options.wggo_prune_fraction {
+                            analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
+                        }
+                        // Pass the weights path for magnitude-based scoring
+                        // (NullWeightProvider is used in run_on_wengert_with_weights
+                        // when weights_path is None, producing uniform scores).
+                        // compile_options is forwarded so build_scorer can wire the
+                        // GradientScorer appropriate for --wggo-importance + --calibration-data.
+                        // The calibration pass above populated calibration_sidecar if
+                        // --calibration-data was supplied and hooks were registered.
+                        let weights_path = self.compile_options.wggo_weights.as_deref();
+                        let plan = crate::wggo::run_on_wengert_with_weights(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            self.compile_options.world_size,
+                            weights_path,
+                            analysis_config,
+                            Some(&self.compile_options),
+                        );
+                        if let Some(plan) = plan {
+                            if self.compile_options.wggo_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[wggo] {}", plan.summary());
+                            }
+                            // Stash for all downstream consumers (CSHA, WRGA, ...).
+                            self.wggo_overrides = Some(
+                                crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
+                            );
+                        }
+                    }
+                }
+
+                // CSHA: Compiler-Synthesized Holistic Attention planner.
+                // Runs the boundary-fusion scan, SMEM feasibility model,
+                // and weight-informed specialization.  Emits either the
+                // full paper-§6.3 report or a compact one-line summary
+                // gated by the `--csha` / `--csha-report` flags.  The
+                // planner is pure data-in/data-out; wiring the kernel
+                // decisions back into codegen is a follow-up step.
+                //
+                // Pass order: Calibration → WGGO → CSHA.
+                // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
+                // (via self.wggo_overrides) so that per-layer fusion-level
+                // decisions from WGGO are honoured (or rejected with a
+                // diagnostic) by CSHA.
+                if let Some(ref mode_str) = self.compile_options.csha_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        if let Some(plan) = crate::csha::run_on_wengert(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
+                            None, // shape override — defaults are fine for diagnostic
+                            8,    // default head count; weight-informed path refines this
+                            self.wggo_overrides.as_ref(),
+                        ) {
+                            if self.compile_options.csha_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[csha] {}", plan.summary());
+                            }
+                            // Emit override-rejection diagnostics after the summary line
+                            // so CLI readers see summary first, per-layer details after.
+                            for diag in &plan.override_diagnostics {
+                                let reason_str = match &diag.reason {
+                                    crate::wggo_overrides::OverrideRejectReason::SmemBudgetExceeded {
+                                        actual_kb,
+                                        limit_kb,
+                                    } => {
+                                        format!("smem_{}kb_exceeds_{}kb", actual_kb, limit_kb)
+                                    }
+                                    other => format!("{:?}", other),
+                                };
+                                eprintln!(
+                                    "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                                    diag.layer_index,
+                                    diag.requested,
+                                    diag.applied,
+                                    reason_str
+                                );
+                            }
+                            // A.1: persist the bridge result so the FA call
+                            // site can route CSHA-active layers through the
+                            // CSHA-aware FFI. `csha::run` already called
+                            // `csha_apply::bridge`; we reconstruct it here
+                            // to keep the kernels / marks / configs map
+                            // available to downstream code.
+                            let mut diags = Vec::<String>::new();
+                            self.last_csha_bridge = Some(crate::csha_apply::bridge(
+                                &plan,
+                                plan.per_layer
+                                    .first()
+                                    .map(|lp| lp.tiles.head_dim as i64)
+                                    .unwrap_or(64),
+                                &mut diags,
+                            ));
+                            for d in diags { eprintln!("warning: {d}"); }
+                            // A.2.1d: record the Wengert op indices CSHA
+                            // has claimed across all boundary chains so
+                            // downstream passes (A.2.2 RMSNorm prologue,
+                            // A.2.3 matmul projection, A.2.4 RoPE
+                            // epilogue) can ask `is_csha_claimed(op)`
+                            // before emitting a redundant launch.
+                            self.csha_claimed_ops =
+                                crate::csha_apply::collect_claimed_ops(&plan);
                         }
                     }
                 }
@@ -3864,6 +3939,32 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // Task 6: render any override-rejected diagnostics to stderr so
+                // the Phase 3 decision explainer and the user can see which
+                // WGGO-requested ranks were adjusted.  Format matches the CSHA
+                // renderer so both can be parsed uniformly.
+                if let Some(ref plan) = wrga_plan {
+                    for diag in &plan.override_diagnostics {
+                        let reason_str = match &diag.reason {
+                            crate::wggo_overrides::OverrideRejectReason::RankClampedToBounds {
+                                r_min,
+                                r_max,
+                            } => format!("rank_out_of_bounds_[{r_min},{r_max}]"),
+                            crate::wggo_overrides::OverrideRejectReason::RankForbiddenByWggo => {
+                                "rank_forbidden_by_wggo".to_string()
+                            }
+                            crate::wggo_overrides::OverrideRejectReason::BudgetExceededDowngraded {
+                                original_rank,
+                                final_rank,
+                            } => format!("budget_exceeded_{original_rank}_to_{final_rank}"),
+                            other => format!("{:?}", other),
+                        };
+                        eprintln!(
+                            "[wrga] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                            diag.layer_index, diag.requested, diag.applied, reason_str
+                        );
+                    }
+                }
                 // B.2.1 Task 2.5: materialise adapter tensors into the model
                 // struct's side-table slot now that the plan is known. Task 2
                 // reserved the slot + zero-initialised it; this call allocates
@@ -3935,6 +4036,7 @@ impl Compiler<'_> {
                     state,
                     &effective_primal,
                     &primal_vars,
+                    None, // FASE on_param_grad hook — wired in Task 3
                 )?;
                 let full_vars = &full_lowered.var_map;
 
@@ -3975,27 +4077,171 @@ impl Compiler<'_> {
                     }
                 }
 
+                // ── Build FASE consume-per-param hook (Task 3) ──
+                //
+                // When fase_deferred && source_ad_enabled, we wire a callback
+                // into the adjoint lowering that immediately accumulates each
+                // parameter gradient into m_partial and frees it.  This keeps
+                // only one parameter gradient live at a time instead of N.
+                //
+                // Ordering note: `param_paths` (built from
+                // enumerate_model_tensor_paths) drives both param_list
+                // construction (line ~3247) and accum_list construction
+                // (line ~3346).  Both iterate param_paths in the same order,
+                // so param_paths[i] == accum_list[i] == param_list[i].
+                // We index accum_list by looking up the parameter name in
+                // a compile-time param_name→idx map built from param_paths.
+                // (fase_hook_active is defined at the outer scope above.)
+                let mut param_adj_set: std::collections::HashSet<crate::wengert::VarId> =
+                    std::collections::HashSet::new();
+                // Maps adjoint VarId → (param_name, primal_cranelift_value, accum_idx)
+                // The primal_cranelift_value is used for a runtime pointer-scan against
+                // param_list so we find the correct accum_list slot even when
+                // trainable params are a subset of named_param_var_ids.
+                struct ParamHookEntry {
+                    primal_val: Value,
+                    // i64 index into accum_list (== param_list index for this param)
+                    accum_idx: i64,
+                }
+                let mut adj_vid_to_hook_entry: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    ParamHookEntry,
+                > = std::collections::HashMap::new();
+
+                if fase_hook_active {
+                    // Build a compile-time name→index map from param_paths
+                    // (param_paths[i] corresponds to accum_list[i]).
+                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
+                        param_paths
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| (p.as_str(), i as i64))
+                            .collect();
+
+                    for (param_name, primal_vid) in extractor.named_param_var_ids() {
+                        if !self.is_trainable_param_name(param_name) {
+                            continue;
+                        }
+                        let Some(&accum_idx) = param_name_to_accum_idx.get(param_name.as_str())
+                        else {
+                            // Not a tensor param — skip (scalar configs, etc.)
+                            continue;
+                        };
+                        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
+                            continue;
+                        };
+                        let Some(&primal_val) = full_vars.get(primal_vid) else {
+                            continue;
+                        };
+                        param_adj_set.insert(adj_vid);
+                        adj_vid_to_hook_entry.insert(
+                            adj_vid,
+                            ParamHookEntry {
+                                primal_val,
+                                accum_idx,
+                            },
+                        );
+                    }
+                }
+
                 // 7. Lower ADJOINT Wengert list using full_vars, which now
                 //    contains all intermediate VarId → Value mappings from
                 //    the forward pass. This is the key fix: the old code only
                 //    had named variables in primal_vars, so intermediate
                 //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
-                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
-                    self, builder, state, &adjoint, full_vars,
-                ) {
-                    Ok(gv) => gv,
-                    Err(e) => {
-                        eprintln!(
-                            "[nsl] source AD lowering failed ({}), \
-                             cannot fall back to tape AD after forward emit; \
-                             rerun without --source-ad",
-                            e
-                        );
-                        return Err(e);
+                let grad_lowered = if fase_hook_active && !param_adj_set.is_empty() {
+                    // FASE Deferred: consume each param gradient immediately.
+                    // The callback receives &mut Compiler explicitly so no
+                    // double-borrow occurs.
+                    let accum_val = accum_list.ok_or_else(|| {
+                        CodegenError::new(
+                            "fase_hook_active requires accum_list to be Some",
+                        )
+                    })?;
+                    let accum_scale = fase_plan.recipe.accum_scale;
+                    let num_params = num_params_val;
+                    let hook_map = &adj_vid_to_hook_entry;
+                    let plist = param_list;
+                    let mut fase_cb = |c: &mut Compiler,
+                                       var_id: crate::wengert::VarId,
+                                       grad_ptr: Value,
+                                       b: &mut cranelift_frontend::FunctionBuilder|
+                     -> Result<(), CodegenError> {
+                        let Some(entry) = hook_map.get(&var_id) else {
+                            return Ok(());
+                        };
+                        // Runtime pointer-scan: find the index in param_list that
+                        // matches the primal param pointer, then use the same index
+                        // for accum_list.  This is necessary because param_list and
+                        // accum_list are both indexed by param_paths order, but a
+                        // given primal_val may appear at any runtime slot if the
+                        // model has shared/aliased weights.
+                        //
+                        // Fast path: use the compile-time accum_idx directly.
+                        // accum_list[accum_idx] == the m_partial for this param
+                        // (both are param_paths-ordered).
+                        let _ = entry.primal_val; // present for future alias detection
+                        let idx_val = b.ins().iconst(cranelift_codegen::ir::types::I64, entry.accum_idx);
+                        let _ = num_params; // captured for guard assertions if needed
+                        let _ = plist;
+                        let m_partial =
+                            c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
+                        c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale)?;
+                        c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                        Ok(())
+                    };
+                    match crate::wengert_lower::compile_wengert_ops(
+                        self,
+                        builder,
+                        state,
+                        &adjoint,
+                        full_vars,
+                        Some((&param_adj_set, &mut fase_cb)),
+                    ) {
+                        Ok(gv) => gv,
+                        Err(e) => {
+                            eprintln!(
+                                "[nsl] source AD lowering (FASE hook) failed ({}), \
+                                 rerun without --source-ad",
+                                e
+                            );
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    match crate::wengert_lower::compile_wengert_ops(
+                        self, builder, state, &adjoint, full_vars,
+                        None,
+                    ) {
+                        Ok(gv) => gv,
+                        Err(e) => {
+                            eprintln!(
+                                "[nsl] source AD lowering failed ({}), \
+                                 cannot fall back to tape AD after forward emit; \
+                                 rerun without --source-ad",
+                                e
+                            );
+                            return Err(e);
+                        }
                     }
                 };
                 let grad_vars = &grad_lowered.var_map;
-                let freed_adjoint_vars = std::collections::HashSet::new();
+                // When the FASE hook is active, each parameter gradient was
+                // already consumed (accumulated into m_partial) and freed by
+                // the per-param callback during adjoint lowering.  Add those
+                // VarIds to freed_adjoint_vars so free_wengert_owned_values
+                // skips them and does not emit a second nsl_tensor_free.
+                let mut freed_adjoint_vars = std::collections::HashSet::new();
+                if fase_hook_active {
+                    freed_adjoint_vars.extend(param_adj_set.iter().copied());
+                    // Also skip raw_grad VarIds that were freed early by the
+                    // reduce_to_shape identity path in wengert_lower.  When
+                    // shapes match, reduce_to_shape returns the input with a
+                    // refcount bump; the hook's nsl_tensor_free drops rc 2→1
+                    // and wengert_lower emits a second free that drops rc 1→0.
+                    // These VarIds must NOT be freed again by end-of-adjoint cleanup.
+                    freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
+                }
 
                 if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {
                     let summarize_owned = |label: &str,
@@ -4052,12 +4298,20 @@ impl Compiler<'_> {
 
                 // 8. Collect parameter gradients into grads_list (NslList)
                 //
-                // Seed grads_list from the runtime param_list so it always has
-                // exactly one slot per collected parameter, then overwrite the
-                // matching slots using source-AD gradients keyed by parameter
-                // pointer identity. This avoids relying on a compile-time DFS
-                // path enumeration matching the runtime collector's traversal.
-                let grads = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                // When FASE hook is active, every parameter gradient was already
+                // consumed (accumulated into m_partial + freed) during adjoint
+                // lowering.  Skip the grads_list construction entirely and emit
+                // a null sentinel so downstream code that is also guarded by
+                // `!fase_hook_active` never dereferences it.
+                //
+                // When hook is inactive: seed grads_list from the runtime
+                // param_list so it always has exactly one slot per collected
+                // parameter, then overwrite the matching slots using source-AD
+                // gradients keyed by parameter pointer identity.  This avoids
+                // relying on a compile-time DFS path enumeration matching the
+                // runtime collector's traversal.
+                let grads = if !fase_hook_active {
+                let grads_inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
 
                 // 8a. Initialize one zero gradient per runtime parameter.
                 let fill_i_var = state.new_variable();
@@ -4078,7 +4332,7 @@ impl Compiler<'_> {
                 builder.seal_block(fill_body);
                 let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
                 let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
-                self.compile_call_by_name(builder, "nsl_list_push", &[grads, z])?;
+                self.compile_call_by_name(builder, "nsl_list_push", &[grads_inner, z])?;
                 let fill_one = builder.ins().iconst(cl_types::I64, 1);
                 let fill_next = builder.ins().iadd(fi, fill_one);
                 builder.def_var(fill_i_var, fill_next);
@@ -4176,7 +4430,7 @@ impl Compiler<'_> {
                     builder.switch_to_block(scan_match);
                     builder.seal_block(scan_match);
                     let old_grad =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[grads, si])?;
+                        self.compile_call_by_name(builder, "nsl_list_get", &[grads_inner, si])?;
                     // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
                     let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                     let summed_grad = self.compile_call_by_name(
@@ -4189,7 +4443,7 @@ impl Compiler<'_> {
                     let next_match_count = builder.ins().iadd(match_count, match_one);
                     builder.def_var(scan_match_count_var, next_match_count);
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[old_grad])?;
-                    self.compile_call_by_name(builder, "nsl_list_set", &[grads, si, summed_grad])?;
+                    self.compile_call_by_name(builder, "nsl_list_set", &[grads_inner, si, summed_grad])?;
                     builder.ins().jump(scan_next, &[]);
 
                     builder.switch_to_block(scan_next);
@@ -4228,6 +4482,13 @@ impl Compiler<'_> {
                     grad_ignored_config_tensor,
                     grad_ignored_non_tensor,
                 );
+                grads_inner // value returned from the `if !fase_hook_active` arm
+                } else {
+                    // Hook consumed all param grads during adjoint lowering.
+                    // Emit a null sentinel — downstream grads_list consumers are
+                    // all guarded by `!fase_hook_active`.
+                    builder.ins().iconst(cl_types::I64, 0)
+                };
 
                 let mut retained_full_vars = std::collections::HashSet::new();
                 retained_full_vars.insert(loss_var_id);
@@ -4270,7 +4531,8 @@ impl Compiler<'_> {
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
         // Prints sum(abs(grad)) per parameter — detects NaN, zero, and misrouted gradients.
-        if self.compile_options.debug_training {
+        // Skip when hook active — grads_list is a null sentinel.
+        if self.compile_options.debug_training && !fase_hook_active {
             self.compile_call_by_name(
                 builder,
                 "nsl_debug_grad_checksum",
@@ -4423,8 +4685,10 @@ impl Compiler<'_> {
             state.current_block = Some(after_wnorm);
         }
 
-        // 7e2. Gradient clipping (only if grad_clip was specified)
-        if grad_clip < f64::MAX {
+        // 7e2. Gradient clipping (only if grad_clip was specified).
+        // Skip when FASE hook is active — clip is applied via two_phase_clip
+        // on m_partial (Phase A/B in the optimizer block below), not on grads_list.
+        if !fase_hook_active && grad_clip < f64::MAX {
             let max_norm_val = builder.ins().f64const(grad_clip);
             self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
         }
@@ -4433,7 +4697,54 @@ impl Compiler<'_> {
         // persistent buffers, then free the per-batch grads immediately.
         // When not accumulating (steps == 1), grads_list is used directly
         // by the optimizer and freed after the step.
+
+        // Compute should_step ONCE here (for grad_accumulation_steps > 1 paths)
+        // so it can be reused both to gate the accumulation loop (when two_phase_clip
+        // is active) and at the optimizer-gate branch below.
+        // For steps == 1 the value is unused; define it anyway to keep the Variable
+        // live (its value is never read in that branch).
+        let should_step_var = state.new_variable();
+        builder.declare_var(should_step_var, cl_types::I8);
+        if grad_accumulation_steps > 1 {
+            let sc_early = builder.use_var(step_count_var);
+            let one_early = builder.ins().iconst(cl_types::I64, 1);
+            let sc_p1_early = builder.ins().iadd(sc_early, one_early);
+            let accum_const_early = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+            let rem_early = builder.ins().srem(sc_p1_early, accum_const_early);
+            let zero_early = builder.ins().iconst(cl_types::I64, 0);
+            let ss_val = builder.ins().icmp(IntCC::Equal, rem_early, zero_early);
+            builder.def_var(should_step_var, ss_val);
+        } else {
+            // steps == 1 → always step; store a constant true (1i8)
+            let true_val = builder.ins().iconst(cl_types::I8, 1);
+            builder.def_var(should_step_var, true_val);
+        }
+
+        if !fase_hook_active {
         if let Some(accum) = accum_list {
+            // When two_phase_clip is active, Phase A (in the optimizer block) handles
+            // the final micro-batch's accumulation as part of the fused accumulate+sum_sq
+            // pass.  Skip the standard accumulation loop on the final micro-batch to
+            // avoid double-accumulating.
+            let run_standard_accum = if fase_plan.two_phase_clip {
+                // Emit a runtime conditional: skip the loop when should_step == true.
+                let pre_accum_skip = builder.create_block();
+                let pre_accum_run = builder.create_block();
+                let pre_accum_join = builder.create_block();
+                let ss_check = builder.use_var(should_step_var);
+                builder.ins().brif(ss_check, pre_accum_skip, &[], pre_accum_run, &[]);
+
+                builder.switch_to_block(pre_accum_run);
+                builder.seal_block(pre_accum_run);
+                // Standard accumulation loop lives here; we fall into the shared
+                // emission below via the `run_standard_accum` flag.
+                // (We use a sentinel to tell the loop-emission code which block to
+                // land in after the loop; the join block is pre_accum_join.)
+                Some((pre_accum_skip, pre_accum_join))
+            } else {
+                None
+            };
+
             // Runtime loop: accum[i] += grads[i], then free grads[i]
             let ga_i_var = state.new_variable();
             builder.declare_var(ga_i_var, cl_types::I64);
@@ -4453,12 +4764,23 @@ impl Compiler<'_> {
             builder.seal_block(ga_body);
             let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
             let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
-            let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-            self.compile_call_by_name(
-                builder,
-                "nsl_grad_accumulate_add",
-                &[accum_buf, grad, n_elems],
-            )?;
+            if fase_deferred {
+                // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
+                self.fase_emit_accumulate(
+                    builder,
+                    accum_buf,
+                    grad,
+                    fase_plan.recipe.accum_scale,
+                )?;
+            } else {
+                // Existing path: raw gradient sum (divided / zeroed after optimizer step)
+                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_grad_accumulate_add",
+                    &[accum_buf, grad, n_elems],
+                )?;
+            }
             self.compile_call_by_name(builder, "nsl_tensor_free", &[grad])?;
             let ga_one = builder.ins().iconst(cl_types::I64, 1);
             let ga_next = builder.ins().iadd(gai, ga_one);
@@ -4469,20 +4791,28 @@ impl Compiler<'_> {
             builder.seal_block(ga_exit);
             state.current_block = Some(ga_exit);
             self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+
+            // If two_phase_clip gated the loop: jump to join, then wire the skip
+            // path in, and continue from join.
+            if let Some((skip_block, join_block)) = run_standard_accum {
+                builder.ins().jump(join_block, &[]);
+                builder.switch_to_block(skip_block);
+                builder.seal_block(skip_block);
+                builder.ins().jump(join_block, &[]);
+                builder.switch_to_block(join_block);
+                builder.seal_block(join_block);
+                state.current_block = Some(join_block);
+            }
         }
+        } // end if !fase_hook_active (per-micro-batch accumulation guard)
 
         // 7e4. Gradient accumulation gate: only step optimizer every N batches
         let optimizer_block = builder.create_block();
         let post_optimizer_block = builder.create_block();
 
         if grad_accumulation_steps > 1 {
-            let sc = builder.use_var(step_count_var);
-            let accum_val = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
-            let one_ga = builder.ins().iconst(cl_types::I64, 1);
-            let sc_plus_one = builder.ins().iadd(sc, one_ga);
-            let rem = builder.ins().srem(sc_plus_one, accum_val);
-            let zero_check = builder.ins().iconst(cl_types::I64, 0);
-            let should_step = builder.ins().icmp(IntCC::Equal, rem, zero_check);
+            // Reuse the already-computed should_step value (defined above).
+            let should_step = builder.use_var(should_step_var);
             builder
                 .ins()
                 .brif(should_step, optimizer_block, &[], post_optimizer_block, &[]);
@@ -4499,6 +4829,230 @@ impl Compiler<'_> {
         }
 
         // 7f. Optimizer step: for each param, call optimizer step function
+        // FASE Deferred: emit fused per-parameter step; otherwise use existing path.
+        if fase_deferred {
+            if let Some(accum) = accum_list {
+                // ── FASE Deferred: compute bias-correction scalars once per step ──
+                // opt_step = (step_count + 1) / grad_accumulation_steps
+                // bc_inv = nsl_bias_correction_inv(β, opt_step)
+                let sc_val = builder.use_var(step_count_var);
+                let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+                let sc_plus_one = builder.ins().iadd(sc_val, one_i64);
+                let grad_accum_const = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+                let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
+
+                let beta1_const = builder.ins().f64const(fase_plan.recipe.beta1);
+                let beta2_const = builder.ins().f64const(fase_plan.recipe.beta2);
+                let bc1_inv = self.compile_call_by_name(
+                    builder,
+                    "nsl_bias_correction_inv",
+                    &[beta1_const, opt_step],
+                )?;
+                let bc2_inv = self.compile_call_by_name(
+                    builder,
+                    "nsl_bias_correction_inv",
+                    &[beta2_const, opt_step],
+                )?;
+
+                if fase_plan.two_phase_clip {
+                    // ── Phase A: fused accumulation + sum_sq loop ──
+                    // Accumulate the final micro-batch's gradients into m_partial
+                    // (the standard accumulation loop was skipped for this batch),
+                    // and simultaneously accumulate sum(||g_i||^2) for the global
+                    // L2 norm.
+                    let pa_tot_var = state.new_variable();
+                    builder.declare_var(pa_tot_var, cl_types::F64);
+                    let pa_zero_f = builder.ins().f64const(0.0);
+                    builder.def_var(pa_tot_var, pa_zero_f);
+
+                    let pa_i_var = state.new_variable();
+                    builder.declare_var(pa_i_var, cl_types::I64);
+                    let pa_i_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(pa_i_var, pa_i_zero);
+
+                    let pa_hdr = builder.create_block();
+                    let pa_body = builder.create_block();
+                    let pa_exit = builder.create_block();
+                    builder.ins().jump(pa_hdr, &[]);
+                    builder.switch_to_block(pa_hdr);
+                    let pa_i = builder.use_var(pa_i_var);
+                    let pa_cont =
+                        builder.ins().icmp(IntCC::SignedLessThan, pa_i, num_params_val);
+                    builder.ins().brif(pa_cont, pa_body, &[], pa_exit, &[]);
+                    builder.switch_to_block(pa_body);
+                    builder.seal_block(pa_body);
+
+                    let pa_mpart =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+                    // When FASE hook is active, accumulation already happened
+                    // during adjoint lowering — skip the grads_list read + accumulate.
+                    if !fase_hook_active {
+                        let pa_grad = self.compile_call_by_name(
+                            builder,
+                            "nsl_list_get",
+                            &[grads_list, pa_i],
+                        )?;
+                        self.fase_emit_accumulate(
+                            builder,
+                            pa_mpart,
+                            pa_grad,
+                            fase_plan.recipe.accum_scale,
+                        )?;
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
+                    }
+                    let pa_sq = self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_sum_sq",
+                        &[pa_mpart],
+                    )?;
+                    let pa_tot_cur = builder.use_var(pa_tot_var);
+                    let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
+                    builder.def_var(pa_tot_var, pa_tot_new);
+                    let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
+                    builder.def_var(pa_i_var, pa_i_next);
+                    builder.ins().jump(pa_hdr, &[]);
+
+                    builder.switch_to_block(pa_exit);
+                    builder.seal_block(pa_hdr);
+                    builder.seal_block(pa_exit);
+
+                    // Free grads_list wrapper — skip when hook active (null sentinel).
+                    if !fase_hook_active {
+                        self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+                    }
+
+                    // ── Scalar: clip_factor = min(1, grad_clip / (sqrt(total_sq) + 1e-6)) ──
+                    // `grad_clip` is the raw f64 from the train-block config
+                    // (f64::MAX when not set, but two_phase_clip is only true when it IS set).
+                    let grad_clip_threshold = grad_clip;
+                    let total_sq = builder.use_var(pa_tot_var);
+                    let norm = builder.ins().sqrt(total_sq);
+                    let eps_v = builder.ins().f64const(1e-6_f64);
+                    let denom = builder.ins().fadd(norm, eps_v);
+                    let tau_v = builder.ins().f64const(grad_clip_threshold);
+                    let ratio = builder.ins().fdiv(tau_v, denom);
+                    let one_f = builder.ins().f64const(1.0_f64);
+                    let clip_factor = builder.ins().fmin(one_f, ratio);
+
+                    // ── Phase B: scale m_partial in place, then fused optimizer step ──
+                    let pb_i_var = state.new_variable();
+                    builder.declare_var(pb_i_var, cl_types::I64);
+                    let pb_i_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(pb_i_var, pb_i_zero);
+
+                    let pb_hdr = builder.create_block();
+                    let pb_body = builder.create_block();
+                    let pb_exit = builder.create_block();
+                    builder.ins().jump(pb_hdr, &[]);
+                    builder.switch_to_block(pb_hdr);
+                    let pb_i = builder.use_var(pb_i_var);
+                    let pb_cont =
+                        builder.ins().icmp(IntCC::SignedLessThan, pb_i, num_params_val);
+                    builder.ins().brif(pb_cont, pb_body, &[], pb_exit, &[]);
+                    builder.switch_to_block(pb_body);
+                    builder.seal_block(pb_body);
+
+                    let pb_mpart =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[accum, pb_i])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_mul_scalar_inplace",
+                        &[pb_mpart, clip_factor],
+                    )?;
+                    let pb_theta = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_get",
+                        &[param_list, pb_i],
+                    )?;
+                    let pb_m = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_get",
+                        &[state_list_1, pb_i],
+                    )?;
+                    let pb_v = if num_state_buffers >= 2 {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_list_get",
+                            &[state_list_2, pb_i],
+                        )?
+                    } else {
+                        pb_m
+                    };
+                    self.fase_emit_final_step(
+                        builder,
+                        pb_theta,
+                        pb_m,
+                        pb_mpart,
+                        pb_v,
+                        &fase_plan.recipe,
+                        Some((bc1_inv, bc2_inv)),
+                    )?;
+                    let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
+                    builder.def_var(pb_i_var, pb_i_next);
+                    builder.ins().jump(pb_hdr, &[]);
+
+                    builder.switch_to_block(pb_exit);
+                    builder.seal_block(pb_hdr);
+                    builder.seal_block(pb_exit);
+                    state.current_block = Some(pb_exit);
+                } else {
+                    // ── Non-clip Deferred path: per-parameter fused final step ──
+                    // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
+                    let fs_i_var = state.new_variable();
+                    builder.declare_var(fs_i_var, cl_types::I64);
+                    let fs_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(fs_i_var, fs_zero);
+                    let fs_hdr = builder.create_block();
+                    let fs_body = builder.create_block();
+                    let fs_exit = builder.create_block();
+                    builder.ins().jump(fs_hdr, &[]);
+                    builder.switch_to_block(fs_hdr);
+                    let fs_i = builder.use_var(fs_i_var);
+                    let fs_cont =
+                        builder.ins().icmp(IntCC::SignedLessThan, fs_i, num_params_val);
+                    builder.ins().brif(fs_cont, fs_body, &[], fs_exit, &[]);
+                    builder.switch_to_block(fs_body);
+                    builder.seal_block(fs_body);
+                    let theta =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fs_i])?;
+                    let m =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, fs_i])?;
+                    let m_partial =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[accum, fs_i])?;
+                    let v = if num_state_buffers >= 2 {
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, fs_i])?
+                    } else {
+                        // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
+                        m
+                    };
+                    self.fase_emit_final_step(
+                        builder,
+                        theta,
+                        m,
+                        m_partial,
+                        v,
+                        &fase_plan.recipe,
+                        Some((bc1_inv, bc2_inv)),
+                    )?;
+                    // fase_emit_final_step zeroed m_partial already — no Site E needed.
+                    let fs_one = builder.ins().iconst(cl_types::I64, 1);
+                    let fs_next = builder.ins().iadd(fs_i, fs_one);
+                    builder.def_var(fs_i_var, fs_next);
+                    builder.ins().jump(fs_hdr, &[]);
+                    builder.seal_block(fs_hdr);
+                    builder.switch_to_block(fs_exit);
+                    builder.seal_block(fs_exit);
+                    state.current_block = Some(fs_exit);
+                }
+
+                // Jump to post-optimizer block (merges optimizer and skip paths)
+                builder.ins().jump(post_optimizer_block, &[]);
+                builder.switch_to_block(post_optimizer_block);
+                builder.seal_block(post_optimizer_block);
+                state.current_block = Some(post_optimizer_block);
+            }
+        } else {
+
         // When accumulating, use accum_list (accumulated grads); otherwise use grads_list directly.
         let opt_grads = if let Some(accum) = accum_list {
             accum
@@ -4739,8 +5293,10 @@ impl Compiler<'_> {
             builder.switch_to_block(c_exit);
             builder.seal_block(c_exit);
             state.current_block = Some(c_exit);
-        } else {
-            // No accumulation — free gradient tensors and grads_list every batch
+        } else if !fase_hook_active {
+            // No accumulation — free gradient tensors and grads_list every batch.
+            // Skip when FASE hook is active: grads are already freed during
+            // adjoint lowering, and grads_list is a null sentinel.
             let cleanup_i_var = state.new_variable();
             builder.declare_var(cleanup_i_var, cl_types::I64);
             let c_zero = builder.ins().iconst(cl_types::I64, 0);
@@ -4775,6 +5331,7 @@ impl Compiler<'_> {
         builder.switch_to_block(post_optimizer_block);
         builder.seal_block(post_optimizer_block);
         state.current_block = Some(post_optimizer_block);
+        } // end else (non-FASE-Deferred optimizer path)
 
         // 7g2. Scheduler: update learning rate if scheduler is configured
         // NOTE: step_count is incremented AFTER the scheduler call so that
@@ -6288,6 +6845,7 @@ impl Compiler<'_> {
             state,
             extractor.wengert_list(),
             &primal_vars,
+            None, // FASE on_param_grad hook — wired in Task 3
         )?;
         let full_vars = &full_lowered.var_map;
 
@@ -6312,6 +6870,7 @@ impl Compiler<'_> {
             if !adjoint.ops.is_empty() {
                 let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, &adjoint, full_vars,
+                    None, // FASE on_param_grad hook — wired in Task 3
                 ) {
                     Ok(gv) => gv,
                     Err(e) => {
@@ -6565,6 +7124,43 @@ impl Compiler<'_> {
             .iconst(cl_types::I64, layout.total_size.max(8) as i64);
         let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
 
+        // 4b. If this is an AWQ quant block and a calibration sidecar is present,
+        //     decode the AWQ activation scales once.  We'll use them per-field below.
+        //
+        //     Key: "awq_activation_scales" in sidecar.hooks (binary blob).
+        //     Projection path format: "{model_type_name}.{field_name}" — same
+        //     cache key as Task 8's discovery pass.
+        //
+        //     Hard error when sidecar present but projection missing:
+        //     silent fallback to uncalibrated is a correctness trap.
+        let is_awq = matches!(quant.default_dtype, Some(QuantDtype::Awq4));
+        let awq_scales_opt: Option<nsl_runtime::awq::AwqScales> = if is_awq {
+            match self.compile_options.calibration_sidecar.as_ref() {
+                None => None,
+                Some(sidecar) => {
+                    match sidecar.hooks.get("awq_activation_scales") {
+                        None => None, // Sidecar present but no AWQ hook blob → treat as uncalibrated.
+                        Some(blob) => {
+                            match nsl_runtime::awq::AwqScales::from_blob(blob) {
+                                Ok(scales) => Some(scales),
+                                Err(e) => {
+                                    // Blob present but malformed → hard error.
+                                    return Err(CodegenError::new(format!(
+                                        "AWQ calibration sidecar blob is malformed: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        // AWQ calibration alpha (matches awq_quantize_with_scales default).
+        let awq_alpha: f64 = 0.5;
+
         // 5. For each field: quantize→dequantize (or clone if excluded)
         for field in &layout.fields {
             let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
@@ -6582,17 +7178,103 @@ impl Compiler<'_> {
                     .ins()
                     .store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
             } else {
+                // For AWQ with a calibration sidecar, pre-scale the weight tensor using
+                // the per-input-channel activation statistics before quantizing.
+                // This embeds the scale data as compile-time constants in the object file
+                // and calls nsl_awq_pre_scale_weight at runtime to apply them.
+                let weight_for_quantize: Value = if is_awq {
+                    match awq_scales_opt.as_ref() {
+                        None => {
+                            // No sidecar → uncalibrated, pass weight through unchanged.
+                            src_val
+                        }
+                        Some(scales_map) => {
+                            // Sidecar present — projection MUST have scales.
+                            let projection_path =
+                                format!("{}.{}", model_type_name, field.name);
+                            let field_scales = scales_map
+                                .by_projection
+                                .get(&projection_path)
+                                .ok_or_else(|| {
+                                    CodegenError::missing_scales(&projection_path)
+                                })?;
+
+                            // Embed scale data as a compile-time constant in .rodata.
+                            let data_label = format!(
+                                "__nsl_awq_scales_{}_{}",
+                                model_type_name, field.name
+                            );
+                            let scale_bytes: Vec<u8> = field_scales
+                                .iter()
+                                .flat_map(|v: &f32| v.to_le_bytes())
+                                .collect();
+                            let scale_data_id = self
+                                .module
+                                .declare_data(
+                                    &data_label,
+                                    cranelift_module::Linkage::Local,
+                                    false,
+                                    false,
+                                )
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to declare AWQ scale data for \
+                                         '{projection_path}': {e}"
+                                    ))
+                                })?;
+                            let mut data_desc = cranelift_module::DataDescription::new();
+                            data_desc.define(scale_bytes.into_boxed_slice());
+                            self.module
+                                .define_data(scale_data_id, &data_desc)
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to define AWQ scale data for \
+                                         '{projection_path}': {e}"
+                                    ))
+                                })?;
+
+                            // Get a pointer to the scale data in this function.
+                            let scale_gv = self
+                                .module
+                                .declare_data_in_func(scale_data_id, builder.func);
+                            let scales_ptr =
+                                builder.ins().symbol_value(cl_types::I64, scale_gv);
+                            let scales_len = builder
+                                .ins()
+                                .iconst(cl_types::I64, field_scales.len() as i64);
+                            let alpha_v = builder.ins().f64const(awq_alpha);
+
+                            // Apply calibration scaling: returns a new NslTensor.
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_awq_pre_scale_weight",
+                                &[src_val, scales_ptr, scales_len, alpha_v],
+                            )?
+                        }
+                    }
+                } else {
+                    src_val
+                };
+
                 // Quantize then immediately dequantize — validates the roundtrip and
                 // shows quantization effects (precision loss) while storing a regular
                 // NslTensor that the original forward method can consume directly.
                 let qt = self.compile_call_by_name(
                     builder,
                     "nsl_qtensor_quantize",
-                    &[src_val, dtype_v, gran_v, axis_v, gs_v],
+                    &[weight_for_quantize, dtype_v, gran_v, axis_v, gs_v],
                 )?;
                 let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
                 // Release the intermediate QuantizedTensor (refcount-aware)
                 self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
+                // If we pre-scaled the weight, release the intermediate scaled tensor too.
+                if is_awq && awq_scales_opt.is_some() {
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_release",
+                        &[weight_for_quantize],
+                    )?;
+                }
                 builder
                     .ins()
                     .store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
@@ -6620,18 +7302,88 @@ impl Compiler<'_> {
 
     /// Walk the compiled model's `quant { ... }` blocks and produce the
     /// list of ProjectionRefs that AWQ needs calibration data for.
-    /// Returns `None` when no AWQ quant block is present.
+    /// Returns `None` when no AWQ quant block is present or discovery
+    /// produces no matches.
     ///
-    /// MVP scope: projection enumeration is deferred — Task 13's AWQ
-    /// quant pass reads `compile_options.calibration_sidecar` when a
-    /// sidecar exists and builds its own projection set from the quant
-    /// AST directly.  Returning `None` here keeps the registry empty so
-    /// the harness logs the "no calibration hooks registered" notice
-    /// and proceeds as a no-op until downstream wiring lands.
+    /// Implementation (Task 3): scans `self.features.quant_configs` for
+    /// models quantised with `"awq4"`.  For each such model, retrieves the
+    /// `forward` method body from `model_method_bodies`, walks its pipe chain
+    /// to enumerate linear-projection call sites, and returns the sorted,
+    /// deduplicated `Vec<ProjectionRef>`.  Discovery errors (e.g. empty match)
+    /// are logged to stderr and treated as `None` so the harness falls back to
+    /// its no-op path rather than crashing the compile.
     fn discover_awq_projections(
         &self,
-    ) -> Option<Vec<crate::calibration::ProjectionRef>> {
-        None
+    ) -> Option<Vec<crate::calibration::DiscoveredProjection>> {
+        use crate::calibration::discover_awq_projections_from_state;
+
+        // Collect all AWQ-quantised model names.
+        let awq_models: Vec<String> = self
+            .features
+            .quant_configs
+            .iter()
+            .filter(|(_, cfg)| cfg.dtype == "awq4")
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if awq_models.is_empty() {
+            return None;
+        }
+
+        let mut all_projections: Vec<crate::calibration::DiscoveredProjection> = Vec::new();
+
+        for model_name in &awq_models {
+            // Retrieve the forward method body (if stored).
+            let forward_body: Option<&nsl_ast::stmt::Block> = self
+                .models
+                .model_method_bodies
+                .get(model_name)
+                .and_then(|methods| methods.get("forward"))
+                .map(|fn_def| &fn_def.body);
+
+            // Retrieve field-type and shape maps for this model.
+            let empty_field_types = std::collections::HashMap::new();
+            let field_types = self
+                .models
+                .model_field_types
+                .get(model_name)
+                .unwrap_or(&empty_field_types);
+
+            let empty_shapes = std::collections::HashMap::new();
+            let tensor_shapes = self
+                .models
+                .model_tensor_field_shapes
+                .get(model_name)
+                .unwrap_or(&empty_shapes);
+
+            match discover_awq_projections_from_state(
+                model_name,
+                forward_body,
+                field_types,
+                tensor_shapes,
+                &[], // no exclusions from the Compiler-level stub; the QuantBlock's
+                     // exclude list is stored in the AST which isn't retained here.
+                self.interner,
+            ) {
+                Ok(discovered) => {
+                    for dp in discovered {
+                        all_projections.push(dp);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[calibration] AWQ discovery for model '{model_name}': {e}");
+                }
+            }
+        }
+
+        if all_projections.is_empty() {
+            None
+        } else {
+            // Sort + dedup across models (by qualified path for determinism).
+            all_projections.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+            all_projections.dedup_by(|a, b| a.projection.0 == b.projection.0);
+            Some(all_projections)
+        }
     }
 
 

@@ -441,6 +441,19 @@ pub struct Compiler<'a> {
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 
+    // ── Calibration retention pass (Task 4) ─────────────────────
+    /// DataId of the `__nsl_calib_retention_arena` .bss global.
+    /// `None` when `calibration_retention` is not set.
+    pub retention_arena_data_id: Option<cranelift_module::DataId>,
+    /// Per-projection byte offsets inside the retention arena.
+    /// Populated at the same time as `retention_arena_data_id`.
+    pub retention_offsets: std::collections::HashMap<String, u32>,
+
+    // ── WGGO override side-channel (Task 3) ─────────────────────
+    /// Per-layer WGGO decisions for consumer passes.  Populated in the
+    /// diagnostics section of `compile_quant_block` when `--wggo` is on;
+    /// read by CSHA, WRGA, and (future) FASE/Prune/Sharding consumers.
+    pub(crate) wggo_overrides: Option<crate::wggo_overrides::WggoOverrides>,
 }
 
 /// Quantization configuration for a model.
@@ -582,6 +595,9 @@ impl<'a> Compiler<'a> {
             csha_claimed_ops: std::collections::HashSet::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
+            retention_arena_data_id: None,
+            retention_offsets: std::collections::HashMap::new(),
+            wggo_overrides: None,
         })
     }
 
@@ -956,6 +972,61 @@ impl<'a> Compiler<'a> {
             self.features.wcet_results.push(func_wcet);
         }
 
+        Ok(())
+    }
+
+    /// Task 4: Declare and define the `__nsl_calib_retention_arena` zeroinit
+    /// `.bss` global when `calibration_retention` is active.  Populates
+    /// `self.retention_arena_data_id` and `self.retention_offsets` for use
+    /// by the splice-point codegen in `expr/mod.rs`.
+    ///
+    /// # MVP note
+    /// Batch and seq are hard-coded to `8` and `4` here (matching the Task 10
+    /// fixture).  Task 6 will thread the real values from the calibration-data
+    /// header through `CompileOptions`.
+    pub fn emit_retention_arena(&mut self) -> Result<(), CodegenError> {
+        let projections = match self.compile_options.calibration_retention.clone() {
+            Some(ps) if !ps.is_empty() => ps,
+            _ => return Ok(()),
+        };
+
+        let (batch, seq) = self.compile_options.calibration_batch_seq.unwrap_or((8, 4));
+        let layout = crate::calibration::build_arena_layout(&projections, batch, seq);
+        let total = layout.total_bytes() as usize;
+        if total == 0 {
+            return Ok(());
+        }
+
+        // Declare a zeroinit global (lands in .bss on ELF targets).
+        let data_id = self
+            .module
+            .declare_data(
+                "__nsl_calib_retention_arena",
+                cranelift_module::Linkage::Export,
+                true,  // writable
+                false, // not TLS
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare retention arena data: {e}"
+                ))
+            })?;
+
+        let mut desc = DataDescription::new();
+        desc.define_zeroinit(total);
+        self.module
+            .define_data(data_id, &desc)
+            .map_err(|e| CodegenError::new(format!("failed to define retention arena: {e}")))?;
+
+        // Populate the offset map so splice-point IR can look up per-projection offsets.
+        let offsets: std::collections::HashMap<String, u32> = layout
+            .entries
+            .iter()
+            .map(|(p, off, _)| (p.0.clone(), *off))
+            .collect();
+
+        self.retention_arena_data_id = Some(data_id);
+        self.retention_offsets = offsets;
         Ok(())
     }
 

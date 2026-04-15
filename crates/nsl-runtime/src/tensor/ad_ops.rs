@@ -1474,11 +1474,21 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
     let g_ndim = grad.ndim as usize;
     let t_ndim = target.ndim as usize;
 
-    // If same ndim and same shape, just clone
+    // If same ndim and same shape, reduce_to_shape is an identity — no new
+    // allocation needed.  Increment grad's refcount and return the same pointer
+    // so both the caller's logical use and the original owner's lifetime share
+    // one physical allocation.  This is what makes the FASE consume-per-param
+    // hook's peak-memory savings actually materialise: the hook's
+    // nsl_tensor_free decrements refcount from 2→1 (no actual free), and
+    // end-of-adjoint cleanup on the raw-grad VarId decrements from 1→0 and
+    // releases the allocation.  Without this, the clone produced a fresh
+    // 256 KB tensor that the hook freed immediately while the raw-grad stayed
+    // alive, so N raw gradients accumulated during adjoint lowering.
     if g_ndim == t_ndim {
         let same = (0..g_ndim).all(|i| unsafe { *grad.shape.add(i) == *target.shape.add(i) });
         if same {
-            return super::nsl_tensor_clone(grad_ptr);
+            super::nsl_tensor_retain(grad_ptr);
+            return grad_ptr;
         }
     }
 

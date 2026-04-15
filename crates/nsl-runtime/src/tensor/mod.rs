@@ -1147,17 +1147,6 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         crate::cuda::inner::memcpy_dtod(dst.data, src.data, byte_count);
         return;
     } else if dst.device > 0 && src.device == 0 {
-        if byte_count == 12_582_912 {
-            eprintln!(
-                "[nsl] memcpy_htod@copy_data dst_shape={:?} src_shape={:?} dst_device={} src_device={} dst_ptr={:?} src_ptr={:?}",
-                get_shape_vec(dst),
-                get_shape_vec(src),
-                dst.device,
-                src.device,
-                dst.data,
-                src.data
-            );
-        }
         crate::cuda::inner::memcpy_htod(dst.data, src.data, byte_count);
         return;
     } else if dst.device == 0 && src.device > 0 {
@@ -1208,20 +1197,30 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *dc.data_f64().add(i) += *sc.data_f64().add(i); }
             }
         }
-        // Copy result back to device
-        let byte_count = (dc.len as usize) * dc.element_size();
-        if byte_count == 12_582_912 {
-            eprintln!(
-                "[nsl] memcpy_htod@add_inplace dst_shape={:?} src_shape={:?} dst_device={} src_device={} dst_ptr={:?} src_ptr={:?}",
-                get_shape_vec(dst),
-                get_shape_vec(dc),
-                dst.device,
-                dc.device,
+        // Copy result back to GPU. The GPU buffer is f32 (canonical GPU dtype).
+        // The CPU result `dc` may be f32 or f64 depending on the migration path
+        // (`nsl_tensor_to_device` upcasts GPU f32 → CPU f64). HtoD with a
+        // f64-sized src would overrun the f32 dst buffer, so down-convert when
+        // needed before the copy.
+        let len = dc.len as usize;
+        let f32_bytes = len * std::mem::size_of::<f32>();
+        if dc.dtype == 1 {
+            // CPU f32 → GPU f32: direct copy.
+            crate::cuda::inner::memcpy_htod(dst.data, dc.data, f32_bytes);
+        } else {
+            // CPU f64 → GPU f32: stage the down-conversion in a heap buffer.
+            let staging = checked_alloc(f32_bytes) as *mut f32;
+            let src = dc.data as *const f64;
+            for i in 0..len {
+                unsafe { *staging.add(i) = *src.add(i) as f32; }
+            }
+            crate::cuda::inner::memcpy_htod(
                 dst.data,
-                dc.data
+                staging as *const std::ffi::c_void,
+                f32_bytes,
             );
+            unsafe { checked_free(staging as *mut u8, f32_bytes); }
         }
-        crate::cuda::inner::memcpy_htod(dst.data, dc.data, byte_count);
         nsl_tensor_free(dst_cpu);
         if src_cpu != src_ptr { nsl_tensor_free(src_cpu); }
         return;
@@ -1253,6 +1252,64 @@ pub extern "C" fn nsl_tensor_zero_inplace(tensor_ptr: i64) {
     }
     unsafe {
         std::ptr::write_bytes(tensor.data as *mut u8, 0, byte_count);
+    }
+}
+
+/// Elementwise in-place scale: `tensor *= scalar`.
+///
+/// No allocation.  CPU tensors mutate their storage directly; GPU tensors
+/// round-trip through CPU for correctness (if this shows up in a profile,
+/// add a dedicated GPU scale kernel — for now the path is unused by
+/// FASE Deferred, which runs clipping on CPU-resident accumulator slots).
+///
+/// Used by FASE Deferred's two-phase gradient clip (Phase B) to apply
+/// the global clip factor to each parameter's `m_partial` without
+/// allocating a fresh tensor per parameter.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
+    if tensor_ptr == 0 {
+        return;
+    }
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 {
+        // Round-trip: pull to CPU, scale, push back.
+        let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
+        nsl_tensor_mul_scalar_inplace(cpu_ptr, scalar);
+        let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
+        let byte_count = (tensor.len as usize) * tensor.element_size();
+        crate::cuda::inner::memcpy_htod(tensor.data, cpu_tensor.data, byte_count);
+        nsl_tensor_free(cpu_ptr);
+        return;
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    if tensor.device > 0 {
+        eprintln!("nsl: mul_scalar_inplace: GPU path requires cuda feature");
+        std::process::abort();
+    }
+
+    if !tensor.has_writable_storage() {
+        eprintln!("nsl: mul_scalar_inplace cannot write into borrowed CPU storage");
+        std::process::abort();
+    }
+
+    if tensor.dtype == 1 {
+        let s = scalar as f32;
+        for i in 0..tensor.len as usize {
+            unsafe {
+                let p = tensor.data_f32().add(i);
+                *p *= s;
+            }
+        }
+    } else {
+        for i in 0..tensor.len as usize {
+            unsafe {
+                let p = tensor.data_f64().add(i);
+                *p *= scalar;
+            }
+        }
     }
 }
 
@@ -1365,6 +1422,47 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
     {
         panic!("CUDA support not compiled. Rebuild with --features cuda");
     }
+}
+
+// === Gradient utilities ===
+
+/// Sum of squared elements: `Σ x²`, returned as f64.
+///
+/// Supports both f32 and f64 dtypes.  GPU tensors are transferred to
+/// CPU for the reduction (mirrors `nsl_clip_grad_norm`).  Used by FASE
+/// Deferred's two-phase gradient clipping to compute the global L2 norm.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
+    if tensor_ptr == 0 {
+        return 0.0;
+    }
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    // GPU tensors: transfer to CPU for reduction.
+    let (cpu_ptr, was_gpu) = if tensor.device > 0 {
+        (nsl_tensor_to_device(tensor_ptr, 0), true)
+    } else {
+        (tensor_ptr, false)
+    };
+
+    let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
+    let mut acc: f64 = 0.0;
+    if cpu_tensor.dtype == 1 {
+        for i in 0..cpu_tensor.len as usize {
+            let v = unsafe { *cpu_tensor.data_f32().add(i) } as f64;
+            acc += v * v;
+        }
+    } else {
+        for i in 0..cpu_tensor.len as usize {
+            let v = unsafe { *cpu_tensor.data_f64().add(i) };
+            acc += v * v;
+        }
+    }
+
+    if was_gpu {
+        nsl_tensor_free(cpu_ptr);
+    }
+    acc
 }
 
 // === Gradient clipping ===
@@ -2604,6 +2702,16 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     panic!("GPU-to-GPU transfer not yet supported");
 }
 
+/// Migrate `src` to match `ref_tensor`'s device. Returns a new refcounted tensor
+/// (either `src` with incremented refcount if devices already match, or a
+/// device-migrated copy). Used by FASE Deferred to reconcile CPU tape-AD
+/// gradients with GPU-resident m_partial buffers before in-place accumulation.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
+    let r = unsafe { &*(ref_ptr as *const NslTensor) };
+    nsl_tensor_to_device(src_ptr, r.device as i64)
+}
+
 /// Prefetch a unified-memory tensor to a GPU device asynchronously.
 /// This starts the page migration before the GPU actually accesses the data,
 /// reducing first-access latency from page faults. No-op on CPU tensors.
@@ -3827,6 +3935,90 @@ mod tests {
         assert!(t.can_mutate_inplace(), "CPU tensor with refcount=1 should pass CPU check");
         assert!(!t.can_mutate_inplace_gpu(), "CPU tensor should fail GPU check");
         nsl_tensor_free(ptr);
+    }
+
+    #[test]
+    fn sum_sq_f32_known_values() {
+        // 4-element f32 tensor with [1.0, 2.0, -3.0, 0.5]: Σx² = 14.25
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = nsl_tensor_zeros(shape_list);
+        let tensor = NslTensor::from_ptr(t);
+        unsafe {
+            *tensor.data_f32().add(0) = 1.0;
+            *tensor.data_f32().add(1) = 2.0;
+            *tensor.data_f32().add(2) = -3.0;
+            *tensor.data_f32().add(3) = 0.5;
+        }
+        let got = nsl_tensor_sum_sq(t);
+        assert!((got - 14.25).abs() < 1e-9, "got {}", got);
+        nsl_tensor_free(t);
+        crate::list::nsl_list_free(shape_list);
+    }
+
+    #[test]
+    fn sum_sq_of_zero_tensor_is_zero() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 8);
+        let t = nsl_tensor_zeros(shape_list);
+        let got = nsl_tensor_sum_sq(t);
+        assert_eq!(got, 0.0);
+        nsl_tensor_free(t);
+        crate::list::nsl_list_free(shape_list);
+    }
+
+    #[test]
+    fn sum_sq_null_pointer_returns_zero() {
+        let got = nsl_tensor_sum_sq(0);
+        assert_eq!(got, 0.0);
+    }
+
+    #[test]
+    fn mul_scalar_inplace_f32_scales_values() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = nsl_tensor_zeros(shape_list);
+        let tensor = NslTensor::from_ptr(t);
+        unsafe {
+            *tensor.data_f32().add(0) = 2.0;
+            *tensor.data_f32().add(1) = -1.5;
+            *tensor.data_f32().add(2) = 0.0;
+        }
+        nsl_tensor_mul_scalar_inplace(t, 0.5);
+        unsafe {
+            assert!(((*tensor.data_f32().add(0)) - 1.0).abs() < 1e-6);
+            assert!(((*tensor.data_f32().add(1)) - (-0.75)).abs() < 1e-6);
+            assert!((*tensor.data_f32().add(2)).abs() < 1e-6);
+        }
+        nsl_tensor_free(t);
+        crate::list::nsl_list_free(shape_list);
+    }
+
+    #[test]
+    fn mul_scalar_inplace_by_zero_clears_tensor() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 4);
+        let t = nsl_tensor_zeros(shape_list);
+        let tensor = NslTensor::from_ptr(t);
+        unsafe {
+            for i in 0..4 {
+                *tensor.data_f32().add(i) = (i + 1) as f32;
+            }
+        }
+        nsl_tensor_mul_scalar_inplace(t, 0.0);
+        unsafe {
+            for i in 0..4 {
+                assert_eq!(*tensor.data_f32().add(i), 0.0);
+            }
+        }
+        nsl_tensor_free(t);
+        crate::list::nsl_list_free(shape_list);
+    }
+
+    #[test]
+    fn mul_scalar_inplace_null_pointer_is_noop() {
+        // Null pointer must not panic or abort.
+        nsl_tensor_mul_scalar_inplace(0, 2.0);
     }
 }
 

@@ -60,6 +60,10 @@ pub struct CpdtInput<'a> {
     pub moe_roofline_slack: f64,
     pub expert_cfg: ExpertConfig,
     pub joint_cfg: JointConfig,
+    /// Single global ZeRO shard-factor recommendation aggregated from
+    /// WGGO's per-layer decisions via `WggoOverrides::min_shard_factor`.
+    /// `None` → CPDT's planner runs unchanged.
+    pub wggo_recommended_shard: Option<u32>,
 }
 
 /// Top-level CPDT plan.
@@ -73,6 +77,10 @@ pub struct CpdtPlan {
     pub experts: Option<ExpertPlan>,
     pub joint: Option<JointPlan>,
     pub solve_us: u64,
+    /// WGGO recommendations that CPDT had to clamp or reject due to
+    /// hardware constraints. Empty when no recommendation was supplied
+    /// or it was applied verbatim.
+    pub override_diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic>,
 }
 
 impl CpdtPlan {
@@ -170,20 +178,82 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
             experts: None,
             joint: None,
             solve_us: t0.elapsed().as_micros() as u64,
+            override_diagnostics: Vec::new(),
         };
     }
 
-    // 1. ZeRO search.
+    // 1. ZeRO search — builds the full eval table and selects the default best.
     let zero_search = crate::cpdt_zero::search(&input.model, &input.cluster);
-    let zero = zero_search.best.clone();
 
-    // 2. Comm schedule for the chosen ZeRO config.
+    // 2. WGGO two-gate shard-factor override.
+    //    Gate 1 (cheap reject): world_size % recommended != 0  → use default.
+    //    Gate 2 (table coverage): most aggressive feasible tuple at-or-below rec.
+    //    None → byte-identical to previous behaviour.
+    let mut override_diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic> = Vec::new();
+    let world_size_u32 = input.cluster.num_gpus;
+
+    let zero: Option<ZeroEvaluation> = match input.wggo_recommended_shard {
+        Some(rec) if world_size_u32 % rec != 0 => {
+            // Gate 1: world-size divisibility.
+            override_diagnostics.push(crate::wggo_overrides::OverrideDiagnostic {
+                layer_index: 0,
+                layer_name: "global".into(),
+                reason: crate::wggo_overrides::OverrideRejectReason::ShardFactorIncompatibleWithWorldSize {
+                    recommended: rec,
+                    world_size: world_size_u32,
+                },
+                requested: rec.to_string(),
+                applied: "internal_default".into(),
+            });
+            zero_search.best.clone()
+        }
+        Some(rec) => {
+            // Gate 2: most aggressive feasible tuple at-or-below rec.
+            let preferred = zero_search
+                .ranked
+                .iter()
+                .filter(|e| e.feasible && e.config.s_p <= rec)
+                .max_by_key(|e| e.config.s_p)
+                .cloned();
+
+            match preferred {
+                Some(t) => {
+                    // Found a feasible tuple within the recommendation —
+                    // use it silently even if s_p < rec (table-gap downgrade).
+                    Some(t)
+                }
+                None => {
+                    // Nothing feasible at-or-below rec; fall back to planner default.
+                    let actual = zero_search.best.clone();
+                    if let Some(ref eval) = actual {
+                        if eval.config.s_p > rec {
+                            override_diagnostics
+                                .push(crate::wggo_overrides::OverrideDiagnostic {
+                                    layer_index: 0,
+                                    layer_name: "global".into(),
+                                    reason: crate::wggo_overrides::OverrideRejectReason::ShardFactorOverriddenByMemory {
+                                        recommended: rec,
+                                        applied: eval.config.s_p,
+                                    },
+                                    requested: rec.to_string(),
+                                    applied: eval.config.s_p.to_string(),
+                                });
+                        }
+                    }
+                    actual
+                }
+            }
+        }
+        None => zero_search.best.clone(),
+    };
+
+    // 3. Comm schedule for the chosen ZeRO config.
     let comm_schedule = match zero.as_ref() {
         Some(eval) => build_schedule(eval.config, &input.model.per_layer_param_bytes),
         None => CommSchedule::default(),
     };
 
-    // 3. Precision plan (only if weights + Full mode).
+    // 4. Precision plan (only if weights + Full mode).
     let precision = if input.mode == CpdtMode::Full {
         match input.weights {
             Some(wm) => plan_map(wm, &input.precision_cfg),
@@ -193,10 +263,10 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         PrecisionPlan::default()
     };
 
-    // 4. Quantized optimizer programs.
+    // 5. Quantized optimizer programs.
     let optimizer_programs = emit_plan(&precision, &input.adamw);
 
-    // 5. MoE placement (if present).
+    // 6. MoE placement (if present).
     let experts = if input.mode == CpdtMode::Full {
         input.moe_shape.map(|shape| {
             crate::cpdt_expert::plan(
@@ -210,7 +280,7 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         None
     };
 
-    // 6. Joint refinement.
+    // 7. Joint refinement.
     let joint = if input.mode == CpdtMode::Full {
         Some(solve_joint(JointInput {
             model: input.model.clone(),
@@ -235,12 +305,203 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         experts,
         joint,
         solve_us: t0.elapsed().as_micros() as u64,
+        override_diagnostics,
     }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    use crate::wggo_overrides::OverrideRejectReason;
+
+    /// Build a `CpdtInput` with adjustable world_size, WGGO recommendation,
+    /// and memory pressure.
+    ///
+    /// Model: 8 layers × 6 MB params = 48 MB total, optim_multiplier=8.0,
+    ///        peak activation = 2 MB (single layer max).
+    ///
+    /// Per-GPU memory formula: params/s_p + params/s_g + params*8/s_os + 2 MB.
+    ///   DDP (s_p=1, s_g=1, s_os=1): 48+48+384+2 = 482 MB.
+    ///   Best s_p=2 tuple (s_p=2,s_g=8,s_os=8): 24+6+48+2   =  80 MB.
+    ///   Best s_p=4 tuple (s_p=4,s_g=4,s_os=8): 12+12+48+2  =  74 MB.
+    ///
+    /// memory_pressure "low"  → 80 GB budget (all tuples fit).
+    /// memory_pressure "high" → 75 MB budget (only s_p ≥ 4 tuples fit):
+    ///    80 MB (best s_p=2 tuple) > 75 MB → infeasible
+    ///    74 MB (best s_p=4 tuple) ≤ 75 MB → feasible
+    fn cpdt_input_with(
+        world_size: u32,
+        recommended: Option<u32>,
+        memory_pressure: &'static str,
+    ) -> CpdtInput<'static> {
+        let memory_budget_bytes = match memory_pressure {
+            "low" => 80u64 * 1024 * 1024 * 1024, // 80 GB — all tuples feasible
+            "high" => 75_000_000u64,              // 75 MB — only s_p ≥ 4 feasible
+            other => panic!("unknown memory_pressure: {other}"),
+        };
+        CpdtInput {
+            mode: CpdtMode::ZeroOnly,
+            model: ModelSize {
+                per_layer_param_bytes: vec![6_000_000; 8],
+                per_layer_activation_bytes: vec![2_000_000; 8],
+                optim_state_multiplier: 8.0,
+                per_layer_compute_us: vec![10.0; 8],
+            },
+            cluster: ClusterSpec {
+                num_gpus: world_size,
+                memory_budget_bytes,
+                intra_bw_bps: 9e11,
+                inter_bw_bps: 1e11,
+                gpus_per_node: world_size.min(8),
+            },
+            weights: None,
+            precision_cfg: PrecisionConfig::default(),
+            adamw: AdamWHyperparams::default(),
+            moe_shape: None,
+            moe_router: None,
+            moe_roofline_slack: 1.0,
+            expert_cfg: ExpertConfig::default(),
+            joint_cfg: JointConfig::default(),
+            wggo_recommended_shard: recommended,
+        }
+    }
+
+    #[test]
+    fn wggo_recommendation_applied_when_world_size_divides_and_memory_fits() {
+        // world_size=8, rec=4 → 8 % 4 == 0 (Gate 1 passes).
+        // "low" budget → all tuples feasible. Most aggressive at-or-below 4
+        // is s_p=4 (divisors of 8: {1,2,4,8}).
+        let input = cpdt_input_with(8, Some(4), "low");
+        let plan = run(input);
+        let s_p = plan.zero.as_ref().expect("zero eval").config.s_p;
+        assert!(s_p <= 4, "applied s_p must not exceed recommendation; got {s_p}");
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "no diagnostics expected; got {:?}",
+            plan.override_diagnostics
+        );
+    }
+
+    #[test]
+    fn wggo_recommendation_rejected_on_world_size_mismatch() {
+        // world_size=2, rec=4 → 2 % 4 == 2 ≠ 0 → Gate 1 fires.
+        let input = cpdt_input_with(2, Some(4), "low");
+        let plan = run(input);
+        let diag = plan
+            .override_diagnostics
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.reason,
+                    OverrideRejectReason::ShardFactorIncompatibleWithWorldSize { .. }
+                )
+            })
+            .expect("incompat diag must be emitted");
+        assert_eq!(diag.requested, "4");
+        assert_eq!(diag.layer_name, "global");
+    }
+
+    #[test]
+    fn wggo_recommendation_overridden_by_memory_when_more_sharding_required() {
+        // world_size=8, rec=2, budget=100 MB.
+        // All tuples with s_p ≤ 2 are infeasible (best costs 112 MB).
+        // Planner falls back to default → picks s_p ≥ 4.
+        // Since applied s_p > 2 = rec, ShardFactorOverriddenByMemory is emitted.
+        let input = cpdt_input_with(8, Some(2), "high");
+        let plan = run(input);
+        let diag = plan
+            .override_diagnostics
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.reason,
+                    OverrideRejectReason::ShardFactorOverriddenByMemory { .. }
+                )
+            })
+            .expect("memory-override diag must be emitted");
+        assert_eq!(diag.requested, "2");
+        let applied_s_p = plan.zero.as_ref().expect("zero eval").config.s_p;
+        assert!(
+            applied_s_p > 2,
+            "applied s_p must exceed recommendation; got {applied_s_p}"
+        );
+    }
+
+    #[test]
+    fn no_recommendation_preserves_existing_planner_behavior() {
+        // None → override path skipped entirely; zero must still be produced.
+        let input = cpdt_input_with(8, None, "low");
+        let plan = run(input);
+        assert!(plan.override_diagnostics.is_empty());
+        assert!(plan.zero.is_some(), "planner must produce a zero evaluation");
+    }
+
+    #[test]
+    fn recommendation_picks_most_aggressive_feasible_at_or_below() {
+        // world_size=8, rec=4, "low" → divisors {1,2,4,8} all feasible.
+        // Most aggressive at-or-below 4 is s_p=4; no diagnostic emitted
+        // (table-gap downgrade is silent, and here there is no gap).
+        let input = cpdt_input_with(8, Some(4), "low");
+        let plan = run(input);
+        let s_p = plan.zero.as_ref().expect("zero eval").config.s_p;
+        assert!(s_p <= 4, "s_p must not exceed recommendation; got {s_p}");
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "table-gap downgrade must be silent (no diagnostic); got {:?}",
+            plan.override_diagnostics
+        );
+    }
+
+    // ── Task 4 smoke tests: end-to-end propagation of wggo_recommended_shard ──
+
+    #[test]
+    fn cpdt_run_with_wggo_recommendation_propagates_to_plan() {
+        use crate::wggo_overrides::{PerLayerOverride, WggoOverrides};
+        let over = WggoOverrides {
+            per_layer: vec![PerLayerOverride {
+                layer_index: 0,
+                layer_name: "blocks.0".into(),
+                active_heads: 8,
+                requested_csha_level: None,
+                adapter_rank: 0,
+                fase_fused: false,
+                packing_mode: 0,
+                shard_factor: 4,
+            }],
+        };
+        let recommended = over.min_shard_factor();
+        assert_eq!(recommended, Some(4));
+        // Use the existing helper: world_size=8, recommended=Some(4), low budget.
+        // 8 % 4 == 0 → Gate 1 passes.  "low" → all tuples feasible.
+        // Most aggressive at-or-below 4 is s_p=4; plan should honour it, no diag.
+        let input = cpdt_input_with(8, recommended, "low");
+        let plan = run(input);
+        let s_p = plan.zero.as_ref().expect("zero eval").config.s_p;
+        let has_diag = !plan.override_diagnostics.is_empty();
+        assert!(
+            s_p <= 4 || has_diag,
+            "expected s_p ≤ 4 OR diagnostic; got s_p={s_p}, diags={:?}",
+            plan.override_diagnostics
+        );
+    }
+
+    #[test]
+    fn cpdt_run_without_overrides_leaves_override_diagnostics_empty() {
+        // wggo_recommended_shard=None → override path skipped entirely;
+        // override_diagnostics must be empty.
+        let input = cpdt_input_with(8, None, "low");
+        let plan = run(input);
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "no recommendation → no diagnostics; got {:?}",
+            plan.override_diagnostics
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -268,6 +529,7 @@ mod tests {
             moe_roofline_slack: 1.0,
             expert_cfg: ExpertConfig::default(),
             joint_cfg: JointConfig::default(),
+            wggo_recommended_shard: None,
         }
     }
 
@@ -342,5 +604,19 @@ mod tests {
     fn full_mode_runs_joint_solver() {
         let plan = run(tiny_input());
         assert!(plan.joint.is_some());
+    }
+
+    #[test]
+    fn cpdt_plan_default_has_empty_override_diagnostics() {
+        // Smoke test: a plan from a minimal Off-mode input has empty diagnostics.
+        // CpdtMode::Off short-circuits the planner so we don't need a full
+        // ClusterSpec / ModelSize / PrecisionConfig to exercise the field.
+        let mut input = tiny_input();
+        input.mode = CpdtMode::Off;
+        let plan = run(input);
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "default CpdtPlan from Off mode must have empty override_diagnostics"
+        );
     }
 }

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wggo_cost::LayerShape;
 use crate::wggo_graph::OptGraph;
-use crate::wggo_ilp::LayerIlpConstraints;
+use crate::wggo_ilp::{HeadImportance, LayerIlpConstraints};
 
 /// Interface for whatever weight source the caller has.
 ///
@@ -179,6 +179,28 @@ pub fn score_layer(
     }
 
     scores
+}
+
+/// Per-layer entry point for the magnitude scorer, suitable for Phase 2
+/// scorer impls that call this layer-by-layer rather than driving
+/// [`analyze`] over the full graph.
+///
+/// Derives `num_heads` from `shape.d_model / shape.head_dim`, computes
+/// magnitude-based raw scores via [`score_layer`], normalises them, and
+/// wraps the result in a [`HeadImportance`].  Falls back to uniform
+/// scores when all weights are absent or all-zero (same semantics as the
+/// `any_signal` path in [`analyze`]).
+pub fn score_layer_magnitude(
+    layer_key: &str,
+    shape: &LayerShape,
+    provider: &dyn WeightProvider,
+) -> HeadImportance {
+    let num_heads = (shape.d_model / shape.head_dim.max(1)).max(1) as usize;
+    let raw = score_layer(layer_key, shape, num_heads, provider);
+    let normalised = normalise(raw, num_heads);
+    HeadImportance {
+        per_head: normalised.iter().map(|&v| v as f32).collect(),
+    }
 }
 
 /// Normalise `scores` so they sum to `num_heads` (making thresholds
@@ -519,6 +541,21 @@ mod tests {
         rep.apply_to(&mut cons);
         assert!(cons[0].min_retained_importance > 0.0);
         assert_eq!(cons[0].min_retained_importance, rep.per_layer[0].default_min_retained);
+    }
+
+    #[test]
+    fn score_layer_magnitude_with_null_provider_yields_uniform_scores() {
+        let s = shape(4); // n_kv_heads=4, d_model=16, head_dim=4 → n_heads=4
+        let hi = score_layer_magnitude("layer.0", &s, &NullWeightProvider);
+        let n_heads = (s.d_model / s.head_dim) as usize;
+        assert_eq!(hi.per_head.len(), n_heads);
+        // All uniform (null provider → no signal → normalise to 1.0 each).
+        let first = hi.per_head[0];
+        assert!(
+            hi.per_head.iter().all(|&v| (v - first).abs() < 1e-6),
+            "expected uniform scores, got {:?}",
+            hi.per_head
+        );
     }
 
     #[test]

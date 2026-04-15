@@ -322,6 +322,10 @@ pub fn compile_returning_plan(
         compiler.run_wcet_analysis()?;
     }
 
+    // Task 4: Declare the calibration retention arena global (zeroinit .bss).
+    // No-op when calibration_retention is None, so shipped binaries are unaffected.
+    compiler.emit_retention_arena()?;
+
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     let plan = compiler.last_wrga_plan.clone();
@@ -474,6 +478,9 @@ fn compile_with_zk_info_best_effort_plan(
             compiler.run_wcet_analysis()?;
         }
 
+        // Task 4: Declare the calibration retention arena global (zeroinit .bss).
+        compiler.emit_retention_arena()?;
+
         // M52: Embed weight hash if weights were loaded
         compiler.embed_weight_hash()?;
         Ok(())
@@ -619,6 +626,8 @@ fn compile_standalone_best_effort_plan(
         if compiler.compile_options.wcet_enabled {
             compiler.run_wcet_analysis()?;
         }
+        // Task 4: Declare the calibration retention arena global (zeroinit .bss).
+        compiler.emit_retention_arena()?;
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
@@ -804,6 +813,8 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.compile_user_functions(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_pending_lambdas()?;
+        // Task 4: Declare the calibration retention arena global (zeroinit .bss).
+        compiler.emit_retention_arena()?;
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
@@ -935,6 +946,8 @@ pub fn compile_entry_returning_plan(
     if compiler.compile_options.wcet_enabled {
         compiler.run_wcet_analysis()?;
     }
+    // Task 4: Declare the calibration retention arena global (zeroinit .bss).
+    compiler.emit_retention_arena()?;
     // M31: Print fusion report if enabled
     if compiler.fusion.report_enabled {
         crate::fusion_report::print_fusion_report(

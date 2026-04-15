@@ -16,13 +16,17 @@ pub enum SubprocessOutcome {
     Infrastructure(String),
 }
 
-/// Spawn `binary` and wait up to `timeout`.  Kills the process on
+/// Spawn `binary` with `args` and wait up to `timeout`.  Kills the process on
 /// timeout and returns `Infrastructure`.  Status mapping:
 /// 0 = Clean, 1 = Degenerate, anything else = Infrastructure.  Stdout
 /// and stderr are inherited so the user sees subprocess diagnostics
 /// inline with the build's own output.
-pub fn run_subprocess(binary: &Path, timeout: Duration) -> std::io::Result<SubprocessOutcome> {
+///
+/// `args` are passed as positional CLI arguments: `argv[1]`, `argv[2]`, etc.
+/// No environment variables are used for path passing.
+pub fn run_subprocess(binary: &Path, args: &[&str], timeout: Duration) -> std::io::Result<SubprocessOutcome> {
     let mut child = Command::new(binary)
+        .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
@@ -88,7 +92,7 @@ mod tests {
     #[test]
     fn exit_0_maps_to_clean() {
         let b = echo_binary_that_exits(0);
-        let r = run_subprocess(&b, Duration::from_secs(5));
+        let r = run_subprocess(&b, &[], Duration::from_secs(5));
         let _ = std::fs::remove_file(&b);
         assert!(matches!(r, Ok(SubprocessOutcome::Clean)));
     }
@@ -96,7 +100,7 @@ mod tests {
     #[test]
     fn exit_1_maps_to_degenerate() {
         let b = echo_binary_that_exits(1);
-        let r = run_subprocess(&b, Duration::from_secs(5));
+        let r = run_subprocess(&b, &[], Duration::from_secs(5));
         let _ = std::fs::remove_file(&b);
         assert!(matches!(r, Ok(SubprocessOutcome::Degenerate)));
     }
@@ -104,7 +108,7 @@ mod tests {
     #[test]
     fn exit_2_maps_to_infrastructure() {
         let b = echo_binary_that_exits(2);
-        let r = run_subprocess(&b, Duration::from_secs(5));
+        let r = run_subprocess(&b, &[], Duration::from_secs(5));
         let _ = std::fs::remove_file(&b);
         assert!(matches!(r, Ok(SubprocessOutcome::Infrastructure(_))));
     }
@@ -127,7 +131,7 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&p, perms).unwrap();
         }
-        let r = run_subprocess(&p, Duration::from_millis(500));
+        let r = run_subprocess(&p, &[], Duration::from_millis(500));
         let _ = std::fs::remove_file(&p);
         match r {
             Ok(SubprocessOutcome::Infrastructure(msg)) => {

@@ -1,0 +1,39 @@
+from nsl.nn.losses import mse_loss
+
+# Four 256x256 weight matrices stacked via matmul.  SGD keeps optimizer-state
+# overhead minimal (only velocity buffers, no second moment).
+#
+# BLOCKED: source-AD peak currently exceeds tape-AD peak for this fixture.
+# Root cause: nsl_tensor_reduce_to_shape clones the gradient tensor even when
+# src and target shapes are identical ([256,256] -> clone([256,256])).  The
+# raw Matmul gradient (dL/dw_raw) and its clone both live in owned_values until
+# free_wengert_owned_values runs after the entire adjoint.  For N=4 params this
+# accumulates 4 x 256KB = 1MB of raw-grad copies that are never freed during
+# adjoint execution, matching tape-AD's grad_map footprint and eliminating the
+# expected delta.
+#
+# Fix needed (beyond fixture scope): make nsl_tensor_reduce_to_shape return the
+# input tensor with a refcount bump (FBIP) when src and target shapes already
+# match, so the FASE hook's nsl_tensor_free fully releases the gradient rather
+# than just decrementing a clone's refcount.
+model Mlp:
+    w1: Tensor = ones([256, 256])
+    w2: Tensor = ones([256, 256])
+    w3: Tensor = ones([256, 256])
+    w4: Tensor = ones([256, 256])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h1 = x @ self.w1
+        let h2 = h1 @ self.w2
+        let h3 = h2 @ self.w3
+        return h3 @ self.w4
+
+let m = Mlp()
+let x = ones([1, 256])
+let y = zeros([1, 256])
+
+train(model = m, epochs = 4, grad_accumulation = 4):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)

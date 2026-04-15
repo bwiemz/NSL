@@ -237,7 +237,7 @@ impl Compiler<'_> {
 
         self.module
             .define_function(func_id, &mut ctx)
-            .map_err(|e| CodegenError::new(format!("failed to define fn '{name}': {e}")))?;
+            .map_err(|e| CodegenError::new(format!("failed to define fn '{name}': {e:?}")))?;
         Ok(())
     }
 }

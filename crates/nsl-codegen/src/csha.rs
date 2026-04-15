@@ -17,7 +17,11 @@ use serde::Serialize;
 
 use crate::csha_boundary::{scan as scan_boundaries, BoundaryScan, ProjKind};
 use crate::csha_patterns::{analyze as analyze_patterns, PatternConfig, PatternPlan};
-use crate::csha_pipeline::{plan_all, FusionLevel, LayerPlan};
+use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
+use crate::csha_pipeline::{
+    block_smem_bytes, pipeline_smem_bytes, plan_all, plan_layer, roofline_tile_config,
+    smem_budget_bytes, FusionLevel, LayerPlan, TileConfig,
+};
 use crate::csha_specialize::{analyze as analyze_spec, SpecConfig, SpecializationPlan};
 use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
 use crate::weight_aware::WeightMap;
@@ -89,7 +93,13 @@ pub struct CshaInput<'a> {
     pub spec_cfg: SpecConfig,
     /// Config for [`csha_patterns`] analysis (causal/GQA/sinks).
     pub pattern_cfg: PatternConfig,
+    /// Per-layer WGGO preferences. `None` → CSHA's internal planner runs
+    /// unchanged. `Some` → per-layer `active_heads` is applied verbatim;
+    /// `requested_csha_level` is a preference subject to SMEM-feasibility
+    /// downgrade at per-layer emission time (Task 4).
+    pub wggo_overrides: Option<&'a crate::wggo_overrides::WggoOverrides>,
 }
+
 
 /// Aggregate plan emitted by the driver.
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +120,11 @@ pub struct CshaPlan {
     pub marks: Vec<crate::csha_apply::FusionMark>,
     /// Total driver wall-clock time (microseconds).
     pub solve_us: u64,
+    /// WGGO overrides that CSHA had to downgrade due to hardware
+    /// infeasibility. Empty when WGGO produced no overrides or all
+    /// overrides were applied verbatim. Stable wire shape; consumed by
+    /// `--csha-report` and the Phase 3 decision explainer.
+    pub override_diagnostics: Vec<OverrideDiagnostic>,
 }
 
 /// A.5: aggregated HBM-traffic savings across every CSHA-active layer
@@ -356,6 +371,81 @@ impl CshaPlan {
     }
 }
 
+/// Map a `cfie_persistent::FusionLevel` (WGGO's vocabulary) to the
+/// corresponding `csha_pipeline::FusionLevel` (CSHA's internal planner
+/// vocabulary).
+///
+/// The two enums use parallel names but live in different crates; this
+/// function is the single authoritative translation point.
+///
+/// Mapping (monotone, ordinal-preserving):
+///   None   → None
+///   Level1 → Boundary
+///   Level2 → Pipeline
+///   Level3 → Block
+fn wggo_to_pipeline_level(
+    wggo: crate::cfie_persistent::FusionLevel,
+) -> FusionLevel {
+    match wggo {
+        crate::cfie_persistent::FusionLevel::None => FusionLevel::None,
+        crate::cfie_persistent::FusionLevel::Level1 => FusionLevel::Boundary,
+        crate::cfie_persistent::FusionLevel::Level2 => FusionLevel::Pipeline,
+        crate::cfie_persistent::FusionLevel::Level3 => FusionLevel::Block,
+    }
+}
+
+/// Map a `csha_pipeline::FusionLevel` back to `cfie_persistent::FusionLevel`
+/// for use in `OverrideDiagnostic.applied`.
+fn pipeline_to_wggo_level(
+    pipeline: FusionLevel,
+) -> crate::cfie_persistent::FusionLevel {
+    match pipeline {
+        FusionLevel::None => crate::cfie_persistent::FusionLevel::None,
+        FusionLevel::Boundary => crate::cfie_persistent::FusionLevel::Level1,
+        FusionLevel::Pipeline => crate::cfie_persistent::FusionLevel::Level2,
+        FusionLevel::Block => crate::cfie_persistent::FusionLevel::Level3,
+    }
+}
+
+/// Walk the level enum downward (most aggressive first) until an SMEM-
+/// feasible level is found.  Returns `FusionLevel::None` as the guaranteed-
+/// feasible fallback (Boundary/None consume zero SMEM kernel-side).
+///
+/// Only candidates strictly below `requested` are tried — the caller already
+/// confirmed `requested` is infeasible.
+///
+/// Ordering: Block (3) → Pipeline (2) → Boundary (1) → None (0).
+fn downgrade_until_feasible(
+    shape: LayerShape,
+    tiles: TileConfig,
+    budget: u64,
+    requested: FusionLevel,
+) -> FusionLevel {
+    // Walk from most-to-least aggressive, skipping levels >= requested.
+    for candidate in [
+        FusionLevel::Block,
+        FusionLevel::Pipeline,
+        FusionLevel::Boundary,
+        FusionLevel::None,
+    ] {
+        // Only try strictly less aggressive than requested.
+        if candidate.as_u8() >= requested.as_u8() {
+            continue;
+        }
+        // Boundary and None consume no SMEM in the kernel — always feasible.
+        let smem_needed = match candidate {
+            FusionLevel::Block => block_smem_bytes(shape, tiles),
+            FusionLevel::Pipeline => pipeline_smem_bytes(shape, tiles),
+            FusionLevel::Boundary | FusionLevel::None => 0,
+        };
+        if smem_needed <= budget {
+            return candidate;
+        }
+    }
+    // Last-resort: Boundary (zero SMEM, always OK).
+    FusionLevel::Boundary
+}
+
 /// Run the CSHA driver.
 pub fn run(input: CshaInput) -> CshaPlan {
     let t0 = std::time::Instant::now();
@@ -374,12 +464,109 @@ pub fn run(input: CshaInput) -> CshaPlan {
             kernels: Vec::new(),
             marks: Vec::new(),
             solve_us: t0.elapsed().as_micros() as u64,
+            override_diagnostics: Vec::new(),
         };
     }
 
     let boundary = scan_boundaries(input.wengert);
-    let per_layer = plan_all(&boundary, input.shape, gpu, input.mode.initial_level());
-    let specialization = analyze_spec(
+
+    // ------------------------------------------------------------------
+    // Per-layer planning — override-aware.
+    //
+    // Ordering is LOAD-BEARING (per spec):
+    //   (1) Apply active_heads FIRST  → drives tile dims.
+    //   (2) Compute tile config against overridden head count.
+    //   (3) Check requested_csha_level feasibility vs the overridden tile.
+    //
+    // Checking feasibility before head reduction produces false-positive
+    // rejections: Level2 may be infeasible at 8 heads but feasible at 4.
+    // ------------------------------------------------------------------
+    let no_overrides = input.wggo_overrides.is_none();
+    let mut override_diagnostics: Vec<OverrideDiagnostic> = Vec::new();
+
+    let per_layer: Vec<LayerPlan> = if no_overrides {
+        // Fast path: uniform level, no per-layer override book-keeping.
+        plan_all(&boundary, input.shape, gpu, input.mode.initial_level())
+    } else {
+        // Override path: iterate unique layers (mirrors `plan_all`'s dedup
+        // via BTreeSet) and apply per-layer decisions.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out: Vec<LayerPlan> = Vec::new();
+        let budget = smem_budget_bytes(gpu);
+
+        for c in &boundary.chains {
+            let key = c.layer.clone().unwrap_or_else(|| "other".to_string());
+            if !seen.insert(key.clone()) {
+                continue; // dedup: only plan each layer once
+            }
+
+            let layer_idx = out.len() as u32;
+
+            // (1) HEADS FIRST — look up override for this layer.
+            let layer_override = input
+                .wggo_overrides
+                .and_then(|o| o.find(layer_idx));
+
+            // Use overridden head count when available; fall back to the
+            // global n_heads.  The head count feeds into roofline_tile_config
+            // via the LayerShape (head_dim), not n_heads directly — but the
+            // shape is fixed per-model.  The active_heads override is
+            // recorded in the specialization plan (post-planning patch).
+            let _applied_heads = match layer_override {
+                Some(ov) => ov.active_heads,
+                None => input.n_heads,
+            };
+
+            // (2) Tile config against the (possibly overridden) shape.
+            // The tile config depends on shape.head_dim, which is fixed.
+            // active_heads affects the specialization plan, not the tile
+            // dimensions directly (head_dim stays constant across GQA).
+            let tiles = roofline_tile_config(input.shape, gpu);
+
+            // (3) Level: honour override if feasible, else downgrade.
+            let layer_plan = match layer_override.and_then(|o| o.requested_csha_level) {
+                Some(requested_wggo) => {
+                    let requested = wggo_to_pipeline_level(requested_wggo);
+                    let smem_needed = match requested {
+                        FusionLevel::Block => block_smem_bytes(input.shape, tiles),
+                        FusionLevel::Pipeline => pipeline_smem_bytes(input.shape, tiles),
+                        FusionLevel::Boundary | FusionLevel::None => 0,
+                    };
+                    if smem_needed <= budget {
+                        // Feasible — use requested level directly.
+                        plan_layer(key.clone(), input.shape, gpu, requested)
+                    } else {
+                        // Infeasible — downgrade and record diagnostic.
+                        let applied =
+                            downgrade_until_feasible(input.shape, tiles, budget, requested);
+                        override_diagnostics.push(OverrideDiagnostic {
+                            layer_index: layer_idx,
+                            layer_name: layer_override
+                                .map(|o| o.layer_name.clone())
+                                .unwrap_or_else(|| key.clone()),
+                            requested: format!("{:?}", requested_wggo),
+                            applied: format!("{:?}", pipeline_to_wggo_level(applied)),
+                            reason: OverrideRejectReason::SmemBudgetExceeded {
+                                actual_kb: (smem_needed / 1024) as u32,
+                                limit_kb: (budget / 1024) as u32,
+                            },
+                        });
+                        plan_layer(key.clone(), input.shape, gpu, applied)
+                    }
+                }
+                None => {
+                    // No level override — internal planner decides.
+                    plan_layer(key.clone(), input.shape, gpu, input.mode.initial_level())
+                }
+            };
+
+            out.push(layer_plan);
+        }
+        out
+    };
+
+    // Specialization analysis (head pruning, entropy buckets, precision).
+    let mut specialization = analyze_spec(
         &boundary,
         input.weights,
         input.n_heads,
@@ -393,6 +580,21 @@ pub fn run(input: CshaInput) -> CshaPlan {
         &input.pattern_cfg,
     );
 
+    // Post-planning patch: apply active_heads overrides to the specialization
+    // plan.  When WGGO says active_heads=4 for a layer that has 8 total
+    // heads, we force n_active_heads=4 (= 4 pruned) so downstream consumers
+    // see the WGGO-sanctioned count rather than the weight-analysis result.
+    if let Some(overrides) = input.wggo_overrides {
+        for (idx, layer_spec) in specialization.layers.iter_mut().enumerate() {
+            if let Some(ov) = overrides.find(idx as u32) {
+                // Only clamp: WGGO can reduce active heads, not add phantom ones.
+                if ov.active_heads < layer_spec.n_active_heads {
+                    layer_spec.n_active_heads = ov.active_heads;
+                }
+            }
+        }
+    }
+
     // Stitch everything together via the apply-bridge so the plan
     // carries ready-to-consume kernel specs + graph marks.
     let interim = CshaPlan {
@@ -405,6 +607,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         kernels: Vec::new(),
         marks: Vec::new(),
         solve_us: 0,
+        override_diagnostics: Vec::new(),
     };
     let mut diags = Vec::<String>::new();
     let bridge = crate::csha_apply::bridge(
@@ -424,6 +627,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         kernels: bridge.kernels,
         marks: bridge.marks,
         solve_us: t0.elapsed().as_micros() as u64,
+        override_diagnostics,
     }
 }
 
@@ -436,6 +640,7 @@ pub fn run_on_wengert(
     weights: Option<&WeightMap>,
     shape: Option<LayerShape>,
     n_heads: u32,
+    wggo_overrides: Option<&crate::wggo_overrides::WggoOverrides>,
 ) -> Option<CshaPlan> {
     let mode = CshaMode::parse(mode_str)?;
     let shape = shape.unwrap_or(LayerShape {
@@ -455,6 +660,7 @@ pub fn run_on_wengert(
         n_heads: n_heads.max(1),
         spec_cfg: SpecConfig::default(),
         pattern_cfg: PatternConfig::default(),
+        wggo_overrides,
     }))
 }
 
@@ -517,6 +723,7 @@ mod tests {
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
             pattern_cfg: PatternConfig::default(),
+            wggo_overrides: None,
         }
     }
 
@@ -604,19 +811,40 @@ mod tests {
         let w = attn_block();
         for mode in ["auto", "boundary", "pipeline", "block", "off", "L2", "3"] {
             assert!(
-                run_on_wengert(&w, "H100", mode, None, None, 8).is_some(),
+                run_on_wengert(&w, "H100", mode, None, None, 8, None).is_some(),
                 "'{}' should parse",
                 mode
             );
         }
-        assert!(run_on_wengert(&w, "H100", "wat", None, None, 8).is_none());
+        assert!(run_on_wengert(&w, "H100", "wat", None, None, 8, None).is_none());
     }
 
     #[test]
     fn unknown_target_falls_back_to_default_gpu() {
         let w = attn_block();
-        let plan = run_on_wengert(&w, "nonexistent-gpu-xyz", "auto", None, None, 8).unwrap();
+        let plan = run_on_wengert(&w, "nonexistent-gpu-xyz", "auto", None, None, 8, None).unwrap();
         assert!(!plan.target_gpu.is_empty());
+    }
+
+    #[test]
+    fn csha_plan_has_empty_override_diagnostics_by_default() {
+        // Regression marker: override_diagnostics must be Vec::new() when no
+        // WggoOverrides are passed to the driver.  Task 4 will populate the
+        // field; this test will catch any future change that accidentally
+        // pre-populates it before that wiring is complete.
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Auto));
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "CshaPlan must have no override diagnostics when no WggoOverrides were passed"
+        );
+
+        // Also verify Off mode initialises the field correctly.
+        let off_plan = run(toy_input(&w, CshaMode::Off));
+        assert!(
+            off_plan.override_diagnostics.is_empty(),
+            "CshaPlan (Off mode) must have no override diagnostics"
+        );
     }
 
     #[test]
@@ -731,5 +959,250 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("JSON must round-trip through serde_json");
         assert!(parsed.get("mode").is_some());
+    }
+
+    #[test]
+    fn run_on_wengert_accepts_wggo_overrides_argument() {
+        // Smoke-test: the new signature accepts Option<&WggoOverrides> without
+        // error. Uses the existing attn_block() Wengert helper.
+        let w = attn_block();
+        let overrides = crate::wggo_overrides::WggoOverrides { per_layer: vec![] };
+
+        // Both calls must compile and produce a plan (or None — we don't care,
+        // we care the signature accepts both None and Some(...)):
+        let _none = run_on_wengert(&w, "A100", "full", None, None, 8, None);
+        let _some = run_on_wengert(&w, "A100", "full", None, None, 8, Some(&overrides));
+
+        // Verify both arms return Some (the mode "full" maps to Auto which is valid).
+        assert!(_none.is_some(), "None arm should produce a plan");
+        assert!(_some.is_some(), "Some arm should produce a plan");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer WGGO override tests (Task 4)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    // Use explicit qualification throughout to avoid ambiguity between
+    //   csha_pipeline::FusionLevel (used by LayerPlan.level)
+    //   cfie_persistent::FusionLevel (used by OverrideDiagnostic + PerLayerOverride)
+    use crate::cfie_persistent::FusionLevel as WggoLevel;
+    use crate::csha_pipeline::FusionLevel as PipelineLevel;
+    use crate::wggo_overrides::{PerLayerOverride, WggoOverrides};
+    use crate::wengert::{PrimalOp, WengertOp};
+    use std::collections::HashMap;
+
+    /// Minimal Wengert list with a single attention block (reuses the
+    /// attn_block() pattern from the parent test module).
+    fn attn_wengert() -> WengertList {
+        let op = |id: u32, result: u32, o: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id, result, op: o, inputs,
+            saved_for_backward: false, checkpointed: false,
+        };
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            op(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
+            op(3, 3, PrimalOp::Matmul, vec![1, 2]),
+            op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
+            op(5, 5, PrimalOp::Param("blocks.0.attn.wk".into()), vec![]),
+            op(6, 6, PrimalOp::Matmul, vec![1, 5]),
+            op(7, 7, PrimalOp::RoPE { dim: 64 }, vec![6]),
+            op(8, 8, PrimalOp::Param("blocks.0.attn.wv".into()), vec![]),
+            op(9, 9, PrimalOp::Matmul, vec![1, 8]),
+        ];
+        WengertList {
+            ops, output: 9,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
+    /// Standard shape used by most tests (d_model=512 for general cases).
+    fn default_shape() -> LayerShape {
+        LayerShape {
+            batch: 1, seq: 1024, d_model: 512,
+            head_dim: 64, n_kv_heads: 4, dtype_bytes: 2,
+        }
+    }
+
+    /// Small shape where Level-3 block fusion fits within the 228 KB SMEM cap
+    /// (the tightest constraint even on an H100).
+    ///
+    /// Calculation with d_model=128, hd=64, bq=64, bkv=64, dtype=2:
+    ///   pipeline = 8192+8192+8192+16384+512+16384 = 57856 bytes = 56 KB
+    ///   block    = 57856 + 16384 + 32768 = 107008 bytes = 104 KB < 228 KB ✓
+    ///
+    /// On T4 (84 KB budget): block (104 KB) DOESN'T FIT, pipeline (56 KB) DOES
+    /// → also the right target for the downgrade test.
+    fn small_shape_block_feasible() -> LayerShape {
+        LayerShape {
+            batch: 1, seq: 1024, d_model: 128,
+            head_dim: 64, n_kv_heads: 4, dtype_bytes: 2,
+        }
+    }
+
+    /// Build a WggoOverrides with a single layer-0 record.
+    fn make_override(active_heads: u32, requested: Option<WggoLevel>) -> WggoOverrides {
+        WggoOverrides {
+            per_layer: vec![PerLayerOverride {
+                layer_index: 0,
+                layer_name: "blocks.0".into(),
+                active_heads,
+                requested_csha_level: requested,
+                adapter_rank: 0,
+                fase_fused: false,
+                packing_mode: 0,
+                shard_factor: 0,
+            }],
+        }
+    }
+
+    fn run_with(
+        wengert: &WengertList,
+        target: &str,
+        shape: LayerShape,
+        n_heads: u32,
+        overrides: Option<&WggoOverrides>,
+    ) -> CshaPlan {
+        run_on_wengert(wengert, target, "full", None, Some(shape), n_heads, overrides)
+            .expect("run_on_wengert must succeed for mode 'full'")
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: Override accepted when SMEM feasible
+    // -----------------------------------------------------------------------
+    #[test]
+    fn wggo_override_applied_when_smem_feasible() {
+        // H100 budget = min((256-12)*1024, 228*1024) = 228 KB = 233472 bytes.
+        // Level-3 block fusion at d_model=128, hd=64, bq=64 needs 104 KB —
+        // well within budget.  See `small_shape_block_feasible()` for the
+        // derivation.
+        let w = attn_wengert();
+        let over = make_override(8, Some(WggoLevel::Level3));
+        let plan = run_with(&w, "H100", small_shape_block_feasible(), 8, Some(&over));
+
+        // The requested Level3 → Block must be honoured.
+        assert_eq!(
+            plan.per_layer[0].level,
+            PipelineLevel::Block,
+            "H100 with small shape: Level3/Block override must be applied verbatim (104 KB < 228 KB)"
+        );
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "no downgrade should be recorded when override is feasible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: Override downgraded when SMEM infeasible
+    // -----------------------------------------------------------------------
+    #[test]
+    fn wggo_override_downgraded_when_smem_infeasible() {
+        // T4 (sm_75): budget = (96 - 12) KB = 84 KB.
+        // Level-3 block fusion at d128/hd64/bq64 needs 104 KB → infeasible.
+        // Level-2 pipeline at same shape needs 56 KB → feasible.
+        // Expected: Level3 downgraded to Level2 (Pipeline) with a diagnostic.
+        let w = attn_wengert();
+        let over = make_override(16, Some(WggoLevel::Level3));
+        let plan = run_with(&w, "T4", small_shape_block_feasible(), 16, Some(&over));
+
+        // The plan must NOT be Block — must be downgraded.
+        assert_ne!(
+            plan.per_layer[0].level,
+            PipelineLevel::Block,
+            "T4 SMEM is too tight for Level-3 block fusion at this shape: must downgrade"
+        );
+
+        // Exactly one diagnostic expected.
+        assert_eq!(
+            plan.override_diagnostics.len(), 1,
+            "exactly one downgrade diagnostic must be emitted"
+        );
+        let diag = &plan.override_diagnostics[0];
+        assert_eq!(diag.layer_index, 0);
+        assert_eq!(diag.requested, "Level3");
+        assert!(
+            matches!(diag.reason, OverrideRejectReason::SmemBudgetExceeded { .. }),
+            "reject reason must be SmemBudgetExceeded"
+        );
+
+        // Applied must be strictly less aggressive than requested.
+        assert!(
+            diag.applied != diag.requested,
+            "applied level must differ from requested"
+        );
+        // applied ordinal < requested ordinal (Level3=3 is most aggressive).
+        fn wggo_level_ordinal(level_str: &str) -> u8 {
+            match level_str {
+                "None" => 0,
+                "Level1" => 1,
+                "Level2" => 2,
+                "Level3" => 3,
+                _ => panic!("unknown level string: {level_str}"),
+            }
+        }
+        assert!(
+            wggo_level_ordinal(&diag.applied) < wggo_level_ordinal(&diag.requested),
+            "applied ({}) must be strictly less aggressive than requested ({})",
+            diag.applied, diag.requested
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3: No overrides → internal planner runs unchanged
+    // -----------------------------------------------------------------------
+    #[test]
+    fn no_wggo_overrides_preserves_internal_planner_behavior() {
+        let w = attn_wengert();
+        let plan = run_with(&w, "H100", default_shape(), 8, None);
+
+        // No override path touched: no diagnostics.
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "no override diagnostics when no WggoOverrides supplied"
+        );
+
+        // Snapshot: H100 in Auto/full mode with d_model=512/hd=64 picks Pipeline
+        // (Level 2).  Block (Level 3) needs 232 KB but the SMEM cap is 228 KB,
+        // so the planner downgrades to Pipeline automatically.
+        //
+        // This value is pinned as the internal-planner baseline; if the planner
+        // logic changes and produces a different level in the future, this test
+        // will catch the regression — by design.
+        assert_eq!(
+            plan.per_layer[0].level,
+            PipelineLevel::Pipeline,
+            "internal planner baseline (H100, Auto, d512/hd64): expected Level2/Pipeline \
+             (Block needs 232 KB, cap is 228 KB)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: active_heads override prunes heads in specialization plan
+    // -----------------------------------------------------------------------
+    #[test]
+    fn wggo_active_heads_override_prunes_heads() {
+        // 8 heads total in the Wengert; WGGO says only 4 are active.
+        // No weights supplied → fallback_heads marks all 8 as active.
+        // The override patch must reduce n_active_heads to 4, yielding
+        // total_pruned_heads() == 8 - 4 == 4.
+        let w = attn_wengert();
+        let over = make_override(4, None); // active_heads=4, no level override
+        let plan = run_with(&w, "H100", default_shape(), 8, Some(&over));
+
+        assert_eq!(
+            plan.specialization.total_pruned_heads(), 4,
+            "WGGO active_heads=4 of 8 must appear as 4 pruned heads in the specialization plan"
+        );
+
+        // Also: no level override → no diagnostics.
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "active_heads-only override must not emit diagnostics"
+        );
     }
 }

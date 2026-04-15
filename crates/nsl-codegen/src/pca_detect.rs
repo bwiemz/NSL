@@ -15,7 +15,7 @@
 use serde::Serialize;
 
 /// Parsed packing configuration from a `dataset` block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DatasetPackingConfig {
     /// Whether the dataset has `packing = true`.
     pub enabled: bool,

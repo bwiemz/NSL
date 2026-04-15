@@ -249,6 +249,23 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
+    // FASE Deferred bias correction: 1/(1 - base^step).  Scalar, no tensor args.
+    (
+        "nsl_bias_correction_inv",
+        &[types::F64, types::I64],
+        Some(types::F64),
+    ),
+    // FASE Deferred two-phase grad clip: sum of squared elements, in-place scale.
+    (
+        "nsl_tensor_sum_sq",
+        &[types::I64],
+        Some(types::F64),
+    ),
+    (
+        "nsl_tensor_mul_scalar_inplace",
+        &[types::I64, types::F64],
+        None,
+    ),
     // Tensor matmul
     (
         "nsl_tensor_matmul",
@@ -674,6 +691,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     (
         "nsl_tensor_to_device",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
+    (
+        "nsl_tensor_to_device_like",
         &[types::I64, types::I64],
         Some(types::I64),
     ),
@@ -1451,6 +1473,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     ("nsl_awq_free", &[types::I64], None),
+    // AWQ calibration sidecar: apply per-channel scales to weight tensor before quantizing.
+    // Signature: (weight_ptr, scales_ptr, scales_len, alpha) -> scaled_weight_ptr
+    (
+        "nsl_awq_pre_scale_weight",
+        &[types::I64, types::I64, types::I64, types::F64],
+        Some(types::I64),
+    ),
     // --- M35: GPTQ quantization ---
     (
         "nsl_gptq_quantize",

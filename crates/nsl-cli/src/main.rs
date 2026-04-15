@@ -14,6 +14,13 @@ use clap::Parser as ClapParser;
 use nsl_errors::{Level, SourceMap};
 use nsl_lexer::Interner;
 
+/// Output format for `--training-report`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingReportFormat {
+    Text,
+    Json,
+}
+
 /// Scan a parsed module for a top-level `train { ... }` block.
 ///
 /// Dev Tools Phase 4 Task 6: `nsl run --monitor` uses this detection to
@@ -25,6 +32,26 @@ fn has_train_block(module: &nsl_ast::Module) -> bool {
         .stmts
         .iter()
         .any(|s| matches!(s.kind, nsl_ast::stmt::StmtKind::TrainBlock(_)))
+}
+
+/// CLI wrapper for `nsl_codegen::WggoImportance` — keeps `clap` out of `nsl-codegen`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+#[clap(rename_all = "lower")]
+enum CliWggoImportance {
+    #[default]
+    Auto,
+    Magnitude,
+    Grad,
+}
+
+impl From<CliWggoImportance> for nsl_codegen::WggoImportance {
+    fn from(v: CliWggoImportance) -> Self {
+        match v {
+            CliWggoImportance::Auto => Self::Auto,
+            CliWggoImportance::Magnitude => Self::Magnitude,
+            CliWggoImportance::Grad => Self::Grad,
+        }
+    }
 }
 
 // The clap command enum carries many subcommand-specific flags, so keeping it
@@ -117,6 +144,11 @@ enum Cli {
         /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
         #[arg(long)]
         fpga_device: Option<String>,
+
+        /// Emit a training-pipeline decision audit for every train block in the file.
+        /// Pass without value for text output, or `--training-report=json` for JSON.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
+        training_report: Option<TrainingReportFormat>,
     },
 
     /// Compile and execute an NSL program
@@ -437,12 +469,12 @@ enum Cli {
         #[arg(long, value_name = "PATH")]
         wggo_weights: Option<PathBuf>,
 
-        /// WGGO Stage 3 importance-scoring mode ("none" or
-        /// "magnitude").  "grad" is reserved for a future milestone
-        /// (blocked on a compile-time execution harness).  Defaults
-        /// to "magnitude" when `--wggo-weights` is set, else "none".
-        #[arg(long, value_name = "MODE")]
-        wggo_importance: Option<String>,
+        /// WGGO head-importance scoring mode.
+        /// - `auto` (default): gradient scoring when calibration sidecar present, else magnitude.
+        /// - `magnitude`: force magnitude scoring even with calibration data.
+        /// - `grad`: require gradient scoring; errors if no calibration sidecar present.
+        #[arg(long, value_enum, default_value_t = CliWggoImportance::Auto)]
+        wggo_importance: CliWggoImportance,
 
         /// WGGO Stage 3: fraction of heads the default
         /// `min_retained_importance` threshold allows to be pruned.
@@ -710,6 +742,7 @@ fn main_inner() {
             do178c_report: _do178c_report,
             wcet_target: _wcet_target,
             fpga_device: _fpga_device,
+            training_report,
         } => {
             if shapes {
                 let src = match std::fs::read_to_string(&file) {
@@ -820,6 +853,31 @@ fn main_inner() {
                 } else {
                     eprintln!("error: --weight-analysis requires --weights <path>");
                     process::exit(1);
+                }
+            }
+
+            // FASE: Training-pipeline decision audit
+            if let Some(format) = training_report {
+                let source = std::fs::read_to_string(&file).unwrap_or_default();
+                let mut tr_interner = Interner::new();
+                let mut tr_source_map = SourceMap::new();
+                let tr_file_id = tr_source_map.add_file(file.display().to_string(), source.clone());
+                let (tr_tokens, _) = nsl_lexer::tokenize(&source, tr_file_id, &mut tr_interner);
+                let tr_parse = nsl_parser::parse(&tr_tokens, &mut tr_interner);
+                let report = nsl_codegen::training_report::build_report(
+                    &tr_parse.module,
+                    &tr_interner,
+                    file.as_path(),
+                );
+                match format {
+                    TrainingReportFormat::Text => {
+                        println!("{}", report);
+                    }
+                    TrainingReportFormat::Json => {
+                        let json = serde_json::to_string_pretty(&report)
+                            .expect("serialize training report");
+                        println!("{}", json);
+                    }
                 }
             }
         }
@@ -1034,7 +1092,7 @@ fn main_inner() {
                 health_flush_interval: None,
                 inspect_enabled: false,
                 wggo_weights: wggo_weights.clone(),
-                wggo_importance: wggo_importance.clone(),
+                wggo_importance: nsl_codegen::WggoImportance::from(wggo_importance),
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
@@ -1044,6 +1102,11 @@ fn main_inner() {
                 calibration_batch_size,
                 calibration_timeout_secs: calibration_timeout,
                 calibration_sidecar: None,
+                calibration_retention: None,
+                // Task 6: peek_batch_seq is called inside the compiler when
+                // calibration_data is set; the CLI passes None here and the
+                // compiler resolves the real (batch, seq) from the data header.
+                calibration_batch_seq: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1057,24 +1120,10 @@ fn main_inner() {
                     process::exit(1);
                 }
             }
-            if let Some(ref m) = wggo_importance {
-                match m.as_str() {
-                    "none" | "magnitude" => {}
-                    "grad" => {
-                        eprintln!(
-                            "error: --wggo-importance=grad is reserved for a future milestone (blocked on a compile-time execution harness); use 'magnitude' or 'none' for now"
-                        );
-                        process::exit(1);
-                    }
-                    other => {
-                        eprintln!(
-                            "error: --wggo-importance value '{}' is not one of none|magnitude",
-                            other
-                        );
-                        process::exit(1);
-                    }
-                }
-            }
+            // wggo_importance is now a typed CliWggoImportance enum; clap
+            // rejects unknown values before we get here.  The Grad variant
+            // requires a calibration sidecar — build_scorer enforces that at
+            // compile time and emits the --calibration-data error message.
             if let Some(f) = wggo_prune_fraction {
                 if !(0.0..=0.9).contains(&f) {
                     eprintln!(
@@ -1310,7 +1359,7 @@ fn main_inner() {
                 health_flush_interval: None,
                 inspect_enabled: inspect,
                 wggo_weights: None,
-                wggo_importance: None,
+                wggo_importance: nsl_codegen::WggoImportance::Auto,
                 wggo_prune_fraction: None,
                 csha_mode: None,
                 csha_report: false,
@@ -1320,6 +1369,8 @@ fn main_inner() {
                 calibration_batch_size: 8,
                 calibration_timeout_secs: 600,
                 calibration_sidecar: None,
+                calibration_retention: None,
+                calibration_batch_seq: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

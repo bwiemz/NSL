@@ -377,4 +377,37 @@ mod tests {
             assert_eq!(*p, BackwardPhase::AccumulateOnly);
         }
     }
+
+    #[test]
+    fn grad_clip_with_adamw_now_returns_deferred() {
+        // Reverses the item #1 Task 5 temporary downgrade.  Item #3 emits
+        // two-phase clip codegen, so grad_clip + Deferred is now valid.
+        let cfg = FaseConfig {
+            accumulation: 4,
+            optimizer: FaseOptimizer::AdamW,
+            grad_clip: Some(1.0),
+            allow_v_approx: true,
+            ..Default::default()
+        };
+        let p = plan(&cfg);
+        assert_eq!(p.mode, FaseMode::Deferred);
+        assert!(p.two_phase_clip);
+        assert!(matches!(
+            p.backward_phases.last(),
+            Some(BackwardPhase::FinalTwoPhase)
+        ));
+    }
+
+    #[test]
+    fn grad_clip_absent_keeps_deferred_for_adamw() {
+        let cfg = FaseConfig {
+            accumulation: 4,
+            optimizer: FaseOptimizer::AdamW,
+            grad_clip: None,
+            allow_v_approx: true,
+            ..Default::default()
+        };
+        let p = plan(&cfg);
+        assert_eq!(p.mode, FaseMode::Deferred);
+    }
 }
