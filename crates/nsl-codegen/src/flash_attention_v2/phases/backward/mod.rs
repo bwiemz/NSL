@@ -10,3 +10,4 @@ pub mod ds_compute;
 pub mod dv_accum;
 pub mod dqdk_accum;
 pub mod csha_hooks_backward;
+pub mod finalize;
