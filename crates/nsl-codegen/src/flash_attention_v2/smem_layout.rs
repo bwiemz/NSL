@@ -14,7 +14,19 @@ pub const ALLOWED_BLOCK_Q:   &[i64] = &[4, 8, 16, 32, 64, 128];
 pub const ALLOWED_BLOCK_KV:  &[i64] = &[16, 32, 64, 128];
 pub const ALLOWED_HEAD_DIM:  &[i64] = &[32, 64, 128, 256];
 pub const ALLOWED_GQA:       &[u32] = &[1, 2, 4, 8];
-pub const SMEM_BUDGET_BYTES: u32    = 48 * 1024;
+/// 48 KB: CUDA static `.shared` cap (all SM generations).
+/// Configs within this budget use a statically-sized shmem array in PTX;
+/// configs above it use an `extern .shared` declaration and require dynamic
+/// SMEM opt-in via `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`.
+pub const SMEM_BUDGET_BYTES: u32         = 48 * 1024;
+/// 99 KB: dynamic shared memory opt-in cap.
+/// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` returns 101376 bytes
+/// (99 KB) on RTX 5070 Ti (sm_120 / Blackwell) with CUDA 13.2.  sm_90/sm_89
+/// (Ada/Hopper) also report 99 KB.  sm_86 supports ~100 KB.
+/// We use 99 KB (101376 bytes) as the conservative cross-generation limit.
+/// Configs in (SMEM_BUDGET_BYTES, SMEM_DYNAMIC_BUDGET_BYTES] use extern
+/// .shared PTX + runtime cuFuncSetAttribute opt-in.
+pub const SMEM_DYNAMIC_BUDGET_BYTES: u32 = 99 * 1024;
 
 #[derive(Debug)]
 pub struct ConfigError(pub String);
@@ -80,13 +92,27 @@ pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), Co
     let q_region  = kv_start;              // Q region: [0, kv_start)
     let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
     let sp_region = total - sp_start;      // SP + weight + save region: [sp_start, total)
-    if total > SMEM_BUDGET_BYTES {
+    if total > SMEM_DYNAMIC_BUDGET_BYTES {
         return Err(ConfigError(format!(
-            "SMEM total {} bytes exceeds 48 KB budget (Q={} KV={} SP+rest={})",
-            total, q_region, kv_region, sp_region
+            "SMEM total {} bytes ({:.1} KB) exceeds 99 KB dynamic SMEM budget \
+             (Q={} KV={} SP+rest={}); reduce head_dim, block_q/block_kv, or d_model",
+            total, total as f32 / 1024.0, q_region, kv_region, sp_region
         )));
     }
+    // Configs in (48 KB, 228 KB] use dynamic SMEM (extern .shared in PTX +
+    // cuFuncSetAttribute opt-in at launch).  These are valid configurations.
     Ok(())
+}
+
+/// Returns true when `total_bytes(config)` exceeds the 48 KB static SMEM cap.
+///
+/// When true, the PTX emitter declares `extern .shared` (dynamic SMEM) instead
+/// of the static `.shared .align 16 .b8 shmem[N]` form.  The runtime must then
+/// call `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+/// total_bytes)` before launch and pass `total_bytes` as `sharedMemBytes` to
+/// `cuLaunchKernel`.
+pub fn needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
+    total_bytes(config) > SMEM_BUDGET_BYTES
 }
 
 /// Q tile always starts at byte 0 (parameter intentionally unused — offset is a constant).

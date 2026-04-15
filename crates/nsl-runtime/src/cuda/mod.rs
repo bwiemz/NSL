@@ -789,6 +789,52 @@ pub(crate) mod inner {
             unsafe { cuEventRecord(*start as CUevent, std::ptr::null_mut()); }
         }
 
+        // Dynamic SMEM opt-in for kernels using `.extern .shared` PTX declarations.
+        // When a kernel requests more than 48 KB of shared memory (the static SMEM
+        // cap on all SM generations), the PTX uses `extern .shared` instead of a
+        // fixed-size static declaration.  Before launch we must call
+        // cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, N)
+        // to raise the per-block SMEM limit.  Typical limits by architecture:
+        //   sm_120 (Blackwell, RTX 5xxx): 99 KB (CU_DEVICE_ATTRIBUTE_…_OPTIN = 101376)
+        //   sm_90  (Hopper):              99 KB
+        //   sm_89  (Ada Lovelace):        99 KB
+        //   sm_86  (Ampere high-end):    ~100 KB
+        // Callers that do not need dynamic SMEM pass shared_mem_bytes=0 (the static
+        // declaration already bakes in the size); only those with total_bytes > 48 KB
+        // pass the full total as shared_mem_bytes, which triggers this opt-in.
+        const STATIC_SMEM_CAP: u32 = 48 * 1024;
+        if shared_mem_bytes > STATIC_SMEM_CAP {
+            // Query the device's opt-in SMEM limit before attempting the attribute set.
+            let device_smem_limit = {
+                let mut guard2 = state.lock().unwrap();
+                let mut limit: i32 = 0;
+                unsafe {
+                    cuDeviceGetAttribute(
+                        &mut limit,
+                        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        guard2.device,
+                    );
+                }
+                let _ = &mut guard2; // keep guard alive to silence lint
+                limit as u32
+            };
+            if shared_mem_bytes > device_smem_limit {
+                // Return the same error code the driver would return, but
+                // without actually making the doomed cuFuncSetAttribute call.
+                return CUresult::CUDA_ERROR_INVALID_VALUE;
+            }
+            let res = unsafe {
+                cuFuncSetAttribute(
+                    func,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                )
+            };
+            if res != CUresult::CUDA_SUCCESS {
+                return res;
+            }
+        }
+
         // Validate launch dimensions
         debug_assert!(grid[0] > 0 && grid[1] > 0 && grid[2] > 0,
             "kernel_launch: invalid grid dimensions {:?}", grid);
