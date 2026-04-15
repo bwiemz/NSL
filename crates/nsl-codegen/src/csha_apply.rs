@@ -319,14 +319,11 @@ pub fn collect_norm_input_varids(
 
 /// Build the downstream artefacts from a CSHA plan.
 ///
-/// `seen` and `diagnostics` are threaded through to `flash_attention_selector`
-/// so that fallback warnings are dedup'd across the whole compilation unit and
-/// emitted by the caller via `eprintln!`.  Pass `&mut FallbackSeen::new()` and
-/// `&mut Vec::new()` from free-function callers that have no compiler context.
+/// `diagnostics` is threaded through to `flash_attention_selector`
+/// and emitted by the caller via `eprintln!`.
 pub fn bridge(
     plan: &CshaPlan,
     shape_head_dim: i64,
-    seen: &mut crate::flash_attention_selector::FallbackSeen,
     diagnostics: &mut Vec<String>,
 ) -> BridgeResult {
     let mut out = BridgeResult::default();
@@ -338,10 +335,10 @@ pub fn bridge(
         let pat = plan.patterns.get(&layer_plan.layer);
         let cfg = build_flash_config(layer_plan, &plan.specialization, pat, shape_head_dim);
         let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-            &cfg, seen, diagnostics,
+            &cfg, diagnostics,
         );
         let smem = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-            &cfg, seen, diagnostics,
+            &cfg, diagnostics,
         );
 
         out.kernels.push(KernelSpec {
@@ -588,7 +585,7 @@ mod tests {
     #[test]
     fn bridge_auto_produces_one_kernel_per_layer() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert_eq!(r.kernels.len(), 1);
         assert_eq!(r.kernels[0].layer, "blocks.0");
         assert_ne!(r.kernels[0].level, FusionLevel::None);
@@ -597,7 +594,7 @@ mod tests {
     #[test]
     fn a1_bridge_populates_extras_per_csha_active_layer() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // One kernel, one extras entry — keyed by layer name.
         assert_eq!(r.extras.len(), 1);
         let extras = r
@@ -614,7 +611,7 @@ mod tests {
     #[test]
     fn a1_bridge_extras_empty_when_csha_off() {
         let plan = toy_plan(CshaMode::Off);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(
             r.extras.is_empty(),
             "Off mode must not populate the extras side-table"
@@ -624,14 +621,14 @@ mod tests {
     #[test]
     fn a1_first_extras_returns_some_when_plan_active() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(r.first_extras().is_some());
     }
 
     #[test]
     fn a1_first_extras_returns_none_when_plan_off() {
         let plan = toy_plan(CshaMode::Off);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(r.first_extras().is_none());
     }
 
@@ -640,7 +637,7 @@ mod tests {
     #[test]
     fn a20_extras_for_layer_returns_extras_for_matching_name() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         let extras = r
             .extras_for_layer("blocks.0")
             .expect("blocks.0 should be present in the single-layer plan");
@@ -650,14 +647,14 @@ mod tests {
     #[test]
     fn a20_extras_for_layer_returns_none_for_unknown_layer() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(r.extras_for_layer("blocks.9999").is_none());
     }
 
     #[test]
     fn a20_extras_at_index_positional_lookup() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(r.extras_at_index(0).is_some());
         assert!(r.extras_at_index(1).is_none(), "toy plan has one layer");
     }
@@ -665,19 +662,19 @@ mod tests {
     #[test]
     fn a20_active_layer_count_matches_extras_len() {
         let plan_on = toy_plan(CshaMode::Auto);
-        let r_on = bridge(&plan_on, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r_on = bridge(&plan_on, 64, &mut Vec::new());
         assert_eq!(r_on.active_layer_count(), r_on.extras.len());
         assert!(r_on.active_layer_count() >= 1);
 
         let plan_off = toy_plan(CshaMode::Off);
-        let r_off = bridge(&plan_off, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r_off = bridge(&plan_off, 64, &mut Vec::new());
         assert_eq!(r_off.active_layer_count(), 0);
     }
 
     #[test]
     fn a21a_layer_at_index_matches_extras_at_index() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // In-order traversal of `extras` yields the same layer name
         // that `layer_at_index` returns for each ordinal — the FA
         // call site relies on this parallel structure to reach both
@@ -767,7 +764,7 @@ mod tests {
             spec_cfg: SpecConfig::default(),
             pattern_cfg: crate::csha_patterns::PatternConfig::default(),
         });
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
 
         // At least one mark must be emitted, and all of them must
         // carry the class-level fallback layer key.
@@ -865,7 +862,7 @@ mod tests {
     #[test]
     fn a21b_extras_for_current_function_matches_mangled_name() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // Cranelift mangling typically produces `ModelName__method`
         // or `ModelName__method__blocks_0`. With dot→underscore
         // normalisation, "blocks.0" matches "blocks_0" inside the
@@ -880,7 +877,7 @@ mod tests {
     #[test]
     fn a21b_extras_for_current_function_matches_plain_name() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // An un-mangled debug-build name still matches — the bridge
         // key `blocks.0` is a substring of `"Model.forward.blocks.0"`
         // under the dot-preserving view.
@@ -891,7 +888,7 @@ mod tests {
     #[test]
     fn a21b_extras_for_current_function_returns_none_when_no_layer_match() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // Function name without any `blocks.N` shape — name-based
         // resolver declines; caller falls back to ordinal.
         assert!(r.extras_for_current_function("MLP__forward").is_none());
@@ -900,7 +897,7 @@ mod tests {
     #[test]
     fn a21b_extras_for_current_function_none_when_csha_off() {
         let plan = toy_plan(CshaMode::Off);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(r
             .extras_for_current_function("anything__blocks_0")
             .is_none());
@@ -909,7 +906,7 @@ mod tests {
     #[test]
     fn a21a_marks_for_layer_filters_by_layer_name() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // Every mark yielded by `marks_for_layer("blocks.0")` must
         // carry that same layer name — the FA call site uses this
         // filter to scope `weights_by_name` lookups to the current
@@ -926,7 +923,7 @@ mod tests {
     #[test]
     fn bridge_emits_qkv_norm_and_rope_marks() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         // 3 chains × (norm + rope) = 6, except V has no rope so 5 marks
         // from boundary chains.  Plus per-layer output-proj mark
         // (Pipeline or Block).
@@ -947,7 +944,7 @@ mod tests {
     #[test]
     fn bridge_off_mode_produces_nothing() {
         let plan = toy_plan(CshaMode::Off);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         assert!(r.kernels.is_empty());
         assert!(r.marks.is_empty());
         assert!(r.configs.is_empty());
@@ -956,7 +953,7 @@ mod tests {
     #[test]
     fn bridge_forced_boundary_emits_no_output_proj_mark() {
         let plan = toy_plan(CshaMode::Boundary);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         let n_output = r
             .marks
             .iter()
@@ -968,7 +965,7 @@ mod tests {
     #[test]
     fn kernel_names_encode_csha_level() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         for k in &r.kernels {
             assert!(k.kernel_name.contains("cshaL"), "name={}", k.kernel_name);
         }
@@ -977,7 +974,7 @@ mod tests {
     #[test]
     fn smem_bytes_are_positive() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         for k in &r.kernels {
             assert!(k.smem_bytes > 0);
         }
@@ -995,7 +992,7 @@ mod tests {
     #[test]
     fn apply_marks_tags_matmul_consumers() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
 
         // Minimal fusion graph: one param node consumed by one matmul.
         let mut g = FusionGraph::new();
@@ -1016,7 +1013,7 @@ mod tests {
     #[test]
     fn apply_marks_is_idempotent() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         let mut g = FusionGraph::new();
         let p = g.add_named_node("blocks.0.attn.wq".into(), FusionOp::Input, vec![]);
         let mm = g.add_node(FusionOp::Matmul, vec![p]);
@@ -1032,7 +1029,7 @@ mod tests {
     #[test]
     fn config_payload_round_trips_csha_level() {
         let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut crate::flash_attention_selector::FallbackSeen::new(), &mut Vec::new());
+        let r = bridge(&plan, 64, &mut Vec::new());
         let (_layer, cfg) = r.configs.iter().next().unwrap();
         assert!(cfg.csha_level >= 1 && cfg.csha_level <= 3);
         assert!(cfg.fused_rmsnorm);

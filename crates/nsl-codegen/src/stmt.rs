@@ -3707,7 +3707,6 @@ impl Compiler<'_> {
                                     .first()
                                     .map(|lp| lp.tiles.head_dim as i64)
                                     .unwrap_or(64),
-                                &mut self.csha_fallback_seen,
                                 &mut diags,
                             ));
                             for d in diags { eprintln!("warning: {d}"); }

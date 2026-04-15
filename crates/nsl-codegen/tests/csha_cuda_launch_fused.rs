@@ -62,6 +62,7 @@ use nsl_codegen::flash_attention_selector::{
     flash_attention_kernel_name_selected, shared_mem_bytes_selected,
     synthesize_flash_attention_ptx_selected, Emitter, select_emitter,
 };
+use nsl_codegen::flash_attention_v2::smem_layout;
 use std::ffi::CString;
 
 use nsl_runtime::{
@@ -74,12 +75,7 @@ use nsl_runtime::flash_attention::nsl_flash_attention_csha;
 // Serialisation helpers
 // --------------------------------------------------------------------------
 
-use std::sync::{Mutex, MutexGuard};
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+// C5: NSL_FA_EMITTER env-var removed — no env serialisation needed.
 
 fn cuda_available() -> bool {
     if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
@@ -227,13 +223,17 @@ fn run_fused_config(
         }),
     };
 
-    let emitter = select_emitter(&config);
-    if emitter != Emitter::V2 {
+    // Pre-validate before calling select_emitter: v1 is deleted so out-of-matrix
+    // configs now panic.  Return Err here so the matrix driver can mark the row
+    // as SMEM-blocked (not a numerical failure) without catching a panic.
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config) {
         return Err(format!(
-            "selector routed to {:?} (SMEM budget exceeded or config out-of-matrix); not a numerical failure",
-            emitter
+            "SMEM budget exceeded or config out-of-matrix: {}; not a numerical failure",
+            e
         ));
     }
+    let emitter = select_emitter(&config);
+    debug_assert_eq!(emitter, Emitter::V2, "post-validation emitter must be V2");
 
     // ── Host data generation ─────────────────────────────────────────────────
     // x_kernel: [heads, seq, head_dim] — layout the kernel's RMSNorm expects.
@@ -440,12 +440,9 @@ fn run_fused_config(
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn fused_csha_32x32x32_heads4_nocausal() {
-    let _guard = lock_env();
-    std::env::set_var("NSL_FA_EMITTER", "v2");
-
     if !cuda_available() { return; }
 
-    // Confirm v2 routing before spending time on GPU launch.
+    // Confirm v2 routing (only emitter post-C5) before spending time on GPU launch.
     let probe = FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
@@ -460,7 +457,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
     assert_eq!(
         select_emitter(&probe),
         Emitter::V2,
-        "selector must route to v2 after NSL_FA_EMITTER=v2"
+        "selector must return V2 (only emitter post-C5)"
     );
 
     let max_abs = run_fused_config(32, 32, 32, 4, false, false)
@@ -502,9 +499,6 @@ fn fused_csha_32x32x32_heads4_nocausal() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csha_fused_matrix_sweep() {
-    let _guard = lock_env();
-    std::env::set_var("NSL_FA_EMITTER", "v2");
-
     if !cuda_available() { return; }
 
     // (block_q, block_kv, head_dim, heads, causal, rope_q)
@@ -581,32 +575,4 @@ fn csha_fused_matrix_sweep() {
     );
 }
 
-/// C3 v1 divergence smoke: documents v1's rc=218 ASCII rejection until C5 deletes v1.
-///
-/// Passes `NSL_FA_EMITTER=v1` so the selector forces v1 for this config.
-/// v1 is known to fail (rc=218 = ASCII 'Z' misfire) — this test asserts
-/// that failure is present, serving as a regression guard until C5.
-#[test]
-#[ignore = "requires CUDA GPU"]
-fn csha_fused_v1_divergence_smoke() {
-    let _guard = lock_env();
-    std::env::set_var("NSL_FA_EMITTER", "v1");
-
-    if !cuda_available() {
-        std::env::remove_var("NSL_FA_EMITTER");
-        return;
-    }
-
-    let result = run_fused_config(32, 32, 32, 4, false, false);
-    // v1 should route to Err (selector routed to V1 message) because we set v1 env.
-    // Either the selector returns V1 (→ Err from our null-guard) or if v1 somehow
-    // launches, it may also fail numerically.  Either outcome documents v1 is broken.
-    assert!(
-        result.is_err(),
-        "v1 emitter path should fail for CSHA fused config; got Ok({:?})",
-        result.ok()
-    );
-    eprintln!("[C3] v1 divergence smoke: confirmed v1 fails — {:?}", result.err());
-
-    std::env::remove_var("NSL_FA_EMITTER");
-}
+// C5: csha_fused_v1_divergence_smoke removed — v1 deleted, only v2 remains.

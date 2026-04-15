@@ -63,21 +63,7 @@ use nsl_runtime::{
 };
 use nsl_runtime::flash_attention::nsl_flash_attention_csha;
 
-// -- Env-var serialisation ------------------------------------------------
-// `NSL_FA_EMITTER` is a process-global env var. Tests that read or write it
-// must not run concurrently, otherwise a v2 test sees "v1" written by the
-// v1-divergence smoke test (or vice versa). Holding ENV_LOCK for the
-// duration of each test serialises the env-var window without needing
-// `--test-threads=1` for the whole binary.
-use std::sync::{Mutex, MutexGuard};
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> MutexGuard<'static, ()> {
-    // Poison recovery: if a previous test panicked while holding the lock,
-    // treat it as a clean lock (the env var may be stale, but each test
-    // sets it explicitly before use).
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+// C5: NSL_FA_EMITTER env-var removed — no env serialisation needed.
 
 /// IEEE 754 half -> single conversion. Stdlib lacks f16 so we decode the
 /// 16-bit pattern manually -- handles subnormals, infinities, and NaN.
@@ -381,18 +367,12 @@ fn run_flash_attention_and_measure(
     LaunchResult::Ok(max_abs)
 }
 
-/// Parametrized v2 sweep entry point. Pins `NSL_FA_EMITTER=v2`, confirms
-/// routing, runs the launch, then asserts max_abs <= 5e-3.
+/// Parametrized v2 sweep entry point. Confirms routing, runs the launch,
+/// then asserts max_abs <= 5e-3.
 fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, causal: bool) {
-    // Hold ENV_LOCK for the entire test so no concurrent test clobbers
-    // NSL_FA_EMITTER between our set_var and the selector read.
-    let _guard = lock_env();
-    // Pin selector to v2.
-    std::env::set_var("NSL_FA_EMITTER", "v2");
-
     if !cuda_available() { return; }
 
-    // Sanity: confirm the selector is routing to v2 after the set_var above.
+    // Sanity: confirm the selector routes to v2 (only emitter since C5).
     let probe_config = FlashAttentionConfig {
         block_q: block_q as i64,
         block_kv: block_kv as i64,
@@ -409,7 +389,7 @@ fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, 
     assert_eq!(
         select_emitter(&probe_config),
         Emitter::V2,
-        "selector must route to v2 after NSL_FA_EMITTER=v2 -- got v1, test would be meaningless"
+        "selector must return V2 (only emitter post-C5)"
     );
 
     match run_flash_attention_and_measure(block_q, block_kv, head_dim, causal) {
@@ -491,85 +471,7 @@ fn classic_16x16x64_causal() { run_classic_numerical_case(16, 16, 64, true); }
 // once the selector gains a fall-back policy for configs outside v2's
 // supported matrix (this one overflows the 48 KB SMEM budget at 67584 B).
 
-// -- v1 divergence smoke test ----------------------------------------------
-
-/// v1 is provably wrong on the canonical config (the reason this whole
-/// rewrite exists). This test pins the selector to v1 and asserts the
-/// divergence IS large, which:
-///   (a) proves the selector actually routes between v1 and v2,
-///   (b) documents the pre-existing v1 defect as a fixed baseline,
-///   (c) alerts us if v1 suddenly starts producing correct output (a
-///       regression signal: either v1 got secretly fixed or the test
-///       is measuring something wrong).
-///
-/// NOTE: v1 emits non-ASCII PTX which causes cuModuleLoadData to fail with
-/// rc=218. A launch failure from v1 is itself conclusive proof that v1 is
-/// broken -- we accept either `LaunchFailed` OR `Ok(max_abs > 1e-2)` as
-/// evidence that v1 remains defective.
-#[test]
-#[ignore = "requires CUDA GPU"]
-fn v1_still_diverges_on_canonical_config_for_regression_tracking() {
-    // Hold ENV_LOCK for the entire test -- same reason as v2 cases.
-    let _guard = lock_env();
-    std::env::set_var("NSL_FA_EMITTER", "v1");
-
-    if !cuda_available() {
-        std::env::remove_var("NSL_FA_EMITTER");
-        return;
-    }
-
-    // Sanity: confirm the selector is routing to v1.
-    let probe_config = FlashAttentionConfig {
-        block_q: 32,
-        block_kv: 32,
-        head_dim: 32,
-        causal: true,
-        paged: false,
-        rope_q: false,
-        rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1,
-        tree_mask: false,
-        gpu_sm: 75,
-        csha: None,
-    };
-    assert_eq!(
-        select_emitter(&probe_config),
-        Emitter::V1,
-        "selector must route to v1 after NSL_FA_EMITTER=v1. \
-         If running with other tests in parallel, re-run this test in isolation \
-         (cargo test ... v1_still_diverges -- --ignored)"
-    );
-
-    // Use canonical config: block_q=32, block_kv=32, head_dim=32, causal=true.
-    let result = run_flash_attention_and_measure(32, 32, 32, true);
-
-    std::env::remove_var("NSL_FA_EMITTER");
-
-    match result {
-        LaunchResult::LaunchFailed(rc, log) => {
-            // v1 emits non-ASCII PTX -- the driver rejects it. This IS the
-            // defect we're documenting: v1 can't even produce valid PTX.
-            // rc=218 = CUDA_ERROR_INVALID_PTX.
-            eprintln!("v1 launch failed (expected): rc={}\nJIT log:\n{}", rc, log);
-            // Pass: v1 broken at PTX-validation level -- more broken than just wrong numerics.
-        }
-        LaunchResult::EmitterPanic(msg) => {
-            // Also acceptable: emitter panics before producing PTX.
-            eprintln!("v1 emitter panicked (expected): {}", msg);
-        }
-        LaunchResult::Ok(divergence) => {
-            // v1 somehow launched. Assert the numerics are still wrong.
-            eprintln!("v1 launched! divergence max_abs={}", divergence);
-            assert!(
-                divergence > 1e-2,
-                "v1 max_abs divergence is {} -- expected >1e-2. Either v1 got fixed \
-                 (update this test / re-evaluate whether v1 retirement is needed) \
-                 or the selector is misrouting (check NSL_FA_EMITTER handling).",
-                divergence
-            );
-        }
-    }
-}
+// C5: v1 divergence smoke test removed — v1 deleted, only v2 remains.
 
 // Guard against unused-import on non-cuda builds (even though the file
 // is cfg-gated, keep c_void wired so the FFI signatures validate).

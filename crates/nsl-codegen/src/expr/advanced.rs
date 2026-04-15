@@ -1323,7 +1323,7 @@ impl Compiler<'_> {
         let is_causal = ctx.config.causal;
         let mut diags = Vec::<String>::new();
         let shmem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-            &ctx.config, &mut self.csha_fallback_seen, &mut diags,
+            &ctx.config, &mut diags,
         ) as i64;
         for d in diags { eprintln!("warning: {d}"); }
 

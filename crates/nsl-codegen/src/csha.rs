@@ -410,7 +410,6 @@ pub fn run(input: CshaInput) -> CshaPlan {
     let bridge = crate::csha_apply::bridge(
         &interim,
         input.shape.head_dim as i64,
-        &mut crate::flash_attention_selector::FallbackSeen::new(),
         &mut diags,
     );
     for d in diags { eprintln!("warning: {d}"); }

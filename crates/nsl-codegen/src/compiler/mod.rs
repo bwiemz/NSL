@@ -441,11 +441,6 @@ pub struct Compiler<'a> {
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 
-    // ── CSHA A2: selector fallback dedup ────────────────────────────
-    /// Tracks which `(block_q, block_kv, head_dim)` triples have already
-    /// emitted a v2-fallback diagnostic this compilation unit, so each
-    /// unique config produces at most one warning.
-    pub csha_fallback_seen: crate::flash_attention_selector::FallbackSeen,
 }
 
 /// Quantization configuration for a model.
@@ -587,7 +582,6 @@ impl<'a> Compiler<'a> {
             csha_claimed_ops: std::collections::HashSet::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
-            csha_fallback_seen: crate::flash_attention_selector::FallbackSeen::new(),
         })
     }
 

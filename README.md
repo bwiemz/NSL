@@ -171,15 +171,6 @@ nsl zk verify proof.zkp             # Verify a proof
 nsl zk stats proof.zkp              # Proof statistics
 ```
 
-## Environment Variables
-
-### NSL_FA_EMITTER
-
-Controls the FA-2 scalar emitter version:
-
-- Unset / `v2` (default): the production emitter. Numerically verified against a CPU reference across the supported matrix (block_q ∈ {32,64}, block_kv ∈ {32,64}, head_dim ∈ {32,64}, heads ∈ {4,8}).
-- `v1`: legacy emitter. Retained for one release cycle; scheduled for removal. Prefer v2.
-
 ## Project Structure
 
 ```text
