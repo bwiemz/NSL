@@ -3292,6 +3292,9 @@ impl Compiler<'_> {
                     global_mode,
                 } => format!("{:?}_optimizer_global_mode_{:?}", optimizer, global_mode)
                     .to_lowercase(),
+                crate::wggo_overrides::OverrideRejectReason::TwoPhaseClipConflict {
+                    grad_clip_threshold,
+                } => format!("two_phase_clip_threshold_{grad_clip_threshold}"),
                 other => format!("{:?}", other),
             };
             eprintln!(
@@ -5015,7 +5018,110 @@ impl Compiler<'_> {
         // mode-table dispatch in ga_body (Task 4b), which is the dominant
         // memory-cost decision. The optimizer step's compute cost is identical
         // between modes — only accumulation buffer shape differs.
-        if fase_deferred {
+        //
+        // FASE Optim-Step Dispatch Task 5: shared locals hoisted from the
+        // fallback `else` arm so the new `if let Some(mtb)` branch can
+        // reference them. Cranelift DCE ensures constants unused by the
+        // Deferred arm don't affect emitted code for that path.
+        let opt_grads = if let Some(accum) = accum_list {
+            accum
+        } else {
+            grads_list
+        };
+
+        let optimizer_fn_name = match optimizer_name.as_str() {
+            "sgd" => "nsl__optim__sgd__sgd_step",
+            "adam" => "nsl__optim__adam__adam_step",
+            "adamw" => "nsl__optim__adamw__adamw_step",
+            "lion" => "nsl__optim__lion__lion_step",
+            "muon" => "nsl__optim__muon__muon_step",
+            "soap" => "nsl__optim__soap__soap_step",
+            _ => {
+                return Err(CodegenError::new(format!(
+                    "unsupported optimizer '{}' in train block",
+                    optimizer_name
+                )));
+            }
+        };
+
+        // Check if optimizer function exists, try fallback name patterns
+        let opt_fn = if self.registry.functions.contains_key(optimizer_fn_name) {
+            optimizer_fn_name.to_string()
+        } else {
+            // Try simpler name: e.g. "sgd_step"
+            let simple = format!("{}_step", optimizer_name);
+            if self.registry.functions.contains_key(&simple) {
+                simple
+            } else if self.registry.runtime_fns.contains_key(optimizer_fn_name) {
+                optimizer_fn_name.to_string()
+            } else if self.registry.runtime_fns.contains_key(&simple) {
+                simple
+            } else {
+                // Register as runtime function so it can be resolved at link time
+                optimizer_fn_name.to_string()
+            }
+        };
+
+        let lr = builder.use_var(lr_var);
+        let momentum_const = builder.ins().f64const(momentum_value);
+        let dampening_const = builder.ins().f64const(dampening_value);
+        let weight_decay_const = builder.ins().f64const(weight_decay_value);
+        let nesterov_const = builder
+            .ins()
+            .iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
+        let beta1_const = builder.ins().f64const(beta1_value);
+        let beta2_const = builder.ins().f64const(beta2_value);
+        let eps_const = builder.ins().f64const(eps_value);
+
+        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step
+        let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
+        if zero_enabled {
+            self.compile_call_by_name(
+                builder,
+                "nsl_zero_reduce_grads",
+                &[opt_grads, num_params_val],
+            )?;
+        }
+
+        if let Some(mtb) = mode_table_base {
+            self.emit_unified_optim_step_dispatch(
+                builder,
+                state,
+                mtb,
+                num_params_val,
+                param_list,
+                state_list_1,
+                state_list_2,
+                num_state_buffers,
+                accum_list,
+                opt_grads,
+                step_count_var,
+                &fase_plan,
+                optimizer_name.as_str(),
+                &opt_fn,
+                lr,
+                momentum_const,
+                dampening_const,
+                weight_decay_const,
+                nesterov_const,
+                beta1_const,
+                beta2_const,
+                eps_const,
+                grad_accumulation_steps,
+                grad_clip,
+            )?;
+
+            // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
+            if zero_enabled {
+                self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
+            }
+
+            // Jump to post-optimizer block (merges optimizer and skip paths)
+            builder.ins().jump(post_optimizer_block, &[]);
+            builder.switch_to_block(post_optimizer_block);
+            builder.seal_block(post_optimizer_block);
+            state.current_block = Some(post_optimizer_block);
+        } else if fase_deferred {
             if let Some(accum) = accum_list {
                 // ── FASE Deferred: compute bias-correction scalars once per step ──
                 // opt_step = (step_count + 1) / grad_accumulation_steps
@@ -5243,67 +5349,6 @@ impl Compiler<'_> {
                 state.current_block = Some(post_optimizer_block);
             }
         } else {
-
-        // When accumulating, use accum_list (accumulated grads); otherwise use grads_list directly.
-        let opt_grads = if let Some(accum) = accum_list {
-            accum
-        } else {
-            grads_list
-        };
-
-        let optimizer_fn_name = match optimizer_name.as_str() {
-            "sgd" => "nsl__optim__sgd__sgd_step",
-            "adam" => "nsl__optim__adam__adam_step",
-            "adamw" => "nsl__optim__adamw__adamw_step",
-            "lion" => "nsl__optim__lion__lion_step",
-            "muon" => "nsl__optim__muon__muon_step",
-            "soap" => "nsl__optim__soap__soap_step",
-            _ => {
-                return Err(CodegenError::new(format!(
-                    "unsupported optimizer '{}' in train block",
-                    optimizer_name
-                )));
-            }
-        };
-
-        // Check if optimizer function exists, try fallback name patterns
-        let opt_fn = if self.registry.functions.contains_key(optimizer_fn_name) {
-            optimizer_fn_name.to_string()
-        } else {
-            // Try simpler name: e.g. "sgd_step"
-            let simple = format!("{}_step", optimizer_name);
-            if self.registry.functions.contains_key(&simple) {
-                simple
-            } else if self.registry.runtime_fns.contains_key(optimizer_fn_name) {
-                optimizer_fn_name.to_string()
-            } else if self.registry.runtime_fns.contains_key(&simple) {
-                simple
-            } else {
-                // Register as runtime function so it can be resolved at link time
-                optimizer_fn_name.to_string()
-            }
-        };
-
-        let lr = builder.use_var(lr_var);
-        let momentum_const = builder.ins().f64const(momentum_value);
-        let dampening_const = builder.ins().f64const(dampening_value);
-        let weight_decay_const = builder.ins().f64const(weight_decay_value);
-        let nesterov_const = builder
-            .ins()
-            .iconst(cl_types::I8, if nesterov_value { 1 } else { 0 });
-        let beta1_const = builder.ins().f64const(beta1_value);
-        let beta2_const = builder.ins().f64const(beta2_value);
-        let eps_const = builder.ins().f64const(eps_value);
-
-        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step
-        let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
-        if zero_enabled {
-            self.compile_call_by_name(
-                builder,
-                "nsl_zero_reduce_grads",
-                &[opt_grads, num_params_val],
-            )?;
-        }
 
         // 7f. Optimizer step loop: for i in 0..num_params (runtime loop)
         {
