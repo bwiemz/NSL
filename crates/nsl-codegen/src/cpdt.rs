@@ -60,6 +60,10 @@ pub struct CpdtInput<'a> {
     pub moe_roofline_slack: f64,
     pub expert_cfg: ExpertConfig,
     pub joint_cfg: JointConfig,
+    /// Single global ZeRO shard-factor recommendation aggregated from
+    /// WGGO's per-layer decisions via `WggoOverrides::min_shard_factor`.
+    /// `None` → CPDT's planner runs unchanged.
+    pub wggo_recommended_shard: Option<u32>,
 }
 
 /// Top-level CPDT plan.
@@ -73,6 +77,10 @@ pub struct CpdtPlan {
     pub experts: Option<ExpertPlan>,
     pub joint: Option<JointPlan>,
     pub solve_us: u64,
+    /// WGGO recommendations that CPDT had to clamp or reject due to
+    /// hardware constraints. Empty when no recommendation was supplied
+    /// or it was applied verbatim.
+    pub override_diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic>,
 }
 
 impl CpdtPlan {
@@ -170,6 +178,7 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
             experts: None,
             joint: None,
             solve_us: t0.elapsed().as_micros() as u64,
+            override_diagnostics: Vec::new(),
         };
     }
 
@@ -235,6 +244,7 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         experts,
         joint,
         solve_us: t0.elapsed().as_micros() as u64,
+        override_diagnostics: Vec::new(),
     }
 }
 
@@ -268,6 +278,7 @@ mod tests {
             moe_roofline_slack: 1.0,
             expert_cfg: ExpertConfig::default(),
             joint_cfg: JointConfig::default(),
+            wggo_recommended_shard: None,
         }
     }
 
@@ -342,5 +353,19 @@ mod tests {
     fn full_mode_runs_joint_solver() {
         let plan = run(tiny_input());
         assert!(plan.joint.is_some());
+    }
+
+    #[test]
+    fn cpdt_plan_default_has_empty_override_diagnostics() {
+        // Smoke test: a plan from a minimal Off-mode input has empty diagnostics.
+        // CpdtMode::Off short-circuits the planner so we don't need a full
+        // ClusterSpec / ModelSize / PrecisionConfig to exercise the field.
+        let mut input = tiny_input();
+        input.mode = CpdtMode::Off;
+        let plan = run(input);
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "default CpdtPlan from Off mode must have empty override_diagnostics"
+        );
     }
 }
