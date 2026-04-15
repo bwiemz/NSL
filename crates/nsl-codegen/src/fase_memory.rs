@@ -54,6 +54,10 @@ impl ModelFootprint {
     pub fn max_param_bytes(&self) -> u64 {
         self.params.iter().map(|p| p.param_bytes).max().unwrap_or(0)
     }
+    /// Canonical per-layer count (one `ParamFootprint` per layer).
+    pub fn num_layers(&self) -> usize {
+        self.params.len()
+    }
 }
 
 /// Memory summary for a given scheduling mode.
@@ -111,23 +115,52 @@ fn standard_breakdown(footprint: &ModelFootprint) -> MemoryBreakdown {
 fn fase_breakdown(footprint: &ModelFootprint, plan: &FasePlan) -> MemoryBreakdown {
     let params = footprint.total_param_bytes();
     let opt_state = optimizer_bytes(footprint);
-    // FASE residency depends on the mode:
-    //   Deferred → m_partial-sized buffer (== params), one-layer gradient.
-    //   FullBuffer → full gradient buffer, one-layer gradient.
-    //   Passthrough → same as standard.
-    let (accumulator_bytes, one_layer_grad) = match plan.mode {
-        FaseMode::Passthrough => (params, 0),
-        FaseMode::Deferred => (params, footprint.max_param_bytes()),
-        FaseMode::FullBuffer => (params, footprint.max_param_bytes()),
-    };
-    // Peak is reached at the final micro-batch, mid-backward, when ONE
-    // layer's gradient is live alongside m_partial / grad-buffer and the
-    // activation for that same layer.
     let peak_activation_layer = footprint.peak_activation_layer_bytes();
-    let peak = match plan.mode {
-        FaseMode::Passthrough => params + accumulator_bytes + opt_state + peak_activation_layer,
-        _ => params + accumulator_bytes + one_layer_grad + opt_state + peak_activation_layer,
+
+    // Per-layer mode drives the (accumulator, one-layer-grad) contribution.
+    // Today Deferred and FullBuffer produce identical tuples — the
+    // iteration is structural and ready for future per-layer refinement
+    // (e.g. Deferred-mode m_partial sizing becoming layer-aware).
+    let num_layers = footprint.num_layers();
+    let mut accumulator_bytes = 0u64;
+    let mut one_layer_grad = 0u64;
+    let mut any_non_passthrough = false;
+
+    for i in 0..num_layers {
+        let mode = plan.mode_for_layer(i);
+        let (acc_i, grad_i) = match mode {
+            FaseMode::Passthrough => (params, 0),
+            FaseMode::Deferred => (params, footprint.max_param_bytes()),
+            FaseMode::FullBuffer => (params, footprint.max_param_bytes()),
+        };
+        accumulator_bytes = accumulator_bytes.max(acc_i);
+        one_layer_grad = one_layer_grad.max(grad_i);
+        if mode != FaseMode::Passthrough {
+            any_non_passthrough = true;
+        }
+    }
+
+    // When per_layer_mode is None, fall back to the global mode for the
+    // Passthrough short-circuit (preserves byte-identical behavior with
+    // today's single-mode schedules, including empty-layer footprints).
+    let treat_as_passthrough = if plan.per_layer_mode.is_none() {
+        plan.mode == FaseMode::Passthrough
+    } else {
+        !any_non_passthrough
     };
+
+    // Preserve legacy behavior for empty footprints: accumulator was
+    // `params` (= 0) regardless of mode in the old match.
+    if num_layers == 0 {
+        accumulator_bytes = params;
+    }
+
+    let peak = if treat_as_passthrough {
+        params + accumulator_bytes + opt_state + peak_activation_layer
+    } else {
+        params + accumulator_bytes + one_layer_grad + opt_state + peak_activation_layer
+    };
+
     MemoryBreakdown {
         params,
         gradients: accumulator_bytes,
@@ -246,5 +279,52 @@ mod tests {
         // FullBuffer mode still saves activations (peak-layer vs total).
         assert!(s.fase.activations < s.standard.activations);
         assert!(s.fase.peak < s.standard.peak);
+    }
+
+    #[test]
+    fn all_deferred_per_layer_matches_global_deferred_schedule() {
+        let footprint = nslcoder_50m_footprint();
+        let global = fase_plan(&FaseConfig {
+            optimizer: FaseOptimizer::AdamW,
+            accumulation: 4,
+            ..Default::default()
+        });
+        let mut overridden = global.clone();
+        let n = footprint.num_layers();
+        overridden.per_layer_mode = Some(vec![crate::fase::FaseMode::Deferred; n]);
+
+        let s_global = schedule(&footprint, &global);
+        let s_overridden = schedule(&footprint, &overridden);
+
+        assert_eq!(s_global.fase.peak, s_overridden.fase.peak);
+        assert_eq!(s_global.fase.gradients, s_overridden.fase.gradients);
+    }
+
+    #[test]
+    fn mixed_per_layer_modes_produce_valid_schedule() {
+        let footprint = nslcoder_50m_footprint();
+        let global = fase_plan(&FaseConfig {
+            optimizer: FaseOptimizer::AdamW,
+            accumulation: 4,
+            ..Default::default()
+        });
+        let n = footprint.num_layers();
+        let modes: Vec<crate::fase::FaseMode> = (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    crate::fase::FaseMode::Deferred
+                } else {
+                    crate::fase::FaseMode::FullBuffer
+                }
+            })
+            .collect();
+        let mut overridden = global.clone();
+        overridden.per_layer_mode = Some(modes);
+
+        let s = schedule(&footprint, &overridden);
+        assert!(s.fase.peak > 0);
+        // Mixed ≥ pure-Deferred because FullBuffer layers contribute same bytes today.
+        let s_deferred = schedule(&footprint, &global);
+        assert!(s.fase.peak >= s_deferred.fase.peak);
     }
 }
