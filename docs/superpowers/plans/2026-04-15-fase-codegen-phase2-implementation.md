@@ -12,6 +12,14 @@
 
 **Branch:** `feat/fase-codegen-phase2` (already created from `origin/main` at `661e7d5` — Phase 1 merged).
 
+## Task 0 Outcome: prefix mismatch — needs strip
+
+`enumerate_model_tensor_paths(model_var_name, model_type_name)` produces paths like `m.blocks.0.attn.wq` (the `model_var_name` is the prefix; recursion appends `.field`). WGGO `layer_name` is bare (`blocks.0`). `find_by_layer_containing("m.blocks.0.attn.wq")` returns `None` because the path does not start with `blocks.0` — the leading `m.` breaks the prefix match.
+
+**Fix:** `build_param_mode_table` takes an additional `model_var_name: &str` parameter and strips `format!("{model_var_name}.")` from each path before calling `find_by_layer_containing`. If the prefix isn't present (e.g., paths are already bare in some future caller), the strip is a no-op via `path.strip_prefix(&prefix).unwrap_or(path.as_str())`. Task 1's helper signature and unit tests are updated below to reflect this.
+
+CSHA/WRGA's existing `find_by_layer_containing` use site (`wrga_spectral.rs`) passes already-bare projection names from WRGA's internal world — that's why the matcher works for them but would fail here without the strip.
+
 ---
 
 ## File Inventory
