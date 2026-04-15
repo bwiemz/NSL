@@ -136,6 +136,18 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .pred %p_wk_fused, %p_wv_fused;\n");
     }
 
+    // CSHA Tier C save_activations scratch registers (only when flag is set).
+    // Used by emit_save_activations to write post-RoPE Q/K/V to HBM for the
+    // fused source-AD backward kernel.
+    if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
+        ptx.push_str(
+            "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
+        );
+        ptx.push_str("    .reg .u32 %r_save_wrow;\n");
+        ptx.push_str("    .reg .b16 %h_save_v;\n");
+        ptx.push_str("    .reg .pred %p_save_null;\n");
+    }
+
     // CSHA A5 Wo output projection stub registers (only when fused_output_proj is set).
     // Actual Wo @ O computation is delegated to a separate follow-up kernel (spec R2);
     // these registers are used only for the null-check dispatch stub.

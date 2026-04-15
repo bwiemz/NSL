@@ -100,6 +100,9 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             // RoPE epilogue.
             phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
 
+            // Tier C: save post-RoPE activations for backward (gated on flag).
+            phases::csha_hooks::emit_save_activations(&mut ptx, config, q_iter);
+
             // Q load (q_smem → registers).
             phases::q_load::emit(&mut ptx, config, q_iter);
 
@@ -184,6 +187,9 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             // Q/K SMEM tiles are rotated BEFORE Q-load / S-compute consume them
             // for QK^T.
             phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
+
+            // Tier C: save post-RoPE activations for backward (gated on flag).
+            phases::csha_hooks::emit_save_activations(&mut ptx, config, q_iter);
 
             // Phase 1: Q load.
             phases::q_load::emit(&mut ptx, config, q_iter);
