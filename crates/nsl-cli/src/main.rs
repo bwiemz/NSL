@@ -2196,7 +2196,20 @@ fn run_build_shared_single(
         nsl_codegen::linker::default_shared_lib_path(file)
     };
 
-    match nsl_codegen::linker::link_shared(std::slice::from_ref(&obj_path), &lib_path) {
+    // M62 Task 6: collect @export symbol names so the linker can force them
+    // into the DLL export table (Linkage::Export alone isn't enough on MSVC).
+    let export_symbols: Vec<String> = exports_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
+        .unwrap_or_default();
+    let export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+
+    match nsl_codegen::linker::link_shared_with_exports(
+        std::slice::from_ref(&obj_path),
+        &lib_path,
+        &export_refs,
+    ) {
         Ok(()) => {
             let _ = std::fs::remove_file(&obj_path);
             println!("Built shared library {}", lib_path.display());
@@ -2442,7 +2455,15 @@ fn run_build_shared_multi(
         nsl_codegen::linker::default_shared_lib_path(file)
     };
 
-    match nsl_codegen::linker::link_shared(&obj_files, &lib_path) {
+    // M62 Task 6: propagate @export symbols to the linker on MSVC.
+    let export_symbols: Vec<String> = exports_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
+        .unwrap_or_default();
+    let export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+
+    match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
             for obj in &obj_files {
                 let _ = std::fs::remove_file(obj);
