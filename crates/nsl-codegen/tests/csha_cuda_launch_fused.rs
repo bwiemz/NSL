@@ -159,14 +159,15 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
     // prologue expects.  Kernel indexes as [batch*heads, seq, head_dim].
     let x_kernel = det_seq(42, heads * seq * head_dim);
 
-    // Wq: [d_model=32, head_dim=32] f32.  All heads share one Wq pointer.
-    // Wk/Wv not used by the kernel (pre-projected K/V uploaded directly).
+    // Wq/Wk/Wv: [d_model=32, head_dim=32] f32.  All heads share one pointer each.
+    // All three are uploaded as f16 for the fused projection sweeps.
     let wq_f32 = det_seq(43, d_model * head_dim);
     let wk_f32 = det_seq(44, d_model * head_dim);
     let wv_f32 = det_seq(45, d_model * head_dim);
 
     let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
-    // Wk/Wv pointers in kernel params will be null — K/V come pre-projected.
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
 
     // norm_weight: [head_dim] all 1.0.
     let norm_weight_f32 = vec![1.0f32; head_dim];
@@ -179,12 +180,8 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
     let zeros_rope  = vec![0f32; seq * (head_dim / 2)];
     let ones_cos    = vec![1.0f32; seq * (head_dim / 2)];
 
-    // Compute per-head CPU output and also extract pre-projected K/V for GPU.
+    // CPU reference: all heads share wq/wk/wv.
     let mut cpu_out = vec![0f32; seq * heads * head_dim];
-    // Pre-projected K and V: [heads, seq, head_dim] f32, layout [batch, heads, seq, head_dim].
-    // Uploaded as f32 because k_tile_load reads f32 (ld.global.f32) and converts to f16 in SMEM.
-    let mut kv_proj_f32 = vec![0f32; heads * seq * head_dim]; // K
-    let mut vv_proj_f32 = vec![0f32; heads * seq * head_dim]; // V
 
     for h in 0..heads {
         // Per-head x slice: [seq, head_dim].
@@ -206,33 +203,11 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
                 ..s * heads * head_dim + (h + 1) * head_dim]
                 .copy_from_slice(&out_h[s * head_dim..(s + 1) * head_dim]);
         }
-
-        // Also compute x_norm for K/V projection.
-        // Re-use: RMSNorm(x_h[s]) → x_norm_s, then K_s = x_norm_s @ Wk, V_s = x_norm_s @ Wv.
-        for s in 0..seq {
-            let row = &x_h[s * head_dim..(s + 1) * head_dim];
-            let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
-            let rms = (mean_sq + norm_eps).sqrt();
-            let x_norm_s: Vec<f32> = row.iter().zip(norm_weight_f32.iter())
-                .map(|(v, w)| v / rms * w)
-                .collect();
-            // K_s[col] = dot(x_norm_s, Wk[:, col])
-            for col in 0..head_dim {
-                let mut sum_k = 0f32;
-                let mut sum_v = 0f32;
-                for k in 0..d_model {
-                    sum_k += x_norm_s[k] * wk_f32[k * head_dim + col];
-                    sum_v += x_norm_s[k] * wv_f32[k * head_dim + col];
-                }
-                kv_proj_f32[h * seq * head_dim + s * head_dim + col] = sum_k;
-                vv_proj_f32[h * seq * head_dim + s * head_dim + col] = sum_v;
-            }
-        }
     }
 
     // ── Device allocations ────────────────────────────────────────────────
     let x_bytes       = (x_kernel.len() * 4) as i64;
-    let wq_bytes      = (wq_f16.len() * 2) as i64;
+    let w_bytes       = (wq_f16.len() * 2) as i64; // same size for Wq/Wk/Wv
     let nw_bytes      = (norm_weight_f32.len() * 4) as i64;
     let qkv_elems     = batch * heads * seq * head_dim;
     let qkv_f16_bytes = (qkv_elems * 2) as i64;
@@ -241,28 +216,30 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
     let lse_bytes     = (batch * heads * seq * 4) as i64;
 
     let x_dev   = unsafe { nsl_test_cuda_alloc(x_bytes) };
-    let wq_dev  = unsafe { nsl_test_cuda_alloc(wq_bytes) };
+    let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let nw_dev  = unsafe { nsl_test_cuda_alloc(nw_bytes) };
-    // Dummy q_dev (Q comes from fused projection, not HBM q_ptr).
+    // Dummy q/k/v_dev: kernel derives Q/K/V from x@Wq/Wk/Wv; classic ptrs unused.
+    // Pass non-null allocations so the kernel doesn't fault if it reads them.
     let q_dev   = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
-    // K and V: pre-projected f32 tensors (k_tile_load reads f32, converts to f16 in SMEM).
     let k_dev   = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
     let v_dev   = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
     let out_dev = unsafe { nsl_test_cuda_alloc(out_bytes) };
     let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
 
     let all_ptrs = [
-        x_dev, wq_dev, nw_dev, q_dev, k_dev, v_dev, out_dev, lse_dev,
+        x_dev, wq_dev, wk_dev, wv_dev, nw_dev, q_dev, k_dev, v_dev, out_dev, lse_dev,
     ];
     assert!(all_ptrs.iter().all(|&p| p != 0), "device allocation returned null");
 
     unsafe {
-        nsl_test_cuda_h2d(x_dev,  x_kernel.as_ptr()        as i64, x_bytes);
-        nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr()           as i64, wq_bytes);
-        nsl_test_cuda_h2d(nw_dev, norm_weight_f32.as_ptr()  as i64, nw_bytes);
-        // q_dev left uninitialised (kernel uses fused projection, not q_ptr).
-        nsl_test_cuda_h2d(k_dev,  kv_proj_f32.as_ptr()      as i64, qkv_f32_bytes);
-        nsl_test_cuda_h2d(v_dev,  vv_proj_f32.as_ptr()      as i64, qkv_f32_bytes);
+        nsl_test_cuda_h2d(x_dev,  x_kernel.as_ptr()           as i64, x_bytes);
+        nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr()             as i64, w_bytes);
+        nsl_test_cuda_h2d(wk_dev, wk_f16.as_ptr()             as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev, wv_f16.as_ptr()             as i64, w_bytes);
+        nsl_test_cuda_h2d(nw_dev, norm_weight_f32.as_ptr()    as i64, nw_bytes);
+        // q/k/v_dev left uninitialised: kernel uses fused Wq/Wk/Wv projections.
     }
 
     // ── PTX synthesis ─────────────────────────────────────────────────────
@@ -335,9 +312,9 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
             // CSHA extras
             x_dev,        // x_ptr
             nw_dev,       // norm_weight_ptr
-            wq_dev,       // wq_ptr
-            0i64,         // wk_ptr=null (K pre-projected in k_dev)
-            0i64,         // wv_ptr=null (V pre-projected in v_dev)
+            wq_dev,       // wq_ptr — fused Q projection
+            wk_dev,       // wk_ptr — fused K projection (kernel derives K from x@Wk)
+            wv_dev,       // wv_ptr — fused V projection (kernel derives V from x@Wv)
             0i64,         // wo_ptr=null (fused_output_proj=false)
             norm_eps.to_bits() as i64,
             active_heads_i,
@@ -352,6 +329,26 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
     }
 
     // ── Readback + compare ────────────────────────────────────────────────
+    // Diagnostic: read back GPU x (normalized in-place by kernel).
+    let mut x_back = vec![0f32; heads * seq * head_dim];
+    unsafe { nsl_test_cuda_d2h(x_back.as_mut_ptr() as i64, x_dev, x_bytes); }
+    // Check x_norm for all heads
+    {
+        let mut all_norm_ok = true;
+        for h in 0..heads {
+            for row in 0..2usize { // check rows 0 and 1
+                let row_raw: Vec<f32> = (0..head_dim).map(|d| x_kernel[h * seq * head_dim + row * head_dim + d]).collect();
+                let sumsq: f32 = row_raw.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+                let rms = (sumsq + norm_eps).sqrt();
+                let norm_cpu: Vec<f32> = row_raw.iter().map(|v| v / rms).collect();
+                let norm_gpu: Vec<f32> = (0..head_dim).map(|d| x_back[h * seq * head_dim + row * head_dim + d]).collect();
+                let max_x_err = norm_cpu.iter().zip(norm_gpu.iter()).map(|(c,g)| (c-g).abs()).fold(0f32, f32::max);
+                if max_x_err > 1e-4 { all_norm_ok = false; }
+                eprintln!("C2 diag: x RMSNorm[h={h},row={row}] max_err={:.3e}", max_x_err);
+            }
+        }
+        eprintln!("C2 diag: all x norms OK: {all_norm_ok}");
+    }
     let mut out_f16 = vec![0u16; qkv_elems];
     unsafe { nsl_test_cuda_d2h(out_f16.as_mut_ptr() as i64, out_dev, out_bytes); }
     // GPU finalize stores in [heads, seq, head_dim] order (batch=1).
@@ -369,12 +366,81 @@ fn run_fused_csha_and_measure() -> (f32, f32) {
         }
     }
 
+    // Compute expected output for head=0, seq_pos=0 using GPU x_norm
+    {
+        let h = 0usize;
+        let x_norm_h: Vec<f32> = (0..seq * head_dim).map(|i| x_back[h * seq * head_dim + i]).collect();
+        let xn = &x_norm_h[..];
+        let wq = &wq_f32[..]; let wk = &wk_f32[..]; let wv = &wv_f32[..];
+        let mut q_mat = vec![0f32; seq * head_dim];
+        let mut k_mat = vec![0f32; seq * head_dim];
+        let mut v_mat = vec![0f32; seq * head_dim];
+        for s in 0..seq { for d in 0..head_dim {
+            q_mat[s * head_dim + d] = (0..d_model).map(|d2| xn[s * d_model + d2] * wq[d2 * head_dim + d]).sum();
+            k_mat[s * head_dim + d] = (0..d_model).map(|d2| xn[s * d_model + d2] * wk[d2 * head_dim + d]).sum();
+            v_mat[s * head_dim + d] = (0..d_model).map(|d2| xn[s * d_model + d2] * wv[d2 * head_dim + d]).sum();
+        }}
+        let mut s_mat = vec![0f32; seq * seq];
+        for i in 0..seq { for j in 0..seq {
+            s_mat[i * seq + j] = (0..head_dim).map(|d| q_mat[i * head_dim + d] * k_mat[j * head_dim + d]).sum::<f32>() * scale;
+        }}
+        for i in 0..seq {
+            let row = &mut s_mat[i * seq..(i + 1) * seq];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sm = 0f32;
+            for v in row.iter_mut() { *v = (*v - mx).exp(); sm += *v; }
+            for v in row.iter_mut() { *v /= sm; }
+        }
+        let mut o_mat = vec![0f32; seq * head_dim];
+        for i in 0..seq { for d in 0..head_dim {
+            o_mat[i * head_dim + d] = (0..seq).map(|j| s_mat[i * seq + j] * v_mat[j * head_dim + d]).sum();
+        }}
+        eprintln!("C2 diag: expected O[h=0,s=0,0..4]: {:?}", &o_mat[..4]);
+        // GPU raw: head h, seq s, dim d → flat index (h*seq + s)*head_dim + d
+        for gpu_h in 0..heads {
+            let gpu_raw_h: Vec<f32> = (0..4).map(|d| f16_to_f32(out_f16[(gpu_h * seq + 0) * head_dim + d])).collect();
+            eprintln!("C2 diag: GPU raw O[h={gpu_h},s=0,0..4]: {gpu_raw_h:?}");
+        }
+        let cpu_h0s0: Vec<f32> = (0..4).map(|d| cpu_out[0 * heads * head_dim + 0 * head_dim + d]).collect();
+        eprintln!("C2 diag: CPU O[h=0,s=0,0..4]: {cpu_h0s0:?}");
+        // Check if all s rows give same GPU output (Q projection broken?)
+        let mut all_same = true;
+        let row0: Vec<f32> = (0..head_dim).map(|d| f16_to_f32(out_f16[(0 * seq + 0) * head_dim + d])).collect();
+        for s in 1..seq {
+            let rows: Vec<f32> = (0..head_dim).map(|d| f16_to_f32(out_f16[(0 * seq + s) * head_dim + d])).collect();
+            if rows.iter().zip(row0.iter()).any(|(a, b)| (a - b).abs() > 0.01) {
+                all_same = false; break;
+            }
+        }
+        eprintln!("C2 diag: GPU h=0 all-rows-same: {all_same}");
+        // Check row uniformity: if P is uniform (Q=0), all rows should be ~equal
+        let row0_s1: Vec<f32> = (0..4).map(|d| f16_to_f32(out_f16[(0 * seq + 1) * head_dim + d])).collect();
+        let row0_s4: Vec<f32> = (0..4).map(|d| f16_to_f32(out_f16[(0 * seq + 4) * head_dim + d])).collect();
+        eprintln!("C2 diag: GPU h=0 s=1,d=0..4: {row0_s1:?}");
+        eprintln!("C2 diag: GPU h=0 s=4,d=0..4: {row0_s4:?}");
+    }
+
     let all_finite = out_gpu.iter().all(|v| v.is_finite());
     let nonzero = out_gpu.iter().filter(|v| v.abs() > 1e-6).count();
     eprintln!("C2 output: finite={all_finite}, nonzero={nonzero}/{qkv_elems}");
     let show = 8.min(qkv_elems);
     eprintln!("C2 first {show} GPU: {:?}", &out_gpu[..show]);
     eprintln!("C2 first {show} CPU: {:?}", &cpu_out[..show]);
+    // Per-head max-abs diagnostics
+    for h in 0..heads {
+        let mut mx = 0f32;
+        for s in 0..seq {
+            for d in 0..head_dim {
+                let idx = s * heads * head_dim + h * head_dim + d;
+                mx = mx.max((out_gpu[idx] - cpu_out[idx]).abs());
+            }
+        }
+        eprintln!("  head {h}: max_abs_diff = {mx:.4e}");
+        // First 4 elements of row 0 for this head
+        let g: Vec<_> = (0..4).map(|d| out_gpu[0 * heads * head_dim + h * head_dim + d]).collect();
+        let c: Vec<_> = (0..4).map(|d| cpu_out[0 * heads * head_dim + h * head_dim + d]).collect();
+        eprintln!("    GPU[s=0,h={h},0..4]={g:.4?}  CPU={c:.4?}");
+    }
 
     let mut max_abs = 0f32;
     let mut max_rel = 0f32;
@@ -421,7 +487,7 @@ fn read_jit_log(ptx_ptr: i64) -> String {
 ///
 /// block_q=32, block_kv=32, head_dim=32, heads=4, d_model=32,
 /// causal=false, rope_q=false (identity), fused_rmsnorm=true,
-/// fused_projections=true (Q only; K/V pre-projected in k_dev/v_dev),
+/// fused_projections=true (Q, K, V all fused; kernel derives Q/K/V from x@Wq/Wk/Wv),
 /// fused_output_proj=false.  Tolerance: 5e-3.
 #[test]
 #[ignore = "requires CUDA GPU"]

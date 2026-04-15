@@ -117,6 +117,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .u64 %x_norm_base, %warp_row;\n");
         // SMEM tile pointer registers for weight matrices and inner-loop use.
         ptx.push_str("    .reg .u64 %q_tile, %k_tile, %v_tile;\n");
+        // KV-tile load bypass registers: used by emit_k_tile_load / emit_v_tile_load
+        // to skip the HBM load when the projection sweep already filled SMEM.
+        ptx.push_str("    .reg .u64 %rd_wk_chk, %rd_wv_chk;\n");
+        ptx.push_str("    .reg .pred %p_wk_fused, %p_wv_fused;\n");
     }
 
     // CSHA A5 Wo output projection stub registers (only when fused_output_proj is set).
