@@ -531,6 +531,9 @@ fn csha_fused_matrix_sweep() {
 
     for &(bq, bkv, hd, h, causal, rope) in configs {
         let label = format!("bq={bq} bkv={bkv} hd={hd} h={h} c={causal} rq={rope}");
+        // f16 accumulation error scales as O(sqrt(head_dim) × ε_f16).
+        // head_dim=32: ~5e-3. head_dim=64: ~2e-2.
+        // Tighter bounds require f32 accumulation (follow-up).
         // Per-head_dim tolerance: head_dim=32 uses strict 5e-3 from C2;
         // head_dim=64 allows 2e-2 due to f16 weight precision accumulation.
         let tol: f32 = if hd <= 32 { 5e-3 } else { 2e-2 };

@@ -59,9 +59,13 @@ pub fn select_emitter_with_dedup(
     if use_mma_path(config.gpu_sm) {
         return Emitter::V1;
     }
-    let env_v2 = std::env::var("NSL_FA_EMITTER").ok().as_deref() == Some("v2");
-    if !env_v2 {
-        return Emitter::V1; // default = v1 until Task 15 flips it
+    // v2 is the default; v1 reachable only via explicit opt-out.
+    let env_choice = std::env::var("NSL_FA_EMITTER").ok();
+    let env_v1 = env_choice.as_deref() == Some("v1");
+    let want_v2 = !env_v1;
+    // Keep gpu_sm >= 80 → v1 routing (MMA path) until that check is removed separately.
+    if !want_v2 {
+        return Emitter::V1;
     }
     // Pre-check validator before routing to v2.
     match smem_layout::validate_scalar_v2_config(config) {
@@ -147,6 +151,13 @@ pub fn shared_mem_bytes_selected(config: &FlashAttentionConfig) -> u32 {
 mod selector_tests {
     use super::*;
     use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
+    use std::sync::{Mutex, MutexGuard};
+
+    // Serialise all tests that touch NSL_FA_EMITTER to avoid cross-test env interference.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn cfg(block_q: i64, block_kv: i64, head_dim: i64, gpu_sm: u32) -> FlashAttentionConfig {
         FlashAttentionConfig {
@@ -166,6 +177,7 @@ mod selector_tests {
 
     #[test]
     fn a2_out_of_matrix_config_falls_back_to_v1_with_diagnostic() {
+        let _guard = lock_env();
         // head_dim=128, block_q=128, block_kv=128 is in the allowed lists —
         // but the SMEM total (128*128*2 + 128*128*2 + 4*128*4 = 67584) exceeds
         // the 48 KB budget, so validate_scalar_v2_config rejects it.
@@ -187,6 +199,7 @@ mod selector_tests {
 
     #[test]
     fn a2_diagnostic_deduped_per_config() {
+        let _guard = lock_env();
         std::env::set_var("NSL_FA_EMITTER", "v2");
         let config = cfg(128, 128, 128, 75);
         let mut diagnostics = Vec::<String>::new();
@@ -199,6 +212,7 @@ mod selector_tests {
 
     #[test]
     fn a2_in_matrix_config_routes_to_v2() {
+        let _guard = lock_env();
         // block_q=32, block_kv=32, head_dim=32: SMEM = 32*32*2 + 32*32*2 + 4*32*4 = 4608 bytes → fits
         std::env::set_var("NSL_FA_EMITTER", "v2");
         let config = cfg(32, 32, 32, 75);
@@ -210,6 +224,7 @@ mod selector_tests {
 
     #[test]
     fn a2_wired_call_site_emits_eprintln_via_compiler_state() {
+        let _guard = lock_env();
         // Verify the new _with_diag wrappers thread FallbackSeen correctly:
         // calling the same out-of-matrix config twice must produce exactly one
         // diagnostic across both calls (cross-call dedup via shared FallbackSeen).
@@ -230,11 +245,50 @@ mod selector_tests {
 
     #[test]
     fn a2_env_unset_keeps_current_default() {
-        // Today's default is v1; C4 will flip this. A2 must not change the default.
+        let _guard = lock_env();
+        // C4 flipped the default to v2. Env-unset now routes to v2 on valid configs.
         std::env::remove_var("NSL_FA_EMITTER");
         let config = cfg(32, 32, 32, 75);
         let mut diagnostics = vec![];
         let result = select_emitter_with_diag(&config, &mut diagnostics);
-        assert_eq!(result, Emitter::V1, "default (env unset) is still v1 before C4");
+        assert_eq!(result, Emitter::V2, "default (env unset) is v2 after C4");
+    }
+
+    #[test]
+    fn c4_default_is_v2_when_env_unset_and_config_valid() {
+        let _guard = lock_env();
+        std::env::remove_var("NSL_FA_EMITTER");
+        let mut cfg = cfg(32, 32, 32, 75);
+        cfg.block_q = 32; cfg.block_kv = 32; cfg.head_dim = 32; cfg.gpu_sm = 75;
+        let mut diagnostics = vec![];
+        let result = select_emitter_with_diag(&cfg, &mut diagnostics);
+        assert_eq!(result, Emitter::V2, "env-unset default should be v2 post-C4");
+        assert!(diagnostics.is_empty(), "no diagnostic expected on valid config");
+    }
+
+    #[test]
+    fn c4_explicit_v1_opt_out_still_works() {
+        let _guard = lock_env();
+        std::env::set_var("NSL_FA_EMITTER", "v1");
+        let mut cfg = cfg(32, 32, 32, 75);
+        cfg.block_q = 32; cfg.block_kv = 32; cfg.head_dim = 32; cfg.gpu_sm = 75;
+        let mut diagnostics = vec![];
+        let result = select_emitter_with_diag(&cfg, &mut diagnostics);
+        assert_eq!(result, Emitter::V1, "explicit NSL_FA_EMITTER=v1 must still route to v1");
+        std::env::remove_var("NSL_FA_EMITTER");
+    }
+
+    #[test]
+    fn c4_default_still_falls_back_to_v1_on_v2_reject() {
+        let _guard = lock_env();
+        std::env::remove_var("NSL_FA_EMITTER");
+        let mut cfg = cfg(128, 128, 128, 75);
+        cfg.block_q = 128; cfg.block_kv = 128; cfg.head_dim = 128; cfg.gpu_sm = 75;
+        // block_q=128, block_kv=128, head_dim=128 exceeds SMEM budget → v2 rejected.
+        let mut diagnostics = vec![];
+        let result = select_emitter_with_diag(&cfg, &mut diagnostics);
+        assert_eq!(result, Emitter::V1, "v2-rejected config should still fall back to v1");
+        assert_eq!(diagnostics.len(), 1, "fallback should emit one diagnostic");
+        assert!(diagnostics[0].contains("block_q=128") && diagnostics[0].contains("head_dim=128"));
     }
 }

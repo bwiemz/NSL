@@ -168,9 +168,14 @@ quant static:
 - Hopper wgmma path exists, but parts of the Hopper-specialized TMA/wgmma kernel plumbing are still placeholder-level
 - Logsumexp save/backward support is implemented
 
-### FlashAttention-2 scalar emitter v2 (soak)
+### FlashAttention-2 scalar emitter v2 (default)
 
-On SM < 80 builds the FlashAttention-2 scalar emitter has two implementations coexisting behind the `NSL_FA_EMITTER` environment variable. The v2 emitter fixes correctness defects in v1 using a warp-per-row thread-mapping contract; see [docs/superpowers/specs/2026-04-14-fa-scalar-emitter-rewrite-design.md](docs/superpowers/specs/2026-04-14-fa-scalar-emitter-rewrite-design.md) for the design spec and migration plan. Default will flip to v2 after the soak period.
+v2 is the default FA-2 scalar emitter. It produces numerically correct
+fused CSHA output (RMSNorm + Q/K/V projections + RoPE + attention)
+across the supported matrix, verified on RTX 5070 Ti + CUDA 13.2 via
+the Part 2 integration test. v1 is reachable via explicit
+`NSL_FA_EMITTER=v1` opt-out for one release cycle; it will be removed
+in a subsequent milestone.
 
 ### Continuous Batching (M29)
 - `serve` block DSL with `@endpoint` decorator
