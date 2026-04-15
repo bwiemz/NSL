@@ -57,6 +57,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         (".param .u64", "csha_wv_ptr"), (".param .u64", "csha_wo_ptr"),
         (".param .f32", "csha_eps"), (".param .u32", "csha_active_heads"),
         (".param .u32", "csha_d_model"),
+        // Tier C: post-RoPE activation save pointers (null when not in use).
+        (".param .u64", "q_proj_ptr"), (".param .u64", "k_proj_ptr"),
+        (".param .u64", "v_proj_ptr"),
+        (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
     ];
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
@@ -134,6 +138,18 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // to skip the HBM load when the projection sweep already filled SMEM.
         ptx.push_str("    .reg .u64 %rd_wk_chk, %rd_wv_chk;\n");
         ptx.push_str("    .reg .pred %p_wk_fused, %p_wv_fused;\n");
+    }
+
+    // CSHA Tier C save_activations scratch registers (only when flag is set).
+    // Used by emit_save_activations to write post-RoPE Q/K/V to HBM for the
+    // fused source-AD backward kernel.
+    if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
+        ptx.push_str(
+            "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
+        );
+        ptx.push_str("    .reg .u32 %r_save_wrow;\n");
+        ptx.push_str("    .reg .b16 %h_save_v;\n");
+        ptx.push_str("    .reg .pred %p_save_null, %p_rowmax_null, %p_rowsum_null, %p_skip_rm, %p_skip_rs;\n");
     }
 
     // CSHA A5 Wo output projection stub registers (only when fused_output_proj is set).

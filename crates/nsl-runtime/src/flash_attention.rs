@@ -379,8 +379,15 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
         let mut dm = d_model as u32;
+        // Tier C activation-save pointers — always null for this FFI; the
+        // `nsl_flash_attention_csha_with_saves` FFI passes real pointers.
+        let mut q_proj: u64 = 0;
+        let mut k_proj: u64 = 0;
+        let mut v_proj: u64 = 0;
+        let mut rmax: u64 = 0;
+        let mut rsum: u64 = 0;
 
-        let args: [*mut c_void; 30] = [
+        let args: [*mut c_void; 35] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -412,6 +419,12 @@ pub extern "C" fn nsl_flash_attention_csha(
             &mut eps as *mut _ as *mut c_void,
             &mut ah as *mut _ as *mut c_void,
             &mut dm as *mut _ as *mut c_void,
+            // ── Tier C activation-save pointers (null by default) ─────
+            &mut q_proj as *mut _ as *mut c_void,
+            &mut k_proj as *mut _ as *mut c_void,
+            &mut v_proj as *mut _ as *mut c_void,
+            &mut rmax as *mut _ as *mut c_void,
+            &mut rsum as *mut _ as *mut c_void,
         ];
 
         let result = crate::cuda::inner::kernel_launch(
@@ -458,6 +471,339 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
+        -1
+    }
+}
+
+/// CSHA Tier C: FlashAttention FFI variant that forwards to the same PTX
+/// body as `nsl_flash_attention_csha` but supplies non-null
+/// activation-save pointers so the fused source-AD backward kernel has
+/// post-RoPE Q/K/V + row_max/row_sum available in HBM.
+///
+/// Pointer contract:
+///   q_proj_ptr / k_proj_ptr / v_proj_ptr — HBM buffers of shape
+///     `[batch, heads, seq, head_dim]` f16, row-major. Typically
+///     allocated via `nsl_csha_alloc_backward_activations`.
+///   row_max_ptr / row_sum_ptr — HBM buffers of shape
+///     `[batch, heads, seq]` f32.
+///
+/// Null-safety: any of the 5 pointers MAY be null (the kernel's per-tensor
+/// null guards skip that store). A fully-null call is equivalent to
+/// `nsl_flash_attention_csha`.
+///
+/// Callers MUST have compiled the kernel with
+/// `CshaExtras::save_activations_for_backward=true`; otherwise the PTX
+/// emits no save path and the pointers are ignored.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_flash_attention_csha_with_saves(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
+    scale_bits: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    block_table_ptr: i64,
+    k_pool_ptr: i64, v_pool_ptr: i64,
+    block_size: i64,
+    cos_ptr: i64, sin_ptr: i64,
+    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    shared_mem_bytes: i64,
+    ptx_ptr: i64, name_ptr: i64,
+    block_q: i64, _block_kv: i64,
+    causal: i64,
+    x_ptr: i64, norm_weight_ptr: i64,
+    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    rmsnorm_eps_bits: i64,
+    active_heads: i64, d_model: i64,
+    // Tier C activation-save pointers.
+    q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
+    row_max_ptr: i64, row_sum_ptr: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let effective_heads = if active_heads > 0 && active_heads < heads {
+            active_heads
+        } else {
+            heads
+        };
+        let grid_x = (seq_len + block_q - 1) / block_q;
+        let grid_y = batch * effective_heads;
+        let grid_z = 1i64;
+        let block_x = 128i64;
+        let block_y = 1i64;
+        let block_z = 1i64;
+
+        let mut q = q_ptr as u64;
+        let mut k = k_ptr as u64;
+        let mut v = v_ptr as u64;
+        let mut out = out_ptr as u64;
+        let mut s = f32::from_bits(scale_bits as u32);
+        let mut b = batch as u64;
+        let mut h = heads as u64;
+        let mut sl = seq_len as u64;
+        let mut hd = head_dim as u64;
+        let mut bt = block_table_ptr as u64;
+        let mut kp = k_pool_ptr as u64;
+        let mut vp = v_pool_ptr as u64;
+        let mut bs = block_size as u64;
+        let mut cos = cos_ptr as u64;
+        let mut sin = sin_ptr as u64;
+        let mut sids = seq_ids_ptr as u64;
+        let mut slens = seq_lens_ptr as u64;
+        let mut dfs_enter: u64 = 0;
+        let mut dfs_exit: u64 = 0;
+        let mut num_tree_nodes: u64 = 0;
+        let mut lse = logsumexp_ptr as u64;
+        let mut x = x_ptr as u64;
+        let mut nw = norm_weight_ptr as u64;
+        let mut wq = wq_ptr as u64;
+        let mut wk = wk_ptr as u64;
+        let mut wv = wv_ptr as u64;
+        let mut wo = wo_ptr as u64;
+        let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
+        let mut ah = active_heads as u32;
+        let mut dm = d_model as u32;
+        let mut q_proj = q_proj_ptr as u64;
+        let mut k_proj = k_proj_ptr as u64;
+        let mut v_proj = v_proj_ptr as u64;
+        let mut rmax = row_max_ptr as u64;
+        let mut rsum = row_sum_ptr as u64;
+
+        let args: [*mut c_void; 35] = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut sids as *mut _ as *mut c_void,
+            &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
+            &mut nw as *mut _ as *mut c_void,
+            &mut wq as *mut _ as *mut c_void,
+            &mut wk as *mut _ as *mut c_void,
+            &mut wv as *mut _ as *mut c_void,
+            &mut wo as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ah as *mut _ as *mut c_void,
+            &mut dm as *mut _ as *mut c_void,
+            &mut q_proj as *mut _ as *mut c_void,
+            &mut k_proj as *mut _ as *mut c_void,
+            &mut v_proj as *mut _ as *mut c_void,
+            &mut rmax as *mut _ as *mut c_void,
+            &mut rsum as *mut _ as *mut c_void,
+        ];
+
+        crate::cuda::inner::kernel_launch(
+            ptx_ptr as *const u8,
+            name_ptr as *const u8,
+            [grid_x, grid_y, grid_z],
+            [block_x, block_y, block_z],
+            &args,
+            shared_mem_bytes as u32,
+        ) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale_bits);
+        let _ = (batch, heads, seq_len, head_dim);
+        let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
+        let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
+        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
+        let _ = (rmsnorm_eps_bits, active_heads, d_model);
+        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr);
+        eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
+        -1
+    }
+}
+
+/// CSHA Tier C: fused source-AD backward kernel launch.
+///
+/// Forwards to the PTX synthesised by
+/// `nsl_codegen::flash_attention_v2::synthesize_backward`. Launch-list
+/// layout: forward's 35 CSHA args (identical order so downstream
+/// tooling sees one ABI), then 8 backward-specific appends:
+/// `dO_ptr` (input) plus the 7 gradient outputs
+/// (`dq_ptr`, `dk_ptr`, `dv_ptr`, `dwq_ptr`, `dwk_ptr`, `dwv_ptr`,
+/// `dx_ptr`).
+///
+/// The five activation-save pointers
+/// (`q_proj_ptr`, `k_proj_ptr`, `v_proj_ptr`, `row_max_ptr`,
+/// `row_sum_ptr`) are inherited from the forward slot: the forward
+/// kernel *wrote* into them when launched via
+/// `nsl_flash_attention_csha_with_saves`; the backward kernel *reads*
+/// from them here. Null pointers on the gradient outputs let callers
+/// skip stores they don't need (e.g. freezing a weight).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_flash_attention_csha_backward(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
+    scale_bits: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    block_table_ptr: i64,
+    k_pool_ptr: i64, v_pool_ptr: i64,
+    block_size: i64,
+    cos_ptr: i64, sin_ptr: i64,
+    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    shared_mem_bytes: i64,
+    ptx_ptr: i64, name_ptr: i64,
+    block_q: i64, _block_kv: i64,
+    causal: i64,
+    x_ptr: i64, norm_weight_ptr: i64,
+    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    rmsnorm_eps_bits: i64,
+    active_heads: i64, d_model: i64,
+    // Saved activations (inputs to backward).
+    q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
+    row_max_ptr: i64, row_sum_ptr: i64,
+    // Tier C backward-specific.
+    do_ptr: i64,
+    dq_ptr: i64, dk_ptr: i64, dv_ptr: i64,
+    dwq_ptr: i64, dwk_ptr: i64, dwv_ptr: i64,
+    dx_ptr: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let effective_heads = if active_heads > 0 && active_heads < heads {
+            active_heads
+        } else {
+            heads
+        };
+        let grid_x = (seq_len + block_q - 1) / block_q;
+        let grid_y = batch * effective_heads;
+        let grid_z = 1i64;
+        let block_x = 128i64;
+        let block_y = 1i64;
+        let block_z = 1i64;
+
+        let mut q = q_ptr as u64;
+        let mut k = k_ptr as u64;
+        let mut v = v_ptr as u64;
+        let mut out = out_ptr as u64;
+        let mut s = f32::from_bits(scale_bits as u32);
+        let mut b = batch as u64;
+        let mut h = heads as u64;
+        let mut sl = seq_len as u64;
+        let mut hd = head_dim as u64;
+        let mut bt = block_table_ptr as u64;
+        let mut kp = k_pool_ptr as u64;
+        let mut vp = v_pool_ptr as u64;
+        let mut bs = block_size as u64;
+        let mut cos = cos_ptr as u64;
+        let mut sin = sin_ptr as u64;
+        let mut sids = seq_ids_ptr as u64;
+        let mut slens = seq_lens_ptr as u64;
+        let mut dfs_enter: u64 = 0;
+        let mut dfs_exit: u64 = 0;
+        let mut num_tree_nodes: u64 = 0;
+        let mut lse = logsumexp_ptr as u64;
+        let mut x = x_ptr as u64;
+        let mut nw = norm_weight_ptr as u64;
+        let mut wq = wq_ptr as u64;
+        let mut wk = wk_ptr as u64;
+        let mut wv = wv_ptr as u64;
+        let mut wo = wo_ptr as u64;
+        let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
+        let mut ah = active_heads as u32;
+        let mut dm = d_model as u32;
+        let mut qp = q_proj_ptr as u64;
+        let mut kpj = k_proj_ptr as u64;
+        let mut vpj = v_proj_ptr as u64;
+        let mut rmax = row_max_ptr as u64;
+        let mut rsum = row_sum_ptr as u64;
+        let mut d_o = do_ptr as u64;
+        let mut d_q = dq_ptr as u64;
+        let mut d_k = dk_ptr as u64;
+        let mut d_v = dv_ptr as u64;
+        let mut d_wq = dwq_ptr as u64;
+        let mut d_wk = dwk_ptr as u64;
+        let mut d_wv = dwv_ptr as u64;
+        let mut d_x = dx_ptr as u64;
+
+        let args: [*mut c_void; 43] = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut sids as *mut _ as *mut c_void,
+            &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
+            &mut nw as *mut _ as *mut c_void,
+            &mut wq as *mut _ as *mut c_void,
+            &mut wk as *mut _ as *mut c_void,
+            &mut wv as *mut _ as *mut c_void,
+            &mut wo as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ah as *mut _ as *mut c_void,
+            &mut dm as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut kpj as *mut _ as *mut c_void,
+            &mut vpj as *mut _ as *mut c_void,
+            &mut rmax as *mut _ as *mut c_void,
+            &mut rsum as *mut _ as *mut c_void,
+            // ── Tier C backward outputs ──
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_q as *mut _ as *mut c_void,
+            &mut d_k as *mut _ as *mut c_void,
+            &mut d_v as *mut _ as *mut c_void,
+            &mut d_wq as *mut _ as *mut c_void,
+            &mut d_wk as *mut _ as *mut c_void,
+            &mut d_wv as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+        ];
+
+        crate::cuda::inner::kernel_launch(
+            ptx_ptr as *const u8,
+            name_ptr as *const u8,
+            [grid_x, grid_y, grid_z],
+            [block_x, block_y, block_z],
+            &args,
+            shared_mem_bytes as u32,
+        ) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale_bits);
+        let _ = (batch, heads, seq_len, head_dim);
+        let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
+        let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
+        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
+        let _ = (rmsnorm_eps_bits, active_heads, d_model);
+        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr);
+        let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr);
+        eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
 }
@@ -1333,6 +1679,7 @@ pub extern "C" fn nsl_flash_attention_backward(
 /// pointers represented as `i64` (matching the rest of the NSL runtime
 /// ABI).  A value of `0` indicates allocation failure.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct CshaBackwardActivations {
     pub q_proj: i64,
     pub k_proj: i64,

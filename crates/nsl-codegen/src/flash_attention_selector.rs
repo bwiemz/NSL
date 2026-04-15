@@ -27,7 +27,7 @@ pub fn select_emitter_with_diag(
     diagnostics: &mut Vec<String>,
 ) -> Emitter {
     let _ = diagnostics; // v1 fallback diagnostics no longer apply
-    if let Err(e) = smem_layout::validate_scalar_v2_config(config) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward) {
         panic!(
             "v2 rejected config (block_q={}, block_kv={}, head_dim={}): {}; \
              v1 is deleted — fix the config or use a supported matrix entry",

@@ -39,8 +39,76 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Which kernel direction the caller intends to emit. Used by
+/// `validate_scalar_v2_config` to pick the right SMEM budget: the
+/// backward pass needs additional tiles (`dQ`, `dK`, `dV`, recomputed
+/// `P`) on top of the forward budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
+/// Additional SMEM bytes the Tier C fused backward pass needs on top of
+/// the forward total. Covers the recomputed `P` tile plus the `dS`
+/// tile plus three f32 gradient accumulators (`dQ`, `dK`, `dV`).
+/// The gradient accumulators are ultimately kept in registers
+/// (`%f_dq_*/%f_dk_*/%f_dv_*`) but the SMEM is budgeted conservatively
+/// so future refactors to SMEM-based tiles don't trip the validator.
+///
+/// Layout (all f32 — backward uses higher-precision accumulators):
+///   P     tile: block_q × block_kv × 4 (recomputed)
+///   dS    tile: block_q × block_kv × 4
+///   dQ    tile: block_q × head_dim × 4 (reserved, register-held today)
+///   dK    tile: block_kv × head_dim × 4 (reserved)
+///   dV    tile: block_kv × head_dim × 4 (reserved)
+pub fn backward_extra_bytes(config: &FlashAttentionConfig) -> u32 {
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    let p = bq * bkv * 4;
+    let ds = bq * bkv * 4;
+    let dq = bq * hd * 4;
+    let dk = bkv * hd * 4;
+    let dv = bkv * hd * 4;
+    p + ds + dq + dk + dv
+}
+
+/// SMEM byte offset of the recomputed P tile (Tier C backward).
+/// P is stored f32 row-major `[block_q, block_kv]` at the start of
+/// the backward extras region.
+pub fn backward_p_offset(config: &FlashAttentionConfig) -> u32 {
+    total_bytes(config)
+}
+
+/// SMEM byte offset of the dS tile (Tier C backward), immediately
+/// after the P tile.
+pub fn backward_ds_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_p_offset(config) + (config.block_q * config.block_kv * 4) as u32
+}
+
+/// SMEM byte offset of the dV accumulator tile. f32 row-major
+/// `[block_kv, head_dim]`. Lives immediately after the dS tile.
+pub fn backward_dv_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_ds_offset(config) + (config.block_q * config.block_kv * 4) as u32
+}
+
+/// SMEM byte offset of the dK accumulator tile. f32 row-major
+/// `[block_kv, head_dim]`. Lives immediately after the dV tile.
+pub fn backward_dk_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_dv_offset(config) + (config.block_kv * config.head_dim * 4) as u32
+}
+
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
-pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), ConfigError> {
+///
+/// `direction` controls whether the backward-pass extra SMEM tiles are
+/// added to the budget before the 99 KB cap check. Forward: unchanged
+/// from Tier A. Backward (Tier C): adds `backward_extra_bytes` to the
+/// forward total.
+pub fn validate_scalar_v2_config(
+    config: &FlashAttentionConfig,
+    direction: Direction,
+) -> Result<(), ConfigError> {
     if !ALLOWED_BLOCK_Q.contains(&config.block_q) {
         return Err(ConfigError(format!(
             "block_q = {}: must be one of {:?}", config.block_q, ALLOWED_BLOCK_Q
@@ -88,18 +156,33 @@ pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), Co
     // ever shift.
     let kv_start = kv_offset(config);
     let sp_start = sp_offset(config);
-    let total    = total_bytes(config);
+    let fwd_total = total_bytes(config);
+    let extra = match direction {
+        Direction::Forward => 0,
+        Direction::Backward => backward_extra_bytes(config),
+    };
+    let total = fwd_total + extra;
     let q_region  = kv_start;              // Q region: [0, kv_start)
     let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
-    let sp_region = total - sp_start;      // SP + weight + save region: [sp_start, total)
+    let sp_region = fwd_total - sp_start;  // SP + weight + save region: [sp_start, fwd_total)
     if total > SMEM_DYNAMIC_BUDGET_BYTES {
-        return Err(ConfigError(format!(
-            "SMEM total {} bytes ({:.1} KB) exceeds 99 KB dynamic SMEM budget \
-             (Q={} KV={} SP+rest={}); reduce head_dim, block_q/block_kv, or d_model",
-            total, total as f32 / 1024.0, q_region, kv_region, sp_region
-        )));
+        return Err(ConfigError(match direction {
+            Direction::Forward => format!(
+                "SMEM total {} bytes ({:.1} KB) exceeds 99 KB dynamic SMEM budget \
+                 (Q={} KV={} SP+rest={}); reduce head_dim, block_q/block_kv, or d_model",
+                total, total as f32 / 1024.0, q_region, kv_region, sp_region
+            ),
+            Direction::Backward => format!(
+                "CSHA fused Backward rejected: {} bytes > {} byte cap at \
+                 (block_q={}, head_dim={}); forward={} backward_extra={} \
+                 (P+dQ+dK+dV). Reduce head_dim, block_q/block_kv, or d_model.",
+                total, SMEM_DYNAMIC_BUDGET_BYTES,
+                config.block_q, config.head_dim,
+                fwd_total, extra
+            ),
+        }));
     }
-    // Configs in (48 KB, 228 KB] use dynamic SMEM (extern .shared in PTX +
+    // Configs in (48 KB, 99 KB] use dynamic SMEM (extern .shared in PTX +
     // cuFuncSetAttribute opt-in at launch).  These are valid configurations.
     Ok(())
 }
@@ -307,6 +390,83 @@ mod tests {
             layout.total_bytes <= 48 * 1024,
             "fused proj+output config exceeds 48 KB SMEM: {} bytes", layout.total_bytes
         );
+    }
+
+    // ── T2.1 Direction-parameterised validator tests ──────────────────────
+
+    fn base_cfg_fused_forward(
+        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+    ) -> FlashAttentionConfig {
+        let _ = heads;
+        FlashAttentionConfig {
+            block_q, block_kv, head_dim,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                d_model,
+                ..CshaExtras::default()
+            }),
+        }
+    }
+
+    fn base_cfg_fused_backward(
+        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+    ) -> FlashAttentionConfig {
+        let mut cfg = base_cfg_fused_forward(block_q, block_kv, head_dim, heads, d_model);
+        cfg.csha = Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model,
+            ..CshaExtras::default()
+        });
+        cfg
+    }
+
+    #[test]
+    fn direction_backward_accepts_smallest_config() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        assert!(
+            validate_scalar_v2_config(&cfg, Direction::Backward).is_ok(),
+            "smallest backward config must pass (total = forward + P+dQ+dK+dV)",
+        );
+    }
+
+    #[test]
+    fn direction_backward_rejects_over_budget_with_detailed_diagnostic() {
+        let cfg = base_cfg_fused_backward(64, 64, 64, 8, 64);
+        let err = validate_scalar_v2_config(&cfg, Direction::Backward)
+            .expect_err("expected backward over-budget rejection");
+        let msg = format!("{err}");
+        assert!(msg.contains("bytes >"), "err must include byte comparison: {msg}");
+        assert!(msg.contains("block_q=64"), "err must include block_q: {msg}");
+        assert!(msg.contains("head_dim=64"), "err must include head_dim: {msg}");
+        assert!(msg.contains("Backward"), "err must name direction: {msg}");
+    }
+
+    #[test]
+    fn direction_forward_budget_unchanged_by_phase_2() {
+        let cfg = base_cfg_fused_forward(32, 32, 32, 4, 32);
+        assert!(validate_scalar_v2_config(&cfg, Direction::Forward).is_ok());
+    }
+
+    #[test]
+    fn direction_backward_adds_extra_bytes() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let extra = backward_extra_bytes(&cfg);
+        // P = 32*32*4 = 4096; dQ = dK = dV = 32*32*4 = 4096 each → 16384 total.
+        // P + dS + dQ + dK + dV, each 32*32*4 = 4096 at this config.
+        assert_eq!(extra, 20480, "backward_extra_bytes = P+dS+dQ+dK+dV");
+    }
+
+    #[test]
+    fn direction_forward_still_rejects_big_config() {
+        // Config that was already over-budget forward-side stays rejected.
+        let cfg = base_cfg_fused_forward(128, 128, 256, 4, 128);
+        assert!(validate_scalar_v2_config(&cfg, Direction::Forward).is_err());
     }
 
     #[test]

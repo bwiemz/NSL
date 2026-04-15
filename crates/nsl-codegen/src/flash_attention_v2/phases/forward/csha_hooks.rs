@@ -601,6 +601,120 @@ pub fn emit_v_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_t
     ptx.push_str(&format!("V2_V_PREPASS_SKIP_{}:\n", q_tile_iter));
 }
 
+/// Emit cooperative HBM writes of post-RoPE Q/K/V activations for the
+/// Tier C backward pass.
+///
+/// Fires immediately after `emit_rope_epilogue` when
+/// `CshaExtras::save_activations_for_backward=true`.  Emits:
+///
+/// 1. `bar.sync 0` fence — ensures the attention body has not yet begun
+///    consuming the SMEM Q/K/V tiles when the save path reads them.
+/// 2. Per-row cooperative store of `Q_proj` from the Q SMEM tile to HBM
+///    at `q_proj_ptr + (batch*heads*seq + head*seq + (q_start+warp_row))
+///    * head_dim + lane_col`.
+/// 3. Same for `K_proj` (from k_smem) and `V_proj` (from v_smem).
+///
+/// Each lane owns `head_dim/32` columns (same contract as
+/// `emit_warp_per_row_sweep`).  Kernel params `q_proj_ptr`, `k_proj_ptr`,
+/// `v_proj_ptr` are expected in the kernel's param block (added alongside
+/// this hook in the prelude); null pointers on any of them skip the
+/// corresponding save sweep without error.
+///
+/// Null-gated invariants:
+/// - `save_activations_for_backward=false` (or `csha=None`) → no-op comment.
+/// - Per-tensor pointer null-guards allow partial-save configs (e.g. only Q
+///   saved during early bring-up).
+pub fn emit_save_activations(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let save = config
+        .csha
+        .as_ref()
+        .map_or(false, |c| c.save_activations_for_backward);
+    if !save {
+        ptx.push_str("    // CSHA Tier C save_activations: save_activations=false, no emission\n");
+        return;
+    }
+    let head_dim = config.head_dim as u32;
+    let slices_per_lane = (head_dim / 32).max(1);
+
+    ptx.push_str(&format!(
+        "    // CSHA Tier C: save post-RoPE Q/K/V activations (q_tile_iter={}, slices/lane={})\n",
+        q_tile_iter, slices_per_lane
+    ));
+
+    // Fence: ensure no attention-body reads of Q/K/V SMEM have commenced.
+    ptx.push_str("    bar.sync 0;  // FENCE: save path must see final SMEM Q/K/V tiles\n");
+
+    for (label, ptr_name, smem_base) in [
+        ("Q", "q_proj_ptr", "%q_smem_base"),
+        ("K", "k_proj_ptr", "%k_smem_base"),
+        ("V", "v_proj_ptr", "%v_smem_base"),
+    ] {
+        ptx.push_str(&format!(
+            "    // -- Save {label} activation to HBM via [{ptr_name}] --\n"
+        ));
+        ptx.push_str(&format!("    ld.param.u64 %rd_save_base, [{ptr_name}];\n"));
+        ptx.push_str("    setp.eq.u64 %p_save_null, %rd_save_base, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p_save_null bra V2_CSHA_SAVE_{label}_SKIP_{q_tile_iter};\n"
+        ));
+
+        // row_idx = batch_idx*heads*seq + head_idx*seq + (q_start + warp_row)
+        ptx.push_str(&format!(
+            "    add.u32 %r_save_wrow, %warp_id, {}; // warp_row = warp_id + iter*4\n",
+            q_tile_iter * 4
+        ));
+        ptx.push_str("    cvt.u64.u32 %rd_save_wrow, %r_save_wrow;\n");
+        // batch*heads
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %batch_idx, %rd5;\n");
+        // + head_idx
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %head_idx;\n");
+        // * seq_len
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd6;\n");
+        // + q_start + warp_row
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %q_start;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %rd_save_wrow;\n");
+        // * head_dim
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd7;\n");
+
+        // Per-slice: add lane*slices_per_lane + slice, load from SMEM, store to HBM (f16).
+        for slice in 0..slices_per_lane {
+            // col = lane * slices_per_lane + slice
+            ptx.push_str("    cvt.u64.u32 %rd_save_col, %lane;\n");
+            if slices_per_lane > 1 {
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd_save_col, %rd_save_col, {};\n",
+                    slices_per_lane
+                ));
+            }
+            if slice > 0 {
+                ptx.push_str(&format!(
+                    "    add.u64 %rd_save_col, %rd_save_col, {};\n",
+                    slice
+                ));
+            }
+            // hbm_addr = base + (row_off + col) * 2 (f16)
+            ptx.push_str("    add.u64 %rd_save_elem, %rd_save_off, %rd_save_col;\n");
+            ptx.push_str("    shl.b64 %rd_save_elem, %rd_save_elem, 1; // * 2 (f16)\n");
+            ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_elem;\n");
+            // smem_addr = smem_base + warp_row*(head_dim*2) + col*2
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd_save_smem, %rd_save_wrow, {};\n",
+                head_dim * 2
+            ));
+            ptx.push_str(&format!(
+                "    add.u64 %rd_save_smem, {smem_base}, %rd_save_smem;\n"
+            ));
+            ptx.push_str("    shl.b64 %rd_save_colb, %rd_save_col, 1;\n");
+            ptx.push_str("    add.u64 %rd_save_smem, %rd_save_smem, %rd_save_colb;\n");
+            ptx.push_str("    ld.shared.b16 %h_save_v, [%rd_save_smem];\n");
+            ptx.push_str(&format!(
+                "    st.global.b16 [%rd_save_elem], %h_save_v;  // {ptr_name} write\n"
+            ));
+        }
+        ptx.push_str(&format!("V2_CSHA_SAVE_{label}_SKIP_{q_tile_iter}:\n"));
+    }
+}
+
 /// Save %row_max and %row_sum to the softmax-state SMEM save area.
 ///
 /// Each (warp_id, q_tile_iter) pair has its own 2×f32 slot to avoid races.
@@ -636,6 +750,56 @@ pub fn emit_save_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, 
     ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_max;\n");
     ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, 4;\n");
     ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_sum;\n");
+
+    // Tier C: also persist row_max/row_sum to HBM so the backward kernel can
+    // recompute P = exp(S - row_max) / row_sum identically to forward.
+    // Layout: [batch, heads, seq] f32, row_major. Stored by lane 0 only
+    // (all 32 lanes share identical values post-butterfly-reduction).
+    let save = config
+        .csha
+        .as_ref()
+        .map_or(false, |c| c.save_activations_for_backward);
+    if save {
+        ptx.push_str(&format!(
+            "    // Tier C: persist row_max/row_sum to HBM (q_tile_iter={})\n",
+            q_tile_iter
+        ));
+        // Lane-0 predicate.
+        ptx.push_str("    setp.eq.u32 %p_save_null, %lane, 0;\n");
+        // warp_row = warp_id + iter*4
+        ptx.push_str(&format!(
+            "    add.u32 %r_save_wrow, %warp_id, {}; // warp_row = warp_id + iter*4\n",
+            q_tile_iter * 4
+        ));
+        ptx.push_str("    cvt.u64.u32 %rd_save_wrow, %r_save_wrow;\n");
+        // row_idx = batch_idx*(heads*seq) + head_idx*seq + (q_start + warp_row)
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %head_idx;\n");
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd6;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %q_start;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %rd_save_wrow;\n");
+        // * 4 bytes (f32)
+        ptx.push_str("    shl.b64 %rd_save_off, %rd_save_off, 2;\n");
+
+        // row_max_ptr
+        ptx.push_str("    ld.param.u64 %rd_save_base, [row_max_ptr];\n");
+        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
+        ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
+        ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
+        ptx.push_str(&format!(
+            "    @!%p_skip_rm st.global.f32 [%rd_save_elem], %row_max;  // row_max_ptr write\n"
+        ));
+        let _ = q_tile_iter;
+
+        // row_sum_ptr
+        ptx.push_str("    ld.param.u64 %rd_save_base, [row_sum_ptr];\n");
+        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
+        ptx.push_str("    setp.eq.u64 %p_rowsum_null, %rd_save_base, 0;\n");
+        ptx.push_str("    or.pred %p_skip_rs, %p_rowsum_null, %p_save_null;\n");
+        ptx.push_str(&format!(
+            "    @!%p_skip_rs st.global.f32 [%rd_save_elem], %row_sum;  // row_sum_ptr write\n"
+        ));
+    }
 }
 
 /// Restore %row_max and %row_sum from the softmax-state SMEM save area.
@@ -1207,6 +1371,139 @@ mod tests {
             ptx.contains("p_x_null"),
             "x_ptr null predicate register missing"
         );
+    }
+
+    // ── T1.3 save_activations tests ────────────────────────────────────────
+
+    #[test]
+    fn save_activations_emits_post_rope_writes() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.csha = Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        });
+
+        let mut ptx = String::new();
+        emit_save_activations(&mut ptx, &cfg, 0);
+
+        assert!(
+            ptx.contains("st.global.b16") && ptx.contains("q_proj_ptr"),
+            "Q_proj save missing: {ptx}"
+        );
+        assert!(
+            ptx.contains("st.global.b16") && ptx.contains("k_proj_ptr"),
+            "K_proj save missing"
+        );
+        assert!(
+            ptx.contains("st.global.b16") && ptx.contains("v_proj_ptr"),
+            "V_proj save missing"
+        );
+        // Fence before cooperative save path.
+        assert!(ptx.contains("bar.sync 0"), "fence before save missing");
+    }
+
+    #[test]
+    fn save_activations_zero_emission_when_flag_false() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.csha = Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: false,
+            d_model: 128,
+            ..CshaExtras::default()
+        });
+        let mut ptx = String::new();
+        emit_save_activations(&mut ptx, &cfg, 0);
+        assert!(
+            ptx.contains("save_activations=false, no emission") || ptx.is_empty(),
+            "expected no-emit comment or empty, got: {ptx}"
+        );
+        assert!(!ptx.contains("st.global.b16"));
+    }
+
+    #[test]
+    fn save_activations_label_uniqueness_across_q_tile_iters() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.block_q = 64;
+        cfg.csha = Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        });
+        let mut ptx = String::new();
+        emit_save_activations(&mut ptx, &cfg, 0);
+        emit_save_activations(&mut ptx, &cfg, 1);
+        assert!(ptx.contains("V2_CSHA_SAVE_Q_SKIP_0:"));
+        assert!(ptx.contains("V2_CSHA_SAVE_Q_SKIP_1:"));
+        assert!(ptx.contains("V2_CSHA_SAVE_K_SKIP_0:"));
+        assert!(ptx.contains("V2_CSHA_SAVE_V_SKIP_1:"));
+    }
+
+    #[test]
+    fn save_softmax_state_emits_hbm_writes_when_backward_flag_set() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state(&mut ptx, &cfg, 0);
+        // SMEM save always present (fused_projections=true).
+        assert!(ptx.contains("st.shared.f32 [%rd_wt_dst], %row_max;"));
+        assert!(ptx.contains("st.shared.f32 [%rd_wt_dst], %row_sum;"));
+        // HBM saves gated on save_activations=true.
+        assert!(ptx.contains("row_max_ptr"), "row_max_ptr load missing");
+        assert!(ptx.contains("row_sum_ptr"), "row_sum_ptr load missing");
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %row_max;"),
+            "row_max HBM store missing"
+        );
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %row_sum;"),
+            "row_sum HBM store missing"
+        );
+    }
+
+    #[test]
+    fn save_softmax_state_skips_hbm_when_backward_flag_false() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: false,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state(&mut ptx, &cfg, 0);
+        assert!(!ptx.contains("row_max_ptr"));
+        assert!(!ptx.contains("row_sum_ptr"));
+        assert!(!ptx.contains("st.global.f32"));
     }
 
     #[test]

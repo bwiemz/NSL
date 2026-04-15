@@ -87,7 +87,11 @@ use nsl_runtime::{
     nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
     nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
 };
-use nsl_runtime::flash_attention::nsl_flash_attention_csha;
+use nsl_runtime::flash_attention::{
+    nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
+    nsl_flash_attention_csha, nsl_flash_attention_csha_backward,
+    nsl_flash_attention_csha_with_saves, CshaBackwardActivations,
+};
 
 // --------------------------------------------------------------------------
 // Serialisation helpers
@@ -264,13 +268,14 @@ fn run_fused_config_dmodel(
             active_heads:      active_heads_i as u32,
             rmsnorm_eps:       norm_eps,
             d_model:           d_model as u32,
+            save_activations_for_backward: false,
         }),
     };
 
     // Pre-validate before calling select_emitter: v1 is deleted so out-of-matrix
     // configs now panic.  Return Err here so the matrix driver can mark the row
     // as SMEM-blocked (not a numerical failure) without catching a panic.
-    if let Err(e) = smem_layout::validate_scalar_v2_config(&config) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
         return Err(format!(
             "SMEM budget exceeded or config out-of-matrix: {}; not a numerical failure",
             e
@@ -584,6 +589,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
             level: 2, fused_rmsnorm: true, fused_projections: true,
             fused_output_proj: false, active_heads: 4,
             rmsnorm_eps: 1e-5, d_model: 32,
+            save_activations_for_backward: false,
         }),
     };
     assert_eq!(
@@ -728,3 +734,313 @@ fn csha_fused_matrix_sweep() {
 }
 
 // C5: csha_fused_v1_divergence_smoke removed — v1 deleted, only v2 remains.
+
+// --------------------------------------------------------------------------
+// T1.4 (Tier C): forward output byte-invariant under save_activations flag
+// --------------------------------------------------------------------------
+
+/// Launch one forward pass with `save_activations_for_backward=true` baked
+/// into the kernel, optionally supplying non-null activation-save pointers.
+/// Returns `(out_f16, lse_f32)` on success.
+///
+/// Using the same compiled kernel in both variants (null vs non-null save
+/// pointers) isolates the effect to the save path's per-tensor null guards,
+/// matching the T1.4 invariant: the save code must not perturb forward O/LSE.
+#[cfg(feature = "cuda")]
+fn run_with_saves(
+    block_q: u32, block_kv: u32, head_dim: u32, heads: u32,
+    causal: bool, rope_q: bool,
+    saves: Option<CshaBackwardActivations>,
+) -> Result<(Vec<u16>, Vec<f32>), String> {
+    let batch = 1usize;
+    let heads_u = heads as usize;
+    let seq = (block_q as usize).max(block_kv as usize);
+    let hd = head_dim as usize;
+    let dm = hd;
+    let norm_eps = 1e-5f32;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+
+    let config = FlashAttentionConfig {
+        block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
+        causal, paged: false, rope_q,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 2,
+            fused_rmsnorm: true,
+            fused_projections: true,
+            fused_output_proj: false,
+            save_activations_for_backward: true,
+            active_heads: heads,
+            rmsnorm_eps: norm_eps,
+            d_model: dm as u32,
+        }),
+    };
+
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
+        return Err(format!("SMEM/validator: {e}"));
+    }
+    let emitter = select_emitter(&config);
+    debug_assert_eq!(emitter, Emitter::V2);
+
+    let x      = det_seq(42, heads_u * seq * hd);
+    let wq_f32 = det_seq(43, dm * hd);
+    let wk_f32 = det_seq(44, dm * hd);
+    let wv_f32 = det_seq(45, dm * hd);
+    let wq: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let nw = vec![1.0f32; hd];
+
+    unsafe { nsl_cuda_init(); }
+    let qkv_elems = heads_u * seq * hd;
+    let lse_elems = batch * heads_u * seq;
+    let qkv_bytes = (qkv_elems * 2) as i64;   // f16
+    let lse_bytes = (lse_elems * 4) as i64;   // f32
+    let x_bytes   = (x.len() * 4) as i64;     // f32
+    let w_bytes   = (dm * hd * 2) as i64;     // f16
+    let nw_bytes  = (hd * 4) as i64;          // f32
+
+    let q_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let k_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let v_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let out_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
+    let x_dev = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let wq_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let nw_dev = unsafe { nsl_test_cuda_alloc(nw_bytes) };
+    let all_ptrs = [q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, wq_dev, wk_dev, wv_dev, nw_dev];
+
+    unsafe {
+        nsl_test_cuda_h2d(x_dev,  x.as_ptr()  as i64, x_bytes);
+        nsl_test_cuda_h2d(wq_dev, wq.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(wk_dev, wk.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev, wv.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(nw_dev, nw.as_ptr() as i64, nw_bytes);
+    }
+
+    let ptx = synthesize_flash_attention_ptx_selected(&config);
+    let kernel_name = CString::new(flash_attention_kernel_name_selected(&config)).unwrap();
+    let smem_total = shared_mem_bytes_selected(&config);
+    let smem_dynamic = if needs_dynamic_smem(&config) { smem_total as i64 } else { 0 };
+
+    let (qp, kp, vp, rmx, rsm) = saves
+        .map(|s| (s.q_proj, s.k_proj, s.v_proj, s.row_max, s.row_sum))
+        .unwrap_or((0, 0, 0, 0, 0));
+
+    let rc = unsafe {
+        nsl_flash_attention_csha_with_saves(
+            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            scale.to_bits() as i64,
+            batch as i64, heads as i64, seq as i64, hd as i64,
+            0, 0, 0, 0,
+            0, 0,
+            0, 0,
+            smem_dynamic,
+            ptx.as_ptr() as i64,
+            kernel_name.as_ptr() as i64,
+            block_q as i64, block_kv as i64,
+            if causal { 1 } else { 0 },
+            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
+            0, norm_eps.to_bits() as i64,
+            heads as i64, dm as i64,
+            qp, kp, vp, rmx, rsm,
+        )
+    };
+    if rc != 0 {
+        free_all(&all_ptrs);
+        return Err(format!("launch rc={rc}"));
+    }
+
+    let mut out = vec![0u16; qkv_elems];
+    let mut lse = vec![0f32; lse_elems];
+    unsafe {
+        nsl_test_cuda_d2h(out.as_mut_ptr() as i64, out_dev, qkv_bytes);
+        nsl_test_cuda_d2h(lse.as_mut_ptr() as i64, lse_dev, lse_bytes);
+    }
+    free_all(&all_ptrs);
+    Ok((out, lse))
+}
+
+/// T1.4 — forward output O and LSE must be byte-identical whether
+/// the save path fires (non-null pointers) or is null-guarded away.
+/// Divergence signals that the save path is racing the attention body's
+/// SMEM consumption, i.e. the T1.3 fence is misplaced or insufficient.
+///
+/// GPU-only: `cargo test -p nsl-codegen --features cuda --test
+/// csha_cuda_launch_fused -- --ignored t1_forward_output_invariant`.
+#[test]
+#[ignore]
+fn t1_forward_output_invariant_under_save_activations_flag() {
+    if !cuda_available() {
+        eprintln!("[T1.4] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
+    let seq = block_q.max(block_kv) as i64;
+
+    let (out_no_save, lse_no_save) =
+        run_with_saves(block_q, block_kv, head_dim, heads, false, false, None)
+            .expect("launch (save=None) failed");
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(1, heads as i64, seq, head_dim as i64)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let (out_save, lse_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, Some(saves),
+    )
+    .expect("launch (save=Some) failed");
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+
+    assert_eq!(
+        out_no_save, out_save,
+        "T1.4 invariant broken: forward O diverged between save-null and save-active"
+    );
+    let lse_bits_eq = lse_no_save
+        .iter()
+        .zip(&lse_save)
+        .all(|(&a, &b)| a.to_bits() == b.to_bits());
+    assert!(lse_bits_eq, "T1.4 invariant broken: LSE diverged");
+}
+
+// --------------------------------------------------------------------------
+// T4.2 backward FFI smoke test
+// --------------------------------------------------------------------------
+
+/// Smoke-launch the Tier C backward kernel via nsl_flash_attention_csha_backward.
+///
+/// Verifies the full 43-arg launch list + synthesize_backward PTX + CUDA
+/// module load path against a real GPU. Numerical correctness is T6.3's
+/// job; here we just check the launch returns rc=0.
+#[test]
+#[ignore]
+#[cfg(feature = "cuda")]
+fn t4_csha_backward_ffi_smoke() {
+    use nsl_codegen::flash_attention_v2::{
+        flash_attention_kernel_name_v2, synthesize_backward,
+    };
+
+    if !cuda_available() {
+        eprintln!("[T4.2] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32i64, 32, 32, 4i64);
+    let batch = 1i64;
+    let seq = block_q.max(block_kv);
+    let d_model = head_dim;
+    let norm_eps = 1e-5f32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let config = FlashAttentionConfig {
+        block_q, block_kv, head_dim,
+        causal: false, paged: false, rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 2, fused_rmsnorm: true, fused_projections: true,
+            fused_output_proj: false,
+            save_activations_for_backward: true,
+            active_heads: heads as u32,
+            rmsnorm_eps: norm_eps,
+            d_model: d_model as u32,
+        }),
+    };
+
+    let mut ptx_str = synthesize_backward(&config)
+        .expect("synthesize_backward should succeed on minimal config");
+    // Keep the NUL that synthesize_backward appends — cuModuleLoadData
+    // expects a NUL-terminated C string.
+    if !ptx_str.ends_with('\0') { ptx_str.push('\0'); }
+    let ptx_bytes = ptx_str.into_bytes();
+    // Backward kernel name: forward name + "_v2" with "flash_attn_" →
+    // "flash_attn_backward_" rewrite (see prelude::kernel_name). Use a
+    // direct literal lookup: the prelude emits the name in .visible .entry
+    // and that's what cuModuleGetFunction must match.
+    let fw_name = flash_attention_kernel_name_v2(&config);
+    let kernel_name = match fw_name.strip_prefix("flash_attn_") {
+        Some(rest) => format!("flash_attn_backward_{}", rest),
+        None => format!("flash_attn_backward_{fw_name}"),
+    };
+    let kernel_cstr = CString::new(kernel_name).unwrap();
+
+    unsafe { nsl_cuda_init(); }
+
+    let qkv_bytes = (heads * seq * head_dim * 2) as i64;
+    let stats_bytes = (heads * seq * 4) as i64;
+    let x_bytes = (seq * d_model * 4) as i64;
+    let w_bytes = (d_model * head_dim * 2) as i64;
+    let dw_bytes = (d_model * heads * head_dim * 2) as i64;
+    let dx_bytes = (seq * d_model * 4) as i64;
+
+    let q_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let k_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let v_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let out_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let lse_dev = unsafe { nsl_test_cuda_alloc(stats_bytes) };
+    let x_dev = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let nw_dev = unsafe { nsl_test_cuda_alloc((d_model * 4) as i64) };
+    let wq_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dq_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dk_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dv_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dx_dev = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+
+    let all_ptrs = [
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
+        wq_dev, wk_dev, wv_dev,
+        do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
+    ];
+
+    let rc = unsafe {
+        nsl_flash_attention_csha_backward(
+            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            scale.to_bits() as i64,
+            batch, heads, seq, head_dim,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0,  // shared_mem_bytes (static SMEM for this config)
+            ptx_bytes.as_ptr() as i64,
+            kernel_cstr.as_ptr() as i64,
+            block_q, block_kv,
+            0,  // causal
+            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
+            0,  // wo_ptr
+            norm_eps.to_bits() as i64,
+            heads, d_model,
+            saves.q_proj, saves.k_proj, saves.v_proj,
+            saves.row_max, saves.row_sum,
+            do_dev, dq_dev, dk_dev, dv_dev,
+            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+        )
+    };
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+    free_all(&all_ptrs);
+
+    if rc != 0 {
+        let log = read_jit_log(ptx_bytes.as_ptr() as i64);
+        let dump = std::env::temp_dir().join("t4_backward_smoke.ptx");
+        let _ = std::fs::write(&dump, &ptx_bytes);
+        panic!(
+            "nsl_flash_attention_csha_backward launch failed rc={rc}\n\
+             kernel={}\ndump={}\nJIT log:\n{log}",
+            kernel_cstr.to_string_lossy(), dump.display()
+        );
+    }
+}

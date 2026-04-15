@@ -223,7 +223,7 @@ impl From<&FlashAttentionConfig> for FlashAttentionConfigPayload {
 }
 
 /// A `FusionGraph` node claim produced by CSHA.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FusionMark {
     /// Layer prefix.
     pub layer: String,
@@ -234,6 +234,22 @@ pub struct FusionMark {
     pub param_name: String,
     /// What the mark means semantically.
     pub role: MarkRole,
+    /// Tier C (T5.1): full `FlashAttentionConfig` for the claim's layer.
+    /// The AD dispatcher calls
+    /// `validate_scalar_v2_config(config, Direction::Backward)` against
+    /// this when deciding whether to route the chain's reverse walk into
+    /// the fused backward kernel. `None` means the mark predates Tier C
+    /// or the layer has no recorded CSHA config (inference builds).
+    /// Serde-skipped: this is an in-memory dispatcher aid, not plan output.
+    #[serde(skip)]
+    pub config: Option<FlashAttentionConfig>,
+    /// Tier C (T5.1): set to `true` by the AD dispatcher once this claim's
+    /// topological output op has been emitted through the fused backward
+    /// path. Interior-mutable `Cell` so the dispatcher can update without
+    /// `&mut self`. `#[serde(skip)]` — this is transient dispatcher state,
+    /// not plan metadata.
+    #[serde(skip)]
+    pub backward_emitted: std::cell::Cell<bool>,
 }
 
 /// Why CSHA is claiming a node.
@@ -331,6 +347,12 @@ pub fn bridge(
         return out;
     }
 
+    // T5.1: cache the full FlashAttentionConfig per layer so the Tier C
+    // AD dispatcher can attach it to FusionMarks and validate the
+    // backward-direction SMEM budget without reaching back into the plan.
+    let mut full_configs: std::collections::HashMap<String, FlashAttentionConfig> =
+        std::collections::HashMap::new();
+
     for layer_plan in &plan.per_layer {
         let pat = plan.patterns.get(&layer_plan.layer);
         let cfg = build_flash_config(layer_plan, &plan.specialization, pat, shape_head_dim);
@@ -353,6 +375,7 @@ pub fn bridge(
         }
         out.configs
             .insert(layer_plan.layer.clone(), (&cfg).into());
+        full_configs.insert(layer_plan.layer.clone(), cfg);
     }
 
     // Emit fusion-graph marks from the per-chain boundary scan so
@@ -360,11 +383,14 @@ pub fn bridge(
     // already spoken for.
     for chain in &plan.boundary.chains {
         if let Some(ref layer) = chain.layer {
+            let cfg = full_configs.get(layer).cloned();
             out.marks.push(FusionMark {
                 layer: layer.clone(),
                 kind: Some(chain.kind),
                 param_name: chain.weight_param.clone(),
                 role: MarkRole::NormPrologue,
+                config: cfg.clone(),
+                backward_emitted: std::cell::Cell::new(false),
             });
             if chain.rope_op.is_some() {
                 out.marks.push(FusionMark {
@@ -372,6 +398,8 @@ pub fn bridge(
                     kind: Some(chain.kind),
                     param_name: chain.weight_param.clone(),
                     role: MarkRole::RoPEEpilogue,
+                    config: cfg,
+                    backward_emitted: std::cell::Cell::new(false),
                 });
             }
         }
@@ -385,6 +413,8 @@ pub fn bridge(
                 kind: None,
                 param_name: format!("{}.attn.wo", layer_plan.layer),
                 role: MarkRole::OutputProjEpilogue,
+                config: full_configs.get(&layer_plan.layer).cloned(),
+                backward_emitted: std::cell::Cell::new(false),
             });
         }
     }
@@ -503,6 +533,54 @@ mod tests {
     use crate::wengert::{PrimalOp, WengertList, WengertOp};
     use crate::wggo_cost::LayerShape;
     use std::collections::HashMap;
+
+    // T5.1: FusionMark carries the dispatcher state the AD pipeline needs to
+    // route claimed chains into the Tier C fused backward kernel.
+
+    #[test]
+    fn fusion_mark_has_backward_emitted_default_false() {
+        let m = FusionMark {
+            layer: "blocks.0".into(),
+            kind: Some(ProjKind::Q),
+            param_name: "blocks.0.attn.wq".into(),
+            role: MarkRole::NormPrologue,
+            config: None,
+            backward_emitted: std::cell::Cell::new(false),
+        };
+        assert!(!m.backward_emitted.get());
+    }
+
+    #[test]
+    fn fusion_mark_backward_emitted_cell_allows_set_without_mut() {
+        let m = FusionMark {
+            layer: "blocks.0".into(),
+            kind: Some(ProjKind::Q),
+            param_name: "blocks.0.attn.wq".into(),
+            role: MarkRole::NormPrologue,
+            config: None,
+            backward_emitted: std::cell::Cell::new(false),
+        };
+        // No &mut — interior mutability for the AD dispatcher.
+        m.backward_emitted.set(true);
+        assert!(m.backward_emitted.get());
+    }
+
+    #[test]
+    fn fusion_mark_config_serde_skipped_round_trip() {
+        let m = FusionMark {
+            layer: "blocks.3".into(),
+            kind: None,
+            param_name: "blocks.3.attn.wo".into(),
+            role: MarkRole::OutputProjEpilogue,
+            config: None,
+            backward_emitted: std::cell::Cell::new(true),
+        };
+        let json = serde_json::to_string(&m).expect("serialize");
+        // #[serde(skip)] fields must NOT appear in the sidecar output.
+        assert!(!json.contains("backward_emitted"), "got: {json}");
+        assert!(!json.contains("\"config\""), "got: {json}");
+        assert!(json.contains("blocks.3"));
+    }
 
     fn op(id: u32, result: u32, o: PrimalOp, inputs: Vec<u32>) -> WengertOp {
         WengertOp {

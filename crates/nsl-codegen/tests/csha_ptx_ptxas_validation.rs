@@ -174,7 +174,7 @@ fn v2_kernel_assembles_on_sm75_full_matrix() {
         eprintln!("skipping: ptxas not found"); return;
     };
     use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
-    use nsl_codegen::flash_attention_v2::smem_layout::validate_scalar_v2_config;
+    use nsl_codegen::flash_attention_v2::smem_layout::{validate_scalar_v2_config, Direction};
 
     let base = FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
@@ -195,7 +195,7 @@ fn v2_kernel_assembles_on_sm75_full_matrix() {
     let mut failures = Vec::new();
     for &(bq, bkv, hd) in matrix {
         let c = FlashAttentionConfig { block_q: bq, block_kv: bkv, head_dim: hd, ..base.clone() };
-        if validate_scalar_v2_config(&c).is_err() { continue; }
+        if validate_scalar_v2_config(&c, Direction::Forward).is_err() { continue; }
         let ptx = synthesize_flash_attention_ptx_v2(&c);
         // Drop trailing NUL for file write; ptxas wants text input.
         let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
@@ -497,6 +497,78 @@ fn a5_v2_fused_output_assembles_on_sm75_sm90_sm120() {
     assert!(
         failures.is_empty(),
         "A5 v2 fused-output ptxas failures:\n\n{}",
+        failures.join("\n---\n")
+    );
+}
+
+/// Tier C T1.3: The v2 scalar emitter with
+/// `save_activations_for_backward=true` must produce ptxas-clean PTX on
+/// sm_75, sm_90, and sm_120. This validates the post-RoPE activation
+/// save path: bar.sync fence + null-guarded Q/K/V cooperative HBM stores
+/// + f32 row_max/row_sum writes.
+///
+/// Skipped gracefully when ptxas is not installed.
+#[test]
+fn csha_tier_c_save_activations_assembles_on_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!(
+            "skipping Tier C save_activations ptxas test: ptxas not found in PATH"
+        );
+        return;
+    };
+    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::Adjacent,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        }),
+    };
+
+    let mut failures = Vec::new();
+    for sm in &["sm_75", "sm_90", "sm_120"] {
+        let mut c = cfg.clone();
+        c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+        let ptx = synthesize_flash_attention_ptx_v2(&c);
+        let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
+        let dump = std::env::temp_dir().join(format!("tier_c_save_{}.ptx", sm));
+        std::fs::write(&dump, &ptx[..text_end]).ok();
+        if let Err(stderr) = assemble_ptx(&ptxas, &ptx[..text_end], sm) {
+            let ptx_str = String::from_utf8_lossy(&ptx[..text_end]);
+            let lines: Vec<&str> = ptx_str.lines().collect();
+            let total = lines.len();
+            let tail_start = total.saturating_sub(60);
+            let tail: String = lines[tail_start..]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("  {:>4}: {}", tail_start + i + 1, l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            failures.push(format!(
+                "Tier C save_activations PTX failed on {} (dump: {}):\n\
+                 --- ptxas ---\n{}\n--- PTX tail ---\n{}",
+                sm,
+                dump.display(),
+                stderr,
+                tail
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Tier C save_activations ptxas failures:\n\n{}",
         failures.join("\n---\n")
     );
 }
