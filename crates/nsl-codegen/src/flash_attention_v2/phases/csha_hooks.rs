@@ -166,12 +166,15 @@ pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q
         q_tile_iter, d_model, head_dim
     ));
 
-    // Null-check: skip Q projection if Wq is null.
-    // Wk/Wv are also loaded for register compatibility but are not required
-    // for Q-only projection (callers supply pre-projected K/V in k_ptr/v_ptr).
+    // Independent null-guards per weight pointer.  Each sweep is individually
+    // gated: if Wq is null the Q sweep is skipped; likewise for Wk and Wv.
+    // This replaces the C2 compound-guard that skipped K/V unconditionally.
     ptx.push_str("    ld.param.u64 %rd60, [csha_wq_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd61, [csha_wk_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd62, [csha_wv_ptr];\n");
+    // Gate the whole projection block on Wq being non-null (Wq is the primary
+    // signal that fused projection is active; Wk/Wv have their own per-sweep
+    // null-checks inside each respective sweep block below).
     ptx.push_str("    setp.eq.u64 %p0, %rd60, 0;\n");
     ptx.push_str(&format!(
         "    @%p0 bra V2_CSHA_PROJECTION_SKIP_{};\n",
@@ -211,8 +214,10 @@ pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q
 
     // Weight-tile SMEM base registers (%q_tile / %k_tile / %v_tile).
     // Each tile occupies wq_tile_bytes = d_model * head_dim * 2 bytes.
+    // Use sp_bytes() so the base is correct whether fused_projections expands
+    // the SP region (iters×4_warps×block_kv×4) or not (4_warps×block_kv×4).
     let wt_base = crate::flash_attention_v2::smem_layout::sp_offset(config)
-        + 4 * (config.block_kv as u32) * 4;
+        + crate::flash_attention_v2::smem_layout::sp_bytes(config);
     let wt_bytes = crate::flash_attention_v2::smem_layout::wq_tile_bytes(config);
     ptx.push_str(&format!(
         "    add.u64 %q_tile, %shmem_base, {}; // Wq tile base in SMEM\n",
@@ -246,14 +251,65 @@ pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q
     ptx.push_str("    add.u64 %x_norm_base, %x_norm_base, %rd_wt_off;\n");
     // ── end register initialisation ───────────────────────────────────────
 
-    // Project Q into Q-SMEM.  K and V come from HBM k_ptr/v_ptr (pre-projected
-    // caller tensors) so we skip the K/V sweeps here.  Per spec §9a, the SMEM
-    // budget for K/V projection tiles does not fit inline; callers are expected
-    // to supply pre-projected K/V in the base k_ptr/v_ptr params.
+    // Project Q and K into their respective SMEM tiles before the KV loop.
+    // V projection is deferred to `emit_v_projection_in_kv_loop` (called from
+    // mod.rs between softmax and PV-accum) because V and K share the same SMEM
+    // region (both at kv_offset); emitting V here would overwrite K before
+    // s_compute reads it.
+    //
+    // K sweep is additionally guarded on its own weight pointer so that callers
+    // who supply pre-projected K via the classic k_ptr param can pass wk_ptr=null
+    // and only the Q sweep fires.
+
+    // Q sweep (gated above on %rd60 != 0).
     emit_warp_per_row_sweep(ptx, config, q_tile_iter, "Q", "%q_smem_base");
+
+    // K sweep — skip if Wk is null (caller supplies pre-projected K via k_ptr).
+    ptx.push_str("    setp.eq.u64 %p0, %rd61, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_CSHA_PROJ_K_SKIP_{};\n",
+        q_tile_iter
+    ));
+    emit_warp_per_row_sweep(ptx, config, q_tile_iter, "K", "%k_smem_base");
+    ptx.push_str(&format!("V2_CSHA_PROJ_K_SKIP_{}:\n", q_tile_iter));
 
     ptx.push_str(&format!("V2_CSHA_PROJECTION_SKIP_{}:\n", q_tile_iter));
     ptx.push_str("    bar.sync 0;  // FENCE: all projection writes visible to all threads\n");
+}
+
+/// Emit the V projection sweep into SMEM from within the KV-tile loop.
+///
+/// # Placement
+///
+/// Must be called **after softmax and before PV-accum** inside the KV loop in
+/// `flash_attention_v2/mod.rs`.  K and V share `kv_offset` in SMEM; writing V
+/// before s_compute would overwrite K.  This deferred sweep writes V into SMEM
+/// after s_compute has consumed K so PV-accum sees the correct projected V.
+///
+/// When `csha.fused_projections` is false (or `csha` is None), or `csha_wv_ptr`
+/// was null at kernel entry, this is a no-op (the classic `emit_v_tile_load`
+/// path handled V from HBM).
+pub fn emit_v_projection_in_kv_loop(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    if !fused {
+        ptx.push_str("    // CSHA V projection (deferred): fused_projections=false, no-op\n");
+        return;
+    }
+    ptx.push_str(&format!(
+        "    // CSHA A.2.3 V projection (deferred, q_tile_iter={}): write V into kv_offset SMEM\n",
+        q_tile_iter
+    ));
+    // Only fire when Wv is non-null (same gate as emit_matmul_projection K sweep).
+    // %rd62 was loaded at entry to emit_matmul_projection; re-load here for correctness.
+    ptx.push_str("    ld.param.u64 %rd62, [csha_wv_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd62, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_CSHA_V_PROJ_KV_SKIP_{};\n",
+        q_tile_iter
+    ));
+    emit_warp_per_row_sweep(ptx, config, q_tile_iter, "V", "%v_smem_base");
+    ptx.push_str(&format!("V2_CSHA_V_PROJ_KV_SKIP_{}:\n", q_tile_iter));
+    ptx.push_str("    bar.sync 0;  // FENCE: V projection visible before PV-accum\n");
 }
 
 /// Emit one warp-per-row sweep computing `out_row = x_normed_row @ W`
@@ -422,6 +478,194 @@ fn emit_warp_per_row_sweep(
             label, slice
         ));
     }
+}
+
+// ── K/V pre-pass helpers for the fused-projection split-loop design ─────────
+//
+// When fused_projections=true the main synthesize function uses a 3-pass
+// structure: K pre-pass → S-compute pass (with Q sweep) → V pre-pass →
+// PV-accum pass. Each *_prepass_sweep function emits the per-warp-row setup
+// (warp_row, smem bases, x_norm_base) plus the relevant sweep, mirroring the
+// register init block in emit_matmul_projection.
+
+/// Emit the register-init block used by K and V pre-pass sweeps.
+/// Sets up warp_row, k/v_smem_base, q/k/v_tile, and x_norm_base for the
+/// given q_tile_iter.  Does NOT emit the Q smem base (not needed for K/V).
+fn emit_kv_prepass_reginit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let kv_off = crate::flash_attention_v2::smem_layout::kv_offset(config);
+    let wt_base = crate::flash_attention_v2::smem_layout::sp_offset(config)
+        + crate::flash_attention_v2::smem_layout::sp_bytes(config);
+    let wt_bytes = crate::flash_attention_v2::smem_layout::wq_tile_bytes(config);
+
+    // warp_row = warp_id + q_tile_iter * 4.  Reuse %r_indim_Q_0 as scratch.
+    ptx.push_str(&format!(
+        "    add.u32 %r_indim_Q_0, %warp_id, {}; // warp_row = warp_id + iter*4\n",
+        q_tile_iter * 4
+    ));
+    ptx.push_str("    cvt.u64.u32 %warp_row, %r_indim_Q_0;\n");
+
+    // Q smem base (needed for q_tile register, even though Q sweep is not emitted here).
+    ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %k_smem_base, %shmem_base, {};\n",
+        kv_off
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %v_smem_base, %shmem_base, {};\n",
+        kv_off
+    ));
+
+    // Weight tile SMEM bases.
+    ptx.push_str(&format!(
+        "    add.u64 %q_tile, %shmem_base, {};\n",
+        wt_base
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %k_tile, %shmem_base, {};\n",
+        wt_base + wt_bytes
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %v_tile, %shmem_base, {};\n",
+        wt_base + 2 * wt_bytes
+    ));
+
+    // x_norm_base: global address of this warp's row in the normalized x tensor.
+    ptx.push_str("    ld.param.u64 %x_norm_base, [csha_x_ptr];\n");
+    ptx.push_str("    mul.lo.u64 %rd_wt_off, %head_idx, %rd6;\n");
+    ptx.push_str("    add.u64 %rd_wt_off, %rd_wt_off, %q_start;\n");
+    ptx.push_str("    add.u64 %rd_wt_off, %rd_wt_off, %warp_row;\n");
+    ptx.push_str("    mul.lo.u64 %rd_wt_off, %rd_wt_off, %rd7;\n");
+    ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 2;\n");
+    ptx.push_str("    add.u64 %x_norm_base, %x_norm_base, %rd_wt_off;\n");
+}
+
+/// Emit the K projection sweep for the K pre-pass (before any S-compute).
+/// Writes K rows for this q_tile_iter's warps into SMEM at kv_offset.
+pub fn emit_k_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        return;
+    }
+    ptx.push_str(&format!(
+        "    // K pre-pass sweep q_tile_iter={}\n", q_tile_iter
+    ));
+    // Load Wk pointer (already in SMEM from the one-time weight tile load;
+    // re-load into %rd61 for the sweep's null-guard pattern).
+    ptx.push_str("    ld.param.u64 %rd61, [csha_wk_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd61, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_K_PREPASS_SKIP_{};\n", q_tile_iter
+    ));
+    emit_kv_prepass_reginit(ptx, config, q_tile_iter);
+    emit_warp_per_row_sweep(ptx, config, q_tile_iter, "K", "%k_smem_base");
+    ptx.push_str(&format!("V2_K_PREPASS_SKIP_{}:\n", q_tile_iter));
+}
+
+/// Emit only the Q projection sweep (no K) for the S-compute pass.
+/// Writes Q rows for this q_tile_iter into q_smem (q_offset).
+/// Assumes x has been normalized by the prologue and weight tiles are in SMEM.
+pub fn emit_q_projection_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        return;
+    }
+    ptx.push_str(&format!(
+        "    // Q-only projection sweep q_tile_iter={}\n", q_tile_iter
+    ));
+    // Load Wq pointer for null guard.
+    ptx.push_str("    ld.param.u64 %rd60, [csha_wq_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd60, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_Q_ONLY_PROJ_SKIP_{};\n", q_tile_iter
+    ));
+    emit_kv_prepass_reginit(ptx, config, q_tile_iter);
+    emit_warp_per_row_sweep(ptx, config, q_tile_iter, "Q", "%q_smem_base");
+    ptx.push_str(&format!("V2_Q_ONLY_PROJ_SKIP_{}:\n", q_tile_iter));
+    ptx.push_str("    bar.sync 0; // Q rows visible before Q-load\n");
+}
+
+/// Emit the V projection sweep for the V pre-pass (after all S-computes).
+/// Writes V rows for this q_tile_iter's warps into SMEM at kv_offset.
+pub fn emit_v_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        return;
+    }
+    ptx.push_str(&format!(
+        "    // V pre-pass sweep q_tile_iter={}\n", q_tile_iter
+    ));
+    ptx.push_str("    ld.param.u64 %rd62, [csha_wv_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd62, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_V_PREPASS_SKIP_{};\n", q_tile_iter
+    ));
+    emit_kv_prepass_reginit(ptx, config, q_tile_iter);
+    emit_warp_per_row_sweep(ptx, config, q_tile_iter, "V", "%v_smem_base");
+    ptx.push_str(&format!("V2_V_PREPASS_SKIP_{}:\n", q_tile_iter));
+}
+
+/// Save %row_max and %row_sum to the softmax-state SMEM save area.
+///
+/// Each (warp_id, q_tile_iter) pair has its own 2×f32 slot to avoid races.
+/// Layout: `softmax_save_offset + (warp_id * iters + q_tile_iter) * 8` bytes.
+///
+/// Only emitted when `fused_projections=true` (the S+PV split design).
+pub fn emit_save_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        return;
+    }
+    let save_base = crate::flash_attention_v2::smem_layout::softmax_save_offset(config);
+    let iters = (config.block_q as u32).div_ceil(4);
+    // Slot base for this (warp_id, q_tile_iter): save_base + (warp_id * iters + q_tile_iter) * 8.
+    // Computed at runtime using %warp_id.
+    // Static part: save_base + q_tile_iter * 8 + warp_id * iters * 8.
+
+    ptx.push_str(&format!(
+        "    // Save softmax state for q_tile_iter={} (warp-indexed)\n",
+        q_tile_iter
+    ));
+    // Compute warp offset: warp_id * iters * 8 (bytes).
+    ptx.push_str("    cvt.u64.u32 %rd_wt_off, %warp_id;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {}; // warp_id * iters * 8\n",
+        iters * 8
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_wt_dst, %shmem_base, {}; // save_base + q_tile_iter*8\n",
+        save_base + q_tile_iter * 8
+    ));
+    ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
+    // Save row_max and row_sum at consecutive 4-byte slots.
+    ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_max;\n");
+    ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, 4;\n");
+    ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_sum;\n");
+}
+
+/// Restore %row_max and %row_sum from the softmax-state SMEM save area.
+///
+/// Symmetric to `emit_save_softmax_state`.  Called at the start of the PV-accum
+/// pass for each q_tile_iter.
+pub fn emit_restore_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        return;
+    }
+    let save_base = crate::flash_attention_v2::smem_layout::softmax_save_offset(config);
+    let iters = (config.block_q as u32).div_ceil(4);
+
+    ptx.push_str(&format!(
+        "    // Restore softmax state for q_tile_iter={} (warp-indexed)\n",
+        q_tile_iter
+    ));
+    ptx.push_str("    cvt.u64.u32 %rd_wt_off, %warp_id;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {};\n",
+        iters * 8
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_wt_dst, %shmem_base, {};\n",
+        save_base + q_tile_iter * 8
+    ));
+    ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
+    ptx.push_str("    ld.shared.f32 %row_max, [%rd_wt_dst];\n");
+    ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, 4;\n");
+    ptx.push_str("    ld.shared.f32 %row_sum, [%rd_wt_dst];\n");
 }
 
 /// Emit the §A.2.5 Wo output projection (post-attention epilogue).
@@ -796,19 +1040,21 @@ mod tests {
     }
 
     #[test]
-    fn a3_matmul_projection_emits_three_warp_per_row_sweeps() {
+    fn a3_matmul_projection_emits_q_and_k_sweeps() {
         let cfg = cfg_with_projections();
         let mut ptx = String::new();
         emit_matmul_projection(&mut ptx, &cfg, 0);
 
-        // Three weight loads present for register compatibility; only Wq is null-guarded.
+        // All three weight pointer loads present with independent null-guards.
         assert!(ptx.contains("ld.param.u64 %rd60, [csha_wq_ptr];"), "missing Wq null-check load");
-        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"), "missing Wk load");
-        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"), "missing Wv load");
-        // Only Q projection loop is emitted; K/V come pre-projected in k_ptr/v_ptr.
+        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"), "missing Wk null-check load");
+        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"), "missing Wv null-check load");
+        // Q and K sweeps emitted here (§9a); V is deferred to emit_v_projection_in_kv_loop
+        // because K and V share kv_offset — emitting V here would overwrite K before s_compute.
         assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing Q loop label");
-        assert!(!ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "K sweep must not be emitted (K pre-projected)");
-        assert!(!ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "V sweep must not be emitted (V pre-projected)");
+        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "missing K loop label");
+        assert!(!ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"),
+            "V sweep must be deferred to emit_v_projection_in_kv_loop (K/V share kv_offset)");
         // No warp butterfly reduction: each lane independently accumulates its own output column.
         assert_eq!(
             ptx.matches("shfl.sync.bfly.b32").count(),
@@ -821,18 +1067,41 @@ mod tests {
     }
 
     #[test]
+    fn a3_v_projection_deferred_to_kv_loop() {
+        let cfg = cfg_with_projections();
+        let mut ptx = String::new();
+        emit_v_projection_in_kv_loop(&mut ptx, &cfg, 0);
+
+        // V sweep is emitted by the deferred hook (for kv_loop placement).
+        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "missing deferred V loop label");
+        // Q and K must NOT appear here (they belong to emit_matmul_projection).
+        assert!(!ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "Q must not appear in deferred V hook");
+        assert!(!ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "K must not appear in deferred V hook");
+        // Null-guard re-loads Wv pointer.
+        assert!(ptx.contains("[csha_wv_ptr]"), "missing Wv null-guard reload");
+    }
+
+    #[test]
     fn a3_label_uniqueness_across_q_tile_iters() {
         let mut cfg = cfg_with_projections();
         cfg.block_q = 64;
         let mut ptx = String::new();
         emit_matmul_projection(&mut ptx, &cfg, 0);
         emit_matmul_projection(&mut ptx, &cfg, 1);
+        emit_v_projection_in_kv_loop(&mut ptx, &cfg, 0);
+        emit_v_projection_in_kv_loop(&mut ptx, &cfg, 1);
 
-        // Every label must include its q_tile_iter suffix
+        // Every label must include its q_tile_iter suffix — for all three sweeps.
         assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing iter-0 Q label");
         assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_1:"), "missing iter-1 Q label");
-        // No unsuffixed labels
+        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "missing iter-0 K label");
+        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_1:"), "missing iter-1 K label");
+        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "missing iter-0 V label");
+        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_1:"), "missing iter-1 V label");
+        // No unsuffixed labels for any sweep
         assert!(!ptx.contains("V2_CSHA_PROJ_Q_LOOP:"), "found unsuffixed Q label");
+        assert!(!ptx.contains("V2_CSHA_PROJ_K_LOOP:"), "found unsuffixed K label");
+        assert!(!ptx.contains("V2_CSHA_PROJ_V_LOOP:"), "found unsuffixed V label");
     }
 
     /// Regression test: RoPE epilogue must appear BEFORE the attention body

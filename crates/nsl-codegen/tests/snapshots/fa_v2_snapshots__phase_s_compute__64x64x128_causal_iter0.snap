@@ -64,7 +64,7 @@ V2_LOOP_S_OVER_K_0:
     cvt.u64.u32 %rd37, %r1;
     add.u64 %rd36, %rd36, %rd37;              // + k
     shl.b64 %rd36, %rd36, 2;                  // * 4 bytes f32
-    add.u64 %rd36, %rd36, 32768;                 // + sp_offset
+    add.u64 %rd36, %rd36, 32768;                 // + sp_iter_offset
     add.u64 %smem_addr, %rd36, %shmem_base;
     @%p1 st.shared.f32 [%smem_addr], %f0;
     add.u32 %r1, %r1, 1;

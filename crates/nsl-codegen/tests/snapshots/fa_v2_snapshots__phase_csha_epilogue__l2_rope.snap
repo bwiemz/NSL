@@ -2,11 +2,60 @@
 source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
 expression: ptx
 ---
-    // CSHA A.2.4: RoPE epilogue (q_tile_iter = 0)
-    ld.param.u64 %rd62, [cos_ptr];
-    setp.eq.u64 %p0, %rd62, 0;
-    @%p0 bra V2_CSHA_EPILOGUE_SKIP_0;
-    // TODO(fa-v2-rope-epilogue): real rotation body
-    // Same shape as q_load's emit_rope_rotation_inline but
-    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.
-V2_CSHA_EPILOGUE_SKIP_0:
+    // CSHA A.2.4: RoPE Q/K rotation epilogue (q_tile_iter=0, block_q=32, head_dim=32, pairs_per_lane=4)
+    ld.param.u64 %rd_rope_cos, [cos_ptr];
+    ld.param.u64 %rd_rope_sin, [sin_ptr];
+    setp.eq.u64 %p_rope_cos_null, %rd_rope_cos, 0;
+    setp.eq.u64 %p_rope_sin_null, %rd_rope_sin, 0;
+    or.pred %p_rope_skip, %p_rope_cos_null, %p_rope_sin_null;
+    @%p_rope_skip bra V2_CSHA_ROPE_SKIP_0;
+    // A.2.4 RoPE Q sweep: block_q=32, half_dim=16, pairs_per_lane=4
+    cvt.u32.u32 %r_rope_tid, %tid_x;
+    mov.u32 %r_rope_pair_idx, %r_rope_tid;
+V2_CSHA_ROPE_Q_LOOP_0:
+    setp.ge.u32 %p_rope_done, %r_rope_pair_idx, 512;
+    @%p_rope_done bra V2_CSHA_ROPE_Q_END_0;
+    div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
+    rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
+    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
+    mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
+    add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
+    cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
+    shl.b64 %rd_rope_cs_idx, %rd_rope_cs_idx, 1;  // *2 for f16
+    add.u64 %rd_rope_addr, %rd_rope_cos, %rd_rope_cs_idx;
+    ld.global.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_cos, %h_rope_pair;
+    add.u64 %rd_rope_addr, %rd_rope_sin, %rd_rope_cs_idx;
+    ld.global.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_sin, %h_rope_pair;
+    mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, 64;
+    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair
+    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;
+    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes
+    cvt.u64.u32 %rd_rope_x0_off, %r_rope_x0_off;
+    cvt.u64.u32 %rd_rope_x1_off, %r_rope_x1_off;
+    add.u64 %rd_rope_addr, %q_smem_base, %rd_rope_x0_off;
+    ld.shared.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_x0, %h_rope_pair;
+    add.u64 %rd_rope_addr, %q_smem_base, %rd_rope_x1_off;
+    ld.shared.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_x1, %h_rope_pair;
+    mov.f32 %f_rope_y0, 0f00000000;
+    fma.rn.f32 %f_rope_y0, %f_rope_x0, %f_rope_cos, %f_rope_y0;
+    neg.f32 %f_rope_neg_x1, %f_rope_x1;
+    fma.rn.f32 %f_rope_y0, %f_rope_neg_x1, %f_rope_sin, %f_rope_y0;
+    mov.f32 %f_rope_y1, 0f00000000;
+    fma.rn.f32 %f_rope_y1, %f_rope_x0, %f_rope_sin, %f_rope_y1;
+    fma.rn.f32 %f_rope_y1, %f_rope_x1, %f_rope_cos, %f_rope_y1;
+    cvt.rn.f16.f32 %h_rope_y0, %f_rope_y0;
+    cvt.rn.f16.f32 %h_rope_y1, %f_rope_y1;
+    add.u64 %rd_rope_addr, %q_smem_base, %rd_rope_x0_off;
+    st.shared.b16 [%rd_rope_addr], %h_rope_y0;
+    add.u64 %rd_rope_addr, %q_smem_base, %rd_rope_x1_off;
+    st.shared.b16 [%rd_rope_addr], %h_rope_y1;
+    add.u32 %r_rope_pair_idx, %r_rope_pair_idx, 128;
+    bra V2_CSHA_ROPE_Q_LOOP_0;
+V2_CSHA_ROPE_Q_END_0:
+    bar.sync 0;  // FENCE: RoPE tile writes complete
+V2_CSHA_ROPE_SKIP_0:
+    bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads

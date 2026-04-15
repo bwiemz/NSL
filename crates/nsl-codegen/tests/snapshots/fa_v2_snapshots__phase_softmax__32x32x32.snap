@@ -11,7 +11,7 @@ expression: ptx
     setp.lt.u64 %p0, %rd41, 32;                 // k < block_kv?
     add.u64 %rd41, %rd41, %rd40;              // warp_base + k
     shl.b64 %rd41, %rd41, 2;                  // * 4 bytes
-    add.u64 %rd41, %rd41, 4096;                 // + sp_offset
+    add.u64 %rd41, %rd41, 4096;                 // + sp_iter_offset
     add.u64 %smem_addr, %rd41, %shmem_base;
     mov.f32 %f1, 0fFF800000;
     @%p0 ld.shared.f32 %f1, [%smem_addr];     // S[k] or -inf

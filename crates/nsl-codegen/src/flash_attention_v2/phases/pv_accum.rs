@@ -29,6 +29,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
     let block_kv = config.block_kv as u32;
+    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    // SP slice base offset for this q_tile_iter (same logic as softmax.rs).
+    let sp_iter_offset = if fused {
+        sp_offset(config) + q_tile_iter * 4 * block_kv * 4
+    } else {
+        sp_offset(config)
+    };
 
     ptx.push_str(&format!(
         "    // Phase 5: O_acc += P * V (q_tile_iter = {})\n",
@@ -63,8 +70,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    add.u64 %rd42, %rd42, %rd43;              // + k\n");
     ptx.push_str("    shl.b64 %rd42, %rd42, 2;                  // * 4 bytes\n");
     ptx.push_str(&format!(
-        "    add.u64 %rd42, %rd42, {};                 // + sp_offset\n",
-        sp_offset(config)
+        "    add.u64 %rd42, %rd42, {};                 // + sp_iter_offset\n",
+        sp_iter_offset
     ));
     ptx.push_str("    add.u64 %smem_addr, %rd42, %shmem_base;\n");
     ptx.push_str("    ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar\n");

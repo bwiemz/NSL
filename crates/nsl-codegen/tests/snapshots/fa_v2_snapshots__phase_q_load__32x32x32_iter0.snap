@@ -5,6 +5,10 @@ expression: ptx
     // Phase 1: Q load, q_tile_iter = 0
     add.u32 %r0, %warp_id, 0;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row base offset
     add.u64 %rd21, %q_start, %rd20;          // q_row_global
     mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
     add.u64 %rd22, %rd22, %head_idx;         // + head_idx
@@ -13,10 +17,6 @@ expression: ptx
     mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
     shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
     add.u64 %rd22, %rd0, %rd22;               // q_base global
-    mov.u64 %rd23, 0;                    // q_offset
-    mul.lo.u64 %rd24, %rd20, 32;          // q_row_local * head_dim
-    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)
-    add.u64 %rd23, %rd23, %rd24;              // shmem row offset
     // slice 0: d = lane + 32*0 = lane + 0
     cvt.u64.u32 %rd28, %lane;
     add.u64 %rd28, %rd28, 0;

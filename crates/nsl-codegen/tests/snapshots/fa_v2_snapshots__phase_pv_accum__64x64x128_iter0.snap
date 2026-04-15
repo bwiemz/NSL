@@ -15,7 +15,7 @@ V2_LOOP_PV_OVER_K_0:
     cvt.u64.u32 %rd43, %r5;
     add.u64 %rd42, %rd42, %rd43;              // + k
     shl.b64 %rd42, %rd42, 2;                  // * 4 bytes
-    add.u64 %rd42, %rd42, 32768;                 // + sp_offset
+    add.u64 %rd42, %rd42, 32768;                 // + sp_iter_offset
     add.u64 %smem_addr, %rd42, %shmem_base;
     ld.shared.f32 %f0, [%smem_addr];          // P[k] scalar
     cvt.u64.u32 %rd44, %r5;

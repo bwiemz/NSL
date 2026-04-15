@@ -10,8 +10,21 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::sp_offset;
 
-pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
+pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let block_kv = config.block_kv as u32;
+    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    // SP slice base offset for this q_tile_iter.  In the fused split-loop
+    // design, all S-passes run before all PV-accums, so each q_tile_iter's P
+    // values must live in a distinct SP slice.  In the standard interleaved
+    // path q_tile_iter is always 0 here (one pass per iter), so the extra
+    // offset is always 0 for the non-fused path.
+    let sp_iter_offset = if fused {
+        // SP layout: [iters, 4_warps, block_kv] f32.
+        // Slice for q_tile_iter starts at: sp_offset + q_tile_iter * 4 * block_kv * 4.
+        sp_offset(config) + q_tile_iter * 4 * block_kv * 4
+    } else {
+        sp_offset(config)
+    };
     // block_kv is always a multiple of 32 in the supported matrix (16, 32, 64, 128).
     // For block_kv=16 we have a partial chunk; the predicated load handles it.
     let chunks = (block_kv + 31) / 32;
@@ -41,8 +54,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    add.u64 %rd41, %rd41, %rd40;              // warp_base + k\n");
         ptx.push_str("    shl.b64 %rd41, %rd41, 2;                  // * 4 bytes\n");
         ptx.push_str(&format!(
-            "    add.u64 %rd41, %rd41, {};                 // + sp_offset\n",
-            sp_offset(config)
+            "    add.u64 %rd41, %rd41, {};                 // + sp_iter_offset\n",
+            sp_iter_offset
         ));
         ptx.push_str("    add.u64 %smem_addr, %rd41, %shmem_base;\n");
         ptx.push_str("    mov.f32 %f1, 0fFF800000;\n");
@@ -90,7 +103,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ));
         ptx.push_str("    add.u64 %rd41, %rd41, %rd40;\n");
         ptx.push_str("    shl.b64 %rd41, %rd41, 2;\n");
-        ptx.push_str(&format!("    add.u64 %rd41, %rd41, {};\n", sp_offset(config)));
+        ptx.push_str(&format!("    add.u64 %rd41, %rd41, {};\n", sp_iter_offset));
         ptx.push_str("    add.u64 %smem_addr, %rd41, %shmem_base;\n");
         ptx.push_str("    mov.f32 %f1, 0fFF800000;\n");
         ptx.push_str("    @%p0 ld.shared.f32 %f1, [%smem_addr];\n");

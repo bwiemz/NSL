@@ -84,14 +84,14 @@ fn phase_s_compute__label_uniqueness_across_iters() {
 #[test]
 fn phase_softmax__32x32x32_snapshot() {
     let mut ptx = String::new();
-    softmax::emit(&mut ptx, &csha_canonical());
+    softmax::emit(&mut ptx, &csha_canonical(), 0);
     insta::assert_snapshot!("phase_softmax__32x32x32", ptx);
 }
 
 #[test]
 fn phase_softmax__64x64x128_snapshot() {
     let mut ptx = String::new();
-    softmax::emit(&mut ptx, &non_csha_canonical());
+    softmax::emit(&mut ptx, &non_csha_canonical(), 0);
     insta::assert_snapshot!("phase_softmax__64x64x128", ptx);
 }
 
