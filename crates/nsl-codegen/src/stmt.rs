@@ -5002,6 +5002,20 @@ impl Compiler<'_> {
 
         // 7f. Optimizer step: for each param, call optimizer step function
         // FASE Deferred: emit fused per-parameter step; otherwise use existing path.
+        //
+        // FASE Codegen Phase 2: Optimizer step dispatch is at outer scope here
+        // (the `if fase_deferred { Deferred loops } else { per-optimizer stdlib
+        // step }` shape can't be split per-param without hoisting a runtime
+        // branch through two structurally different optimizer-step emission
+        // paths — the Deferred side uses `fase_emit_final_step` on m_partial,
+        // the FullBuffer side dispatches to optimizer-specific stdlib functions
+        // (adam_step/sgd_step/...) with different calling conventions.
+        //
+        // Deferring per-param optimizer dispatch to a follow-up plan. WGGO's
+        // per-layer signal still influences accumulation behavior via the
+        // mode-table dispatch in ga_body (Task 4b), which is the dominant
+        // memory-cost decision. The optimizer step's compute cost is identical
+        // between modes — only accumulation buffer shape differs.
         if fase_deferred {
             if let Some(accum) = accum_list {
                 // ── FASE Deferred: compute bias-correction scalars once per step ──
