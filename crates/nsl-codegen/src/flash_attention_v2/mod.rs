@@ -19,7 +19,7 @@ use phases::pv_accum::O_BASE;
 /// v2 entry point. Returns a byte vector ending with a single trailing
 /// newline followed by a NUL terminator so `cuModuleLoadData` accepts it.
 pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u8> {
-    smem_layout::validate_scalar_v2_config(config)
+    smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward)
         .expect("v2 emitter called with unsupported config -- selector must gate this");
 
     let mut ptx = String::new();

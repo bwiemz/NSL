@@ -174,7 +174,7 @@ fn v2_kernel_assembles_on_sm75_full_matrix() {
         eprintln!("skipping: ptxas not found"); return;
     };
     use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
-    use nsl_codegen::flash_attention_v2::smem_layout::validate_scalar_v2_config;
+    use nsl_codegen::flash_attention_v2::smem_layout::{validate_scalar_v2_config, Direction};
 
     let base = FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
@@ -195,7 +195,7 @@ fn v2_kernel_assembles_on_sm75_full_matrix() {
     let mut failures = Vec::new();
     for &(bq, bkv, hd) in matrix {
         let c = FlashAttentionConfig { block_q: bq, block_kv: bkv, head_dim: hd, ..base.clone() };
-        if validate_scalar_v2_config(&c).is_err() { continue; }
+        if validate_scalar_v2_config(&c, Direction::Forward).is_err() { continue; }
         let ptx = synthesize_flash_attention_ptx_v2(&c);
         // Drop trailing NUL for file write; ptxas wants text input.
         let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());

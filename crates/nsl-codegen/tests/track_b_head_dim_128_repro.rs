@@ -69,7 +69,7 @@ use nsl_codegen::flash_attention_selector::{
     shared_mem_bytes_selected,
     synthesize_flash_attention_ptx_selected,
 };
-use nsl_codegen::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, validate_scalar_v2_config};
+use nsl_codegen::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, validate_scalar_v2_config, Direction};
 use std::ffi::CString;
 
 use nsl_runtime::{
@@ -141,7 +141,7 @@ fn track_b_d_model_128_rejected_by_validator() {
     );
 
     // Validator must reject it (exceeds 99 KB dynamic budget).
-    let result = validate_scalar_v2_config(&config);
+    let result = validate_scalar_v2_config(&config, Direction::Forward);
     assert!(
         result.is_err(),
         "d_model=128 ({} bytes = {:.2} KB) must be rejected by validator \
@@ -196,7 +196,7 @@ fn track_b_head_dim_128_d_model_32_launches() {
     );
 
     // Validate config passes the validator.
-    validate_scalar_v2_config(&config)
+    validate_scalar_v2_config(&config, Direction::Forward)
         .expect("d_model=32 head_dim=128 config must pass validator");
 
     // Synthesize PTX.

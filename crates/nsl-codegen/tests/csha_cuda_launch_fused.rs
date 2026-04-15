@@ -275,7 +275,7 @@ fn run_fused_config_dmodel(
     // Pre-validate before calling select_emitter: v1 is deleted so out-of-matrix
     // configs now panic.  Return Err here so the matrix driver can mark the row
     // as SMEM-blocked (not a numerical failure) without catching a panic.
-    if let Err(e) = smem_layout::validate_scalar_v2_config(&config) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
         return Err(format!(
             "SMEM budget exceeded or config out-of-matrix: {}; not a numerical failure",
             e
@@ -777,7 +777,7 @@ fn run_with_saves(
         }),
     };
 
-    if let Err(e) = smem_layout::validate_scalar_v2_config(&config) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
         return Err(format!("SMEM/validator: {e}"));
     }
     let emitter = select_emitter(&config);
