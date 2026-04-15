@@ -110,6 +110,7 @@ fn cfg_128(d_model: u32) -> FlashAttentionConfig {
             active_heads: 4,
             rmsnorm_eps: 1e-5,
             d_model,
+            save_activations_for_backward: false,
         }),
     }
 }

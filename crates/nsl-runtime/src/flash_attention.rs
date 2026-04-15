@@ -1502,6 +1502,7 @@ pub extern "C" fn nsl_flash_attention_backward(
 /// pointers represented as `i64` (matching the rest of the NSL runtime
 /// ABI).  A value of `0` indicates allocation failure.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct CshaBackwardActivations {
     pub q_proj: i64,
     pub k_proj: i64,
