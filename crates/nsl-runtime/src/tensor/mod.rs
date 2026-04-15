@@ -3240,6 +3240,38 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Test-only helpers — build/read tensors from f32 slices for integration
+// tests in `tests/*.rs`. Gated on the `test-hooks` feature so production
+// builds don't expose this surface.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "test-hooks")]
+pub fn test_build_tensor_2d_f32(rows: usize, cols: usize, data: &[f32]) -> i64 {
+    assert_eq!(data.len(), rows * cols, "data length must equal rows*cols");
+    let shape = crate::list::nsl_list_new();
+    crate::list::nsl_list_push(shape, rows as i64);
+    crate::list::nsl_list_push(shape, cols as i64);
+    let ptr = nsl_tensor_zeros(shape);
+
+    let t = unsafe { &*(ptr as *const NslTensor) };
+    let buf = t.data as *mut f32;
+    for (i, &v) in data.iter().enumerate() {
+        unsafe { *buf.add(i) = v };
+    }
+    crate::list::nsl_list_free(shape);
+    ptr
+}
+
+#[cfg(feature = "test-hooks")]
+pub fn test_read_tensor_f32(ptr: i64) -> Vec<f32> {
+    let t = unsafe { &*(ptr as *const NslTensor) };
+    assert_eq!(t.dtype, 1, "expected f32 tensor (dtype=1), got dtype={}", t.dtype);
+    let len = t.len as usize;
+    let buf = t.data as *const f32;
+    (0..len).map(|i| unsafe { *buf.add(i) }).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
