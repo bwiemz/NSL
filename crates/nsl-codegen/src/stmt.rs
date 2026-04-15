@@ -5336,107 +5336,29 @@ impl Compiler<'_> {
             let grad_val = self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, idx])?;
             let s1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, idx])?;
 
-            match optimizer_name.as_str() {
-                "sgd" => {
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            lr,
-                            momentum_const,
-                            dampening_const,
-                            weight_decay_const,
-                            nesterov_const,
-                        ],
-                    )?;
-                }
-                "adam" | "adamw" => {
-                    let s2 =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
-                    let t_val = builder.use_var(step_count_var);
-                    let one = builder.ins().iconst(cl_types::I64, 1);
-                    let t_plus_one = builder.ins().iadd(t_val, one);
-                    let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            s2,
-                            lr,
-                            beta1_const,
-                            beta2_const,
-                            eps_const,
-                            weight_decay_const,
-                            t_float,
-                        ],
-                    )?;
-                }
-                "lion" => {
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            lr,
-                            beta1_const,
-                            beta2_const,
-                            weight_decay_const,
-                        ],
-                    )?;
-                }
-                "muon" => {
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            lr,
-                            momentum_const,
-                            weight_decay_const,
-                            nesterov_const,
-                        ],
-                    )?;
-                }
-                "soap" => {
-                    let s2 =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?;
-                    let t_val_s = builder.use_var(step_count_var);
-                    let one_s = builder.ins().iconst(cl_types::I64, 1);
-                    let t_plus_s = builder.ins().iadd(t_val_s, one_s);
-                    let t_float_s = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_s);
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            s2,
-                            lr,
-                            beta1_const,
-                            beta2_const,
-                            eps_const,
-                            t_float_s,
-                        ],
-                    )?;
-                }
-                _ => {
-                    return Err(CodegenError::new(format!(
-                        "unsupported optimizer '{}' in train block",
-                        optimizer_name
-                    )));
-                }
-            }
+            let s2 = if num_state_buffers >= 2 {
+                self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?
+            } else {
+                s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
+            };
+            self.emit_stdlib_optim_call(
+                builder,
+                optimizer_name.as_str(),
+                &opt_fn,
+                param_val,
+                grad_val,
+                s1,
+                s2,
+                lr,
+                momentum_const,
+                dampening_const,
+                weight_decay_const,
+                nesterov_const,
+                beta1_const,
+                beta2_const,
+                eps_const,
+                step_count_var,
+            )?;
 
             let one_opt = builder.ins().iconst(cl_types::I64, 1);
             let next_opt = builder.ins().iadd(idx, one_opt);

@@ -551,6 +551,106 @@ impl Compiler<'_> {
             .ins()
             .brif(is_deferred, deferred_block, &[], fullbuffer_block, &[]);
     }
+
+    /// Emit a per-parameter stdlib optimizer step call. Factored from the
+    /// monolithic FullBuffer optimizer-step loop in `compile_train_block`
+    /// so both the original loop and the unified per-param dispatch loop
+    /// (FASE Codegen Phase 3) can share the arg-shape logic.
+    ///
+    /// Each optimizer has a distinct arg shape; the `match` arms preserve
+    /// the original ordering verbatim.
+    ///
+    /// `s2` is always passed; SGD/Lion/Muon arms ignore it. Caller must
+    /// load `s2` from `state_list_2` for num_state_buffers >= 2, or pass
+    /// `s1` as a placeholder otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_stdlib_optim_call(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        optimizer_name: &str,
+        opt_fn: &str,
+        param_val: cranelift_codegen::ir::Value,
+        grad_val: cranelift_codegen::ir::Value,
+        s1: cranelift_codegen::ir::Value,
+        s2: cranelift_codegen::ir::Value,
+        lr: cranelift_codegen::ir::Value,
+        momentum_const: cranelift_codegen::ir::Value,
+        dampening_const: cranelift_codegen::ir::Value,
+        weight_decay_const: cranelift_codegen::ir::Value,
+        nesterov_const: cranelift_codegen::ir::Value,
+        beta1_const: cranelift_codegen::ir::Value,
+        beta2_const: cranelift_codegen::ir::Value,
+        eps_const: cranelift_codegen::ir::Value,
+        step_count_var: cranelift_frontend::Variable,
+    ) -> Result<(), crate::error::CodegenError> {
+        match optimizer_name {
+            "sgd" => {
+                self.compile_call_by_name(
+                    builder,
+                    opt_fn,
+                    &[
+                        param_val, grad_val, s1,
+                        lr, momentum_const, dampening_const, weight_decay_const, nesterov_const,
+                    ],
+                )?;
+            }
+            "adam" | "adamw" => {
+                let t_val = builder.use_var(step_count_var);
+                let one = builder.ins().iconst(cl_types::I64, 1);
+                let t_plus_one = builder.ins().iadd(t_val, one);
+                let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
+                self.compile_call_by_name(
+                    builder,
+                    opt_fn,
+                    &[
+                        param_val, grad_val, s1, s2,
+                        lr, beta1_const, beta2_const, eps_const, weight_decay_const, t_float,
+                    ],
+                )?;
+            }
+            "lion" => {
+                self.compile_call_by_name(
+                    builder,
+                    opt_fn,
+                    &[
+                        param_val, grad_val, s1,
+                        lr, beta1_const, beta2_const, weight_decay_const,
+                    ],
+                )?;
+            }
+            "muon" => {
+                self.compile_call_by_name(
+                    builder,
+                    opt_fn,
+                    &[
+                        param_val, grad_val, s1,
+                        lr, momentum_const, weight_decay_const, nesterov_const,
+                    ],
+                )?;
+            }
+            "soap" => {
+                let t_val_s = builder.use_var(step_count_var);
+                let one_s = builder.ins().iconst(cl_types::I64, 1);
+                let t_plus_s = builder.ins().iadd(t_val_s, one_s);
+                let t_float_s = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_s);
+                self.compile_call_by_name(
+                    builder,
+                    opt_fn,
+                    &[
+                        param_val, grad_val, s1, s2,
+                        lr, beta1_const, beta2_const, eps_const, t_float_s,
+                    ],
+                )?;
+            }
+            _ => {
+                return Err(crate::error::CodegenError::new(format!(
+                    "unsupported optimizer '{}' in train block",
+                    optimizer_name
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
