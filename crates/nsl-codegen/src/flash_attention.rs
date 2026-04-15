@@ -195,6 +195,11 @@ pub struct CshaExtras {
     /// `d_model` — feature dimension fed into the fused projections.
     /// Ignored unless `fused_projections` is true.
     pub d_model: u32,
+    /// When true, forward writes Q_proj, K_proj, V_proj, row_max, row_sum
+    /// to HBM for backward consumption. Gated on @train mode by the
+    /// compiler. Inference builds leave this false; forward pays zero
+    /// extra HBM cost.
+    pub save_activations_for_backward: bool,
 }
 
 impl CshaExtras {
@@ -209,6 +214,7 @@ impl CshaExtras {
             active_heads: 0,
             rmsnorm_eps,
             d_model: 0,
+            save_activations_for_backward: false,
         }
     }
 
@@ -222,6 +228,7 @@ impl CshaExtras {
             active_heads: 0,
             rmsnorm_eps,
             d_model,
+            save_activations_for_backward: false,
         }
     }
 
@@ -5448,6 +5455,22 @@ fn emit_bwd_main_store_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CshaExtras field tests ─────────────────────────────────────────
+
+    #[test]
+    fn cshaextras_save_activations_defaults_false() {
+        let e = CshaExtras::default();
+        assert!(!e.save_activations_for_backward);
+    }
+
+    #[test]
+    fn cshaextras_save_activations_independent_of_fused_projections() {
+        let mut e = CshaExtras::default();
+        e.save_activations_for_backward = true;
+        assert!(e.save_activations_for_backward);
+        assert!(!e.fused_projections); // independent flags
+    }
 
     // ── MMA tile validation tests ─────────────────────────────────────
 
