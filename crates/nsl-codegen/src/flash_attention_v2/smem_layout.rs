@@ -89,6 +89,95 @@ pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
 }
 
 /// Total SMEM bytes: Q tile + KV tile + S/P rows (4 warps × block_kv × 4 bytes, f32).
+/// When `csha.fused_projections`, also includes Wq/Wk/Wv weight tile slots.
 pub fn total_bytes(config: &FlashAttentionConfig) -> u32 {
-    sp_offset(config) + 4 * (config.block_kv as u32) * 4
+    let base = sp_offset(config) + 4 * (config.block_kv as u32) * 4;
+    base + wq_tile_bytes(config) + wk_tile_bytes(config) + wv_tile_bytes(config)
+}
+
+/// Wq weight tile bytes when `csha.fused_projections` is set: `d_model × head_dim × 2` (f16).
+/// Returns 0 when `fused_projections` is false or `d_model == 0`.
+pub fn wq_tile_bytes(config: &FlashAttentionConfig) -> u32 {
+    if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
+        2 * d_model * (config.head_dim as u32)
+    } else {
+        0
+    }
+}
+
+/// Wk weight tile bytes — same as Wq.
+pub fn wk_tile_bytes(config: &FlashAttentionConfig) -> u32 {
+    wq_tile_bytes(config)
+}
+
+/// Wv weight tile bytes — same as Wq.
+pub fn wv_tile_bytes(config: &FlashAttentionConfig) -> u32 {
+    wq_tile_bytes(config)
+}
+
+/// SmemLayout captures all per-config SMEM region sizes.
+#[derive(Debug)]
+pub struct SmemLayout {
+    pub q_tile_bytes: usize,
+    pub kv_tile_bytes: usize,
+    pub sp_tile_bytes: usize,
+    pub wq_tile_bytes: usize,
+    pub wk_tile_bytes: usize,
+    pub wv_tile_bytes: usize,
+    pub total_bytes: usize,
+}
+
+/// Compute the full SMEM layout for a given config.
+pub fn compute_layout(config: &FlashAttentionConfig) -> SmemLayout {
+    let q_bytes   = (config.block_q  * config.head_dim * 2) as usize;
+    let kv_bytes  = (config.block_kv * config.head_dim * 2) as usize;
+    let sp_bytes  = (4 * config.block_kv as u32 * 4) as usize;
+    let wq_bytes  = wq_tile_bytes(config) as usize;
+    let wk_bytes  = wk_tile_bytes(config) as usize;
+    let wv_bytes  = wv_tile_bytes(config) as usize;
+    SmemLayout {
+        q_tile_bytes: q_bytes,
+        kv_tile_bytes: kv_bytes,
+        sp_tile_bytes: sp_bytes,
+        wq_tile_bytes: wq_bytes,
+        wk_tile_bytes: wk_bytes,
+        wv_tile_bytes: wv_bytes,
+        total_bytes: q_bytes + kv_bytes + sp_bytes + wq_bytes + wk_bytes + wv_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    fn base_cfg() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: None,
+        }
+    }
+
+    #[test]
+    fn a3_smem_includes_wq_wk_wv_tiles() {
+        let mut cfg = base_cfg();
+        cfg.csha = Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() });
+        let layout = compute_layout(&cfg);
+        assert!(layout.wq_tile_bytes > 0, "wq tile missing");
+        assert!(layout.wk_tile_bytes > 0, "wk tile missing");
+        assert!(layout.wv_tile_bytes > 0, "wv tile missing");
+        // f16: 2 bytes × d_model × head_dim
+        let d_model = cfg.csha.as_ref().unwrap().d_model as usize;
+        assert_eq!(layout.wq_tile_bytes, 2 * d_model * cfg.head_dim as usize);
+    }
 }
