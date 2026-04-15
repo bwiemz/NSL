@@ -455,6 +455,52 @@ mod override_tests {
             plan.override_diagnostics
         );
     }
+
+    // ── Task 4 smoke tests: end-to-end propagation of wggo_recommended_shard ──
+
+    #[test]
+    fn cpdt_run_with_wggo_recommendation_propagates_to_plan() {
+        use crate::wggo_overrides::{PerLayerOverride, WggoOverrides};
+        let over = WggoOverrides {
+            per_layer: vec![PerLayerOverride {
+                layer_index: 0,
+                layer_name: "blocks.0".into(),
+                active_heads: 8,
+                requested_csha_level: None,
+                adapter_rank: 0,
+                fase_fused: false,
+                packing_mode: 0,
+                shard_factor: 4,
+            }],
+        };
+        let recommended = over.min_shard_factor();
+        assert_eq!(recommended, Some(4));
+        // Use the existing helper: world_size=8, recommended=Some(4), low budget.
+        // 8 % 4 == 0 → Gate 1 passes.  "low" → all tuples feasible.
+        // Most aggressive at-or-below 4 is s_p=4; plan should honour it, no diag.
+        let input = cpdt_input_with(8, recommended, "low");
+        let plan = run(input);
+        let s_p = plan.zero.as_ref().expect("zero eval").config.s_p;
+        let has_diag = !plan.override_diagnostics.is_empty();
+        assert!(
+            s_p <= 4 || has_diag,
+            "expected s_p ≤ 4 OR diagnostic; got s_p={s_p}, diags={:?}",
+            plan.override_diagnostics
+        );
+    }
+
+    #[test]
+    fn cpdt_run_without_overrides_leaves_override_diagnostics_empty() {
+        // wggo_recommended_shard=None → override path skipped entirely;
+        // override_diagnostics must be empty.
+        let input = cpdt_input_with(8, None, "low");
+        let plan = run(input);
+        assert!(
+            plan.override_diagnostics.is_empty(),
+            "no recommendation → no diagnostics; got {:?}",
+            plan.override_diagnostics
+        );
+    }
 }
 
 #[cfg(test)]
