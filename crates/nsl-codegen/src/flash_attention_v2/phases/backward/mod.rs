@@ -5,3 +5,4 @@
 //! dqk_accum, dv_accum, dwq_dwk_dwv, dx_finalize) will land in
 //! T3.2..T3.8 as Phase 3 progresses.
 pub mod prelude;
+pub mod q_load;
