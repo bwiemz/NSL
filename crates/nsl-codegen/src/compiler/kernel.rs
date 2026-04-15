@@ -640,7 +640,11 @@ impl Compiler<'_> {
                 };
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
-                let shmem = crate::flash_attention_selector::shared_mem_bytes_selected(&test_config);
+                let mut diags = Vec::<String>::new();
+                let shmem = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+                    &test_config, &mut self.csha_fallback_seen, &mut diags,
+                );
+                for d in diags { eprintln!("warning: {d}"); }
                 if shmem > 49152 {
                     return Err(CodegenError::new(format!(
                         "@autotune variant (block_q={}, block_kv={}) requires {}KB shared memory, exceeds 48KB limit for sm_52",
@@ -657,10 +661,16 @@ impl Compiler<'_> {
                 }
 
                 // Synthesize and embed PTX for this variant
-                let ptx_bytes =
-                    crate::flash_attention_selector::synthesize_flash_attention_ptx_selected(&test_config);
-                let variant_kernel_name =
-                    crate::flash_attention_selector::flash_attention_kernel_name_selected(&test_config);
+                let mut diags = Vec::<String>::new();
+                let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+                    &test_config, &mut self.csha_fallback_seen, &mut diags,
+                );
+                for d in diags { eprintln!("warning: {d}"); }
+                let mut diags = Vec::<String>::new();
+                let variant_kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                    &test_config, &mut self.csha_fallback_seen, &mut diags,
+                );
+                for d in diags { eprintln!("warning: {d}"); }
                 self.embed_flash_ptx(&variant_kernel_name, ptx_bytes)?;
             }
 
@@ -691,7 +701,11 @@ impl Compiler<'_> {
                 csha: None,
             };
 
-            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected(&config);
+            let mut diags = Vec::<String>::new();
+            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                &config, &mut self.csha_fallback_seen, &mut diags,
+            );
+            for d in diags { eprintln!("warning: {d}"); }
 
             // The primary variant's PTX was already embedded in the loop above.
             // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
@@ -757,8 +771,16 @@ impl Compiler<'_> {
                 csha: None,
             };
 
-            let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected(&config);
-            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected(&config);
+            let mut diags = Vec::<String>::new();
+            let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+                &config, &mut self.csha_fallback_seen, &mut diags,
+            );
+            for d in diags { eprintln!("warning: {d}"); }
+            let mut diags = Vec::<String>::new();
+            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                &config, &mut self.csha_fallback_seen, &mut diags,
+            );
+            for d in diags { eprintln!("warning: {d}"); }
 
             // Embed PTX bytes in .rodata
             let ptx_data_id = self

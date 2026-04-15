@@ -31,10 +31,12 @@ impl FallbackSeen {
 
 /// Select v1 or v2, pre-checking `validate_scalar_v2_config` before
 /// routing to v2.  On validator rejection, falls back to v1 and appends
-/// a single diagnostic to `diagnostics` (one per unique triple, no dedup).
+/// a single diagnostic to `diagnostics`.
 ///
-/// Callers that need dedup across multiple invocations should use
-/// `select_emitter_with_dedup` with a `FallbackSeen` kept on the compiler.
+/// NOTE: this creates a fresh `FallbackSeen` per call, so dedup only
+/// applies within a single invocation.  For cross-call dedup (e.g., across
+/// a full compilation unit) use `select_emitter_with_dedup` with a
+/// compiler-owned `FallbackSeen`.
 pub fn select_emitter_with_diag(
     config: &FlashAttentionConfig,
     diagnostics: &mut Vec<String>,
@@ -84,25 +86,61 @@ pub fn select_emitter(config: &FlashAttentionConfig) -> Emitter {
     select_emitter_with_diag(config, &mut Vec::new())
 }
 
-pub fn synthesize_flash_attention_ptx_selected(config: &FlashAttentionConfig) -> Vec<u8> {
-    match select_emitter(config) {
+/// Synthesise PTX, threading diagnostics through a compiler-owned `FallbackSeen`
+/// for cross-call dedup.  Prefer this over `synthesize_flash_attention_ptx_selected`
+/// at any call site that has a `Compiler` (or equivalent) in scope.
+pub fn synthesize_flash_attention_ptx_selected_with_diag(
+    config: &FlashAttentionConfig,
+    seen: &mut FallbackSeen,
+    diagnostics: &mut Vec<String>,
+) -> Vec<u8> {
+    match select_emitter_with_dedup(config, diagnostics, seen) {
         Emitter::V1 => v1_synth(config),
         Emitter::V2 => synthesize_flash_attention_ptx_v2(config),
     }
 }
 
-pub fn flash_attention_kernel_name_selected(config: &FlashAttentionConfig) -> String {
-    match select_emitter(config) {
+/// Return the kernel name, threading diagnostics through a compiler-owned
+/// `FallbackSeen` for cross-call dedup.
+pub fn flash_attention_kernel_name_selected_with_diag(
+    config: &FlashAttentionConfig,
+    seen: &mut FallbackSeen,
+    diagnostics: &mut Vec<String>,
+) -> String {
+    match select_emitter_with_dedup(config, diagnostics, seen) {
         Emitter::V1 => v1_kernel_name(config),
         Emitter::V2 => flash_attention_kernel_name_v2(config),
     }
 }
 
-pub fn shared_mem_bytes_selected(config: &FlashAttentionConfig) -> u32 {
-    match select_emitter(config) {
+/// Return shared-memory bytes, threading diagnostics through a compiler-owned
+/// `FallbackSeen` for cross-call dedup.
+pub fn shared_mem_bytes_selected_with_diag(
+    config: &FlashAttentionConfig,
+    seen: &mut FallbackSeen,
+    diagnostics: &mut Vec<String>,
+) -> u32 {
+    match select_emitter_with_dedup(config, diagnostics, seen) {
         Emitter::V1 => v1_shared_mem(config),
         Emitter::V2 => shared_mem_bytes_v2(config),
     }
+}
+
+/// Back-compat shim — routes through a throwaway diagnostic buffer.
+/// Retained for test helpers and call sites without compiler context;
+/// prefer `*_with_diag` variants in production code.
+pub fn synthesize_flash_attention_ptx_selected(config: &FlashAttentionConfig) -> Vec<u8> {
+    synthesize_flash_attention_ptx_selected_with_diag(config, &mut FallbackSeen::new(), &mut Vec::new())
+}
+
+/// Back-compat shim — routes through a throwaway diagnostic buffer.
+pub fn flash_attention_kernel_name_selected(config: &FlashAttentionConfig) -> String {
+    flash_attention_kernel_name_selected_with_diag(config, &mut FallbackSeen::new(), &mut Vec::new())
+}
+
+/// Back-compat shim — routes through a throwaway diagnostic buffer.
+pub fn shared_mem_bytes_selected(config: &FlashAttentionConfig) -> u32 {
+    shared_mem_bytes_selected_with_diag(config, &mut FallbackSeen::new(), &mut Vec::new())
 }
 
 #[cfg(test)]
@@ -168,6 +206,26 @@ mod selector_tests {
         let result = select_emitter_with_diag(&config, &mut diagnostics);
         assert_eq!(result, Emitter::V2);
         assert!(diagnostics.is_empty(), "no diagnostic expected on valid config");
+    }
+
+    #[test]
+    fn a2_wired_call_site_emits_eprintln_via_compiler_state() {
+        // Verify the new _with_diag wrappers thread FallbackSeen correctly:
+        // calling the same out-of-matrix config twice must produce exactly one
+        // diagnostic across both calls (cross-call dedup via shared FallbackSeen).
+        std::env::set_var("NSL_FA_EMITTER", "v2");
+        let config = cfg(128, 128, 128, 75);
+        let mut seen = FallbackSeen::new();
+        let mut diags = Vec::<String>::new();
+        // First call — should produce one diagnostic.
+        let _ = synthesize_flash_attention_ptx_selected_with_diag(&config, &mut seen, &mut diags);
+        // Second call — dedup should suppress the second warning.
+        let _ = synthesize_flash_attention_ptx_selected_with_diag(&config, &mut seen, &mut diags);
+        assert_eq!(diags.len(), 1, "cross-call dedup via shared FallbackSeen should collapse to one warning");
+        assert!(
+            diags[0].contains("block_q=128") && diags[0].contains("block_kv=128") && diags[0].contains("head_dim=128"),
+            "diagnostic should include the config triple, got: {:?}", diags[0]
+        );
     }
 
     #[test]

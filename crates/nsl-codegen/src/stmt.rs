@@ -3700,13 +3700,17 @@ impl Compiler<'_> {
                             // `csha_apply::bridge`; we reconstruct it here
                             // to keep the kernels / marks / configs map
                             // available to downstream code.
+                            let mut diags = Vec::<String>::new();
                             self.last_csha_bridge = Some(crate::csha_apply::bridge(
                                 &plan,
                                 plan.per_layer
                                     .first()
                                     .map(|lp| lp.tiles.head_dim as i64)
                                     .unwrap_or(64),
+                                &mut self.csha_fallback_seen,
+                                &mut diags,
                             ));
+                            for d in diags { eprintln!("warning: {d}"); }
                             // A.2.1d: record the Wengert op indices CSHA
                             // has claimed across all boundary chains so
                             // downstream passes (A.2.2 RMSNorm prologue,
