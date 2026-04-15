@@ -3,7 +3,7 @@
 //! budget this phase allocates.
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::flash_attention_v2::smem_layout::total_bytes;
+use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes};
 
 /// Emit the PTX file header up through the index-computation block.
 ///
@@ -27,6 +27,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str(".version 8.7\n");
     ptx.push_str(".target sm_75\n");
     ptx.push_str(".address_size 64\n\n");
+
+    // Dynamic SMEM module-scope declaration (must precede the .visible .entry).
+    // In PTX, `.extern .shared` is a module-level directive — it CANNOT appear
+    // inside a function body.  For configs that exceed the 48 KB static SMEM cap
+    // the declaration moves here; the static `.shared .align 16 .b8 shmem[N]`
+    // form (which CAN appear inside a function body) is used for smaller configs.
+    if needs_dynamic_smem(config) {
+        ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+    }
 
     // Kernel entry + param block. All 30 params declared even when a
     // variant ignores some -- keeps the 30-arg FFI launch list stable.
@@ -55,11 +64,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     }
     ptx.push_str(")\n{\n");
 
-    // Static shared memory -- ASCII-only, no em-dashes.
-    ptx.push_str(&format!(
-        "    .shared .align 16 .b8 shmem[{}];\n",
-        total_bytes(config)
-    ));
+    // Static shared memory declaration (inside function body).
+    // Dynamic SMEM configs use `.extern .shared` at module scope (emitted above,
+    // before the .visible .entry).  Static configs declare the array here.
+    if !needs_dynamic_smem(config) {
+        ptx.push_str(&format!(
+            "    .shared .align 16 .b8 shmem[{}];\n",
+            total_bytes(config)
+        ));
+    }
 
     // Register declarations. f32 pool must cover the highest-indexed
     // register any phase writes:

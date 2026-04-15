@@ -115,6 +115,32 @@ mod selector_tests {
         }
     }
 
+    /// Config with CSHA fused projections enabled (d_model = head_dim).
+    fn cfg_csha(block_q: i64, block_kv: i64, head_dim: i64, gpu_sm: u32) -> FlashAttentionConfig {
+        use crate::flash_attention::CshaExtras;
+        FlashAttentionConfig {
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm,
+            csha: Some(CshaExtras {
+                level: 2,
+                fused_rmsnorm: true,
+                fused_projections: true,
+                fused_output_proj: false,
+                active_heads: 4,
+                rmsnorm_eps: 1e-5,
+                d_model: head_dim as u32,
+            }),
+        }
+    }
+
     // ---- surviving tests ----
 
     #[test]
@@ -150,12 +176,28 @@ mod selector_tests {
     // ---- C5 new test ----
 
     #[test]
+    fn c5_head_dim_128_no_csha_valid_with_dynamic_smem() {
+        let _guard = lock_env();
+        // block_q=128, block_kv=128, head_dim=128 (no CSHA) = 66 KB.
+        // Track B: expanded SMEM budget to 228 KB (dynamic SMEM opt-in).
+        // This config is now valid (66 KB < 228 KB dynamic limit).
+        let config = cfg(128, 128, 128, 75);
+        let result = select_emitter(&config);
+        assert_eq!(result, Emitter::V2, "128x128x128 no-CSHA must be valid post Track B");
+        // Verify dynamic SMEM is flagged.
+        assert!(
+            smem_layout::needs_dynamic_smem(&config),
+            "128x128x128 must need dynamic SMEM (66 KB > 48 KB static cap)"
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "v2 rejected config")]
     fn c5_out_of_matrix_config_panics_after_v1_deletion() {
         let _guard = lock_env();
-        // block_q=128, block_kv=128, head_dim=128 — SMEM budget exceeded;
-        // v2 rejects it, and v1 no longer exists as a fallback.
-        let config = cfg(128, 128, 128, 75);
+        // block_q=64, block_kv=64, head_dim=256, d_model=256, CSHA fused
+        // = 464.5 KB > 99 KB dynamic cap; v2 still rejects this.
+        let config = cfg_csha(64, 64, 256, 75);
         let mut diagnostics = vec![];
         let _ = select_emitter_with_diag(&config, &mut diagnostics);
     }
