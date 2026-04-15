@@ -3262,7 +3262,7 @@ impl Compiler<'_> {
         // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
         // (Lion, Unknown, or grad_clip set) fall through to the existing
         // accum-buffer path below.  Deferred routes through stmt_fase.
-        let fase_plan = crate::fase::plan(&crate::fase::FaseConfig {
+        let fase_cfg = crate::fase::FaseConfig {
             accumulation: grad_accumulation_steps.max(1) as u32,
             optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
             grad_clip: if grad_clip < f64::MAX { Some(grad_clip) } else { None },
@@ -3273,7 +3273,43 @@ impl Compiler<'_> {
             weight_decay: weight_decay_value,
             momentum: momentum_value,
             allow_v_approx: true,
-        });
+        };
+        let fase_plan = match self.wggo_overrides.as_ref() {
+            Some(o) => {
+                let fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
+                crate::fase::plan_with_overrides(&fase_cfg, &fused)
+            }
+            None => crate::fase::plan(&fase_cfg),
+        };
+
+        // Render FaseModeInfeasible diagnostics to stderr in the same format
+        // as CSHA / WRGA / CPDT so the Phase 3 decision explainer parses
+        // uniformly.
+        for diag in &fase_plan.override_diagnostics {
+            let reason_str = match &diag.reason {
+                crate::wggo_overrides::OverrideRejectReason::FaseModeInfeasible {
+                    optimizer,
+                    global_mode,
+                } => format!("{:?}_optimizer_global_mode_{:?}", optimizer, global_mode)
+                    .to_lowercase(),
+                other => format!("{:?}", other),
+            };
+            eprintln!(
+                "[fase] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                diag.layer_index, diag.requested, diag.applied, reason_str
+            );
+        }
+        // TODO(fase-consumer-3-phase-2): Per-layer codegen dispatch deferred.
+        // The backward loop below (`nsl_list_get(grads_list, gai)` around the
+        // `ga_body` block) and the optimizer-step loop branch on this single
+        // compile-time boolean. Routing per-layer modes would require either
+        // a runtime lookup table keyed on param index or loop unrolling at
+        // codegen time — both substantial refactors beyond this plan. The
+        // planner (fase::plan_with_overrides), memory schedule
+        // (fase_memory::fase_breakdown), and stderr renderer above already
+        // honor per-layer modes, so WGGO's fase_fused signal flows through
+        // observability even though codegen still uses the global mode.
+        // See docs/superpowers/specs/2026-04-15-fase-per-layer-mode-design.md §9.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── 3. Resolve model type and build param list ──────────────────
