@@ -70,6 +70,7 @@ pub mod pca_detect;
 pub mod pca_rope;
 pub mod pca_segment;
 pub mod pca_tileskip;
+pub mod training_report;
 pub mod pipeline;
 pub mod reduction_fusion;
 pub mod serve;
