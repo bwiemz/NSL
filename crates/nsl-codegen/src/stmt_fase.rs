@@ -237,7 +237,15 @@ impl Compiler<'_> {
                         resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
                     self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dst_ptr, scaled_sq])?;
+                    // FBIP relinq contract: when mul_scalar reuses the input
+                    // buffer in-place, it bumps refcount so the input ptr is
+                    // still valid post-call. The caller must free BOTH the
+                    // input (sq) and the output (scaled_sq) — under FBIP they
+                    // are the same pointer with rc=2; the two frees drop it
+                    // to 0. Without the second free, every SquaredAccumulate
+                    // leaks one operand-sized tensor per call.
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_sq])?;
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[sq])?;
                 }
 
                 // ── SqrtPlusEps: dst = sqrt(src) + eps ─────────────────────
@@ -294,6 +302,11 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, eps_result])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[eps_result])?;
                     }
+                    // FBIP relinq contract: caller must also free the input we
+                    // relinquished to add_scalar. Under FBIP, sqrt_val and
+                    // eps_result share the same buffer with rc=2; the eps_result
+                    // free above drops to 1, this one drops to 0.
+                    self.compile_call_by_name(builder, "nsl_tensor_free", &[sqrt_val])?;
                 }
 
                 // ── Div: dst = src / divisor ─────────────────────────────────
@@ -477,19 +490,33 @@ impl Compiler<'_> {
         grad_ptr: Value,
         accum_scale: f64,
     ) -> Result<(), crate::error::CodegenError> {
-        // Step 1: scaled_grad = grad * accum_scale  (owned new tensor)
+        // Step 0: migrate grad to m_partial's (device, dtype). Tape-AD produces
+        // CPU f64 gradients while m_partial is GPU f32 (it was allocated via
+        // zeros_like(param), inheriting the parameter's placement). Without
+        // this, `nsl_tensor_add_inplace` below hits a device/dtype mismatch
+        // (CPU f64 src into GPU f32 dst) and panics inside the runtime.
+        // `to_device_like` is a no-op (refcount++) when placements already match.
+        let grad_migrated =
+            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[grad_ptr, m_partial_ptr])?;
+
+        // Step 1: scaled_grad = grad_migrated * accum_scale  (owned new tensor)
         let scale_val = builder.ins().f64const(accum_scale);
-        // flags=0: do NOT relinquish `grad_ptr` — the caller owns it and will
-        // free it after this call returns.
-        let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+        // flags=1: relinquish `grad_migrated` — we own the refcount bump from
+        // to_device_like and mul_scalar can reuse the buffer when unique.
+        let flags_relinq = builder.ins().iconst(cl_types::I8, 1);
         let scaled_grad =
-            self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_ptr, scale_val, flags_zero])?;
+            self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_migrated, scale_val, flags_relinq])?;
 
         // Step 2: m_partial += scaled_grad  (in-place, void)
         self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[m_partial_ptr, scaled_grad])?;
 
-        // Step 3: free the temporary scaled_grad
+        // Step 3: free both refs to the buffer mul_scalar relinquished into.
+        // Under FBIP, scaled_grad and grad_migrated alias the same tensor
+        // with rc=2; both frees together drop it to 0. Without the second
+        // free this leaks one parameter-sized tensor per accumulate call —
+        // ~217/step at 500M with grad_accumulation=8.
         self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_grad])?;
+        self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_migrated])?;
 
         Ok(())
     }

@@ -1,0 +1,58 @@
+# models/coder500m/config.nsl
+# NSL-Coder-500M Configuration
+#
+# Scaled from coder50m (48.8M) by widening d_model 512→1280 and deepening
+# n_layers 8→24.  Same GQA / SwiGLU / RoPE architecture — only hyperparams
+# change.  Target: ~505M params for a FASE peak-memory demo on consumer
+# GPUs (16GB VRAM).
+
+# Architecture
+const VOCAB_SIZE = 49152
+const D_MODEL = 1280
+const N_LAYERS = 24
+const N_HEADS = 20
+const N_KV_HEADS = 10
+const HEAD_DIM = 64
+const D_FF = 3520
+const MAX_SEQ_LEN = 1024
+const ROPE_THETA = 10000.0
+const DROPOUT = 0.1
+
+# Pretrain hyperparameters
+const PRETRAIN_LR = 0.0003
+const PRETRAIN_WARMUP = 3000
+const PRETRAIN_TOTAL_STEPS = 305000
+const PRETRAIN_MIN_LR = 0.00003
+const PRETRAIN_BATCH_SIZE = 2
+const PRETRAIN_GRAD_ACCUM = 8
+const PRETRAIN_WEIGHT_DECAY = 0.1
+const PRETRAIN_BETA1 = 0.9
+const PRETRAIN_BETA2 = 0.95
+const PRETRAIN_EPOCHS = 1
+const PRETRAIN_GRAD_CLIP = 1.0
+
+# Finetune hyperparameters
+const FINETUNE_LR = 0.00001
+const FINETUNE_WARMUP = 100
+const FINETUNE_MIN_LR = 0.000001
+const FINETUNE_BATCH_SIZE = 1
+const FINETUNE_GRAD_ACCUM = 16
+const FINETUNE_WEIGHT_DECAY = 0.1
+const FINETUNE_BETA1 = 0.9
+const FINETUNE_BETA2 = 0.95
+const FINETUNE_EPOCHS = 1
+
+# Inference
+const TOP_K = 40
+const TEMPERATURE = 0.8
+const MAX_GEN_TOKENS = 512
+
+# Parameter budget (approximate, f32):
+#   Embedding (tied LM head): 49152 × 1280 =  62.9M
+#   Per TransformerBlock:
+#     GQA (Q/K/V/O):          1280 × 3840 =   4.9M
+#     SwiGLU (gate+up+down):  3 × (1280×3520) = 13.5M
+#     Block total:                         ≈ 18.4M
+#   24 blocks:                              ≈ 442M
+#   Final RMSNorm:                          ≈ 0
+#   TOTAL:                                  ≈ 505M

@@ -1147,17 +1147,6 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         crate::cuda::inner::memcpy_dtod(dst.data, src.data, byte_count);
         return;
     } else if dst.device > 0 && src.device == 0 {
-        if byte_count == 12_582_912 {
-            eprintln!(
-                "[nsl] memcpy_htod@copy_data dst_shape={:?} src_shape={:?} dst_device={} src_device={} dst_ptr={:?} src_ptr={:?}",
-                get_shape_vec(dst),
-                get_shape_vec(src),
-                dst.device,
-                src.device,
-                dst.data,
-                src.data
-            );
-        }
         crate::cuda::inner::memcpy_htod(dst.data, src.data, byte_count);
         return;
     } else if dst.device == 0 && src.device > 0 {
@@ -1208,20 +1197,30 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *dc.data_f64().add(i) += *sc.data_f64().add(i); }
             }
         }
-        // Copy result back to device
-        let byte_count = (dc.len as usize) * dc.element_size();
-        if byte_count == 12_582_912 {
-            eprintln!(
-                "[nsl] memcpy_htod@add_inplace dst_shape={:?} src_shape={:?} dst_device={} src_device={} dst_ptr={:?} src_ptr={:?}",
-                get_shape_vec(dst),
-                get_shape_vec(dc),
-                dst.device,
-                dc.device,
+        // Copy result back to GPU. The GPU buffer is f32 (canonical GPU dtype).
+        // The CPU result `dc` may be f32 or f64 depending on the migration path
+        // (`nsl_tensor_to_device` upcasts GPU f32 → CPU f64). HtoD with a
+        // f64-sized src would overrun the f32 dst buffer, so down-convert when
+        // needed before the copy.
+        let len = dc.len as usize;
+        let f32_bytes = len * std::mem::size_of::<f32>();
+        if dc.dtype == 1 {
+            // CPU f32 → GPU f32: direct copy.
+            crate::cuda::inner::memcpy_htod(dst.data, dc.data, f32_bytes);
+        } else {
+            // CPU f64 → GPU f32: stage the down-conversion in a heap buffer.
+            let staging = checked_alloc(f32_bytes) as *mut f32;
+            let src = dc.data as *const f64;
+            for i in 0..len {
+                unsafe { *staging.add(i) = *src.add(i) as f32; }
+            }
+            crate::cuda::inner::memcpy_htod(
                 dst.data,
-                dc.data
+                staging as *const std::ffi::c_void,
+                f32_bytes,
             );
+            unsafe { checked_free(staging as *mut u8, f32_bytes); }
         }
-        crate::cuda::inner::memcpy_htod(dst.data, dc.data, byte_count);
         nsl_tensor_free(dst_cpu);
         if src_cpu != src_ptr { nsl_tensor_free(src_cpu); }
         return;
@@ -2701,6 +2700,16 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
     }
 
     panic!("GPU-to-GPU transfer not yet supported");
+}
+
+/// Migrate `src` to match `ref_tensor`'s device. Returns a new refcounted tensor
+/// (either `src` with incremented refcount if devices already match, or a
+/// device-migrated copy). Used by FASE Deferred to reconcile CPU tape-AD
+/// gradients with GPU-resident m_partial buffers before in-place accumulation.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
+    let r = unsafe { &*(ref_ptr as *const NslTensor) };
+    nsl_tensor_to_device(src_ptr, r.device as i64)
 }
 
 /// Prefetch a unified-memory tensor to a GPU device asynchronously.

@@ -1,0 +1,56 @@
+# models/coder7b/config.nsl
+# NSL-Coder-7B Configuration
+#
+# Scaled from coder500m (~505M) to Llama-3-8B-style shape (~7.2B params).
+# Same GQA / SwiGLU / RoPE architecture — only hyperparams change.
+#
+# Memory budget (f32):
+#   Parameters:        ~28.7 GB
+#   AdamW state (m,v): ~57.4 GB
+#   Gradients (FASE):  ~0.8 GB (one largest param at a time)
+#   Grand total:       ~87 GB — does NOT fit on 16 GB VRAM.
+# Use --profile-memory and nvidia-smi to observe; for execution on <80 GB
+# hardware, apply CPU offload, mixed precision, or shrink the config.
+
+# Architecture (Llama-3-8B-ish with our 49152 vocab)
+const VOCAB_SIZE = 49152
+const D_MODEL = 4096
+const N_LAYERS = 32
+const N_HEADS = 32
+const N_KV_HEADS = 8
+const HEAD_DIM = 128
+const D_FF = 14336
+const MAX_SEQ_LEN = 2048
+const ROPE_THETA = 500000.0
+const DROPOUT = 0.0
+
+# Pretrain hyperparameters
+const PRETRAIN_LR = 0.0003
+const PRETRAIN_WARMUP = 3000
+const PRETRAIN_TOTAL_STEPS = 150000
+const PRETRAIN_MIN_LR = 0.00003
+const PRETRAIN_BATCH_SIZE = 1
+const PRETRAIN_GRAD_ACCUM = 8
+const PRETRAIN_WEIGHT_DECAY = 0.1
+const PRETRAIN_BETA1 = 0.9
+const PRETRAIN_BETA2 = 0.95
+const PRETRAIN_EPOCHS = 1
+const PRETRAIN_GRAD_CLIP = 1.0
+
+# Inference
+const TOP_K = 40
+const TEMPERATURE = 0.8
+const MAX_GEN_TOKENS = 512
+
+# Parameter budget (approximate, f32):
+#   Embedding (tied LM head): 49152 × 4096 =   201.3M
+#   Per TransformerBlock:
+#     GQA Q:                  4096 × 4096 =    16.78M
+#     GQA K:                  4096 × 1024 =     4.19M
+#     GQA V:                  4096 × 1024 =     4.19M
+#     GQA O:                  4096 × 4096 =    16.78M
+#     SwiGLU (gate+up+down):  3 × (4096×14336) = 176.16M
+#     Block total:                          ≈  218.11M
+#   32 blocks:                              ≈   6980M
+#   Final RMSNorm:                          ≈        0
+#   TOTAL:                                  ≈   7181M  (~7.2B)
