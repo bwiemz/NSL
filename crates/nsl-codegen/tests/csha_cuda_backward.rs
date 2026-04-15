@@ -501,3 +501,67 @@ fn t6_3_matrix_sweep_structural() {
         }
     }
 }
+
+/// Diagnostic pass 2: localise which backward SMEM tile is first to
+/// diverge. Dumps max_abs_diff, first-8-element side-by-side, peak
+/// element, and zero-count for dq/dk/dv at the smoke config. Signals:
+///   * all-zero             → accumulator dropped / never reached HBM
+///   * constant             → gated by a broken predicate
+///   * cpu × scalar         → scale bug
+///   * right sign, wrong k  → addressing / missing-term bug
+///   * noise uncorrelated   → SMEM aliasing (K/V share kv_offset)
+#[test]
+#[ignore]
+fn t6_3_element_dump_diag() {
+    if !cuda_available() {
+        eprintln!("[T6.3 diag] skipping — no CUDA");
+        return;
+    }
+    let (gpu, cpu) = run_fused_backward_config(32, 32, 32, 1, 32, false, false)
+        .expect("smoke config must launch structurally");
+
+    fn dump(name: &str, gpu: &[f32], cpu: &[f32]) {
+        assert_eq!(gpu.len(), cpu.len(), "{name} len mismatch");
+        let mut max_abs = 0f32;
+        let mut peak_idx = 0usize;
+        for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let d = (g - c).abs();
+            if d > max_abs { max_abs = d; peak_idx = i; }
+        }
+        let zeros = gpu.iter().filter(|v| v.abs() < 1e-8).count();
+        let const_q = {
+            // crude "is it nearly constant" heuristic: min/max spread
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &v in gpu { if v < lo { lo = v; } if v > hi { hi = v; } }
+            hi - lo
+        };
+        // cpu × scalar check: median(gpu/cpu) — pick a few non-tiny cpu entries.
+        let mut ratios = Vec::new();
+        for (&g, &c) in gpu.iter().zip(cpu.iter()).take(64) {
+            if c.abs() > 1e-3 { ratios.push(g / c); }
+        }
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_ratio = if ratios.is_empty() { f32::NAN } else { ratios[ratios.len() / 2] };
+
+        eprintln!("─── {name}  len={}  max_abs_diff={:.3e}  zero_count={}/{}  spread(hi-lo)={:.3e}  median(g/c)={:.3e}",
+            gpu.len(), max_abs, zeros, gpu.len(), const_q, median_ratio);
+        eprintln!("  peak idx={peak_idx} gpu={:.4e} cpu={:.4e} diff={:.4e}",
+            gpu[peak_idx], cpu[peak_idx], gpu[peak_idx] - cpu[peak_idx]);
+        eprintln!("  first 8:   idx | gpu           | cpu           | diff");
+        for i in 0..8.min(gpu.len()) {
+            eprintln!("            {:>3} | {:>13.5e} | {:>13.5e} | {:>13.5e}",
+                i, gpu[i], cpu[i], gpu[i] - cpu[i]);
+        }
+    }
+
+    eprintln!("[T6.3 diag] config: bq=32 bkv=32 hd=32 heads=1 dm=32 causal=false rope=false");
+    dump("dq", &gpu.dq, &cpu.dq);
+    dump("dk", &gpu.dk, &cpu.dk);
+    dump("dv", &gpu.dv, &cpu.dv);
+    eprintln!("[T6.3 diag] SMEM-aliasing hypothesis: backward prelude sets \
+        %k_smem_base and %v_smem_base BOTH to kv_offset (phases/backward/prelude.rs:174-179). \
+        After kv_load::emit_v runs (mod.rs:472), the K tile holds V data. ds_compute then \
+        recomputes S = Q·V^T instead of Q·K^T (ds_compute.rs:75), corrupting P, dS, dP \
+        and therefore dq/dk/dv. Fix: allocate a separate V-input SMEM region (e.g. extend \
+        backward_extra_bytes by block_kv*head_dim*2) and point %v_smem_base there.");
+}
