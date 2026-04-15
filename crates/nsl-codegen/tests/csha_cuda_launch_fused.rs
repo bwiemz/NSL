@@ -89,8 +89,8 @@ use nsl_runtime::{
 };
 use nsl_runtime::flash_attention::{
     nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
-    nsl_flash_attention_csha, nsl_flash_attention_csha_with_saves,
-    CshaBackwardActivations,
+    nsl_flash_attention_csha, nsl_flash_attention_csha_backward,
+    nsl_flash_attention_csha_with_saves, CshaBackwardActivations,
 };
 
 // --------------------------------------------------------------------------
@@ -906,4 +906,141 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
         .zip(&lse_save)
         .all(|(&a, &b)| a.to_bits() == b.to_bits());
     assert!(lse_bits_eq, "T1.4 invariant broken: LSE diverged");
+}
+
+// --------------------------------------------------------------------------
+// T4.2 backward FFI smoke test
+// --------------------------------------------------------------------------
+
+/// Smoke-launch the Tier C backward kernel via nsl_flash_attention_csha_backward.
+///
+/// Verifies the full 43-arg launch list + synthesize_backward PTX + CUDA
+/// module load path against a real GPU. Numerical correctness is T6.3's
+/// job; here we just check the launch returns rc=0.
+#[test]
+#[ignore]
+#[cfg(feature = "cuda")]
+fn t4_csha_backward_ffi_smoke() {
+    use nsl_codegen::flash_attention_v2::{
+        flash_attention_kernel_name_v2, synthesize_backward,
+    };
+
+    if !cuda_available() {
+        eprintln!("[T4.2] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32i64, 32, 32, 4i64);
+    let batch = 1i64;
+    let seq = block_q.max(block_kv);
+    let d_model = head_dim;
+    let norm_eps = 1e-5f32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let config = FlashAttentionConfig {
+        block_q, block_kv, head_dim,
+        causal: false, paged: false, rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 2, fused_rmsnorm: true, fused_projections: true,
+            fused_output_proj: false,
+            save_activations_for_backward: true,
+            active_heads: heads as u32,
+            rmsnorm_eps: norm_eps,
+            d_model: d_model as u32,
+        }),
+    };
+
+    let mut ptx_str = synthesize_backward(&config)
+        .expect("synthesize_backward should succeed on minimal config");
+    // Keep the NUL that synthesize_backward appends — cuModuleLoadData
+    // expects a NUL-terminated C string.
+    if !ptx_str.ends_with('\0') { ptx_str.push('\0'); }
+    let ptx_bytes = ptx_str.into_bytes();
+    // Backward kernel name: forward name + "_v2" with "flash_attn_" →
+    // "flash_attn_backward_" rewrite (see prelude::kernel_name). Use a
+    // direct literal lookup: the prelude emits the name in .visible .entry
+    // and that's what cuModuleGetFunction must match.
+    let fw_name = flash_attention_kernel_name_v2(&config);
+    let kernel_name = match fw_name.strip_prefix("flash_attn_") {
+        Some(rest) => format!("flash_attn_backward_{}", rest),
+        None => format!("flash_attn_backward_{fw_name}"),
+    };
+    let kernel_cstr = CString::new(kernel_name).unwrap();
+
+    unsafe { nsl_cuda_init(); }
+
+    let qkv_bytes = (heads * seq * head_dim * 2) as i64;
+    let stats_bytes = (heads * seq * 4) as i64;
+    let x_bytes = (seq * d_model * 4) as i64;
+    let w_bytes = (d_model * head_dim * 2) as i64;
+    let dw_bytes = (d_model * heads * head_dim * 2) as i64;
+    let dx_bytes = (seq * d_model * 4) as i64;
+
+    let q_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let k_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let v_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let out_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let lse_dev = unsafe { nsl_test_cuda_alloc(stats_bytes) };
+    let x_dev = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let nw_dev = unsafe { nsl_test_cuda_alloc((d_model * 4) as i64) };
+    let wq_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dq_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dk_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dv_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dx_dev = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+
+    let all_ptrs = [
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
+        wq_dev, wk_dev, wv_dev,
+        do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
+    ];
+
+    let rc = unsafe {
+        nsl_flash_attention_csha_backward(
+            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            scale.to_bits() as i64,
+            batch, heads, seq, head_dim,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0,  // shared_mem_bytes (static SMEM for this config)
+            ptx_bytes.as_ptr() as i64,
+            kernel_cstr.as_ptr() as i64,
+            block_q, block_kv,
+            0,  // causal
+            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
+            0,  // wo_ptr
+            norm_eps.to_bits() as i64,
+            heads, d_model,
+            saves.q_proj, saves.k_proj, saves.v_proj,
+            saves.row_max, saves.row_sum,
+            do_dev, dq_dev, dk_dev, dv_dev,
+            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+        )
+    };
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+    free_all(&all_ptrs);
+
+    if rc != 0 {
+        let log = read_jit_log(ptx_bytes.as_ptr() as i64);
+        let dump = std::env::temp_dir().join("t4_backward_smoke.ptx");
+        let _ = std::fs::write(&dump, &ptx_bytes);
+        panic!(
+            "nsl_flash_attention_csha_backward launch failed rc={rc}\n\
+             kernel={}\ndump={}\nJIT log:\n{log}",
+            kernel_cstr.to_string_lossy(), dump.display()
+        );
+    }
 }

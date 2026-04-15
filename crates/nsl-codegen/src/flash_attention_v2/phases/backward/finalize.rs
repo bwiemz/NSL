@@ -20,7 +20,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let slices_per_lane = (head_dim / 32).max(1);
 
     ptx.push_str(&format!(
-        "    // Tier C backward finalize — global stores of all 7 gradients (q_tile_iter={q_tile_iter})\n"
+        "    // Tier C backward finalize -- global stores of all 7 gradients (q_tile_iter={q_tile_iter})\n"
     ));
     ptx.push_str(&format!("V2_BWD_FINALIZE_{q_tile_iter}:\n"));
 
