@@ -99,7 +99,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // immediately after emit_matmul_projection in mod.rs) already rotates
         // the Q/K SMEM tiles before this q_load path runs.  Skip the inline
         // RoPE branch here to prevent double-rotation.
-        let csha_rope_active = config.rope_q;
+        let csha_rope_active = config.csha.as_ref().map_or(false, |c| c.fused_projections);
 
         // Optional RoPE cos/sin bases (position-indexed by q_row_global).
         // Only needed when the non-CSHA inline path will fire.

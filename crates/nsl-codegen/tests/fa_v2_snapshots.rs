@@ -147,7 +147,7 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+        rope_style: RopeStyle::Adjacent, gqa_group_size: 1,  // emit_rope_pair_sweep implements Adjacent
         tree_mask: false, gpu_sm: 75,
         csha: Some(CshaExtras::level2(1e-5, 32)),
     }
@@ -215,9 +215,10 @@ fn phase_csha_hooks__label_uniqueness_across_iters() {
     let mut epi1 = String::new();
     csha_hooks::emit_rope_epilogue(&mut epi0, &cfg, 0);
     csha_hooks::emit_rope_epilogue(&mut epi1, &cfg, 1);
-    assert!(epi0.contains("V2_CSHA_EPILOGUE_SKIP_0"), "epilogue iter 0 label missing");
-    assert!(epi1.contains("V2_CSHA_EPILOGUE_SKIP_1"), "epilogue iter 1 label missing");
-    assert!(!epi0.contains("V2_CSHA_EPILOGUE_SKIP_1"), "epilogue iter 0 leaks iter 1");
+    // emit_rope_epilogue uses V2_CSHA_ROPE_SKIP_* (not V2_CSHA_EPILOGUE_SKIP_*).
+    assert!(epi0.contains("V2_CSHA_ROPE_SKIP_0"), "epilogue iter 0 label missing");
+    assert!(epi1.contains("V2_CSHA_ROPE_SKIP_1"), "epilogue iter 1 label missing");
+    assert!(!epi0.contains("V2_CSHA_ROPE_SKIP_1"), "epilogue iter 0 leaks iter 1");
 }
 
 // ---------------------------------------------------------------------------

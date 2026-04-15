@@ -63,10 +63,20 @@ fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 
 /// Apply RoPE in-place to a tensor of shape [seq, heads, head_dim].
 /// cos/sin have shape [seq, head_dim/2].
+///
+/// **Implements `RopeStyle::Adjacent` (GPT-NeoX / GPT-J layout) ONLY.**
+/// Pair `i` rotates `(x[2i], x[2i+1])`.  This matches `emit_rope_pair_sweep`
+/// in `csha_hooks.rs`.  Do NOT call this function for `RopeStyle::HalfSplit`
+/// (LLaMA / Qwen: `x[i]` paired with `x[i + head_dim/2]`) — the kernel and
+/// CPU reference would diverge silently.
+///
 /// Rotation formula (matching v2 kernel §A.2.4):
 ///   new_x[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
 ///   new_x[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
 fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f32], sin: &[f32]) {
+    // Consistency guard: this function only implements Adjacent layout.
+    // If head_dim is 0 somehow, the loop is a no-op — but flag odd configs.
+    debug_assert!(head_dim > 0 && head_dim % 2 == 0, "apply_rope requires even head_dim > 0");
     let half = head_dim / 2;
     for s in 0..seq {
         for h in 0..heads {

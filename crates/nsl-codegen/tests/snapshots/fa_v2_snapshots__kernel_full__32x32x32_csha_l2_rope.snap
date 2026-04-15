@@ -6,7 +6,7 @@ expression: s
 .target sm_75
 .address_size 64
 
-.visible .entry flash_attn_p0_r1_hs_g1_c1_t0_q32_kv32_cshaL2_n1_p1_o1_h0_v2 (
+.visible .entry flash_attn_p0_r1_adj_g1_c1_t0_q32_kv32_cshaL2_n1_p1_o1_h0_v2 (
     .param .u64 q_ptr,
     .param .u64 k_ptr,
     .param .u64 v_ptr,
@@ -1096,7 +1096,6 @@ V2_CSHA_ROPE_Q_LOOP_0:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_0;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -1371,7 +1370,6 @@ V2_CSHA_ROPE_Q_LOOP_1:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_1;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -1646,7 +1644,6 @@ V2_CSHA_ROPE_Q_LOOP_2:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_2;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -1921,7 +1918,6 @@ V2_CSHA_ROPE_Q_LOOP_3:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_3;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -2196,7 +2192,6 @@ V2_CSHA_ROPE_Q_LOOP_4:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_4;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -2471,7 +2466,6 @@ V2_CSHA_ROPE_Q_LOOP_5:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_5;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -2746,7 +2740,6 @@ V2_CSHA_ROPE_Q_LOOP_6:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_6;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
@@ -3021,7 +3014,6 @@ V2_CSHA_ROPE_Q_LOOP_7:
     @%p_rope_done bra V2_CSHA_ROPE_Q_END_7;
     div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
     rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
-    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;
     mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
     add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
     cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;

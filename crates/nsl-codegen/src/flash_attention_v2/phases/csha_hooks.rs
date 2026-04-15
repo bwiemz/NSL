@@ -7,7 +7,7 @@
 //! on `q_tile_iter` so the orchestrator (Task 11) can call them multiple
 //! times for block_q > 4 configs without duplicate-label errors.
 
-use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
 
 /// Emit the §A.4 active_heads guard. When `csha_active_heads` param is
 /// non-zero and `head_idx >= csha_active_heads`, the kernel returns
@@ -760,6 +760,16 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         return;
     }
 
+    // emit_rope_pair_sweep implements RopeStyle::Adjacent (GPT-NeoX / GPT-J layout):
+    //   pair i rotates (x[2i], x[2i+1]).
+    // RopeStyle::HalfSplit (LLaMA / Qwen layout: x[i] paired with x[i+head_dim/2])
+    // is NOT implemented here.  If you need HalfSplit, add a separate sweep variant.
+    assert!(
+        matches!(config.rope_style, RopeStyle::Adjacent),
+        "emit_rope_pair_sweep only implements RopeStyle::Adjacent; got {:?}",
+        config.rope_style
+    );
+
     let block_q  = config.block_q  as u32;
     let head_dim = config.head_dim as u32;
     let half_dim = head_dim / 2;
@@ -864,8 +874,7 @@ fn emit_rope_pair_sweep(
 
     // cos/sin HBM address:
     //   byte_offset = (row * half_dim + dim_pair) * 2   (f16 = 2 bytes)
-    ptx.push_str("    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;\n");
-    // Correct: row * half_dim + dim_pair
+    //   row * half_dim + dim_pair
     ptx.push_str(&format!(
         "    mul.lo.u32 %r_rope_cs_off, %r_rope_row, {half_dim};\n"
     ));
@@ -982,7 +991,7 @@ mod tests {
             causal: false,
             paged: false,
             rope_q: true,
-            rope_style: RopeStyle::HalfSplit,
+            rope_style: RopeStyle::Adjacent,  // emit_rope_pair_sweep implements Adjacent (x[2i], x[2i+1])
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 75,
