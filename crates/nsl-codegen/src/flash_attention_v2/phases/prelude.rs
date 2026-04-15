@@ -119,6 +119,14 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .u64 %q_tile, %k_tile, %v_tile;\n");
     }
 
+    // CSHA A5 Wo output projection stub registers (only when fused_output_proj is set).
+    // Actual Wo @ O computation is delegated to a separate follow-up kernel (spec R2);
+    // these registers are used only for the null-check dispatch stub.
+    if config.csha.as_ref().map_or(false, |c| c.fused_output_proj) {
+        ptx.push_str("    .reg .u64 %rd_wo_ptr;\n");
+        ptx.push_str("    .reg .pred %p_wo_null, %p_x_null;\n");
+    }
+
     // CSHA A.2.4 RoPE epilogue registers (only when rope_q=true and csha is set).
     if config.rope_q && config.csha.is_some() {
         // HBM pointer registers for cos/sin tables.

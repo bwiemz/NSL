@@ -97,7 +97,16 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
         ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_START_{};\n", q_iter));
 
         // Phase 6: finalize + output store + LSE.
+        // When fused_output_proj=true the Wo projection is a separate follow-up
+        // kernel (spec R2: Wo tile does not fit in 48 KB SMEM budget inline).
+        // finalize always emits its output store; emit_output_projection adds
+        // the Wo null-check dispatch stub + skip labels after it.
         phases::finalize::emit(&mut ptx, config, q_iter);
+
+        // CSHA A5: Wo output projection stub. No-op when csha=None or
+        // fused_output_proj=false. Emits pointer null-checks + skip labels;
+        // actual Wo @ O and residual add are dispatched as a separate kernel.
+        phases::csha_hooks::emit_output_projection(&mut ptx, config, q_iter);
     }
 
     ptx.push_str("    ret;\n");

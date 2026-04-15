@@ -352,6 +352,72 @@ fn emit_warp_per_row_sweep(
     }
 }
 
+/// Emit the §A.2.5 Wo output projection (post-attention epilogue).
+///
+/// # SMEM budget status (spec R2 decision point)
+///
+/// A5.0 measured 99328 bytes for the worst-case matrix config (block_q=64,
+/// block_kv=64, head_dim=64, d_model=128, fused_projections=true,
+/// fused_output_proj=true) — 2.02× the 48 KB budget.  Inline fusion is
+/// therefore NOT viable.
+///
+/// Per spec R2: this function is a **dispatch stub**.  It emits the Wo
+/// pointer null-check so the kernel can signal "Wo ready" and sets up
+/// skip labels, but does NOT perform the matrix multiply inline.  The
+/// actual `O @ Wo` + residual add is delegated to a separate follow-up
+/// kernel call emitted by the surrounding codegen after the FA kernel
+/// returns.
+///
+/// When `fused_output_proj=false` (or `csha=None`) the function is a
+/// complete no-op (emits a comment only).
+pub fn emit_output_projection(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let fused_output = config.csha.as_ref().map_or(false, |c| c.fused_output_proj);
+    if !fused_output {
+        ptx.push_str("    // CSHA A5: fused_output=false, no emission\n");
+        return;
+    }
+
+    let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
+
+    ptx.push_str(&format!(
+        "    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)\n"
+    ));
+    ptx.push_str(&format!(
+        "    // d_model={d_model}, q_tile_iter={q_tile_iter}\n"
+    ));
+
+    // Wo pointer null-check. If Wo=null the kernel has no output projection
+    // to perform; skip all Wo/residual logic.
+    // Uses named registers declared in prelude (%rd_wo_ptr, %p_wo_null).
+    ptx.push_str("    ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p_wo_null bra V2_CSHA_WO_SKIP_{};\n",
+        q_tile_iter
+    ));
+
+    // x_ptr null-check for residual add. If x_ptr=null, residual is skipped.
+    // Uses %rd52 which is already declared in the 64-register pool and reused
+    // here post-prologue (prologue is complete at this phase).
+    ptx.push_str("    ld.param.u64 %rd52, [csha_x_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p_x_null, %rd52, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p_x_null bra V2_CSHA_WO_SKIP_RESIDUAL_{};\n",
+        q_tile_iter
+    ));
+
+    // Wo loop dispatch point. In the separate-kernel path this label marks
+    // where a follow-up kernel call takes over.  The label is retained so
+    // downstream tests can verify orchestration ordering.
+    ptx.push_str(&format!("V2_CSHA_WO_LOOP_{}:\n", q_tile_iter));
+    ptx.push_str("    // Wo @ O and residual add delegated to follow-up kernel (spec R2)\n");
+
+    // Residual skip label (inline path not implemented; used by null-x guard).
+    ptx.push_str(&format!("V2_CSHA_WO_SKIP_RESIDUAL_{}:\n", q_tile_iter));
+
+    ptx.push_str(&format!("V2_CSHA_WO_SKIP_{}:\n", q_tile_iter));
+}
+
 /// Emit the §A.2.4 RoPE Q/K-rotation epilogue.
 ///
 /// # Placement (pre-attention, immediately after `emit_matmul_projection`)
@@ -700,6 +766,96 @@ mod tests {
     /// Verifies the fix that moved `emit_rope_epilogue` from post-KV-loop
     /// to immediately after `emit_matmul_projection`.  The canonical ordering
     /// is: projection → RoPE(Q,K) → Q-load → `QK^T` → softmax → `PV`.
+    fn base_cfg_for_a5() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                fused_output_proj: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        }
+    }
+
+    /// A5.1 — stub emits Wo null-check + x_ptr null-check + loop label +
+    /// skip labels, delegating the matrix multiply to a separate kernel.
+    #[test]
+    fn a5_emit_output_projection_stub_for_separate_kernel_path() {
+        let cfg = base_cfg_for_a5();
+        let mut ptx = String::new();
+        emit_output_projection(&mut ptx, &cfg, 0);
+
+        // Wo pointer load (null-check guard) — uses named %rd_wo_ptr register
+        assert!(
+            ptx.contains("ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];"),
+            "Wo pointer load missing"
+        );
+        // x_ptr load for residual null-check
+        assert!(
+            ptx.contains("[csha_x_ptr]"),
+            "x_ptr load for residual null-check missing"
+        );
+        // Wo sweep dispatch label (loop entry point for follow-up kernel)
+        assert!(ptx.contains("V2_CSHA_WO_LOOP_0:"), "Wo loop label missing");
+        // Residual skip label (for null x_ptr branch)
+        assert!(
+            ptx.contains("V2_CSHA_WO_SKIP_RESIDUAL_0:"),
+            "residual-skip label for null x_ptr missing"
+        );
+        // Overall Wo skip label (for null Wo ptr branch)
+        assert!(ptx.contains("V2_CSHA_WO_SKIP_0:"), "Wo overall skip label missing");
+        // Spec R2 note in emitted PTX
+        assert!(
+            ptx.contains("separate kernel") || ptx.contains("spec R2"),
+            "spec R2 / separate-kernel comment missing"
+        );
+    }
+
+    /// A5.1 — when fused_output_proj=false the function emits nothing but a comment.
+    #[test]
+    fn a5_emit_output_projection_skipped_when_fused_output_false() {
+        let mut cfg = base_cfg_for_a5();
+        cfg.csha = Some(CshaExtras {
+            fused_output_proj: false,
+            ..CshaExtras::default()
+        });
+
+        let mut ptx = String::new();
+        emit_output_projection(&mut ptx, &cfg, 0);
+        assert!(
+            ptx.contains("fused_output=false") || ptx.is_empty(),
+            "expected no-emit marker or empty string, got: {ptx}"
+        );
+        assert!(!ptx.contains("V2_CSHA_WO_LOOP"), "should not emit WO loop when disabled");
+    }
+
+    /// A5.1 — null x_ptr skip label exists (tested at stub level; runtime
+    /// null-path coverage lives in C3's dedicated integration test row).
+    #[test]
+    fn a5_null_x_ptr_skips_residual_add() {
+        let cfg = base_cfg_for_a5();
+        let mut ptx = String::new();
+        emit_output_projection(&mut ptx, &cfg, 0);
+        assert!(
+            ptx.contains("V2_CSHA_WO_SKIP_RESIDUAL_0"),
+            "null x_ptr skip-residual branch missing"
+        );
+        assert!(
+            ptx.contains("p_x_null"),
+            "x_ptr null predicate register missing"
+        );
+    }
+
     #[test]
     fn a4_rope_epilogue_placed_before_attention_body() {
         let cfg = base_cfg_for_rope_test();
