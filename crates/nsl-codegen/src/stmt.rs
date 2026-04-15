@@ -5056,6 +5056,12 @@ impl Compiler<'_> {
 
                     let pa_mpart =
                         self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+                    // FASE Codegen Phase 2: Phase A (two-phase-clip accumulation) runs
+                    // only when the global FASE plan is Deferred + grad_clip is set.
+                    // Per spec §2, per-layer FullBuffer overrides on this path are inert
+                    // (the path's existence already implies global Deferred). No mode-
+                    // table dispatch needed here.
+                    //
                     // When FASE hook is active, accumulation already happened
                     // during adjoint lowering — skip the grads_list read + accumulate.
                     if !fase_hook_active {
