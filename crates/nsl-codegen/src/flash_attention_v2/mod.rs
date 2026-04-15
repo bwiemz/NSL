@@ -100,8 +100,12 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             // RoPE epilogue.
             phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
 
-            // Tier C: save post-RoPE activations for backward (gated on flag).
-            phases::csha_hooks::emit_save_activations(&mut ptx, config, q_iter);
+            // Tier C: save post-RoPE Q and K only here — V SMEM tile aliases
+            // K during the S-pass (same `kv_offset`) and is only populated
+            // with real V values after the V pre-pass, so V save is deferred.
+            phases::csha_hooks::emit_save_activations_subset(
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
+            );
 
             // Q load (q_smem → registers).
             phases::q_load::emit(&mut ptx, config, q_iter);
@@ -130,6 +134,14 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             phases::csha_hooks::emit_v_prepass_sweep(&mut ptx, config, q_iter);
         }
         ptx.push_str("    bar.sync 0; // V tile complete; safe for all PV-accums\n");
+
+        // Tier C: V save runs AFTER the V pre-pass so v_smem_base actually
+        // holds V projection (during S-pass it aliased K).
+        for q_iter in 0..iters {
+            phases::csha_hooks::emit_save_activations_subset(
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::V,
+            );
+        }
 
         // PV-accum pass: restore softmax state + PV-accum + finalize per iter.
         ptx.push_str("    // CSHA PV-accum pass\n");
