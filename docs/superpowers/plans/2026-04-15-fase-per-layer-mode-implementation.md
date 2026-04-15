@@ -12,6 +12,10 @@
 
 **Branch:** `feat/fase-per-layer-refactor` (already created from synced `main` at `49c0dd9`).
 
+## Task 0 Outcome: C (Codegen dispatch deferred)
+
+The backward loop at `stmt.rs:4829-4876` is a runtime loop (param index `gai` via `nsl_list_get`) with a compile-time branch at line 4837 gating Deferred vs FullBuffer — all iterations take the same branch. Per-layer dispatch would require either a runtime lookup table keyed on param index, or loop unrolling at codegen — both substantial refactors beyond this plan's scope. The same pattern repeats at `stmt.rs:4903` (optimizer step). Task 7 ships outcome C: a TODO comment at `stmt.rs:3277` pointing to Phase 2 codegen work.
+
 ---
 
 ## File Inventory
