@@ -854,6 +854,7 @@ mod override_tests {
                     adapter_rank: *rank,
                     fase_fused: false,
                     packing_mode: 0,
+                    shard_factor: 0,
                 })
                 .collect(),
         }
