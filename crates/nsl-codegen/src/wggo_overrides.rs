@@ -44,6 +44,14 @@ pub enum OverrideRejectReason {
         optimizer: crate::fase::FaseOptimizer,
         global_mode: crate::fase::FaseMode,
     },
+    /// Two-phase-clip + mixed mode conflict. When `grad_clip` is set and
+    /// accumulation > 1 and global FASE plan is Deferred, Phase A's global
+    /// ||m_partial||² norm requires uniform accumulation convention across
+    /// params. WGGO requests of `fase_fused=false` for individual layers
+    /// are clamped back to Deferred to preserve the norm's validity.
+    TwoPhaseClipConflict {
+        grad_clip_threshold: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,6 +232,16 @@ mod tests {
         assert!(s.contains("FaseModeInfeasible"));
         assert!(s.contains("Lion"));
         assert!(s.contains("FullBuffer"));
+    }
+
+    #[test]
+    fn two_phase_clip_conflict_round_trips_debug() {
+        let r = OverrideRejectReason::TwoPhaseClipConflict {
+            grad_clip_threshold: 1.5,
+        };
+        let s = format!("{:?}", r);
+        assert!(s.contains("TwoPhaseClipConflict"));
+        assert!(s.contains("1.5"));
     }
 
     #[test]
