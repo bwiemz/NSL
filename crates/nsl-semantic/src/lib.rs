@@ -8,6 +8,7 @@ pub mod cpdt;
 pub mod context_parallel;
 pub mod determinism;
 pub mod effects;
+pub mod export;
 pub mod fp8;
 pub mod grammar;
 pub mod inspect;
@@ -103,6 +104,10 @@ pub fn analyze_with_imports(
     let wrga_configs = checker.wrga_configs;
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
+
+    // M62: Run `@export` decorator validation.  Pure-additive — appends
+    // diagnostics without touching other analysis state.
+    diagnostics.extend(crate::export::validate_exports(module, interner));
 
     // M38a: Run ownership analysis when --linear-types is active.
     // Runs after type checking so we have the TypeMap for tensor type detection.

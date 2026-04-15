@@ -259,6 +259,10 @@ pub struct FeatureConfigs {
     // ── Quantization & Precision (M35) ───────────────────────────────
     /// M35: Functions with @fp8_compute decorator
     pub fp8_compute_fns: HashSet<String>,
+    /// M62: Functions decorated with `@export` — collected during
+    /// declaration so the CLI can emit a matching C header after the
+    /// shared-lib build completes.
+    pub export_functions: Vec<crate::c_header::ExportInfo>,
     /// M35: Model quantization configs — "ModelName" -> QuantConfig
     pub quant_configs: HashMap<String, QuantConfig>,
 
@@ -314,6 +318,7 @@ impl FeatureConfigs {
             kv_compress_policies: HashMap::new(),
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
+            export_functions: Vec::new(),
             quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
             ownership_info: options.ownership_info.clone(),
@@ -1116,6 +1121,14 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {
+        // M62: publish @export functions to the CLI-owned output slot so
+        // `nsl build --shared-lib` can emit a matching C header without
+        // threading the list through every entry-point's return tuple.
+        if let Some(slot) = self.compile_options.export_functions_out.as_ref() {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(self.features.export_functions.clone());
+            }
+        }
         let product = self.module.finish();
         product
             .emit()

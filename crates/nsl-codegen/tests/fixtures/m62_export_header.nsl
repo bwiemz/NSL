@@ -1,0 +1,7 @@
+@export
+fn forward(x: Tensor<[B, 768], f32>) -> Tensor<[B, 1000], f32>:
+    return x
+
+@export(name="predict")
+fn inference_forward(x: Tensor<[B, 768], f32>) -> Tensor<[B, 10], f32>:
+    return x

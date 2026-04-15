@@ -49,15 +49,45 @@ impl Compiler<'_> {
             let raw_name = self.resolve_sym(fn_def.name).to_string();
             let cranelift_name = mangle_name(&self.module_prefix, &raw_name);
             let sig = self.build_fn_signature(fn_def);
+
+            // M62: @export override — if decorated, use Export linkage and an
+            // unmangled (or user-named) symbol so C consumers see a clean ABI.
+            let (is_export, override_name) = match decorators {
+                Some(decos) => extract_export_decorator(decos, self.interner),
+                None => (false, None),
+            };
+            let effective_linkage = if is_export {
+                Linkage::Export
+            } else {
+                linkage
+            };
+            let symbol_name = if is_export {
+                override_name.unwrap_or_else(|| raw_name.clone())
+            } else {
+                cranelift_name.clone()
+            };
+
             let func_id = self
                 .module
-                .declare_function(&cranelift_name, linkage, &sig)
+                .declare_function(&symbol_name, effective_linkage, &sig)
                 .map_err(|e| {
                     CodegenError::new(format!("failed to declare fn '{raw_name}': {e}"))
                 })?;
             self.registry
                 .functions
                 .insert(raw_name.clone(), (func_id, sig));
+
+            // M62: record ExportInfo for @export functions so the CLI can
+            // emit a matching C header after codegen finishes.
+            if is_export {
+                let info = crate::c_header::ExportInfo::from_fn_def(
+                    fn_def,
+                    &raw_name,
+                    &symbol_name,
+                    self.interner,
+                );
+                self.features.export_functions.push(info);
+            }
 
             // Track decorated functions
             if let Some(decos) = decorators {
@@ -783,5 +813,118 @@ impl Compiler<'_> {
         builder.ins().call(fin_ref, &[]);
 
         Ok(())
+    }
+}
+
+/// Extract `@export` info from a list of decorators. Returns
+/// `(is_export, Option<override_name>)`. `Interner` is passed by
+/// reference so this can be unit-tested without a full `Compiler`.
+fn extract_export_decorator(
+    decorators: &[nsl_ast::decl::Decorator],
+    interner: &nsl_lexer::Interner,
+) -> (bool, Option<String>) {
+    let mut is_export = false;
+    let mut override_name: Option<String> = None;
+
+    for d in decorators {
+        if d.name.len() != 1 {
+            continue;
+        }
+        let dname = interner.resolve(d.name[0].0).unwrap_or("");
+        if dname != "export" {
+            continue;
+        }
+        is_export = true;
+        if let Some(ref args) = d.args {
+            for arg in args {
+                if let Some(name_sym) = arg.name {
+                    let arg_name = interner.resolve(name_sym.0).unwrap_or("");
+                    if arg_name == "name" {
+                        if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                            override_name = Some(s.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (is_export, override_name)
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use string_interner::StringInterner;
+
+    fn decorator_no_args(
+        name: &str,
+        interner: &mut nsl_lexer::Interner,
+    ) -> nsl_ast::decl::Decorator {
+        let sym = nsl_ast::Symbol(interner.get_or_intern(name));
+        nsl_ast::decl::Decorator {
+            name: vec![sym],
+            args: None,
+            span: nsl_ast::Span::dummy(),
+        }
+    }
+
+    fn decorator_with_name_arg(
+        decorator_name: &str,
+        kwarg_name: &str,
+        kwarg_val: &str,
+        interner: &mut nsl_lexer::Interner,
+    ) -> nsl_ast::decl::Decorator {
+        let dname_sym = nsl_ast::Symbol(interner.get_or_intern(decorator_name));
+        let kname_sym = nsl_ast::Symbol(interner.get_or_intern(kwarg_name));
+        nsl_ast::decl::Decorator {
+            name: vec![dname_sym],
+            args: Some(vec![nsl_ast::expr::Arg {
+                name: Some(kname_sym),
+                value: nsl_ast::expr::Expr {
+                    kind: nsl_ast::expr::ExprKind::StringLiteral(kwarg_val.into()),
+                    span: nsl_ast::Span::dummy(),
+                    id: nsl_ast::NodeId::dummy(),
+                },
+                span: nsl_ast::Span::dummy(),
+            }]),
+            span: nsl_ast::Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn extract_export_from_decorators_no_decorator() {
+        let interner: nsl_lexer::Interner = StringInterner::new();
+        let decos: Vec<nsl_ast::decl::Decorator> = vec![];
+        let (is_export, override_name) = extract_export_decorator(&decos, &interner);
+        assert!(!is_export);
+        assert_eq!(override_name, None);
+    }
+
+    #[test]
+    fn extract_export_from_decorators_bare_export() {
+        let mut interner: nsl_lexer::Interner = StringInterner::new();
+        let decos = vec![decorator_no_args("export", &mut interner)];
+        let (is_export, override_name) = extract_export_decorator(&decos, &interner);
+        assert!(is_export);
+        assert_eq!(override_name, None);
+    }
+
+    #[test]
+    fn extract_export_from_decorators_with_name() {
+        let mut interner: nsl_lexer::Interner = StringInterner::new();
+        let decos = vec![decorator_with_name_arg("export", "name", "predict", &mut interner)];
+        let (is_export, override_name) = extract_export_decorator(&decos, &interner);
+        assert!(is_export);
+        assert_eq!(override_name, Some("predict".to_string()));
+    }
+
+    #[test]
+    fn extract_export_from_decorators_ignores_non_export() {
+        let mut interner: nsl_lexer::Interner = StringInterner::new();
+        let decos = vec![decorator_no_args("no_grad", &mut interner)];
+        let (is_export, override_name) = extract_export_decorator(&decos, &interner);
+        assert!(!is_export);
+        assert_eq!(override_name, None);
     }
 }

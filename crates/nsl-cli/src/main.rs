@@ -1175,6 +1175,7 @@ fn main_inner() {
                 cpdt_cluster: cpdt_cluster.clone(),
                 cpdt_report_requested: cpdt_report,
                 cpdt_plan_out: cpdt_plan_out.clone(),
+                export_functions_out: None,
                 calibration_data: calibration_data.clone(),
                 calibration_mode: Some(calibrate.clone()),
                 calibration_samples,
@@ -1469,6 +1470,7 @@ fn main_inner() {
                 cpdt_cluster: None,
                 cpdt_report_requested: false,
                 cpdt_plan_out: None,
+                export_functions_out: None,
                 calibration_data: None,
                 calibration_mode: Some("required".to_string()),
                 calibration_samples: 512,
@@ -2149,6 +2151,12 @@ fn run_build_shared_single(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // M62: allocate a slot the compiler publishes @export functions into,
+    // so we can emit the C header after the shared library is linked.
+    let exports_slot: std::sync::Arc<
+        std::sync::Mutex<Option<Vec<nsl_codegen::c_header::ExportInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    options.export_functions_out = Some(exports_slot.clone());
     let options = &options;
 
     // Codegen with PIC enabled (shared_lib=true in options)
@@ -2188,7 +2196,20 @@ fn run_build_shared_single(
         nsl_codegen::linker::default_shared_lib_path(file)
     };
 
-    match nsl_codegen::linker::link_shared(std::slice::from_ref(&obj_path), &lib_path) {
+    // M62 Task 6: collect @export symbol names so the linker can force them
+    // into the DLL export table (Linkage::Export alone isn't enough on MSVC).
+    let export_symbols: Vec<String> = exports_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
+        .unwrap_or_default();
+    let export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+
+    match nsl_codegen::linker::link_shared_with_exports(
+        std::slice::from_ref(&obj_path),
+        &lib_path,
+        &export_refs,
+    ) {
         Ok(()) => {
             let _ = std::fs::remove_file(&obj_path);
             println!("Built shared library {}", lib_path.display());
@@ -2197,6 +2218,35 @@ fn run_build_shared_single(
             eprintln!("link error: {e}");
             process::exit(1);
         }
+    }
+
+    emit_c_header_if_any(&exports_slot, &lib_path);
+}
+
+/// M62: Write a matching C header next to the shared library when the
+/// compile published one or more `@export` functions. No-op otherwise.
+fn emit_c_header_if_any(
+    exports_slot: &std::sync::Arc<
+        std::sync::Mutex<Option<Vec<nsl_codegen::c_header::ExportInfo>>>,
+    >,
+    lib_path: &std::path::Path,
+) {
+    let exports = match exports_slot.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(v) if !v.is_empty() => v.clone(),
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    let module_name = lib_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let header = nsl_codegen::c_header::emit(&exports, module_name);
+    let header_path = lib_path.with_extension("h");
+    match std::fs::write(&header_path, header) {
+        Ok(()) => println!("Wrote C header {}", header_path.display()),
+        Err(e) => eprintln!("warning: failed to write header '{}': {e}", header_path.display()),
     }
 }
 
@@ -2211,6 +2261,11 @@ fn run_build_shared_multi(
     let mut entry_wrga_plan: Option<nsl_codegen::wrga::WrgaPlan> = None;
     let mut source_map = SourceMap::new();
     let mut interner = Interner::new();
+    // M62: allocate a slot the entry-module compile publishes @export
+    // functions into, so we can emit a C header after linking.
+    let exports_slot: std::sync::Arc<
+        std::sync::Mutex<Option<Vec<nsl_codegen::c_header::ExportInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     let graph = match loader::load_all_modules(file, &mut source_map, &mut interner) {
         Ok(g) => g,
@@ -2338,6 +2393,7 @@ fn run_build_shared_multi(
             }
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
+            entry_options.export_functions_out = Some(exports_slot.clone());
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(
@@ -2399,7 +2455,15 @@ fn run_build_shared_multi(
         nsl_codegen::linker::default_shared_lib_path(file)
     };
 
-    match nsl_codegen::linker::link_shared(&obj_files, &lib_path) {
+    // M62 Task 6: propagate @export symbols to the linker on MSVC.
+    let export_symbols: Vec<String> = exports_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
+        .unwrap_or_default();
+    let export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+
+    match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
             for obj in &obj_files {
                 let _ = std::fs::remove_file(obj);
@@ -2411,6 +2475,8 @@ fn run_build_shared_multi(
             process::exit(1);
         }
     }
+
+    emit_c_header_if_any(&exports_slot, &lib_path);
 }
 
 /// M55: Build with --zk-circuit. Runs normal compilation and then invokes

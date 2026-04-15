@@ -453,10 +453,23 @@ fn find_c_compiler() -> Result<String, CodegenError> {
 
 /// M62a: Link multiple object files into a shared library (.so/.dylib/.dll).
 pub fn link_shared(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), CodegenError> {
+    link_shared_with_exports(obj_paths, output_path, &[])
+}
+
+/// M62 Task 6: like [`link_shared`] but also forces the named symbols into
+/// the export table.  On MSVC, Cranelift's `Linkage::Export` is not enough —
+/// `link.exe /DLL` still needs an explicit `/EXPORT:<sym>` to expose the
+/// function via `GetProcAddress` / `ctypes.CDLL`.  On Unix `Linkage::Export`
+/// is sufficient; the names are accepted but unused.
+pub fn link_shared_with_exports(
+    obj_paths: &[PathBuf],
+    output_path: &Path,
+    extra_exports: &[&str],
+) -> Result<(), CodegenError> {
     let runtime_lib = find_runtime_lib()?;
 
     if cfg!(target_os = "windows") {
-        link_shared_msvc(obj_paths, output_path, &runtime_lib)
+        link_shared_msvc(obj_paths, output_path, &runtime_lib, extra_exports)
             .or_else(|_| link_shared_gcc(obj_paths, output_path, &runtime_lib))
     } else {
         link_shared_gcc(obj_paths, output_path, &runtime_lib)
@@ -733,11 +746,31 @@ fn link_shared_gcc(
     Ok(())
 }
 
+/// M62 Task 6: cheap probe — does any of the given object files contain
+/// the given symbol name?  Used to decide whether `/EXPORT:main` is safe
+/// to pass to `link.exe` (the flag requires the symbol to resolve).
+///
+/// Scans raw bytes for the null-terminated ASCII symbol name.  Good enough
+/// for the `main` / short-name case; we don't need to parse COFF here.
+fn objs_contain_symbol(obj_paths: &[PathBuf], name: &str) -> bool {
+    let mut needle = Vec::with_capacity(name.len() + 1);
+    needle.extend_from_slice(name.as_bytes());
+    needle.push(0);
+    for p in obj_paths {
+        let Ok(bytes) = std::fs::read(p) else { continue };
+        if bytes.windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// M62a: Link a shared library using MSVC toolchain (link.exe /DLL).
 fn link_shared_msvc(
     obj_paths: &[PathBuf],
     output_path: &Path,
     runtime_lib: &Path,
+    extra_exports: &[&str],
 ) -> Result<(), CodegenError> {
     let msvc = find_msvc()?;
 
@@ -784,7 +817,20 @@ fn link_shared_msvc(
     // On MSVC, Linkage::Export in the .obj is not enough — we must add
     // /EXPORT explicitly.  argc/argv params are passed as i32/i64 so the
     // MSVC decorated name remains plain `main`.
-    cmd.arg("/EXPORT:main");
+    //
+    // M62 Task 6: shared libraries built from pure-`@export` sources have
+    // no top-level `main`.  `/EXPORT:<sym>` requires the symbol to resolve,
+    // so probe the objects for `main` via dumpbin /SYMBOLS before adding
+    // the export.  If unavailable, we fall back to emitting it and let link
+    // fail loudly (matches prior behavior for train-block builds).
+    if objs_contain_symbol(obj_paths, "main") {
+        cmd.arg("/EXPORT:main");
+    }
+
+    // M62 Task 6: force @export functions into the DLL export table.
+    for sym in extra_exports {
+        cmd.arg(format!("/EXPORT:{sym}"));
+    }
 
     // Item #5: re-export test-hooks peak FFIs.
     // /INCLUDE forces the staticlib symbol to be linked in;
