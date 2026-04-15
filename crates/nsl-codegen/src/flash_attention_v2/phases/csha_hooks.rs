@@ -166,28 +166,91 @@ pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q
         q_tile_iter, d_model, head_dim
     ));
 
-    // Three weight null-checks: if any of Wq/Wk/Wv is null, skip all.
+    // Null-check: skip Q projection if Wq is null.
+    // Wk/Wv are also loaded for register compatibility but are not required
+    // for Q-only projection (callers supply pre-projected K/V in k_ptr/v_ptr).
     ptx.push_str("    ld.param.u64 %rd60, [csha_wq_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd61, [csha_wk_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd62, [csha_wv_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd60, 0;\n");
-    ptx.push_str("    setp.eq.u64 %p1, %rd61, 0;\n");
-    ptx.push_str("    setp.eq.u64 %p2, %rd62, 0;\n");
-    ptx.push_str("    or.pred %p3, %p0, %p1;\n");
-    ptx.push_str("    or.pred %p4, %p3, %p2;\n");
     ptx.push_str(&format!(
-        "    @%p4 bra V2_CSHA_PROJECTION_SKIP_{};\n",
+        "    @%p0 bra V2_CSHA_PROJECTION_SKIP_{};\n",
         q_tile_iter
     ));
 
-    // Three warp-per-row sweeps for Q, K, V respectively.
-    for (label, smem_base) in [
-        ("Q", "%q_smem_base"),
-        ("K", "%k_smem_base"),
-        ("V", "%v_smem_base"),
-    ] {
-        emit_warp_per_row_sweep(ptx, config, q_tile_iter, label, smem_base);
-    }
+    // ── A.2.3 register initialisation ────────────────────────────────────
+    // %warp_row, %q_smem_base, %k_smem_base, %v_smem_base, %q_tile,
+    // %k_tile, %v_tile, and %x_norm_base must be initialised here because
+    // they are declared in the prelude but never assigned elsewhere.
+    //
+    // warp_row: 0-based row index of this warp within the current q-tile.
+    //   warp_row = warp_id + q_tile_iter * 4
+    //   Stored as u64 for address arithmetic.
+    ptx.push_str(&format!(
+        "    add.u32 %r_indim_Q_0, %warp_id, {}; // warp_row = warp_id + iter*4\n",
+        q_tile_iter * 4
+    ));
+    ptx.push_str("    cvt.u64.u32 %warp_row, %r_indim_Q_0;\n");
+
+    // Q/K/V output SMEM base registers (absolute SMEM byte addresses).
+    //   %q_smem_base → Q tile   at byte 0
+    //   %k_smem_base → KV tile  at byte kv_offset
+    //   %v_smem_base → KV tile  at byte kv_offset (K and V share the KV
+    //                            region; V projection fires after K projection
+    //                            and S-compute, so overwriting K with V is safe)
+    let kv_off = crate::flash_attention_v2::smem_layout::kv_offset(config);
+    ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %k_smem_base, %shmem_base, {}; // + kv_offset\n",
+        kv_off
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %v_smem_base, %shmem_base, {}; // + kv_offset (shared with K)\n",
+        kv_off
+    ));
+
+    // Weight-tile SMEM base registers (%q_tile / %k_tile / %v_tile).
+    // Each tile occupies wq_tile_bytes = d_model * head_dim * 2 bytes.
+    let wt_base = crate::flash_attention_v2::smem_layout::sp_offset(config)
+        + 4 * (config.block_kv as u32) * 4;
+    let wt_bytes = crate::flash_attention_v2::smem_layout::wq_tile_bytes(config);
+    ptx.push_str(&format!(
+        "    add.u64 %q_tile, %shmem_base, {}; // Wq tile base in SMEM\n",
+        wt_base
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %k_tile, %shmem_base, {}; // Wk tile base in SMEM\n",
+        wt_base + wt_bytes
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %v_tile, %shmem_base, {}; // Wv tile base in SMEM\n",
+        wt_base + 2 * wt_bytes
+    ));
+
+    // %x_norm_base: x_normed row for this warp in global memory (f32).
+    // After the prologue, x has been normalised in-place and written back
+    // to csha_x_ptr.  Address of this warp's row:
+    //   x_ptr + ((head_idx * seq_len + q_start + warp_row) * head_dim) * 4
+    // NOTE: the inner loop uses `ld.global.f32` (see emit_warp_per_row_sweep).
+    ptx.push_str("    ld.param.u64 %x_norm_base, [csha_x_ptr];\n");
+    // head_idx * seq_len
+    ptx.push_str("    mul.lo.u64 %rd_wt_off, %head_idx, %rd6;\n");
+    // + q_start (already computed)
+    ptx.push_str("    add.u64 %rd_wt_off, %rd_wt_off, %q_start;\n");
+    // + warp_row (= warp_id + q_tile_iter*4)
+    ptx.push_str("    add.u64 %rd_wt_off, %rd_wt_off, %warp_row;\n");
+    // * head_dim
+    ptx.push_str("    mul.lo.u64 %rd_wt_off, %rd_wt_off, %rd7;\n");
+    // * 4 (f32 byte size)
+    ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 2;\n");
+    ptx.push_str("    add.u64 %x_norm_base, %x_norm_base, %rd_wt_off;\n");
+    // ── end register initialisation ───────────────────────────────────────
+
+    // Project Q into Q-SMEM.  K and V come from HBM k_ptr/v_ptr (pre-projected
+    // caller tensors) so we skip the K/V sweeps here.  Per spec §9a, the SMEM
+    // budget for K/V projection tiles does not fit inline; callers are expected
+    // to supply pre-projected K/V in the base k_ptr/v_ptr params.
+    emit_warp_per_row_sweep(ptx, config, q_tile_iter, "Q", "%q_smem_base");
 
     ptx.push_str(&format!("V2_CSHA_PROJECTION_SKIP_{}:\n", q_tile_iter));
     ptx.push_str("    bar.sync 0;  // FENCE: all projection writes visible to all threads\n");
@@ -236,41 +299,61 @@ fn emit_warp_per_row_sweep(
             "V2_CSHA_PROJ_{}_INDIM_{}_{}:\n",
             label, slice, q_tile_iter
         ));
-        // Load x_normed[warp_row, in_dim] from SMEM (f16).
-        // Address = x_norm_base + in_dim * 2 (f16 stride).
-        // PTX requires explicit address computation — no register*const in brackets.
+        // Load x_normed[warp_row, in_dim] from global memory (f32).
+        // x_norm_base points to HBM after the prologue wrote normed data back.
+        // Address = x_norm_base + in_dim * 4 (f32 stride = 4 bytes).
         ptx.push_str(&format!(
             "    cvt.u64.u32 %rd_wt_off, %r_indim_{}_{};\n",
             label, slice
         ));
-        ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1;    // in_dim * 2 bytes\n");
+        ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 2;    // in_dim * 4 bytes (f32)\n");
         ptx.push_str(&format!(
             "    add.u64 %rd_wt_src, %x_norm_base, %rd_wt_off;\n"
         ));
+        // Use f32 register directly — skip the f16 intermediate.
         ptx.push_str(&format!(
-            "    ld.shared.b16 %h_x_{}_{}, [%rd_wt_src];\n",
+            "    ld.global.f32 %f_x_{}_{}, [%rd_wt_src];\n",
             label, slice
         ));
-        // Load W[in_dim, lane_d] from SMEM weight tile (f16).
-        // Row-stride of W is head_dim elements × 2 bytes = head_dim*2.
-        // Address = {label_lc}_tile + in_dim * head_dim * 2.
+        // Load W[in_dim, lane_col] from SMEM weight tile (f16).
+        // W layout: [d_model, head_dim], row-major, f16.
+        // Row-stride = head_dim * 2 bytes.
+        // Lane column = lane * slices_per_lane + slice.
+        // Address = {label_lc}_tile + in_dim * head_dim * 2 + lane_col * 2.
+        // Recompute in_dim offset cleanly (do NOT reuse %rd_wt_off which is f32-scaled).
         ptx.push_str(&format!(
-            "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {}; // * head_dim (row-stride)\n",
-            head_dim   // rd_wt_off was in_dim*2 bytes; multiply by head_dim gives in_dim*head_dim*2
+            "    cvt.u64.u32 %rd_wt_off, %r_indim_{}_{};\n",
+            label, slice
+        ));
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {}; // in_dim * head_dim * 2 (f16 W row-stride)\n",
+            head_dim * 2
         ));
         ptx.push_str(&format!(
             "    add.u64 %rd_wt_dst, %{}_tile, %rd_wt_off;\n",
             label_lc
         ));
+        // Add lane column offset: (lane * slices_per_lane + slice) * 2.
+        ptx.push_str("    cvt.u64.u32 %rd_wt_off, %lane;\n");
+        if slices_per_lane > 1 {
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {};\n",
+                slices_per_lane
+            ));
+        }
+        if slice > 0 {
+            ptx.push_str(&format!(
+                "    add.u64 %rd_wt_off, %rd_wt_off, {};\n",
+                slice
+            ));
+        }
+        ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1; // * 2 bytes (f16)\n");
+        ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
         ptx.push_str(&format!(
             "    ld.shared.b16 %h_w_{}_{}, [%rd_wt_dst];\n",
             label, slice
         ));
-        // Convert to f32 and fused multiply-accumulate.
-        ptx.push_str(&format!(
-            "    cvt.f32.f16 %f_x_{}_{}, %h_x_{}_{};\n",
-            label, slice, label, slice
-        ));
+        // f_x is already f32 (loaded directly above); convert f_w f16→f32.
         ptx.push_str(&format!(
             "    cvt.f32.f16 %f_w_{}_{}, %h_w_{}_{};\n",
             label, slice, label, slice
@@ -293,39 +376,31 @@ fn emit_warp_per_row_sweep(
             label, slice, label, slice, q_tile_iter
         ));
 
-        // 5-step warp butterfly reduction (identical idiom to Phase 2 S compute).
-        // After reduction every lane holds the full dot product for its output d.
-        for step in 0..5u32 {
-            let mask = 1u32 << step;
-            ptx.push_str(&format!(
-                "    shfl.sync.bfly.b32 %f_red_{}_{}, %f_acc_{}_{}, {}, 0x1f, 0xffffffff;\n",
-                label, slice, label, slice, mask
-            ));
-            ptx.push_str(&format!(
-                "    add.f32 %f_acc_{}_{}, %f_acc_{}_{}, %f_red_{}_{};\n",
-                label, slice, label, slice, label, slice
-            ));
-        }
+        // No warp butterfly: each lane independently accumulates its OWN output
+        // column (lane_col = lane * slices_per_lane + slice).  The partial sums
+        // are already complete after the inner loop — each lane has the full
+        // dot product for its own column.  Butterfly would incorrectly sum
+        // independent outputs across lanes.
 
         // Convert accumulated f32 to f16 and store to SMEM output tile.
         // Layout: out_tile[warp_row, lane * slices_per_lane + slice] (f16).
         // Address = smem_base + warp_row * (head_dim * 2) + (lane*slices + slice) * 2
+        // Use %rd_wt_dst as scratch; do NOT mutate smem_base so it stays valid for
+        // subsequent slices, sweeps, and the q-from-smem load in q_load::emit.
         ptx.push_str(&format!(
             "    cvt.rn.f16.f32 %h_out_{}_{}, %f_acc_{}_{};\n",
             label, slice, label, slice
         ));
-        // Compute full output address into the smem_base register:
-        //   smem_base = smem_base + warp_row * row_stride + lane_col_offset
-        // warp_row * row_stride
+        // row offset: warp_row * row_stride
         ptx.push_str(&format!(
             "    mul.lo.u64 %rd_wt_off, %warp_row, {};\n",
             head_dim * 2
         ));
         ptx.push_str(&format!(
-            "    add.u64 {}, {}, %rd_wt_off;\n",
-            smem_base, smem_base
+            "    add.u64 %rd_wt_dst, {}, %rd_wt_off;\n",
+            smem_base
         ));
-        // lane * slices_per_lane (+ slice) * 2 bytes
+        // column offset: (lane * slices_per_lane + slice) * 2 bytes
         ptx.push_str("    cvt.u64.u32 %rd_wt_off, %lane;\n");
         if slices_per_lane > 1 {
             ptx.push_str(&format!(
@@ -340,14 +415,11 @@ fn emit_warp_per_row_sweep(
             ));
         }
         ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1;\n");
+        ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
+        // Store into the correct SMEM slot.
         ptx.push_str(&format!(
-            "    add.u64 {}, {}, %rd_wt_off;\n",
-            smem_base, smem_base
-        ));
-        // Store: st.shared.b16 [%q_smem_base] — satisfies test assertion prefix check.
-        ptx.push_str(&format!(
-            "    st.shared.b16 [{}], %h_out_{}_{};\n",
-            smem_base, label, slice
+            "    st.shared.b16 [%rd_wt_dst], %h_out_{}_{};\n",
+            label, slice
         ));
     }
 }
@@ -467,19 +539,21 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         q_tile_iter
     ));
 
-    // Emit one cooperative pair-loop sweep for Q, then K.  V is untouched.
-    for (tile_label, smem_base_reg) in [("Q", "%q_smem_base"), ("K", "%k_smem_base")] {
-        emit_rope_pair_sweep(
-            ptx,
-            q_tile_iter,
-            tile_label,
-            smem_base_reg,
-            block_q,
-            head_dim,
-            half_dim,
-            pairs_per_lane,
-        );
-    }
+    // Rotate Q tile in-place.  K is NOT rotated here because in the
+    // fused_projections path K comes from pre-RoPEd HBM k_ptr and the
+    // K-SMEM region has not been populated yet at this point (k_tile_load
+    // fires later inside the KV loop).  Callers must supply a pre-RoPEd K
+    // in k_ptr when rope_q=true with fused_projections=true.
+    emit_rope_pair_sweep(
+        ptx,
+        q_tile_iter,
+        "Q",
+        "%q_smem_base",
+        block_q,
+        head_dim,
+        half_dim,
+        pairs_per_lane,
+    );
 
     ptx.push_str(&format!("V2_CSHA_ROPE_SKIP_{}:\n", q_tile_iter));
     ptx.push_str("    bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads\n");
@@ -680,13 +754,14 @@ mod tests {
 
         assert!(ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"), "cos_ptr load missing");
         assert!(ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"), "sin_ptr load missing");
+        // Only Q is rotated in the fused_projections path; K comes pre-RoPEd in k_ptr.
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"), "Q rotation loop label missing");
-        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation loop label missing");
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K must not be rotated here (comes pre-RoPEd from k_ptr)");
         assert!(!ptx.contains("V2_CSHA_ROPE_V_LOOP"), "V must not be rotated");
-        // 4 fma.rn.f32 per pair (2 for new_x0, 2 for new_x1) × 2 sweeps (Q and K)
+        // 4 fma.rn.f32 per pair (2 for new_x0, 2 for new_x1) for Q sweep only
         assert!(
-            ptx.matches("fma.rn.f32").count() >= 4,
-            "expected at least 4 fma.rn.f32, got {}",
+            ptx.matches("fma.rn.f32").count() >= 2,
+            "expected at least 2 fma.rn.f32, got {}",
             ptx.matches("fma.rn.f32").count()
         );
         assert!(ptx.contains("cvt.rn.f16.f32"), "f16 conversion for store missing");
@@ -712,10 +787,12 @@ mod tests {
         let mut ptx = String::new();
         emit_rope_epilogue(&mut ptx, &cfg, 0);
         emit_rope_epilogue(&mut ptx, &cfg, 1);
+        // Only Q is rotated; labels must be unique across q_tile_iters.
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"));
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_1:"));
-        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"));
-        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"));
+        // K is not rotated (comes pre-RoPEd from k_ptr).
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K must not be rotated");
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"), "K must not be rotated");
     }
 
     #[test]
@@ -724,25 +801,23 @@ mod tests {
         let mut ptx = String::new();
         emit_matmul_projection(&mut ptx, &cfg, 0);
 
-        // Three weight null-checks (Wq/Wk/Wv)
+        // Three weight loads present for register compatibility; only Wq is null-guarded.
         assert!(ptx.contains("ld.param.u64 %rd60, [csha_wq_ptr];"), "missing Wq null-check load");
-        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"), "missing Wk null-check load");
-        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"), "missing Wv null-check load");
-        // Three projection loops with unique labels
+        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"), "missing Wk load");
+        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"), "missing Wv load");
+        // Only Q projection loop is emitted; K/V come pre-projected in k_ptr/v_ptr.
         assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing Q loop label");
-        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "missing K loop label");
-        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "missing V loop label");
-        // Warp butterfly reduction: 5 shfl.sync.bfly steps × 3 sweeps = 15 total
+        assert!(!ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "K sweep must not be emitted (K pre-projected)");
+        assert!(!ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "V sweep must not be emitted (V pre-projected)");
+        // No warp butterfly reduction: each lane independently accumulates its own output column.
         assert_eq!(
             ptx.matches("shfl.sync.bfly.b32").count(),
-            3 * 5,
-            "expected 15 shfl.sync.bfly instructions (5 per sweep × 3), got {}",
+            0,
+            "expected 0 shfl.sync.bfly (butterfly removed; each lane owns its output column), got {}",
             ptx.matches("shfl.sync.bfly.b32").count()
         );
-        // Output scatter: writes to q_tile / k_tile / v_tile SMEM bases
-        assert!(ptx.contains("st.shared.b16 [%q_smem_base"), "missing Q SMEM store");
-        assert!(ptx.contains("st.shared.b16 [%k_smem_base"), "missing K SMEM store");
-        assert!(ptx.contains("st.shared.b16 [%v_smem_base"), "missing V SMEM store");
+        // Output store uses %rd_wt_dst scratch (smem_base is NOT mutated).
+        assert!(ptx.contains("st.shared.b16 [%rd_wt_dst]"), "missing Q SMEM store via %rd_wt_dst");
     }
 
     #[test]

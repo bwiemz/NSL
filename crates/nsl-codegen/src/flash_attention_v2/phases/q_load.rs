@@ -28,27 +28,24 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         q_tile_iter
     ));
 
+    // When CSHA fused_projections is active, Q has already been projected
+    // into Q-SMEM by emit_matmul_projection (and optionally RoPE-rotated
+    // by emit_rope_epilogue).  In this path we load Q from SMEM into the
+    // Q registers (%f{Q_BASE..}) so s_compute can proceed -- we do NOT
+    // reload from the HBM q_ptr, which would overwrite the projected Q.
+    let csha_fused_q = config
+        .csha
+        .as_ref()
+        .map_or(false, |c| c.fused_projections);
+
     // q_row_local = q_tile_iter * 4 + warp_id
-    // q_row_global = q_start + q_row_local
     ptx.push_str(&format!(
         "    add.u32 %r0, %warp_id, {};            // q_row_local = warp_id + q_tile_iter*4\n",
         q_tile_iter * 4
     ));
     ptx.push_str("    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64\n");
-    ptx.push_str("    add.u64 %rd21, %q_start, %rd20;          // q_row_global\n");
 
-    // Q-base global address: q_ptr + (batch*heads*seq_len*head_dim
-    //                                 + head_idx*seq_len*head_dim
-    //                                 + q_row_global*head_dim) * 4 bytes
-    ptx.push_str("    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads\n");
-    ptx.push_str("    add.u64 %rd22, %rd22, %head_idx;         // + head_idx\n");
-    ptx.push_str("    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len\n");
-    ptx.push_str("    add.u64 %rd22, %rd22, %rd21;              // + q_row_global\n");
-    ptx.push_str("    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim\n");
-    ptx.push_str("    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)\n");
-    ptx.push_str("    add.u64 %rd22, %rd0, %rd22;               // q_base global\n");
-
-    // Q-shmem row base for this warp.
+    // Q-shmem row base for this warp (used in both paths for storing/loading).
     ptx.push_str(&format!(
         "    mov.u64 %rd23, {};                    // q_offset\n",
         q_offset(config)
@@ -57,61 +54,96 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    mul.lo.u64 %rd24, %rd20, {};          // q_row_local * head_dim\n",
         head_dim
     ));
-    ptx.push_str("    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)\n");
-    ptx.push_str("    add.u64 %rd23, %rd23, %rd24;              // shmem row offset\n");
+    ptx.push_str("    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16)\n");
+    ptx.push_str("    add.u64 %rd23, %rd23, %rd24;              // shmem row base offset\n");
 
-    // When CSHA fused_projections is active, emit_rope_epilogue (called
-    // immediately after emit_matmul_projection in mod.rs) already rotates
-    // the Q/K SMEM tiles before this q_load path runs.  Skip the inline
-    // RoPE branch here to prevent double-rotation.
-    let csha_rope_active = config.rope_q
-        && config
-            .csha
-            .as_ref()
-            .map_or(false, |c| c.fused_projections);
+    if csha_fused_q {
+        // Fused-projection path: load Q from SMEM (already projected + RoPE-rotated).
+        // Q-SMEM tile starts at shmem_base + q_offset (offset 0 for v2).
+        // Layout: [block_q rows × head_dim f16].  This warp's row is at offset
+        //   (warp_id + q_tile_iter*4) * head_dim * 2.
+        // Lane l owns column l (for slices_per_lane=1, head_dim=32).
+        ptx.push_str("    // fused_projections: Q already in SMEM; load registers from SMEM\n");
+        for i in 0..slices {
+            ptx.push_str(&format!("    // slice {} from SMEM\n", i));
+            ptx.push_str("    cvt.u64.u32 %rd28, %lane;\n");
+            if i > 0 {
+                ptx.push_str(&format!("    add.u64 %rd28, %rd28, {};\n", i * 32));
+            }
+            // SMEM address = shmem_base + q_offset + warp_row * head_dim * 2 + lane * 2
+            ptx.push_str("    shl.b64 %rd29, %rd28, 1;  // d * 2 (f16)\n");
+            ptx.push_str("    add.u64 %smem_addr, %rd23, %rd29;\n");
+            ptx.push_str("    add.u64 %smem_addr, %smem_addr, %shmem_base;\n");
+            ptx.push_str("    ld.shared.b16 %h0, [%smem_addr];\n");
+            ptx.push_str(&format!(
+                "    cvt.f32.f16 %f{}, %h0;  // Q[warp_row, d] f16 to f32\n",
+                Q_BASE + i
+            ));
+        }
+    } else {
+        // Classic path: load Q from HBM q_ptr.
+        ptx.push_str("    add.u64 %rd21, %q_start, %rd20;          // q_row_global\n");
 
-    // Optional RoPE cos/sin bases (position-indexed by q_row_global).
-    // Only needed when the non-CSHA inline path will fire.
-    if config.rope_q && !csha_rope_active {
-        ptx.push_str("    // RoPE: cos/sin bases for q_row_global\n");
-        ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
-        ptx.push_str("    ld.param.u64 %rd26, [sin_ptr];\n");
-        ptx.push_str(&format!(
-            "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
-            head_dim
-        ));
-        ptx.push_str("    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes\n");
-        ptx.push_str("    add.u64 %rd25, %rd25, %rd27;              // cos row base\n");
-        ptx.push_str("    add.u64 %rd26, %rd26, %rd27;              // sin row base\n");
-    }
+        // Q-base global address: q_ptr + (batch*heads*seq_len*head_dim
+        //                                 + head_idx*seq_len*head_dim
+        //                                 + q_row_global*head_dim) * 4 bytes
+        ptx.push_str("    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads\n");
+        ptx.push_str("    add.u64 %rd22, %rd22, %head_idx;         // + head_idx\n");
+        ptx.push_str("    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len\n");
+        ptx.push_str("    add.u64 %rd22, %rd22, %rd21;              // + q_row_global\n");
+        ptx.push_str("    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim\n");
+        ptx.push_str("    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)\n");
+        ptx.push_str("    add.u64 %rd22, %rd0, %rd22;               // q_base global\n");
 
-    // Per-slice load + optional rotate + f16 shmem store.
-    for i in 0..slices {
-        ptx.push_str(&format!(
-            "    // slice {}: d = lane + 32*{} = lane + {}\n",
-            i, i, i * 32
-        ));
-        ptx.push_str("    cvt.u64.u32 %rd28, %lane;\n");
-        ptx.push_str(&format!("    add.u64 %rd28, %rd28, {};\n", i * 32));
-        ptx.push_str("    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32\n");
-        ptx.push_str("    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4\n");
-        ptx.push_str(&format!(
-            "    ld.global.f32 %f{}, [%rd29];\n",
-            Q_BASE + i
-        ));
+        // When CSHA fused_projections is active, emit_rope_epilogue (called
+        // immediately after emit_matmul_projection in mod.rs) already rotates
+        // the Q/K SMEM tiles before this q_load path runs.  Skip the inline
+        // RoPE branch here to prevent double-rotation.
+        let csha_rope_active = config.rope_q;
 
-        // Inline RoPE rotation: only when rope_q=true AND CSHA has not
-        // already rotated Q via emit_rope_epilogue (prevents double-rotation).
+        // Optional RoPE cos/sin bases (position-indexed by q_row_global).
+        // Only needed when the non-CSHA inline path will fire.
         if config.rope_q && !csha_rope_active {
-            emit_rope_rotation_inline(ptx, Q_BASE + i, i, config.rope_style);
+            ptx.push_str("    // RoPE: cos/sin bases for q_row_global\n");
+            ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
+            ptx.push_str("    ld.param.u64 %rd26, [sin_ptr];\n");
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
+                head_dim
+            ));
+            ptx.push_str("    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes\n");
+            ptx.push_str("    add.u64 %rd25, %rd25, %rd27;              // cos row base\n");
+            ptx.push_str("    add.u64 %rd26, %rd26, %rd27;              // sin row base\n");
         }
 
-        // Store into shmem as f16.
-        ptx.push_str(&format!("    cvt.rn.f16.f32 %h0, %f{};\n", Q_BASE + i));
-        ptx.push_str("    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)\n");
-        ptx.push_str("    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest\n");
-        ptx.push_str("    add.u64 %smem_addr, %smem_addr, %shmem_base;\n");
-        ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
+        // Per-slice load + optional rotate + f16 shmem store.
+        for i in 0..slices {
+            ptx.push_str(&format!(
+                "    // slice {}: d = lane + 32*{} = lane + {}\n",
+                i, i, i * 32
+            ));
+            ptx.push_str("    cvt.u64.u32 %rd28, %lane;\n");
+            ptx.push_str(&format!("    add.u64 %rd28, %rd28, {};\n", i * 32));
+            ptx.push_str("    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32\n");
+            ptx.push_str("    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4\n");
+            ptx.push_str(&format!(
+                "    ld.global.f32 %f{}, [%rd29];\n",
+                Q_BASE + i
+            ));
+
+            // Inline RoPE rotation: only when rope_q=true AND CSHA has not
+            // already rotated Q via emit_rope_epilogue (prevents double-rotation).
+            if config.rope_q && !csha_rope_active {
+                emit_rope_rotation_inline(ptx, Q_BASE + i, i, config.rope_style);
+            }
+
+            // Store into shmem as f16.
+            ptx.push_str(&format!("    cvt.rn.f16.f32 %h0, %f{};\n", Q_BASE + i));
+            ptx.push_str("    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)\n");
+            ptx.push_str("    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest\n");
+            ptx.push_str("    add.u64 %smem_addr, %smem_addr, %shmem_base;\n");
+            ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
+        }
     }
 
     ptx.push_str("    bar.sync 0;  // FENCE: all warps finish Q shmem store\n");
