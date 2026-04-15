@@ -90,9 +90,11 @@ pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
 
 /// Total SMEM bytes: Q tile + KV tile + S/P rows (4 warps × block_kv × 4 bytes, f32).
 /// When `csha.fused_projections`, also includes Wq/Wk/Wv weight tile slots.
+/// When `csha.fused_output_proj`, also includes Wo tile + x_residual input slot.
 pub fn total_bytes(config: &FlashAttentionConfig) -> u32 {
     let base = sp_offset(config) + 4 * (config.block_kv as u32) * 4;
     base + wq_tile_bytes(config) + wk_tile_bytes(config) + wv_tile_bytes(config)
+        + wo_tile_bytes(config) + x_residual_bytes(config)
 }
 
 /// Wq weight tile bytes when `csha.fused_projections` is set: `d_model × head_dim × 2` (f16).
@@ -116,6 +118,28 @@ pub fn wv_tile_bytes(config: &FlashAttentionConfig) -> u32 {
     wq_tile_bytes(config)
 }
 
+/// Wo output projection tile bytes when `csha.fused_output_proj` is set:
+/// `head_dim * d_model * 2` (f16). Returns 0 when not enabled or `d_model == 0`.
+pub fn wo_tile_bytes(config: &FlashAttentionConfig) -> u32 {
+    if config.csha.as_ref().map_or(false, |c| c.fused_output_proj) {
+        let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
+        2 * (config.head_dim as u32) * d_model
+    } else {
+        0
+    }
+}
+
+/// Residual input tile bytes when `csha.fused_output_proj` is set:
+/// `block_q * d_model * 2` (f16). Returns 0 when not enabled or `d_model == 0`.
+pub fn x_residual_bytes(config: &FlashAttentionConfig) -> u32 {
+    if config.csha.as_ref().map_or(false, |c| c.fused_output_proj) {
+        let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
+        2 * (config.block_q as u32) * d_model
+    } else {
+        0
+    }
+}
+
 /// SmemLayout captures all per-config SMEM region sizes.
 #[derive(Debug)]
 pub struct SmemLayout {
@@ -125,17 +149,21 @@ pub struct SmemLayout {
     pub wq_tile_bytes: usize,
     pub wk_tile_bytes: usize,
     pub wv_tile_bytes: usize,
+    pub wo_tile_bytes: usize,
+    pub x_residual_bytes: usize,
     pub total_bytes: usize,
 }
 
 /// Compute the full SMEM layout for a given config.
 pub fn compute_layout(config: &FlashAttentionConfig) -> SmemLayout {
-    let q_bytes   = (config.block_q  * config.head_dim * 2) as usize;
-    let kv_bytes  = (config.block_kv * config.head_dim * 2) as usize;
-    let sp_bytes  = (4 * config.block_kv as u32 * 4) as usize;
-    let wq_bytes  = wq_tile_bytes(config) as usize;
-    let wk_bytes  = wk_tile_bytes(config) as usize;
-    let wv_bytes  = wv_tile_bytes(config) as usize;
+    let q_bytes      = (config.block_q  * config.head_dim * 2) as usize;
+    let kv_bytes     = (config.block_kv * config.head_dim * 2) as usize;
+    let sp_bytes     = (4 * config.block_kv as u32 * 4) as usize;
+    let wq_bytes     = wq_tile_bytes(config) as usize;
+    let wk_bytes     = wk_tile_bytes(config) as usize;
+    let wv_bytes     = wv_tile_bytes(config) as usize;
+    let wo_bytes     = wo_tile_bytes(config) as usize;
+    let xres_bytes   = x_residual_bytes(config) as usize;
     SmemLayout {
         q_tile_bytes: q_bytes,
         kv_tile_bytes: kv_bytes,
@@ -143,7 +171,10 @@ pub fn compute_layout(config: &FlashAttentionConfig) -> SmemLayout {
         wq_tile_bytes: wq_bytes,
         wk_tile_bytes: wk_bytes,
         wv_tile_bytes: wv_bytes,
-        total_bytes: q_bytes + kv_bytes + sp_bytes + wq_bytes + wk_bytes + wv_bytes,
+        wo_tile_bytes: wo_bytes,
+        x_residual_bytes: xres_bytes,
+        total_bytes: q_bytes + kv_bytes + sp_bytes + wq_bytes + wk_bytes + wv_bytes
+            + wo_bytes + xres_bytes,
     }
 }
 
@@ -166,6 +197,24 @@ mod tests {
             gpu_sm: 75,
             csha: None,
         }
+    }
+
+    #[test]
+    fn a5_wo_fits_in_smem_for_worst_case_matrix_config() {
+        let mut cfg = base_cfg();
+        cfg.block_q = 64; cfg.block_kv = 64; cfg.head_dim = 64;
+        cfg.rope_q = true; cfg.causal = true;
+        cfg.csha = Some(CshaExtras {
+            fused_projections: true,
+            fused_output_proj: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        });
+        let layout = compute_layout(&cfg);
+        assert!(
+            layout.total_bytes <= 48 * 1024,
+            "worst-case matrix config exceeds 48 KB SMEM: {} bytes", layout.total_bytes
+        );
     }
 
     #[test]
