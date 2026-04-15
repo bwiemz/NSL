@@ -354,21 +354,20 @@ fn emit_warp_per_row_sweep(
 
 /// Emit the §A.2.4 RoPE Q/K-rotation epilogue.
 ///
-/// # Placement note (post-attention, non-standard)
+/// # Placement (pre-attention, immediately after `emit_matmul_projection`)
 ///
-/// Despite being called "epilogue", this hook fires **after** the entire
-/// KV-loop (S-compute → softmax → PV-accumulate) completes — i.e. it
-/// operates on the post-attention SMEM Q and K tiles, NOT the pre-attention
-/// input queries/keys.  Standard RoPE is applied pre-attention; this
-/// placement is a CSHA-specific fusion where the rotation is deliberately
-/// deferred to avoid materialising rotated Q/K to HBM between a preceding
-/// norm/projection kernel and this attention kernel.  The cos/sin tables
-/// are still position-indexed by the query row so the rotation values are
-/// identical to what a standard pre-attention RoPE would have used.
+/// This hook fires **immediately after `emit_matmul_projection`** and
+/// **before** the Q-load / S-compute / softmax / PV-accumulate body.
+/// `emit_matmul_projection` writes projected Q/K/V fragments into SMEM
+/// tiles; this hook then rotates the Q and K tiles in-place so that the
+/// subsequent `QK^T` computation (in `s_compute`) consumes already-rotated
+/// queries and keys — exactly matching standard pre-attention RoPE semantics
+/// (`RoPE(Q); RoPE(K); S = Q @ K^T / sqrt(d); softmax; O = P @ V`).
 ///
-/// If this is ever re-evaluated and pre-attention placement is preferred,
-/// move the `emit_rope_epilogue` call in `mod.rs` to immediately after
-/// `emit_matmul_projection` and before `emit_q_load`.
+/// This mirrors v1's equivalent: `emit_csha_rope_epilogue` in
+/// `flash_attention.rs` is called after `emit_csha_matmul_projection` and
+/// before `emit_q_tile_load`.  The v2 orchestrator (`mod.rs`) follows the
+/// same ordering.
 ///
 /// Null-guarded on `cos_ptr` AND `sin_ptr` — if either is zero the entire
 /// rotation body is skipped.  Only emits when `rope_q=true` AND
@@ -693,5 +692,36 @@ mod tests {
         assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_1:"), "missing iter-1 Q label");
         // No unsuffixed labels
         assert!(!ptx.contains("V2_CSHA_PROJ_Q_LOOP:"), "found unsuffixed Q label");
+    }
+
+    /// Regression test: RoPE epilogue must appear BEFORE the attention body
+    /// (S-compute / softmax / PV-accum) in the synthesized PTX.
+    ///
+    /// Verifies the fix that moved `emit_rope_epilogue` from post-KV-loop
+    /// to immediately after `emit_matmul_projection`.  The canonical ordering
+    /// is: projection → RoPE(Q,K) → Q-load → `QK^T` → softmax → `PV`.
+    #[test]
+    fn a4_rope_epilogue_placed_before_attention_body() {
+        let cfg = base_cfg_for_rope_test();
+        let ptx_bytes =
+            crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg);
+        // synthesize returns a NUL-terminated byte vec; drop the trailing NUL.
+        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len().saturating_sub(1)])
+            .expect("PTX should be valid UTF-8");
+
+        let rope_q_idx = ptx
+            .find("V2_CSHA_ROPE_Q_LOOP_")
+            .expect("ROPE_Q label missing — emit_rope_epilogue did not fire");
+        // V2_LOOP_S_OVER_K_{iter} is emitted by s_compute::emit, which is the
+        // first phase that consumes Q and K for QK^T.  RoPE must precede it.
+        let attn_body_idx = ptx
+            .find("V2_LOOP_S_OVER_K_")
+            .expect("S-compute loop label missing — s_compute did not fire");
+
+        assert!(
+            rope_q_idx < attn_body_idx,
+            "RoPE must run pre-attention (before QK^T / S-compute); \
+             found ROPE_Q @ byte {rope_q_idx} but S-compute @ byte {attn_body_idx}"
+        );
     }
 }

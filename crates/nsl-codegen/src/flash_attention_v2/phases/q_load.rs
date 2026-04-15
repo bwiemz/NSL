@@ -60,8 +60,19 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16 dest)\n");
     ptx.push_str("    add.u64 %rd23, %rd23, %rd24;              // shmem row offset\n");
 
+    // When CSHA fused_projections is active, emit_rope_epilogue (called
+    // immediately after emit_matmul_projection in mod.rs) already rotates
+    // the Q/K SMEM tiles before this q_load path runs.  Skip the inline
+    // RoPE branch here to prevent double-rotation.
+    let csha_rope_active = config.rope_q
+        && config
+            .csha
+            .as_ref()
+            .map_or(false, |c| c.fused_projections);
+
     // Optional RoPE cos/sin bases (position-indexed by q_row_global).
-    if config.rope_q {
+    // Only needed when the non-CSHA inline path will fire.
+    if config.rope_q && !csha_rope_active {
         ptx.push_str("    // RoPE: cos/sin bases for q_row_global\n");
         ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
         ptx.push_str("    ld.param.u64 %rd26, [sin_ptr];\n");
@@ -89,7 +100,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
             Q_BASE + i
         ));
 
-        if config.rope_q {
+        // Inline RoPE rotation: only when rope_q=true AND CSHA has not
+        // already rotated Q via emit_rope_epilogue (prevents double-rotation).
+        if config.rope_q && !csha_rope_active {
             emit_rope_rotation_inline(ptx, Q_BASE + i, i, config.rope_style);
         }
 

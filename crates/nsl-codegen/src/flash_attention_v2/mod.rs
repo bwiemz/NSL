@@ -68,6 +68,13 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
 
         phases::csha_hooks::emit_matmul_projection(&mut ptx, config, q_iter);
 
+        // CSHA A.2.4 RoPE epilogue: runs immediately after projection so
+        // Q/K SMEM tiles are rotated BEFORE Q-load / S-compute consume them
+        // for QK^T.  Mirrors v1's emit_csha_rope_epilogue placement (after
+        // emit_csha_matmul_projection, before emit_q_tile_load).
+        // No-op when csha=None or rope_q=false.
+        phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
+
         // Phase 1: Q load.
         phases::q_load::emit(&mut ptx, config, q_iter);
 
@@ -88,9 +95,6 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
         ));
         ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
         ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_START_{};\n", q_iter));
-
-        // CSHA A.2.4 RoPE epilogue (no-op when csha=None or rope_q=false).
-        phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
 
         // Phase 6: finalize + output store + LSE.
         phases::finalize::emit(&mut ptx, config, q_iter);
