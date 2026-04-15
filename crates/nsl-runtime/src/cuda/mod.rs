@@ -23,7 +23,12 @@ pub(crate) mod inner {
         device: CUdevice,
         #[allow(dead_code)]
         context: CUcontext,
-        module_cache: HashMap<usize, CUmodule>,
+        // Keyed by FNV-1a hash of PTX content so different PTX Vecs at the
+        // same address (heap reuse between sequential test calls) don't
+        // produce stale cache hits.  Raw pointer was used previously but
+        // caused CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was
+        // allocated at the same address as an old one.
+        module_cache: HashMap<u64, CUmodule>,
     }
 
     // SAFETY: CUcontext/CUmodule are opaque pointers managed by the CUDA driver.
@@ -736,8 +741,24 @@ pub(crate) mod inner {
             let mut guard = state.lock().unwrap();
             unsafe { cuCtxSetCurrent(guard.context); }
 
-            // Cache modules by PTX pointer address (stable .rodata addresses)
-            let cache_key = ptx_ptr as usize;
+            // Cache modules by FNV-1a hash of PTX content.
+            // Using pointer address as key (the old approach) caused
+            // CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was allocated
+            // at the same heap address as a previously-freed one — the cache
+            // returned the stale old module and the new kernel name was not found.
+            let cache_key = {
+                // Compute length by scanning for the NUL terminator.
+                let mut len = 0usize;
+                while unsafe { *ptx_ptr.add(len) } != 0 { len += 1; }
+                let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
+                // FNV-1a 64-bit hash (no external dep, no alloc).
+                let mut h: u64 = 14695981039346656037u64;
+                for &b in ptx_bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211u64);
+                }
+                h
+            };
             let module = if let Some(m) = guard.module_cache.get(&cache_key) {
                 *m
             } else {

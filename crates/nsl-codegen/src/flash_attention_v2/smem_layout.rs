@@ -57,6 +57,20 @@ pub fn validate_scalar_v2_config(config: &FlashAttentionConfig) -> Result<(), Co
         )));
     }
 
+    // Fused-projection constraint: the K pre-pass writes exactly `block_q`
+    // K rows (4 warps × ceil(block_q/4) iters = block_q rows).  The K tile
+    // in SMEM holds `block_kv` rows.  block_q ≠ block_kv causes either an
+    // under-fill (garbage S-compute) or a SMEM out-of-bounds write.
+    if config.csha.as_ref().map_or(false, |c| c.fused_projections)
+        && config.block_q != config.block_kv
+    {
+        return Err(ConfigError(format!(
+            "fused_projections requires block_q == block_kv (got block_q={}, block_kv={}); \
+             the K pre-pass writes exactly block_q rows into the block_kv-row K tile",
+            config.block_q, config.block_kv
+        )));
+    }
+
     // Derive region sizes from the layout helpers so the validator and
     // emitter stay in sync automatically if f16/f32 storage decisions
     // ever shift.
