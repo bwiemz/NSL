@@ -1,0 +1,17 @@
+# tiny_transformer.nsl — fixture for `nsl profile` snapshot test.
+# A toy attention-shaped forward pass with three matmuls so the
+# profile walker produces a non-empty, stable ops list.
+
+fn forward(
+    x: Tensor<[1, 2048, 512], bf16>,
+    wq: Tensor<[512, 512], bf16>,
+    wk: Tensor<[512, 512], bf16>,
+    wv: Tensor<[512, 512], bf16>,
+    wo: Tensor<[512, 512], bf16>,
+) -> Tensor<[1, 2048, 512], bf16>:
+    let q = x @ wq
+    let k = x @ wk
+    let v = x @ wv
+    let a = q @ wo
+    let o = a @ wo
+    return o

@@ -1,10 +1,12 @@
 pub mod autotune;
 pub mod builtins;
+pub mod calibration;
 pub mod compiler;
 pub mod context;
 pub mod context_parallel;
 pub mod cost_model;
 pub mod deterministic_kernels;
+pub mod profiling;
 pub mod grammar_compiler;
 pub mod schema_convert;
 pub mod stdlib_loader;
@@ -55,6 +57,7 @@ pub mod fusion_graph;
 pub mod fusion_report;
 pub mod gpu_specs;
 pub mod gpu_target;
+pub mod inspect;
 pub mod kernel;
 pub mod kernel_ir;
 pub mod kernel_lower;
@@ -94,12 +97,17 @@ pub mod wggo_apply;
 pub mod wggo_conflicts;
 pub mod wggo_cost;
 pub mod wggo_dp;
+pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wggo_schedule;
 pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
+pub mod wggo_overrides;
+pub use wggo_overrides::{
+    OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
+};
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;
@@ -113,6 +121,9 @@ pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers;
 
 pub use compiler::{
     compile, compile_entry, compile_module, compile_module_with_imports,
@@ -353,6 +364,20 @@ pub enum AdapterKind {
     GatedLora,
 }
 
+/// User-facing knob that gates how WGGO scores head importance.
+/// - `Auto`: use gradient scoring when a calibration sidecar is present
+///   (with per-layer magnitude fallback); otherwise pure magnitude.
+/// - `Magnitude`: force pure magnitude scoring even if calibration is available.
+/// - `Grad`: require gradient scoring; error if no calibration sidecar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WggoImportance {
+    #[default]
+    Auto,
+    Magnitude,
+    Grad,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -434,24 +459,55 @@ pub struct CompileOptions {
     pub wggo_mode: Option<String>,
     /// WGGO: print the global-optimization report to stderr.
     pub wggo_report: bool,
-    /// WGGO Stage 3: path to a `.nslweights` sidecar file for real
-    /// weight-based importance scoring.  When `None`, the analyzer
-    /// falls back to uniform per-head scores.
+    /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
+    pub profile_kernels: bool,
+    /// Dev Tools Phase 2: target GPU name for the profile walker.
+    pub target_gpu: String,
+    /// Dev Tools Phase 2: tensor dtype assumed by the profile walker.
+    pub dtype: String,
+    /// Dev Tools Phase 2, Task 6: manifest output path.
+    pub manifest_output_path: Option<std::path::PathBuf>,
+    /// Dev Tools Phase 2, Task 6: source text for span line numbers.
+    pub profile_source_text: Option<String>,
+    /// Dev Tools Phase 2, Task 6: source file name for manifest spans.
+    pub profile_source_file_name: Option<String>,
+    /// Dev Tools Phase 4, Task 4: enable per-step health hook emission.
+    pub health_monitor: bool,
+    /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter.
+    pub health_flush_interval: Option<u64>,
+    /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
+    pub inspect_enabled: bool,
+    /// WGGO Stage 3: path to a `.nslweights` sidecar file.
     pub wggo_weights: Option<std::path::PathBuf>,
-    /// WGGO Stage 3: scoring mode ("none", "magnitude").  "grad" is
-    /// reserved for Phase 2 (blocked on a compile-time execution
-    /// harness).  Default "magnitude" when weights are supplied,
-    /// otherwise "none".
-    pub wggo_importance: Option<String>,
-    /// WGGO Stage 3: default fraction of heads the auto-derived
-    /// `min_retained_importance` threshold allows to be pruned.
-    /// Clamped to `[0.0, 0.9]`.  Default 0.25.
+    /// WGGO Stage 3: scoring mode (Auto/Magnitude/Grad).
+    pub wggo_importance: WggoImportance,
+    /// WGGO Stage 3: default fraction of heads allowed to be pruned.
     pub wggo_prune_fraction: Option<f64>,
-    /// CSHA: fusion mode ("auto", "boundary", "pipeline", "block", "off").
-    /// When `None`, CSHA is not run.  See `crates/nsl-codegen/src/csha.rs`.
+    /// CSHA: fusion mode.
     pub csha_mode: Option<String>,
-    /// CSHA: print the attention-fusion report to stderr.
+    /// CSHA: print the attention-fusion report.
     pub csha_report: bool,
+    /// Path to calibration dataset.
+    pub calibration_data: Option<std::path::PathBuf>,
+    /// Failure-handling mode: `"required"` or `"best-effort"`.
+    pub calibration_mode: Option<String>,
+    pub calibration_samples: u32,
+    pub calibration_batch_size: u32,
+    pub calibration_timeout_secs: u64,
+    /// Populated by the harness after a successful calibration run.
+    /// Downstream passes (AWQ quantizer, future hooks' consumers) read
+    /// their sidecar key from here.  `None` when calibration didn't
+    /// run or produced no usable output.
+    pub calibration_sidecar: Option<crate::calibration::sidecar::Sidecar>,
+    /// When `Some`, codegen runs the retention pass on `model_forward`, splicing
+    /// memcpys of input activations before matched linear sites. `None` = shipped
+    /// binary, zero IR impact.
+    pub calibration_retention: Option<Vec<crate::calibration::DiscoveredProjection>>,
+    /// Batch count and sequence length read from the calibration-data header
+    /// (`peek_batch_seq`).  Must be set whenever `calibration_retention` is
+    /// `Some`.  Callers that exercise retention in tests without real calib
+    /// data fall back to (8, 4) when this is `None`.
+    pub calibration_batch_seq: Option<(u32, u32)>,
 }
 
 impl Default for CompileOptions {
@@ -496,11 +552,205 @@ impl Default for CompileOptions {
             wrga_fold_allocations: false,
             wggo_mode: None,
             wggo_report: false,
+            profile_kernels: false,
+            target_gpu: "h100".to_string(),
+            dtype: "bf16".to_string(),
+            manifest_output_path: None,
+            profile_source_text: None,
+            profile_source_file_name: None,
+            health_monitor: false,
+            health_flush_interval: None,
+            inspect_enabled: false,
             wggo_weights: None,
-            wggo_importance: None,
+            wggo_importance: WggoImportance::Auto,
             wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
+            calibration_data: None,
+            calibration_mode: Some("required".to_string()),
+            calibration_samples: 512,
+            calibration_batch_size: 8,
+            calibration_timeout_secs: 600,
+            calibration_sidecar: None,
+            calibration_retention: None,
+            calibration_batch_seq: None,
         }
+    }
+}
+
+/// Compile an NSL source file, run the AWQ calibration harness, and return
+/// the resulting `Sidecar`.
+///
+/// This is a convenience wrapper that:
+/// 1. Reads the calibration-data header to obtain `(batch, seq)`.
+/// 2. Sets up `CompileOptions` with `calibration_data`, `weight_file`,
+///    `calibration_batch_seq`, and `calibration_mode = "required"`.
+/// 3. Lexes, parses, and semantically analyses the source.
+/// 4. Constructs a `Compiler` directly and runs all passes, which triggers
+///    `discover_awq_projections` and `run_harness_production` as side effects
+///    inside `compile_train_block` (the calibration harness fires when a
+///    `train` block is compiled and `calibration_data` is set).
+/// 5. Reads back `compiler.compile_options.calibration_sidecar` and returns it.
+///
+/// The NSL source must contain a `train` block for the calibration harness
+/// to fire; models decorated with `@quantize(dtype="awq4")` and using `|>`
+/// pipe syntax in `forward` will have their projections discovered automatically.
+pub fn compile_and_calibrate(
+    source_path: &std::path::Path,
+    data_path: &std::path::Path,
+    weights_path: &std::path::Path,
+) -> Result<crate::calibration::sidecar::Sidecar, CodegenError> {
+    let source = std::fs::read_to_string(source_path).map_err(|e| {
+        CodegenError::new(format!("reading source {}: {e}", source_path.display()))
+    })?;
+
+    // Step 1: peek at the calibration data to get (batch, seq).
+    let (batch, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
+        .map_err(|e| CodegenError::new(format!("reading calibration data header: {e}")))?;
+
+    // Step 2: lex, parse, and semantically analyse.
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "lex errors in {}: {:?}",
+            source_path.display(),
+            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "parse errors in {}: {:?}",
+            source_path.display(),
+            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    if analysis.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "semantic errors in {}: {:?}",
+            source_path.display(),
+            analysis.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+
+    // Step 3: assemble options.
+    let mut opts = CompileOptions::default();
+    opts.calibration_data = Some(data_path.to_path_buf());
+    opts.weight_file = Some(weights_path.to_path_buf());
+    opts.calibration_batch_seq = Some((batch, seq));
+    opts.calibration_mode = Some("required".to_string());
+
+    // Step 4: Run stdlib imports for any train block references.
+    let imported_fns = crate::stdlib_loader::build_imported_fns_for_entry(
+        &parsed.module,
+        &mut interner,
+        &analysis.type_map,
+        &opts,
+    )?;
+
+    // Step 5: construct the Compiler directly so we can read back
+    // `compiler.compile_options.calibration_sidecar` after all passes run.
+    // (This is Blocker A's fix: compile_module takes &CompileOptions so the
+    // sidecar written into the Compiler's internal copy cannot be recovered
+    // via the public API.  Driving Compiler directly avoids this limitation.)
+    let mut compiler = crate::compiler::Compiler::new(&interner, &analysis.type_map, &opts)?;
+
+    let pre_finalize = (|| -> Result<(), CodegenError> {
+        compiler.intern_string("")?;
+        compiler.collect_strings(&parsed.module.stmts)?;
+        compiler.collect_enums(&parsed.module.stmts)?;
+        compiler.collect_structs(&parsed.module.stmts)?;
+        compiler.collect_models(&parsed.module.stmts)?;
+        compiler.declare_runtime_functions()?;
+        compiler.declare_imported_functions(&imported_fns)?;
+        compiler.declare_user_functions_with_linkage(
+            &parsed.module.stmts,
+            cranelift_module::Linkage::Export,
+        )?;
+        let vmap_results = compiler.apply_vmap_transforms(&parsed.module);
+        compiler.register_batched_functions(&vmap_results);
+        compiler.compile_datatype_defs(&parsed.module.stmts)?;
+        compiler.compile_kernels(&parsed.module.stmts)?;
+        compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        compiler.compile_user_functions(&parsed.module.stmts)?;
+        compiler.compile_batched_functions(&vmap_results)?;
+        // compile_main triggers compile_train_block which fires the calibration
+        // harness (AWQ discovery + run_harness_production) as a side-effect,
+        // populating compiler.compile_options.calibration_sidecar.
+        compiler.compile_main(&parsed.module.stmts)?;
+        compiler.compile_pending_lambdas()?;
+        compiler.emit_retention_arena()?;
+        Ok(())
+    })();
+
+    // The calibration sidecar is stored in the Compiler's copy of compile_options.
+    // Extract it before handling errors (the sidecar may have been populated even
+    // if a later codegen pass failed, but we want the sidecar from a successful run).
+    let sidecar = compiler.compile_options.calibration_sidecar.take();
+
+    // Propagate codegen errors only after extracting the sidecar.
+    pre_finalize?;
+
+    sidecar.ok_or_else(|| {
+        CodegenError::new(
+            "compile_and_calibrate: calibration harness ran but produced no sidecar. \
+             Ensure the NSL source contains a train block and at least one \
+             @quantize(dtype=\"awq4\")-decorated model with |>-pipe forward method."
+                .to_string(),
+        )
+    })
+}
+
+/// Compile a source string with the given options (convenience wrapper for
+/// tests that already hold a populated `CompileOptions::calibration_sidecar`
+/// and want to verify the final compile path).
+pub fn compile_with_options(source: &str, opts: &CompileOptions) -> Result<Vec<u8>, CodegenError> {
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "lex errors: {:?}",
+            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+        return Err(CodegenError::new(format!(
+            "parse errors: {:?}",
+            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        )));
+    }
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    compile_module(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        opts,
+    )
+}
+
+#[cfg(test)]
+mod calib_options_tests {
+    use super::*;
+
+    #[test]
+    fn default_has_no_calibration_data() {
+        let o = CompileOptions::default();
+        assert!(o.calibration_data.is_none());
+        assert_eq!(o.calibration_mode.as_deref(), Some("required"));
+        assert_eq!(o.calibration_samples, 512);
+        assert_eq!(o.calibration_batch_size, 8);
+        assert_eq!(o.calibration_timeout_secs, 600);
+    }
+
+    #[test]
+    fn compile_options_default_has_no_calibration_retention() {
+        let opts = CompileOptions::default();
+        assert!(opts.calibration_retention.is_none());
     }
 }

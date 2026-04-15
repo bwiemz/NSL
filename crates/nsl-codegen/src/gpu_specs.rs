@@ -457,6 +457,41 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         num_sms: 128,
         empirical_p95_ratio: 1.20,
     },
+    // NVIDIA T4 (Turing, sm_75) — tight-SMEM target used by CSHA override tests.
+    // Turing's L1/SMEM is split; a CTA can claim up to 96 KB of combined
+    // L1+SMEM, but typical production kernels are limited to 64 KB by the
+    // driver's default carveout.  We use 96 KB here (the documented maximum
+    // configurable via cudaFuncSetAttribute), giving a budget of
+    // (96 - 12) KB = 84 KB after the conservative CSHA reserve — enough for
+    // a Level-2 pipelined kernel but NOT for Level-3 block fusion at the
+    // standard tile sizes, which is the boundary the override-downgrade tests
+    // are designed to exercise.
+    GpuSpec {
+        name: "T4",
+        sm_version: 75,
+        peak_fp16_tflops: 65.0,
+        peak_fp8_tflops: 0.0,
+        peak_fp32_tflops: 8.1,
+        peak_bandwidth_gbs: 300.0,
+        vram_gb: 16.0,
+        l2_cache_mb: 4.0,
+        crossover_fp16: 216.7,
+        crossover_fp8: 0.0,
+        crossover_fp32: 27.0,
+        base_clock_mhz: 585,
+        kernel_launch_overhead_ns: 8000,
+        sync_overhead_ns: 4000,
+        pcie_bandwidth_gbps: 16.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 4 * 1024 * 1024,
+        l1_cache_kb: 96,
+        l1_bandwidth_gbs: 4000.0,
+        l2_bandwidth_gbs: 1200.0,
+        max_warps_per_sm: 32,
+        registers_per_sm: 65536,
+        num_sms: 40,
+        empirical_p95_ratio: 1.40,
+    },
 ];
 
 /// Find a GPU by name. Case-insensitive prefix match; prefers SXM variants.
@@ -666,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_database_has_all_gpus() {
-        assert_eq!(GPU_DATABASE.len(), 11);
+        assert_eq!(GPU_DATABASE.len(), 12);
         let names: Vec<&str> = GPU_DATABASE.iter().map(|g| g.name).collect();
         assert!(names.contains(&"A100-SXM"));
         assert!(names.contains(&"H100-SXM"));

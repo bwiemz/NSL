@@ -132,6 +132,8 @@ pub(crate) fn invoke_wrga_if_enabled(
         r_min: 2,
         r_max: 16,
         seed: 0xC0DE_FACE,
+        inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
+        wggo_overrides: compiler.wggo_overrides.as_ref(),
     };
     let mut plan = crate::wrga::run(wrga_input);
 
@@ -178,6 +180,16 @@ pub(crate) fn invoke_wrga_if_enabled(
     }
     compiler.last_wrga_plan = Some(plan.clone());
     Some(plan)
+}
+
+/// Dev Tools Phase 4 Task 4: extract a layer index from a parameter path.
+/// Finds the last numeric segment (e.g. "blocks.3.attn.wq" -> 3).  Returns
+/// `u32::MAX` when no numeric segment is present.
+fn parse_layer_idx_for_health(path: &str) -> u32 {
+    path.split('.')
+        .rev()
+        .find_map(|seg| seg.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
 }
 
 fn classify_source_ad_param_name(
@@ -1237,6 +1249,24 @@ impl Compiler<'_> {
                     }
                 }
                 self.compile_stmt(builder, state, stmt)?;
+
+                // Phase 5 Task 7: after the inner VarDecl has bound the
+                // target, emit @inspect hooks.  Only active when
+                // `compile_options.inspect_enabled` is true and the stmt
+                // is a `let x = ...`.
+                if self.compile_options.inspect_enabled {
+                    if let StmtKind::VarDecl { pattern, .. } = &stmt.kind {
+                        if let PatternKind::Ident(target_sym) = &pattern.kind {
+                            for d in decorators {
+                                if d.name.len() == 1
+                                    && self.resolve_sym(d.name[0]) == "inspect"
+                                {
+                                    self.emit_inspect_hook(builder, state, d, *target_sym)?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             _ => {
@@ -3339,6 +3369,19 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // Dev Tools Phase 5 Task 7: publish step-counter variable so
+        // `@inspect` emission inside the step body can gate on `step % N`.
+        // Cleared at end of compile_train_block.
+        self.inspect_train_step_var = Some(step_count_var);
+
+        // ── 5a. Dev Tools Phase 4 Task 4: optional health flush-interval setter ──
+        if self.compile_options.health_monitor {
+            if let Some(n) = self.compile_options.health_flush_interval {
+                let n_val = builder.ins().iconst(cl_types::I64, n as i64);
+                self.compile_call_by_name(builder, "nsl_health_set_flush_interval", &[n_val])?;
+            }
+        }
+
         // ── 5b. Allocate gradient accumulation buffers (if grad_accumulation_steps > 1) ──
         // These persist across batches within each accumulation window. Each buffer
         // is zeros_like(param) and gets += each batch's grads, then zeroed after
@@ -3653,27 +3696,82 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
-                // CSHA: Compiler-Synthesized Holistic Attention planner.
-                // Runs the boundary-fusion scan, SMEM feasibility model,
-                // and weight-informed specialization.  Emits either the
-                // full paper-§6.3 report or a compact one-line summary
-                // gated by the `--csha` / `--csha-report` flags.  The
-                // planner is pure data-in/data-out; wiring the kernel
-                // decisions back into codegen is a follow-up step.
-                if let Some(ref mode_str) = self.compile_options.csha_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
-                        if let Some(plan) = crate::csha::run_on_wengert(
-                            extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
-                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-                            None, // shape override — defaults are fine for diagnostic
-                            8,    // default head count; weight-informed path refines this
-                        ) {
-                            if self.compile_options.csha_report {
-                                eprintln!("{}", plan.render_report());
-                            } else {
-                                eprintln!("[csha] {}", plan.summary());
+                // Calibration harness MUST run before WGGO: WGGO Phase 2's
+                // gradient-scoring path reads `compile_options.calibration_sidecar`
+                // via `build_scorer`. If WGGO ran first, the sidecar would
+                // still be `None` and Phase 2 would silently fall back to
+                // magnitude scoring even when `--calibration-data` was
+                // supplied. Calibration does not depend on WGGO output, so
+                // running it first is a safe one-way reorder.
+                if let Some(ref data_path) = self.compile_options.calibration_data {
+                    let mut registry = crate::calibration::registry::HookRegistry::new();
+                    if let Some(awq_projections) = self.discover_awq_projections() {
+                        if !awq_projections.is_empty() {
+                            // Extract just the ProjectionRef for the hook; the full
+                            // DiscoveredProjection (with weight_shape) lives in
+                            // compile_options.calibration_retention for codegen.
+                            let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
+                                .iter()
+                                .map(|dp| dp.projection.clone())
+                                .collect();
+                            registry.register(Box::new(
+                                crate::calibration::awq_hook::AwqCalibrationHook::new(
+                                    proj_refs,
+                                ),
+                            ));
+                            // Store the full DiscoveredProjection vec so the retention
+                            // pass can use weight_shape for arena-layout sizing.
+                            self.compile_options.calibration_retention = Some(awq_projections);
+                        }
+                    }
+                    if registry.is_empty() {
+                        eprintln!(
+                            "warning: --calibration-data {} supplied but no calibration hooks registered (no consumers yet — this is a no-op in MVP)",
+                            data_path.display()
+                        );
+                    } else {
+                        let mode = match self
+                            .compile_options
+                            .calibration_mode
+                            .as_deref()
+                            .unwrap_or("required")
+                        {
+                            "best-effort" => crate::calibration::HarnessMode::BestEffort,
+                            _ => crate::calibration::HarnessMode::Required,
+                        };
+                        let cfg = crate::calibration::HarnessConfig {
+                            checkpoints: self
+                                .compile_options
+                                .weight_file
+                                .as_ref()
+                                .map(|p| vec![p.clone()])
+                                .unwrap_or_default(),
+                            calibration_data: data_path.clone(),
+                            samples: self.compile_options.calibration_samples,
+                            batch_size: self.compile_options.calibration_batch_size,
+                            timeout_secs: self.compile_options.calibration_timeout_secs,
+                            mode,
+                            // Wire per-projection (path, weight_shape) into the
+                            // cache key so renames and shape changes invalidate it.
+                            projections: self
+                                .compile_options
+                                .calibration_retention
+                                .clone()
+                                .unwrap_or_default(),
+                        };
+                        match crate::calibration::run_harness_production(&registry, &cfg) {
+                            Ok(out) => {
+                                eprintln!(
+                                    "[calibration] {} ({} hooks)",
+                                    out.outcome_repr,
+                                    out.sidecar.hooks.len()
+                                );
+                                self.compile_options.calibration_sidecar = Some(out.sidecar);
+                            }
+                            Err(e) => {
+                                return Err(crate::error::CodegenError::new(format!(
+                                    "calibration failed: {e}"
+                                )));
                             }
                         }
                     }
@@ -3687,6 +3785,7 @@ impl Compiler<'_> {
                 // codegen is a future step; the planner itself is
                 // independently useful as a diagnostic and is exercised by
                 // the test suite and CLI integration tests.
+                //
                 if let Some(ref mode_str) = self.compile_options.wggo_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
@@ -3697,17 +3796,14 @@ impl Compiler<'_> {
                         if let Some(f) = self.compile_options.wggo_prune_fraction {
                             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
                         }
-                        // Honour `--wggo-importance=none` by clearing the
-                        // weights path — the analyzer then runs against
-                        // NullWeightProvider and produces uniform scores.
-                        let weights_path = match self
-                            .compile_options
-                            .wggo_importance
-                            .as_deref()
-                        {
-                            Some("none") => None,
-                            _ => self.compile_options.wggo_weights.as_deref(),
-                        };
+                        // Pass the weights path for magnitude-based scoring
+                        // (NullWeightProvider is used in run_on_wengert_with_weights
+                        // when weights_path is None, producing uniform scores).
+                        // compile_options is forwarded so build_scorer can wire the
+                        // GradientScorer appropriate for --wggo-importance + --calibration-data.
+                        // The calibration pass above populated calibration_sidecar if
+                        // --calibration-data was supplied and hooks were registered.
+                        let weights_path = self.compile_options.wggo_weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
                             &self.compile_options.target,
@@ -3715,12 +3811,70 @@ impl Compiler<'_> {
                             self.compile_options.world_size,
                             weights_path,
                             analysis_config,
+                            Some(&self.compile_options),
                         );
                         if let Some(plan) = plan {
                             if self.compile_options.wggo_report {
                                 eprintln!("{}", plan.render_report());
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
+                            }
+                            // Stash for all downstream consumers (CSHA, WRGA, ...).
+                            self.wggo_overrides = Some(
+                                crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
+                            );
+                        }
+                    }
+                }
+
+                // CSHA: Compiler-Synthesized Holistic Attention planner.
+                // Runs the boundary-fusion scan, SMEM feasibility model,
+                // and weight-informed specialization.  Emits either the
+                // full paper-§6.3 report or a compact one-line summary
+                // gated by the `--csha` / `--csha-report` flags.  The
+                // planner is pure data-in/data-out; wiring the kernel
+                // decisions back into codegen is a follow-up step.
+                //
+                // Pass order: Calibration → WGGO → CSHA.
+                // CSHA receives WGGO's AppliedPlan (if any) as WggoOverrides
+                // (via self.wggo_overrides) so that per-layer fusion-level
+                // decisions from WGGO are honoured (or rejected with a
+                // diagnostic) by CSHA.
+                if let Some(ref mode_str) = self.compile_options.csha_mode {
+                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        if let Some(plan) = crate::csha::run_on_wengert(
+                            extractor.wengert_list(),
+                            &self.compile_options.target,
+                            mode_str,
+                            None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
+                            None, // shape override — defaults are fine for diagnostic
+                            8,    // default head count; weight-informed path refines this
+                            self.wggo_overrides.as_ref(),
+                        ) {
+                            if self.compile_options.csha_report {
+                                eprintln!("{}", plan.render_report());
+                            } else {
+                                eprintln!("[csha] {}", plan.summary());
+                            }
+                            // Emit override-rejection diagnostics after the summary line
+                            // so CLI readers see summary first, per-layer details after.
+                            for diag in &plan.override_diagnostics {
+                                let reason_str = match &diag.reason {
+                                    crate::wggo_overrides::OverrideRejectReason::SmemBudgetExceeded {
+                                        actual_kb,
+                                        limit_kb,
+                                    } => {
+                                        format!("smem_{}kb_exceeds_{}kb", actual_kb, limit_kb)
+                                    }
+                                    other => format!("{:?}", other),
+                                };
+                                eprintln!(
+                                    "[csha] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                                    diag.layer_index,
+                                    diag.requested,
+                                    diag.applied,
+                                    reason_str
+                                );
                             }
                         }
                     }
@@ -3761,6 +3915,32 @@ impl Compiler<'_> {
                 // inputs are empty, this is a no-op and we use the raw
                 // extractor list.
                 let wrga_plan = crate::stmt::invoke_wrga_if_enabled(self, extractor.wengert_list());
+                // Task 6: render any override-rejected diagnostics to stderr so
+                // the Phase 3 decision explainer and the user can see which
+                // WGGO-requested ranks were adjusted.  Format matches the CSHA
+                // renderer so both can be parsed uniformly.
+                if let Some(ref plan) = wrga_plan {
+                    for diag in &plan.override_diagnostics {
+                        let reason_str = match &diag.reason {
+                            crate::wggo_overrides::OverrideRejectReason::RankClampedToBounds {
+                                r_min,
+                                r_max,
+                            } => format!("rank_out_of_bounds_[{r_min},{r_max}]"),
+                            crate::wggo_overrides::OverrideRejectReason::RankForbiddenByWggo => {
+                                "rank_forbidden_by_wggo".to_string()
+                            }
+                            crate::wggo_overrides::OverrideRejectReason::BudgetExceededDowngraded {
+                                original_rank,
+                                final_rank,
+                            } => format!("budget_exceeded_{original_rank}_to_{final_rank}"),
+                            other => format!("{:?}", other),
+                        };
+                        eprintln!(
+                            "[wrga] layer:{} wggo-override-rejected requested={} applied={} reason={}",
+                            diag.layer_index, diag.requested, diag.applied, reason_str
+                        );
+                    }
+                }
                 // B.2.1 Task 2.5: materialise adapter tensors into the model
                 // struct's side-table slot now that the plan is known. Task 2
                 // reserved the slot + zero-initialised it; this call allocates
@@ -4334,6 +4514,151 @@ impl Compiler<'_> {
                 "nsl_debug_grad_checksum",
                 &[grads_list, num_params_val],
             )?;
+        }
+
+        // 7e1c. Dev Tools Phase 4 Task 4: health-monitor hooks.
+        // Emits per-step loss, per-parameter gradient norm, per-parameter
+        // weight norm (step 0 + every 100 steps), and a snapshot flush every
+        // 100 steps.  Gated entirely on `health_monitor`; when off the IR is
+        // byte-identical to pre-phase-4.
+        //
+        // TODO(phase4-fase): splice grad-norm emission into the FASE per-layer
+        // loop when FASE is active.  Phase 4 Task 4 ships the standard-
+        // backward-only path — grads_list is indexed the same whether the
+        // primary backward was tape-AD or source-AD.
+        if self.compile_options.health_monitor {
+            use cranelift_codegen::ir::{types as cl_types, MemFlags};
+            let _ = MemFlags::trusted(); // keep import valid across cfgs
+
+            // (a) Record loss: scalarize loss_val and call
+            //     nsl_health_record_loss(loss_scalar, step).
+            let loss_scalar = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_item",
+                &[loss_val],
+            )?;
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_health_record_loss",
+                &[loss_scalar, step_now],
+            )?;
+
+            // Precompute step-gating flags shared by grad/weight/flush hooks.
+            let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
+            let step_h = builder.use_var(step_count_var);
+            let hundred = builder.ins().iconst(cl_types::I64, 100);
+            let step_mod = builder.ins().srem(step_h, hundred);
+            let is_flush_due = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                step_mod,
+                zero_i64_h,
+            );
+            // Init == step 0.  We reuse `is_flush_due` for the weight-norm
+            // periodic check (step 0 also satisfies step % 100 == 0), so a
+            // single gate covers both "init" and "every 100".
+
+            // (b) Per-parameter gradient norms (unrolled over compile-time
+            //     param_paths; grads_list / param_list are indexed by idx).
+            for (i, path) in param_paths.iter().enumerate() {
+                let path_data_id = self.intern_string(path)?;
+                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                let path_len = builder
+                    .ins()
+                    .iconst(cl_types::I64, path.len() as i64);
+                let layer_idx = parse_layer_idx_for_health(path);
+                let layer_idx_val = builder
+                    .ins()
+                    .iconst(cl_types::I32, layer_idx as i64);
+
+                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                let grad = self.compile_call_by_name(
+                    builder,
+                    "nsl_list_get",
+                    &[grads_list, idx_val],
+                )?;
+                let gnorm = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_l2_norm",
+                    &[grad],
+                )?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_health_record_grad_norm",
+                    &[path_ptr, path_len, layer_idx_val, gnorm],
+                )?;
+            }
+
+            // (c) Per-parameter weight norms — gated by step % 100 == 0
+            //     (which includes step 0 as the initial weight snapshot).
+            let wnorm_block = builder.create_block();
+            let after_wnorm = builder.create_block();
+            builder
+                .ins()
+                .brif(is_flush_due, wnorm_block, &[], after_wnorm, &[]);
+
+            builder.switch_to_block(wnorm_block);
+            builder.seal_block(wnorm_block);
+            state.current_block = Some(wnorm_block);
+
+            for (i, path) in param_paths.iter().enumerate() {
+                let path_data_id = self.intern_string(path)?;
+                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                let path_len = builder
+                    .ins()
+                    .iconst(cl_types::I64, path.len() as i64);
+                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                let param = self.compile_call_by_name(
+                    builder,
+                    "nsl_list_get",
+                    &[param_list, idx_val],
+                )?;
+                let wnorm = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_l2_norm",
+                    &[param],
+                )?;
+                // is_init flag: 1 iff step == 0.
+                let step_cmp = builder.use_var(step_count_var);
+                let zero_cmp = builder.ins().iconst(cl_types::I64, 0);
+                let is_init_b1 = builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    step_cmp,
+                    zero_cmp,
+                );
+                let is_init_i8 = builder.ins().uextend(cl_types::I8, is_init_b1);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_health_record_weight_norm",
+                    &[path_ptr, path_len, wnorm, is_init_i8],
+                )?;
+            }
+
+            // (d) Snapshot flush (reuses is_flush_due — we're still in wnorm_block).
+            let snap_path = self
+                .compile_options
+                .profile_source_file_name
+                .as_ref()
+                .map(|p| format!("{}.nsl-health.json", p))
+                .unwrap_or_else(|| "nsl-health.json".to_string());
+            let snap_data_id = self.intern_string(&snap_path)?;
+            let snap_gv = self.module.declare_data_in_func(snap_data_id, builder.func);
+            let snap_ptr = builder.ins().symbol_value(cl_types::I64, snap_gv);
+            let snap_len = builder
+                .ins()
+                .iconst(cl_types::I64, snap_path.len() as i64);
+            self.compile_call_by_name(
+                builder,
+                "nsl_health_flush_snapshot",
+                &[snap_ptr, snap_len],
+            )?;
+
+            builder.ins().jump(after_wnorm, &[]);
+            builder.switch_to_block(after_wnorm);
+            builder.seal_block(after_wnorm);
+            state.current_block = Some(after_wnorm);
         }
 
         // 7e2. Gradient clipping (only if grad_clip was specified).
@@ -5435,6 +5760,9 @@ impl Compiler<'_> {
         state.dataloader_symbols = saved_dataloader_symbols;
         state.borrowed_batch_symbols = saved_borrowed_batch_symbols;
 
+        // Phase 5 Task 7: clear train-scope @inspect context on exit.
+        self.inspect_train_step_var = None;
+
         Ok(())
     }
 
@@ -5986,6 +6314,9 @@ impl Compiler<'_> {
         let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(step_count_var, zero_i64);
 
+        // Phase 5 Task 7: publish step counter for @inspect in pipelined train.
+        self.inspect_train_step_var = Some(step_count_var);
+
         let lr_var = state.new_variable();
         builder.declare_var(lr_var, cl_types::F64);
         let lr_const = builder.ins().f64const(lr_value);
@@ -6322,6 +6653,9 @@ impl Compiler<'_> {
         state.variable_types = saved_variable_types;
         state.dataloader_symbols = saved_dataloader_symbols;
         state.borrowed_batch_symbols = saved_borrowed_batch_symbols;
+
+        // Phase 5 Task 7: clear train-scope @inspect context on exit.
+        self.inspect_train_step_var = None;
 
         Ok(())
     }
@@ -6766,6 +7100,43 @@ impl Compiler<'_> {
             .iconst(cl_types::I64, layout.total_size.max(8) as i64);
         let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
 
+        // 4b. If this is an AWQ quant block and a calibration sidecar is present,
+        //     decode the AWQ activation scales once.  We'll use them per-field below.
+        //
+        //     Key: "awq_activation_scales" in sidecar.hooks (binary blob).
+        //     Projection path format: "{model_type_name}.{field_name}" — same
+        //     cache key as Task 8's discovery pass.
+        //
+        //     Hard error when sidecar present but projection missing:
+        //     silent fallback to uncalibrated is a correctness trap.
+        let is_awq = matches!(quant.default_dtype, Some(QuantDtype::Awq4));
+        let awq_scales_opt: Option<nsl_runtime::awq::AwqScales> = if is_awq {
+            match self.compile_options.calibration_sidecar.as_ref() {
+                None => None,
+                Some(sidecar) => {
+                    match sidecar.hooks.get("awq_activation_scales") {
+                        None => None, // Sidecar present but no AWQ hook blob → treat as uncalibrated.
+                        Some(blob) => {
+                            match nsl_runtime::awq::AwqScales::from_blob(blob) {
+                                Ok(scales) => Some(scales),
+                                Err(e) => {
+                                    // Blob present but malformed → hard error.
+                                    return Err(CodegenError::new(format!(
+                                        "AWQ calibration sidecar blob is malformed: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        // AWQ calibration alpha (matches awq_quantize_with_scales default).
+        let awq_alpha: f64 = 0.5;
+
         // 5. For each field: quantize→dequantize (or clone if excluded)
         for field in &layout.fields {
             let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
@@ -6783,17 +7154,103 @@ impl Compiler<'_> {
                     .ins()
                     .store(MemFlags::trusted(), cloned, new_ptr, field.offset as i32);
             } else {
+                // For AWQ with a calibration sidecar, pre-scale the weight tensor using
+                // the per-input-channel activation statistics before quantizing.
+                // This embeds the scale data as compile-time constants in the object file
+                // and calls nsl_awq_pre_scale_weight at runtime to apply them.
+                let weight_for_quantize: Value = if is_awq {
+                    match awq_scales_opt.as_ref() {
+                        None => {
+                            // No sidecar → uncalibrated, pass weight through unchanged.
+                            src_val
+                        }
+                        Some(scales_map) => {
+                            // Sidecar present — projection MUST have scales.
+                            let projection_path =
+                                format!("{}.{}", model_type_name, field.name);
+                            let field_scales = scales_map
+                                .by_projection
+                                .get(&projection_path)
+                                .ok_or_else(|| {
+                                    CodegenError::missing_scales(&projection_path)
+                                })?;
+
+                            // Embed scale data as a compile-time constant in .rodata.
+                            let data_label = format!(
+                                "__nsl_awq_scales_{}_{}",
+                                model_type_name, field.name
+                            );
+                            let scale_bytes: Vec<u8> = field_scales
+                                .iter()
+                                .flat_map(|v: &f32| v.to_le_bytes())
+                                .collect();
+                            let scale_data_id = self
+                                .module
+                                .declare_data(
+                                    &data_label,
+                                    cranelift_module::Linkage::Local,
+                                    false,
+                                    false,
+                                )
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to declare AWQ scale data for \
+                                         '{projection_path}': {e}"
+                                    ))
+                                })?;
+                            let mut data_desc = cranelift_module::DataDescription::new();
+                            data_desc.define(scale_bytes.into_boxed_slice());
+                            self.module
+                                .define_data(scale_data_id, &data_desc)
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to define AWQ scale data for \
+                                         '{projection_path}': {e}"
+                                    ))
+                                })?;
+
+                            // Get a pointer to the scale data in this function.
+                            let scale_gv = self
+                                .module
+                                .declare_data_in_func(scale_data_id, builder.func);
+                            let scales_ptr =
+                                builder.ins().symbol_value(cl_types::I64, scale_gv);
+                            let scales_len = builder
+                                .ins()
+                                .iconst(cl_types::I64, field_scales.len() as i64);
+                            let alpha_v = builder.ins().f64const(awq_alpha);
+
+                            // Apply calibration scaling: returns a new NslTensor.
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_awq_pre_scale_weight",
+                                &[src_val, scales_ptr, scales_len, alpha_v],
+                            )?
+                        }
+                    }
+                } else {
+                    src_val
+                };
+
                 // Quantize then immediately dequantize — validates the roundtrip and
                 // shows quantization effects (precision loss) while storing a regular
                 // NslTensor that the original forward method can consume directly.
                 let qt = self.compile_call_by_name(
                     builder,
                     "nsl_qtensor_quantize",
-                    &[src_val, dtype_v, gran_v, axis_v, gs_v],
+                    &[weight_for_quantize, dtype_v, gran_v, axis_v, gs_v],
                 )?;
                 let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
                 // Release the intermediate QuantizedTensor (refcount-aware)
                 self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
+                // If we pre-scaled the weight, release the intermediate scaled tensor too.
+                if is_awq && awq_scales_opt.is_some() {
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_release",
+                        &[weight_for_quantize],
+                    )?;
+                }
                 builder
                     .ins()
                     .store(MemFlags::trusted(), deq, new_ptr, field.offset as i32);
@@ -6815,6 +7272,325 @@ impl Compiler<'_> {
         builder.declare_var(var, cl_types::I64);
         builder.def_var(var, new_ptr);
         state.variables.insert(quant.name, (var, cl_types::I64));
+
+        Ok(())
+    }
+
+    /// Walk the compiled model's `quant { ... }` blocks and produce the
+    /// list of ProjectionRefs that AWQ needs calibration data for.
+    /// Returns `None` when no AWQ quant block is present or discovery
+    /// produces no matches.
+    ///
+    /// Implementation (Task 3): scans `self.features.quant_configs` for
+    /// models quantised with `"awq4"`.  For each such model, retrieves the
+    /// `forward` method body from `model_method_bodies`, walks its pipe chain
+    /// to enumerate linear-projection call sites, and returns the sorted,
+    /// deduplicated `Vec<ProjectionRef>`.  Discovery errors (e.g. empty match)
+    /// are logged to stderr and treated as `None` so the harness falls back to
+    /// its no-op path rather than crashing the compile.
+    fn discover_awq_projections(
+        &self,
+    ) -> Option<Vec<crate::calibration::DiscoveredProjection>> {
+        use crate::calibration::discover_awq_projections_from_state;
+
+        // Collect all AWQ-quantised model names.
+        let awq_models: Vec<String> = self
+            .features
+            .quant_configs
+            .iter()
+            .filter(|(_, cfg)| cfg.dtype == "awq4")
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if awq_models.is_empty() {
+            return None;
+        }
+
+        let mut all_projections: Vec<crate::calibration::DiscoveredProjection> = Vec::new();
+
+        for model_name in &awq_models {
+            // Retrieve the forward method body (if stored).
+            let forward_body: Option<&nsl_ast::stmt::Block> = self
+                .models
+                .model_method_bodies
+                .get(model_name)
+                .and_then(|methods| methods.get("forward"))
+                .map(|fn_def| &fn_def.body);
+
+            // Retrieve field-type and shape maps for this model.
+            let empty_field_types = std::collections::HashMap::new();
+            let field_types = self
+                .models
+                .model_field_types
+                .get(model_name)
+                .unwrap_or(&empty_field_types);
+
+            let empty_shapes = std::collections::HashMap::new();
+            let tensor_shapes = self
+                .models
+                .model_tensor_field_shapes
+                .get(model_name)
+                .unwrap_or(&empty_shapes);
+
+            match discover_awq_projections_from_state(
+                model_name,
+                forward_body,
+                field_types,
+                tensor_shapes,
+                &[], // no exclusions from the Compiler-level stub; the QuantBlock's
+                     // exclude list is stored in the AST which isn't retained here.
+                self.interner,
+            ) {
+                Ok(discovered) => {
+                    for dp in discovered {
+                        all_projections.push(dp);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[calibration] AWQ discovery for model '{model_name}': {e}");
+                }
+            }
+        }
+
+        if all_projections.is_empty() {
+            None
+        } else {
+            // Sort + dedup across models (by qualified path for determinism).
+            all_projections.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+            all_projections.dedup_by(|a, b| a.projection.0 == b.projection.0);
+            Some(all_projections)
+        }
+    }
+
+
+    /// Dev Tools Phase 5 Task 7: emit IR for one `@inspect(target, every=?, condition=?)`
+    /// decorator attached to a `let` binding.
+    ///
+    /// Ship-first scope:
+    ///   * Only fires inside a train block (requires `inspect_train_step_var`).
+    ///     Outside train scope, emits nothing.
+    ///   * `every=N` → step-gated call to `nsl_tensor_stats` +
+    ///     `nsl_inspect_record_stats`.
+    ///   * `condition="..."` → predicate-gated `nsl_inspect_dump_full`.
+    ///     Predicate AST is lowered via `inspect::predicate::lower_predicate`.
+    ///   * The `loss` identifier in predicates always evaluates to `0.0` —
+    ///     the loss value isn't in scope at @inspect emission time (inspect
+    ///     fires at the let-binding site, typically before the loss compute).
+    ///     TODO(phase-5-fase): thread loss through once it's available.
+    ///
+    /// All emission gated on `compile_options.inspect_enabled`.  When that
+    /// flag is off, this method is never called.
+    fn emit_inspect_hook(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        decorator: &nsl_ast::decl::Decorator,
+        target_sym: nsl_ast::Symbol,
+    ) -> Result<(), CodegenError> {
+        // Outside a train block we skip entirely for Phase 5 ship-first.
+        let step_count_var = match self.inspect_train_step_var {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        // Resolve target tensor: prefer decorator arg[0] (which semantic
+        // guarantees is a positional Ident), fall back to the let binding's
+        // own LHS symbol when argument extraction fails.
+        let (resolved_sym, tensor_name) = {
+            let mut s = target_sym;
+            if let Some(args) = &decorator.args {
+                if let Some(first) = args.first() {
+                    if first.name.is_none() {
+                        if let ExprKind::Ident(sym) = &first.value.kind {
+                            s = *sym;
+                        }
+                    }
+                }
+            }
+            let name = self.resolve_sym(s).to_string();
+            (s, name)
+        };
+        let tensor_val = match state.variables.get(&resolved_sym) {
+            Some((var, _)) => builder.use_var(*var),
+            None => return Ok(()),
+        };
+
+        // Extract every=N and condition="..." from decorator args.
+        let mut every_n: Option<i64> = None;
+        let mut cond_str: Option<String> = None;
+        if let Some(args) = &decorator.args {
+            // args[0] is the positional tensor target — resolved above.
+            for arg in args.iter().skip(1) {
+                let kw = arg.name.map(|s| self.resolve_sym(s).to_string());
+                match kw.as_deref() {
+                    Some("every") => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            if *n > 0 {
+                                every_n = Some(*n);
+                            }
+                        }
+                    }
+                    Some("condition") => {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                            cond_str = Some(s.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Intern the tensor name once — shared by stats + dump branches.
+        let name_data_id = self.intern_string(&tensor_name)?;
+        let name_gv = self
+            .module
+            .declare_data_in_func(name_data_id, builder.func);
+
+        // ── (a) Stats branch: every=N ────────────────────────────────────
+        if let Some(n) = every_n {
+            let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
+            let step_loaded = builder.use_var(step_count_var);
+            let n_val = builder.ins().iconst(cl_types::I64, n);
+            let rem = builder.ins().srem(step_loaded, n_val);
+            let due = builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                rem,
+                zero_i64,
+            );
+
+            let do_block = builder.create_block();
+            let after_block = builder.create_block();
+            builder.ins().brif(due, do_block, &[], after_block, &[]);
+
+            builder.switch_to_block(do_block);
+            builder.seal_block(do_block);
+            state.current_block = Some(do_block);
+
+            // Allocate a 48-byte 8-aligned stack slot for the stats struct
+            // (matches the runtime's NslTensorStats layout — 6 × f64).
+            let slot = builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    48,
+                    3,
+                ),
+            );
+            let stats_ptr = builder.ins().stack_addr(cl_types::I64, slot, 0);
+
+            self.compile_call_by_name(
+                builder,
+                "nsl_tensor_stats",
+                &[tensor_val, stats_ptr],
+            )?;
+
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+            let name_len = builder
+                .ins()
+                .iconst(cl_types::I64, tensor_name.len() as i64);
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_inspect_record_stats",
+                &[stats_ptr, step_now, name_ptr, name_len],
+            )?;
+
+            builder.ins().jump(after_block, &[]);
+            builder.switch_to_block(after_block);
+            builder.seal_block(after_block);
+            state.current_block = Some(after_block);
+        }
+
+        // ── (b) Dump branch: condition="..." ──────────────────────────────
+        if let Some(cond_src) = cond_str {
+            let ast = match crate::inspect::predicate::parse_predicate(&cond_src) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[@inspect] predicate parse failed for {:?}: {}",
+                        cond_src, e
+                    );
+                    return Ok(());
+                }
+            };
+
+            // Resolve FuncRefs for all health getters.  Any missing symbol
+            // means builtins.rs / Phase 4+5 runtime didn't register — bail.
+            let (lema_id, _) = match self.registry.runtime_fns.get("nsl_health_get_loss_ema") {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_loss_ema_ref =
+                self.module.declare_func_in_func(lema_id, builder.func);
+            let (lslope_id, _) = match self
+                .registry
+                .runtime_fns
+                .get("nsl_health_get_loss_ema_slope")
+            {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_loss_ema_slope_ref =
+                self.module.declare_func_in_func(lslope_id, builder.func);
+            let (gnt_id, _) = match self
+                .registry
+                .runtime_fns
+                .get("nsl_health_get_grad_norm_total")
+            {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_grad_norm_total_ref =
+                self.module.declare_func_in_func(gnt_id, builder.func);
+            let (nic_id, _) = match self
+                .registry
+                .runtime_fns
+                .get("nsl_health_get_nan_inf_count_window")
+            {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_nan_inf_count_window_ref =
+                self.module.declare_func_in_func(nic_id, builder.func);
+
+            let step_loaded = builder.use_var(step_count_var);
+            // Placeholder for `loss` identifier in predicate — see TODO above.
+            let loss_placeholder = builder.ins().f64const(0.0);
+
+            let ctx = crate::inspect::predicate::PredicateLowerCtx {
+                step_val: step_loaded,
+                loss_val: loss_placeholder,
+                get_loss_ema_ref,
+                get_loss_ema_slope_ref,
+                get_grad_norm_total_ref,
+                get_nan_inf_count_window_ref,
+            };
+            let pred_val =
+                crate::inspect::predicate::lower_predicate(&ast, builder, &ctx);
+
+            let do_block = builder.create_block();
+            let after_block = builder.create_block();
+            builder.ins().brif(pred_val, do_block, &[], after_block, &[]);
+
+            builder.switch_to_block(do_block);
+            builder.seal_block(do_block);
+            state.current_block = Some(do_block);
+
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+            let name_len = builder
+                .ins()
+                .iconst(cl_types::I64, tensor_name.len() as i64);
+            let step_now = builder.use_var(step_count_var);
+            self.compile_call_by_name(
+                builder,
+                "nsl_inspect_dump_full",
+                &[tensor_val, step_now, name_ptr, name_len],
+            )?;
+
+            builder.ins().jump(after_block, &[]);
+            builder.switch_to_block(after_block);
+            builder.seal_block(after_block);
+            state.current_block = Some(after_block);
+        }
 
         Ok(())
     }

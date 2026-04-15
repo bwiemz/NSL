@@ -3,6 +3,8 @@
 //! This crate compiles to a static library that is linked into every compiled NSL program.
 //! All public functions use C ABI (`extern "C"`) so Cranelift-generated code can call them.
 
+pub mod health;
+pub mod profiler;
 pub mod print;
 pub mod power;
 pub mod memory;
@@ -22,12 +24,21 @@ pub(crate) mod cpu;
 pub(crate) mod cuda;
 pub mod autodiff;
 pub mod checkpoint;
+pub mod inspect;
 pub mod tokenizer;
 pub mod quantize;
 pub mod fp8;
 pub mod awq;
 pub mod fase_bc;
+pub use awq::{nsl_awq_write_sidecar, AwqProjectionDescriptor};
 pub mod gptq;
+
+// Calibration-data loader: .bin and .safetensors dispatch (unconditional)
+pub mod calibration_data;
+pub use calibration_data::{
+    nsl_calibration_load, nsl_calibration_batch_at,
+    nsl_calibration_count, nsl_calibration_free,
+};
 
 // M18b: Interop modules (feature-gated)
 #[cfg(feature = "interop")]

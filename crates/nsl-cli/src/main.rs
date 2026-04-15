@@ -21,6 +21,39 @@ pub enum TrainingReportFormat {
     Json,
 }
 
+/// Scan a parsed module for a top-level `train { ... }` block.
+///
+/// Dev Tools Phase 4 Task 6: `nsl run --monitor` uses this detection to
+/// decide whether to enable the health monitor (train program) or fall
+/// back to the Phase 1/2 kernel-timing profile path (non-train program).
+/// Train blocks in NSL are a top-level construct, so a flat scan suffices.
+fn has_train_block(module: &nsl_ast::Module) -> bool {
+    module
+        .stmts
+        .iter()
+        .any(|s| matches!(s.kind, nsl_ast::stmt::StmtKind::TrainBlock(_)))
+}
+
+/// CLI wrapper for `nsl_codegen::WggoImportance` — keeps `clap` out of `nsl-codegen`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+#[clap(rename_all = "lower")]
+enum CliWggoImportance {
+    #[default]
+    Auto,
+    Magnitude,
+    Grad,
+}
+
+impl From<CliWggoImportance> for nsl_codegen::WggoImportance {
+    fn from(v: CliWggoImportance) -> Self {
+        match v {
+            CliWggoImportance::Auto => Self::Auto,
+            CliWggoImportance::Magnitude => Self::Magnitude,
+            CliWggoImportance::Grad => Self::Grad,
+        }
+    }
+}
+
 // The clap command enum carries many subcommand-specific flags, so keeping it
 // as a single enum is clearer than splitting every large variant into boxes.
 #[allow(clippy::large_enum_variant)]
@@ -43,6 +76,10 @@ enum Cli {
         /// Print the inferred type map
         #[arg(long)]
         dump_types: bool,
+
+        /// Print a compile-time shape-propagation trace
+        #[arg(long)]
+        shapes: bool,
 
         /// M37: Run roofline performance analysis
         #[arg(long)]
@@ -216,6 +253,14 @@ enum Cli {
         /// live caching-allocator block summary and driver/allocator stats.
         #[arg(long)]
         gpu_mem_report: bool,
+
+        /// Render predicted-vs-actual kernel timings instead of running the program
+        #[arg(long)]
+        monitor: bool,
+
+        /// Activate @inspect hooks: dump tensor stats/contents to .nsl-inspect/
+        #[arg(long)]
+        inspect: bool,
 
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
@@ -424,12 +469,12 @@ enum Cli {
         #[arg(long, value_name = "PATH")]
         wggo_weights: Option<PathBuf>,
 
-        /// WGGO Stage 3 importance-scoring mode ("none" or
-        /// "magnitude").  "grad" is reserved for a future milestone
-        /// (blocked on a compile-time execution harness).  Defaults
-        /// to "magnitude" when `--wggo-weights` is set, else "none".
-        #[arg(long, value_name = "MODE")]
-        wggo_importance: Option<String>,
+        /// WGGO head-importance scoring mode.
+        /// - `auto` (default): gradient scoring when calibration sidecar present, else magnitude.
+        /// - `magnitude`: force magnitude scoring even with calibration data.
+        /// - `grad`: require gradient scoring; errors if no calibration sidecar present.
+        #[arg(long, value_enum, default_value_t = CliWggoImportance::Auto)]
+        wggo_importance: CliWggoImportance,
 
         /// WGGO Stage 3: fraction of heads the default
         /// `min_retained_importance` threshold allows to be pruned.
@@ -446,6 +491,28 @@ enum Cli {
         /// CSHA: print the attention-fusion report to stderr
         #[arg(long)]
         csha_report: bool,
+
+        /// Path to calibration dataset (.bin or .safetensors).  When
+        /// omitted, calibration is skipped entirely.
+        #[arg(long, value_name = "PATH")]
+        calibration_data: Option<PathBuf>,
+
+        /// Calibration failure policy.  Default `required` aborts the
+        /// build on infrastructure errors; `best-effort` warns and
+        /// falls back.  Degenerate-data errors are always fatal.
+        #[arg(long, value_name = "MODE", default_value = "required")]
+        calibrate: String,
+
+        /// Number of calibration samples to consume (default 512).
+        /// Truncated to the dataset size with a warning when smaller.
+        #[arg(long, value_name = "N", default_value_t = 512)]
+        calibration_samples: u32,
+
+        #[arg(long, value_name = "N", default_value_t = 8)]
+        calibration_batch_size: u32,
+
+        #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+        calibration_timeout: u64,
     },
 
     /// Run @test functions in an NSL file
@@ -518,6 +585,52 @@ enum Cli {
     Zk {
         #[command(subcommand)]
         cmd: ZkCmd,
+    },
+
+    /// Predictive performance profile for a target GPU
+    Profile {
+        /// Path to the .nsl file
+        file: PathBuf,
+
+        /// Target GPU (e.g., "h100", "a100", "rtx-4090")
+        #[arg(long, default_value = "h100")]
+        target: String,
+
+        /// Dtype to cost (e.g., "bf16", "fp16", "fp8")
+        #[arg(long, default_value = "bf16")]
+        dtype: String,
+
+        /// Concrete batch size to resolve shape symbols
+        #[arg(long, default_value_t = 1)]
+        batch: u64,
+
+        /// Concrete sequence length to resolve shape symbols
+        #[arg(long, default_value_t = 2048)]
+        seq: u64,
+
+        /// Extra shape-env bindings as "name=N" (repeatable)
+        #[arg(long)]
+        dim: Vec<String>,
+
+        /// Disable fusion plan in the report
+        #[arg(long)]
+        no_fusion: bool,
+
+        /// Include memory timeline in the report (Task 5)
+        #[arg(long)]
+        memory: bool,
+
+        /// Entry point: "auto", "train", or "fn:<name>"
+        #[arg(long, default_value = "auto")]
+        entry: String,
+
+        /// Emit machine-readable JSON instead of a formatted table
+        #[arg(long)]
+        json: bool,
+
+        /// Run WGGO Full mode and append/attach the decision explanation
+        #[arg(long)]
+        explain_wggo: bool,
     },
 
     /// Train a BPE tokenizer from source files
@@ -612,6 +725,7 @@ fn main_inner() {
             dump_tokens,
             dump_ast,
             dump_types,
+            shapes,
             perf: _perf,
             gpu: _gpu,
             trace: _trace,
@@ -630,6 +744,28 @@ fn main_inner() {
             fpga_device: _fpga_device,
             training_report,
         } => {
+            if shapes {
+                let src = match std::fs::read_to_string(&file) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: could not read file '{}': {e}", file.display());
+                        process::exit(1);
+                    }
+                };
+                match nsl_cli::shape_debug::ShapeDebugInput::from_source(
+                    &src,
+                    &file.display().to_string(),
+                ) {
+                    Ok(input) => {
+                        println!("{}", nsl_cli::shape_debug::format_trace(&input));
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: shape debug failed: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
             run_check(&file, dump_tokens, dump_ast, dump_types, linear_types);
             // M37: --perf, --gpu, --trace flags parsed but dormant.
 
@@ -799,6 +935,11 @@ fn main_inner() {
             wggo_prune_fraction,
             csha,
             csha_report,
+            calibration_data,
+            calibrate,
+            calibration_samples,
+            calibration_batch_size,
+            calibration_timeout,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -843,6 +984,54 @@ fn main_inner() {
             } else {
                 None
             };
+
+            // Calibration-flag validation per spec §8.
+            if calibration_data.is_none() && calibrate.as_str() != "required" {
+                eprintln!(
+                    "error: --calibrate={} requires --calibration-data <PATH>",
+                    calibrate
+                );
+                process::exit(1);
+            }
+            match calibrate.as_str() {
+                "required" | "best-effort" => {}
+                other => {
+                    eprintln!(
+                        "error: --calibrate value '{}' is not one of required|best-effort",
+                        other
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = calibration_data {
+                if !p.exists() {
+                    eprintln!("error: --calibration-data path does not exist: {}", p.display());
+                    process::exit(1);
+                }
+                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+                match ext.as_deref() {
+                    Some("bin") | Some("safetensors") => {}
+                    other => {
+                        eprintln!(
+                            "error: --calibration-data extension {:?} is not one of .bin|.safetensors",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            if calibration_samples == 0 {
+                eprintln!("error: --calibration-samples must be > 0");
+                process::exit(1);
+            }
+            if calibration_batch_size == 0 {
+                eprintln!("error: --calibration-batch-size must be > 0");
+                process::exit(1);
+            }
+            if calibration_timeout == 0 {
+                eprintln!("error: --calibration-timeout must be > 0");
+                process::exit(1);
+            }
 
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
@@ -893,11 +1082,31 @@ fn main_inner() {
                 wrga_fold_allocations,
                 wggo_mode: wggo.clone(),
                 wggo_report,
+                profile_kernels: false,
+                target_gpu: "h100".to_string(),
+                dtype: "bf16".to_string(),
+                manifest_output_path: None,
+                profile_source_text: None,
+                profile_source_file_name: None,
+                health_monitor: false,
+                health_flush_interval: None,
+                inspect_enabled: false,
                 wggo_weights: wggo_weights.clone(),
-                wggo_importance: wggo_importance.clone(),
+                wggo_importance: nsl_codegen::WggoImportance::from(wggo_importance),
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
+                calibration_data: calibration_data.clone(),
+                calibration_mode: Some(calibrate.clone()),
+                calibration_samples,
+                calibration_batch_size,
+                calibration_timeout_secs: calibration_timeout,
+                calibration_sidecar: None,
+                calibration_retention: None,
+                // Task 6: peek_batch_seq is called inside the compiler when
+                // calibration_data is set; the CLI passes None here and the
+                // compiler resolves the real (batch, seq) from the data header.
+                calibration_batch_seq: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -911,24 +1120,10 @@ fn main_inner() {
                     process::exit(1);
                 }
             }
-            if let Some(ref m) = wggo_importance {
-                match m.as_str() {
-                    "none" | "magnitude" => {}
-                    "grad" => {
-                        eprintln!(
-                            "error: --wggo-importance=grad is reserved for a future milestone (blocked on a compile-time execution harness); use 'magnitude' or 'none' for now"
-                        );
-                        process::exit(1);
-                    }
-                    other => {
-                        eprintln!(
-                            "error: --wggo-importance value '{}' is not one of none|magnitude",
-                            other
-                        );
-                        process::exit(1);
-                    }
-                }
-            }
+            // wggo_importance is now a typed CliWggoImportance enum; clap
+            // rejects unknown values before we get here.  The Grad variant
+            // requires a calibration sidecar — build_scorer enforces that at
+            // compile time and emits the --calibration-data error message.
             if let Some(f) = wggo_prune_fraction {
                 if !(0.0..=0.9).contains(&f) {
                     eprintln!(
@@ -1028,7 +1223,76 @@ fn main_inner() {
             fpga_device,
             cuda_sync,
             gpu_mem_report,
+            monitor,
+            inspect,
         } => {
+            // Dev Tools Phase 4 Task 6: when --monitor is set, auto-detect
+            // whether this program has a `train { }` block.  If so, enable
+            // the health monitor and skip the Phase 1/2 kernel-timing path
+            // (the two are mutually exclusive per spec § 4.6).  Non-train
+            // programs keep the existing kernel-timing behavior.
+            let detected_train_block: bool = if monitor {
+                let src = std::fs::read_to_string(&file).unwrap_or_default();
+                match nsl_cli::shape_debug::ShapeDebugInput::from_source(
+                    &src,
+                    file.to_str().unwrap_or("<file>"),
+                ) {
+                    Ok(input) => has_train_block(&input.module),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+
+            if monitor && !detected_train_block {
+                let profile_args = nsl_cli::profile::ProfileArgs {
+                    file: file.clone(),
+                    target: gpu.clone().unwrap_or_else(|| "h100".to_string()),
+                    dtype: "bf16".into(),
+                    batch: 1,
+                    seq: 2048,
+                    dim: vec![],
+                    fusion: true,
+                    memory: false,
+                    entry: "auto".into(),
+                    json: true,
+                    explain_wggo: false,
+                };
+                let report_json = match nsl_cli::profile::run_profile(&profile_args) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                };
+                let report: nsl_codegen::profiling::types::ProfileReport =
+                    match serde_json::from_str(&report_json) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("error: profile JSON parse: {e}");
+                            process::exit(1);
+                        }
+                    };
+                let manifest_path =
+                    match nsl_cli::monitor::write_manifest_beside(&file, &report) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                let actual_path = file.with_extension("nsl-profile-actual.json");
+                match nsl_cli::monitor::run_monitor(&file, &manifest_path, &actual_path) {
+                    Ok(rendered) => {
+                        println!("{}", rendered);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
                 autotune_fresh: false,
@@ -1070,11 +1334,43 @@ fn main_inner() {
                 wrga_fold_allocations: false,
                 wggo_mode: None,
                 wggo_report: false,
+                // Phase 4 Task 6: when a train block is detected with --monitor,
+                // the health monitor takes over; disable the Phase 1/2 kernel
+                // timing path so they don't stomp on each other.
+                profile_kernels: if detected_train_block { false } else { monitor },
+                target_gpu: "h100".to_string(),
+                dtype: "bf16".to_string(),
+                manifest_output_path: if monitor {
+                    Some(file.with_extension("nsl-profile.json"))
+                } else {
+                    None
+                },
+                profile_source_text: if monitor {
+                    std::fs::read_to_string(&file).ok()
+                } else {
+                    None
+                },
+                profile_source_file_name: if monitor {
+                    Some(file.display().to_string())
+                } else {
+                    None
+                },
+                health_monitor: detected_train_block,
+                health_flush_interval: None,
+                inspect_enabled: inspect,
                 wggo_weights: None,
-                wggo_importance: None,
+                wggo_importance: nsl_codegen::WggoImportance::Auto,
                 wggo_prune_fraction: None,
                 csha_mode: None,
                 csha_report: false,
+                calibration_data: None,
+                calibration_mode: Some("required".to_string()),
+                calibration_samples: 512,
+                calibration_batch_size: 8,
+                calibration_timeout_secs: 600,
+                calibration_sidecar: None,
+                calibration_retention: None,
+                calibration_batch_seq: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -1288,6 +1584,65 @@ fn main_inner() {
                 }
             } else {
                 run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, gpu_mem_report, &compile_opts);
+                // Phase 4 Task 6: after the child process exits, load and
+                // render the health snapshot written by the runtime flush
+                // hook.  Only runs when `--monitor` + train-block detection
+                // enabled the health monitor upstream.
+                if monitor && detected_train_block {
+                    let health_path = file.with_extension("nsl-health.json");
+                    match std::fs::read_to_string(&health_path) {
+                        Ok(s) => match serde_json::from_str::<
+                            nsl_runtime::health::collector::HealthSnapshot,
+                        >(&s)
+                        {
+                            Ok(snap) => {
+                                let mut renderer =
+                                    nsl_cli::health_monitor::HealthRenderer::new();
+                                renderer.render(&snap);
+                            }
+                            Err(e) => eprintln!(
+                                "warning: health snapshot at {} failed to parse: {}",
+                                health_path.display(),
+                                e
+                            ),
+                        },
+                        Err(_) => eprintln!(
+                            "warning: no health snapshot at {} — train step may not have reached first flush",
+                            health_path.display()
+                        ),
+                    }
+                }
+                // Phase 5 Task 8: summarize @inspect dumps written by the
+                // runtime hook to `.nsl-inspect/`.
+                if inspect {
+                    let dir = std::path::PathBuf::from(".nsl-inspect");
+                    match std::fs::read_dir(&dir) {
+                        Ok(entries) => {
+                            let (mut stats_count, mut full_count) = (0usize, 0usize);
+                            for entry in entries.flatten() {
+                                let name = entry.file_name();
+                                let name_str = name.to_string_lossy();
+                                if name_str.ends_with(".stats.bin") {
+                                    stats_count += 1;
+                                } else if name_str.ends_with(".tensor.bin") {
+                                    full_count += 1;
+                                }
+                            }
+                            eprintln!(
+                                "[inspect] Wrote {} stats records, {} full dumps to {}/",
+                                stats_count,
+                                full_count,
+                                dir.display()
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[inspect] No inspect output directory at {} — @inspect sites may not have fired",
+                                dir.display()
+                            );
+                        }
+                    }
+                }
             }
         }
         Cli::Test { file, filter } => {
@@ -1324,6 +1679,40 @@ fn main_inner() {
         }
         Cli::Zk { cmd } => {
             run_zk_cmd(cmd);
+        }
+        Cli::Profile {
+            file,
+            target,
+            dtype,
+            batch,
+            seq,
+            dim,
+            no_fusion,
+            memory,
+            entry,
+            json,
+            explain_wggo,
+        } => {
+            let args = nsl_cli::profile::ProfileArgs {
+                file,
+                target,
+                dtype,
+                batch,
+                seq,
+                dim,
+                fusion: !no_fusion,
+                memory,
+                entry,
+                json,
+                explain_wggo,
+            };
+            match nsl_cli::profile::run_profile(&args) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
         }
         Cli::Tokenize { dirs, output, vocab_size, min_freq, ext } => {
             run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);

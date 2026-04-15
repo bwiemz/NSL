@@ -391,43 +391,40 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
-    /// B.2.1 Task 3: adapter materialisation sites from the most recent
-    /// `wrga_adapter_inject::run_with_compiler` call. Empty when WRGA is
-    /// disabled or no `@adapter` decorators are present.
+
+    // ── Dev Tools Phase 2: kernel-profile pre-pass ─────────────────────
+    pub prediction_map: HashMap<NodeId, crate::cost_model::OpCost>,
+    pub manifest_builder: Option<crate::profiling::instrument::ManifestBuilder>,
+    pub fusion_plan_for_profile: Option<crate::wrga_fusion::FusionPlan>,
+    pub source_text: String,
+    pub source_file_name: String,
+
+    // ── Dev Tools Phase 5: @inspect decorator state ─────────────────────
+    pub inspect_train_step_var: Option<cranelift_frontend::Variable>,
+    pub inspect_pinned_vars: std::collections::BTreeSet<crate::wengert::VarId>,
+
+    // ── WRGA Milestone B.2/B.3 adapter state ─────────────────────
     pub adapter_sites: Vec<crate::wrga_adapter_inject::AdapterSite>,
-    /// B.2.1 Task 3: override map from synthesized `MemberAccess` NodeId to
-    /// the resolved field name. Populated by `wrga_adapter_rewrite` when it
-    /// emits member-access nodes for adapter side-table fields whose names
-    /// are not present in the original source (and therefore not in the
-    /// `Interner`). `compile_member_access` consults this map first before
-    /// falling back to `resolve_sym(member)`.
     pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
-    /// B.2.1 Task 5.5: name of the model class whose method is currently
-    /// being compiled. Used by `compile_member_access` to resolve
-    /// synthesized-adapter-field accesses on `self` (whose obj_type
-    /// lookup returns Unknown because the rewrite pass synthesizes fresh
-    /// `SelfRef` nodes without type-map entries).
     pub current_method_model_name: Option<String>,
-    /// B.2.1 Task 5.5: WrgaPlan produced by the decorator-driven pre-scan
-    /// pass (`wrga_prescan::prescan_adapter_sites_from_decorators`).
-    /// Persists across the @train-block invocation, which overwrites
-    /// `last_wrga_plan` with a real Wengert-derived plan that lacks
-    /// decorated placements when target patterns don't syntactically
-    /// match the inferred placement names.
     pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
-    /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
-    /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
-    /// (but potentially different α/rank scales) share one PTX string.
-    /// Populated during the fusion-decision pass and consulted by the
-    /// CUDA launcher (Task 5) to pick the right kernel per call site.
     pub fused_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
-    /// B.3 Task 4: override map mirroring `synth_member_names` but for
-    /// Call callees.  The AST rewrite synthesizes `ExprKind::Call` nodes
-    /// whose callee Ident carries a sentinel Symbol; the real FFI name
-    /// (`nsl_adapter_fused_lora_matmul` / `nsl_adapter_fused_ia3_matmul`)
-    /// is resolved from this map by `expr_as_func_name`.
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
+
+    // ── Calibration retention pass (Task 4) ─────────────────────
+    /// DataId of the `__nsl_calib_retention_arena` .bss global.
+    /// `None` when `calibration_retention` is not set.
+    pub retention_arena_data_id: Option<cranelift_module::DataId>,
+    /// Per-projection byte offsets inside the retention arena.
+    /// Populated at the same time as `retention_arena_data_id`.
+    pub retention_offsets: std::collections::HashMap<String, u32>,
+
+    // ── WGGO override side-channel (Task 3) ─────────────────────
+    /// Per-layer WGGO decisions for consumer passes.  Populated in the
+    /// diagnostics section of `compile_quant_block` when `--wggo` is on;
+    /// read by CSHA, WRGA, and (future) FASE/Prune/Sharding consumers.
+    pub(crate) wggo_overrides: Option<crate::wggo_overrides::WggoOverrides>,
 }
 
 /// Quantization configuration for a model.
@@ -553,12 +550,22 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            prediction_map: HashMap::new(),
+            manifest_builder: None,
+            fusion_plan_for_profile: None,
+            source_text: String::new(),
+            source_file_name: String::new(),
+            inspect_train_step_var: None,
+            inspect_pinned_vars: std::collections::BTreeSet::new(),
             adapter_sites: Vec::new(),
             synth_member_names: std::collections::HashMap::new(),
             current_method_model_name: None,
             adapter_prescan_plan: None,
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
+            retention_arena_data_id: None,
+            retention_offsets: std::collections::HashMap::new(),
+            wggo_overrides: None,
         })
     }
 
@@ -576,6 +583,24 @@ impl<'a> Compiler<'a> {
     /// Defaults to CUDA when no target is specified.
     pub fn gpu_target(&self) -> crate::gpu_target::GpuTarget {
         crate::gpu_target::GpuTarget::from_target_string(&self.compile_options.target)
+    }
+
+    /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the
+    /// kernel rooted at `root`.  For non-fused kernels (or when no
+    /// `FusionPlan` is recorded for profiling), returns `vec![root]`.
+    pub fn fusion_constituents(&self, root: NodeId) -> Vec<NodeId> {
+        match &self.fusion_plan_for_profile {
+            Some(p) => p.constituents_of(root),
+            None => vec![root],
+        }
+    }
+
+    /// Returns a mutable borrow of the Compiler-owned FusionPlan when profiling
+    /// is active. Fusion passes should call this and thread the borrow into
+    /// apply_epilogue_fusion / apply_reduction_fusion so that mutations land
+    /// in the same instance that fusion_constituents reads.
+    pub fn profile_fusion_plan_mut(&mut self) -> Option<&mut crate::wrga_fusion::FusionPlan> {
+        self.fusion_plan_for_profile.as_mut()
     }
 
     /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`
@@ -907,6 +932,61 @@ impl<'a> Compiler<'a> {
             self.features.wcet_results.push(func_wcet);
         }
 
+        Ok(())
+    }
+
+    /// Task 4: Declare and define the `__nsl_calib_retention_arena` zeroinit
+    /// `.bss` global when `calibration_retention` is active.  Populates
+    /// `self.retention_arena_data_id` and `self.retention_offsets` for use
+    /// by the splice-point codegen in `expr/mod.rs`.
+    ///
+    /// # MVP note
+    /// Batch and seq are hard-coded to `8` and `4` here (matching the Task 10
+    /// fixture).  Task 6 will thread the real values from the calibration-data
+    /// header through `CompileOptions`.
+    pub fn emit_retention_arena(&mut self) -> Result<(), CodegenError> {
+        let projections = match self.compile_options.calibration_retention.clone() {
+            Some(ps) if !ps.is_empty() => ps,
+            _ => return Ok(()),
+        };
+
+        let (batch, seq) = self.compile_options.calibration_batch_seq.unwrap_or((8, 4));
+        let layout = crate::calibration::build_arena_layout(&projections, batch, seq);
+        let total = layout.total_bytes() as usize;
+        if total == 0 {
+            return Ok(());
+        }
+
+        // Declare a zeroinit global (lands in .bss on ELF targets).
+        let data_id = self
+            .module
+            .declare_data(
+                "__nsl_calib_retention_arena",
+                cranelift_module::Linkage::Export,
+                true,  // writable
+                false, // not TLS
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare retention arena data: {e}"
+                ))
+            })?;
+
+        let mut desc = DataDescription::new();
+        desc.define_zeroinit(total);
+        self.module
+            .define_data(data_id, &desc)
+            .map_err(|e| CodegenError::new(format!("failed to define retention arena: {e}")))?;
+
+        // Populate the offset map so splice-point IR can look up per-projection offsets.
+        let offsets: std::collections::HashMap<String, u32> = layout
+            .entries
+            .iter()
+            .map(|(p, off, _)| (p.0.clone(), *off))
+            .collect();
+
+        self.retention_arena_data_id = Some(data_id);
+        self.retention_offsets = offsets;
         Ok(())
     }
 
