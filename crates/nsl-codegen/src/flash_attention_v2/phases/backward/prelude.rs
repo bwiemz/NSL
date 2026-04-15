@@ -139,6 +139,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // (g_d = dx_norm * norm_weight).
     ptx.push_str("    .reg .f32 %f_g;                // dRMSNorm per-dim gradient term\n");
 
+    // Orchestrator scratch for cooperative dK + dV SMEM zero-init.
+    ptx.push_str("    .reg .u64 %rd_zero_idx;\n");
+    ptx.push_str("    .reg .f32 %f_zero_val;\n");
+    ptx.push_str("    .reg .pred %p_zero;\n");
+    // Finalize scratch for SMEM->HBM cooperative dK + dV copy.
+    ptx.push_str("    .reg .u64 %rd_dk_base, %rd_dk_idx, %rd_dk_smem, %rd_dk_hbm;\n");
+    ptx.push_str("    .reg .f32 %f_dk_tmp;\n");
+    ptx.push_str("    .reg .pred %p_dk;\n");
+
     // Backward HBM pointer registers (saved-activation inputs +
     // gradient outputs). Separate name so an unsuspecting forward
     // phase doesn't clobber them.

@@ -463,17 +463,53 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // (matches the forward orchestrator's tile cadence).
     let iters = (config.block_q as u32).div_ceil(4);
     let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
+
+    // Cooperatively zero the dV and dK SMEM tiles ONCE before the KV
+    // loop. Both tiles are block_kv × head_dim × 4 bytes f32; 128
+    // threads per block cooperatively zero
+    // `block_kv*head_dim*2 / 128` floats each.
+    let dv_off = smem_layout::backward_dv_offset(config);
+    let dk_off = smem_layout::backward_dk_offset(config);
+    let dk_dv_cells = (config.block_kv * config.head_dim) as u32;
+    let cells_per_thread = dk_dv_cells.div_ceil(128);
+    for (tag, off) in [("DV", dv_off), ("DK", dk_off)] {
+        ptx.push_str(&format!(
+            "    // BWD zero-init {tag} SMEM tile ({dk_dv_cells} cells, \
+             {cells_per_thread}/thread)\n"
+        ));
+        for k in 0..cells_per_thread {
+            let thread_cell = k * 128;
+            // cell_idx = tid + k*128; byte_off = off + cell_idx*4
+            ptx.push_str("    cvt.u64.u32 %rd_zero_idx, %tid_x;\n");
+            if thread_cell > 0 {
+                ptx.push_str(&format!(
+                    "    add.u64 %rd_zero_idx, %rd_zero_idx, {};\n",
+                    thread_cell
+                ));
+            }
+            // Guard (only stores in-range cells): cell_idx < total
+            ptx.push_str(&format!(
+                "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", dk_dv_cells
+            ));
+            ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
+            ptx.push_str(&format!(
+                "    add.u64 %rd_zero_idx, %rd_zero_idx, {off};\n"
+            ));
+            ptx.push_str("    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;\n");
+            ptx.push_str("    mov.f32 %f_zero_val, 0f00000000;\n");
+            ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
+        }
+    }
+    ptx.push_str("    bar.sync 0;  // dV + dK tiles zeroed\n");
+
     for q_iter in 0..iters {
         ptx.push_str(&format!(
             "    // ====== BWD q_tile_iter = {q_iter} / {iters} ======\n"
         ));
-        // Accumulator reset — belongs in the orchestrator per the phase
-        // contracts in dv_accum / dqdk_accum (their emit functions
-        // intentionally omit the zero-init).
+        // %f_dq_{slice} register-held accumulator reset per iter.
+        // (dV/dK now use SMEM tiles zeroed above, so no per-iter reset.)
         for slice in 0..slices_per_lane {
             ptx.push_str(&format!("    mov.f32 %f_dq_{slice}, 0f00000000;\n"));
-            ptx.push_str(&format!("    mov.f32 %f_dk_{slice}, 0f00000000;\n"));
-            ptx.push_str(&format!("    mov.f32 %f_dv_{slice}, 0f00000000;\n"));
         }
         phases::backward::ds_compute::emit(&mut ptx, config, q_iter);
         phases::backward::dv_accum::emit(&mut ptx, config, q_iter);
@@ -567,11 +603,16 @@ mod backward_orchestrator_tests {
     fn synthesize_backward_emits_accumulator_resets() {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let ptx = synthesize_backward(&cfg).expect("synth backward");
-        // Orchestrator, not per-phase emit, owns the zero-init of
-        // %f_dq_*/%f_dk_*/%f_dv_* — verify they're present in the
-        // final kernel.
+        // dQ is register-held — orchestrator zero-inits %f_dq_{slice}
+        // per q_tile_iter (cross-iter accumulation not needed; dQ has
+        // unique per-thread cell ownership).
         assert!(ptx.contains("mov.f32 %f_dq_0, 0f00000000"));
-        assert!(ptx.contains("mov.f32 %f_dk_0, 0f00000000"));
-        assert!(ptx.contains("mov.f32 %f_dv_0, 0f00000000"));
+        // dK and dV migrated to SMEM tiles (backward_dk_offset /
+        // backward_dv_offset). Orchestrator cooperatively zeros the
+        // tiles ONCE before the KV loop rather than per-iter resets.
+        assert!(ptx.contains("BWD zero-init DK SMEM tile"),
+            "orchestrator must zero dK SMEM tile");
+        assert!(ptx.contains("BWD zero-init DV SMEM tile"),
+            "orchestrator must zero dV SMEM tile");
     }
 }

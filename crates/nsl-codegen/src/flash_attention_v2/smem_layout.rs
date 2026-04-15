@@ -87,6 +87,18 @@ pub fn backward_ds_offset(config: &FlashAttentionConfig) -> u32 {
     backward_p_offset(config) + (config.block_q * config.block_kv * 4) as u32
 }
 
+/// SMEM byte offset of the dV accumulator tile. f32 row-major
+/// `[block_kv, head_dim]`. Lives immediately after the dS tile.
+pub fn backward_dv_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_ds_offset(config) + (config.block_q * config.block_kv * 4) as u32
+}
+
+/// SMEM byte offset of the dK accumulator tile. f32 row-major
+/// `[block_kv, head_dim]`. Lives immediately after the dV tile.
+pub fn backward_dk_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_dv_offset(config) + (config.block_kv * config.head_dim * 4) as u32
+}
+
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
 ///
 /// `direction` controls whether the backward-pass extra SMEM tiles are

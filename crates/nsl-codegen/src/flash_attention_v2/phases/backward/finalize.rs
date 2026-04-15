@@ -72,78 +72,68 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     }
     ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
 
-    // dK/dV: row_idx is keyed by lane (KV row), NOT warp_row. We ALSO
-    // gate on warp_id == 0 so only one warp performs the store per
-    // KV row (four warps share the lane ownership; all produced the
-    // same accumulator via reduction — actually no, each warp's
-    // accumulator covers only its own 4 Q rows, so dk/dv across warps
-    // partition the sum). Warps must collectively reduce before
-    // storing. For the first correctness pass (block_q=block_kv=32,
-    // single iter), we accept the per-warp-own-partial and store ONLY
-    // from warp_id=0 to avoid clobbering. Cross-warp reduction is a
-    // follow-up.
-    ptx.push_str("    setp.eq.u32 %p1, %warp_id, 0;\n");
-    ptx.push_str(&format!(
-        "    @!%p1 bra V2_BWD_STORE_DK_DV_WARP_SKIP_{q_tile_iter};\n"
-    ));
-    // kv_row_idx (global HBM) = batch_idx*(heads*seq) + head_idx*seq + lane
-    ptx.push_str("    cvt.u64.u32 %rd33, %lane;\n");
-    ptx.push_str("    mul.lo.u64 %rd34, %batch_idx, %rd5;\n");
-    ptx.push_str("    add.u64 %rd34, %rd34, %head_idx;\n");
-    ptx.push_str("    mul.lo.u64 %rd34, %rd34, %rd6;\n");
-    ptx.push_str("    add.u64 %rd34, %rd34, %rd33;\n");
-    ptx.push_str("    mul.lo.u64 %rd34, %rd34, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd34, %rd34, 1;  // * 2 (f16)\n");
-
-    for (label, acc_prefix, ptr_reg, ptr_name) in [
-        ("DK", "%f_dk_", "%rd_bwd_dk", "dk_ptr"),
-        ("DV", "%f_dv_", "%rd_bwd_dv", "dv_ptr"),
+    // dK / dV: cooperative SMEM → HBM copy. Both tiles are
+    //   [block_kv, head_dim] f32, row-major, living at backward_dk_offset
+    //   and backward_dv_offset. We convert to f16 and store with layout
+    //   [batch, heads, seq, head_dim] — SMEM row `r` maps to HBM kv_row
+    //   `r` (= this block's KV segment starts at row index 0 for the
+    //   single-KV-block configs this first cut supports).
+    //
+    // Coverage: block_kv * head_dim cells total. 128 threads cooperatively
+    // copy cells_per_thread = ceil(total / 128) each.
+    let total_cells = (config.block_kv as u32) * head_dim;
+    let cells_per_thread = total_cells.div_ceil(128);
+    let dk_smem_off = crate::flash_attention_v2::smem_layout::backward_dk_offset(config);
+    let dv_smem_off = crate::flash_attention_v2::smem_layout::backward_dv_offset(config);
+    for (label, ptr_reg, ptr_name, smem_off) in [
+        ("DK", "%rd_bwd_dk", "dk_ptr", dk_smem_off),
+        ("DV", "%rd_bwd_dv", "dv_ptr", dv_smem_off),
     ] {
-        ptx.push_str(&format!("    // store via [{ptr_name}]\n"));
-        ptx.push_str(&format!("    // -- {label} store --\n"));
+        ptx.push_str(&format!(
+            "    // -- {label} store via [{ptr_name}] (coop SMEM->HBM) --\n"
+        ));
         ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
         ptx.push_str(&format!(
             "    @%p0 bra V2_BWD_STORE_{label}_SKIP_{q_tile_iter};\n"
         ));
-        for slice in 0..slices_per_lane {
-            // For dk/dv the lane maps to the KV row (stored in
-            // row-major [kv_row, col] layout); col is what the lane
-            // would normally own, but since lane_id is the row, the
-            // lane owns every column of its row. Store all head_dim
-            // entries per lane — only slice=0 is the lane's own
-            // accumulator value, but accumulators %f_dv_{slice} for
-            // slice>0 correspond to column index (lane*slices+slice)
-            // which isn't this row's column. For the
-            // single-head-single-slice head_dim=32 smoke target,
-            // slices_per_lane=1 so this loop body runs once and
-            // column = lane = correct KV row column match.
-            //
-            // TODO(head_dim>32): the dV/dK accumulator layout needs
-            // reindexing when slices_per_lane > 1 (each lane owns a
-            // d-slice but dk/dv rows are keyed by lane_as_row, not
-            // lane_as_col). See follow-up notes.
-            let _ = slice;
-            ptx.push_str("    cvt.u64.u32 %rd35, %lane;\n");
-            if slices_per_lane > 1 {
+        // HBM base for this block's KV segment:
+        //   ((batch_idx*heads + head_idx)*seq + 0) * head_dim * 2
+        ptx.push_str("    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;\n");
+        ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;\n");
+        ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;\n");
+        ptx.push_str("    shl.b64 %rd_dk_base, %rd_dk_base, 1;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dk_base, {ptr_reg}, %rd_dk_base;\n"
+        ));
+        for k in 0..cells_per_thread {
+            let thread_cell = k * 128;
+            ptx.push_str("    cvt.u64.u32 %rd_dk_idx, %tid_x;\n");
+            if thread_cell > 0 {
                 ptx.push_str(&format!(
-                    "    mul.lo.u64 %rd35, %rd35, {slices_per_lane};\n"
+                    "    add.u64 %rd_dk_idx, %rd_dk_idx, {};\n", thread_cell
                 ));
             }
-            ptx.push_str("    shl.b64 %rd35, %rd35, 1;\n");
-            ptx.push_str("    add.u64 %rd36, %rd34, %rd35;\n");
-            ptx.push_str(&format!("    add.u64 %rd36, {ptr_reg}, %rd36;\n"));
             ptx.push_str(&format!(
-                "    cvt.rn.f16.f32 %h0, {acc_prefix}{slice};\n"
+                "    setp.lt.u64 %p_dk, %rd_dk_idx, {};\n", total_cells
             ));
-            ptx.push_str("    st.global.b16 [%rd36], %h0;\n");
+            // SMEM f32 load
+            ptx.push_str("    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;\n");
+            ptx.push_str(&format!(
+                "    add.u64 %rd_dk_smem, %rd_dk_smem, {smem_off};\n"
+            ));
+            ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
+            ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
+            // HBM f16 store
+            ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;\n");
+            ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
+            ptx.push_str("    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;\n");
+            ptx.push_str("    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;\n");
         }
         ptx.push_str(&format!(
             "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
         ));
     }
-    ptx.push_str(&format!(
-        "V2_BWD_STORE_DK_DV_WARP_SKIP_{q_tile_iter}:\n"
-    ));
 
     // ── f16 stores: dwq, dwk, dwv (shape [d_model, heads*head_dim]) ──────
     //
