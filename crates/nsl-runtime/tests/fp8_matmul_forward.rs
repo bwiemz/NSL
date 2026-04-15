@@ -1,3 +1,5 @@
+#![cfg(feature = "test-hooks")]
+
 //! Integration tests for E4M3 forward matmul — output of nsl_fp8_matmul
 //! agrees with the scalar reference within E4M3_REL_TOL (2%).
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "test-hooks")]
+
 //! Integration tests for nsl_fp8_cast — f32 → FP8 → f32 round-trip
 //! correctness across E4M3 and E5M2 formats.
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "test-hooks")]
+
 //! Integration tests for nsl_fp8_compute_scale — verifies scale =
 //! max_abs / FP8_MAX for both formats, plus edge cases.
 

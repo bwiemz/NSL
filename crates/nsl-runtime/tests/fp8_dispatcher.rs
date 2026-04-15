@@ -1,3 +1,5 @@
+#![cfg(feature = "test-hooks")]
+
 //! Integration tests for FP8 matmul dispatcher — MMA kernel output and
 //! CPU fallback output must agree within DISPATCH_ABS_TOL (1e-5) at all
 //! tested shapes. Divergence > 1e-5 indicates an algorithmic difference,

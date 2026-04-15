@@ -1,3 +1,5 @@
+#![cfg(feature = "test-hooks")]
+
 //! Integration tests for E5M2 backward matmul — output of
 //! fp8_matmul_e5m2_backward agrees with the scalar reference within
 //! E5M2_REL_TOL (10%).
