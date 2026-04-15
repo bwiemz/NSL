@@ -625,6 +625,21 @@ pub fn emit_v_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_t
 /// - Per-tensor pointer null-guards allow partial-save configs (e.g. only Q
 ///   saved during early bring-up).
 pub fn emit_save_activations(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    emit_save_activations_subset(ptx, config, q_tile_iter, SaveSet::All);
+}
+
+/// Which of the Q/K/V saves to emit. `QK` runs in the S-pass (while Q and K
+/// SMEM tiles are live and post-RoPE); `V` runs after the V pre-pass (V SMEM
+/// aliases K during the S-pass, so an early V save would store K's bytes).
+#[derive(Copy, Clone)]
+pub enum SaveSet { All, QK, V }
+
+pub fn emit_save_activations_subset(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    set: SaveSet,
+) {
     let save = config
         .csha
         .as_ref()
@@ -637,18 +652,25 @@ pub fn emit_save_activations(ptx: &mut String, config: &FlashAttentionConfig, q_
     let slices_per_lane = (head_dim / 32).max(1);
 
     ptx.push_str(&format!(
-        "    // CSHA Tier C: save post-RoPE Q/K/V activations (q_tile_iter={}, slices/lane={})\n",
-        q_tile_iter, slices_per_lane
+        "    // CSHA Tier C: save post-RoPE activations (q_tile_iter={}, slices/lane={}, set={:?})\n",
+        q_tile_iter, slices_per_lane,
+        match set { SaveSet::All => "All", SaveSet::QK => "QK", SaveSet::V => "V" }
     ));
 
     // Fence: ensure no attention-body reads of Q/K/V SMEM have commenced.
-    ptx.push_str("    bar.sync 0;  // FENCE: save path must see final SMEM Q/K/V tiles\n");
+    ptx.push_str("    bar.sync 0;  // FENCE: save path must see final SMEM tiles\n");
 
-    for (label, ptr_name, smem_base) in [
+    let all = [
         ("Q", "q_proj_ptr", "%q_smem_base"),
         ("K", "k_proj_ptr", "%k_smem_base"),
         ("V", "v_proj_ptr", "%v_smem_base"),
-    ] {
+    ];
+    let entries: &[(&str, &str, &str)] = match set {
+        SaveSet::All => &all,
+        SaveSet::QK => &all[0..2],
+        SaveSet::V  => &all[2..3],
+    };
+    for &(label, ptr_name, smem_base) in entries {
         ptx.push_str(&format!(
             "    // -- Save {label} activation to HBM via [{ptr_name}] --\n"
         ));
