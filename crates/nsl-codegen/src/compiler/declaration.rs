@@ -77,6 +77,18 @@ impl Compiler<'_> {
                 .functions
                 .insert(raw_name.clone(), (func_id, sig));
 
+            // M62: record ExportInfo for @export functions so the CLI can
+            // emit a matching C header after codegen finishes.
+            if is_export {
+                let info = crate::c_header::ExportInfo::from_fn_def(
+                    fn_def,
+                    &raw_name,
+                    &symbol_name,
+                    self.interner,
+                );
+                self.features.export_functions.push(info);
+            }
+
             // Track decorated functions
             if let Some(decos) = decorators {
                 for d in decos {

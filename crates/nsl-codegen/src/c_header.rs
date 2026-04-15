@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use nsl_ast::decl::FnDef;
+use nsl_ast::types::{DeviceExpr, DimExpr, DimValue, TypeExpr, TypeExprKind};
+use nsl_lexer::Interner;
+
 /// Per-function metadata for a single `@export` function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportInfo {
@@ -62,6 +66,138 @@ pub enum ExportDevice {
     Any,
 }
 
+/// Map an NSL dtype name (as it appears in `Tensor<[...], dtype, ...>`
+/// or a bare scalar type) to the corresponding `ExportDtype`. Unknown
+/// names default to `F32`; semantic validation (Task 4) rejects anything
+/// unsupported before we reach this path.
+fn lower_dtype_name(name: &str) -> ExportDtype {
+    match name {
+        "f32" | "fp32" | "float" | "float32" => ExportDtype::F32,
+        "f64" | "fp64" | "double" | "float64" => ExportDtype::F64,
+        "f16" | "fp16" | "half" | "float16" => ExportDtype::F16,
+        "bf16" | "bfloat16" => ExportDtype::BF16,
+        "i8" | "int8" => ExportDtype::I8,
+        "i16" | "int16" => ExportDtype::I16,
+        "i32" | "int32" | "int" => ExportDtype::I32,
+        "i64" | "int64" | "long" => ExportDtype::I64,
+        "u8" | "uint8" => ExportDtype::U8,
+        "u16" | "uint16" => ExportDtype::U16,
+        "u32" | "uint32" => ExportDtype::U32,
+        "u64" | "uint64" => ExportDtype::U64,
+        "bool" => ExportDtype::Bool,
+        _ => ExportDtype::F32,
+    }
+}
+
+fn lower_device(dev: &DeviceExpr) -> ExportDevice {
+    match dev {
+        DeviceExpr::Cpu => ExportDevice::Cpu,
+        DeviceExpr::Cuda(_) | DeviceExpr::Rocm(_) | DeviceExpr::Metal => ExportDevice::Cuda,
+        DeviceExpr::Npu(_) => ExportDevice::Any,
+    }
+}
+
+fn stringify_dim(dim: &DimExpr, interner: &Interner) -> String {
+    match dim {
+        DimExpr::Concrete(n) => n.to_string(),
+        DimExpr::Symbolic(sym) => interner.resolve(sym.0).unwrap_or("").to_string(),
+        DimExpr::Named { name, value } => {
+            let name_str = interner.resolve(name.0).unwrap_or("");
+            if !name_str.is_empty() {
+                name_str.to_string()
+            } else {
+                match value {
+                    DimValue::String(s) => s.clone(),
+                    DimValue::Int(n) => n.to_string(),
+                }
+            }
+        }
+        DimExpr::Bounded { name, .. } => interner.resolve(name.0).unwrap_or("").to_string(),
+        DimExpr::Wildcard => "_".to_string(),
+    }
+}
+
+/// Lower an AST `TypeExpr` into an `ExportTypeInfo`. Only the subset
+/// allowed by `@export` semantic validation (Task 4) is meaningfully
+/// represented; unsupported shapes fall through to `Tuple(vec![])`.
+pub fn lower_type_expr(ty: &TypeExpr, interner: &Interner) -> ExportTypeInfo {
+    match &ty.kind {
+        TypeExprKind::Tensor {
+            shape,
+            dtype,
+            device,
+        } => {
+            let shape_strs: Vec<String> =
+                shape.iter().map(|d| stringify_dim(d, interner)).collect();
+            let dtype_str = interner.resolve(dtype.0).unwrap_or("");
+            let dev = device
+                .as_ref()
+                .map(lower_device)
+                .unwrap_or(ExportDevice::Any);
+            ExportTypeInfo::Tensor {
+                shape: shape_strs,
+                dtype: lower_dtype_name(dtype_str),
+                device: dev,
+            }
+        }
+        TypeExprKind::Param { shape, dtype }
+        | TypeExprKind::Buffer { shape, dtype } => {
+            let shape_strs: Vec<String> =
+                shape.iter().map(|d| stringify_dim(d, interner)).collect();
+            let dtype_str = interner.resolve(dtype.0).unwrap_or("");
+            ExportTypeInfo::Tensor {
+                shape: shape_strs,
+                dtype: lower_dtype_name(dtype_str),
+                device: ExportDevice::Any,
+            }
+        }
+        TypeExprKind::Named(sym) => {
+            let name = interner.resolve(sym.0).unwrap_or("");
+            ExportTypeInfo::Scalar(lower_dtype_name(name))
+        }
+        TypeExprKind::Tuple(elems) => {
+            ExportTypeInfo::Tuple(elems.iter().map(|t| lower_type_expr(t, interner)).collect())
+        }
+        _ => ExportTypeInfo::Tuple(vec![]),
+    }
+}
+
+impl ExportInfo {
+    /// Build an `ExportInfo` from a type-checked `FnDef` signature.
+    /// Called from `declaration.rs` when a function is decorated with
+    /// `@export`.
+    pub fn from_fn_def(
+        fn_def: &FnDef,
+        raw_name: &str,
+        symbol_name: &str,
+        interner: &Interner,
+    ) -> Self {
+        let params = fn_def
+            .params
+            .iter()
+            .map(|p| ExportParamInfo {
+                name: interner.resolve(p.name.0).unwrap_or("").to_string(),
+                ty: match &p.type_ann {
+                    Some(ty) => lower_type_expr(ty, interner),
+                    None => ExportTypeInfo::Tuple(vec![]),
+                },
+            })
+            .collect();
+
+        let return_type = match &fn_def.return_type {
+            Some(ty) => lower_type_expr(ty, interner),
+            None => ExportTypeInfo::Tuple(vec![]),
+        };
+
+        Self {
+            symbol_name: symbol_name.to_string(),
+            raw_name: raw_name.to_string(),
+            params,
+            return_type,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +223,79 @@ mod tests {
         };
         assert_eq!(info.params.len(), 1);
         assert_eq!(info.symbol_name, "forward");
+    }
+
+    #[test]
+    fn export_info_from_simple_fn_def() {
+        use nsl_ast::decl::{FnDef, Param};
+        use nsl_ast::types::{DimExpr, TypeExpr, TypeExprKind};
+        use nsl_ast::{NodeId, Span, Symbol};
+        use string_interner::StringInterner;
+
+        let mut interner: Interner = StringInterner::new();
+        let x_sym = Symbol(interner.get_or_intern("x"));
+        let b_sym = Symbol(interner.get_or_intern("B"));
+        let f32_sym = Symbol(interner.get_or_intern("f32"));
+        let fn_name_sym = Symbol(interner.get_or_intern("forward"));
+
+        let param_ty = TypeExpr {
+            kind: TypeExprKind::Tensor {
+                shape: vec![DimExpr::Symbolic(b_sym), DimExpr::Concrete(768)],
+                dtype: f32_sym,
+                device: None,
+            },
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+        let ret_ty = TypeExpr {
+            kind: TypeExprKind::Tensor {
+                shape: vec![DimExpr::Symbolic(b_sym), DimExpr::Concrete(1000)],
+                dtype: f32_sym,
+                device: None,
+            },
+            span: Span::dummy(),
+            id: NodeId::dummy(),
+        };
+
+        let fn_def = FnDef {
+            name: fn_name_sym,
+            type_params: vec![],
+            effect_params: vec![],
+            params: vec![Param {
+                name: x_sym,
+                type_ann: Some(param_ty),
+                default: None,
+                is_variadic: false,
+                span: Span::dummy(),
+            }],
+            return_type: Some(ret_ty),
+            return_effect: None,
+            body: nsl_ast::stmt::Block {
+                stmts: vec![],
+                span: Span::dummy(),
+            },
+            is_async: false,
+            span: Span::dummy(),
+        };
+
+        let info = ExportInfo::from_fn_def(&fn_def, "forward", "forward", &interner);
+        assert_eq!(info.symbol_name, "forward");
+        assert_eq!(info.raw_name, "forward");
+        assert_eq!(info.params.len(), 1);
+        assert_eq!(info.params[0].name, "x");
+        match &info.params[0].ty {
+            ExportTypeInfo::Tensor { shape, dtype, .. } => {
+                assert_eq!(shape, &vec!["B".to_string(), "768".to_string()]);
+                assert_eq!(*dtype, ExportDtype::F32);
+            }
+            _ => panic!("expected Tensor param"),
+        }
+        match &info.return_type {
+            ExportTypeInfo::Tensor { shape, dtype, .. } => {
+                assert_eq!(shape, &vec!["B".to_string(), "1000".to_string()]);
+                assert_eq!(*dtype, ExportDtype::F32);
+            }
+            _ => panic!("expected Tensor return"),
+        }
     }
 }
