@@ -273,6 +273,7 @@ fn csha_l2_rope_ptx_assembles_on_sm120() {
 /// in the resulting `FlashAttentionCompileContext`.  Reverting any of the
 /// three fixed call-sites in `kernel.rs` back to `gpu_sm: 80` would cause
 /// this test to fail for every SM other than `sm_80`.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn a1_gpu_sm_matches_compile_target() {
     // (compile target string, expected gpu_sm value)
