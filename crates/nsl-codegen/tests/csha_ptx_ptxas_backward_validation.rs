@@ -437,3 +437,51 @@ fn backward_full_pipeline_ptxas_clean_sm75_sm90_sm120() {
         );
     }
 }
+
+#[test]
+fn synthesize_backward_orchestrator_ptxas_clean_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("skipping: ptxas not found");
+        return;
+    };
+    use nsl_codegen::flash_attention_v2::synthesize_backward;
+    for (causal, rope_q, tag) in [
+        (false, false, "plain"),
+        (true, false, "causal"),
+        (false, true, "rope"),
+    ] {
+        let base = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal, paged: false, rope_q,
+            rope_style: RopeStyle::Adjacent,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model: 32,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut failures = Vec::new();
+        for sm in &["sm_75", "sm_90", "sm_120"] {
+            let mut c = base.clone();
+            c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+            let mut ptx = synthesize_backward(&c).expect("synth_backward");
+            // Strip trailing NUL for stdin feed (kept for cuModuleLoadData).
+            if ptx.ends_with('\0') { ptx.pop(); }
+            let bytes = ptx.into_bytes();
+            let dump = std::env::temp_dir()
+                .join(format!("synth_backward_{tag}_{sm}.ptx"));
+            std::fs::write(&dump, &bytes).ok();
+            if let Err(err) = assemble_ptx(&ptxas, &bytes, sm) {
+                failures.push(format!("tag={tag} sm={sm} dump={} ptxas:\n{err}",
+                    dump.display()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "synthesize_backward ({tag}) ptxas failures:\n{}",
+            failures.join("\n---\n")
+        );
+    }
+}

@@ -421,3 +421,153 @@ pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
 pub fn shared_mem_bytes_v2(config: &FlashAttentionConfig) -> u32 {
     smem_layout::total_bytes(config)
 }
+
+/// Tier C backward orchestrator — emits the full backward PTX kernel by
+/// wiring every Phase 3 emitter in the correct execution order.
+///
+/// Order (mirrors the CPU reference in `tests/csha_reference.rs`):
+///   1. prelude — .visible .entry, register pool, pointer loads.
+///   2. q_load — cooperative HBM load of saved post-RoPE Q_proj.
+///   3. Per q_tile_iter (4 Q rows each):
+///        accumulator reset (%f_dq_*, %f_dk_*, %f_dv_* ← 0)
+///        ds_compute — P recompute + dP + dS with softmax Jacobian
+///        dv_accum   — P^T @ dO
+///        dqdk_accum — dS @ K, dS^T @ Q
+///   4. dRoPE (Q + K inverse rotation, skipped when rope_q=false).
+///   5. dproj — dWq/dWk/dWv weight gradient accumulations.
+///   6. dRMSNorm — closed-form dx.
+///   7. finalize — cooperative HBM stores of all 7 gradients + final
+///      bar.sync.
+///
+/// Returns `Err` if the validator rejects the config in
+/// `Direction::Backward` (the 99 KB budget check includes
+/// `backward_extra_bytes` for the gradient accumulator tiles).
+pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, String> {
+    smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
+        .map_err(|e| format!("backward validator rejected: {e}"))?;
+
+    let mut ptx = String::new();
+
+    // Phase 0: header, .visible .entry, SMEM, register pool, indices.
+    phases::backward::prelude::emit(&mut ptx, config);
+
+    // Phase 1: load saved post-RoPE Q from HBM into the Q SMEM tile.
+    // Fired once; subsequent q_tile_iter iterations read from this tile.
+    phases::backward::q_load::emit(&mut ptx, config, 0);
+
+    // Phase 2: per q_tile_iter KV loop. One iter per 4-row warp group
+    // (matches the forward orchestrator's tile cadence).
+    let iters = (config.block_q as u32).div_ceil(4);
+    let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
+    for q_iter in 0..iters {
+        ptx.push_str(&format!(
+            "    // ====== BWD q_tile_iter = {q_iter} / {iters} ======\n"
+        ));
+        // Accumulator reset — belongs in the orchestrator per the phase
+        // contracts in dv_accum / dqdk_accum (their emit functions
+        // intentionally omit the zero-init).
+        for slice in 0..slices_per_lane {
+            ptx.push_str(&format!("    mov.f32 %f_dq_{slice}, 0f00000000;\n"));
+            ptx.push_str(&format!("    mov.f32 %f_dk_{slice}, 0f00000000;\n"));
+            ptx.push_str(&format!("    mov.f32 %f_dv_{slice}, 0f00000000;\n"));
+        }
+        phases::backward::ds_compute::emit(&mut ptx, config, q_iter);
+        phases::backward::dv_accum::emit(&mut ptx, config, q_iter);
+        phases::backward::dqdk_accum::emit(&mut ptx, config, q_iter);
+    }
+
+    // Phase 3: CSHA hooks (inverse RoPE, weight gradients, dRMSNorm).
+    // Fire once — they operate on the accumulated dQ/dK/dV tiles.
+    phases::backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
+    phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
+    phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
+
+    // Phase 4: cooperative global stores of the 7 gradients + final fence.
+    phases::backward::finalize::emit(&mut ptx, config, 0);
+
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+    // NUL-terminate so cuModuleLoadData accepts the byte slice.
+    ptx.push('\0');
+    Ok(ptx)
+}
+
+#[cfg(test)]
+mod backward_orchestrator_tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    fn base_cfg_fused_backward(
+        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+    ) -> FlashAttentionConfig {
+        let _ = heads;
+        FlashAttentionConfig {
+            block_q, block_kv, head_dim,
+            causal: false, paged: false, rope_q: true,
+            rope_style: RopeStyle::Adjacent,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model,
+                ..CshaExtras::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn synthesize_backward_emits_all_phases_in_order() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let ptx = synthesize_backward(&cfg).expect("synth backward");
+
+        let idx_prelude = ptx.find(".visible .entry").expect(".visible .entry missing");
+        let idx_qload = ptx.find("V2_BWD_Q_LOAD_0:").expect("q_load label missing");
+        let idx_ds = ptx.find("V2_BWD_DS_0:").expect("dS label missing");
+        let idx_dv = ptx.find("V2_BWD_DV_ACCUM_0:").expect("dV label missing");
+        let idx_dq = ptx.find("V2_BWD_DQ_ACCUM_0:").expect("dQ label missing");
+        let idx_drope = ptx.find("V2_BWD_DROPE_Q_LOOP_0:").expect("dRoPE label missing");
+        let idx_dproj = ptx.find("V2_BWD_DPROJ_WQ_LOOP_0:").expect("dproj label missing");
+        let idx_drmsnorm = ptx.find("V2_BWD_DRMSNORM_0:").expect("dRMSNorm label missing");
+        let idx_final = ptx.find("ret;").expect("ret missing");
+
+        assert!(idx_prelude < idx_qload, "prelude before q_load");
+        assert!(idx_qload < idx_ds, "q_load before ds");
+        assert!(idx_ds < idx_dv, "ds before dV");
+        assert!(idx_dv < idx_dq, "dV before dQ");
+        assert!(idx_dq < idx_drope, "dQ/dK before dRoPE");
+        assert!(idx_drope < idx_dproj, "dRoPE before dproj");
+        assert!(idx_dproj < idx_drmsnorm, "dproj before dRMSNorm");
+        assert!(idx_drmsnorm < idx_final, "dRMSNorm before ret");
+    }
+
+    #[test]
+    fn synthesize_backward_rejects_over_budget_config() {
+        // head_dim=64, heads=8, block_q=64 with backward tiles should
+        // blow the 99 KB cap (see T2.1's rejection test).
+        let cfg = base_cfg_fused_backward(64, 64, 64, 8, 64);
+        let err = synthesize_backward(&cfg)
+            .expect_err("expected backward validator rejection");
+        assert!(err.contains("backward validator rejected"), "err: {err}");
+        assert!(err.contains("Backward"), "err must name direction: {err}");
+    }
+
+    #[test]
+    fn synthesize_backward_nul_terminated() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let ptx = synthesize_backward(&cfg).expect("synth backward");
+        assert!(ptx.ends_with('\0'),
+            "cuModuleLoadData requires NUL terminator");
+    }
+
+    #[test]
+    fn synthesize_backward_emits_accumulator_resets() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let ptx = synthesize_backward(&cfg).expect("synth backward");
+        // Orchestrator, not per-phase emit, owns the zero-init of
+        // %f_dq_*/%f_dk_*/%f_dv_* — verify they're present in the
+        // final kernel.
+        assert!(ptx.contains("mov.f32 %f_dq_0, 0f00000000"));
+        assert!(ptx.contains("mov.f32 %f_dk_0, 0f00000000"));
+        assert!(ptx.contains("mov.f32 %f_dv_0, 0f00000000"));
+    }
+}
