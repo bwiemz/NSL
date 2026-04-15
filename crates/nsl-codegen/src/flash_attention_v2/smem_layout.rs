@@ -62,6 +62,10 @@ pub enum Direction {
 ///   dQ    tile: block_q × head_dim × 4 (reserved, register-held today)
 ///   dK    tile: block_kv × head_dim × 4 (reserved)
 ///   dV    tile: block_kv × head_dim × 4 (reserved)
+///   V_in  tile: block_kv × head_dim × 2 (f16 V input for backward; can NOT
+///              alias the forward kv_offset slot because backward's
+///              emit_v otherwise clobbers K mid-kernel before ds_compute
+///              reads it — see commit fixing bug #2).
 pub fn backward_extra_bytes(config: &FlashAttentionConfig) -> u32 {
     let bq = config.block_q as u32;
     let bkv = config.block_kv as u32;
@@ -71,7 +75,8 @@ pub fn backward_extra_bytes(config: &FlashAttentionConfig) -> u32 {
     let dq = bq * hd * 4;
     let dk = bkv * hd * 4;
     let dv = bkv * hd * 4;
-    p + ds + dq + dk + dv
+    let v_in = bkv * hd * 2;
+    p + ds + dq + dk + dv + v_in
 }
 
 /// SMEM byte offset of the recomputed P tile (Tier C backward).
@@ -87,16 +92,34 @@ pub fn backward_ds_offset(config: &FlashAttentionConfig) -> u32 {
     backward_p_offset(config) + (config.block_q * config.block_kv * 4) as u32
 }
 
-/// SMEM byte offset of the dV accumulator tile. f32 row-major
-/// `[block_kv, head_dim]`. Lives immediately after the dS tile.
-pub fn backward_dv_offset(config: &FlashAttentionConfig) -> u32 {
+/// SMEM byte offset of the dQ accumulator tile. f32 row-major
+/// `[block_q, head_dim]`. Lives immediately after the dS tile.
+///
+/// Per-iter %f_dq_{slice} registers are flushed into this tile after
+/// each q_tile_iter so finalize can read the full dQ rather than only
+/// the last iter's register state.
+pub fn backward_dq_offset(config: &FlashAttentionConfig) -> u32 {
     backward_ds_offset(config) + (config.block_q * config.block_kv * 4) as u32
+}
+
+/// SMEM byte offset of the dV accumulator tile. f32 row-major
+/// `[block_kv, head_dim]`. Lives immediately after the dQ tile.
+pub fn backward_dv_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_dq_offset(config) + (config.block_q * config.head_dim * 4) as u32
 }
 
 /// SMEM byte offset of the dK accumulator tile. f32 row-major
 /// `[block_kv, head_dim]`. Lives immediately after the dV tile.
 pub fn backward_dk_offset(config: &FlashAttentionConfig) -> u32 {
     backward_dv_offset(config) + (config.block_kv * config.head_dim * 4) as u32
+}
+
+/// SMEM byte offset of the backward-pass V input tile (f16 row-major
+/// `[block_kv, head_dim]`). MUST be disjoint from the forward `kv_offset`
+/// slot that holds K, because the backward's `kv_load::emit_v` would
+/// otherwise overwrite K mid-kernel before `ds_compute` reads it.
+pub fn backward_v_input_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_dk_offset(config) + (config.block_kv * config.head_dim * 4) as u32
 }
 
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
@@ -457,9 +480,10 @@ mod tests {
     fn direction_backward_adds_extra_bytes() {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let extra = backward_extra_bytes(&cfg);
-        // P = 32*32*4 = 4096; dQ = dK = dV = 32*32*4 = 4096 each → 16384 total.
-        // P + dS + dQ + dK + dV, each 32*32*4 = 4096 at this config.
-        assert_eq!(extra, 20480, "backward_extra_bytes = P+dS+dQ+dK+dV");
+        // P = dS = dQ = dK = dV = 32*32*4 = 4096 each (20480); V_in = 32*32*2 = 2048.
+        // Total = 22528.
+        assert_eq!(extra, 22528,
+            "backward_extra_bytes = P+dS+dQ+dK+dV+V_in");
     }
 
     #[test]

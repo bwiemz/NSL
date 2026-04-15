@@ -482,14 +482,21 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // `block_kv*head_dim*2 / 128` floats each.
     let dv_off = smem_layout::backward_dv_offset(config);
     let dk_off = smem_layout::backward_dk_offset(config);
+    let dq_off = smem_layout::backward_dq_offset(config);
     let dk_dv_cells = (config.block_kv * config.head_dim) as u32;
+    let dq_cells = (config.block_q * config.head_dim) as u32;
     let cells_per_thread = dk_dv_cells.div_ceil(128);
-    for (tag, off) in [("DV", dv_off), ("DK", dk_off)] {
+    let dq_cells_per_thread = dq_cells.div_ceil(128);
+    for (tag, off, total, per_thread) in [
+        ("DV", dv_off, dk_dv_cells, cells_per_thread),
+        ("DK", dk_off, dk_dv_cells, cells_per_thread),
+        ("DQ", dq_off, dq_cells, dq_cells_per_thread),
+    ] {
         ptx.push_str(&format!(
-            "    // BWD zero-init {tag} SMEM tile ({dk_dv_cells} cells, \
-             {cells_per_thread}/thread)\n"
+            "    // BWD zero-init {tag} SMEM tile ({total} cells, \
+             {per_thread}/thread)\n"
         ));
-        for k in 0..cells_per_thread {
+        for k in 0..per_thread {
             let thread_cell = k * 128;
             // cell_idx = tid + k*128; byte_off = off + cell_idx*4
             ptx.push_str("    cvt.u64.u32 %rd_zero_idx, %tid_x;\n");
@@ -501,7 +508,7 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
             }
             // Guard (only stores in-range cells): cell_idx < total
             ptx.push_str(&format!(
-                "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", dk_dv_cells
+                "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", total
             ));
             ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
             ptx.push_str(&format!(
@@ -512,7 +519,7 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
             ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
         }
     }
-    ptx.push_str("    bar.sync 0;  // dV + dK tiles zeroed\n");
+    ptx.push_str("    bar.sync 0;  // dV + dK + dQ tiles zeroed\n");
 
     for q_iter in 0..iters {
         ptx.push_str(&format!(
@@ -526,7 +533,50 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
         phases::backward::ds_compute::emit(&mut ptx, config, q_iter);
         phases::backward::dv_accum::emit(&mut ptx, config, q_iter);
         phases::backward::dqdk_accum::emit(&mut ptx, config, q_iter);
+
+        // Flush %f_dq_{slice} registers into the dQ SMEM tile so the
+        // per-iter register values survive across iters. Warp owns row
+        // (warp_row = warp_id + q_iter*4), lane owns d-slice cols.
+        let hd = config.head_dim as u32;
+        let row_stride = hd * 4; // f32
+        let slices = slices_per_lane;
+        ptx.push_str(&format!(
+            "    // BWD flush %f_dq -> dQ SMEM tile (q_tile_iter={q_iter})\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %r0, %warp_id, {};\n", q_iter * 4
+        ));
+        ptx.push_str("    cvt.u64.u32 %rd_dqs_row, %r0;\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, {row_stride};\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dqs_row, %rd_dqs_row, {dq_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;\n");
+        for slice in 0..slices {
+            // col = lane * slices + slice; byte off = col * 4
+            ptx.push_str("    cvt.u64.u32 %rd_dqs_col, %lane;\n");
+            if slices > 1 {
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd_dqs_col, %rd_dqs_col, {slices};\n"
+                ));
+            }
+            if slice > 0 {
+                ptx.push_str(&format!(
+                    "    add.u64 %rd_dqs_col, %rd_dqs_col, {slice};\n"
+                ));
+            }
+            ptx.push_str("    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;\n");
+            ptx.push_str(
+                "    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;\n",
+            );
+            ptx.push_str(&format!(
+                "    st.shared.f32 [%rd_dqs_addr], %f_dq_{slice};\n"
+            ));
+        }
     }
+    ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete\n");
 
     // Phase 3: CSHA hooks (inverse RoPE, weight gradients, dRMSNorm).
     // Fire once — they operate on the accumulated dQ/dK/dV tiles.

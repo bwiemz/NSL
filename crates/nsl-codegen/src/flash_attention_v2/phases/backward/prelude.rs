@@ -147,6 +147,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %rd_dk_base, %rd_dk_idx, %rd_dk_smem, %rd_dk_hbm;\n");
     ptx.push_str("    .reg .f32 %f_dk_tmp;\n");
     ptx.push_str("    .reg .pred %p_dk;\n");
+    // Finalize scratch for SMEM->HBM cooperative dQ copy + per-iter
+    // register-to-SMEM flush.
+    ptx.push_str("    .reg .u64 %rd_dq_base, %rd_dq_idx, %rd_dq_smem, %rd_dq_hbm;\n");
+    ptx.push_str("    .reg .f32 %f_dq_tmp;\n");
+    ptx.push_str("    .reg .pred %p_dq_g;\n");
+    ptx.push_str("    .reg .u64 %rd_dqs_row, %rd_dqs_col, %rd_dqs_addr;\n");
 
     // Backward HBM pointer registers (saved-activation inputs +
     // gradient outputs). Separate name so an unsuspecting forward
@@ -164,18 +170,19 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // log2(e)\n");
 
-    // Initialise SMEM tile bases so every backward phase can address
-    // them without depending on a specific sibling phase having run
-    // first. Q tile at byte 0 (Tier A layout); K/V share the kv_offset
-    // region immediately after (K is consumed first, then V overwrites
-    // its SMEM slot).
+    // Initialise SMEM tile bases. Q tile at byte 0 (Tier A layout); K
+    // at kv_offset (Tier A layout). V gets its OWN tile in the backward
+    // extras region — if V aliased K's slot (as in forward), the
+    // backward's kv_load::emit_v would clobber K before ds_compute can
+    // read it, corrupting every downstream gradient. See bug #2 fix.
     let kv_off = crate::flash_attention_v2::smem_layout::kv_offset(config);
+    let v_in_off = crate::flash_attention_v2::smem_layout::backward_v_input_offset(config);
     ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;\n");
     ptx.push_str(&format!(
         "    add.u64 %k_smem_base, %shmem_base, {};\n", kv_off
     ));
     ptx.push_str(&format!(
-        "    add.u64 %v_smem_base, %shmem_base, {};\n", kv_off
+        "    add.u64 %v_smem_base, %shmem_base, {};\n", v_in_off
     ));
 
     // Scalar param loads.

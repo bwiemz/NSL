@@ -17,7 +17,8 @@ use crate::flash_attention::FlashAttentionConfig;
 /// Emit the cooperative global stores for all 7 gradient tensors.
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
-    let slices_per_lane = (head_dim / 32).max(1);
+    let _slices_per_lane = (head_dim / 32).max(1);
+    let block_q = config.block_q as u32;
 
     ptx.push_str(&format!(
         "    // Tier C backward finalize -- global stores of all 7 gradients (q_tile_iter={q_tile_iter})\n"
@@ -41,34 +42,53 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd7;\n");
     ptx.push_str("    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)\n");
 
-    // ── f16 stores: dq (row-keyed by warp_row), dk/dv (row-keyed by lane).
+    // ── f16 store: dQ (cooperative SMEM→HBM, full block_q×head_dim tile).
     //
-    // dQ[warp_row, col] — warp owns Q row, lane owns col.
-    //   row_byte_off already holds row_idx*head_dim*2 for warp_row.
-    //   dk/dv use a parallel block keyed by lane (KV row).
-    ptx.push_str("    // -- DQ store via [dq_ptr] --\n");
+    // The dQ SMEM tile at backward_dq_offset is populated by the
+    // orchestrator's per-iter flush of %f_dq_{slice} registers. Finalize
+    // is invoked exactly once (q_tile_iter=0), so it must drain the
+    // WHOLE tile here — not just the rows owned by one iter. Mirrors the
+    // dK/dV cooperative copy pattern below.
+    let dq_smem_off = crate::flash_attention_v2::smem_layout::backward_dq_offset(config);
+    let dq_cells = block_q * head_dim;
+    let dq_cells_per_thread = dq_cells.div_ceil(128);
+    ptx.push_str("    // -- DQ store via [dq_ptr] (coop SMEM->HBM, full tile) --\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dq, 0;\n");
     ptx.push_str(&format!(
         "    @%p0 bra V2_BWD_STORE_DQ_SKIP_{q_tile_iter};\n"
     ));
-    for slice in 0..slices_per_lane {
-        // col = lane * slices_per_lane + slice
-        ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
-        if slices_per_lane > 1 {
+    // HBM base for this block's Q segment:
+    //   ((batch_idx*heads + head_idx) * seq + q_start) * head_dim * 2
+    ptx.push_str("    mul.lo.u64 %rd_dq_base, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd6;\n");
+    ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %q_start;\n");
+    ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd7;\n");
+    ptx.push_str("    shl.b64 %rd_dq_base, %rd_dq_base, 1;  // * 2 bytes (f16)\n");
+    ptx.push_str("    add.u64 %rd_dq_base, %rd_bwd_dq, %rd_dq_base;\n");
+    for k in 0..dq_cells_per_thread {
+        let thread_cell = k * 128;
+        ptx.push_str("    cvt.u64.u32 %rd_dq_idx, %tid_x;\n");
+        if thread_cell > 0 {
             ptx.push_str(&format!(
-                "    mul.lo.u64 %rd31, %rd31, {slices_per_lane};\n"
+                "    add.u64 %rd_dq_idx, %rd_dq_idx, {};\n", thread_cell
             ));
         }
-        if slice > 0 {
-            ptx.push_str(&format!("    add.u64 %rd31, %rd31, {slice};\n"));
-        }
-        ptx.push_str("    shl.b64 %rd31, %rd31, 1;\n");
-        ptx.push_str("    add.u64 %rd32, %rd30, %rd31;\n");
-        ptx.push_str("    add.u64 %rd32, %rd_bwd_dq, %rd32;\n");
         ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %h0, %f_dq_{slice};\n"
+            "    setp.lt.u64 %p_dq_g, %rd_dq_idx, {};\n", dq_cells
         ));
-        ptx.push_str("    st.global.b16 [%rd32], %h0;\n");
+        // SMEM f32 load
+        ptx.push_str("    shl.b64 %rd_dq_smem, %rd_dq_idx, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dq_smem, %rd_dq_smem, {dq_smem_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;\n");
+        ptx.push_str("    @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];\n");
+        // HBM f16 store
+        ptx.push_str("    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;\n");
+        ptx.push_str("    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;\n");
+        ptx.push_str("    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;\n");
     }
     ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
 
