@@ -19,21 +19,53 @@ pub type VarMap = HashMap<VarId, Value>;
 pub struct LoweredWengert {
     pub var_map: VarMap,
     pub owned_values: Vec<(VarId, Value, WengertType)>,
+    /// VarIds that were freed early by the FASE hook's reduce_to_shape
+    /// identity path.  When the hook fires on a `reduce_to_shape` result and
+    /// the runtime returns the same pointer (shapes match → retain+return),
+    /// the input VarId (raw_grad) needs an extra `nsl_tensor_free` to bring
+    /// the refcount to zero — the hook's free only drops it from 2→1.  The
+    /// extra free is emitted here; these VarIds are added to
+    /// `freed_adjoint_vars` in stmt.rs so `free_wengert_owned_values` skips
+    /// them and does not double-free.
+    ///
+    /// This is also correct when shapes differ (normal clone path): the input
+    /// grad (rc=1) is freed immediately by the extra call, and cleanup skips it.
+    pub hook_freed_input_vars: std::collections::HashSet<VarId>,
 }
 
 /// Lower a WengertList to Cranelift IR by dispatching each PrimalOp to its runtime FFI call.
 ///
 /// `primal_vars` maps VarIds from the forward pass to their Cranelift Values (i64 tensor pointers).
 /// Returns a map from all VarIds (including adjoint) to Cranelift Values.
+///
+/// `on_param_grad`, when `Some((set, cb))`, causes `cb` to be invoked
+/// immediately after any op whose `result` VarId is in `set`.  The callback
+/// receives `(&mut Compiler, VarId, Value, &mut FunctionBuilder)` — the
+/// compiler is passed explicitly so the closure does NOT need to capture it,
+/// avoiding a double-mutable-borrow with the `compiler` parameter above.
+/// The gradient is then REMOVED from `var_map` — the callback is responsible
+/// for freeing or otherwise owning that tensor.  Used by FASE Deferred to
+/// consume parameter gradients during backward lowering so only one gradient
+/// is live at a time.
 pub fn compile_wengert_ops(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
     _state: &mut FuncState,
     wengert: &WengertList,
     primal_vars: &VarMap,
+    mut on_param_grad: Option<(
+        &std::collections::HashSet<VarId>,
+        &mut dyn FnMut(
+            &mut Compiler,
+            VarId,
+            Value,
+            &mut FunctionBuilder,
+        ) -> Result<(), CodegenError>,
+    )>,
 ) -> Result<LoweredWengert, CodegenError> {
     let mut var_map = primal_vars.clone();
     let mut owned_values = Vec::new();
+    let mut hook_freed_input_vars = std::collections::HashSet::new();
     // Clone var_types so the lowerer can look up types for any VarId and
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
@@ -60,6 +92,40 @@ pub fn compile_wengert_ops(
         }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
         var_map.insert(op.result, result_val);
+        // FASE hook: consume parameter gradients immediately during lowering.
+        if let Some(ref mut hook) = on_param_grad {
+            let (param_set, cb) = hook;
+            if param_set.contains(&op.result) {
+                cb(compiler, op.result, result_val, builder)?;
+                // Callback owns/freed the tensor — remove from var_map so
+                // downstream code can't accidentally re-use it.
+                var_map.remove(&op.result);
+
+                // If the hook fired on a reduce_to_shape op, emit an extra
+                // nsl_tensor_free for the raw-grad input (inputs[0]).
+                //
+                // Why this is needed: nsl_tensor_reduce_to_shape increments
+                // the input's refcount and returns the same pointer when the
+                // src and target shapes match (the identity path).  The hook
+                // callback already called nsl_tensor_free(result_val), which
+                // drops refcount from 2→1 — not an actual free.  We need one
+                // more free here to bring it to 0 so the raw grad is released
+                // immediately, not held until end-of-adjoint cleanup (which
+                // is what causes the N×grad_size peak-memory regression).
+                //
+                // This is also correct on the non-identity path (fresh clone):
+                // the raw_grad has rc=1, this free drops it to 0 (freed), and
+                // the cleanup pass skips it via hook_freed_input_vars.
+                if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape") {
+                    if let Some(&input_vid) = op.inputs.first() {
+                        if let Some(&input_val) = var_map.get(&input_vid) {
+                            call(compiler, builder, "nsl_tensor_free", &[input_val])?;
+                            hook_freed_input_vars.insert(input_vid);
+                        }
+                    }
+                }
+            }
+        }
         // Infer result type: for binary ops, if both inputs are Integer, result is Integer.
         // For Constants, preserve the extractor's type (it may have overridden
         // the default Tensor to Integer for IntLiteral).
@@ -97,6 +163,7 @@ pub fn compile_wengert_ops(
     Ok(LoweredWengert {
         var_map,
         owned_values,
+        hook_freed_input_vars,
     })
 }
 
@@ -1481,5 +1548,27 @@ mod tests {
         ];
         // 51 variants total (including markers)
         assert_eq!(ops.len(), 51);
+    }
+
+    #[test]
+    fn on_param_grad_signature_is_shaped_correctly() {
+        // This test is a compile-time assertion that the callback type
+        // signature matches what FASE's call site will construct.
+        // Behavioral validation lives in the integration tests that exercise
+        // source-AD + FASE Deferred end-to-end.
+        fn _signature_compiles(
+            _hook: Option<(
+                &std::collections::HashSet<VarId>,
+                &mut dyn FnMut(
+                    &mut crate::compiler::Compiler,
+                    VarId,
+                    Value,
+                    &mut FunctionBuilder,
+                ) -> Result<(), crate::CodegenError>,
+            )>,
+        ) {
+        }
+        // If this compiles, the API shape is correct.
+        assert!(true);
     }
 }

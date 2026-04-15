@@ -701,6 +701,25 @@ fn link_shared_gcc(
         }
     }
 
+    // Item #5: re-export test-hooks peak FFIs so dlopen can resolve them.
+    // -u forces the symbol to be pulled in from the staticlib;
+    // --export-dynamic-symbol adds it to the .so/.dylib's export table.
+    #[cfg(feature = "test-hooks")]
+    {
+        if cfg!(target_os = "linux") {
+            cmd.arg("-Wl,-u,nsl_cpu_peak_reset");
+            cmd.arg("-Wl,-u,nsl_cpu_peak_bytes");
+            cmd.arg("-Wl,--export-dynamic-symbol=nsl_cpu_peak_reset");
+            cmd.arg("-Wl,--export-dynamic-symbol=nsl_cpu_peak_bytes");
+        } else if cfg!(target_os = "macos") {
+            // On macOS, `-u` (or `-Wl,-u,`) forces the symbol in; staticlib
+            // symbols are exported by default from a dylib unless
+            // `-exported_symbols_list` is used, so no extra flag needed.
+            cmd.arg("-Wl,-u,_nsl_cpu_peak_reset");
+            cmd.arg("-Wl,-u,_nsl_cpu_peak_bytes");
+        }
+    }
+
     let status = cmd
         .status()
         .map_err(|e| CodegenError::new(format!("failed to run linker '{cc}': {e}")))?;
@@ -759,6 +778,23 @@ fn link_shared_msvc(
             cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
             cmd.arg("cuda.lib");
         }
+    }
+
+    // Export the program entry point so dlopen callers can invoke it.
+    // On MSVC, Linkage::Export in the .obj is not enough — we must add
+    // /EXPORT explicitly.  argc/argv params are passed as i32/i64 so the
+    // MSVC decorated name remains plain `main`.
+    cmd.arg("/EXPORT:main");
+
+    // Item #5: re-export test-hooks peak FFIs.
+    // /INCLUDE forces the staticlib symbol to be linked in;
+    // /EXPORT adds it to the DLL's export table.
+    #[cfg(feature = "test-hooks")]
+    {
+        cmd.arg("/INCLUDE:nsl_cpu_peak_reset");
+        cmd.arg("/INCLUDE:nsl_cpu_peak_bytes");
+        cmd.arg("/EXPORT:nsl_cpu_peak_reset");
+        cmd.arg("/EXPORT:nsl_cpu_peak_bytes");
     }
 
     let status = cmd

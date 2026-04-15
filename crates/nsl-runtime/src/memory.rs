@@ -70,6 +70,8 @@ pub(crate) fn checked_alloc(size: usize) -> *mut u8 {
     }
     #[cfg(test)]
     stats::cpu_alloc(size);
+    #[cfg(feature = "test-hooks")]
+    peak::record_alloc(size);
     ptr
 }
 
@@ -89,6 +91,8 @@ pub(crate) fn checked_alloc_zeroed(size: usize) -> *mut u8 {
     }
     #[cfg(test)]
     stats::cpu_alloc(size);
+    #[cfg(feature = "test-hooks")]
+    peak::record_alloc(size);
     ptr
 }
 
@@ -108,6 +112,11 @@ pub(crate) unsafe fn checked_realloc(ptr: *mut u8, old_size: usize, new_size: us
         stats::cpu_free(old_size);
         stats::cpu_alloc(new_size);
     }
+    #[cfg(feature = "test-hooks")]
+    {
+        peak::record_free(old_size);
+        peak::record_alloc(new_size);
+    }
     let new_ptr = unsafe { std::alloc::realloc(ptr, old_layout, new_size) };
     if new_ptr.is_null() {
         eprintln!("nsl: out of memory");
@@ -121,9 +130,49 @@ pub(crate) unsafe fn checked_free(ptr: *mut u8, size: usize) {
     if !ptr.is_null() && size > 0 {
         #[cfg(test)]
         stats::cpu_free(size);
+        #[cfg(feature = "test-hooks")]
+        peak::record_free(size);
         let layout = Layout::from_size_align(size, 8).unwrap();
         unsafe { dealloc(ptr, layout) };
     }
+}
+
+/// CPU heap peak tracking — test-only, gated behind the `test-hooks`
+/// cargo feature.  Used by the FASE item #5 peak-memory regression test
+/// to measure the allocator high-watermark of a compiled NSL program.
+///
+/// Atomics, not thread-local: the compiled program may spawn auxiliary
+/// threads and we want the max across all of them.
+#[cfg(feature = "test-hooks")]
+pub mod peak {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
+    pub static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn record_alloc(size: usize) {
+        let new_current = CURRENT_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+        PEAK_BYTES.fetch_max(new_current, Ordering::Relaxed);
+    }
+
+    pub fn record_free(size: usize) {
+        CURRENT_BYTES.fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub extern "C" fn nsl_cpu_peak_reset() {
+    use std::sync::atomic::Ordering;
+    peak::CURRENT_BYTES.store(0, Ordering::Relaxed);
+    peak::PEAK_BYTES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub extern "C" fn nsl_cpu_peak_bytes() -> i64 {
+    use std::sync::atomic::Ordering;
+    peak::PEAK_BYTES.load(Ordering::Relaxed) as i64
 }
 
 /// Allocation statistics for fuzz testing. Only compiled in test builds.
@@ -182,4 +231,53 @@ pub mod stats {
     pub fn cuda_free_count() -> usize { CUDA_FREE_COUNT.with(|c| c.get()) }
     pub fn cuda_alloc_bytes() -> usize { CUDA_ALLOC_BYTES.with(|c| c.get()) }
     pub fn cuda_free_bytes() -> usize { CUDA_FREE_BYTES.with(|c| c.get()) }
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_peak_tracks_current_and_high_watermark() {
+        // Reset so we're not influenced by other tests that ran before us.
+        nsl_cpu_peak_reset();
+        assert_eq!(nsl_cpu_peak_bytes(), 0);
+
+        // Allocate 1 MB via the checked_alloc path.
+        let a = checked_alloc(1_048_576);
+        assert!(
+            nsl_cpu_peak_bytes() >= 1_048_576,
+            "peak after 1MB alloc: {}",
+            nsl_cpu_peak_bytes()
+        );
+
+        // Allocate another 2 MB.
+        let b = checked_alloc(2_097_152);
+        assert!(
+            nsl_cpu_peak_bytes() >= 3_145_728,
+            "peak after +2MB alloc: {}",
+            nsl_cpu_peak_bytes()
+        );
+
+        let peak_after_both = nsl_cpu_peak_bytes();
+
+        // Free one.  Peak must NOT decrease (it's a high-watermark).
+        unsafe {
+            checked_free(a, 1_048_576);
+        }
+        assert_eq!(
+            nsl_cpu_peak_bytes(),
+            peak_after_both,
+            "peak is a watermark; free must not lower it"
+        );
+
+        unsafe {
+            checked_free(b, 2_097_152);
+        }
+        assert_eq!(nsl_cpu_peak_bytes(), peak_after_both);
+
+        // Reset zeros the watermark.
+        nsl_cpu_peak_reset();
+        assert_eq!(nsl_cpu_peak_bytes(), 0);
+    }
 }

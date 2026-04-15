@@ -29,6 +29,7 @@ pub mod tokenizer;
 pub mod quantize;
 pub mod fp8;
 pub mod awq;
+pub mod fase_bc;
 pub use awq::{nsl_awq_write_sidecar, AwqProjectionDescriptor};
 pub mod gptq;
 

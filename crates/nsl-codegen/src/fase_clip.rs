@@ -78,6 +78,21 @@ impl ClipPlan {
         }
     }
 
+    /// Construct an L2-global-norm plan with explicit eps and Phase-A accumulation fused.
+    ///
+    /// This is the shape the FASE Deferred two-phase emission uses.
+    /// See `docs/superpowers/specs/2026-04-14-fase-two-phase-grad-clip-design.md`
+    /// decision D2.
+    pub fn new_l2_global(threshold: f64, eps: f64) -> Self {
+        Self {
+            enabled: true,
+            threshold,
+            norm: ClipNorm::L2Global,
+            eps,
+            accumulate_during_phase_a: true,
+        }
+    }
+
     /// Compute the clip factor for a given pre-clip norm.
     ///
     /// Matches PyTorch's `torch.nn.utils.clip_grad_norm_` (max_norm) formula:
@@ -225,5 +240,24 @@ mod tests {
     fn norm_enum_name_is_nonempty() {
         assert_eq!(ClipNorm::L2Global.as_str(), "l2_global");
         assert_eq!(ClipNorm::LinfPerParam.as_str(), "linf_per_param");
+    }
+
+    #[test]
+    fn two_phase_plan_fuses_accumulation() {
+        // For item #3, the two-phase plan must:
+        //   - be enabled with the user's threshold
+        //   - use L2 global norm (matches non-FASE path)
+        //   - have accumulate_during_phase_a=true so Phase A
+        //     fuses m_partial accumulation with sum_sq in one loop
+        //   - have eps > 0 for numerical stability when grad is zero
+        let plan = ClipPlan::new_l2_global(/*threshold=*/ 1.0, /*eps=*/ 1e-6);
+        assert!(plan.enabled);
+        assert!((plan.threshold - 1.0).abs() < 1e-12);
+        assert_eq!(plan.norm, ClipNorm::L2Global);
+        assert!(plan.eps > 0.0);
+        assert!(
+            plan.accumulate_during_phase_a,
+            "Phase A must fuse accumulation with sum_sq (plan D2)"
+        );
     }
 }

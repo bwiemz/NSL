@@ -172,6 +172,7 @@ fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> nsl_codegen::calibrati
         cache_key_digest: String::new(),
         num_samples_used: 1,
         hooks,
+        wggo_head_gradients: None,
     }
 }
 

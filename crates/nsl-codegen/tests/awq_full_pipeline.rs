@@ -66,6 +66,7 @@ fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> Sidecar {
         cache_key_digest: String::new(),
         num_samples_used: 1,
         hooks,
+        wggo_head_gradients: None,
     }
 }
 
@@ -382,6 +383,7 @@ fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
         cache_key_digest: String::new(),
         num_samples_used: batches.count as u32,
         hooks: hooks_map,
+        wggo_head_gradients: None,
     };
 
     // Parse via AwqScales.
