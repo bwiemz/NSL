@@ -120,6 +120,27 @@ fn synth_backward_through_dqdk_with_ret(config: &FlashAttentionConfig) -> Vec<u8
     ptx.into_bytes()
 }
 
+fn synth_backward_through_csha_hooks_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
+    let mut ptx = String::new();
+    backward::prelude::emit(&mut ptx, config);
+    backward::q_load::emit(&mut ptx, config, 0);
+    backward::ds_compute::emit(&mut ptx, config, 0);
+    let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
+    for slice in 0..slices_per_lane {
+        ptx.push_str(&format!("    mov.f32 %f_dv_{slice}, 0f00000000;\n"));
+        ptx.push_str(&format!("    mov.f32 %f_dq_{slice}, 0f00000000;\n"));
+        ptx.push_str(&format!("    mov.f32 %f_dk_{slice}, 0f00000000;\n"));
+    }
+    backward::dv_accum::emit(&mut ptx, config, 0);
+    backward::dqdk_accum::emit(&mut ptx, config, 0);
+    backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
+    backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
+    backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+    ptx.into_bytes()
+}
+
 #[test]
 fn backward_prelude_ptxas_clean_sm75_sm90_sm120() {
     let Some(ptxas) = find_ptxas() else {
@@ -311,6 +332,43 @@ fn backward_through_dqdk_accum_ptxas_clean_sm75_sm90_sm120() {
     assert!(
         failures.is_empty(),
         "backward-through-dqdk ptxas failures:\n{}",
+        failures.join("\n---\n")
+    );
+}
+
+#[test]
+fn backward_through_csha_hooks_ptxas_clean_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("skipping: ptxas not found");
+        return;
+    };
+    // rope_q=true so dRoPE actually fires in the emitted PTX.
+    let base = FlashAttentionConfig {
+        block_q: 32, block_kv: 32, head_dim: 32,
+        causal: false, paged: false, rope_q: true,
+        rope_style: RopeStyle::Adjacent,
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+        csha: Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            ..CshaExtras::default()
+        }),
+    };
+    let mut failures = Vec::new();
+    for sm in &["sm_75", "sm_90", "sm_120"] {
+        let mut c = base.clone();
+        c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+        let ptx = synth_backward_through_csha_hooks_with_ret(&c);
+        let dump = std::env::temp_dir().join(format!("bwd_through_hooks_{sm}.ptx"));
+        std::fs::write(&dump, &ptx).ok();
+        if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
+            failures.push(format!("sm={sm} dump={} ptxas:\n{err}", dump.display()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "backward-through-csha-hooks ptxas failures:\n{}",
         failures.join("\n---\n")
     );
 }

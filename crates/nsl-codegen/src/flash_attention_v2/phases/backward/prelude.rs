@@ -135,6 +135,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // column; ds/dp/p share the same reduction shape).
     ptx.push_str("    .reg .f32 %f_P, %f_dP, %f_dS;\n");
     ptx.push_str("    .reg .f32 %f_rowsum_dP_P;      // sum_k P[i,k]*dP[i,k] for softmax Jacobian\n");
+    // CSHA hook registers (T3.6): dRMSNorm per-dim gradient scratch
+    // (g_d = dx_norm * norm_weight).
+    ptx.push_str("    .reg .f32 %f_g;                // dRMSNorm per-dim gradient term\n");
 
     // Backward HBM pointer registers (saved-activation inputs +
     // gradient outputs). Separate name so an unsuspecting forward
