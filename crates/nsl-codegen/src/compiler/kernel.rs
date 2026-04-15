@@ -9,6 +9,18 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 use super::{Compiler, FlashAttentionCompileContext};
 use crate::error::CodegenError;
 
+/// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
+///
+/// Panics with a clear message on an unrecognised format so that a
+/// misconfigured compile target is caught at compile time rather than
+/// silently routing to the wrong PTX path.
+pub(crate) fn parse_gpu_sm_from_target(target: &str) -> u32 {
+    target
+        .strip_prefix("sm_")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("invalid compile target: {target}"))
+}
+
 impl Compiler<'_> {
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
@@ -623,7 +635,7 @@ impl Compiler<'_> {
                     rope_style,
                     gqa_group_size,
                     tree_mask: false,
-                    gpu_sm: 80,
+                    gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                     csha: None,
                 };
 
@@ -675,7 +687,7 @@ impl Compiler<'_> {
                 rope_style,
                 gqa_group_size,
                 tree_mask: false,
-                gpu_sm: 80,
+                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 csha: None,
             };
 
@@ -741,7 +753,7 @@ impl Compiler<'_> {
                 rope_style,
                 gqa_group_size,
                 tree_mask: false,
-                gpu_sm: 80,
+                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 csha: None,
             };
 

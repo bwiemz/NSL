@@ -990,3 +990,4 @@ impl<'a> Compiler<'a> {
             .map_err(|e| CodegenError::new(format!("failed to emit object: {e}")))
     }
 }
+

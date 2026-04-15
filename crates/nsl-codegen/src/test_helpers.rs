@@ -164,3 +164,56 @@ pub struct PrePassResult {
     /// `profile_source_file_name`, else empty).
     pub source_text: String,
 }
+
+/// A1 regression test helper: build a minimal `@flash_attention`-decorated NSL
+/// snippet, run `compile_flash_attention_kernels` against a `Compiler` whose
+/// `compile_options.target` is set to `target`, and return the `gpu_sm` stored
+/// in the resulting `FlashAttentionCompileContext`.
+///
+/// This exercises the **non-autotune call-site at ~line 756** in
+/// `compiler/kernel.rs` (the path where
+/// `parse_gpu_sm_from_target(&self.compile_options.target)` is called).
+/// If that call-site were reverted to `gpu_sm: 80`, the return value would
+/// always be `80` regardless of `target`, causing the regression test to fail
+/// for every SM other than `sm_80`.
+///
+/// # Panics
+/// Panics when `target` is not a recognised `sm_<N>` string, or when
+/// `Compiler::new` fails.
+pub fn flash_sm_for_compile_target(target: &str) -> u32 {
+    use nsl_errors::FileId;
+
+    // Parse a minimal NSL snippet that contains @flash_attention but NO
+    // @autotune.  The absence of @autotune means compile_flash_attention_kernels
+    // always takes the single-config path and hits the gpu_sm assignment at
+    // ~line 756 in compiler/kernel.rs.
+    let src = "@flash_attention\nfn forward():\n    pass\n";
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+
+    let type_map: TypeMap = TypeMap::new();
+
+    // Build a Compiler whose compile_options.target is set to `target`.
+    // This is the field read by parse_gpu_sm_from_target at the three
+    // fixed call-sites in kernel.rs.
+    let opts = crate::CompileOptions {
+        target: target.to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new failed in flash_sm_for_compile_target");
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .expect("compile_flash_attention_kernels failed in flash_sm_for_compile_target");
+
+    compiler
+        .kernels
+        .flash_attention_context
+        .expect("flash_attention_context not set after compile_flash_attention_kernels")
+        .config
+        .gpu_sm
+}

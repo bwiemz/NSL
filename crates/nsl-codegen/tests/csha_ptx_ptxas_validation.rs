@@ -252,3 +252,45 @@ fn csha_l2_rope_ptx_assembles_on_sm120() {
         );
     }
 }
+
+/// A1: The `.target` line in synthesised PTX must reflect the compile
+/// target's SM, not the old hardcoded `80`.
+///
+/// `emit_ptx_header` (v1) maps SM versions to three discrete PTX targets:
+///   * `gpu_sm < 80`  → `.target sm_52`  (scalar path)
+///   * `gpu_sm >= 80` → `.target sm_80`  (MMA path)
+///   * `gpu_sm >= 90` → `.target sm_90`  (Hopper / Blackwell)
+///
+/// Before the A1 fix, all three kernel-build sites in `compiler/kernel.rs`
+/// hard-coded `gpu_sm: 80`, so even a `sm_75` compile target would silently
+/// emit MMA PTX (`.target sm_80`).  After the fix the target line must match
+/// the table above.
+///
+/// This test exercises the actual compiler pipeline:
+/// `compiler::flash_sm_for_compile_target` constructs a `Compiler` with the
+/// given `compile_options.target`, runs `compile_flash_attention_kernels`
+/// against a minimal `@flash_attention` stub, and returns the `gpu_sm` stored
+/// in the resulting `FlashAttentionCompileContext`.  Reverting any of the
+/// three fixed call-sites in `kernel.rs` back to `gpu_sm: 80` would cause
+/// this test to fail for every SM other than `sm_80`.
+#[test]
+fn a1_gpu_sm_matches_compile_target() {
+    // (compile target string, expected gpu_sm value)
+    let cases: &[(&str, u32)] = &[
+        ("sm_75",  75),
+        ("sm_80",  80),
+        ("sm_90",  90),
+        ("sm_120", 120),
+    ];
+
+    for &(sm, expected_gpu_sm) in cases {
+        let gpu_sm = nsl_codegen::test_helpers::flash_sm_for_compile_target(sm);
+        assert_eq!(
+            gpu_sm,
+            expected_gpu_sm,
+            "a1 [{sm}]: compile_options.target should flow into gpu_sm={expected_gpu_sm}, \
+             got gpu_sm={gpu_sm} — check the three parse_gpu_sm_from_target call-sites \
+             in compiler/kernel.rs (~line 638, ~690, ~756)"
+        );
+    }
+}
