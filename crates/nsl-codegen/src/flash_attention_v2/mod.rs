@@ -451,9 +451,13 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // Phase 0: header, .visible .entry, SMEM, register pool, indices.
     phases::backward::prelude::emit(&mut ptx, config);
 
-    // Phase 1: load saved post-RoPE Q from HBM into the Q SMEM tile.
-    // Fired once; subsequent q_tile_iter iterations read from this tile.
+    // Phase 1: load saved post-RoPE Q/K/V from HBM into their SMEM
+    // tiles. Fired once; subsequent q_tile_iter iterations read from
+    // these tiles. K and V are loaded via kv_load so ds_compute can
+    // recompute S = Q @ K^T and dP = dO · V^T with real addressing.
     phases::backward::q_load::emit(&mut ptx, config, 0);
+    phases::backward::kv_load::emit_k(&mut ptx, config);
+    phases::backward::kv_load::emit_v(&mut ptx, config);
 
     // Phase 2: per q_tile_iter KV loop. One iter per 4-row warp group
     // (matches the forward orchestrator's tile cadence).

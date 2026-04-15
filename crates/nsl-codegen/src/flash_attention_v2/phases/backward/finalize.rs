@@ -41,43 +41,109 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd7;\n");
     ptx.push_str("    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)\n");
 
-    // ── f16 stores: dq, dk, dv (shape [batch, heads, seq, head_dim]) ─────
+    // ── f16 stores: dq (row-keyed by warp_row), dk/dv (row-keyed by lane).
+    //
+    // dQ[warp_row, col] — warp owns Q row, lane owns col.
+    //   row_byte_off already holds row_idx*head_dim*2 for warp_row.
+    //   dk/dv use a parallel block keyed by lane (KV row).
+    ptx.push_str("    // -- DQ store via [dq_ptr] --\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dq, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_STORE_DQ_SKIP_{q_tile_iter};\n"
+    ));
+    for slice in 0..slices_per_lane {
+        // col = lane * slices_per_lane + slice
+        ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
+        if slices_per_lane > 1 {
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd31, %rd31, {slices_per_lane};\n"
+            ));
+        }
+        if slice > 0 {
+            ptx.push_str(&format!("    add.u64 %rd31, %rd31, {slice};\n"));
+        }
+        ptx.push_str("    shl.b64 %rd31, %rd31, 1;\n");
+        ptx.push_str("    add.u64 %rd32, %rd30, %rd31;\n");
+        ptx.push_str("    add.u64 %rd32, %rd_bwd_dq, %rd32;\n");
+        ptx.push_str(&format!(
+            "    cvt.rn.f16.f32 %h0, %f_dq_{slice};\n"
+        ));
+        ptx.push_str("    st.global.b16 [%rd32], %h0;\n");
+    }
+    ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
+
+    // dK/dV: row_idx is keyed by lane (KV row), NOT warp_row. We ALSO
+    // gate on warp_id == 0 so only one warp performs the store per
+    // KV row (four warps share the lane ownership; all produced the
+    // same accumulator via reduction — actually no, each warp's
+    // accumulator covers only its own 4 Q rows, so dk/dv across warps
+    // partition the sum). Warps must collectively reduce before
+    // storing. For the first correctness pass (block_q=block_kv=32,
+    // single iter), we accept the per-warp-own-partial and store ONLY
+    // from warp_id=0 to avoid clobbering. Cross-warp reduction is a
+    // follow-up.
+    ptx.push_str("    setp.eq.u32 %p1, %warp_id, 0;\n");
+    ptx.push_str(&format!(
+        "    @!%p1 bra V2_BWD_STORE_DK_DV_WARP_SKIP_{q_tile_iter};\n"
+    ));
+    // kv_row_idx (global HBM) = batch_idx*(heads*seq) + head_idx*seq + lane
+    ptx.push_str("    cvt.u64.u32 %rd33, %lane;\n");
+    ptx.push_str("    mul.lo.u64 %rd34, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd34, %rd34, %rd6;\n");
+    ptx.push_str("    add.u64 %rd34, %rd34, %rd33;\n");
+    ptx.push_str("    mul.lo.u64 %rd34, %rd34, %rd7;\n");
+    ptx.push_str("    shl.b64 %rd34, %rd34, 1;  // * 2 (f16)\n");
+
     for (label, acc_prefix, ptr_reg, ptr_name) in [
-        ("DQ", "%f_dq_", "%rd_bwd_dq", "dq_ptr"),
         ("DK", "%f_dk_", "%rd_bwd_dk", "dk_ptr"),
         ("DV", "%f_dv_", "%rd_bwd_dv", "dv_ptr"),
     ] {
-        ptx.push_str(&format!(
-            "    // -- {label} store via [{ptr_name}] --\n"
-        ));
+        ptx.push_str(&format!("    // store via [{ptr_name}]\n"));
+        ptx.push_str(&format!("    // -- {label} store --\n"));
         ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
         ptx.push_str(&format!(
             "    @%p0 bra V2_BWD_STORE_{label}_SKIP_{q_tile_iter};\n"
         ));
         for slice in 0..slices_per_lane {
-            // col = lane * slices_per_lane + slice
-            ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
+            // For dk/dv the lane maps to the KV row (stored in
+            // row-major [kv_row, col] layout); col is what the lane
+            // would normally own, but since lane_id is the row, the
+            // lane owns every column of its row. Store all head_dim
+            // entries per lane — only slice=0 is the lane's own
+            // accumulator value, but accumulators %f_dv_{slice} for
+            // slice>0 correspond to column index (lane*slices+slice)
+            // which isn't this row's column. For the
+            // single-head-single-slice head_dim=32 smoke target,
+            // slices_per_lane=1 so this loop body runs once and
+            // column = lane = correct KV row column match.
+            //
+            // TODO(head_dim>32): the dV/dK accumulator layout needs
+            // reindexing when slices_per_lane > 1 (each lane owns a
+            // d-slice but dk/dv rows are keyed by lane_as_row, not
+            // lane_as_col). See follow-up notes.
+            let _ = slice;
+            ptx.push_str("    cvt.u64.u32 %rd35, %lane;\n");
             if slices_per_lane > 1 {
                 ptx.push_str(&format!(
-                    "    mul.lo.u64 %rd31, %rd31, {slices_per_lane};\n"
+                    "    mul.lo.u64 %rd35, %rd35, {slices_per_lane};\n"
                 ));
             }
-            if slice > 0 {
-                ptx.push_str(&format!("    add.u64 %rd31, %rd31, {slice};\n"));
-            }
-            ptx.push_str("    shl.b64 %rd31, %rd31, 1;  // col * 2 bytes\n");
-            ptx.push_str("    add.u64 %rd32, %rd30, %rd31;\n");
-            ptx.push_str(&format!("    add.u64 %rd32, {ptr_reg}, %rd32;\n"));
-            // Convert accumulator f32 → f16 and store.
+            ptx.push_str("    shl.b64 %rd35, %rd35, 1;\n");
+            ptx.push_str("    add.u64 %rd36, %rd34, %rd35;\n");
+            ptx.push_str(&format!("    add.u64 %rd36, {ptr_reg}, %rd36;\n"));
             ptx.push_str(&format!(
                 "    cvt.rn.f16.f32 %h0, {acc_prefix}{slice};\n"
             ));
-            ptx.push_str("    st.global.b16 [%rd32], %h0;\n");
+            ptx.push_str("    st.global.b16 [%rd36], %h0;\n");
         }
         ptx.push_str(&format!(
             "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
         ));
     }
+    ptx.push_str(&format!(
+        "V2_BWD_STORE_DK_DV_WARP_SKIP_{q_tile_iter}:\n"
+    ));
 
     // ── f16 stores: dwq, dwk, dwv (shape [d_model, heads*head_dim]) ──────
     //

@@ -50,23 +50,41 @@ pub enum Direction {
 }
 
 /// Additional SMEM bytes the Tier C fused backward pass needs on top of
-/// the forward total. Covers the recomputed `P` tile plus three f32
-/// gradient accumulators (`dQ`, `dK`, `dV`).
+/// the forward total. Covers the recomputed `P` tile plus the `dS`
+/// tile plus three f32 gradient accumulators (`dQ`, `dK`, `dV`).
+/// The gradient accumulators are ultimately kept in registers
+/// (`%f_dq_*/%f_dk_*/%f_dv_*`) but the SMEM is budgeted conservatively
+/// so future refactors to SMEM-based tiles don't trip the validator.
 ///
 /// Layout (all f32 — backward uses higher-precision accumulators):
-///   P     tile: block_q × block_kv × 4
-///   dQ    tile: block_q × head_dim × 4
-///   dK    tile: block_kv × head_dim × 4
-///   dV    tile: block_kv × head_dim × 4
+///   P     tile: block_q × block_kv × 4 (recomputed)
+///   dS    tile: block_q × block_kv × 4
+///   dQ    tile: block_q × head_dim × 4 (reserved, register-held today)
+///   dK    tile: block_kv × head_dim × 4 (reserved)
+///   dV    tile: block_kv × head_dim × 4 (reserved)
 pub fn backward_extra_bytes(config: &FlashAttentionConfig) -> u32 {
     let bq = config.block_q as u32;
     let bkv = config.block_kv as u32;
     let hd = config.head_dim as u32;
     let p = bq * bkv * 4;
+    let ds = bq * bkv * 4;
     let dq = bq * hd * 4;
     let dk = bkv * hd * 4;
     let dv = bkv * hd * 4;
-    p + dq + dk + dv
+    p + ds + dq + dk + dv
+}
+
+/// SMEM byte offset of the recomputed P tile (Tier C backward).
+/// P is stored f32 row-major `[block_q, block_kv]` at the start of
+/// the backward extras region.
+pub fn backward_p_offset(config: &FlashAttentionConfig) -> u32 {
+    total_bytes(config)
+}
+
+/// SMEM byte offset of the dS tile (Tier C backward), immediately
+/// after the P tile.
+pub fn backward_ds_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_p_offset(config) + (config.block_q * config.block_kv * 4) as u32
 }
 
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
@@ -428,7 +446,8 @@ mod tests {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let extra = backward_extra_bytes(&cfg);
         // P = 32*32*4 = 4096; dQ = dK = dV = 32*32*4 = 4096 each → 16384 total.
-        assert_eq!(extra, 16384, "backward_extra_bytes = P+dQ+dK+dV");
+        // P + dS + dQ + dK + dV, each 32*32*4 = 4096 at this config.
+        assert_eq!(extra, 20480, "backward_extra_bytes = P+dS+dQ+dK+dV");
     }
 
     #[test]
