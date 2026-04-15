@@ -4089,6 +4089,22 @@ pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
     { let _ = (dst, src, bytes); }
 }
 
+// ---------------------------------------------------------------------------
+// test-hooks: SM version query exposed to integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "test-hooks", feature = "cuda"))]
+#[no_mangle]
+pub extern "C" fn test_detect_sm_version() -> u32 {
+    inner::detect_sm_version()
+}
+
+#[cfg(all(feature = "test-hooks", not(feature = "cuda")))]
+#[no_mangle]
+pub extern "C" fn test_detect_sm_version() -> u32 {
+    0
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;

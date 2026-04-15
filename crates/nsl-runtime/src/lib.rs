@@ -34,6 +34,10 @@ pub use cuda::{
     nsl_test_cuda_jit_log,
 };
 
+// Test-only re-export: SM version query for dispatcher tests.
+#[cfg(feature = "test-hooks")]
+pub use cuda::test_detect_sm_version;
+
 pub mod autodiff;
 pub mod checkpoint;
 pub mod inspect;
