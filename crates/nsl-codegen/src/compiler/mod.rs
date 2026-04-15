@@ -373,6 +373,12 @@ pub struct Compiler<'a> {
     /// Access via `self.features.field_name`.
     pub features: FeatureConfigs,
 
+    // ── FASE Codegen Phase 2: per-param mode table suffix counter ──
+    /// Monotonic counter used by `compile_train_block` to disambiguate
+    /// `nsl_fase_param_modes_*` rodata symbols when multiple `@train`
+    /// blocks exist in a single compile unit.
+    pub fase_table_counter: u32,
+
     // ── FlashAttention backward side-channel ────────────────────────
     /// Maps the Cranelift Value of a forward SDPA output to (out_val, lse_val)
     /// so the backward lowering can retrieve the logsumexp buffer.
@@ -586,6 +592,7 @@ impl<'a> Compiler<'a> {
             memory: MemoryPlanState::new(),
             vmap: VmapState::new(),
             features: FeatureConfigs::new(options),
+            fase_table_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
@@ -1068,6 +1075,44 @@ impl<'a> Compiler<'a> {
             })?;
         }
         Ok(())
+    }
+
+    /// FASE Codegen Phase 2: emit a per-parameter FASE mode byte table
+    /// into `.rodata` and return the DataId. Caller wraps in a
+    /// `GlobalValue` via `module.declare_data_in_func` and obtains a base
+    /// pointer for runtime byte loads inside the backward loops.
+    ///
+    /// `func_name_suffix` disambiguates symbols when multiple `@train`
+    /// blocks exist in one compile unit.
+    pub fn emit_param_mode_table_rodata(
+        &mut self,
+        modes: &[u8],
+        func_name_suffix: &str,
+    ) -> Result<DataId, CodegenError> {
+        let symbol = format!("nsl_fase_param_modes_{func_name_suffix}");
+        let data_id = self
+            .module
+            .declare_data(
+                &symbol,
+                cranelift_module::Linkage::Local,
+                false, // not writable
+                false, // not TLS
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare FASE param-mode table data: {e}"
+                ))
+            })?;
+
+        let mut desc = DataDescription::new();
+        desc.define(modes.to_vec().into_boxed_slice());
+        self.module.define_data(data_id, &desc).map_err(|e| {
+            CodegenError::new(format!(
+                "failed to define FASE param-mode table data: {e}"
+            ))
+        })?;
+
+        Ok(data_id)
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {

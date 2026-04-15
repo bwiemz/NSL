@@ -47,6 +47,7 @@ pub mod error;
 pub mod expr;
 pub mod fase;
 pub mod fase_clip;
+pub mod fase_codegen_table;
 pub mod fase_memory;
 pub mod fase_optimizer;
 pub mod stmt_fase;

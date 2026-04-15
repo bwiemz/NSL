@@ -3299,17 +3299,16 @@ impl Compiler<'_> {
                 diag.layer_index, diag.requested, diag.applied, reason_str
             );
         }
-        // TODO(fase-consumer-3-phase-2): Per-layer codegen dispatch deferred.
-        // The backward loop below (`nsl_list_get(grads_list, gai)` around the
-        // `ga_body` block) and the optimizer-step loop branch on this single
-        // compile-time boolean. Routing per-layer modes would require either
-        // a runtime lookup table keyed on param index or loop unrolling at
-        // codegen time — both substantial refactors beyond this plan. The
-        // planner (fase::plan_with_overrides), memory schedule
-        // (fase_memory::fase_breakdown), and stderr renderer above already
-        // honor per-layer modes, so WGGO's fase_fused signal flows through
-        // observability even though codegen still uses the global mode.
-        // See docs/superpowers/specs/2026-04-15-fase-per-layer-mode-design.md §9.
+        // FASE Codegen Phase 2 (mostly) shipped: the accumulation loop
+        // `ga_body` below now dispatches per-param via a `.rodata` mode
+        // table built from WGGO's per-layer decisions (see
+        // `mode_table_base` allocation below + `emit_fase_mode_branch`
+        // in stmt_fase.rs). Phase A two-phase-clip is Deferred-only by
+        // construction; the optimizer step retains the global boolean
+        // dispatch — its outer-scope structure (separate fused vs
+        // stdlib emission paths) requires a deeper refactor that is
+        // tracked as a follow-up.
+        // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── 3. Resolve model type and build param list ──────────────────
@@ -3383,6 +3382,36 @@ impl Compiler<'_> {
         let num_params_val = builder
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
+
+        // FASE Codegen Phase 2: build per-parameter mode table from WGGO's
+        // per-layer decisions and emit it as a .rodata byte array. The
+        // backward loop below loads `modes[gai]` to choose Deferred vs
+        // FullBuffer per param. When None (no WGGO active), the loops use
+        // today's monolithic `fase_deferred` branch (byte-identical to
+        // pre-Phase-2 codegen).
+        let mode_table_base: Option<cranelift_codegen::ir::Value> = {
+            let modes = crate::fase_codegen_table::build_param_mode_table(
+                &param_paths,
+                &model_var_name,
+                &fase_plan,
+                self.wggo_overrides.as_ref(),
+            );
+            match modes {
+                Some(bytes) => {
+                    let suffix = self.fase_table_counter;
+                    self.fase_table_counter += 1;
+                    let func_suffix = format!("t{suffix}");
+                    let data_id = self.emit_param_mode_table_rodata(&bytes, &func_suffix)?;
+                    let global = self.module.declare_data_in_func(data_id, builder.func);
+                    Some(
+                        builder
+                            .ins()
+                            .symbol_value(cranelift_codegen::ir::types::I64, global),
+                    )
+                }
+                None => None,
+            }
+        };
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
@@ -4870,7 +4899,42 @@ impl Compiler<'_> {
             builder.seal_block(ga_body);
             let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
             let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
-            if fase_deferred {
+            if let Some(mtb) = mode_table_base {
+                // FASE Codegen Phase 2: per-param dispatch via runtime byte load.
+                let ga_deferred = builder.create_block();
+                let ga_fullbuf = builder.create_block();
+                let ga_join = builder.create_block();
+
+                self.emit_fase_mode_branch(builder, mtb, gai, ga_deferred, ga_fullbuf);
+
+                // Deferred path
+                builder.switch_to_block(ga_deferred);
+                builder.seal_block(ga_deferred);
+                self.fase_emit_accumulate(
+                    builder,
+                    accum_buf,
+                    grad,
+                    fase_plan.recipe.accum_scale,
+                )?;
+                builder.ins().jump(ga_join, &[]);
+
+                // FullBuffer path
+                builder.switch_to_block(ga_fullbuf);
+                builder.seal_block(ga_fullbuf);
+                let n_elems =
+                    self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_grad_accumulate_add",
+                    &[accum_buf, grad, n_elems],
+                )?;
+                builder.ins().jump(ga_join, &[]);
+
+                // Join — single tensor_free regardless of path
+                builder.switch_to_block(ga_join);
+                builder.seal_block(ga_join);
+            } else if fase_deferred {
+                // Pre-Phase-2 monolithic Deferred path (byte-identical when no overrides).
                 // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
                 self.fase_emit_accumulate(
                     builder,
@@ -4879,6 +4943,7 @@ impl Compiler<'_> {
                     fase_plan.recipe.accum_scale,
                 )?;
             } else {
+                // Pre-Phase-2 monolithic FullBuffer path (byte-identical).
                 // Existing path: raw gradient sum (divided / zeroed after optimizer step)
                 let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
                 self.compile_call_by_name(
@@ -4936,6 +5001,20 @@ impl Compiler<'_> {
 
         // 7f. Optimizer step: for each param, call optimizer step function
         // FASE Deferred: emit fused per-parameter step; otherwise use existing path.
+        //
+        // FASE Codegen Phase 2: Optimizer step dispatch is at outer scope here
+        // (the `if fase_deferred { Deferred loops } else { per-optimizer stdlib
+        // step }` shape can't be split per-param without hoisting a runtime
+        // branch through two structurally different optimizer-step emission
+        // paths — the Deferred side uses `fase_emit_final_step` on m_partial,
+        // the FullBuffer side dispatches to optimizer-specific stdlib functions
+        // (adam_step/sgd_step/...) with different calling conventions.
+        //
+        // Deferring per-param optimizer dispatch to a follow-up plan. WGGO's
+        // per-layer signal still influences accumulation behavior via the
+        // mode-table dispatch in ga_body (Task 4b), which is the dominant
+        // memory-cost decision. The optimizer step's compute cost is identical
+        // between modes — only accumulation buffer shape differs.
         if fase_deferred {
             if let Some(accum) = accum_list {
                 // ── FASE Deferred: compute bias-correction scalars once per step ──
@@ -4990,6 +5069,12 @@ impl Compiler<'_> {
 
                     let pa_mpart =
                         self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+                    // FASE Codegen Phase 2: Phase A (two-phase-clip accumulation) runs
+                    // only when the global FASE plan is Deferred + grad_clip is set.
+                    // Per spec §2, per-layer FullBuffer overrides on this path are inert
+                    // (the path's existence already implies global Deferred). No mode-
+                    // table dispatch needed here.
+                    //
                     // When FASE hook is active, accumulation already happened
                     // during adjoint lowering — skip the grads_list read + accumulate.
                     if !fase_hook_active {
