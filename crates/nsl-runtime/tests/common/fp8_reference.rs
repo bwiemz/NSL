@@ -10,6 +10,10 @@ use nsl_runtime::fp8::{
     FP8_FORMAT_E4M3, FP8_FORMAT_E5M2,
 };
 
+// Not every test binary uses both helpers (fp8_scale only builds tensors;
+// fp8_dispatcher's no-cuda path uses neither) — silence the unused-import
+// warnings this produces in those binaries.
+#[allow(unused_imports)]
 pub use nsl_runtime::tensor::{test_build_tensor_2d_f32 as make_tensor_2d_f32,
                                test_read_tensor_f32 as read_tensor_f32};
 

@@ -4,6 +4,11 @@
 //! not f32 accumulation-ordering physics.
 
 mod common;
+// Needed by `cuda_tests` via `super::*`. When cuda is off, the submodule
+// is compiled out and the glob looks unused — the attribute silences the
+// warning without moving the glob (which would complicate super reach-
+// through if additional tests land here later).
+#[allow(unused_imports)]
 use common::fp8_reference::*;
 
 #[cfg(feature = "cuda")]
