@@ -651,6 +651,228 @@ impl Compiler<'_> {
         }
         Ok(())
     }
+
+    /// Emit a single unified optimizer-step loop with per-param runtime
+    /// dispatch on the FASE mode table. Used when `mode_table_base.is_some()`.
+    ///
+    /// Per spec §6, when `two_phase_clip` is active every mode is clamped
+    /// to Deferred upstream (in `plan_with_overrides`). So when this helper
+    /// is called with `fase_plan.two_phase_clip == true`, the runtime
+    /// branch inside the loop still works — modes[i] is Deferred for every
+    /// i, meaning the FullBuffer branch is effectively dead code at
+    /// runtime. This keeps the helper structure uniform regardless of
+    /// clip state.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn emit_unified_optim_step_dispatch(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        state: &mut crate::context::FuncState,
+        mode_table_base: cranelift_codegen::ir::Value,
+        num_params_val: cranelift_codegen::ir::Value,
+        param_list: cranelift_codegen::ir::Value,
+        state_list_1: cranelift_codegen::ir::Value,
+        state_list_2: cranelift_codegen::ir::Value,
+        num_state_buffers: usize,
+        accum_list: Option<cranelift_codegen::ir::Value>,
+        opt_grads: cranelift_codegen::ir::Value,
+        step_count_var: cranelift_frontend::Variable,
+        fase_plan: &crate::fase::FasePlan,
+        optimizer_name: &str,
+        opt_fn: &str,
+        lr: cranelift_codegen::ir::Value,
+        momentum_const: cranelift_codegen::ir::Value,
+        dampening_const: cranelift_codegen::ir::Value,
+        weight_decay_const: cranelift_codegen::ir::Value,
+        nesterov_const: cranelift_codegen::ir::Value,
+        beta1_const: cranelift_codegen::ir::Value,
+        beta2_const: cranelift_codegen::ir::Value,
+        eps_const: cranelift_codegen::ir::Value,
+        grad_accumulation_steps: i64,
+        grad_clip_threshold: f64,
+    ) -> Result<(), crate::error::CodegenError> {
+        use cranelift_codegen::ir::{condcodes::IntCC, InstBuilder};
+
+        // ── 1. Bias-correction scalars (computed once, used by Deferred branch) ──
+        let sc_val = builder.use_var(step_count_var);
+        let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+        let sc_plus_one = builder.ins().iadd(sc_val, one_i64);
+        let grad_accum_const =
+            builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+        let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
+        let beta1_for_bc = builder.ins().f64const(fase_plan.recipe.beta1);
+        let beta2_for_bc = builder.ins().f64const(fase_plan.recipe.beta2);
+        let bc1_inv = self.compile_call_by_name(
+            builder,
+            "nsl_bias_correction_inv",
+            &[beta1_for_bc, opt_step],
+        )?;
+        let bc2_inv = self.compile_call_by_name(
+            builder,
+            "nsl_bias_correction_inv",
+            &[beta2_for_bc, opt_step],
+        )?;
+
+        // ── 2. Phase A sum_sq loop + clip factor (two_phase_clip only) ──
+        let clip_factor = if fase_plan.two_phase_clip {
+            let Some(accum) = accum_list else {
+                return Err(crate::error::CodegenError::new(
+                    "two_phase_clip requires accum_list to be Some".to_string(),
+                ));
+            };
+
+            let pa_tot_var = state.new_variable();
+            builder.declare_var(pa_tot_var, cl_types::F64);
+            let pa_zero = builder.ins().f64const(0.0);
+            builder.def_var(pa_tot_var, pa_zero);
+            let pa_i_var = state.new_variable();
+            builder.declare_var(pa_i_var, cl_types::I64);
+            let pa_i_zero = builder.ins().iconst(cl_types::I64, 0);
+            builder.def_var(pa_i_var, pa_i_zero);
+
+            let pa_hdr = builder.create_block();
+            let pa_body = builder.create_block();
+            let pa_exit = builder.create_block();
+            builder.ins().jump(pa_hdr, &[]);
+            builder.switch_to_block(pa_hdr);
+            let pa_i = builder.use_var(pa_i_var);
+            let pa_cont =
+                builder.ins().icmp(IntCC::SignedLessThan, pa_i, num_params_val);
+            builder.ins().brif(pa_cont, pa_body, &[], pa_exit, &[]);
+            builder.switch_to_block(pa_body);
+            builder.seal_block(pa_body);
+
+            let pa_mpart =
+                self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+            let pa_sq =
+                self.compile_call_by_name(builder, "nsl_tensor_sum_sq", &[pa_mpart])?;
+            let pa_tot_cur = builder.use_var(pa_tot_var);
+            let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
+            builder.def_var(pa_tot_var, pa_tot_new);
+            let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
+            builder.def_var(pa_i_var, pa_i_next);
+            builder.ins().jump(pa_hdr, &[]);
+            builder.switch_to_block(pa_exit);
+            builder.seal_block(pa_hdr);
+            builder.seal_block(pa_exit);
+
+            let total_sq = builder.use_var(pa_tot_var);
+            let norm = builder.ins().sqrt(total_sq);
+            let eps_v = builder.ins().f64const(1e-6_f64);
+            let denom = builder.ins().fadd(norm, eps_v);
+            let tau_v = builder.ins().f64const(grad_clip_threshold);
+            let ratio = builder.ins().fdiv(tau_v, denom);
+            let one_f = builder.ins().f64const(1.0_f64);
+            let cf = builder.ins().fmin(one_f, ratio);
+            Some(cf)
+        } else {
+            None
+        };
+
+        // ── 3. Unified per-param loop with mode dispatch ──
+        let opt_i_var = state.new_variable();
+        builder.declare_var(opt_i_var, cl_types::I64);
+        let opt_zero = builder.ins().iconst(cl_types::I64, 0);
+        builder.def_var(opt_i_var, opt_zero);
+
+        let hdr = builder.create_block();
+        let body = builder.create_block();
+        let exit = builder.create_block();
+        builder.ins().jump(hdr, &[]);
+        builder.switch_to_block(hdr);
+        let opt_i = builder.use_var(opt_i_var);
+        let cont = builder.ins().icmp(IntCC::SignedLessThan, opt_i, num_params_val);
+        builder.ins().brif(cont, body, &[], exit, &[]);
+        builder.switch_to_block(body);
+        builder.seal_block(body);
+
+        // Common per-param loads (theta, s1, s2) — shared by both paths.
+        let theta =
+            self.compile_call_by_name(builder, "nsl_list_get", &[param_list, opt_i])?;
+        let s1 =
+            self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, opt_i])?;
+        let s2 = if num_state_buffers >= 2 {
+            self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, opt_i])?
+        } else {
+            s1
+        };
+
+        // Per-iteration mode dispatch.
+        let deferred_blk = builder.create_block();
+        let fullbuf_blk = builder.create_block();
+        let iter_join = builder.create_block();
+        self.emit_fase_mode_branch(
+            builder,
+            mode_table_base,
+            opt_i,
+            deferred_blk,
+            fullbuf_blk,
+        );
+
+        // ── Deferred path: m_partial-driven fused step ──
+        builder.switch_to_block(deferred_blk);
+        builder.seal_block(deferred_blk);
+        if let Some(accum) = accum_list {
+            let m_partial =
+                self.compile_call_by_name(builder, "nsl_list_get", &[accum, opt_i])?;
+            if let Some(cf) = clip_factor {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_mul_scalar_inplace",
+                    &[m_partial, cf],
+                )?;
+            }
+            self.fase_emit_final_step(
+                builder,
+                theta,
+                s1,
+                m_partial,
+                s2,
+                &fase_plan.recipe,
+                Some((bc1_inv, bc2_inv)),
+            )?;
+        }
+        builder.ins().jump(iter_join, &[]);
+
+        // ── FullBuffer path: stdlib optimizer dispatch ──
+        builder.switch_to_block(fullbuf_blk);
+        builder.seal_block(fullbuf_blk);
+        let grad =
+            self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, opt_i])?;
+        self.emit_stdlib_optim_call(
+            builder,
+            optimizer_name,
+            opt_fn,
+            theta,
+            grad,
+            s1,
+            s2,
+            lr,
+            momentum_const,
+            dampening_const,
+            weight_decay_const,
+            nesterov_const,
+            beta1_const,
+            beta2_const,
+            eps_const,
+            step_count_var,
+        )?;
+        builder.ins().jump(iter_join, &[]);
+
+        // ── Join + loop tail ──
+        builder.switch_to_block(iter_join);
+        builder.seal_block(iter_join);
+        let one_tail = builder.ins().iconst(cl_types::I64, 1);
+        let next = builder.ins().iadd(opt_i, one_tail);
+        builder.def_var(opt_i_var, next);
+        builder.ins().jump(hdr, &[]);
+        builder.seal_block(hdr);
+
+        builder.switch_to_block(exit);
+        builder.seal_block(exit);
+        state.current_block = Some(exit);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
