@@ -57,6 +57,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         (".param .u64", "csha_wv_ptr"), (".param .u64", "csha_wo_ptr"),
         (".param .f32", "csha_eps"), (".param .u32", "csha_active_heads"),
         (".param .u32", "csha_d_model"),
+        // Tier C: post-RoPE activation save pointers (null when not in use).
+        (".param .u64", "q_proj_ptr"), (".param .u64", "k_proj_ptr"),
+        (".param .u64", "v_proj_ptr"),
+        (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
     ];
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
@@ -145,7 +149,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         );
         ptx.push_str("    .reg .u32 %r_save_wrow;\n");
         ptx.push_str("    .reg .b16 %h_save_v;\n");
-        ptx.push_str("    .reg .pred %p_save_null;\n");
+        ptx.push_str("    .reg .pred %p_save_null, %p_rowmax_null, %p_rowsum_null, %p_skip_rm, %p_skip_rs;\n");
     }
 
     // CSHA A5 Wo output projection stub registers (only when fused_output_proj is set).
