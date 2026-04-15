@@ -84,7 +84,16 @@ pub(crate) fn invoke_cpdt_if_enabled(
         wggo_recommended_shard: overrides.min_shard_factor(),
     };
 
-    compiler.cpdt_plan = Some(cpdt_run(input));
+    let plan = cpdt_run(input);
+    // Publish to the CLI-owned output slot (if any) so `nsl build` can
+    // render the plan after compile returns without threading it through
+    // every entry-point's return tuple.
+    if let Some(slot) = compiler.compile_options.cpdt_plan_out.as_ref() {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(plan.clone());
+        }
+    }
+    compiler.cpdt_plan = Some(plan);
 }
 
 pub(crate) fn invoke_wrga_if_enabled(
