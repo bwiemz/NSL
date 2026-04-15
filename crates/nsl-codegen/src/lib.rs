@@ -503,6 +503,12 @@ pub struct CompileOptions {
     /// can render it without extending every entry-point return type.
     pub cpdt_plan_out:
         Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
+    /// M62: shared output slot the CLI reads after compile returns so it can
+    /// emit a matching C header alongside the shared library. Populated by
+    /// `Compiler::finalize` from `features.export_functions`.
+    pub export_functions_out: Option<
+        std::sync::Arc<std::sync::Mutex<Option<Vec<crate::c_header::ExportInfo>>>>,
+    >,
     /// Path to calibration dataset.
     pub calibration_data: Option<std::path::PathBuf>,
     /// Failure-handling mode: `"required"` or `"best-effort"`.
@@ -586,6 +592,7 @@ impl Default for CompileOptions {
             cpdt_cluster: None,
             cpdt_report_requested: false,
             cpdt_plan_out: None,
+            export_functions_out: None,
             calibration_data: None,
             calibration_mode: Some("required".to_string()),
             calibration_samples: 512,

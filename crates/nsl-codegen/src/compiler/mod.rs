@@ -1121,6 +1121,14 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {
+        // M62: publish @export functions to the CLI-owned output slot so
+        // `nsl build --shared-lib` can emit a matching C header without
+        // threading the list through every entry-point's return tuple.
+        if let Some(slot) = self.compile_options.export_functions_out.as_ref() {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(self.features.export_functions.clone());
+            }
+        }
         let product = self.module.finish();
         product
             .emit()
