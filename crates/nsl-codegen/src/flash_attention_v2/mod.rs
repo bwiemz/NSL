@@ -54,6 +54,18 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
 
         // CSHA hooks (no-op when csha=None).
         phases::csha_hooks::emit_prologue(&mut ptx, config, q_iter);
+
+        // Cooperative HBM→SMEM weight-tile loads for Wq/Wk/Wv.
+        // Must execute BEFORE emit_matmul_projection so the projection
+        // sweeps can read W from SMEM. Gated on fused_projections.
+        if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+            let base = smem_layout::sp_offset(config) + 4 * (config.block_kv as u32) * 4;
+            let wt_bytes = smem_layout::wq_tile_bytes(config);
+            emit_weight_tile_load(&mut ptx, config, "Wq", "csha_wq_ptr", base, q_iter);
+            emit_weight_tile_load(&mut ptx, config, "Wk", "csha_wk_ptr", base + wt_bytes, q_iter);
+            emit_weight_tile_load(&mut ptx, config, "Wv", "csha_wv_ptr", base + 2 * wt_bytes, q_iter);
+        }
+
         phases::csha_hooks::emit_matmul_projection(&mut ptx, config, q_iter);
 
         // Phase 1: Q load.
@@ -163,6 +175,73 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_V_LOAD_{};\n", q_iter));
     ptx.push_str("    bar.sync 0;  // FENCE: V tile in shmem\n");
+}
+
+/// Cooperative HBM→SMEM load for one CSHA projection weight tile.
+///
+/// 128 threads cooperatively load `d_model × head_dim` f16 values from
+/// `weight_param` into the SMEM region at `shmem_base + smem_byte_offset`.
+/// Null-guarded: if the weight pointer is 0 the load is skipped.
+///
+/// `label` is used only for comments and loop-label naming (e.g., "Wq").
+/// `q_iter` suffixes labels to prevent duplicates when the outer loop
+/// calls this function multiple times.
+fn emit_weight_tile_load(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    label: &str,              // e.g. "Wq"
+    weight_param: &str,       // PTX param name, e.g. "csha_wq_ptr"
+    smem_byte_offset: u32,    // byte offset from shmem[] base
+    q_iter: u32,
+) {
+    let csha = match &config.csha {
+        Some(c) if c.fused_projections => c,
+        _ => return,
+    };
+    let d_model    = csha.d_model as u64;
+    let head_dim   = config.head_dim as u64;
+    let total_elems = d_model * head_dim; // number of f16 elements
+
+    let loop_label = format!("V2_WT_LOAD_{}_{}", label.to_uppercase(), q_iter);
+    let skip_label = format!("V2_WT_SKIP_{}_{}", label.to_uppercase(), q_iter);
+
+    ptx.push_str(&format!(
+        "    // Cooperative HBM->SMEM load: {} (d_model={}, head_dim={}, smem_off={})\n",
+        label, d_model, head_dim, smem_byte_offset
+    ));
+    // Null-guard: skip load if the weight pointer is 0.
+    ptx.push_str(&format!(
+        "    ld.param.u64 %rd_wt, [{}];\n",
+        weight_param
+    ));
+    ptx.push_str("    setp.eq.u64 %p_wt, %rd_wt, 0;\n");
+    ptx.push_str(&format!("    @%p_wt bra {};\n", skip_label));
+
+    // Compute SMEM base for this tile: shmem_base + smem_byte_offset.
+    ptx.push_str(&format!(
+        "    add.u64 %rd_wt_dst, %shmem_base, {};\n",
+        smem_byte_offset
+    ));
+    // Each thread loads its elements: idx = tid_x, tid_x+128, tid_x+256, ...
+    ptx.push_str("    cvt.u64.u32 %rd_wt_idx, %tid_x;\n");
+    ptx.push_str(&format!("{}:\n", loop_label));
+    // Byte offset within the tile (2 bytes per f16 element).
+    ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_idx, 1;\n");
+    // HBM source address.
+    ptx.push_str("    add.u64 %rd_wt_src, %rd_wt, %rd_wt_off;\n");
+    ptx.push_str("    ld.global.b16 %h_wt, [%rd_wt_src];\n");
+    // SMEM destination address = tile_base + element_offset.
+    ptx.push_str("    add.u64 %rd_wt_src, %rd_wt_dst, %rd_wt_off;  // reuse %rd_wt_src\n");
+    ptx.push_str("    st.shared.b16 [%rd_wt_src], %h_wt;\n");
+    // Advance by 128 and loop.
+    ptx.push_str("    add.u64 %rd_wt_idx, %rd_wt_idx, 128;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u64 %p_wt, %rd_wt_idx, {};\n",
+        total_elems
+    ));
+    ptx.push_str(&format!("    @%p_wt bra {};\n", loop_label));
+    ptx.push_str(&format!("{}:\n", skip_label));
+    ptx.push_str("    bar.sync 0;  // FENCE: weight tile in SMEM\n");
 }
 
 /// Kernel entry-point name for v2. Same format as v1 with a `_v2` suffix

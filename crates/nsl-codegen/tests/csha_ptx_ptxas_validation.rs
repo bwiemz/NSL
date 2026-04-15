@@ -294,3 +294,72 @@ fn a1_gpu_sm_matches_compile_target() {
         );
     }
 }
+
+/// A3: The v2 scalar emitter with `fused_projections = true` must produce
+/// ptxas-clean PTX on sm_75, sm_90, and sm_120.  This validates the full
+/// Q/K/V warp-per-row sweep emission: weight null-checks, projection inner
+/// loops, 5-step butterfly reduction, and output f16 stores.
+///
+/// Config: block_q=32, head_dim=32, d_model=128 — the smallest corner of
+/// the supported matrix that exercises all three projection sweeps.
+///
+/// Skipped gracefully when ptxas is not installed (CI / Windows dev boxes
+/// without a CUDA toolkit). On CUDA-equipped boxes this is the A3 gate:
+/// passing here proves the emitter produces assemble-able PTX.
+#[test]
+fn a3_v2_fused_projections_assembles_on_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("skipping a3 ptxas test: ptxas not found in PATH or standard install");
+        return;
+    };
+    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            fused_projections: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        }),
+    };
+
+    let mut failures = Vec::new();
+    for sm in &["sm_75", "sm_90", "sm_120"] {
+        let mut c = cfg.clone();
+        c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+        let ptx = synthesize_flash_attention_ptx_v2(&c);
+        let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
+        let dump = std::env::temp_dir().join(format!("a3_fused_proj_{}.ptx", sm));
+        std::fs::write(&dump, &ptx[..text_end]).ok();
+        if let Err(stderr) = assemble_ptx(&ptxas, &ptx[..text_end], sm) {
+            let ptx_str = String::from_utf8_lossy(&ptx[..text_end]);
+            let lines: Vec<&str> = ptx_str.lines().collect();
+            let total = lines.len();
+            let tail_start = total.saturating_sub(40);
+            let tail: String = lines[tail_start..]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("  {:>4}: {}", tail_start + i + 1, l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            failures.push(format!(
+                "A3 fused-projections PTX failed on {} (dump: {}):\n--- ptxas ---\n{}\n--- PTX tail ---\n{}",
+                sm, dump.display(), stderr, tail
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "A3 v2 fused-projections ptxas failures:\n\n{}",
+        failures.join("\n---\n")
+    );
+}

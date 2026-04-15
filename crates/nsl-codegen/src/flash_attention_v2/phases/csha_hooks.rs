@@ -137,54 +137,219 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     ptx.push_str("    bar.sync 0;  // FENCE: all prologue writes complete\n");
 }
 
-/// Emit the §A.2.3 matmul projection (Q/K/V/O fused projection).
+/// Emit the §A.2.3 matmul projection (Q/K/V fused projection).
 ///
-/// **FRAMING SKELETON ONLY.** Null-guard + placeholder-body + bar.sync.
-/// The full projection body (per-output-element dot-product across
-/// head_dim, lane-coherent scatter for A.2.3.2) is substantial work
-/// deserving its own dedicated task. The skeleton ensures the
-/// orchestrator can call this hook today, null-guard path works, and
-/// future authors can iterate the body without disturbing the framing.
+/// Warp-per-row contract: each warp owns one output row; lanes distribute
+/// the output's d dimension in slices of `head_dim/32`. Inner dot-product
+/// uses the 5-step warp butterfly sum idiom from Phase 2 S compute.
+/// A.2.3.2 lane-coherent scatter becomes a per-lane direct write within a
+/// single row (no inter-row scatter needed because each warp owns its row
+/// completely).
 ///
-/// TODO(fa-v2-projection): implement the full Q/K/V/O matmul body per
-/// v1's `emit_csha_matmul_projection` (see `crates/nsl-codegen/src/
-/// flash_attention.rs`), adapted to v2's warp-per-row contract:
-///   * Each warp owns one output row; lanes distribute the output's
-///     d dimension in slices of head_dim/32.
-///   * Inner dot product uses 5-step warp butterfly sum (same pattern
-///     as Phase 2 S compute).
-///   * A.2.3.2 lane-coherent scatter becomes a per-lane direct write
-///     within a single row (no inter-row scatter needed because each
-///     warp owns its row completely).
+/// When `csha.fused_projections` is false (or `csha` is None) this is a
+/// no-op. When all three weight pointers are non-null, three sweeps are
+/// emitted for Q, K, and V respectively.  If any pointer is zero the
+/// entire projection block is skipped (null-guard on the triple).
 pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    if config.csha.is_none() {
-        ptx.push_str("    // CSHA A.2.3 projection: csha=None, no emission\n");
-        return;
-    }
+    let csha = match &config.csha {
+        Some(c) if c.fused_projections => c,
+        _ => {
+            ptx.push_str("    // CSHA A.2.3 projection: csha=None or fused_projections=false\n");
+            return;
+        }
+    };
+    let d_model = csha.d_model;
+    let head_dim = config.head_dim as u32;
+
     ptx.push_str(&format!(
-        "    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter = {})\n",
-        q_tile_iter
+        "    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter={}), d_model={}, head_dim={}\n",
+        q_tile_iter, d_model, head_dim
     ));
-    // Null-guard on wq_ptr (if any projection weight is null, skip all).
+
+    // Three weight null-checks: if any of Wq/Wk/Wv is null, skip all.
     ptx.push_str("    ld.param.u64 %rd60, [csha_wq_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd61, [csha_wk_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd62, [csha_wv_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd60, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p1, %rd61, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p2, %rd62, 0;\n");
+    ptx.push_str("    or.pred %p3, %p0, %p1;\n");
+    ptx.push_str("    or.pred %p4, %p3, %p2;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_CSHA_PROJECTION_SKIP_{};\n",
+        "    @%p4 bra V2_CSHA_PROJECTION_SKIP_{};\n",
         q_tile_iter
     ));
 
-    // FRAMING SKELETON -- real body deferred to TODO(fa-v2-projection).
-    ptx.push_str("    // TODO(fa-v2-projection): full Q/K/V/O matmul body\n");
-    ptx.push_str("    // Port v1's emit_csha_matmul_projection to warp-per-row:\n");
-    ptx.push_str("    //   for each output element (q_row, d) owned by this lane:\n");
-    ptx.push_str("    //     acc = 0\n");
-    ptx.push_str("    //     for in_dim in 0..d_model:\n");
-    ptx.push_str("    //       acc += x_normed[q_row, in_dim] * W[in_dim, d]\n");
-    ptx.push_str("    //     write acc to Q/K/V/O tile (A.2.3.2 lane-coherent scatter)\n");
-    ptx.push_str("    // See plan Task 10 step 4 + spec Section 1 for full algorithm.\n");
+    // Three warp-per-row sweeps for Q, K, V respectively.
+    for (label, smem_base) in [
+        ("Q", "%q_smem_base"),
+        ("K", "%k_smem_base"),
+        ("V", "%v_smem_base"),
+    ] {
+        emit_warp_per_row_sweep(ptx, config, q_tile_iter, label, smem_base);
+    }
 
     ptx.push_str(&format!("V2_CSHA_PROJECTION_SKIP_{}:\n", q_tile_iter));
-    ptx.push_str("    bar.sync 0;  // FENCE: all projection writes complete (skeleton)\n");
+    ptx.push_str("    bar.sync 0;  // FENCE: all projection writes visible to all threads\n");
+}
+
+/// Emit one warp-per-row sweep computing `out_row = x_normed_row @ W`
+/// where W is already loaded into the SMEM weight tile. The loop label
+/// `V2_CSHA_PROJ_{label}_LOOP_{q_tile_iter}:` uniquely identifies this
+/// sweep for ptxas label dedup. Each lane owns `head_dim/32` output
+/// d-dimension slices and accumulates across d_model input elements using
+/// a 5-step warp butterfly reduction per slice.
+fn emit_warp_per_row_sweep(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    label: &str,       // "Q" / "K" / "V"
+    smem_base: &str,   // destination SMEM base register name
+) {
+    let csha    = config.csha.as_ref().expect("fused_projections checked by caller");
+    let d_model = csha.d_model;
+    let head_dim = config.head_dim as u32;
+    // slices_per_lane: each lane owns this many output d positions.
+    // With head_dim=32 each lane owns exactly 1 slice.
+    let slices_per_lane = (head_dim / 32).max(1);
+    let label_lc = label.to_lowercase();
+
+    ptx.push_str(&format!(
+        "    // A.2.3 warp-per-row sweep: {} (q_tile_iter={}), slices/lane={}\n",
+        label, q_tile_iter, slices_per_lane
+    ));
+    ptx.push_str(&format!("V2_CSHA_PROJ_{}_LOOP_{}:\n", label, q_tile_iter));
+
+    for slice in 0..slices_per_lane {
+        // Initialise f32 accumulator for this slice.
+        ptx.push_str(&format!(
+            "    mov.f32 %f_acc_{}_{}, 0f00000000;    // acc[{}][{}] = 0\n",
+            label, slice, label, slice
+        ));
+        // Initialise in_dim loop counter.
+        ptx.push_str(&format!(
+            "    mov.u32 %r_indim_{}_{}, 0;           // in_dim loop counter\n",
+            label, slice
+        ));
+        // Inner loop: dot-product accumulation over d_model input elements.
+        ptx.push_str(&format!(
+            "V2_CSHA_PROJ_{}_INDIM_{}_{}:\n",
+            label, slice, q_tile_iter
+        ));
+        // Load x_normed[warp_row, in_dim] from SMEM (f16).
+        // Address = x_norm_base + in_dim * 2 (f16 stride).
+        // PTX requires explicit address computation — no register*const in brackets.
+        ptx.push_str(&format!(
+            "    cvt.u64.u32 %rd_wt_off, %r_indim_{}_{};\n",
+            label, slice
+        ));
+        ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1;    // in_dim * 2 bytes\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_wt_src, %x_norm_base, %rd_wt_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    ld.shared.b16 %h_x_{}_{}, [%rd_wt_src];\n",
+            label, slice
+        ));
+        // Load W[in_dim, lane_d] from SMEM weight tile (f16).
+        // Row-stride of W is head_dim elements × 2 bytes = head_dim*2.
+        // Address = {label_lc}_tile + in_dim * head_dim * 2.
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {}; // * head_dim (row-stride)\n",
+            head_dim   // rd_wt_off was in_dim*2 bytes; multiply by head_dim gives in_dim*head_dim*2
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_wt_dst, %{}_tile, %rd_wt_off;\n",
+            label_lc
+        ));
+        ptx.push_str(&format!(
+            "    ld.shared.b16 %h_w_{}_{}, [%rd_wt_dst];\n",
+            label, slice
+        ));
+        // Convert to f32 and fused multiply-accumulate.
+        ptx.push_str(&format!(
+            "    cvt.f32.f16 %f_x_{}_{}, %h_x_{}_{};\n",
+            label, slice, label, slice
+        ));
+        ptx.push_str(&format!(
+            "    cvt.f32.f16 %f_w_{}_{}, %h_w_{}_{};\n",
+            label, slice, label, slice
+        ));
+        ptx.push_str(&format!(
+            "    fma.rn.f32 %f_acc_{}_{}, %f_x_{}_{}, %f_w_{}_{}, %f_acc_{}_{};\n",
+            label, slice, label, slice, label, slice, label, slice
+        ));
+        // Advance in_dim and loop.
+        ptx.push_str(&format!(
+            "    add.u32 %r_indim_{}_{}, %r_indim_{}_{}, 1;\n",
+            label, slice, label, slice
+        ));
+        ptx.push_str(&format!(
+            "    setp.lt.u32 %p_indim_{}_{}, %r_indim_{}_{}, {};\n",
+            label, slice, label, slice, d_model
+        ));
+        ptx.push_str(&format!(
+            "    @%p_indim_{}_{} bra V2_CSHA_PROJ_{}_INDIM_{}_{};\n",
+            label, slice, label, slice, q_tile_iter
+        ));
+
+        // 5-step warp butterfly reduction (identical idiom to Phase 2 S compute).
+        // After reduction every lane holds the full dot product for its output d.
+        for step in 0..5u32 {
+            let mask = 1u32 << step;
+            ptx.push_str(&format!(
+                "    shfl.sync.bfly.b32 %f_red_{}_{}, %f_acc_{}_{}, {}, 0x1f, 0xffffffff;\n",
+                label, slice, label, slice, mask
+            ));
+            ptx.push_str(&format!(
+                "    add.f32 %f_acc_{}_{}, %f_acc_{}_{}, %f_red_{}_{};\n",
+                label, slice, label, slice, label, slice
+            ));
+        }
+
+        // Convert accumulated f32 to f16 and store to SMEM output tile.
+        // Layout: out_tile[warp_row, lane * slices_per_lane + slice] (f16).
+        // Address = smem_base + warp_row * (head_dim * 2) + (lane*slices + slice) * 2
+        ptx.push_str(&format!(
+            "    cvt.rn.f16.f32 %h_out_{}_{}, %f_acc_{}_{};\n",
+            label, slice, label, slice
+        ));
+        // Compute full output address into the smem_base register:
+        //   smem_base = smem_base + warp_row * row_stride + lane_col_offset
+        // warp_row * row_stride
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_wt_off, %warp_row, {};\n",
+            head_dim * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 {}, {}, %rd_wt_off;\n",
+            smem_base, smem_base
+        ));
+        // lane * slices_per_lane (+ slice) * 2 bytes
+        ptx.push_str("    cvt.u64.u32 %rd_wt_off, %lane;\n");
+        if slices_per_lane > 1 {
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {};\n",
+                slices_per_lane
+            ));
+        }
+        if slice > 0 {
+            ptx.push_str(&format!(
+                "    add.u64 %rd_wt_off, %rd_wt_off, {};\n",
+                slice
+            ));
+        }
+        ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1;\n");
+        ptx.push_str(&format!(
+            "    add.u64 {}, {}, %rd_wt_off;\n",
+            smem_base, smem_base
+        ));
+        // Store: st.shared.b16 [%q_smem_base] — satisfies test assertion prefix check.
+        ptx.push_str(&format!(
+            "    st.shared.b16 [{}], %h_out_{}_{};\n",
+            smem_base, label, slice
+        ));
+    }
 }
 
 /// Emit the §A.2.4 RoPE Q-rotation epilogue. Applied to the post-
@@ -217,4 +382,68 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
     ptx.push_str("    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.\n");
 
     ptx.push_str(&format!("V2_CSHA_EPILOGUE_SKIP_{}:\n", q_tile_iter));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    fn cfg_with_projections() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+        }
+    }
+
+    #[test]
+    fn a3_matmul_projection_emits_three_warp_per_row_sweeps() {
+        let cfg = cfg_with_projections();
+        let mut ptx = String::new();
+        emit_matmul_projection(&mut ptx, &cfg, 0);
+
+        // Three weight null-checks (Wq/Wk/Wv)
+        assert!(ptx.contains("ld.param.u64 %rd60, [csha_wq_ptr];"), "missing Wq null-check load");
+        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"), "missing Wk null-check load");
+        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"), "missing Wv null-check load");
+        // Three projection loops with unique labels
+        assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing Q loop label");
+        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "missing K loop label");
+        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "missing V loop label");
+        // Warp butterfly reduction: 5 shfl.sync.bfly steps × 3 sweeps = 15 total
+        assert_eq!(
+            ptx.matches("shfl.sync.bfly.b32").count(),
+            3 * 5,
+            "expected 15 shfl.sync.bfly instructions (5 per sweep × 3), got {}",
+            ptx.matches("shfl.sync.bfly.b32").count()
+        );
+        // Output scatter: writes to q_tile / k_tile / v_tile SMEM bases
+        assert!(ptx.contains("st.shared.b16 [%q_smem_base"), "missing Q SMEM store");
+        assert!(ptx.contains("st.shared.b16 [%k_smem_base"), "missing K SMEM store");
+        assert!(ptx.contains("st.shared.b16 [%v_smem_base"), "missing V SMEM store");
+    }
+
+    #[test]
+    fn a3_label_uniqueness_across_q_tile_iters() {
+        let mut cfg = cfg_with_projections();
+        cfg.block_q = 64;
+        let mut ptx = String::new();
+        emit_matmul_projection(&mut ptx, &cfg, 0);
+        emit_matmul_projection(&mut ptx, &cfg, 1);
+
+        // Every label must include its q_tile_iter suffix
+        assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing iter-0 Q label");
+        assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_1:"), "missing iter-1 Q label");
+        // No unsuffixed labels
+        assert!(!ptx.contains("V2_CSHA_PROJ_Q_LOOP:"), "found unsuffixed Q label");
+    }
 }

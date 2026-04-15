@@ -82,6 +82,42 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .f32 %log_sum, %lse;\n");
     ptx.push_str("    .reg .u64 %logsumexp_base;\n");
     ptx.push_str("    .reg .pred %p_has_lse;\n");
+
+    // CSHA A.2.3 projection registers (only when fused_projections is set).
+    // Named register pools: one accumulator, counter, scratch, and output
+    // register per (label ∈ {Q,K,V}) × (slice ∈ 0..slices_per_lane).
+    if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
+        for label in ["Q", "K", "V"] {
+            for slice in 0..slices_per_lane {
+                ptx.push_str(&format!(
+                    "    .reg .f32 %f_acc_{}_{}, %f_x_{}_{}, %f_w_{}_{}, %f_red_{}_{};\n",
+                    label, slice, label, slice, label, slice, label, slice
+                ));
+                ptx.push_str(&format!(
+                    "    .reg .b16 %h_x_{}_{}, %h_w_{}_{}, %h_out_{}_{};\n",
+                    label, slice, label, slice, label, slice
+                ));
+                ptx.push_str(&format!(
+                    "    .reg .u32 %r_indim_{}_{};\n",
+                    label, slice
+                ));
+                ptx.push_str(&format!(
+                    "    .reg .pred %p_indim_{}_{};\n",
+                    label, slice
+                ));
+            }
+        }
+        // Weight-tile load scratch registers (shared across all three tile loads).
+        ptx.push_str("    .reg .u64 %rd_wt, %rd_wt_idx, %rd_wt_off, %rd_wt_src, %rd_wt_dst;\n");
+        ptx.push_str("    .reg .b16 %h_wt;\n");
+        ptx.push_str("    .reg .pred %p_wt;\n");
+        // SMEM base registers for Q/K/V output tiles and x_norm input tile.
+        ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
+        ptx.push_str("    .reg .u64 %x_norm_base, %warp_row;\n");
+        // SMEM tile pointer registers for weight matrices and inner-loop use.
+        ptx.push_str("    .reg .u64 %q_tile, %k_tile, %v_tile;\n");
+    }
     ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))\n");
 
