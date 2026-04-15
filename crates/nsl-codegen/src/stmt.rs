@@ -4900,7 +4900,42 @@ impl Compiler<'_> {
             builder.seal_block(ga_body);
             let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
             let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
-            if fase_deferred {
+            if let Some(mtb) = mode_table_base {
+                // FASE Codegen Phase 2: per-param dispatch via runtime byte load.
+                let ga_deferred = builder.create_block();
+                let ga_fullbuf = builder.create_block();
+                let ga_join = builder.create_block();
+
+                self.emit_fase_mode_branch(builder, mtb, gai, ga_deferred, ga_fullbuf);
+
+                // Deferred path
+                builder.switch_to_block(ga_deferred);
+                builder.seal_block(ga_deferred);
+                self.fase_emit_accumulate(
+                    builder,
+                    accum_buf,
+                    grad,
+                    fase_plan.recipe.accum_scale,
+                )?;
+                builder.ins().jump(ga_join, &[]);
+
+                // FullBuffer path
+                builder.switch_to_block(ga_fullbuf);
+                builder.seal_block(ga_fullbuf);
+                let n_elems =
+                    self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_grad_accumulate_add",
+                    &[accum_buf, grad, n_elems],
+                )?;
+                builder.ins().jump(ga_join, &[]);
+
+                // Join — single tensor_free regardless of path
+                builder.switch_to_block(ga_join);
+                builder.seal_block(ga_join);
+            } else if fase_deferred {
+                // Pre-Phase-2 monolithic Deferred path (byte-identical when no overrides).
                 // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
                 self.fase_emit_accumulate(
                     builder,
@@ -4909,6 +4944,7 @@ impl Compiler<'_> {
                     fase_plan.recipe.accum_scale,
                 )?;
             } else {
+                // Pre-Phase-2 monolithic FullBuffer path (byte-identical).
                 // Existing path: raw gradient sum (divided / zeroed after optimizer step)
                 let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
                 self.compile_call_by_name(
