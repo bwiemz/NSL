@@ -155,6 +155,20 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // log2(e)\n");
 
+    // Initialise SMEM tile bases so every backward phase can address
+    // them without depending on a specific sibling phase having run
+    // first. Q tile at byte 0 (Tier A layout); K/V share the kv_offset
+    // region immediately after (K is consumed first, then V overwrites
+    // its SMEM slot).
+    let kv_off = crate::flash_attention_v2::smem_layout::kv_offset(config);
+    ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %k_smem_base, %shmem_base, {};\n", kv_off
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %v_smem_base, %shmem_base, {};\n", kv_off
+    ));
+
     // Scalar param loads.
     ptx.push_str("    ld.param.f32 %scale, [scale];\n");
     ptx.push_str("    ld.param.u64 %rd0, [q_ptr];\n");
