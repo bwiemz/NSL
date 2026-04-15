@@ -3299,17 +3299,16 @@ impl Compiler<'_> {
                 diag.layer_index, diag.requested, diag.applied, reason_str
             );
         }
-        // TODO(fase-consumer-3-phase-2): Per-layer codegen dispatch deferred.
-        // The backward loop below (`nsl_list_get(grads_list, gai)` around the
-        // `ga_body` block) and the optimizer-step loop branch on this single
-        // compile-time boolean. Routing per-layer modes would require either
-        // a runtime lookup table keyed on param index or loop unrolling at
-        // codegen time — both substantial refactors beyond this plan. The
-        // planner (fase::plan_with_overrides), memory schedule
-        // (fase_memory::fase_breakdown), and stderr renderer above already
-        // honor per-layer modes, so WGGO's fase_fused signal flows through
-        // observability even though codegen still uses the global mode.
-        // See docs/superpowers/specs/2026-04-15-fase-per-layer-mode-design.md §9.
+        // FASE Codegen Phase 2 (mostly) shipped: the accumulation loop
+        // `ga_body` below now dispatches per-param via a `.rodata` mode
+        // table built from WGGO's per-layer decisions (see
+        // `mode_table_base` allocation below + `emit_fase_mode_branch`
+        // in stmt_fase.rs). Phase A two-phase-clip is Deferred-only by
+        // construction; the optimizer step retains the global boolean
+        // dispatch — its outer-scope structure (separate fused vs
+        // stdlib emission paths) requires a deeper refactor that is
+        // tracked as a follow-up.
+        // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── 3. Resolve model type and build param list ──────────────────
