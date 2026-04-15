@@ -64,14 +64,17 @@ use nsl_runtime::flash_attention::{
     CshaBackwardActivations,
 };
 
-// ── Gate: flip to true after Phase 3 placeholder loads are replaced ─────────
+// ── Gates ──────────────────────────────────────────────────────────────────
 //
-// Until the T3.3/T3.4/T3.5/T3.6 inner loops read Q/K/V/dO/x_norm from
-// HBM instead of using 0f3F800000 placeholder constants, any numerical
-// tolerance comparison against the CPU reference is meaningless.
-// Structural assertions (rc=0, finite gradients, correct shapes) run
-// unconditionally.
-const NUMERICAL_GATE_ENABLED: bool = false;
+// dq/dk/dv: enabled after the three structural fixes on feat/csha-tier-c-diag
+//   (V save scheduling, backward V-input SMEM tile, per-iter dQ SMEM flush).
+//   Tier A 5e-3 tolerance for head_dim=32.
+//
+// dwq/dwk/dwv/dx: still blocked on csha_hooks_backward::emit_dproj and
+//   emit_drmsnorm using 0f3F800000 placeholders for their x_norm / x /
+//   norm_weight HBM reads. Flip after real addressing lands.
+const NUMERICAL_GATE_DQKV_ENABLED: bool = true;
+const NUMERICAL_GATE_DW_DX_ENABLED: bool = false;
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) as u32;
@@ -433,20 +436,20 @@ fn t6_3_smoke_single_config() {
          dv={d_dv:.3e} dwq={d_dwq:.3e} dx={d_dx:.3e}"
     );
 
-    if NUMERICAL_GATE_ENABLED {
-        let tol = tol_for_head_dim(32);
+    let tol = tol_for_head_dim(32);
+    if NUMERICAL_GATE_DQKV_ENABLED {
         assert!(d_dq < tol, "dq max_abs {d_dq:.3e} > tol {tol:.1e}");
         assert!(d_dk < tol, "dk max_abs {d_dk:.3e} > tol {tol:.1e}");
         assert!(d_dv < tol, "dv max_abs {d_dv:.3e} > tol {tol:.1e}");
+    }
+    if NUMERICAL_GATE_DW_DX_ENABLED {
         assert!(d_dwq < tol, "dwq max_abs {d_dwq:.3e} > tol {tol:.1e}");
         assert!(d_dx < tol, "dx max_abs {d_dx:.3e} > tol {tol:.1e}");
     } else {
         eprintln!(
-            "[T6.3] BLOCKED: numerical gate disabled pending Phase 3 \
-             inner-loop HBM-load implementation (T3.3/T3.4/T3.5/T3.6 \
-             emit placeholder 0f3F800000 constants for Q/K/V/dO/x_norm \
-             reads). Flip NUMERICAL_GATE_ENABLED=true after real \
-             addressing lands."
+            "[T6.3] dwq/dx gate disabled: csha_hooks_backward emit_dproj \
+             and emit_drmsnorm still use 0f3F800000 placeholders for \
+             x_norm/x/norm_weight HBM reads."
         );
     }
 }
