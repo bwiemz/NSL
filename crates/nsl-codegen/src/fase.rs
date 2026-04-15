@@ -612,4 +612,33 @@ mod tests {
         assert_eq!(p.per_layer_mode, Some(vec![FaseMode::FullBuffer]));
         assert_eq!(p.override_diagnostics.len(), 1);
     }
+
+    #[test]
+    fn fase_mode_infeasible_diagnostic_has_stderr_shape() {
+        // Pins the FaseModeInfeasible diagnostic's field shape so the
+        // stmt.rs stderr formatter has a stable contract. If stderr format
+        // drifts, this test won't catch it — rely on CSHA/WRGA/CPDT
+        // renderer symmetry and manual verification for the formatter.
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::Lion,
+            accumulation: 4,
+            ..Default::default()
+        };
+        let p = plan_with_overrides(&cfg, &[true]);
+        let diag = &p.override_diagnostics[0];
+
+        assert_eq!(diag.layer_index, 0);
+        assert_eq!(diag.requested.as_str(), "Deferred");
+        assert_eq!(diag.applied.as_str(), "FullBuffer");
+        match &diag.reason {
+            crate::wggo_overrides::OverrideRejectReason::FaseModeInfeasible {
+                optimizer,
+                global_mode,
+            } => {
+                assert_eq!(*optimizer, FaseOptimizer::Lion);
+                assert_eq!(*global_mode, FaseMode::FullBuffer);
+            }
+            _ => panic!("expected FaseModeInfeasible"),
+        }
+    }
 }
