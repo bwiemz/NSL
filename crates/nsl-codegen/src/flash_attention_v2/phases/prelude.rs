@@ -118,6 +118,27 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // SMEM tile pointer registers for weight matrices and inner-loop use.
         ptx.push_str("    .reg .u64 %q_tile, %k_tile, %v_tile;\n");
     }
+
+    // CSHA A.2.4 RoPE epilogue registers (only when rope_q=true and csha is set).
+    if config.rope_q && config.csha.is_some() {
+        // HBM pointer registers for cos/sin tables.
+        ptx.push_str("    .reg .u64 %rd_rope_cos, %rd_rope_sin, %rd_rope_addr;\n");
+        ptx.push_str("    .reg .u64 %rd_rope_cs_idx, %rd_rope_x0_off, %rd_rope_x1_off;\n");
+        // f32 accumulators for rotation math.
+        ptx.push_str("    .reg .f32 %f_rope_cos, %f_rope_sin;\n");
+        ptx.push_str("    .reg .f32 %f_rope_x0, %f_rope_x1, %f_rope_y0, %f_rope_y1;\n");
+        ptx.push_str("    .reg .f32 %f_rope_neg_x1;\n");
+        // f16 scratch for pair loads/stores.
+        ptx.push_str("    .reg .b16 %h_rope_pair, %h_rope_y0, %h_rope_y1;\n");
+        // u32 loop/index registers.
+        ptx.push_str("    .reg .u32 %r_rope_tid, %r_rope_pair_idx;\n");
+        ptx.push_str("    .reg .u32 %r_rope_row, %r_rope_dim_pair;\n");
+        ptx.push_str("    .reg .u32 %r_rope_cs_off, %r_rope_smem_row_off;\n");
+        ptx.push_str("    .reg .u32 %r_rope_x0_col, %r_rope_x0_off, %r_rope_x1_off;\n");
+        // Predicate registers for null-guard and loop exit.
+        ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
+    }
+
     ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))\n");
 

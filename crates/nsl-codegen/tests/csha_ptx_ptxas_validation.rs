@@ -363,3 +363,70 @@ fn a3_v2_fused_projections_assembles_on_sm75_sm90_sm120() {
         failures.join("\n---\n")
     );
 }
+
+/// A4: The v2 scalar emitter with `rope_q = true` AND `fused_projections = true`
+/// must produce ptxas-clean PTX on sm_75, sm_90, and sm_120.  This validates the
+/// full RoPE Q/K rotation pair-loop emission: cos/sin null-guards, cooperative
+/// pair-loop, fma rotation math, and f16 SMEM writeback.
+///
+/// Config: block_q=32, head_dim=32, d_model=128, rope_q=true — smallest corner
+/// that exercises both projection sweeps (A3) and RoPE rotation sweeps (A4).
+///
+/// Skipped gracefully when ptxas is not installed.
+#[test]
+fn a4_v2_rope_q_fused_projections_assembles_on_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("skipping a4 ptxas test: ptxas not found in PATH or standard install");
+        return;
+    };
+    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            fused_projections: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        }),
+    };
+
+    let mut failures = Vec::new();
+    for sm in &["sm_75", "sm_90", "sm_120"] {
+        let mut c = cfg.clone();
+        c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+        let ptx = synthesize_flash_attention_ptx_v2(&c);
+        let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
+        let dump = std::env::temp_dir().join(format!("a4_rope_q_{}.ptx", sm));
+        std::fs::write(&dump, &ptx[..text_end]).ok();
+        if let Err(stderr) = assemble_ptx(&ptxas, &ptx[..text_end], sm) {
+            let ptx_str = String::from_utf8_lossy(&ptx[..text_end]);
+            let lines: Vec<&str> = ptx_str.lines().collect();
+            let total = lines.len();
+            let tail_start = total.saturating_sub(40);
+            let tail: String = lines[tail_start..]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("  {:>4}: {}", tail_start + i + 1, l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            failures.push(format!(
+                "A4 rope_q PTX failed on {} (dump: {}):\n--- ptxas ---\n{}\n--- PTX tail ---\n{}",
+                sm, dump.display(), stderr, tail
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "A4 v2 rope_q ptxas failures:\n\n{}",
+        failures.join("\n---\n")
+    );
+}

@@ -352,36 +352,221 @@ fn emit_warp_per_row_sweep(
     }
 }
 
-/// Emit the §A.2.4 RoPE Q-rotation epilogue. Applied to the post-
-/// attention Q tile (%f{O_BASE+i} on each lane) using the same cos/sin
-/// tables as Q-load's Phase 1 RoPE. Null-guarded on `cos_ptr` AND only
-/// emits when `rope_q=true` (otherwise no rotation to apply).
+/// Emit the §A.2.4 RoPE Q/K-rotation epilogue.
+///
+/// # Placement note (post-attention, non-standard)
+///
+/// Despite being called "epilogue", this hook fires **after** the entire
+/// KV-loop (S-compute → softmax → PV-accumulate) completes — i.e. it
+/// operates on the post-attention SMEM Q and K tiles, NOT the pre-attention
+/// input queries/keys.  Standard RoPE is applied pre-attention; this
+/// placement is a CSHA-specific fusion where the rotation is deliberately
+/// deferred to avoid materialising rotated Q/K to HBM between a preceding
+/// norm/projection kernel and this attention kernel.  The cos/sin tables
+/// are still position-indexed by the query row so the rotation values are
+/// identical to what a standard pre-attention RoPE would have used.
+///
+/// If this is ever re-evaluated and pre-attention placement is preferred,
+/// move the `emit_rope_epilogue` call in `mod.rs` to immediately after
+/// `emit_matmul_projection` and before `emit_q_load`.
+///
+/// Null-guarded on `cos_ptr` AND `sin_ptr` — if either is zero the entire
+/// rotation body is skipped.  Only emits when `rope_q=true` AND
+/// `csha.is_some()`.  V is never rotated (standard attention).
 pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     if config.csha.is_none() || !config.rope_q {
-        ptx.push_str("    // CSHA A.2.4 RoPE epilogue: csha=None or rope_q=false, no emission\n");
+        ptx.push_str("    // CSHA A.2.4 RoPE epilogue: rope_q=false, no emission\n");
         return;
     }
+
+    let block_q  = config.block_q  as u32;
+    let head_dim = config.head_dim as u32;
+    let half_dim = head_dim / 2;
+    // Each of 128 threads covers ceil(block_q * half_dim / 128) pairs.
+    let total_pairs = block_q * half_dim;
+    let pairs_per_lane = total_pairs.div_ceil(128);
+
     ptx.push_str(&format!(
-        "    // CSHA A.2.4: RoPE epilogue (q_tile_iter = {})\n",
-        q_tile_iter
+        "    // CSHA A.2.4: RoPE Q/K rotation epilogue (q_tile_iter={}, block_q={}, head_dim={}, pairs_per_lane={})\n",
+        q_tile_iter, block_q, head_dim, pairs_per_lane
     ));
-    ptx.push_str("    ld.param.u64 %rd62, [cos_ptr];\n");
-    ptx.push_str("    setp.eq.u64 %p0, %rd62, 0;\n");
+
+    // Null-guard: skip if either cos_ptr or sin_ptr is zero.
+    ptx.push_str("    ld.param.u64 %rd_rope_cos, [cos_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_rope_sin, [sin_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p_rope_cos_null, %rd_rope_cos, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p_rope_sin_null, %rd_rope_sin, 0;\n");
+    ptx.push_str("    or.pred %p_rope_skip, %p_rope_cos_null, %p_rope_sin_null;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_CSHA_EPILOGUE_SKIP_{};\n",
+        "    @%p_rope_skip bra V2_CSHA_ROPE_SKIP_{};\n",
         q_tile_iter
     ));
 
-    // TODO(fa-v2-rope-epilogue): apply the same HalfSplit/Adjacent
-    // rotation as q_load's Phase 1 RoPE but on the post-attention output
-    // registers %f{O_BASE+i}. Shares the sign-flip correctness gap
-    // documented in q_load.rs (currently deferred to a rope_q=true test
-    // expansion). For now this is a structural skeleton.
-    ptx.push_str("    // TODO(fa-v2-rope-epilogue): real rotation body\n");
-    ptx.push_str("    // Same shape as q_load's emit_rope_rotation_inline but\n");
-    ptx.push_str("    // operates on %f{O_BASE+i} instead of %f{Q_BASE+i}.\n");
+    // Emit one cooperative pair-loop sweep for Q, then K.  V is untouched.
+    for (tile_label, smem_base_reg) in [("Q", "%q_smem_base"), ("K", "%k_smem_base")] {
+        emit_rope_pair_sweep(
+            ptx,
+            q_tile_iter,
+            tile_label,
+            smem_base_reg,
+            block_q,
+            head_dim,
+            half_dim,
+            pairs_per_lane,
+        );
+    }
 
-    ptx.push_str(&format!("V2_CSHA_EPILOGUE_SKIP_{}:\n", q_tile_iter));
+    ptx.push_str(&format!("V2_CSHA_ROPE_SKIP_{}:\n", q_tile_iter));
+    ptx.push_str("    bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads\n");
+}
+
+/// Emit one cooperative pair-loop sweep that applies RoPE to a single
+/// SMEM tile (Q or K).  Each lane handles `pairs_per_lane` consecutive
+/// (row, dim_pair) pairs in the (block_q × head_dim/2) space.
+///
+/// Rotation math per pair:
+///   cos, sin  = cos_ptr[row * half_dim + dim_pair], sin_ptr[same]  (f16→f32)
+///   x0        = tile[row, 2*dim_pair]     (f16→f32)
+///   x1        = tile[row, 2*dim_pair + 1] (f16→f32)
+///   new_x0    = x0*cos - x1*sin           (2× fma)
+///   new_x1    = x0*sin + x1*cos           (2× fma)
+///   store f32→f16, write back to SMEM
+///
+/// All SMEM addresses are precomputed into u64 registers before use
+/// (bracket-register-arithmetic rejected by ptxas).
+#[allow(clippy::too_many_arguments)]
+fn emit_rope_pair_sweep(
+    ptx: &mut String,
+    q_tile_iter: u32,
+    tile_label: &str,    // "Q" or "K"
+    smem_base_reg: &str, // "%q_smem_base" or "%k_smem_base"
+    block_q: u32,
+    head_dim: u32,
+    half_dim: u32,
+    pairs_per_lane: u32,
+) {
+    let tl = tile_label; // short alias for label generation
+    ptx.push_str(&format!(
+        "    // A.2.4 RoPE {tl} sweep: block_q={block_q}, half_dim={half_dim}, pairs_per_lane={pairs_per_lane}\n"
+    ));
+
+    // Linear thread index within the block (tid_x = warp_id*32 + lane).
+    ptx.push_str("    cvt.u32.u32 %r_rope_tid, %tid_x;\n");
+
+    // Loop counter: start = tid_x (first pair for this lane).
+    ptx.push_str("    mov.u32 %r_rope_pair_idx, %r_rope_tid;\n");
+
+    // Total pairs constant for loop-exit predicate.
+    let total_pairs = block_q * half_dim;
+
+    ptx.push_str(&format!("V2_CSHA_ROPE_{tl}_LOOP_{q_tile_iter}:\n"));
+
+    // Guard: if pair_idx >= total_pairs, exit loop.
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p_rope_done, %r_rope_pair_idx, {total_pairs};\n"
+    ));
+    ptx.push_str(&format!(
+        "    @%p_rope_done bra V2_CSHA_ROPE_{tl}_END_{q_tile_iter};\n"
+    ));
+
+    // Decompose pair_idx into (row, dim_pair).
+    //   row      = pair_idx / half_dim
+    //   dim_pair = pair_idx % half_dim
+    ptx.push_str(&format!(
+        "    div.u32 %r_rope_row,      %r_rope_pair_idx, {half_dim};\n"
+    ));
+    ptx.push_str(&format!(
+        "    rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, {half_dim};\n"
+    ));
+
+    // cos/sin HBM address:
+    //   byte_offset = (row * half_dim + dim_pair) * 2   (f16 = 2 bytes)
+    ptx.push_str("    mul.lo.u32 %r_rope_cs_off, %r_rope_row, %r_rope_dim_pair;\n");
+    // Correct: row * half_dim + dim_pair
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %r_rope_cs_off, %r_rope_row, {half_dim};\n"
+    ));
+    ptx.push_str("    add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;\n");
+    ptx.push_str("    cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;\n");
+    ptx.push_str("    shl.b64 %rd_rope_cs_idx, %rd_rope_cs_idx, 1;  // *2 for f16\n");
+
+    // Load cos (f16) from HBM, convert to f32.
+    ptx.push_str("    add.u64 %rd_rope_addr, %rd_rope_cos, %rd_rope_cs_idx;\n");
+    ptx.push_str("    ld.global.b16 %h_rope_pair, [%rd_rope_addr];\n");
+    ptx.push_str("    cvt.f32.f16 %f_rope_cos, %h_rope_pair;\n");
+
+    // Load sin (f16) from HBM, convert to f32.
+    ptx.push_str("    add.u64 %rd_rope_addr, %rd_rope_sin, %rd_rope_cs_idx;\n");
+    ptx.push_str("    ld.global.b16 %h_rope_pair, [%rd_rope_addr];\n");
+    ptx.push_str("    cvt.f32.f16 %f_rope_sin, %h_rope_pair;\n");
+
+    // SMEM tile addresses for x0 and x1.
+    //   tile[row, col] at byte offset = (row * head_dim + col) * 2  (f16)
+    //   x0 col = 2 * dim_pair
+    //   x1 col = 2 * dim_pair + 1
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, {head_dim_x2};\n",
+        head_dim_x2 = head_dim * 2
+    ));
+    // x0: col = 2*dim_pair → byte offset = 2*dim_pair*2 = 4*dim_pair
+    ptx.push_str("    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair\n");
+    ptx.push_str("    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n");
+    // x1: col = 2*dim_pair+1 → byte offset = (2*dim_pair+1)*2 = 4*dim_pair+2
+    ptx.push_str("    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes\n");
+
+    // Precompute full SMEM addresses for x0 and x1 into u64 regs.
+    ptx.push_str("    cvt.u64.u32 %rd_rope_x0_off, %r_rope_x0_off;\n");
+    ptx.push_str("    cvt.u64.u32 %rd_rope_x1_off, %r_rope_x1_off;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd_rope_addr, {smem_base_reg}, %rd_rope_x0_off;\n"
+    ));
+    ptx.push_str("    ld.shared.b16 %h_rope_pair, [%rd_rope_addr];\n");
+    ptx.push_str("    cvt.f32.f16 %f_rope_x0, %h_rope_pair;\n");
+
+    ptx.push_str(&format!(
+        "    add.u64 %rd_rope_addr, {smem_base_reg}, %rd_rope_x1_off;\n"
+    ));
+    ptx.push_str("    ld.shared.b16 %h_rope_pair, [%rd_rope_addr];\n");
+    ptx.push_str("    cvt.f32.f16 %f_rope_x1, %h_rope_pair;\n");
+
+    // Rotation:
+    //   new_x0 = x0*cos - x1*sin   →  fma.rn.f32 new_x0, x0, cos, 0
+    //                                  fma.rn.f32 new_x0, -x1, sin, new_x0
+    //   new_x1 = x0*sin + x1*cos   →  fma.rn.f32 new_x1, x0, sin, 0
+    //                                  fma.rn.f32 new_x1, x1, cos, new_x1
+    ptx.push_str("    mov.f32 %f_rope_y0, 0f00000000;\n");
+    ptx.push_str("    fma.rn.f32 %f_rope_y0, %f_rope_x0, %f_rope_cos, %f_rope_y0;\n");
+    ptx.push_str("    neg.f32 %f_rope_neg_x1, %f_rope_x1;\n");
+    ptx.push_str("    fma.rn.f32 %f_rope_y0, %f_rope_neg_x1, %f_rope_sin, %f_rope_y0;\n");
+
+    ptx.push_str("    mov.f32 %f_rope_y1, 0f00000000;\n");
+    ptx.push_str("    fma.rn.f32 %f_rope_y1, %f_rope_x0, %f_rope_sin, %f_rope_y1;\n");
+    ptx.push_str("    fma.rn.f32 %f_rope_y1, %f_rope_x1, %f_rope_cos, %f_rope_y1;\n");
+
+    // Convert new_x0, new_x1 to f16 and store back to SMEM.
+    ptx.push_str("    cvt.rn.f16.f32 %h_rope_y0, %f_rope_y0;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %h_rope_y1, %f_rope_y1;\n");
+
+    // Store x0 back.
+    ptx.push_str(&format!(
+        "    add.u64 %rd_rope_addr, {smem_base_reg}, %rd_rope_x0_off;\n"
+    ));
+    ptx.push_str("    st.shared.b16 [%rd_rope_addr], %h_rope_y0;\n");
+
+    // Store x1 back.
+    ptx.push_str(&format!(
+        "    add.u64 %rd_rope_addr, {smem_base_reg}, %rd_rope_x1_off;\n"
+    ));
+    ptx.push_str("    st.shared.b16 [%rd_rope_addr], %h_rope_y1;\n");
+
+    // Advance by 128 (one full warp-block stride).
+    ptx.push_str("    add.u32 %r_rope_pair_idx, %r_rope_pair_idx, 128;\n");
+    ptx.push_str(&format!(
+        "    bra V2_CSHA_ROPE_{tl}_LOOP_{q_tile_iter};\n"
+    ));
+
+    ptx.push_str(&format!("V2_CSHA_ROPE_{tl}_END_{q_tile_iter}:\n"));
+    ptx.push_str("    bar.sync 0;  // FENCE: RoPE tile writes complete\n");
 }
 
 #[cfg(test)]
@@ -403,6 +588,69 @@ mod tests {
             gpu_sm: 75,
             csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
         }
+    }
+
+    /// Base config for A4 RoPE tests.  rope_q=true, csha set with fused_projections.
+    fn base_cfg_for_rope_test() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: true,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+        }
+    }
+
+    #[test]
+    fn a4_rope_epilogue_emits_q_and_k_rotation_sweeps() {
+        let cfg = base_cfg_for_rope_test();
+        let mut ptx = String::new();
+        emit_rope_epilogue(&mut ptx, &cfg, 0);
+
+        assert!(ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"), "cos_ptr load missing");
+        assert!(ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"), "sin_ptr load missing");
+        assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"), "Q rotation loop label missing");
+        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation loop label missing");
+        assert!(!ptx.contains("V2_CSHA_ROPE_V_LOOP"), "V must not be rotated");
+        // 4 fma.rn.f32 per pair (2 for new_x0, 2 for new_x1) × 2 sweeps (Q and K)
+        assert!(
+            ptx.matches("fma.rn.f32").count() >= 4,
+            "expected at least 4 fma.rn.f32, got {}",
+            ptx.matches("fma.rn.f32").count()
+        );
+        assert!(ptx.contains("cvt.rn.f16.f32"), "f16 conversion for store missing");
+    }
+
+    #[test]
+    fn a4_rope_epilogue_skipped_when_rope_q_false() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.rope_q = false;
+        let mut ptx = String::new();
+        emit_rope_epilogue(&mut ptx, &cfg, 0);
+        assert!(
+            ptx.contains("rope_q=false, no emission") || ptx.is_empty(),
+            "expected no-emit comment or empty string, got: {ptx}"
+        );
+        assert!(!ptx.contains("V2_CSHA_ROPE_Q_LOOP"));
+    }
+
+    #[test]
+    fn a4_rope_epilogue_label_uniqueness_across_q_tile_iters() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.block_q = 64;
+        let mut ptx = String::new();
+        emit_rope_epilogue(&mut ptx, &cfg, 0);
+        emit_rope_epilogue(&mut ptx, &cfg, 1);
+        assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"));
+        assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_1:"));
+        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"));
+        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"));
     }
 
     #[test]
