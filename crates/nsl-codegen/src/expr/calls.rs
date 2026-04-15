@@ -1111,7 +1111,7 @@ impl Compiler<'_> {
 
             // Check if the enclosing function has @flash_attention decorator
             if self.kernels.flash_attention_context.is_some() {
-                return self.compile_flash_attention_call(builder, q_val, k_val, v_val, scale_val);
+                return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
 
             // M34: Check for context parallelism (ring attention)

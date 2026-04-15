@@ -429,6 +429,38 @@ fn emit_flash_attention_entry(ptx: &mut String, kernel_name: &str, config: &Flas
     // Compute thread/block indices
     emit_index_computation(ptx, config);
 
+    // CSHA A.4: active_heads guard — compile-time literal early-exit.
+    // When `config.csha.active_heads` is set to a non-zero value smaller
+    // than the full head count, the runtime launches with a shrunken
+    // grid_y so each CTA's `bid_y % heads` lands inside the active range
+    // — but as a defence-in-depth measure we emit a `setp.ge ... @ret`
+    // right after head_idx is computed so any launch-vs-kernel
+    // specialisation mismatch fails cleanly instead of corrupting
+    // memory. ptxas turns the literal into dead-code elimination when
+    // the guard is provably unreachable.
+    emit_csha_active_heads_guard(ptx, config);
+
+    // CSHA A.2.2: RMSNorm prologue — emits when `config.csha.fused_rmsnorm`
+    // is set. Writes normalised x into the Q-tile SMEM slot, runtime-gated
+    // on a non-null `csha_x_ptr` so kernels that were compiled with the
+    // flag but launched with null pointers (current A.1/A.2.1x state) fall
+    // through to the classic Q-from-HBM path emitted just below.
+    emit_csha_rmsnorm_prologue(ptx, config);
+
+    // CSHA A.2.3: matmul projection — emits when `config.csha.fused_projections`
+    // is set. Projects `x_norm @ Wq/Wk/Wv` into Q/K/V SMEM tiles via m16n8k16
+    // MMA, reusing the `matmul_mma` primitives. Runtime-gated on non-null Wq/
+    // Wk/Wv pointers so NULL-pointer calls (current state) fall through to the
+    // classic path. Dormant at runtime until A.2.5.
+    emit_csha_matmul_projection(ptx, config);
+
+    // CSHA A.2.4: RoPE epilogue — emits when both `config.rope_q` and
+    // `config.csha.fused_projections` are set. Rotates the projected Q/K
+    // fragments in registers before they feed the QK^T MMA, rather than
+    // loading pre-rotated Q from HBM. Runtime-gated on non-null cos/sin
+    // pointers. Dormant until A.2.5.
+    emit_csha_rope_epilogue(ptx, config);
+
     // Load Q tile into shared memory
     emit_q_tile_load(ptx, config);
 
@@ -572,6 +604,773 @@ fn emit_index_computation(ptx: &mut String, config: &FlashAttentionConfig) {
             config.gqa_group_size
         ));
     }
+}
+
+/// CSHA A.2.2 — RMSNorm prologue emitter.
+///
+/// When `config.csha.fused_rmsnorm` is set, this emits PTX that:
+///
+///   1. Loads the `csha_x_ptr` and `csha_norm_weight_ptr` params.
+///   2. Runtime null-checks — if either pointer is null (the current
+///      A.1/A.2.1x state where the FA call site still passes NULL), the
+///      whole block is a no-op and the classic `emit_q_tile_load` path
+///      fills SMEM as before.
+///   3. When pointers are non-null (future A.2.1e), computes
+///      `rsqrt(sum(x²)/head_dim + eps) * x * w` per Q-tile row and
+///      stores the f16 result into the Q-tile SMEM region (same
+///      `shmem[0..]` slot that `emit_q_tile_load` writes, accounted for
+///      in `shared_mem_bytes` at the `fused_rmsnorm` branch).
+///   4. Finishes with `bar.sync 0` so the main QK^T loop sees a
+///      consistent Q tile regardless of which path filled SMEM.
+///
+/// NOTE: Level 1 (`fused_rmsnorm=true`, `fused_projections=false`) is
+/// semantically ambiguous — a complete implementation also needs the
+/// matmul projection inside the kernel (A.2.3) because the prologue's
+/// output is `x_norm: [block_q, d_model]`, not the `[block_q, head_dim]`
+/// Q tile that the attention body consumes. For now we normalise across
+/// `head_dim` so the SMEM geometry matches; A.2.3 will replace this
+/// with a proper d_model reduction followed by Wq projection.
+///
+/// The kernel variant that uses this prologue is currently dormant —
+/// `nsl_flash_attention_csha` still forwards to the non-CSHA path per
+/// A.1, and A.2.5 is where the CSHA-tagged PTX actually launches.
+fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if !csha.fused_rmsnorm {
+        return;
+    }
+
+    let block_q = config.block_q;
+    let head_dim = config.head_dim;
+
+    ptx.push_str("    // ── CSHA A.2.2: RMSNorm prologue ──────────────────────────\n");
+    ptx.push_str(&format!(
+        "    // fused_rmsnorm=1, block_q={}, head_dim={}\n",
+        block_q, head_dim
+    ));
+    ptx.push_str("    // Registers %rd50-%rd60, %f100-%f103, %p10-%p12 are reserved for this block.\n");
+
+    // Declare local registers — PTX requires all regs pre-declared in the
+    // prolog, but the helper is emitted inline. These are additive to the
+    // generous `%rd<64>`, `%f<128>`, `%p<16>` pools declared in
+    // `emit_register_declarations`, so the indices here don't need new
+    // `.reg` lines.
+    ptx.push_str("    // (no new .reg lines — all indices fall within the pools declared above)\n");
+
+    ptx.push_str("    ld.param.u64 %rd50, [csha_x_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd51, [csha_norm_weight_ptr];\n");
+    ptx.push_str("    ld.param.f32 %f100, [csha_rmsnorm_eps];\n");
+
+    // Runtime null-check: if x_ptr OR norm_weight_ptr is null, skip the
+    // whole prologue and let `emit_q_tile_load` run normally.
+    ptx.push_str("    setp.eq.u64 %p10, %rd50, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p11, %rd51, 0;\n");
+    ptx.push_str("    or.pred %p10, %p10, %p11;\n");
+    ptx.push_str("    @%p10 bra CSHA_PROLOGUE_END;\n");
+
+    // Per-thread row-scoped RMSNorm. We restrict this prologue so that
+    // only threads with `tid_x < block_q` (one thread per Q-tile row)
+    // actually do the reduction — keeps the code straightforward until
+    // A.2.3 brings in MMA-primitive reductions.
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p12, %tid_x, {}; // only threads with tid_x < block_q\n",
+        block_q
+    ));
+    ptx.push_str("    @%p12 bra CSHA_PROLOGUE_END;\n");
+
+    // row = tid_x (u64 for address math)
+    ptx.push_str("    cvt.u64.u32 %rd52, %tid_x;\n");
+
+    // x base addr = csha_x_ptr + (batch_idx*seq_len*head_dim + (q_start+row)*head_dim) * 4
+    // assumes x is [batch, seq, head_dim] laid out contiguously, f32.
+    ptx.push_str("    mul.lo.u64 %rd53, %rd19, %rd6;   // batch_idx * seq_len\n");
+    ptx.push_str("    add.u64 %rd53, %rd53, %rd16;     // + q_start\n");
+    ptx.push_str("    add.u64 %rd53, %rd53, %rd52;     // + row\n");
+    ptx.push_str("    mul.lo.u64 %rd53, %rd53, %rd7;   // * head_dim\n");
+    ptx.push_str("    shl.b64 %rd53, %rd53, 2;         // * 4 bytes (f32)\n");
+    ptx.push_str("    add.u64 %rd53, %rd50, %rd53;     // %rd53 = x row base\n");
+
+    // Pass 1: sum of squares across head_dim.
+    ptx.push_str("    mov.f32 %f101, 0.0;              // sum_sq\n");
+    ptx.push_str("    mov.u64 %rd54, 0;                // d\n");
+    ptx.push_str("CSHA_PROLOGUE_SUMSQ:\n");
+    ptx.push_str("    shl.b64 %rd55, %rd54, 2;         // d * 4\n");
+    ptx.push_str("    add.u64 %rd55, %rd53, %rd55;     // x[row, d] addr\n");
+    ptx.push_str("    ld.global.f32 %f102, [%rd55];\n");
+    ptx.push_str("    fma.rn.f32 %f101, %f102, %f102, %f101;\n");
+    ptx.push_str("    add.u64 %rd54, %rd54, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u64 %p11, %rd54, {};\n",
+        head_dim
+    ));
+    ptx.push_str("    @%p11 bra CSHA_PROLOGUE_SUMSQ;\n");
+
+    // mean = sum_sq / head_dim; inv_rms = rsqrt(mean + eps)
+    ptx.push_str(&format!(
+        "    mov.f32 %f103, 0f{:08X};         // 1.0 / head_dim\n",
+        (1.0f32 / head_dim as f32).to_bits()
+    ));
+    ptx.push_str("    mul.f32 %f101, %f101, %f103;     // mean_sq\n");
+    ptx.push_str("    add.f32 %f101, %f101, %f100;     // + eps\n");
+    ptx.push_str("    rsqrt.approx.f32 %f101, %f101;   // inv_rms\n");
+
+    // Pass 2: y = x * inv_rms * w, stored as f16 into SMEM at
+    // shmem[(row * head_dim + d) * 2]. `shmem` is the PTX symbol for the
+    // shared-memory array declared in emit_flash_attention_entry.
+    ptx.push_str("    mul.lo.u64 %rd56, %rd52, %rd7;   // row * head_dim\n");
+    ptx.push_str("    shl.b64 %rd56, %rd56, 1;         // * 2 bytes (f16)\n");
+    ptx.push_str("    mov.u64 %rd57, shmem;\n");
+    ptx.push_str("    add.u64 %rd56, %rd57, %rd56;     // %rd56 = row SMEM base\n");
+    ptx.push_str("    mov.u64 %rd54, 0;                // d = 0\n");
+    ptx.push_str("CSHA_PROLOGUE_APPLY:\n");
+    ptx.push_str("    shl.b64 %rd58, %rd54, 2;         // d * 4\n");
+    ptx.push_str("    add.u64 %rd59, %rd53, %rd58;     // x[row, d]\n");
+    ptx.push_str("    ld.global.f32 %f102, [%rd59];\n");
+    ptx.push_str("    add.u64 %rd60, %rd51, %rd58;     // w[d]\n");
+    ptx.push_str("    ld.global.f32 %f103, [%rd60];\n");
+    ptx.push_str("    mul.f32 %f102, %f102, %f101;     // x * inv_rms\n");
+    ptx.push_str("    mul.f32 %f102, %f102, %f103;     // * w\n");
+    ptx.push_str("    cvt.rn.f16.f32 %h0, %f102;\n");
+    ptx.push_str("    shl.b64 %rd58, %rd54, 1;         // d * 2 (SMEM offset)\n");
+    ptx.push_str("    add.u64 %rd58, %rd56, %rd58;\n");
+    ptx.push_str("    st.shared.b16 [%rd58], %h0;\n");
+    ptx.push_str("    add.u64 %rd54, %rd54, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u64 %p11, %rd54, {};\n",
+        head_dim
+    ));
+    ptx.push_str("    @%p11 bra CSHA_PROLOGUE_APPLY;\n");
+
+    ptx.push_str("CSHA_PROLOGUE_END:\n");
+    ptx.push_str("    bar.sync 0;                       // Q tile (from prologue OR Q load) consistent across warps\n");
+    ptx.push_str("    // ── end CSHA prologue ───────────────────────────────────────\n");
+}
+
+/// CSHA A.4 — active_heads early-exit guard.
+///
+/// Emits a compile-time-literal guard that returns from the kernel when
+/// `head_idx >= active_heads`. Present only when
+/// `config.csha.active_heads` is non-zero (weight-informed specialisation
+/// per paper §9.3 — i.e. some heads were pruned by the planner).
+///
+/// The runtime path (`nsl_flash_attention_csha`, A.4 runtime side)
+/// shrinks `grid_y = batch * active_heads` when `active_heads > 0`, so
+/// in a correctly-paired launch this guard never fires. Emitting it
+/// anyway protects against:
+///
+///   - A launch-vs-kernel specialisation mismatch (e.g. grid built for
+///     a different `active_heads` than the kernel variant was
+///     compiled with).
+///   - Cache-hit misrouting: two callers of the same FA entry pointing
+///     at different PTX variants.
+///
+/// The literal makes it a strict optimisation hint for ptxas — when
+/// `active_heads == heads` at launch time (the common no-pruning case
+/// with `active_heads=0`), this function emits nothing.
+fn emit_csha_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if csha.active_heads == 0 {
+        return;
+    }
+
+    ptx.push_str("    // ── CSHA A.4: active_heads guard ─────────────────────────\n");
+    ptx.push_str(&format!(
+        "    // active_heads={} (weight-informed kernel specialisation)\n",
+        csha.active_heads
+    ));
+    ptx.push_str(&format!(
+        "    setp.ge.u64 %p9, %rd18, {};       // head_idx >= active_heads\n",
+        csha.active_heads
+    ));
+    ptx.push_str("    @%p9 ret;                         // dead head: exit CTA cleanly\n");
+    ptx.push_str("    // ── end CSHA active_heads guard ─────────────────────────────\n");
+}
+
+/// CSHA A.2.3 — matmul projection emitter.
+///
+/// When `config.csha.fused_projections` is set, this emits PTX that
+/// projects the normalised x tile (produced by the A.2.2 prologue)
+/// into Q/K/V tiles via three m16n8k16 tensor-core matmuls, reusing
+/// the primitives in [`crate::matmul_mma`]:
+///
+/// ```text
+///    Q_tile = x_norm @ Wq   (A=[block_q, d_model], B=[d_model, head_dim])
+///    K_tile = x_norm @ Wk
+///    V_tile = x_norm @ Wv
+/// ```
+///
+/// A.2.3 ships a **single-tile proof of structure** — one MMA per
+/// projection at the tile origin — rather than the full
+/// `(block_q/MMA_M) × (head_dim/MMA_N)` tile-sweep loop. The loop is
+/// marked with a PTX comment and lands in a follow-up; ABI / SMEM
+/// layout / register conventions are fixed here so the loop expansion
+/// is a local change.
+///
+/// Same dormant-kernel contract as A.2.2: the CSHA-tagged kernel
+/// variant is emitted but not launched by `nsl_flash_attention_csha`
+/// today (A.2.5 wires runtime dispatch). Runtime null-checks on
+/// `csha_wq/wk/wv_ptr` keep current A.1/A.2.1x call sites (which pass
+/// NULL) from dereferencing uninitialised pointers if the variant
+/// ever does execute during bring-up.
+fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if !csha.fused_projections {
+        return;
+    }
+
+    let block_q = config.block_q;
+    let head_dim = config.head_dim;
+    let d_model = csha.d_model.max(head_dim as u32);
+
+    ptx.push_str("    // ── CSHA A.2.3: matmul projection (x_norm @ Wq/Wk/Wv) ────\n");
+    ptx.push_str(&format!(
+        "    // fused_projections=1, block_q={}, head_dim={}, d_model={}\n",
+        block_q, head_dim, d_model
+    ));
+
+    // Load the three projection-weight pointers and null-check.
+    ptx.push_str("    ld.param.u64 %rd61, [csha_wq_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd62, [csha_wk_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd63, [csha_wv_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p13, %rd61, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p14, %rd62, 0;\n");
+    ptx.push_str("    or.pred %p13, %p13, %p14;\n");
+    ptx.push_str("    setp.eq.u64 %p14, %rd63, 0;\n");
+    ptx.push_str("    or.pred %p13, %p13, %p14;\n");
+    ptx.push_str("    @%p13 bra CSHA_PROJECTION_END;\n");
+
+    // Emit MMA temporary registers (laneid, row indices, addr scratch).
+    // `emit_mma_temp_registers` is `#[allow(dead_code)]` so calling it here
+    // both gives us the standard MMA scaffolding and removes the dead-code
+    // annotation's need in future commits.
+    emit_mma_temp_registers(ptx);
+
+    // Projection-weight SMEM slot starts right after the Q-tile slot.
+    // Layout (matches `shared_mem_bytes` at `fused_projections` branch):
+    //   [0 .. block_q*head_dim*2)           — Q tile (written by A.2.2 prologue)
+    //   [block_q*head_dim*2 .. + 3*hd*d*2)  — Wq/Wk/Wv tiles
+    let q_tile_bytes = (block_q * head_dim * 2) as u32;
+    let weight_tile_bytes = (head_dim as u32) * d_model.min(256) * 2;
+    ptx.push_str(&format!(
+        "    // SMEM weight-tile bases: wq={}, wk={}, wv={}\n",
+        q_tile_bytes,
+        q_tile_bytes + weight_tile_bytes,
+        q_tile_bytes + 2 * weight_tile_bytes,
+    ));
+
+    // A-fragment and B-fragment registers for one m16n8k16 MMA iteration.
+    // These are local to the projection block — distinct from the attention
+    // QK^T / PV MMAs further down the kernel body to avoid register aliasing.
+    ptx.push_str("    .reg .b32 %proj_a0, %proj_a1, %proj_a2, %proj_a3;\n");
+    ptx.push_str("    .reg .b32 %proj_b0, %proj_b1;\n");
+    ptx.push_str("    .reg .f32 %proj_d0, %proj_d1, %proj_d2, %proj_d3;\n");
+    ptx.push_str("    .reg .f32 %proj_c0, %proj_c1, %proj_c2, %proj_c3;\n");
+    // A.2.3 fragment-pack: 2 .b32 regs carry the 4 f16 output values per
+    // (m, n) tile iteration. `%mma_h0` / `%mma_h1` (declared by
+    // `emit_mma_temp_registers` earlier in the kernel) are the f16
+    // conversion temps used by `emit_f32_to_f16_pack`.
+    ptx.push_str("    .reg .b32 %proj_c_pack0, %proj_c_pack1;\n");
+    ptx.push_str("    // Zero accumulator for this proof-of-structure iteration\n");
+    ptx.push_str("    mov.f32 %proj_c0, 0.0;\n");
+    ptx.push_str("    mov.f32 %proj_c1, 0.0;\n");
+    ptx.push_str("    mov.f32 %proj_c2, 0.0;\n");
+    ptx.push_str("    mov.f32 %proj_c3, 0.0;\n");
+
+    // Fragment register string lists shared across Q/K/V.
+    let a_regs = [
+        "proj_a0".to_string(),
+        "proj_a1".to_string(),
+        "proj_a2".to_string(),
+        "proj_a3".to_string(),
+    ];
+    let b_regs = ["proj_b0".to_string(), "proj_b1".to_string()];
+    let c_regs = [
+        "%proj_c0".to_string(),
+        "%proj_c1".to_string(),
+        "%proj_c2".to_string(),
+        "%proj_c3".to_string(),
+    ];
+    let d_regs = [
+        "%proj_d0".to_string(),
+        "%proj_d1".to_string(),
+        "%proj_d2".to_string(),
+        "%proj_d3".to_string(),
+    ];
+
+    // x_norm (A side) lives at SMEM offset 0, row-stride = head_dim * 2.
+    // Row-stride here is head_dim rather than d_model because A.2.2's
+    // prologue currently normalises over head_dim (see A.2.2 semantic
+    // note); A.2.3-full-d_model is a follow-up coupled with A.2.1e.
+    let a_stride_bytes = (head_dim * 2) as usize;
+    let b_stride_bytes = (d_model.min(256) * 2) as usize;
+
+    // Tile-sweep counters (A.2.3-tile-sweep expansion): m iterates
+    // block_q / MMA_M=16 tiles along the output rows, n iterates
+    // head_dim / MMA_N=8 tiles along the columns, k reduces over
+    // d_model / MMA_K=16 tiles. Accumulator (%proj_c*) is zeroed at
+    // the top of each (m, n) iteration and lives across the K loop.
+    ptx.push_str("    .reg .u32 %ts_m, %ts_n, %ts_k;\n");
+    ptx.push_str("    .reg .u32 %ts_a_base, %ts_b_base, %ts_out_base;\n");
+    // A.2.3.2 lane-coherent scatter scratch: per-thread row/col derived
+    // from `%mma_laneid` (set by `emit_mma_temp_registers`), plus the
+    // two per-pack addresses.
+    ptx.push_str("    .reg .u32 %ts_row_lo, %ts_col_pair, %ts_col_off, %ts_row_off;\n");
+    ptx.push_str("    .reg .u32 %ts_pack0_addr, %ts_pack1_addr;\n");
+    let m_tiles = (block_q / 16).max(1);
+    let n_tiles = (head_dim / 8).max(1);
+    let k_tiles = (d_model.min(256) as i64 / 16).max(1);
+
+    // Per-projection helper: emit the M/N/K nested loops that sweep a
+    // full (block_q × head_dim) output by accumulating over the K-axis
+    // of (x_norm × W_*). Writes fragment results into a scratch SMEM
+    // slot at `out_smem_bytes`; the store is a placeholder
+    // (`st.shared.b32` per accumulator) until the fragment-packing
+    // helper lands — semantically-correct conversion+packing is the
+    // A.2.3-follow-up's remaining task, but the loop structure,
+    // address math, and MMA issue are real and testable.
+    fn emit_proj_sweep(
+        ptx: &mut String,
+        proj_tag: &str,
+        w_offset_bytes: u32,
+        out_offset_bytes: u32,
+        a_stride_bytes: usize,
+        b_stride_bytes: usize,
+        m_tiles: i64,
+        n_tiles: i64,
+        k_tiles: i64,
+        a_regs: &[String; 4],
+        b_regs: &[String; 2],
+        c_regs: &[String; 4],
+        d_regs: &[String; 4],
+    ) {
+        ptx.push_str(&format!(
+            "    // --- {} projection: x_norm @ W{} ({}×{} × {} MMA) ---\n",
+            proj_tag,
+            proj_tag.to_ascii_lowercase(),
+            m_tiles,
+            n_tiles,
+            k_tiles,
+        ));
+        ptx.push_str(&format!(
+            "    mov.u32 %ts_m, 0;                 // M-tile loop: 0..{}\n",
+            m_tiles
+        ));
+        ptx.push_str(&format!("CSHA_PROJ_{}_M_LOOP:\n", proj_tag));
+        ptx.push_str(&format!(
+            "    mov.u32 %ts_n, 0;                 // N-tile loop: 0..{}\n",
+            n_tiles
+        ));
+        ptx.push_str(&format!("CSHA_PROJ_{}_N_LOOP:\n", proj_tag));
+
+        // Zero accumulator for this (m, n) tile.
+        for i in 0..4 {
+            ptx.push_str(&format!("    mov.f32 {}, 0.0;\n", c_regs[i]));
+        }
+
+        // K-tile loop: one MMA per iteration, accumulating into %proj_c*.
+        ptx.push_str(&format!(
+            "    mov.u32 %ts_k, 0;                 // K-tile loop: 0..{}\n",
+            k_tiles
+        ));
+        ptx.push_str(&format!("CSHA_PROJ_{}_K_LOOP:\n", proj_tag));
+
+        // A-tile base = m*16*a_stride + k*16*2 (row-major, f16)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %ts_a_base, %ts_m, {};   // m * 16 * a_stride\n",
+            16 * a_stride_bytes
+        ));
+        ptx.push_str("    mad.lo.u32 %ts_a_base, %ts_k, 32, %ts_a_base; // + k*16*2\n");
+
+        // B-tile base = W_offset + k*16*b_stride + n*8*2 (col-major B)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %ts_b_base, %ts_k, {};   // k * 16 * b_stride\n",
+            16 * b_stride_bytes
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %ts_b_base, %ts_b_base, {}; // + W offset\n",
+            w_offset_bytes
+        ));
+        ptx.push_str("    mad.lo.u32 %ts_b_base, %ts_n, 16, %ts_b_base; // + n*8*2\n");
+
+        crate::matmul_mma::emit_load_a_fragment_smem(
+            ptx,
+            a_regs,
+            "%ts_a_base",
+            a_stride_bytes,
+        );
+        crate::matmul_mma::emit_load_b_fragment_smem(
+            ptx,
+            b_regs,
+            "%ts_b_base",
+            b_stride_bytes,
+        );
+        // The load helpers take bare register names (they prepend `%`
+        // internally), but `emit_mma_instruction` embeds names
+        // verbatim — prefix them here before the MMA issue.
+        let pct = |regs: &[String]| -> Vec<String> {
+            regs.iter().map(|r| format!("%{}", r)).collect()
+        };
+        let a_pct_vec = pct(a_regs);
+        let b_pct_vec = pct(b_regs);
+        let a_pct: [String; 4] = [
+            a_pct_vec[0].clone(),
+            a_pct_vec[1].clone(),
+            a_pct_vec[2].clone(),
+            a_pct_vec[3].clone(),
+        ];
+        let b_pct: [String; 2] = [b_pct_vec[0].clone(), b_pct_vec[1].clone()];
+        crate::matmul_mma::emit_mma_instruction(ptx, d_regs, &a_pct, &b_pct, c_regs);
+
+        // D is the new accumulator — copy into C for the next K iter.
+        for i in 0..4 {
+            ptx.push_str(&format!("    mov.f32 {}, {};\n", c_regs[i], d_regs[i]));
+        }
+
+        ptx.push_str("    add.u32 %ts_k, %ts_k, 1;\n");
+        ptx.push_str(&format!(
+            "    setp.lt.u32 %p7, %ts_k, {};\n",
+            k_tiles
+        ));
+        ptx.push_str(&format!("    @%p7 bra CSHA_PROJ_{}_K_LOOP;\n", proj_tag));
+
+        // Fragment pack: f32 accumulator (4 f32 per thread) → 2 .b32
+        // registers holding 4 packed f16 values, stored to SMEM at the
+        // per-(m, n) tile origin. Uses the shared `emit_f32_to_f16_pack`
+        // helper so ptxas sees the same conversion pattern as the
+        // existing attention-body epilogue.
+        //
+        // Lane-scatter note: mma.sync.m16n8k16 f32 output has each
+        // thread holding (row=t/4, col=2*(t%4)+{0,1}) and (row+8,
+        // same col) fragment entries. The per-thread SMEM address
+        // computed here stages the 4 packed f16 values at the tile
+        // base — a thread-local scatter-to-lane-coords pass lands in
+        // the A.2.3.2 follow-up once real-hardware validation is in
+        // place. The dtype is now correct (f16), which was the blocker
+        // for A.2.4's f16-reading tile-sweep.
+        let c_names: Vec<String> = c_regs
+            .iter()
+            .map(|r| r.trim_start_matches('%').to_string())
+            .collect();
+        let c_pack_dsts = vec!["proj_c_pack0".to_string(), "proj_c_pack1".to_string()];
+        emit_f32_to_f16_pack(ptx, &c_names, &c_pack_dsts);
+
+        // Tile-base SMEM address: out_offset + m*16*a_stride + n*8*2.
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %ts_out_base, %ts_m, {};  // m * 16 * a_stride\n",
+            16 * a_stride_bytes
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %ts_out_base, %ts_out_base, {}; // + projection out offset\n",
+            out_offset_bytes
+        ));
+        ptx.push_str("    mad.lo.u32 %ts_out_base, %ts_n, 16, %ts_out_base; // + n*8*2\n");
+
+        // A.2.3.2 lane-coherent scatter (per mma.sync.m16n8k16 f32 accumulator layout):
+        //   pack0 holds (regs[0], regs[1]) → (row = laneid/4,        col = 2*(laneid%4)+{0,1})
+        //   pack1 holds (regs[2], regs[3]) → (row = laneid/4 + 8,    col = 2*(laneid%4)+{0,1})
+        // Each thread computes its own scatter address from the tile
+        // base + per-lane row/col offsets, so the 32 threads in a warp
+        // cover the full 16×8 output tile with no bank conflicts on
+        // aligned SMEM.
+        ptx.push_str(&format!(
+            "    shr.u32 %ts_row_lo, %mma_laneid, 2;              // row_lo = laneid / 4 (0..7)\n"
+        ));
+        ptx.push_str("    and.b32 %ts_col_pair, %mma_laneid, 3;            // col_pair = laneid % 4 (0..3)\n");
+        ptx.push_str("    shl.b32 %ts_col_off, %ts_col_pair, 2;            // col_off = col_pair * 2*f16 = *4\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %ts_row_off, %ts_row_lo, {};          // row_off = row_lo * stride\n",
+            a_stride_bytes
+        ));
+        ptx.push_str("    add.u32 %ts_pack0_addr, %ts_out_base, %ts_row_off;\n");
+        ptx.push_str("    add.u32 %ts_pack0_addr, %ts_pack0_addr, %ts_col_off;\n");
+        ptx.push_str("    st.shared.b32 [%ts_pack0_addr], %proj_c_pack0;   // (row_lo, col_pair)\n");
+        ptx.push_str(&format!(
+            "    add.u32 %ts_pack1_addr, %ts_pack0_addr, {};       // +8 rows = 8 * stride\n",
+            8 * a_stride_bytes
+        ));
+        ptx.push_str("    st.shared.b32 [%ts_pack1_addr], %proj_c_pack1;   // (row_lo+8, col_pair)\n");
+
+        ptx.push_str("    add.u32 %ts_n, %ts_n, 1;\n");
+        ptx.push_str(&format!(
+            "    setp.lt.u32 %p7, %ts_n, {};\n",
+            n_tiles
+        ));
+        ptx.push_str(&format!("    @%p7 bra CSHA_PROJ_{}_N_LOOP;\n", proj_tag));
+
+        ptx.push_str("    add.u32 %ts_m, %ts_m, 1;\n");
+        ptx.push_str(&format!(
+            "    setp.lt.u32 %p7, %ts_m, {};\n",
+            m_tiles
+        ));
+        ptx.push_str(&format!("    @%p7 bra CSHA_PROJ_{}_M_LOOP;\n", proj_tag));
+    }
+
+    // Three projections — each writes into its own SMEM slot.
+    // Output slots reuse the Q-tile region (slot 0) for Q since the
+    // attention body reads Q from that slot; K and V write into the
+    // weight-tile slots vacated after the MMA reduction (which is safe
+    // because each K iteration overwrites its own B fragment).
+    let q_out = 0u32;
+    let k_out = q_tile_bytes + weight_tile_bytes;
+    let v_out = q_tile_bytes + 2 * weight_tile_bytes;
+
+    emit_proj_sweep(
+        ptx, "Q",
+        q_tile_bytes,
+        q_out,
+        a_stride_bytes, b_stride_bytes,
+        m_tiles, n_tiles, k_tiles,
+        &a_regs, &b_regs, &c_regs, &d_regs,
+    );
+    emit_proj_sweep(
+        ptx, "K",
+        q_tile_bytes + weight_tile_bytes,
+        k_out,
+        a_stride_bytes, b_stride_bytes,
+        m_tiles, n_tiles, k_tiles,
+        &a_regs, &b_regs, &c_regs, &d_regs,
+    );
+    emit_proj_sweep(
+        ptx, "V",
+        q_tile_bytes + 2 * weight_tile_bytes,
+        v_out,
+        a_stride_bytes, b_stride_bytes,
+        m_tiles, n_tiles, k_tiles,
+        &a_regs, &b_regs, &c_regs, &d_regs,
+    );
+
+    // A.2.3.2: lane-coherent scatter now emitted per iteration above.
+    // Real-hardware numerical validation (mma.sync f32-accumulator test
+    // vector) is the remaining follow-up — the scatter math matches the
+    // documented layout but has not been run on GPU.
+
+    ptx.push_str("CSHA_PROJECTION_END:\n");
+    ptx.push_str("    bar.sync 0;                       // Q/K/V SMEM tiles consistent\n");
+    ptx.push_str("    // ── end CSHA projection ─────────────────────────────────────\n");
+}
+
+/// CSHA A.2.4 — RoPE epilogue emitter.
+///
+/// When both `config.rope_q` and `config.csha.fused_projections` are set,
+/// this emits PTX that rotates the Q and K fragments produced by the
+/// A.2.3 matmul projection **in registers** before they feed the QK^T
+/// MMA, rather than loading pre-rotated Q from HBM as `emit_q_tile_load`
+/// does in the non-CSHA path.
+///
+/// Rotation math matches the existing [`emit_q_tile_load`] RoPE branch:
+///
+/// ```text
+///   q_rot_a = q_a * cos - q_b * sin
+///   q_rot_b = q_a * sin + q_b * cos
+/// ```
+///
+/// A.2.4 ships a **register-level scaffold** — one (q_a, q_b) pair
+/// rotation for Q and one for K, using the `proj_d*` output registers
+/// from A.2.3's single MMA. The tile-sweep that applies rotation to
+/// every fragment across `(block_q, head_dim)` lands with A.2.3's
+/// tile-sweep follow-up, since the two loops share the same tiling.
+///
+/// Runtime null-check on `cos_ptr` / `sin_ptr` keeps current
+/// A.1/A.2.1x call sites (which pass null for CSHA-tagged kernels via
+/// the non-CSHA forwarder) from dereferencing uninitialised pointers.
+/// Kernel variant remains dormant until A.2.5 wires the runtime FFI.
+fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
+    let Some(csha) = config.csha.as_ref() else {
+        return;
+    };
+    if !csha.fused_projections || !config.rope_q {
+        return;
+    }
+
+    let head_dim = config.head_dim;
+    let stride_val = match config.rope_style {
+        RopeStyle::HalfSplit => head_dim / 2,
+        RopeStyle::Adjacent => 1,
+    };
+    let block_q = config.block_q;
+
+    ptx.push_str("    // ── CSHA A.2.4: RoPE epilogue ────────────────────────────\n");
+    ptx.push_str(&format!(
+        "    // rope_q=1, rope_style={:?}, head_dim={}, stride={}\n",
+        config.rope_style, head_dim, stride_val
+    ));
+
+    // cos/sin param pointers are loaded into %rd12/%rd13 by
+    // `emit_param_loads`; we just need to null-check them here.
+    ptx.push_str("    setp.eq.u64 %p15, %rd12, 0;       // cos_ptr null?\n");
+    ptx.push_str("    setp.eq.u64 %p14, %rd13, 0;       // sin_ptr null?\n");
+    ptx.push_str("    or.pred %p15, %p15, %p14;\n");
+    ptx.push_str("    @%p15 bra CSHA_ROPE_EPILOGUE_END;\n");
+
+    // A.2.4 tile-sweep registers.
+    ptx.push_str("    .reg .f32 %rope_q_a, %rope_q_b, %rope_q_rot_a, %rope_q_rot_b;\n");
+    ptx.push_str("    .reg .f32 %rope_k_a, %rope_k_b, %rope_k_rot_a, %rope_k_rot_b;\n");
+    ptx.push_str("    .reg .f32 %rope_cos, %rope_sin, %rope_tmp;\n");
+    ptx.push_str("    .reg .u32 %rope_pair_idx, %rope_row, %rope_d;\n");
+    ptx.push_str("    .reg .u32 %rope_elem_a_off, %rope_elem_b_off;\n");
+    ptx.push_str("    .reg .u64 %rope_cs_addr, %rope_row_u64;\n");
+
+    // Pair count = block_q * (head_dim / 2); each thread strides by
+    // blockDim.x (=128) through the flat pair index space so all 128
+    // threads cooperate across the full Q/K SMEM tile.
+    let pairs_per_q = (block_q * (head_dim / 2)) as u32;
+    let q_smem_base = 0u32;
+    let q_tile_bytes = (block_q * head_dim * 2) as u32;
+    let k_smem_base = if csha.fused_projections {
+        // Matches A.2.3's k_out: q_tile_bytes + weight_tile_bytes.
+        q_tile_bytes
+            + (head_dim as u32) * csha.d_model.max(head_dim as u32).min(256) * 2
+    } else {
+        // Without projection, K stays in its default pre-projected slot.
+        q_tile_bytes
+    };
+    let stride_bytes = (stride_val * 4) as u32;
+
+    // --- Q rotation sweep ---
+    ptx.push_str(&format!(
+        "    // --- Q rotation sweep: {} row pairs × {} col pairs per row ---\n",
+        block_q,
+        head_dim / 2,
+    ));
+    ptx.push_str("    mov.u32 %rope_pair_idx, %tid_x;\n");
+    ptx.push_str("CSHA_ROPE_Q_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p14, %rope_pair_idx, {};\n",
+        pairs_per_q
+    ));
+    ptx.push_str("    @%p14 bra CSHA_ROPE_K_START;\n");
+    ptx.push_str(&format!(
+        "    div.u32 %rope_row, %rope_pair_idx, {};   // row = pair/(head_dim/2)\n",
+        head_dim / 2
+    ));
+    ptx.push_str(&format!(
+        "    rem.u32 %rope_d, %rope_pair_idx, {};     // d = pair%%(head_dim/2)\n",
+        head_dim / 2
+    ));
+    // elem_a_off = (row * head_dim + d) * 4  (f32 SMEM placeholder stores)
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %rope_elem_a_off, %rope_row, {};\n",
+        head_dim * 4
+    ));
+    ptx.push_str("    mad.lo.u32 %rope_elem_a_off, %rope_d, 4, %rope_elem_a_off;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %rope_elem_a_off, %rope_elem_a_off, {}; // + q_smem_base\n",
+        q_smem_base
+    ));
+    ptx.push_str(&format!(
+        "    add.u32 %rope_elem_b_off, %rope_elem_a_off, {}; // +stride*4\n",
+        stride_bytes
+    ));
+
+    ptx.push_str("    ld.shared.f32 %rope_q_a, [%rope_elem_a_off];\n");
+    ptx.push_str("    ld.shared.f32 %rope_q_b, [%rope_elem_b_off];\n");
+
+    // cos/sin address: base_ptr + ((q_start + row) * head_dim + d) * 4.
+    // Mirrors the math in `emit_q_tile_load`'s LOOP_Q_LOAD_ROPE branch
+    // (%rd25 = cos_base, %rd26 = sin_base in that emitter); here we
+    // compute the offset from cos_ptr (%rd12) / sin_ptr (%rd13)
+    // directly per loop iteration so the scaffold stays self-contained.
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_row;\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rope_row_u64, %rd16;        // + q_start\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rope_cs_addr, %rope_row_u64, {}; // * head_dim\n",
+        head_dim
+    ));
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_d;                  // reuse as d temp\n");
+    ptx.push_str("    add.u64 %rope_cs_addr, %rope_cs_addr, %rope_row_u64; // + d\n");
+    ptx.push_str("    shl.b64 %rope_cs_addr, %rope_cs_addr, 2;             // * 4 bytes\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd12, %rope_cs_addr;         // cos addr\n");
+    ptx.push_str("    ld.global.f32 %rope_cos, [%rope_row_u64];\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd13, %rope_cs_addr;         // sin addr\n");
+    ptx.push_str("    ld.global.f32 %rope_sin, [%rope_row_u64];\n");
+
+    ptx.push_str("    mul.f32 %rope_q_rot_a, %rope_q_a, %rope_cos;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_q_b, %rope_sin;\n");
+    ptx.push_str("    sub.f32 %rope_q_rot_a, %rope_q_rot_a, %rope_tmp;\n");
+    ptx.push_str("    mul.f32 %rope_q_rot_b, %rope_q_a, %rope_sin;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_q_b, %rope_cos;\n");
+    ptx.push_str("    add.f32 %rope_q_rot_b, %rope_q_rot_b, %rope_tmp;\n");
+    ptx.push_str("    st.shared.f32 [%rope_elem_a_off], %rope_q_rot_a;\n");
+    ptx.push_str("    st.shared.f32 [%rope_elem_b_off], %rope_q_rot_b;\n");
+
+    ptx.push_str("    add.u32 %rope_pair_idx, %rope_pair_idx, 128;  // stride by blockDim.x\n");
+    ptx.push_str("    bra CSHA_ROPE_Q_LOOP;\n");
+
+    // --- K rotation sweep ---
+    ptx.push_str("CSHA_ROPE_K_START:\n");
+    ptx.push_str(&format!(
+        "    // --- K rotation sweep: {} row pairs × {} col pairs per row ---\n",
+        block_q,
+        head_dim / 2,
+    ));
+    ptx.push_str("    mov.u32 %rope_pair_idx, %tid_x;\n");
+    ptx.push_str("CSHA_ROPE_K_LOOP:\n");
+    ptx.push_str(&format!(
+        "    setp.ge.u32 %p14, %rope_pair_idx, {};\n",
+        pairs_per_q
+    ));
+    ptx.push_str("    @%p14 bra CSHA_ROPE_EPILOGUE_END;\n");
+    ptx.push_str(&format!(
+        "    div.u32 %rope_row, %rope_pair_idx, {};\n",
+        head_dim / 2
+    ));
+    ptx.push_str(&format!(
+        "    rem.u32 %rope_d, %rope_pair_idx, {};\n",
+        head_dim / 2
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %rope_elem_a_off, %rope_row, {};\n",
+        head_dim * 4
+    ));
+    ptx.push_str("    mad.lo.u32 %rope_elem_a_off, %rope_d, 4, %rope_elem_a_off;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %rope_elem_a_off, %rope_elem_a_off, {}; // + k_smem_base\n",
+        k_smem_base
+    ));
+    ptx.push_str(&format!(
+        "    add.u32 %rope_elem_b_off, %rope_elem_a_off, {};\n",
+        stride_bytes
+    ));
+
+    ptx.push_str("    ld.shared.f32 %rope_k_a, [%rope_elem_a_off];\n");
+    ptx.push_str("    ld.shared.f32 %rope_k_b, [%rope_elem_b_off];\n");
+
+    // Per-(row, d) cos/sin indexing — same pattern as the Q sweep.
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_row;\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rope_row_u64, %rd16;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rope_cs_addr, %rope_row_u64, {};\n",
+        head_dim
+    ));
+    ptx.push_str("    cvt.u64.u32 %rope_row_u64, %rope_d;\n");
+    ptx.push_str("    add.u64 %rope_cs_addr, %rope_cs_addr, %rope_row_u64;\n");
+    ptx.push_str("    shl.b64 %rope_cs_addr, %rope_cs_addr, 2;\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd12, %rope_cs_addr;\n");
+    ptx.push_str("    ld.global.f32 %rope_cos, [%rope_row_u64];\n");
+    ptx.push_str("    add.u64 %rope_row_u64, %rd13, %rope_cs_addr;\n");
+    ptx.push_str("    ld.global.f32 %rope_sin, [%rope_row_u64];\n");
+
+    ptx.push_str("    mul.f32 %rope_k_rot_a, %rope_k_a, %rope_cos;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_k_b, %rope_sin;\n");
+    ptx.push_str("    sub.f32 %rope_k_rot_a, %rope_k_rot_a, %rope_tmp;\n");
+    ptx.push_str("    mul.f32 %rope_k_rot_b, %rope_k_a, %rope_sin;\n");
+    ptx.push_str("    mul.f32 %rope_tmp, %rope_k_b, %rope_cos;\n");
+    ptx.push_str("    add.f32 %rope_k_rot_b, %rope_k_rot_b, %rope_tmp;\n");
+    ptx.push_str("    st.shared.f32 [%rope_elem_a_off], %rope_k_rot_a;\n");
+    ptx.push_str("    st.shared.f32 [%rope_elem_b_off], %rope_k_rot_b;\n");
+
+    ptx.push_str("    add.u32 %rope_pair_idx, %rope_pair_idx, 128;\n");
+    ptx.push_str("    bra CSHA_ROPE_K_LOOP;\n");
+
+
+    ptx.push_str("CSHA_ROPE_EPILOGUE_END:\n");
+    ptx.push_str("    // ── end CSHA RoPE epilogue ─────────────────────────────────\n");
 }
 
 fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -5683,5 +6482,553 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── CSHA A.2.2: RMSNorm prologue emission tests ──────────────────
+
+    fn csha_l1_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            csha: Some(CshaExtras::level1(1e-5)),
+        }
+    }
+
+    fn non_csha_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            csha: None,
+        }
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_appears_with_fused_rmsnorm() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        // Prologue marker comment must appear — this is the anchor
+        // downstream assertions use to confirm the block was emitted.
+        assert!(
+            ptx.contains("CSHA A.2.2: RMSNorm prologue"),
+            "prologue block missing for CSHA L1 config"
+        );
+        // Core PTX ops that the prologue emits.
+        assert!(ptx.contains("ld.param.u64 %rd50, [csha_x_ptr];"));
+        assert!(ptx.contains("ld.param.u64 %rd51, [csha_norm_weight_ptr];"));
+        assert!(ptx.contains("ld.param.f32 %f100, [csha_rmsnorm_eps];"));
+        assert!(ptx.contains("rsqrt.approx.f32 %f101, %f101;"));
+        assert!(ptx.contains("st.shared.b16 [%rd58], %h0;"));
+        // Labels must be present for the runtime null-check branch.
+        assert!(ptx.contains("CSHA_PROLOGUE_SUMSQ:"));
+        assert!(ptx.contains("CSHA_PROLOGUE_APPLY:"));
+        assert!(ptx.contains("CSHA_PROLOGUE_END:"));
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_absent_without_csha() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&non_csha_config())).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.2: RMSNorm prologue"),
+            "prologue must not appear in non-CSHA PTX"
+        );
+        assert!(!ptx.contains("CSHA_PROLOGUE_SUMSQ:"));
+        assert!(!ptx.contains("CSHA_PROLOGUE_APPLY:"));
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_absent_when_fused_rmsnorm_off() {
+        // CSHA plumbing enabled but prologue fusion explicitly off —
+        // the kernel variant registers the CSHA param list (so ABI stays
+        // stable across cshaL*/non-CSHA variants) but the prologue
+        // PTX body is still elided.
+        let mut cfg = csha_l1_config();
+        cfg.csha.as_mut().unwrap().fused_rmsnorm = false;
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.2: RMSNorm prologue"),
+            "prologue must respect the fused_rmsnorm gate"
+        );
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_runtime_null_check_uses_or_pred() {
+        // The prologue must short-circuit if EITHER csha_x_ptr OR
+        // csha_norm_weight_ptr is null — otherwise threading only one
+        // of them (possible during A.2.1e rollout) would dereference a
+        // null pointer in the other. Check the or.pred guard.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        assert!(
+            ptx.contains("setp.eq.u64 %p10, %rd50, 0;")
+                && ptx.contains("setp.eq.u64 %p11, %rd51, 0;")
+                && ptx.contains("or.pred %p10, %p10, %p11;")
+                && ptx.contains("@%p10 bra CSHA_PROLOGUE_END;"),
+            "runtime null-check on x_ptr/norm_weight_ptr is missing"
+        );
+    }
+
+    // ── CSHA A.2.3: matmul projection emission tests ─────────────────
+
+    fn csha_l2_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            csha: Some(CshaExtras::level2(1e-5, 512)),
+        }
+    }
+
+    #[test]
+    fn a23_projection_appears_with_fused_projections() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        assert!(
+            ptx.contains("CSHA A.2.3: matmul projection"),
+            "projection block missing for CSHA L2 config"
+        );
+        // Tile-sweep: three MMAs (one per projection iteration, reused
+        // across M/N/K loops at runtime). Exactly three `mma.sync`
+        // statically-emitted instructions — the loop structure above
+        // dispatches them many times at runtime.
+        assert_eq!(
+            ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32")
+                .count(),
+            3,
+            "exactly three statically-emitted m16n8k16 MMAs (Q/K/V loop bodies)"
+        );
+        // Section markers for each projection.
+        assert!(ptx.contains("--- Q projection:"));
+        assert!(ptx.contains("--- K projection:"));
+        assert!(ptx.contains("--- V projection:"));
+        // End label + bar.sync.
+        assert!(ptx.contains("CSHA_PROJECTION_END:"));
+    }
+
+    #[test]
+    fn a23_projection_tile_sweep_has_nested_mnk_loops() {
+        // Tile-sweep expansion: every projection has an M-loop, N-loop,
+        // and K-loop, each a runtime branch backed by a unique label.
+        // The label count verifies the loop structure is generated for
+        // all three projections (9 labels total: 3 × {M, N, K}).
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        for tag in ["Q", "K", "V"] {
+            for dim in ["M", "N", "K"] {
+                let label = format!("CSHA_PROJ_{}_{}_LOOP:", tag, dim);
+                assert!(
+                    ptx.contains(&label),
+                    "missing loop label {} in CSHA L2 PTX",
+                    label
+                );
+            }
+        }
+        // Each projection increments its counters by 1 per iteration,
+        // so we expect 9 `add.u32 %ts_{m,n,k}, ..., 1;` increments
+        // (one per loop per projection).
+        assert_eq!(
+            ptx.matches("add.u32 %ts_m, %ts_m, 1;").count(),
+            3,
+            "one M-loop increment per projection"
+        );
+        assert_eq!(
+            ptx.matches("add.u32 %ts_n, %ts_n, 1;").count(),
+            3,
+            "one N-loop increment per projection"
+        );
+        assert_eq!(
+            ptx.matches("add.u32 %ts_k, %ts_k, 1;").count(),
+            3,
+            "one K-loop increment per projection"
+        );
+    }
+
+    #[test]
+    fn a23_fragment_pack_converts_f32_accumulator_to_f16_before_smem_store() {
+        // A.2.3 follow-up: per-(m, n) tile closure packs the 4 f32
+        // accumulator lanes into 2 .b32 registers (each holding 2
+        // packed f16 values) via `emit_f32_to_f16_pack`. Verifies the
+        // conversion is actually emitted rather than the old
+        // placeholder `st.shared.b32 %proj_c0` raw-f32 store.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // Three projections × 2 f32→f16 conversion pairs each
+        // (emit_f32_to_f16_pack emits one cvt per f32 src, 4 per call).
+        assert_eq!(
+            ptx.matches("cvt.rn.f16.f32 %mma_h0, %proj_c").count(),
+            6,
+            "two f32→f16 conversion calls per projection × 3 projections"
+        );
+        // A.2.3.2 lane-coherent scatter: each pack is stored via a
+        // per-lane address (%ts_pack0_addr / %ts_pack1_addr), not the
+        // bare tile origin. The tile-origin stores of the old
+        // scaffold must be gone.
+        assert!(ptx.contains("st.shared.b32 [%ts_pack0_addr], %proj_c_pack0;"));
+        assert!(ptx.contains("st.shared.b32 [%ts_pack1_addr], %proj_c_pack1;"));
+        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 0], %proj_c_pack0"));
+        assert!(!ptx.contains("st.shared.b32 [%ts_out_base + 4], %proj_c_pack1"));
+    }
+
+    #[test]
+    fn a232_lane_coherent_scatter_matches_mma_layout() {
+        // A.2.3.2: the per-(m, n) tile closure must emit the scatter
+        // address math documented for mma.sync.m16n8k16 f32-accumulator
+        // layout — thread t holds (row=t/4, col=2*(t%4)+{0,1}) and
+        // (row+8, same col). Pack0 stores the low row, pack1 the high
+        // row.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // Lane → row / col math
+        assert!(ptx.contains("shr.u32 %ts_row_lo, %mma_laneid, 2;"));
+        assert!(ptx.contains("and.b32 %ts_col_pair, %mma_laneid, 3;"));
+        assert!(ptx.contains("shl.b32 %ts_col_off, %ts_col_pair, 2;"));
+        // Row offset = row_lo * stride (stride = head_dim*2 = 256 here).
+        assert!(ptx.contains("mul.lo.u32 %ts_row_off, %ts_row_lo, 256;"));
+        // pack0 = out_base + row_off + col_off
+        assert!(ptx.contains("add.u32 %ts_pack0_addr, %ts_out_base, %ts_row_off;"));
+        assert!(ptx.contains("add.u32 %ts_pack0_addr, %ts_pack0_addr, %ts_col_off;"));
+        // pack1 = pack0 + 8*stride (8 rows lower)
+        assert!(ptx.contains("add.u32 %ts_pack1_addr, %ts_pack0_addr, 2048;"));
+        // Per-lane scatter stores (not tile-origin stores)
+        assert_eq!(
+            ptx.matches("st.shared.b32 [%ts_pack0_addr], %proj_c_pack0;").count(),
+            3,
+            "one pack0 scatter store per projection (Q/K/V)"
+        );
+        assert_eq!(
+            ptx.matches("st.shared.b32 [%ts_pack1_addr], %proj_c_pack1;").count(),
+            3,
+            "one pack1 scatter store per projection"
+        );
+    }
+
+    #[test]
+    fn a24_rope_cos_sin_indexing_uses_per_row_per_d_addressing() {
+        // A.2.4 follow-up: cos/sin addresses now compute
+        // `cos_ptr + ((q_start + row) * head_dim + d) * 4` per pair,
+        // rather than sampling position 0 like the original scaffold.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        // Two sweeps (Q, K), each computes `(q_start + row) * head_dim`,
+        // adds `d`, shifts << 2, and adds to cos_ptr / sin_ptr.
+        assert_eq!(
+            ptx.matches("add.u64 %rope_row_u64, %rope_row_u64, %rd16;").count(),
+            2,
+            "q_start added once per sweep (Q + K)"
+        );
+        assert_eq!(
+            ptx.matches("shl.b64 %rope_cs_addr, %rope_cs_addr, 2;").count(),
+            2,
+            "* 4 bytes indexing shift per sweep"
+        );
+        assert_eq!(
+            ptx.matches("add.u64 %rope_row_u64, %rd12, %rope_cs_addr;").count(),
+            2,
+            "cos_ptr-relative addr computed per sweep"
+        );
+        assert_eq!(
+            ptx.matches("add.u64 %rope_row_u64, %rd13, %rope_cs_addr;").count(),
+            2,
+            "sin_ptr-relative addr computed per sweep"
+        );
+        // The old placeholder-load pattern (sampling %rd12 directly
+        // without offset computation) must no longer appear.
+        assert!(!ptx.contains("ld.global.f32 %rope_cos, [%rd12];"));
+        assert!(!ptx.contains("ld.global.f32 %rope_sin, [%rd13];"));
+    }
+
+    #[test]
+    fn a23_projection_tile_sweep_uses_register_based_smem_addresses() {
+        // Per-iteration A and B fragment loads must use register
+        // expressions (%ts_a_base / %ts_b_base) rather than compile-
+        // time literals, so the MMA primitive addresses the correct
+        // tile on each iteration.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // A stride = head_dim * 2 = 128 * 2 = 256 bytes.
+        assert!(
+            ptx.contains("%mma_a_row, 256, %ts_a_base"),
+            "A-fragment load must resolve against the tile-base register"
+        );
+        // B stride = d_model.min(256) * 2 = 256 * 2 = 512 bytes.
+        assert!(
+            ptx.contains("%mma_b_row, 512, %ts_b_base"),
+            "B-fragment load must resolve against the tile-base register"
+        );
+    }
+
+    #[test]
+    fn a23_projection_absent_without_fused_projections() {
+        // CSHA L1 only has fused_rmsnorm; projections stay external.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.3: matmul projection"),
+            "projection must not appear in CSHA L1 PTX (fused_projections=false)"
+        );
+        assert!(!ptx.contains("CSHA_PROJECTION_END:"));
+    }
+
+    #[test]
+    fn a23_projection_absent_in_non_csha_ptx() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&non_csha_config())).unwrap();
+        assert!(!ptx.contains("CSHA A.2.3: matmul projection"));
+        // And the non-CSHA path emits exactly the attention-body MMAs it
+        // already had (sanity: no CSHA-tagged MMAs leaking through).
+        assert!(!ptx.contains("CSHA_PROJECTION_END:"));
+    }
+
+    #[test]
+    fn a23_projection_runtime_null_check_covers_all_three_weights() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        // Must set-predicate-eq for each of Wq/Wk/Wv and or.pred-combine
+        // them, then branch to PROJECTION_END if any is null.
+        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wq_ptr];"));
+        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wk_ptr];"));
+        assert!(ptx.contains("ld.param.u64 %rd63, [csha_wv_ptr];"));
+        assert!(ptx.contains("setp.eq.u64 %p13, %rd61, 0;"));
+        assert!(ptx.contains("setp.eq.u64 %p14, %rd62, 0;"));
+        assert!(ptx.contains("setp.eq.u64 %p14, %rd63, 0;"));
+        assert!(ptx.contains("@%p13 bra CSHA_PROJECTION_END;"));
+    }
+
+    // ── CSHA A.4: active_heads guard emission tests ──────────────────
+
+    fn csha_pruned_config(active_heads: u32) -> FlashAttentionConfig {
+        let mut cfg = csha_l1_config();
+        cfg.csha.as_mut().unwrap().active_heads = active_heads;
+        cfg
+    }
+
+    #[test]
+    fn a4_active_heads_guard_absent_when_zero() {
+        // active_heads=0 is the "no pruning" signal — kernel runs the
+        // full head count and the guard must not appear (otherwise ptxas
+        // sees a `bid_y >= 0` check which is never false but still
+        // emits the branch instruction).
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        assert!(!ptx.contains("CSHA A.4: active_heads guard"));
+        assert!(!ptx.contains("@%p9 ret;"));
+    }
+
+    #[test]
+    fn a4_active_heads_guard_emits_literal_bound() {
+        let cfg = csha_pruned_config(5);
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(
+            ptx.contains("CSHA A.4: active_heads guard"),
+            "guard must appear when active_heads > 0"
+        );
+        // The compile-time literal (5) appears in the setp operand,
+        // letting ptxas fold the comparison against a constant rather
+        // than a runtime-loaded param.
+        assert!(
+            ptx.contains("setp.ge.u64 %p9, %rd18, 5;"),
+            "guard must use the compile-time active_heads literal"
+        );
+        assert!(ptx.contains("@%p9 ret;"));
+    }
+
+    #[test]
+    fn a4_active_heads_guard_follows_index_computation() {
+        // The guard must appear AFTER `emit_index_computation` (which
+        // writes %rd18 = head_idx) but BEFORE the A.2.2 prologue — so
+        // dead heads exit without doing any SMEM work.
+        let cfg = csha_pruned_config(3);
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        let head_idx = ptx
+            .find("head_idx = bid_y % heads")
+            .expect("index computation writes head_idx");
+        let guard_idx = ptx.find("CSHA A.4: active_heads guard").unwrap();
+        let prologue_idx = ptx.find("CSHA A.2.2: RMSNorm prologue").unwrap();
+        assert!(head_idx < guard_idx, "guard must follow head_idx computation");
+        assert!(
+            guard_idx < prologue_idx,
+            "guard must precede the prologue so dead heads skip SMEM work"
+        );
+    }
+
+    #[test]
+    fn a4_active_heads_guard_absent_in_non_csha_ptx() {
+        // Sanity: the guard is purely a CSHA feature.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&non_csha_config())).unwrap();
+        assert!(!ptx.contains("CSHA A.4: active_heads guard"));
+    }
+
+    // ── CSHA A.2.4: RoPE epilogue emission tests ────────────────────
+
+    fn csha_l2_rope_config() -> FlashAttentionConfig {
+        let mut cfg = csha_l2_config();
+        cfg.rope_q = true;
+        cfg.rope_style = RopeStyle::HalfSplit;
+        cfg
+    }
+
+    #[test]
+    fn a24_rope_epilogue_appears_with_rope_plus_fused_projections() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        assert!(
+            ptx.contains("CSHA A.2.4: RoPE epilogue"),
+            "RoPE epilogue block missing for CSHA L2 + rope_q config"
+        );
+        // Tile-sweep markers — both Q and K now rotate across the full
+        // (block_q × head_dim/2) pair grid, not just a single element.
+        assert!(ptx.contains("--- Q rotation sweep:"));
+        assert!(ptx.contains("--- K rotation sweep:"));
+        // Rotation math: Q and K each do cos*a - sin*b and sin*a + cos*b.
+        assert!(ptx.contains("sub.f32 %rope_q_rot_a"));
+        assert!(ptx.contains("add.f32 %rope_q_rot_b"));
+        assert!(ptx.contains("sub.f32 %rope_k_rot_a"));
+        assert!(ptx.contains("add.f32 %rope_k_rot_b"));
+        // Write-back into SMEM (tile-sweep replaces the previous
+        // register-only %proj_d* write-back).
+        assert!(ptx.contains("st.shared.f32 [%rope_elem_a_off], %rope_q_rot_a;"));
+        assert!(ptx.contains("st.shared.f32 [%rope_elem_a_off], %rope_k_rot_a;"));
+        // End label.
+        assert!(ptx.contains("CSHA_ROPE_EPILOGUE_END:"));
+    }
+
+    #[test]
+    fn a24_rope_tile_sweep_has_cooperative_pair_loop() {
+        // The Q-sweep and K-sweep are each implemented as a runtime
+        // loop strided by blockDim.x (128) so all 128 threads
+        // cooperate over the flat pair index space. Check the loop
+        // labels + the `+128` stride increment are present.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        assert!(ptx.contains("CSHA_ROPE_Q_LOOP:"));
+        assert!(ptx.contains("CSHA_ROPE_K_LOOP:"));
+        assert!(ptx.contains("CSHA_ROPE_K_START:"));
+        // blockDim.x stride appears in both loops.
+        assert_eq!(
+            ptx.matches("add.u32 %rope_pair_idx, %rope_pair_idx, 128;").count(),
+            2,
+            "one stride increment each for Q and K sweeps"
+        );
+    }
+
+    #[test]
+    fn a24_rope_epilogue_absent_without_rope() {
+        // fused_projections on, rope_q off → epilogue must not appear;
+        // the A.2.3 projection still does.
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.4: RoPE epilogue"),
+            "RoPE epilogue must respect the rope_q gate"
+        );
+        assert!(ptx.contains("CSHA A.2.3: matmul projection"));
+    }
+
+    #[test]
+    fn a24_rope_epilogue_absent_without_fused_projections() {
+        // CSHA L1 (fused_rmsnorm only) + rope_q on. Pre-CSHA RoPE path
+        // in `emit_q_tile_load` handles rotation from HBM; the A.2.4
+        // epilogue is only meaningful when Q/K come from A.2.3's
+        // in-kernel projection.
+        let mut cfg = csha_l1_config();
+        cfg.rope_q = true;
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(
+            !ptx.contains("CSHA A.2.4: RoPE epilogue"),
+            "RoPE epilogue requires fused_projections — L1 must not emit it"
+        );
+    }
+
+    #[test]
+    fn a24_rope_epilogue_runtime_null_check_on_cos_sin() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        // cos_ptr is %rd12, sin_ptr is %rd13 per `emit_param_loads`.
+        assert!(ptx.contains("setp.eq.u64 %p15, %rd12, 0;"));
+        assert!(ptx.contains("setp.eq.u64 %p14, %rd13, 0;"));
+        assert!(ptx.contains("or.pred %p15, %p15, %p14;"));
+        assert!(ptx.contains("@%p15 bra CSHA_ROPE_EPILOGUE_END;"));
+    }
+
+    #[test]
+    fn a24_rope_epilogue_follows_projection() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_rope_config())).unwrap();
+        let projection_idx = ptx
+            .find("CSHA A.2.3: matmul projection")
+            .expect("projection present");
+        let epilogue_idx = ptx
+            .find("CSHA A.2.4: RoPE epilogue")
+            .expect("epilogue present");
+        let q_load_idx = ptx
+            .find("Load Q tile into shared memory")
+            .expect("Q tile load present");
+        assert!(
+            projection_idx < epilogue_idx,
+            "RoPE epilogue must follow A.2.3 projection"
+        );
+        assert!(
+            epilogue_idx < q_load_idx,
+            "RoPE epilogue must precede the classic Q-from-HBM load"
+        );
+    }
+
+    #[test]
+    fn a24_rope_epilogue_absent_in_non_csha_ptx() {
+        // Non-CSHA + rope_q uses the original in-Q-load RoPE path; the
+        // CSHA-specific epilogue must NOT leak in.
+        let mut cfg = non_csha_config();
+        cfg.rope_q = true;
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&cfg)).unwrap();
+        assert!(!ptx.contains("CSHA A.2.4: RoPE epilogue"));
+        assert!(!ptx.contains("CSHA_ROPE_EPILOGUE_END:"));
+        // But the original RoPE path must still be active.
+        assert!(ptx.contains("LOOP_Q_LOAD_ROPE:"));
+    }
+
+    #[test]
+    fn a23_projection_follows_prologue_precedes_q_tile_load() {
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
+        let prologue_idx = ptx
+            .find("CSHA A.2.2: RMSNorm prologue")
+            .expect("prologue present (L2 turns on fused_rmsnorm too)");
+        let projection_idx = ptx
+            .find("CSHA A.2.3: matmul projection")
+            .expect("projection present");
+        let q_load_idx = ptx
+            .find("Load Q tile into shared memory")
+            .expect("Q tile load present");
+        assert!(
+            prologue_idx < projection_idx,
+            "prologue must precede projection"
+        );
+        assert!(
+            projection_idx < q_load_idx,
+            "projection must precede classic Q load"
+        );
+    }
+
+    #[test]
+    fn a22_rmsnorm_prologue_precedes_q_tile_load() {
+        // The prologue must emit BEFORE the classic Q-from-HBM load so
+        // that when null pointers short-circuit the prologue, Q load
+        // still fills SMEM and the kernel behaves identically to the
+        // non-CSHA variant at runtime (current A.1/A.2.1x state).
+        let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l1_config())).unwrap();
+        let prologue_idx = ptx.find("CSHA A.2.2: RMSNorm prologue").expect("prologue present");
+        let q_load_idx = ptx
+            .find("Load Q tile into shared memory")
+            .expect("Q tile load present");
+        assert!(
+            prologue_idx < q_load_idx,
+            "prologue at offset {} must precede Q tile load at offset {}",
+            prologue_idx,
+            q_load_idx
+        );
     }
 }

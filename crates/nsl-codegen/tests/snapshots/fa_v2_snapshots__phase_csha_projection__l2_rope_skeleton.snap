@@ -1,0 +1,86 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // CSHA A.2.3: Q/K/V matmul projection (q_tile_iter=0), d_model=32, head_dim=32
+    ld.param.u64 %rd60, [csha_wq_ptr];
+    ld.param.u64 %rd61, [csha_wk_ptr];
+    ld.param.u64 %rd62, [csha_wv_ptr];
+    setp.eq.u64 %p0, %rd60, 0;
+    @%p0 bra V2_CSHA_PROJECTION_SKIP_0;
+    add.u32 %r_indim_Q_0, %warp_id, 0; // warp_row = warp_id + iter*4
+    cvt.u64.u32 %warp_row, %r_indim_Q_0;
+    mov.u64 %q_smem_base, %shmem_base;
+    add.u64 %k_smem_base, %shmem_base, 2048; // + kv_offset
+    add.u64 %v_smem_base, %shmem_base, 2048; // + kv_offset (shared with K)
+    add.u64 %q_tile, %shmem_base, 8192; // Wq tile base in SMEM
+    add.u64 %k_tile, %shmem_base, 10240; // Wk tile base in SMEM
+    add.u64 %v_tile, %shmem_base, 12288; // Wv tile base in SMEM
+    ld.param.u64 %x_norm_base, [csha_x_ptr];
+    mul.lo.u64 %rd_wt_off, %head_idx, %rd6;
+    add.u64 %rd_wt_off, %rd_wt_off, %q_start;
+    add.u64 %rd_wt_off, %rd_wt_off, %warp_row;
+    mul.lo.u64 %rd_wt_off, %rd_wt_off, %rd7;
+    shl.b64 %rd_wt_off, %rd_wt_off, 2;
+    add.u64 %x_norm_base, %x_norm_base, %rd_wt_off;
+    // A.2.3 warp-per-row sweep: Q (q_tile_iter=0), slices/lane=1
+V2_CSHA_PROJ_Q_LOOP_0:
+    mov.f32 %f_acc_Q_0, 0f00000000;    // acc[Q][0] = 0
+    mov.u32 %r_indim_Q_0, 0;           // in_dim loop counter
+V2_CSHA_PROJ_Q_INDIM_0_0:
+    cvt.u64.u32 %rd_wt_off, %r_indim_Q_0;
+    shl.b64 %rd_wt_off, %rd_wt_off, 2;    // in_dim * 4 bytes (f32)
+    add.u64 %rd_wt_src, %x_norm_base, %rd_wt_off;
+    ld.global.f32 %f_x_Q_0, [%rd_wt_src];
+    cvt.u64.u32 %rd_wt_off, %r_indim_Q_0;
+    mul.lo.u64 %rd_wt_off, %rd_wt_off, 64; // in_dim * head_dim * 2 (f16 W row-stride)
+    add.u64 %rd_wt_dst, %q_tile, %rd_wt_off;
+    cvt.u64.u32 %rd_wt_off, %lane;
+    shl.b64 %rd_wt_off, %rd_wt_off, 1; // * 2 bytes (f16)
+    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;
+    ld.shared.b16 %h_w_Q_0, [%rd_wt_dst];
+    cvt.f32.f16 %f_w_Q_0, %h_w_Q_0;
+    fma.rn.f32 %f_acc_Q_0, %f_x_Q_0, %f_w_Q_0, %f_acc_Q_0;
+    add.u32 %r_indim_Q_0, %r_indim_Q_0, 1;
+    setp.lt.u32 %p_indim_Q_0, %r_indim_Q_0, 32;
+    @%p_indim_Q_0 bra V2_CSHA_PROJ_Q_INDIM_0_0;
+    cvt.rn.f16.f32 %h_out_Q_0, %f_acc_Q_0;
+    mul.lo.u64 %rd_wt_off, %warp_row, 64;
+    add.u64 %rd_wt_dst, %q_smem_base, %rd_wt_off;
+    cvt.u64.u32 %rd_wt_off, %lane;
+    shl.b64 %rd_wt_off, %rd_wt_off, 1;
+    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;
+    st.shared.b16 [%rd_wt_dst], %h_out_Q_0;
+    setp.eq.u64 %p0, %rd61, 0;
+    @%p0 bra V2_CSHA_PROJ_K_SKIP_0;
+    // A.2.3 warp-per-row sweep: K (q_tile_iter=0), slices/lane=1
+V2_CSHA_PROJ_K_LOOP_0:
+    mov.f32 %f_acc_K_0, 0f00000000;    // acc[K][0] = 0
+    mov.u32 %r_indim_K_0, 0;           // in_dim loop counter
+V2_CSHA_PROJ_K_INDIM_0_0:
+    cvt.u64.u32 %rd_wt_off, %r_indim_K_0;
+    shl.b64 %rd_wt_off, %rd_wt_off, 2;    // in_dim * 4 bytes (f32)
+    add.u64 %rd_wt_src, %x_norm_base, %rd_wt_off;
+    ld.global.f32 %f_x_K_0, [%rd_wt_src];
+    cvt.u64.u32 %rd_wt_off, %r_indim_K_0;
+    mul.lo.u64 %rd_wt_off, %rd_wt_off, 64; // in_dim * head_dim * 2 (f16 W row-stride)
+    add.u64 %rd_wt_dst, %k_tile, %rd_wt_off;
+    cvt.u64.u32 %rd_wt_off, %lane;
+    shl.b64 %rd_wt_off, %rd_wt_off, 1; // * 2 bytes (f16)
+    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;
+    ld.shared.b16 %h_w_K_0, [%rd_wt_dst];
+    cvt.f32.f16 %f_w_K_0, %h_w_K_0;
+    fma.rn.f32 %f_acc_K_0, %f_x_K_0, %f_w_K_0, %f_acc_K_0;
+    add.u32 %r_indim_K_0, %r_indim_K_0, 1;
+    setp.lt.u32 %p_indim_K_0, %r_indim_K_0, 32;
+    @%p_indim_K_0 bra V2_CSHA_PROJ_K_INDIM_0_0;
+    cvt.rn.f16.f32 %h_out_K_0, %f_acc_K_0;
+    mul.lo.u64 %rd_wt_off, %warp_row, 64;
+    add.u64 %rd_wt_dst, %k_smem_base, %rd_wt_off;
+    cvt.u64.u32 %rd_wt_off, %lane;
+    shl.b64 %rd_wt_off, %rd_wt_off, 1;
+    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;
+    st.shared.b16 [%rd_wt_dst], %h_out_K_0;
+V2_CSHA_PROJ_K_SKIP_0:
+V2_CSHA_PROJECTION_SKIP_0:
+    bar.sync 0;  // FENCE: all projection writes visible to all threads

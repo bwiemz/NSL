@@ -1267,9 +1267,44 @@ impl Compiler<'_> {
         }
     }
 
+    /// A.2.1g: find a tensor-typed parameter of the enclosing
+    /// `@flash_attention` function by conventional name (`x`,
+    /// `hidden_states`, `input`, `inputs`) — the pre-norm input the
+    /// CSHA fused kernel's prologue consumes.
+    ///
+    /// Returns the first match with `Type::Tensor` semantic type, in
+    /// the priority order above. Returns `None` when no convention
+    /// hits; the FA call site then threads null and A.2.2's runtime
+    /// null-check falls through to the classic Q-from-HBM path.
+    ///
+    /// Extracted as a plan-pure method so the name-resolution logic
+    /// is directly unit-testable without a `FunctionBuilder`. The
+    /// caller turns the returned `Variable` into a Cranelift `Value`
+    /// via `builder.use_var`.
+    pub(crate) fn find_csha_x_param(
+        &self,
+        state: &FuncState,
+    ) -> Option<cranelift_frontend::Variable> {
+        for candidate in ["x", "hidden_states", "input", "inputs"] {
+            for (sym, (var, _)) in state.variables.iter() {
+                if self.resolve_sym(*sym) != candidate {
+                    continue;
+                }
+                if matches!(
+                    state.variable_types.get(sym),
+                    Some(Type::Tensor { .. })
+                ) {
+                    return Some(*var);
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn compile_flash_attention_call(
         &mut self,
         builder: &mut FunctionBuilder,
+        state: &mut FuncState,
         q_val: Value,
         k_val: Value,
         v_val: Value,
@@ -1286,7 +1321,11 @@ impl Compiler<'_> {
         let block_q = ctx.config.block_q;
         let block_kv = ctx.config.block_kv;
         let is_causal = ctx.config.causal;
-        let shmem_bytes = crate::flash_attention::shared_mem_bytes(&ctx.config) as i64;
+        let mut diags = Vec::<String>::new();
+        let shmem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+            &ctx.config, &mut diags,
+        ) as i64;
+        for d in diags { eprintln!("warning: {d}"); }
 
         // Allocate output tensor (same shape as Q, same device)
         let out_val = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[q_val])?;
@@ -1332,37 +1371,190 @@ impl Compiler<'_> {
         let lse_val =
             self.compile_call_by_name(builder, "nsl_tensor_to_device", &[lse_cpu, cuda_device])?;
 
-        // Call flash attention FFI — returns error code (i64), output written to out_val
-        let _err = self.compile_call_by_name(
-            builder,
-            "nsl_flash_attention",
-            &[
-                q_val,
-                k_val,
-                v_val,
-                out_val,
-                lse_val, // logsumexp auxiliary output
-                scale_val,
-                batch,
-                heads,
-                seq_len,
-                head_dim,
-                null,
-                null,
-                null,
-                null, // paged params (null for now)
-                null,
-                null, // RoPE params (null for now)
-                null,
-                null, // seq_ids, seq_lens (M29-ready)
-                shmem_val,
-                ptx_ptr,
-                name_ptr,
-                block_q_val,
-                block_kv_val,
-                causal_val,
-            ],
-        )?;
+        // A.1/A.2.0: dispatch to CSHA-aware FFI when the active CSHA
+        // plan produced extras for at least one layer. The extras
+        // carry the fusion level, active-heads count, and the RMSNorm /
+        // projection flags that A.2.1+ PTX emission will consume. For
+        // Tier A.1 the runtime side forwards to the non-CSHA path —
+        // the wiring is observable via the extra args being marshalled
+        // and passed.
+        //
+        // A.2.0: positional match — the Nth FA call in source order
+        // picks up the Nth layer's extras. A.2.1 replaces this with a
+        // proper layer-name resolver (Wengert `Param` prefix →
+        // enclosing function → layer key).
+        // A.2.1b: prefer name-based layer resolution when the current
+        // function name contains a bridge layer key (normalising dots
+        // ↔ underscores to tolerate Cranelift mangling). Falls back to
+        // the A.2.0 positional ordinal match when the name lookup
+        // misses — e.g. single-layer toy models whose function name
+        // doesn't carry a `blocks.N` prefix.
+        let ordinal = self.csha_fa_call_ordinal;
+        let (csha_layer, csha_extras) = match self.last_csha_bridge.as_ref() {
+            Some(b) => {
+                let by_name = state
+                    .current_function_name
+                    .as_deref()
+                    .and_then(|fn_name| b.extras_for_current_function(fn_name))
+                    .map(|(layer, extras)| (layer.to_string(), extras.clone()));
+                match by_name {
+                    Some((layer, extras)) => (Some(layer), Some(extras)),
+                    None => (
+                        b.layer_at_index(ordinal).map(str::to_string),
+                        b.extras_at_index(ordinal).cloned(),
+                    ),
+                }
+            }
+            None => (None, None),
+        };
+        self.csha_fa_call_ordinal = ordinal.saturating_add(1);
+
+        if let Some(extras) = csha_extras {
+            let eps_bits = builder
+                .ins()
+                .iconst(cl_types::I64, extras.rmsnorm_eps.to_bits() as i64);
+            let active_heads_val = builder
+                .ins()
+                .iconst(cl_types::I64, extras.active_heads as i64);
+            let d_model_val = builder
+                .ins()
+                .iconst(cl_types::I64, extras.d_model as i64);
+
+            // A.2.1a/e: resolve bridge marks' `param_name` strings against
+            // `FuncState.weights_by_name` — this gives the Cranelift
+            // Value of the already-loaded Wq/Wk/Wv/Wo weight tensor
+            // without re-emitting the field load. A.2.1e additionally
+            // probes conventional names for the RMSNorm gamma
+            // (`<layer>.attn_norm.weight` and friends) since it isn't
+            // carried as an explicit Wengert op input.
+            //
+            // A.2.1g: also probe `state.variables` for a tensor
+            // parameter named `x` / `hidden_states` / `input` /
+            // `inputs` to resolve x_ptr. This only works because the
+            // FA call site runs inside the `@flash_attention`
+            // function body — the same FunctionBuilder that declared
+            // the params — so `builder.use_var(var)` produces a Value
+            // that's local to this scope (no cross-function-body
+            // issue).
+            //
+            // Any pointer that fails to resolve stays null and the
+            // runtime scaffolds (A.2.2/A.2.3/A.2.4) short-circuit to
+            // the classic path via their own null-checks.
+            let (mut wq_v, mut wk_v, mut wv_v, mut wo_v) = (null, null, null, null);
+            let mut norm_w_v = null;
+            let mut x_v = null;
+            if let (Some(bridge), Some(layer)) =
+                (self.last_csha_bridge.as_ref(), csha_layer.as_deref())
+            {
+                use crate::csha_boundary::ProjKind;
+                use crate::csha_apply::{MarkRole, BridgeResult};
+                for mark in bridge.marks_for_layer(layer) {
+                    let v = match state.weights_by_name.get(&mark.param_name) {
+                        Some(v) => *v,
+                        None => continue,
+                    };
+                    match (mark.role, mark.kind) {
+                        (MarkRole::NormPrologue, Some(ProjKind::Q)) => wq_v = v,
+                        (MarkRole::NormPrologue, Some(ProjKind::K)) => wk_v = v,
+                        (MarkRole::NormPrologue, Some(ProjKind::V)) => wv_v = v,
+                        (MarkRole::OutputProjEpilogue, _) => wo_v = v,
+                        _ => {}
+                    }
+                }
+                // A.2.1e: probe conventional norm-weight names. First
+                // hit in priority order wins; miss stays null.
+                for candidate in BridgeResult::norm_weight_candidates(layer) {
+                    if let Some(v) = state.weights_by_name.get(&candidate) {
+                        norm_w_v = *v;
+                        break;
+                    }
+                }
+            }
+
+            // A.2.1g: probe `state.variables` for a tensor-typed
+            // parameter named by one of the common conventions the
+            // `@flash_attention` function body would use for its
+            // pre-norm input. Delegates to `find_csha_x_param` for
+            // the plan-pure Symbol/Variable resolution; `builder.use_var`
+            // here turns the Variable into a Cranelift Value local to
+            // this scope.
+            if let Some(var) = self.find_csha_x_param(state) {
+                x_v = builder.use_var(var);
+            }
+
+            let _err = self.compile_call_by_name(
+                builder,
+                "nsl_flash_attention_csha",
+                &[
+                    q_val, k_val, v_val, out_val,
+                    lse_val,
+                    scale_val,
+                    batch, heads, seq_len, head_dim,
+                    null, null, null, null, // paged
+                    null, null,             // RoPE
+                    null, null,             // seq_ids, seq_lens
+                    shmem_val,
+                    ptx_ptr, name_ptr,
+                    block_q_val, block_kv_val,
+                    causal_val,
+                    // CSHA extras (A.2.1a + A.2.1e + A.2.1g):
+                    //
+                    // x_v comes from a `state.variables` probe for a
+                    // tensor-typed parameter named by one of the
+                    // common conventions (`x`, `hidden_states`, ...).
+                    // Works without cross-function-body machinery
+                    // because the FA call site runs inside the same
+                    // FunctionBuilder that declared the
+                    // `@flash_attention` function's params. Null when
+                    // no conventional name hits — A.2.2 prologue's
+                    // runtime null-check falls through to the classic
+                    // Q-from-HBM path.
+                    //
+                    // The plan-level VarId resolver from A.2.1f
+                    // (`csha_apply::collect_norm_input_varids`)
+                    // remains available for future callers that need
+                    // to resolve x by Wengert position rather than
+                    // Cranelift-parameter name.
+                    x_v,                       // A.2.1g: param probe
+                    norm_w_v,                  // resolved via conventional-name probe
+                    wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
+                    eps_bits,
+                    active_heads_val,
+                    d_model_val,
+                ],
+            )?;
+        } else {
+            let _err = self.compile_call_by_name(
+                builder,
+                "nsl_flash_attention",
+                &[
+                    q_val,
+                    k_val,
+                    v_val,
+                    out_val,
+                    lse_val, // logsumexp auxiliary output
+                    scale_val,
+                    batch,
+                    heads,
+                    seq_len,
+                    head_dim,
+                    null,
+                    null,
+                    null,
+                    null, // paged params (null for now)
+                    null,
+                    null, // RoPE params (null for now)
+                    null,
+                    null, // seq_ids, seq_lens (M29-ready)
+                    shmem_val,
+                    ptx_ptr,
+                    name_ptr,
+                    block_q_val,
+                    block_kv_val,
+                    causal_val,
+                ],
+            )?;
+        }
 
         // Logsumexp is consumed by the runtime's tape recording in nsl_flash_attention.
         // The TapeOp::FlashAttention variant is recorded there with the logsumexp pointer.

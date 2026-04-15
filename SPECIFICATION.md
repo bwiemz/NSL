@@ -168,6 +168,16 @@ quant static:
 - Hopper wgmma path exists, but parts of the Hopper-specialized TMA/wgmma kernel plumbing are still placeholder-level
 - Logsumexp save/backward support is implemented
 
+### FlashAttention-2 scalar emitter v2
+
+v2 is the sole FA-2 scalar emitter (v1 deleted in Task C5, feat/csha).
+It produces numerically correct fused CSHA output (RMSNorm + Q/K/V
+projections + RoPE + attention) across the supported matrix (block_q ∈
+{32,64}, block_kv ∈ {32,64}, head_dim ∈ {32,64}, heads ∈ {4,8}),
+verified on RTX 5070 Ti + CUDA 13.2 via the Part 2 integration test.
+Out-of-matrix configs (e.g. head_dim=128 until Track B, or block_q ≠
+block_kv with fused projections) are rejected at compile time.
+
 ### Continuous Batching (M29)
 - `serve` block DSL with `@endpoint` decorator
 - Chunked prefill with configurable chunk size

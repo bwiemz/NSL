@@ -408,6 +408,35 @@ pub struct Compiler<'a> {
     pub synth_member_names: std::collections::HashMap<nsl_ast::NodeId, String>,
     pub current_method_model_name: Option<String>,
     pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
+    /// CSHA Tier A.1: bridge result from the most recent CSHA planner run.
+    /// Populated by the CSHA hook in `stmt.rs` when
+    /// `CompileOptions.csha_mode` is set to a non-off mode. Consumed by
+    /// `compile_flash_attention_call` to route FA launches through the
+    /// CSHA-aware FFI when per-layer extras are available. `None` when
+    /// CSHA is disabled or when no `@train` block compiled.
+    pub last_csha_bridge: Option<crate::csha_apply::BridgeResult>,
+    /// CSHA Tier A.2.0: ordinal of the next FlashAttention call lowered
+    /// during this compile. Incremented each time
+    /// `compile_flash_attention_call` runs, so that successive SDPA
+    /// invocations in source order map to successive layers in the
+    /// planner's `per_layer` vec (e.g. `blocks.0`, `blocks.1`, ...).
+    /// Reset implicitly at the start of each compile — currently not
+    /// reset per-function because all observed models have exactly one
+    /// `@flash_attention` function whose body contains the SDPA calls
+    /// for the whole stack. A.2.1 replaces this positional match with a
+    /// proper layer-name resolver.
+    pub csha_fa_call_ordinal: usize,
+    /// CSHA Tier A.2.1d: side-table of Wengert op indices claimed by the
+    /// current CSHA plan — the RMSNorm prologue, the Q/K/V projection
+    /// matmuls, and (where present) the RoPE epilogue op per boundary
+    /// chain. Populated at the same hook that sets `last_csha_bridge`
+    /// (stmt.rs), from `plan.boundary.chains`.
+    pub csha_claimed_ops: std::collections::HashSet<u32>,
+    /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
+    /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
+    /// (but potentially different α/rank scales) share one PTX string.
+    /// Populated during the fusion-decision pass and consulted by the
+    /// CUDA launcher (Task 5) to pick the right kernel per call site.
     pub fused_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
@@ -561,6 +590,9 @@ impl<'a> Compiler<'a> {
             synth_member_names: std::collections::HashMap::new(),
             current_method_model_name: None,
             adapter_prescan_plan: None,
+            last_csha_bridge: None,
+            csha_fa_call_ordinal: 0,
+            csha_claimed_ops: std::collections::HashSet::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
@@ -583,6 +615,14 @@ impl<'a> Compiler<'a> {
     /// Defaults to CUDA when no target is specified.
     pub fn gpu_target(&self) -> crate::gpu_target::GpuTarget {
         crate::gpu_target::GpuTarget::from_target_string(&self.compile_options.target)
+    }
+
+    /// CSHA A.2.1d: returns true when the Wengert op at `op_idx` has
+    /// been claimed by a CSHA boundary chain (RMSNorm prologue, Q/K/V
+    /// projection matmul, or RoPE epilogue). Returns false when CSHA
+    /// is off or no plan has been run this compile.
+    pub fn is_csha_claimed(&self, op_idx: u32) -> bool {
+        self.csha_claimed_ops.contains(&op_idx)
     }
 
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the
@@ -1022,3 +1062,4 @@ impl<'a> Compiler<'a> {
             .map_err(|e| CodegenError::new(format!("failed to emit object: {e}")))
     }
 }
+

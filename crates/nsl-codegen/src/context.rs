@@ -210,6 +210,15 @@ pub struct FuncState {
     /// M52b: Maps Cranelift Value → weight name in WeightMap.
     /// Set when compile_member_access loads a model weight field that exists in the WeightMap.
     pub weight_values: HashMap<cranelift_codegen::ir::Value, String>,
+    /// CSHA A.2.1a: Forward inverse of `weight_values` — weight name → most-recent
+    /// Cranelift Value that loaded it. The FA call site uses this to resolve
+    /// bridge `FusionMark.param_name` strings (e.g. `"TransformerBlock.wq"`) to
+    /// the already-loaded weight pointer without re-emitting the load.
+    ///
+    /// If the same weight is loaded more than once in a function, the last load
+    /// wins — this is safe because weight tensors are immutable and both Values
+    /// point to the same runtime tensor.
+    pub weights_by_name: HashMap<String, cranelift_codegen::ir::Value>,
     /// M44: Name of the function currently being compiled.
     /// Used by generate() to look up @grammar decorator configs.
     pub current_function_name: Option<String>,
@@ -249,6 +258,7 @@ impl FuncState {
             use_counts: None,
             slab_ptr_var: None,
             weight_values: HashMap::new(),
+            weights_by_name: HashMap::new(),
             current_function_name: None,
             variable_types: HashMap::new(),
             eltls_loop_predeclared: HashSet::new(),

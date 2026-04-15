@@ -23,7 +23,12 @@ pub(crate) mod inner {
         device: CUdevice,
         #[allow(dead_code)]
         context: CUcontext,
-        module_cache: HashMap<usize, CUmodule>,
+        // Keyed by FNV-1a hash of PTX content so different PTX Vecs at the
+        // same address (heap reuse between sequential test calls) don't
+        // produce stale cache hits.  Raw pointer was used previously but
+        // caused CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was
+        // allocated at the same address as an old one.
+        module_cache: HashMap<u64, CUmodule>,
     }
 
     // SAFETY: CUcontext/CUmodule are opaque pointers managed by the CUDA driver.
@@ -736,8 +741,24 @@ pub(crate) mod inner {
             let mut guard = state.lock().unwrap();
             unsafe { cuCtxSetCurrent(guard.context); }
 
-            // Cache modules by PTX pointer address (stable .rodata addresses)
-            let cache_key = ptx_ptr as usize;
+            // Cache modules by FNV-1a hash of PTX content.
+            // Using pointer address as key (the old approach) caused
+            // CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was allocated
+            // at the same heap address as a previously-freed one — the cache
+            // returned the stale old module and the new kernel name was not found.
+            let cache_key = {
+                // Compute length by scanning for the NUL terminator.
+                let mut len = 0usize;
+                while unsafe { *ptx_ptr.add(len) } != 0 { len += 1; }
+                let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
+                // FNV-1a 64-bit hash (no external dep, no alloc).
+                let mut h: u64 = 14695981039346656037u64;
+                for &b in ptx_bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211u64);
+                }
+                h
+            };
             let module = if let Some(m) = guard.module_cache.get(&cache_key) {
                 *m
             } else {
@@ -3944,6 +3965,128 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
         t.ndim, total as i64, t.device, 1, 1, 0,
     ));
     NslTensor::publish(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Test-only helpers (doc-hidden, feature-gated) — cross-crate integration
+// tests need raw device alloc + H2D/D2H without going through the full
+// NslTensor publishing machinery. Keeping these as thin pub wrappers over
+// `inner::*` lets tests in sibling crates exercise real kernel launches
+// against `nsl_flash_attention` / `nsl_flash_attention_csha`.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Allocate `bytes` of device memory. Returns raw device pointer as i64
+/// (0 on non-CUDA builds). Test-only — production code paths go through
+/// the caching allocator.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        inner::alloc_device(bytes as usize) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = bytes; 0 }
+}
+
+/// Free device memory previously returned by `nsl_test_cuda_alloc`.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_test_cuda_free(ptr: i64) {
+    #[cfg(feature = "cuda")]
+    {
+        if ptr != 0 { inner::free_managed(ptr as *mut std::ffi::c_void); }
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = ptr; }
+}
+
+/// Copy `bytes` from host pointer `src` to device pointer `dst`.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_test_cuda_h2d(dst: i64, src: i64, bytes: i64) {
+    #[cfg(feature = "cuda")]
+    {
+        inner::memcpy_htod(
+            dst as *mut std::ffi::c_void,
+            src as *const std::ffi::c_void,
+            bytes as usize,
+        );
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = (dst, src, bytes); }
+}
+
+/// Attempt to JIT-compile a PTX string via `cuModuleLoadDataEx` with an
+/// error log buffer, returning the driver's diagnostic message. Returns
+/// an empty string on success, or the error log (possibly with a generic
+/// prefix) on failure. Test-only.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_test_cuda_jit_log(ptx_ptr: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::*;
+        // Context is assumed already current on this thread (nsl_cuda_init
+        // and any prior kernel launch will have set it). We don't re-set
+        // it here to avoid having to reach into the private CudaState.
+        let mut log_buf = vec![0u8; 4096];
+        let mut info_buf = vec![0u8; 4096];
+        let log_size: u32 = log_buf.len() as u32;
+        let info_size: u32 = info_buf.len() as u32;
+        // JIT options: error log buffer + size + info log buffer + size
+        let mut opts = [
+            CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+            CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CUjit_option::CU_JIT_INFO_LOG_BUFFER,
+            CUjit_option::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+        ];
+        let mut vals: [*mut std::ffi::c_void; 4] = [
+            log_buf.as_mut_ptr() as *mut _,
+            log_size as usize as *mut _,
+            info_buf.as_mut_ptr() as *mut _,
+            info_size as usize as *mut _,
+        ];
+        let mut module: CUmodule = std::ptr::null_mut();
+        unsafe {
+            let _ = cuModuleLoadDataEx(
+                &mut module,
+                ptx_ptr as *const std::ffi::c_void,
+                4,
+                opts.as_mut_ptr(),
+                vals.as_mut_ptr(),
+            );
+        }
+        let end = log_buf.iter().position(|&b| b == 0).unwrap_or(log_buf.len());
+        // Empty log ⇒ JIT succeeded (or wrote nothing). Return 0 so the
+        // caller's fallback ("<no log>") kicks in and we don't leak a
+        // dummy CString on every call. When end > 0 we *do* leak — this
+        // is a test-only diagnostic helper, so the cost is bounded by the
+        // number of launch failures per test run (typically one).
+        if end == 0 { return 0; }
+        let msg = std::ffi::CString::new(&log_buf[..end]).unwrap_or_else(|_| std::ffi::CString::new("<binary>").unwrap());
+        let leaked = Box::leak(msg.into_boxed_c_str());
+        leaked.as_ptr() as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = ptx_ptr; 0 }
+}
+
+/// Copy `bytes` from device pointer `src` to host pointer `dst`.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
+    #[cfg(feature = "cuda")]
+    {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        inner::memcpy_dtoh(
+            dst as *mut std::ffi::c_void,
+            src as *const std::ffi::c_void,
+            bytes as usize,
+        );
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = (dst, src, bytes); }
 }
 
 #[cfg(all(test, feature = "cuda"))]

@@ -16,6 +16,7 @@
 use serde::Serialize;
 
 use crate::csha_boundary::{scan as scan_boundaries, BoundaryScan, ProjKind};
+use crate::csha_patterns::{analyze as analyze_patterns, PatternConfig, PatternPlan};
 use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
 use crate::csha_pipeline::{
     block_smem_bytes, pipeline_smem_bytes, plan_all, plan_layer, roofline_tile_config,
@@ -90,6 +91,8 @@ pub struct CshaInput<'a> {
     /// Number of attention heads.  Used for per-head specialization.
     pub n_heads: u32,
     pub spec_cfg: SpecConfig,
+    /// Config for [`csha_patterns`] analysis (causal/GQA/sinks).
+    pub pattern_cfg: PatternConfig,
     /// Per-layer WGGO preferences. `None` → CSHA's internal planner runs
     /// unchanged. `Some` → per-layer `active_heads` is applied verbatim;
     /// `requested_csha_level` is a preference subject to SMEM-feasibility
@@ -106,6 +109,8 @@ pub struct CshaPlan {
     pub boundary: BoundaryScan,
     pub per_layer: Vec<LayerPlan>,
     pub specialization: SpecializationPlan,
+    /// Per-layer causal-mask / GQA / attention-sink decisions.
+    pub patterns: PatternPlan,
     /// Per-layer kernel-specialisation artefacts produced by the
     /// `csha_apply` bridge.  Empty in `Off` mode.
     pub kernels: Vec<crate::csha_apply::KernelSpec>,
@@ -122,7 +127,84 @@ pub struct CshaPlan {
     pub override_diagnostics: Vec<OverrideDiagnostic>,
 }
 
+/// A.5: aggregated HBM-traffic savings across every CSHA-active layer
+/// in the plan. Produced by [`CshaPlan::total_hbm_reduction`] and
+/// consumed by:
+///
+///   * [`CshaPlan::render_report`] — as a trailing "Total savings" footer.
+///   * External CI gates / calibration harness — via the JSON form
+///     emitted by [`CshaPlan::to_json`].
+///
+/// All byte counts are per-forward-pass per-layer sums; ratios are
+/// dimensionless. `active_layers` counts only layers whose realised
+/// fusion level is non-`None` — layers that CSHA couldn't fuse
+/// (SMEM-infeasible, no boundary chain, etc.) contribute nothing to
+/// `baseline_bytes` / `fused_bytes` and are excluded from the count.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TotalSavings {
+    /// Σ baseline HBM bytes across CSHA-active layers.
+    pub baseline_bytes: u64,
+    /// Σ fused HBM bytes across CSHA-active layers.
+    pub fused_bytes: u64,
+    /// `baseline_bytes - fused_bytes`. Saturates at 0 if a
+    /// pathological layer reports fused > baseline (shouldn't happen
+    /// but keeps the helper panic-free).
+    pub savings_bytes: u64,
+    /// `baseline_bytes / fused_bytes` — the geometric-mean HBM
+    /// reduction factor. `1.0` when CSHA achieved no savings; higher
+    /// is better. `0.0` when `fused_bytes == 0` (no active layers).
+    pub ratio: f64,
+    /// Number of layers that realised a non-`None` fusion level.
+    pub active_layers: usize,
+}
+
 impl CshaPlan {
+    /// A.5: aggregate HBM-traffic totals across every layer that CSHA
+    /// successfully fused. Returns zeros / `0.0` when the plan has no
+    /// active layers (e.g. `--csha=off`, empty model, or every layer
+    /// downgraded to `FusionLevel::None` by SMEM pressure).
+    ///
+    /// Baseline = what the unfused Q/K/V projection + attention pipeline
+    /// would have moved through HBM; fused = what the CSHA-compiled
+    /// kernel variant moves. Per paper §6.3 the ratio is the headline
+    /// metric a compiler report surfaces to the user.
+    pub fn total_hbm_reduction(&self) -> TotalSavings {
+        let mut baseline: u64 = 0;
+        let mut fused: u64 = 0;
+        let mut active: usize = 0;
+        for lp in &self.per_layer {
+            if lp.level == FusionLevel::None {
+                continue;
+            }
+            baseline = baseline.saturating_add(lp.baseline_hbm_bytes);
+            fused = fused.saturating_add(lp.hbm_traffic_bytes);
+            active += 1;
+        }
+        let savings = baseline.saturating_sub(fused);
+        let ratio = if fused > 0 {
+            baseline as f64 / fused as f64
+        } else {
+            0.0
+        };
+        TotalSavings {
+            baseline_bytes: baseline,
+            fused_bytes: fused,
+            savings_bytes: savings,
+            ratio,
+            active_layers: active,
+        }
+    }
+
+    /// A.5: serialise the full plan as JSON. Consumed by the
+    /// calibration harness and downstream CI gates that want to
+    /// assert numerical invariants (e.g. ratio ≥ threshold) without
+    /// screen-scraping [`Self::render_report`]. Returns `None` on
+    /// `serde_json` serialisation failure (in practice only possible
+    /// if a custom `Serialize` impl somewhere in the plan tree panics).
+    pub fn to_json(&self) -> Option<String> {
+        serde_json::to_string_pretty(self).ok()
+    }
+
     /// One-line compact summary suitable for debug logs.
     pub fn summary(&self) -> String {
         let l3 = self
@@ -249,9 +331,36 @@ impl CshaPlan {
             {
                 writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
             }
+            if let Some(pat) = self.patterns.get(&plan.layer) {
+                writeln!(
+                    s,
+                    "  Patterns: causal={} gqa={} sink={}",
+                    pat.causal_mask.as_str(),
+                    pat.gqa.as_str(),
+                    pat.sink.as_str(),
+                )
+                .unwrap();
+            }
         }
 
+        // A.5: trailing aggregate savings footer.
+        let totals = self.total_hbm_reduction();
         writeln!(s).unwrap();
+        if totals.active_layers > 0 {
+            writeln!(
+                s,
+                "Total savings: {:.1} MB across {} layer{} ({:.2}× reduction, {:.1} MB → {:.1} MB)",
+                totals.savings_bytes as f64 / 1e6,
+                totals.active_layers,
+                if totals.active_layers == 1 { "" } else { "s" },
+                totals.ratio,
+                totals.baseline_bytes as f64 / 1e6,
+                totals.fused_bytes as f64 / 1e6,
+            )
+            .unwrap();
+        } else {
+            writeln!(s, "Total savings: 0 MB (no CSHA-active layers).").unwrap();
+        }
         writeln!(
             s,
             "Solve time: {:.2} ms",
@@ -351,6 +460,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
             boundary: BoundaryScan::default(),
             per_layer: Vec::new(),
             specialization: SpecializationPlan::default(),
+            patterns: PatternPlan::default(),
             kernels: Vec::new(),
             marks: Vec::new(),
             solve_us: t0.elapsed().as_micros() as u64,
@@ -462,6 +572,13 @@ pub fn run(input: CshaInput) -> CshaPlan {
         input.n_heads,
         &input.spec_cfg,
     );
+    let patterns = analyze_patterns(
+        &per_layer,
+        &input.shape,
+        input.n_heads,
+        input.weights,
+        &input.pattern_cfg,
+    );
 
     // Post-planning patch: apply active_heads overrides to the specialization
     // plan.  When WGGO says active_heads=4 for a layer that has 8 total
@@ -486,12 +603,19 @@ pub fn run(input: CshaInput) -> CshaPlan {
         boundary: boundary.clone(),
         per_layer: per_layer.clone(),
         specialization: specialization.clone(),
+        patterns: patterns.clone(),
         kernels: Vec::new(),
         marks: Vec::new(),
         solve_us: 0,
         override_diagnostics: Vec::new(),
     };
-    let bridge = crate::csha_apply::bridge(&interim, input.shape.head_dim as i64);
+    let mut diags = Vec::<String>::new();
+    let bridge = crate::csha_apply::bridge(
+        &interim,
+        input.shape.head_dim as i64,
+        &mut diags,
+    );
+    for d in diags { eprintln!("warning: {d}"); }
 
     CshaPlan {
         mode: input.mode,
@@ -499,6 +623,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
         boundary,
         per_layer,
         specialization,
+        patterns,
         kernels: bridge.kernels,
         marks: bridge.marks,
         solve_us: t0.elapsed().as_micros() as u64,
@@ -534,6 +659,7 @@ pub fn run_on_wengert(
         shape,
         n_heads: n_heads.max(1),
         spec_cfg: SpecConfig::default(),
+        pattern_cfg: PatternConfig::default(),
         wggo_overrides,
     }))
 }
@@ -596,6 +722,7 @@ mod tests {
             },
             n_heads: 8,
             spec_cfg: SpecConfig::default(),
+            pattern_cfg: PatternConfig::default(),
             wggo_overrides: None,
         }
     }
@@ -737,6 +864,101 @@ mod tests {
         assert_eq!(plan.boundary.num_chains(), 0);
         assert!(plan.per_layer.is_empty());
         assert!(plan.render_report().contains("nothing to do"));
+    }
+
+    // ── A.5: TotalSavings + JSON + report footer ─────────────────────
+
+    #[test]
+    fn a5_total_hbm_reduction_on_auto_plan_sums_across_layers() {
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Auto));
+        let totals = plan.total_hbm_reduction();
+        // The toy attn_block is one layer; CSHA Auto should fuse it so
+        // active_layers is 1, baseline > fused, ratio > 1.
+        assert_eq!(totals.active_layers, 1);
+        assert!(totals.baseline_bytes > 0);
+        assert!(totals.fused_bytes > 0);
+        assert!(
+            totals.baseline_bytes >= totals.fused_bytes,
+            "fused bytes must not exceed baseline; got baseline={} fused={}",
+            totals.baseline_bytes,
+            totals.fused_bytes,
+        );
+        assert_eq!(
+            totals.savings_bytes,
+            totals.baseline_bytes - totals.fused_bytes
+        );
+        assert!(
+            totals.ratio >= 1.0,
+            "CSHA Auto should not regress HBM; ratio={}",
+            totals.ratio
+        );
+    }
+
+    #[test]
+    fn a5_total_hbm_reduction_on_off_plan_is_zero() {
+        // `--csha=off` short-circuits in `run`, producing an empty
+        // `per_layer` — totals must reflect zero active layers and
+        // a 0.0 ratio (sentinel for "no fused bytes").
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Off));
+        let totals = plan.total_hbm_reduction();
+        assert_eq!(totals.active_layers, 0);
+        assert_eq!(totals.baseline_bytes, 0);
+        assert_eq!(totals.fused_bytes, 0);
+        assert_eq!(totals.savings_bytes, 0);
+        assert_eq!(totals.ratio, 0.0);
+    }
+
+    #[test]
+    fn a5_render_report_footer_contains_total_savings_line() {
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Auto));
+        let report = plan.render_report();
+        assert!(
+            report.contains("Total savings:"),
+            "render_report must emit the A.5 totals footer; got:\n{report}"
+        );
+        assert!(
+            report.contains("× reduction"),
+            "footer must include the reduction ratio; got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn a5_render_report_off_mode_reports_nothing_to_do() {
+        // Off-mode keeps its existing "nothing to do" short-circuit —
+        // the A.5 footer applies only when the planner ran over real
+        // layers. Documented here so a future edit of the early-return
+        // path doesn't silently regress the off-mode contract.
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Off));
+        let report = plan.render_report();
+        assert!(report.contains("nothing to do"));
+    }
+
+    #[test]
+    fn a5_to_json_round_trips_to_structured_output() {
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Auto));
+        let json = plan.to_json().expect("JSON serialisation succeeds");
+        // Spot-check: the JSON must carry `mode` and at least one
+        // layer's HBM-traffic field — CI gates / calibration harness
+        // consume this to assert numerical invariants.
+        assert!(
+            json.contains("\"mode\""),
+            "JSON must include the plan mode; got:\n{json}"
+        );
+        assert!(
+            json.contains("\"hbm_traffic_bytes\""),
+            "JSON must include per-layer HBM traffic; got:\n{json}"
+        );
+        // It must also parse back into arbitrary JSON — guards
+        // against malformed output that `to_string_pretty` could
+        // produce if a nested `Serialize` impl panics.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("JSON must round-trip through serde_json");
+        assert!(parsed.get("mode").is_some());
     }
 
     #[test]

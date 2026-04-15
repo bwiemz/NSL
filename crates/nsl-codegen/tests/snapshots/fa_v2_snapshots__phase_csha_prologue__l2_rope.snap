@@ -1,0 +1,63 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // CSHA A.2.2: RMSNorm prologue (q_tile_iter = 0)
+    ld.param.u64 %rd52, [csha_x_ptr];
+    setp.eq.u64 %p0, %rd52, 0;
+    @%p0 bra V2_CSHA_PROLOGUE_SKIP_0;
+    mov.f32 %f0, 0f00000000;             // sumsq = 0
+    // x slice 0: load, square, accumulate
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 0;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f1, [%rd54];
+    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    shfl.sync.bfly.b32 %shfl_tmp, %f0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f0, %f0, %shfl_tmp;
+    mov.f32 %f1, 0f3D000000;       // 1.0 / head_dim
+    mul.f32 %f0, %f0, %f1;
+    ld.param.f32 %f1, [csha_eps];
+    add.f32 %f0, %f0, %f1;
+    sqrt.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f0, %f0;                  // 1/rms
+    // x slice 0: normalize + scale, writeback
+    cvt.u64.u32 %rd53, %lane;
+    mul.lo.u64 %rd54, %batch_idx, %rd5;
+    add.u64 %rd54, %rd54, %head_idx;
+    mul.lo.u64 %rd54, %rd54, %rd6;
+    add.u32 %r12, %warp_id, 0;
+    cvt.u64.u32 %rd55, %r12;
+    add.u64 %rd54, %rd54, %q_start;
+    add.u64 %rd54, %rd54, %rd55;
+    mul.lo.u64 %rd54, %rd54, %rd7;
+    add.u64 %rd54, %rd54, %rd53;
+    shl.b64 %rd54, %rd54, 2;
+    add.u64 %rd54, %rd52, %rd54;
+    ld.global.f32 %f2, [%rd54];
+    mul.f32 %f2, %f2, %f0;                    // x * 1/rms
+    ld.param.u64 %rd56, [csha_norm_weight_ptr];
+    shl.b64 %rd57, %rd53, 2;
+    add.u64 %rd56, %rd56, %rd57;
+    ld.global.f32 %f3, [%rd56];
+    mul.f32 %f2, %f2, %f3;
+    st.global.f32 [%rd54], %f2;
+V2_CSHA_PROLOGUE_SKIP_0:
+    bar.sync 0;  // FENCE: all prologue writes complete

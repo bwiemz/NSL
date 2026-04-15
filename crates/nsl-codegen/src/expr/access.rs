@@ -175,6 +175,7 @@ impl Compiler<'_> {
                             for key in &candidates {
                                 if wmap.get(key).is_some() {
                                     state.weight_values.insert(val, key.clone());
+                                    state.weights_by_name.insert(key.clone(), val);
                                     break;
                                 }
                             }

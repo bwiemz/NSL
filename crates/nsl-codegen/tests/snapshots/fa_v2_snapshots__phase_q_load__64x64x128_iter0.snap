@@ -1,0 +1,64 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // Phase 1: Q load, q_tile_iter = 0
+    add.u32 %r0, %warp_id, 0;            // q_row_local = warp_id + q_tile_iter*4
+    cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
+    mov.u64 %rd23, 0;                    // q_offset
+    mul.lo.u64 %rd24, %rd20, 128;          // q_row_local * head_dim
+    shl.b64 %rd24, %rd24, 1;                  // * 2 bytes (f16)
+    add.u64 %rd23, %rd23, %rd24;              // shmem row base offset
+    add.u64 %rd21, %q_start, %rd20;          // q_row_global
+    mul.lo.u64 %rd22, %batch_idx, %rd5;      // batch*heads
+    add.u64 %rd22, %rd22, %head_idx;         // + head_idx
+    mul.lo.u64 %rd22, %rd22, %rd6;            // * seq_len
+    add.u64 %rd22, %rd22, %rd21;              // + q_row_global
+    mul.lo.u64 %rd22, %rd22, %rd7;            // * head_dim
+    shl.b64 %rd22, %rd22, 2;                  // * 4 bytes (f32 source)
+    add.u64 %rd22, %rd0, %rd22;               // q_base global
+    // slice 0: d = lane + 32*0 = lane + 0
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 0;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f32, [%rd29];
+    cvt.rn.f16.f32 %h0, %f32;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    // slice 1: d = lane + 32*1 = lane + 32
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 32;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f33, [%rd29];
+    cvt.rn.f16.f32 %h0, %f33;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    // slice 2: d = lane + 32*2 = lane + 64
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 64;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f34, [%rd29];
+    cvt.rn.f16.f32 %h0, %f34;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    // slice 3: d = lane + 32*3 = lane + 96
+    cvt.u64.u32 %rd28, %lane;
+    add.u64 %rd28, %rd28, 96;
+    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32
+    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4
+    ld.global.f32 %f35, [%rd29];
+    cvt.rn.f16.f32 %h0, %f35;
+    shl.b64 %rd30, %rd28, 1;                  // d * 2 bytes (f16)
+    add.u64 %smem_addr, %rd23, %rd30;         // shmem dest
+    add.u64 %smem_addr, %smem_addr, %shmem_base;
+    st.shared.b16 [%smem_addr], %h0;
+    bar.sync 0;  // FENCE: all warps finish Q shmem store

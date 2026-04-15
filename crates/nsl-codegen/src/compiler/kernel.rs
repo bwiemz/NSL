@@ -9,6 +9,18 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 use super::{Compiler, FlashAttentionCompileContext};
 use crate::error::CodegenError;
 
+/// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
+///
+/// Panics with a clear message on an unrecognised format so that a
+/// misconfigured compile target is caught at compile time rather than
+/// silently routing to the wrong PTX path.
+pub(crate) fn parse_gpu_sm_from_target(target: &str) -> u32 {
+    target
+        .strip_prefix("sm_")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("invalid compile target: {target}"))
+}
+
 impl Compiler<'_> {
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
@@ -623,12 +635,16 @@ impl Compiler<'_> {
                     rope_style,
                     gqa_group_size,
                     tree_mask: false,
-                    gpu_sm: 80,
+                    gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                     csha: None,
                 };
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
-                let shmem = crate::flash_attention::shared_mem_bytes(&test_config);
+                let mut diags = Vec::<String>::new();
+                let shmem = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+                    &test_config, &mut diags,
+                );
+                for d in diags { eprintln!("warning: {d}"); }
                 if shmem > 49152 {
                     return Err(CodegenError::new(format!(
                         "@autotune variant (block_q={}, block_kv={}) requires {}KB shared memory, exceeds 48KB limit for sm_52",
@@ -645,10 +661,16 @@ impl Compiler<'_> {
                 }
 
                 // Synthesize and embed PTX for this variant
-                let ptx_bytes =
-                    crate::flash_attention::synthesize_flash_attention_ptx(&test_config);
-                let variant_kernel_name =
-                    crate::flash_attention::flash_attention_kernel_name(&test_config);
+                let mut diags = Vec::<String>::new();
+                let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+                    &test_config, &mut diags,
+                );
+                for d in diags { eprintln!("warning: {d}"); }
+                let mut diags = Vec::<String>::new();
+                let variant_kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                    &test_config, &mut diags,
+                );
+                for d in diags { eprintln!("warning: {d}"); }
                 self.embed_flash_ptx(&variant_kernel_name, ptx_bytes)?;
             }
 
@@ -675,11 +697,15 @@ impl Compiler<'_> {
                 rope_style,
                 gqa_group_size,
                 tree_mask: false,
-                gpu_sm: 80,
+                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 csha: None,
             };
 
-            let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+            let mut diags = Vec::<String>::new();
+            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                &config, &mut diags,
+            );
+            for d in diags { eprintln!("warning: {d}"); }
 
             // The primary variant's PTX was already embedded in the loop above.
             // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
@@ -741,12 +767,20 @@ impl Compiler<'_> {
                 rope_style,
                 gqa_group_size,
                 tree_mask: false,
-                gpu_sm: 80,
+                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 csha: None,
             };
 
-            let ptx_bytes = crate::flash_attention::synthesize_flash_attention_ptx(&config);
-            let kernel_name = crate::flash_attention::flash_attention_kernel_name(&config);
+            let mut diags = Vec::<String>::new();
+            let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+                &config, &mut diags,
+            );
+            for d in diags { eprintln!("warning: {d}"); }
+            let mut diags = Vec::<String>::new();
+            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                &config, &mut diags,
+            );
+            for d in diags { eprintln!("warning: {d}"); }
 
             // Embed PTX bytes in .rodata
             let ptx_data_id = self

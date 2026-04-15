@@ -1002,6 +1002,35 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // CSHA Tier A.1: FA launcher variant carrying per-layer CSHA extras.
+    // Same 24-arg prelude as `nsl_flash_attention`, then 9 CSHA args:
+    //   x, norm_weight, Wq, Wk, Wv, Wo, rmsnorm_eps_bits, active_heads, d_model.
+    // Stub today — forwards to `nsl_flash_attention`; A.2 will light up
+    // the CSHA PTX body.
+    (
+        "nsl_flash_attention_csha",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // q, k, v, out
+            types::I64, // logsumexp
+            types::I64, // scale_bits
+            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
+            types::I64, types::I64, types::I64, types::I64, // block_table, k_pool, v_pool, block_size
+            types::I64, types::I64, // cos, sin
+            types::I64, types::I64, // seq_ids, seq_lens
+            types::I64, // shared_mem_bytes
+            types::I64, types::I64, // ptx_ptr, name_ptr
+            types::I64, types::I64, // block_q, block_kv
+            types::I64, // causal
+            // CSHA extras:
+            types::I64, // x_ptr
+            types::I64, // norm_weight_ptr
+            types::I64, types::I64, types::I64, types::I64, // Wq, Wk, Wv, Wo
+            types::I64, // rmsnorm_eps_bits (f32 as i64)
+            types::I64, // active_heads
+            types::I64, // d_model
+        ],
+        Some(types::I64),
+    ),
     // FlashAttention-2 backward (M27 backward pass)
     // Returns NslList [dQ, dK, dV]. When logsumexp_ptr == 0, auto-computes lse.
     (

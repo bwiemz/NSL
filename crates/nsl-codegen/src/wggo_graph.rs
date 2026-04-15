@@ -103,6 +103,29 @@ pub fn layer_prefix(name: &str) -> Option<String> {
     None
 }
 
+/// CSHA A.2.1c: layer-key derivation with a last-dot fallback.
+///
+/// Identical to [`layer_prefix`] when the name carries a canonical
+/// `blocks.N` / `layers.N` / `h.N` prefix. When it does NOT — e.g. a
+/// single-class model whose Wengert `Param` names are `"Model.wq"` —
+/// fall back to "everything before the last dot", which gives the
+/// enclosing model class name.
+///
+/// This is specific to CSHA's fusion-graph mark emission, where a
+/// missing layer key means no marks are produced for the chain at all
+/// (`csha_apply::bridge` gates on `chain.layer.is_some()`). WGGO still
+/// uses the strict [`layer_prefix`] form with its `"other"` bucket.
+///
+/// Returns `None` only when the name has no dot at all (a top-level
+/// parameter like `"bias"` — not a model-method weight).
+pub fn layer_key_with_fallback(name: &str) -> Option<String> {
+    if let Some(p) = layer_prefix(name) {
+        return Some(p);
+    }
+    let idx = name.rfind('.')?;
+    Some(name[..idx].to_string())
+}
+
 /// Infer a layer's role from its canonical name.
 pub fn infer_role(name: &str) -> LayerRole {
     let lname = name.to_ascii_lowercase();
@@ -279,6 +302,47 @@ mod tests {
         );
         assert_eq!(layer_prefix("h.3.mlp.fc"), Some("h.3".to_string()));
         assert_eq!(layer_prefix("embedding.weight"), None);
+    }
+
+    #[test]
+    fn a21c_layer_key_with_fallback_matches_canonical_when_possible() {
+        // Canonical prefixes pass straight through — behaviour must be
+        // identical to `layer_prefix` for names that carry `blocks.N`
+        // etc., so WGGO and CSHA agree on layer identity for
+        // hierarchical models.
+        assert_eq!(
+            layer_key_with_fallback("blocks.6.attn.wq"),
+            Some("blocks.6".to_string())
+        );
+        assert_eq!(
+            layer_key_with_fallback("h.3.mlp.fc"),
+            Some("h.3".to_string())
+        );
+    }
+
+    #[test]
+    fn a21c_layer_key_with_fallback_strips_last_dot_for_flat_models() {
+        // Single-class models emit Wengert Param names of the form
+        // `"ModelClass.field"` — fallback gives the class as layer.
+        assert_eq!(
+            layer_key_with_fallback("TransformerBlock.wq"),
+            Some("TransformerBlock".to_string())
+        );
+        // Nested access (`self.attn.wq`) compounds to `Model.attn.wq`
+        // — fallback peels off just the leaf field.
+        assert_eq!(
+            layer_key_with_fallback("Model.attn.wq"),
+            Some("Model.attn".to_string())
+        );
+    }
+
+    #[test]
+    fn a21c_layer_key_with_fallback_returns_none_for_top_level_names() {
+        // Truly top-level parameters (no dot at all) have no layer
+        // scope — CSHA shouldn't invent one. The bridge's gate on
+        // `chain.layer.is_some()` will correctly skip these.
+        assert_eq!(layer_key_with_fallback("bias"), None);
+        assert_eq!(layer_key_with_fallback(""), None);
     }
 
     #[test]

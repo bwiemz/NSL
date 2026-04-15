@@ -1,0 +1,5 @@
+---
+source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+expression: ptx
+---
+    // CSHA A.2.2 prologue: csha=None, no emission

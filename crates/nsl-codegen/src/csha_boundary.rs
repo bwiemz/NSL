@@ -211,7 +211,12 @@ pub fn scan(list: &WengertList) -> BoundaryScan {
         }
 
         chains.push(BoundaryChain {
-            layer: crate::wggo_graph::layer_prefix(&weight_param),
+            // A.2.1c: use the fallback-aware layer-key derivation so
+            // single-class models (whose Wengert Param names are
+            // `"Model.wq"` without a `blocks.N` prefix) still get a
+            // non-None layer key and therefore still produce
+            // `FusionMark`s in `csha_apply::bridge`.
+            layer: crate::wggo_graph::layer_key_with_fallback(&weight_param),
             kind,
             norm_op: norm_op_idx,
             matmul_op: mm_idx as u32,
