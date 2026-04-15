@@ -520,6 +520,37 @@ impl Compiler<'_> {
 
         Ok(())
     }
+
+    /// FASE Codegen Phase 2: emit a runtime branch on the per-parameter
+    /// FASE mode. Loads `modes[gai]` (a u8 from the .rodata table), tests
+    /// for `Deferred = 1`, and conditionally jumps to one of the two
+    /// caller-provided blocks.
+    ///
+    /// Caller is responsible for:
+    /// - creating both destination blocks AND a join block,
+    /// - switching to and sealing each destination block before emitting
+    ///   its body,
+    /// - jumping from each destination to the join block,
+    /// - switching to and sealing the join block.
+    pub(crate) fn emit_fase_mode_branch(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        mode_table_base: cranelift_codegen::ir::Value,
+        gai: cranelift_codegen::ir::Value,
+        deferred_block: cranelift_codegen::ir::Block,
+        fullbuffer_block: cranelift_codegen::ir::Block,
+    ) {
+        use cranelift_codegen::ir::{condcodes::IntCC, types as cl_types, InstBuilder, MemFlags};
+        let byte_addr = builder.ins().iadd(mode_table_base, gai);
+        let mode = builder
+            .ins()
+            .load(cl_types::I8, MemFlags::trusted(), byte_addr, 0);
+        let one_i8 = builder.ins().iconst(cl_types::I8, 1);
+        let is_deferred = builder.ins().icmp(IntCC::Equal, mode, one_i8);
+        builder
+            .ins()
+            .brif(is_deferred, deferred_block, &[], fullbuffer_block, &[]);
+    }
 }
 
 #[cfg(test)]
