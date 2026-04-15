@@ -1326,11 +1326,90 @@ pub extern "C" fn nsl_flash_attention_backward(
     list
 }
 
+// ── CSHA backward-activation buffer allocator ─────────────────────────────
+
+/// The five HBM buffers that the CSHA forward kernel fills when
+/// `save_activations_for_backward = true`.  All fields are device
+/// pointers represented as `i64` (matching the rest of the NSL runtime
+/// ABI).  A value of `0` indicates allocation failure.
+#[repr(C)]
+pub struct CshaBackwardActivations {
+    pub q_proj: i64,
+    pub k_proj: i64,
+    pub v_proj: i64,
+    pub row_max: i64,
+    pub row_sum: i64,
+}
+
+/// Allocate the 5 HBM buffers forward fills when
+/// `csha.save_activations_for_backward = true`. Called by the compiler
+/// before the forward launch in training mode. All returned pointers
+/// are non-zero on success; a zero pointer indicates allocation failure.
+/// Caller must call `nsl_csha_free_backward_activations` to release.
+#[no_mangle]
+pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
+    batch: i64, heads: i64, seq: i64, head_dim: i64,
+) -> CshaBackwardActivations {
+    let qkv_bytes = batch * heads * seq * head_dim * 2;  // f16 = 2 bytes
+    let stats_bytes = batch * heads * seq * 4;           // f32 = 4 bytes
+    #[cfg(feature = "cuda")]
+    {
+        use crate::cuda::inner;
+        CshaBackwardActivations {
+            q_proj: inner::alloc_device(qkv_bytes as usize) as i64,
+            k_proj: inner::alloc_device(qkv_bytes as usize) as i64,
+            v_proj: inner::alloc_device(qkv_bytes as usize) as i64,
+            row_max: inner::alloc_device(stats_bytes as usize) as i64,
+            row_sum: inner::alloc_device(stats_bytes as usize) as i64,
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (qkv_bytes, stats_bytes);
+        CshaBackwardActivations { q_proj: 0, k_proj: 0, v_proj: 0, row_max: 0, row_sum: 0 }
+    }
+}
+
+/// Free the 5 HBM buffers allocated by `nsl_csha_alloc_backward_activations`.
+/// Safe to call with zero pointers — they are silently skipped.
+#[no_mangle]
+pub unsafe extern "C" fn nsl_csha_free_backward_activations(
+    a: CshaBackwardActivations,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        use crate::cuda::inner;
+        if a.q_proj != 0 { inner::free_managed(a.q_proj as *mut std::ffi::c_void); }
+        if a.k_proj != 0 { inner::free_managed(a.k_proj as *mut std::ffi::c_void); }
+        if a.v_proj != 0 { inner::free_managed(a.v_proj as *mut std::ffi::c_void); }
+        if a.row_max != 0 { inner::free_managed(a.row_max as *mut std::ffi::c_void); }
+        if a.row_sum != 0 { inner::free_managed(a.row_sum as *mut std::ffi::c_void); }
+    }
+    #[cfg(not(feature = "cuda"))]
+    { let _ = a; }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn nsl_csha_alloc_backward_activations_allocates_five_buffers() {
+        // Shape: batch=2, heads=4, seq=32, head_dim=32.
+        // Expected sizes:
+        //   q_proj, k_proj, v_proj: 2*4*32*32 f16 = 8192 bytes each
+        //   row_max, row_sum: 2*4*32 f32 = 1024 bytes each
+        let r = unsafe { nsl_csha_alloc_backward_activations(2, 4, 32, 32) };
+        assert_ne!(r.q_proj, 0, "q_proj alloc failed");
+        assert_ne!(r.k_proj, 0, "k_proj alloc failed");
+        assert_ne!(r.v_proj, 0, "v_proj alloc failed");
+        assert_ne!(r.row_max, 0, "row_max alloc failed");
+        assert_ne!(r.row_sum, 0, "row_sum alloc failed");
+        unsafe { nsl_csha_free_backward_activations(r); }
+    }
 
     /// Naive attention forward for reference: O = softmax(Q @ K^T * scale) @ V
     fn naive_attention_forward(
