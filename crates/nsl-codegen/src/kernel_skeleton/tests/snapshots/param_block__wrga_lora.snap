@@ -1,0 +1,9 @@
+.visible .entry nsl_wrga_fused_lora_test (
+    .param .u64 x_ptr,
+    .param .u64 w_ptr,
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .f32 scale,
+    .param .u64 y_ptr
+)
+{
