@@ -2211,7 +2211,23 @@ fn run_build_shared_single(
         .ok()
         .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
         .unwrap_or_default();
-    let export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    // M62 Task 9: also re-export the runtime lifecycle symbols so that ctypes
+    // callers can call nsl_model_create / nsl_model_destroy / nsl_get_last_error
+    // directly from the generated shared lib without loading a separate runtime DLL.
+    let runtime_exports = [
+        "nsl_model_create",
+        "nsl_model_destroy",
+        "nsl_model_get_weight_ptrs",
+        "nsl_model_get_num_weights",
+        "nsl_model_num_weights",
+        "nsl_get_last_error",
+        "nsl_set_error_cstr",
+        "nsl_desc_to_tensor",
+        "nsl_tensor_to_desc_ffi",
+        "nsl_tensor_free",
+    ];
+    let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    export_refs.extend_from_slice(&runtime_exports);
 
     match nsl_codegen::linker::link_shared_with_exports(
         std::slice::from_ref(&obj_path),

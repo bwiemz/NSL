@@ -172,9 +172,13 @@ impl ExportInfo {
         symbol_name: &str,
         interner: &Interner,
     ) -> Self {
+        // Skip `self` — for @export model methods, `self` is implicit in the
+        // C ABI as the `NslModel*` leading argument; it must not appear as a
+        // separate input parameter in the header or wrapper signature.
         let params = fn_def
             .params
             .iter()
+            .filter(|p| interner.resolve(p.name.0).unwrap_or("") != "self")
             .map(|p| ExportParamInfo {
                 name: interner.resolve(p.name.0).unwrap_or("").to_string(),
                 ty: match &p.type_ann {

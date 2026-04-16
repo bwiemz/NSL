@@ -440,6 +440,29 @@ pub extern "C" fn nsl_model_num_weights(model_ptr: i64) -> i64 {
     model.weight_ptrs.len() as i64
 }
 
+/// Get the number of weight tensors — canonical name used by @export model-method wrappers.
+/// Alias for `nsl_model_num_weights`.
+#[no_mangle]
+pub extern "C" fn nsl_model_get_num_weights(model_ptr: i64) -> i64 {
+    nsl_model_num_weights(model_ptr)
+}
+
+/// Return a pointer to the contiguous array of weight tensor pointers (`*const i64`).
+///
+/// The returned pointer is valid for the lifetime of the model; callers must not
+/// free it.  Returns 0 if `model_ptr` is null or the model has no weights.
+/// Used by `@export` model-method wrappers to thread weight pointers into the
+/// compiled impl function.
+#[no_mangle]
+pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
+    if model_ptr == 0 { return 0; }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    if model.weight_ptrs.is_empty() {
+        return 0;
+    }
+    model.weight_ptrs.as_ptr() as i64
+}
+
 /// Get a weight tensor by name. Returns NslTensor pointer or 0 if not found.
 #[no_mangle]
 pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: i64) -> i64 {
