@@ -1,0 +1,45 @@
+# Gap E — minimal end-to-end CSHA fused-backward smoke.
+#
+# This toy program is the source form of what
+# `crates/nsl-codegen/tests/csha_gap_e_toy_pretrain_smoke.rs` compiles
+# inline as a `&str`.  It lives here as a standalone NSL example so a
+# human can run `nsl run` (GPU required) or compile-and-inspect the
+# object file outside the cargo test harness.
+#
+# Shape rationale: hd/d_model=32, seq=32, 1 head, 1 layer, no RoPE,
+# non-causal SDPA — this matches the Tier C smoke config that the
+# fused-backward SMEM validator accepts today.  Larger shapes (head_dim
+# >= 64, causal=true) currently work for the forward save path but the
+# backward PTX may or may not pass the validator depending on the
+# SMEM budget — Gap B skips the embed in that case and Gap D falls
+# through to the CPU tape-op backward.
+#
+# Weight names follow the CSHA boundary-scan convention (wq/wk/wv) so
+# `ProjKind::from_param_name` classifies the chain correctly and the
+# dispatcher can claim the shared SDPA op (Gap D.1).
+
+model TinyAttn:
+    w_norm: Tensor = ones([32])
+    wq: Tensor = ones([32, 32])
+    wk: Tensor = ones([32, 32])
+    wv: Tensor = ones([32, 32])
+
+    @flash_attention
+    fn forward(self, x: Tensor) -> Tensor:
+        let x_norm = rmsnorm(x, self.w_norm, 0.00001)
+        let q = x_norm @ self.wq
+        let k = x_norm @ self.wk
+        let v = x_norm @ self.wv
+        let scale = 1.0 / sqrt(32.0)
+        return scaled_dot_product_attention(q, k, v, scale)
+
+let m = TinyAttn()
+let x = ones([32, 32])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out)
+
+print("csha_toy_pretrain_hd32: PASS")
