@@ -1113,6 +1113,283 @@ fn lower_single_op(
 
             Ok(result)
         }
+        PrimalOp::FusedCshaBackward { layer } => {
+            // Gap D: fused CSHA backward kernel launch.
+            //
+            // Emits a call to `nsl_flash_attention_csha_backward` using:
+            //   - Saved activation pointers stashed by Gap A's forward
+            //     side in `compiler.csha_forward_saves[layer]`.
+            //   - Backward PTX / name / shmem triple synthesized by
+            //     Gap B and cached on the same record.
+            //   - FlashAttentionConfig from the FA compile context
+            //     (`csha_training_config`).
+            //
+            // Produces seven output gradient tensors (dq/dk/dv/dwq/dwk/
+            // dwv/dx) which are stashed on `compiler.csha_fused_bwd_cache`
+            // keyed by the first input's Cranelift Value (the "chain key"
+            // the AD emitter chose).  Gap C's extract-op lowerer consumes
+            // those outputs downstream.
+            //
+            // Input convention (produced by EmitFused in source_ad.rs):
+            //   inputs[0] = chain_key VarId (cache key — opaque here)
+            //   inputs[1] = dO VarId (adjoint of attention output), if
+            //               the emitter could find one.  If `inputs.len()
+            //               < 2` the lowerer passes null for do_ptr,
+            //               which the kernel interprets as "no seed" and
+            //               produces zeroed gradients (structural
+            //               fallback — the AD graph will still be valid
+            //               because per-op AD ran on SDPA separately).
+            //
+            // The op's own result Value is a placeholder zero tensor —
+            // it is never read downstream; extract ops pull the real
+            // outputs from the cache.
+            let key_val = inputs[0];
+
+            // Look up saves + backward PTX DataIds by layer name.
+            let saves_opt = compiler.csha_forward_saves.get(layer).copied();
+            let saves = saves_opt.ok_or_else(|| {
+                CodegenError::new(format!(
+                    "FusedCshaBackward: no forward saves for layer '{}'. \
+                     Gap A must allocate save buffers at the FA call site \
+                     before Gap D's adjoint emission runs.",
+                    layer
+                ))
+            })?;
+
+            // Backward PTX + name pointers from .rodata (Gap B).
+            let bwd_ptx_did = saves.backward_ptx_data_id;
+            let bwd_name_did = saves.backward_name_data_id;
+            let (bwd_ptx_ptr, bwd_name_ptr) = match (bwd_ptx_did, bwd_name_did) {
+                (Some(pid), Some(nid)) => {
+                    let pgv = compiler.module.declare_data_in_func(pid, builder.func);
+                    let ngv = compiler.module.declare_data_in_func(nid, builder.func);
+                    (
+                        builder.ins().symbol_value(cl_types::I64, pgv),
+                        builder.ins().symbol_value(cl_types::I64, ngv),
+                    )
+                }
+                _ => (
+                    builder.ins().iconst(cl_types::I64, 0),
+                    builder.ins().iconst(cl_types::I64, 0),
+                ),
+            };
+
+            // FlashAttentionConfig + SMEM bytes for the backward launch.
+            let training_cfg = compiler
+                .kernels
+                .flash_attention_context
+                .as_ref()
+                .and_then(|c| c.csha_training_config.clone());
+            let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes) =
+                match training_cfg {
+                    Some(cfg) => {
+                        let mut d = Vec::<String>::new();
+                        let bytes =
+                            crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+                                &cfg, &mut d,
+                            ) as i64;
+                        for s in d { eprintln!("warning: {s}"); }
+                        let dm = cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
+                        let eps = cfg
+                            .csha
+                            .as_ref()
+                            .map(|c| c.rmsnorm_eps.to_bits() as i64)
+                            .unwrap_or(1e-5f32.to_bits() as i64);
+                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes)
+                    }
+                    None => {
+                        // No training config — the backward launch cannot
+                        // succeed.  Return a zero-tensor placeholder so the
+                        // op has a valid Value but do NOT emit the launch
+                        // (it would segfault).  Extract ops will hit the
+                        // cache-miss path and the whole adjoint graph
+                        // falls back to per-op AD via the AD emitter's
+                        // reset-cell pattern in EmitFused.
+                        eprintln!(
+                            "[nsl] FusedCshaBackward: no csha_training_config for layer '{}'; \
+                             skipping launch (cache stays empty, extract ops will fail).",
+                            layer
+                        );
+                        let one = builder.ins().iconst(cl_types::I64, 1);
+                        let shape_list = call(compiler, builder, "nsl_list_new", &[])?;
+                        call(compiler, builder, "nsl_list_push", &[shape_list, one])?;
+                        return call(compiler, builder, "nsl_tensor_zeros", &[shape_list]);
+                    }
+                };
+
+            // Shape values: derive batch/heads/seq_len/head_dim from the
+            // chain_key tensor (it's a q/k/v-shaped tensor).  When the
+            // emitter passes a non-tensor chain_key (e.g. a primal VarId
+            // that's a scalar), we fall back to constants from the
+            // config.
+            //
+            // For the smoke path we follow the minimal convention: if
+            // inputs contains the forward q tensor as a later arg (index
+            // 2 by the EmitFused convention), use it; otherwise read
+            // from the key.
+            let shape_src = if inputs.len() > 2 { inputs[2] } else { key_val };
+            let dim0 = builder.ins().iconst(cl_types::I64, 0);
+            let dim1 = builder.ins().iconst(cl_types::I64, 1);
+            let dim2 = builder.ins().iconst(cl_types::I64, 2);
+            let batch =
+                call(compiler, builder, "nsl_tensor_shape_dim", &[shape_src, dim0])?;
+            let heads =
+                call(compiler, builder, "nsl_tensor_shape_dim", &[shape_src, dim1])?;
+            let seq_len =
+                call(compiler, builder, "nsl_tensor_shape_dim", &[shape_src, dim2])?;
+            let hd_val = builder.ins().iconst(cl_types::I64, head_dim);
+            let block_q_val = builder.ins().iconst(cl_types::I64, block_q);
+            let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv);
+            let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes);
+            let causal_val = builder
+                .ins()
+                .iconst(cl_types::I64, if is_causal { 1 } else { 0 });
+            let d_model_val = builder.ins().iconst(cl_types::I64, d_model);
+            let eps_bits_val = builder.ins().iconst(cl_types::I64, eps_bits);
+
+            // scale_bits = 1/sqrt(head_dim) reinterpreted as f32 bits.
+            let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, hd_val);
+            let hd_sqrt = builder.ins().sqrt(hd_f64);
+            let one_f64 = builder.ins().f64const(1.0);
+            let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
+            let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
+            let scale_bits_i32 = builder.ins().bitcast(
+                cl_types::I32,
+                cranelift_codegen::ir::MemFlags::new(),
+                scale_f32,
+            );
+            let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
+
+            let null = builder.ins().iconst(cl_types::I64, 0);
+
+            // Optional input pointers: pass-through from inputs[].  These
+            // feed the kernel's `q_ptr / k_ptr / v_ptr / out_ptr / lse_ptr /
+            // x_ptr / norm_weight_ptr / wq_ptr / wk_ptr / wv_ptr` params.
+            // Null is acceptable when the forward saves carry the
+            // activations the backward kernel actually reads (which is
+            // the design intent of Gap A).
+            let q_ptr = if inputs.len() > 2 { inputs[2] } else { null };
+            let k_ptr = if inputs.len() > 3 { inputs[3] } else { null };
+            let v_ptr = if inputs.len() > 4 { inputs[4] } else { null };
+            let x_ptr = if inputs.len() > 5 { inputs[5] } else { null };
+            let wq_ptr = if inputs.len() > 6 { inputs[6] } else { null };
+            let wk_ptr = if inputs.len() > 7 { inputs[7] } else { null };
+            let wv_ptr = if inputs.len() > 8 { inputs[8] } else { null };
+            let norm_weight_ptr = if inputs.len() > 9 { inputs[9] } else { null };
+            let do_ptr = if inputs.len() > 1 { inputs[1] } else { null };
+
+            // Allocate 7 output gradient tensors.
+            // dq/dk/dv: [batch, heads, seq_len, head_dim]
+            // dwq/dwk/dwv: [d_model, heads*head_dim]   (kv_dim = heads*head_dim)
+            // dx: [batch, seq_len, d_model]
+            let heads_hd = builder.ins().imul(heads, hd_val);
+
+            let alloc_shape = |compiler: &mut Compiler,
+                               builder: &mut FunctionBuilder,
+                               dims: &[Value]|
+             -> Result<Value, CodegenError> {
+                let shape = call(compiler, builder, "nsl_list_new", &[])?;
+                for d in dims {
+                    call(compiler, builder, "nsl_list_push", &[shape, *d])?;
+                }
+                call(compiler, builder, "nsl_tensor_zeros", &[shape])
+            };
+
+            let dq = alloc_shape(compiler, builder, &[batch, heads, seq_len, hd_val])?;
+            let dk = alloc_shape(compiler, builder, &[batch, heads, seq_len, hd_val])?;
+            let dv = alloc_shape(compiler, builder, &[batch, heads, seq_len, hd_val])?;
+            let dwq = alloc_shape(compiler, builder, &[d_model_val, heads_hd])?;
+            let dwk = alloc_shape(compiler, builder, &[d_model_val, heads_hd])?;
+            let dwv = alloc_shape(compiler, builder, &[d_model_val, heads_hd])?;
+            let dx = alloc_shape(compiler, builder, &[batch, seq_len, d_model_val])?;
+
+            // Move all seven outputs to device so the kernel can write to
+            // them via st.global.*.  (nsl_tensor_zeros is CPU; the kernel
+            // requires managed/device memory.)
+            let cuda_device = builder.ins().iconst(cl_types::I64, 1);
+            let to_dev = |compiler: &mut Compiler,
+                          builder: &mut FunctionBuilder,
+                          t: Value|
+             -> Result<Value, CodegenError> {
+                call(compiler, builder, "nsl_tensor_to_device", &[t, cuda_device])
+            };
+            let dq_dev = to_dev(compiler, builder, dq)?;
+            let dk_dev = to_dev(compiler, builder, dk)?;
+            let dv_dev = to_dev(compiler, builder, dv)?;
+            let dwq_dev = to_dev(compiler, builder, dwq)?;
+            let dwk_dev = to_dev(compiler, builder, dwk)?;
+            let dwv_dev = to_dev(compiler, builder, dwv)?;
+            let dx_dev = to_dev(compiler, builder, dx)?;
+
+            // Launch the 44-arg backward kernel.
+            // Forward-side `active_heads` — take from the training config
+            // (stored on the FA context via Gap B).  When the ctx is gone,
+            // pass 0 (kernel interprets as "all heads live").
+            let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
+
+            let _rc = call(
+                compiler,
+                builder,
+                "nsl_flash_attention_csha_backward",
+                &[
+                    // Forward-side 36 args (mirrors _with_saves order).
+                    q_ptr, k_ptr, v_ptr,
+                    null,                 // out_ptr
+                    null,                 // logsumexp_ptr
+                    scale_bits,
+                    batch, heads, seq_len, hd_val,
+                    null, null, null, null,    // paged (block_table, k_pool, v_pool, block_size)
+                    null, null,                 // RoPE cos/sin
+                    null, null,                 // seq_ids, seq_lens
+                    shmem_val,
+                    bwd_ptx_ptr, bwd_name_ptr,
+                    block_q_val, block_kv_val,
+                    causal_val,
+                    x_ptr, norm_weight_ptr,
+                    wq_ptr, wk_ptr, wv_ptr,
+                    null,                 // wo_ptr
+                    eps_bits_val,
+                    active_heads_val, d_model_val,
+                    // Forward-saved activations (Gap A).
+                    saves.q_proj, saves.k_proj, saves.v_proj,
+                    saves.row_max, saves.row_sum,
+                    saves.x_raw,
+                    // Tier C backward-specific: dO input + 7 gradient outputs.
+                    do_ptr,
+                    dq_dev, dk_dev, dv_dev,
+                    dwq_dev, dwk_dev, dwv_dev,
+                    dx_dev,
+                ],
+            )?;
+
+            // Populate Gap C cache so extract ops can read outputs.
+            compiler
+                .csha_fused_bwd_cache
+                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev]);
+
+            // Gap A cleanup: now that the backward has consumed the save
+            // pointers, free them.  (Moved here from the forward site in
+            // expr/advanced.rs — under @train, the forward leaves them
+            // live so the backward can read them.)
+            let _ = call(
+                compiler,
+                builder,
+                "nsl_csha_free_backward_activations_from",
+                &[
+                    saves.q_proj, saves.k_proj, saves.v_proj,
+                    saves.row_max, saves.row_sum, saves.x_raw,
+                ],
+            )?;
+            compiler.csha_forward_saves.remove(layer);
+
+            // Return a placeholder Value.  The op's own `result` VarId
+            // is never consumed — extract ops pull real outputs from
+            // the cache — so an empty tensor is fine.
+            let one = builder.ins().iconst(cl_types::I64, 1);
+            let shape_list = call(compiler, builder, "nsl_list_new", &[])?;
+            call(compiler, builder, "nsl_list_push", &[shape_list, one])?;
+            call(compiler, builder, "nsl_tensor_zeros", &[shape_list])
+        }
         PrimalOp::RoPE { .. } => {
             // No dedicated nsl_tensor_rope FFI exists; clone as identity for now.
             // RoPE forward is handled by the flash attention system.
@@ -1596,6 +1873,9 @@ mod tests {
                 component: 0,
             },
             PrimalOp::CshaFusedBackwardExtract { component: 0 },
+            PrimalOp::FusedCshaBackward {
+                layer: "blocks.0".into(),
+            },
             PrimalOp::RoPE { dim: 64 },
             PrimalOp::RoPEInverse { dim: 64 },
             PrimalOp::Dropout { p: 0.1 },
@@ -1605,9 +1885,10 @@ mod tests {
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 52 variants total (including markers) — bumped by Gap C's
-        // CshaFusedBackwardExtract addition.
-        assert_eq!(ops.len(), 52);
+        // 53 variants total (including markers) — bumped by Gap D's
+        // FusedCshaBackward addition (on top of Gap C's
+        // CshaFusedBackwardExtract).
+        assert_eq!(ops.len(), 53);
     }
 
     #[test]

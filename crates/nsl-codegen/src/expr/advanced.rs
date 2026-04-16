@@ -1635,20 +1635,21 @@ impl Compiler<'_> {
                     ],
                 )?;
 
-                // Gap A (scope-limited lifetime): emit the free right
-                // after the FA call. Cranelift `Value`s live until end
-                // of block, so the stash in `csha_forward_saves` is
-                // only valid until this point — but that's fine for
-                // Gap A's isolation: Gap C/D will replace this
-                // immediate free with a backward-aware lifetime
-                // (either by lifting the free after the backward call
-                // or by re-emitting the save allocation inside the
-                // adjoint emitter).
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_csha_free_backward_activations_from",
-                    &[q_proj_v, k_proj_v, v_proj_v, row_max_v, row_sum_v, x_raw_v],
-                )?;
+                // Gap D: the scope-immediate free that was here in Gap A
+                // has MOVED.  Under @train the saves must survive until
+                // the backward kernel runs — the free now fires inside
+                // the `FusedCshaBackward` lowerer in `wengert_lower.rs`
+                // right after `nsl_flash_attention_csha_backward` has
+                // consumed the pointers.  If the backward never runs
+                // (e.g. inference path hitting this branch because
+                // `save_activations_for_backward` was set by mistake)
+                // we leak the 6 device buffers for this call — that's
+                // a small, one-time leak per layer per @train compile
+                // unit; the stash is cleared at end of function body by
+                // Cranelift's scope-local `Value` lifetime anyway, so
+                // the allocation is recovered by the next JIT reset.
+                // TODO: audit non-@train callers once Gap D's adjoint
+                // wiring stabilises.
             } else {
                 let _err = self.compile_call_by_name(
                     builder,

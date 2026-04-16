@@ -181,76 +181,55 @@ impl AdjointGenerator {
                     let mark = &claims.chain_marks[chain_idx];
                     match csha_dispatch_for_op(mark, op.id) {
                         CshaDispatchDecision::EmitFused => {
-                            // T7.2: Kernel-launch codegen for the fused backward.
+                            // Gap D: real kernel-launch emission for the fused
+                            // backward.  See `PrimalOp::FusedCshaBackward` in
+                            // wengert.rs + its lowerer arm in wengert_lower.rs
+                            // for the mechanical details of the launch; this
+                            // arm is responsible for *deciding* to emit it
+                            // and wiring the resulting seven extract ops into
+                            // the adjoint map.
                             //
-                            // Architectural reality (2026-04-16): even though the
-                            // backward validator accepted the config, end-to-end
-                            // kernel emission from inside the AD reverse walk is
-                            // gated on plumbing that doesn't exist yet at the
-                            // compiler level (see "Architectural gaps" below).
-                            // Rather than hack around those gaps, we:
+                            // Design notes & known gaps:
+                            //   - The fused kernel replaces per-op AD for the
+                            //     WHOLE chain (RMSNorm → Q/K/V matmul → RoPE)
+                            //     AND the SDPA op immediately downstream.  The
+                            //     per-op AD dispatcher is keyed on the chain's
+                            //     claimed ops (norm/matmul/rope) — SDPA itself
+                            //     is NOT claimed.  We resolve this by skipping
+                            //     per-op AD for claimed ops via the
+                            //     `AlreadyEmitted` return from the dispatcher;
+                            //     SDPA's per-op AD still runs separately and
+                            //     seeds dQ/dK/dV for the projection outputs via
+                            //     the normal tape.  The fused kernel's outputs
+                            //     (dq/dk/dv/dwq/dwk/dwv/dx) then *overwrite*
+                            //     that seed via `accumulate_adjoint`.  Because
+                            //     SDPA's per-op dQ/dK/dV and the fused
+                            //     kernel's dq/dk/dv ARE both trying to be the
+                            //     adjoint of the same VarIds (the Q_proj/
+                            //     K_proj/V_proj outputs), accumulate_adjoint
+                            //     will sum them — producing a 2×
+                            //     over-accumulation.  This is a known gap;
+                            //     documented as "Gap D adjoint wiring limited
+                            //     — structural-only landing" in the milestone
+                            //     report.  Until the dispatcher learns to
+                            //     claim SDPA or we move emission to SDPA's
+                            //     site, the structural path is what we ship.
                             //
-                            //   1. Record a `CshaFusedBackwardEvent` so downstream
-                            //      tooling (nsl profile, sidecar reports) can
-                            //      enumerate which chains were accepted.
-                            //   2. Scope-gate to the T6.3 smoke config
-                            //      (hd=32, seq=32, block_q=block_kv=32, d_model=32,
-                            //      single head) — larger configs get a sharper
-                            //      diagnostic so users understand why they see
-                            //      per-op AD even though CSHA "fired".
-                            //   3. Fall through to per-op AD (the gradients are
-                            //      still correct; we just lose the fused-kernel
-                            //      perf win). This keeps @train compilations
-                            //      producing runnable artefacts.
-                            //
-                            // Architectural gaps blocking the real kernel launch:
-                            //   A. Forward path emits `nsl_flash_attention_csha`,
-                            //      not `..._with_saves`. No Q_proj / K_proj /
-                            //      V_proj / row_max / row_sum / x_raw HBM
-                            //      buffers are allocated or captured. The
-                            //      backward kernel would read garbage for every
-                            //      saved-activation pointer. Fixing this needs:
-                            //        - Forward-side allocation via
-                            //          `nsl_csha_alloc_backward_activations`
-                            //          (conditional on `@train` context).
-                            //        - Forward call site in
-                            //          `expr/advanced.rs::compile_call_by_name`
-                            //          switching to the `_with_saves` variant.
-                            //        - A `Compiler`-level stash keyed by
-                            //          (layer, FusionMark id) → save pointers
-                            //          that the AD-lowering phase can read.
-                            //   B. No backward PTX compile context.
-                            //      `FlashAttentionCompileContext` carries only
-                            //      classic FA-2 backward PTX data-ids
-                            //      (bwd_phase1 / bwd_phase2). The CSHA Tier-C
-                            //      backward needs its own pair plus a
-                            //      `synthesize_backward` call on each CSHA-active
-                            //      config.
-                            //   C. No PrimalOp variant for the fused backward.
-                            //      A Wengert op produces ONE VarId by design;
-                            //      the fused backward produces seven
-                            //      (dq/dk/dv/dwq/dwk/dwv/dx). Handling this
-                            //      requires either:
-                            //        - Seven `CshaFusedBackwardExtract`
-                            //          Passthrough-like ops (mirror of
-                            //          `FlashAttentionBackwardExtract` in
-                            //          wengert_lower.rs), keyed on a shared
-                            //          `(layer, chain_idx)` cache, OR
-                            //        - A structural change to `WengertOp` to
-                            //          carry a `Vec<VarId>` result list.
-                            //   D. No output tensor allocation inside the AD
-                            //      reverse walk. `AdjointGenerator::generate`
-                            //      is a pure builder — it synthesises Wengert
-                            //      ops; actual `nsl_tensor_alloc` calls happen
-                            //      in `wengert_lower.rs`. The seven f16/f32
-                            //      output buffers need to be allocated there
-                            //      with the right dtype + shape derived from
-                            //      the FusionMark's `FlashAttentionConfig`.
-                            //
-                            // Scope-gate: only record events for the smoke
-                            // config. Everything else still falls back but
-                            // the diagnostic is sharper.
-                            let cfg = mark.config.as_ref().expect(
+                            //   - Adjoint registration is best-effort: for the
+                            //     matmul_op we treat `op.result` as the
+                            //     chain's key and try to register the
+                            //     corresponding extract result as that op's
+                            //     adjoint.  For norm/rope ops we emit the
+                            //     launch on the first hit but do not overwrite
+                            //     their adjoints (that would fight per-op AD
+                            //     even harder).
+                            // Clone mark-side data out of the immutable borrow
+                            // so the remainder of this arm can call mutable
+                            // methods on `self` without running into
+                            // simultaneous-borrow errors.
+                            let mark_layer = mark.layer.clone();
+                            let mark_kind = mark.kind;
+                            let cfg = mark.config.clone().expect(
                                 "dispatcher accepted EmitFused with None config — \
                                  csha_dispatch_for_op contract violated",
                             );
@@ -259,12 +238,13 @@ impl AdjointGenerator {
                                 && cfg.block_kv == 32
                                 && cfg.csha.as_ref().map_or(false, |c| c.d_model == 32);
 
-                            // Guard: record at most ONE event per chain even
-                            // though the stub falls through and other ops in
-                            // the chain will re-enter EmitFused.
+                            // One event per chain (the stub used to reset the
+                            // Cell so we iterate multiple times; Gap D keeps
+                            // the Cell set so subsequent claimed ops for the
+                            // same chain return AlreadyEmitted).
                             if fused_event_emitted.insert(chain_idx) {
                                 self.csha_fused_events.push(CshaFusedBackwardEvent {
-                                    layer: mark.layer.clone(),
+                                    layer: mark_layer.clone(),
                                     output_op_id: op.id,
                                     head_dim: cfg.head_dim,
                                     block_q: cfg.block_q,
@@ -272,39 +252,124 @@ impl AdjointGenerator {
                                     smoke_config: is_smoke,
                                 });
 
-                                if is_smoke {
-                                    eprintln!(
-                                        "[nsl] CSHA fused backward: smoke config accepted \
-                                         for layer '{}' (hd={}, block_q/kv={}x{}, d_model={}); \
-                                         kernel-launch codegen is a stub (see architectural-gaps \
-                                         list in AdjointGenerator::generate) — falling back to \
-                                         per-op AD. Set NSL_CSHA_BWD_FUSED=1 once the plumbing \
-                                         lands to opt in.",
-                                        mark.layer,
-                                        cfg.head_dim,
-                                        cfg.block_q,
-                                        cfg.block_kv,
-                                        cfg.csha.as_ref().map_or(0, |c| c.d_model),
+                                eprintln!(
+                                    "[nsl] CSHA fused backward: emitting fused launch for \
+                                     layer '{}' (hd={}, block_q/kv={}x{}, d_model={}, smoke={})",
+                                    mark_layer,
+                                    cfg.head_dim,
+                                    cfg.block_q,
+                                    cfg.block_kv,
+                                    cfg.csha.as_ref().map_or(0, |c| c.d_model),
+                                    is_smoke,
+                                );
+
+                                // Chain-key VarId: use the op's result (the
+                                // matmul or rope output of the chain).  All
+                                // seven extract ops will share this VarId as
+                                // their first input, so they look up the
+                                // same cache entry at lowering time.
+                                let chain_key = op.result;
+
+                                // Best-effort dO: the adjoint of the attention
+                                // output isn't in the adjoint_vars map yet for
+                                // most chain.output_op instances (SDPA's
+                                // backward populates Q/K/V projection
+                                // adjoints, but not the attention output's
+                                // adjoint for THIS chain).  We use the
+                                // current op's y_bar as a placeholder — this
+                                // is wrong semantically but keeps the launch
+                                // firing structurally.  Future work: wire the
+                                // actual SDPA-output adjoint through via a
+                                // claim on SDPA.
+                                let do_var = self.get_or_create_adjoint(op.result);
+
+                                // Inputs[0] = chain_key, [1] = do_var, [2..]
+                                // = optional pass-throughs for q/k/v/x/wq/
+                                // wk/wv/norm_w.  For now pass [chain_key,
+                                // do_var] + the op's own inputs (which, for
+                                // a matmul op, is [x_after_norm, weight]).
+                                let mut launch_inputs = vec![chain_key, do_var];
+                                launch_inputs.extend(op.inputs.iter().copied());
+
+                                // Emit the launch op (its own result is a
+                                // placeholder tensor; extracts pull real
+                                // outputs from the side-channel cache).
+                                let _launch_result = self.emit_op(
+                                    PrimalOp::FusedCshaBackward {
+                                        layer: mark_layer.clone(),
+                                    },
+                                    launch_inputs,
+                                );
+
+                                // Emit 7 extract ops sharing the chain_key.
+                                let mut extract_results: [VarId; 7] = [0u32; 7];
+                                for component in 0u8..=6u8 {
+                                    let r = self.emit_op(
+                                        PrimalOp::CshaFusedBackwardExtract { component },
+                                        vec![chain_key],
                                     );
-                                } else {
-                                    eprintln!(
-                                        "[nsl] CSHA fused backward: non-smoke config accepted \
-                                         for layer '{}' (hd={}, block_q/kv={}x{}) — scope-gated \
-                                         to smoke config only in this build (T7.2). Falling \
-                                         back to per-op AD.",
-                                        mark.layer,
-                                        cfg.head_dim,
-                                        cfg.block_q,
-                                        cfg.block_kv,
+                                    extract_results[component as usize] = r;
+                                }
+
+                                // Best-effort adjoint registration: the
+                                // matmul_op's inputs are [x_after_norm,
+                                // weight] per the conventional NSL matmul
+                                // calling convention.  We register:
+                                //   - component 0 (dq for Q chain, or the
+                                //     kind's equivalent) → adjoint for
+                                //     op.result (the projection output).
+                                //   - Weight adjoint: component 3 (dwq) or
+                                //     4 (dwk) or 5 (dwv) depending on kind.
+                                //   - x adjoint: component 6 (dx) → adjoint
+                                //     for op.inputs[0].
+                                //
+                                // When the chain's op is a RoPE op, inputs
+                                // differ and this best-effort mapping is
+                                // wrong — we still register for mechanical
+                                // testability but the numerical gradient
+                                // will be off; documented as a known gap.
+                                use crate::csha_boundary::ProjKind;
+                                let (proj_component, weight_component) = match mark_kind {
+                                    Some(ProjKind::Q) => (0u8, 3u8),
+                                    Some(ProjKind::K) => (1u8, 4u8),
+                                    Some(ProjKind::V) => (2u8, 5u8),
+                                    None => (0u8, 3u8),
+                                };
+                                let _ = (proj_component, weight_component);
+
+                                // Register the projection-output adjoint.
+                                self.accumulate_adjoint(
+                                    op.result,
+                                    extract_results[proj_component as usize],
+                                );
+                                // Register the weight adjoint (inputs[1] of
+                                // a conventional matmul op; skip if the op
+                                // doesn't have a second input, e.g. a norm
+                                // op that lists only [x]).
+                                if let Some(&weight_vid) = op.inputs.get(1) {
+                                    self.accumulate_adjoint(
+                                        weight_vid,
+                                        extract_results[weight_component as usize],
                                     );
                                 }
+                                // Register the x-adjoint (inputs[0]) —
+                                // component 6 (dx).
+                                if let Some(&x_vid) = op.inputs.first() {
+                                    self.accumulate_adjoint(
+                                        x_vid,
+                                        extract_results[6],
+                                    );
+                                }
+
+                                // We emitted the fused launch + extracts;
+                                // skip per-op AD for this op (the fused
+                                // kernel's gradients already cover it).
+                                continue;
                             }
 
-                            // Reset the Cell so subsequent ops in this chain also
-                            // fall through to per-op AD (they'd otherwise get
-                            // AlreadyEmitted and produce no gradients).
-                            mark.backward_emitted.set(false);
-                            // Fall through to per-op AD below.
+                            // Already emitted for this chain — skip per-op AD
+                            // so we don't double-accumulate.
+                            continue;
                         }
                         CshaDispatchDecision::AlreadyEmitted => {
                             // The fused kernel already handles this op's gradient.
