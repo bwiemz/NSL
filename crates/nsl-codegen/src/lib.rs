@@ -67,6 +67,7 @@ pub mod inspect;
 pub mod kernel;
 pub mod kernel_ir;
 pub mod kernel_lower;
+pub mod kernel_skeleton;
 pub mod linker;
 pub mod memory_planner;
 pub mod moe;
