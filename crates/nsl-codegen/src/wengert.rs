@@ -176,6 +176,31 @@ pub enum PrimalOp {
         causal: bool,
         component: u8,
     },
+    /// Gap C: extract one component from the fused CSHA backward kernel.
+    ///
+    /// The CSHA fused backward produces **seven** output tensors — dq, dk, dv,
+    /// dwq, dwk, dwv, dx — and the AD graph represents every op with a single
+    /// `VarId` result.  To plumb seven results through the graph without
+    /// restructuring `WengertOp`, we mirror the `FlashAttentionBackwardExtract`
+    /// pattern: one dedicated extract op per component, all sharing a cache
+    /// keyed by the first input (the "chain key" VarId chosen by the caller).
+    ///
+    /// Component mapping:
+    ///   - 0 = dq  (gradient w.r.t. Q projection output)
+    ///   - 1 = dk  (gradient w.r.t. K projection output)
+    ///   - 2 = dv  (gradient w.r.t. V projection output)
+    ///   - 3 = dwq (gradient w.r.t. Wq weight)
+    ///   - 4 = dwk (gradient w.r.t. Wk weight)
+    ///   - 5 = dwv (gradient w.r.t. Wv weight)
+    ///   - 6 = dx  (gradient w.r.t. the layer input `x`)
+    ///
+    /// Gap C lands the variant + the lowerer + the `Compiler`-level cache.
+    /// Gap D constructs these ops inside the EmitFused arm of
+    /// `AdjointGenerator::generate` and populates the cache via a real
+    /// `nsl_flash_attention_csha_backward` FFI call.
+    CshaFusedBackwardExtract {
+        component: u8,
+    },
     RoPE {
         dim: usize,
     },
@@ -314,6 +339,88 @@ mod tests {
         };
         assert!(!list.is_checkpointed(0));
         assert!(list.is_checkpointed(1));
+    }
+
+    /// Gap C: `CshaFusedBackwardExtract` is a seven-slot extract primitive
+    /// (dq/dk/dv/dwq/dwk/dwv/dx).  Each component value MUST be distinct
+    /// and in the documented 0..=6 range so the lowerer's cache-lookup
+    /// (`compiler.csha_fused_bwd_cache[key][component]`) selects the right
+    /// output tensor.
+    #[test]
+    fn test_csha_fused_backward_extract_components_are_distinct() {
+        let components: Vec<PrimalOp> = (0u8..=6)
+            .map(|c| PrimalOp::CshaFusedBackwardExtract { component: c })
+            .collect();
+        assert_eq!(components.len(), 7, "CSHA fused backward has 7 outputs");
+        // All seven variants are PartialEq-distinct.
+        for (i, a) in components.iter().enumerate() {
+            for (j, b) in components.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b, "same component must equal itself");
+                } else {
+                    assert_ne!(
+                        a, b,
+                        "components {i} and {j} must be distinct PrimalOp values"
+                    );
+                }
+            }
+        }
+        // Produces the Tensor type (every output is a tensor).
+        for op in &components {
+            assert_eq!(type_for_op(op), WengertType::Tensor);
+        }
+    }
+
+    /// Gap C: seven distinct `CshaFusedBackwardExtract` ops, all sharing the
+    /// same first-input VarId (the "chain key"), lower into seven distinct
+    /// VarIds in a Wengert list.  This mirrors Gap D's usage pattern: one
+    /// fused-backward launch followed by seven extract ops sharing the
+    /// cache key.
+    #[test]
+    fn test_csha_fused_backward_extract_seven_distinct_results() {
+        let chain_key_var: VarId = 42;
+        let mut ops = vec![WengertOp {
+            id: 0,
+            result: chain_key_var,
+            op: PrimalOp::Input("chain_key".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        }];
+        for c in 0u8..=6 {
+            ops.push(WengertOp {
+                id: (c as u32) + 1,
+                result: 100 + c as VarId,
+                op: PrimalOp::CshaFusedBackwardExtract { component: c },
+                inputs: vec![chain_key_var],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+        }
+        let list = WengertList {
+            ops,
+            output: 106,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        // All seven extract ops are distinct VarIds.
+        let mut seen = std::collections::HashSet::new();
+        for c in 0u8..=6 {
+            let vid = 100 + c as VarId;
+            assert!(list.defines(vid), "extract {c} should define VarId {vid}");
+            assert!(seen.insert(vid), "extract VarIds must be distinct");
+            let producer = list.find_producer(vid).unwrap();
+            assert_eq!(
+                producer.op,
+                PrimalOp::CshaFusedBackwardExtract { component: c }
+            );
+            assert_eq!(
+                producer.inputs,
+                vec![chain_key_var],
+                "all extracts share the same chain-key input"
+            );
+        }
+        assert_eq!(seen.len(), 7);
     }
 
     #[test]

@@ -1055,6 +1055,64 @@ fn lower_single_op(
 
             Ok(result)
         }
+        PrimalOp::CshaFusedBackwardExtract { component } => {
+            // Gap C: structural extract arm — reads the requested component
+            // from `compiler.csha_fused_bwd_cache`, keyed by the first input's
+            // Cranelift Value.  Gap D is responsible for populating the cache
+            // (by calling `nsl_flash_attention_csha_backward` inside the
+            // EmitFused arm of `AdjointGenerator::generate`).
+            //
+            // Today the EmitFused arm still falls through to per-op AD, so no
+            // CshaFusedBackwardExtract op is ever emitted in a real compile
+            // and this arm is unreachable in practice.  It exists as a ready-
+            // made symbol Gap D can call without further plumbing work.
+            //
+            // Contract expected by Gap D:
+            //   - inputs[0] is the "chain key" VarId.  Gap D decides what
+            //     VarId to use (typically the RMSNorm input or the SDPA
+            //     output), but all seven extract ops in one chain MUST share
+            //     the same first-input VarId so they look up the same cache
+            //     entry.
+            //   - Gap D populates the cache *before* emitting any extract
+            //     op, by running the fused backward launch and stashing the
+            //     seven output tensors into
+            //     `compiler.csha_fused_bwd_cache.insert(key_val, [t0..t6])`.
+            //   - `component` MUST be in 0..=6 (see variant doc-comment in
+            //     `wengert.rs` for the dq/dk/dv/dwq/dwk/dwv/dx mapping).
+            //
+            // Cache eviction is the last-component's responsibility, mirroring
+            // the FlashAttention extract pattern (which evicts on component=2).
+            if *component > 6 {
+                return Err(CodegenError::new(format!(
+                    "CshaFusedBackwardExtract: component {} out of range 0..=6",
+                    component
+                )));
+            }
+            let key_val = inputs[0];
+            let slot = compiler
+                .csha_fused_bwd_cache
+                .get(&key_val)
+                .copied()
+                .ok_or_else(|| {
+                    CodegenError::new(format!(
+                        "CshaFusedBackwardExtract: no cache entry for key Value {:?}. \
+                         Gap D must populate `compiler.csha_fused_bwd_cache` before \
+                         emitting extract ops (via a `nsl_flash_attention_csha_backward` \
+                         launch in the EmitFused arm of `AdjointGenerator::generate`).",
+                        key_val
+                    ))
+                })?;
+            let result = slot[*component as usize];
+
+            // Evict on the last component (component=6 → dx) so subsequent
+            // chains with a coincidentally-equal key_val don't reuse stale
+            // tensor pointers.  Mirrors FlashAttention's component==2 free.
+            if *component == 6 {
+                compiler.csha_fused_bwd_cache.remove(&key_val);
+            }
+
+            Ok(result)
+        }
         PrimalOp::RoPE { .. } => {
             // No dedicated nsl_tensor_rope FFI exists; clone as identity for now.
             // RoPE forward is handled by the flash attention system.
@@ -1537,6 +1595,7 @@ mod tests {
                 causal: false,
                 component: 0,
             },
+            PrimalOp::CshaFusedBackwardExtract { component: 0 },
             PrimalOp::RoPE { dim: 64 },
             PrimalOp::RoPEInverse { dim: 64 },
             PrimalOp::Dropout { p: 0.1 },
@@ -1546,8 +1605,9 @@ mod tests {
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 51 variants total (including markers)
-        assert_eq!(ops.len(), 51);
+        // 52 variants total (including markers) — bumped by Gap C's
+        // CshaFusedBackwardExtract addition.
+        assert_eq!(ops.len(), 52);
     }
 
     #[test]
