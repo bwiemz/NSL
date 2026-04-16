@@ -249,6 +249,8 @@ fn sanitize_header_guard(name: &str) -> String {
 }
 
 fn emit_prototype(out: &mut String, info: &ExportInfo) {
+    out.push_str("/* @export dispatch is inference-only. Gradient recording does not flow\n");
+    out.push_str(" * through this call path — use nsl_model_forward for training autograd. */\n");
     out.push_str(&format!("int {}(NslModel* model", info.symbol_name));
     for param in &info.params {
         out.push_str(",\n        ");
