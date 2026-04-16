@@ -1125,6 +1125,19 @@ impl<'a> Compiler<'a> {
         Ok(data_id)
     }
 
+    /// After all internal function bodies have been emitted, synthesize the
+    /// Cranelift body of each `@export` C-ABI wrapper registered during
+    /// `declare_user_functions_with_linkage`. See `crate::c_wrapper`.
+    pub fn emit_export_wrappers(&mut self) -> Result<(), CodegenError> {
+        // Clone to side-step borrow of `self.features` during emission, which
+        // itself calls `&mut self.module`.
+        let wrappers = self.features.export_wrappers.clone();
+        for wrapper in &wrappers {
+            crate::c_wrapper::emit_c_abi_wrapper(self, wrapper)?;
+        }
+        Ok(())
+    }
+
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {
         // M62: publish @export functions to the CLI-owned output slot so
         // `nsl build --shared-lib` can emit a matching C header without
