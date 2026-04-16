@@ -263,6 +263,10 @@ pub struct FeatureConfigs {
     /// declaration so the CLI can emit a matching C header after the
     /// shared-lib build completes.
     pub export_functions: Vec<crate::c_header::ExportInfo>,
+    /// M62: C-ABI wrapper functions for `@export`-decorated NSL functions.
+    /// Populated during codegen; used by the CLI to finalize wrapper functions
+    /// in the shared-lib object file.
+    pub export_wrappers: Vec<crate::c_wrapper::ExportWrapper>,
     /// M35: Model quantization configs — "ModelName" -> QuantConfig
     pub quant_configs: HashMap<String, QuantConfig>,
 
@@ -319,6 +323,7 @@ impl FeatureConfigs {
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
             export_functions: Vec::new(),
+            export_wrappers: Vec::new(),
             quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
             ownership_info: options.ownership_info.clone(),
