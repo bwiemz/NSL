@@ -4,7 +4,7 @@
 //! Errors here block codegen — `declaration.rs`'s `@export` branch
 //! assumes signatures are already validated.
 
-use nsl_ast::decl::{Decorator, FnDef, Param};
+use nsl_ast::decl::{Decorator, FnDef, ModelMember, Param};
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::types::{TypeExpr, TypeExprKind};
@@ -21,8 +21,53 @@ pub fn validate_exports(module: &Module, interner: &Interner) -> Vec<Diagnostic>
     let mut diagnostics = Vec::new();
     for stmt in &module.stmts {
         validate_stmt(stmt, interner, &mut diagnostics);
+        validate_model_method_exports(stmt, interner, &mut diagnostics);
     }
     diagnostics
+}
+
+/// Validate `@export` decorators on methods inside `model` blocks.
+///
+/// Rule 1 — method has `self` as first param: accepted, no error.
+/// Rule 2 — method lacks `self`: error with a pointed diagnostic.
+fn validate_model_method_exports(
+    stmt: &Stmt,
+    interner: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let StmtKind::ModelDef(md) = &stmt.kind else {
+        return;
+    };
+
+    for member in &md.members {
+        let ModelMember::Method(fn_def, decos) = member else {
+            continue;
+        };
+
+        let has_export = decos.iter().any(|d| {
+            d.name.len() == 1
+                && interner.resolve(d.name[0].0).unwrap_or("") == "export"
+        });
+        if !has_export {
+            continue;
+        }
+
+        let method_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+        let has_self = fn_def
+            .params
+            .first()
+            .map(|p| interner.resolve(p.name.0).unwrap_or("") == "self")
+            .unwrap_or(false);
+
+        if !has_self {
+            diagnostics.push(
+                Diagnostic::error(format!(
+                    "@export model method '{method_name}' requires `self` as first parameter; \
+                     for a standalone function export use a top-level `@export fn`"
+                )),
+            );
+        }
+    }
 }
 
 fn validate_stmt(stmt: &Stmt, interner: &Interner, diagnostics: &mut Vec<Diagnostic>) {
@@ -65,7 +110,8 @@ fn validate_stmt(stmt: &Stmt, interner: &Interner, diagnostics: &mut Vec<Diagnos
         return;
     };
 
-    validate_fn_signature(fn_def, interner, export_occurrences[0], diagnostics);
+    // Top-level @export fn — never a model method.
+    validate_fn_signature(fn_def, interner, export_occurrences[0], false, diagnostics);
 }
 
 fn validate_export_args(
@@ -136,6 +182,7 @@ fn validate_fn_signature(
     fn_def: &FnDef,
     interner: &Interner,
     export_decorator: &Decorator,
+    is_model_method_with_self: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // No generic type parameters — C ABI requires monomorphised types.
@@ -168,7 +215,8 @@ fn validate_fn_signature(
 
     // Warn if the body references model weights — these are silently absent
     // at C-ABI call time because @export functions use compile-time-baked weights.
-    check_no_model_weight_access(fn_def, interner, diagnostics);
+    // Model methods with `self` are exempt: the weight-loading PR makes those work.
+    check_no_model_weight_access(fn_def, interner, diagnostics, is_model_method_with_self);
 }
 
 fn validate_param(param: &Param, interner: &Interner, diagnostics: &mut Vec<Diagnostic>) {
@@ -215,7 +263,13 @@ fn check_no_model_weight_access(
     fn_def: &FnDef,
     interner: &Interner,
     diagnostics: &mut Vec<Diagnostic>,
+    is_model_method_with_self: bool,
 ) {
+    // Model methods with `self` are weight-loading-aware — skip the warning.
+    if is_model_method_with_self {
+        return;
+    }
+
     let fn_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>");
 
     // Build the set of "suspect" parameter names: self + Named-typed params.
@@ -728,6 +782,74 @@ fn add(a: Tensor<[4], f32>, b: Tensor<[4], f32>) -> Tensor<[4], f32>:
         assert!(
             weight_warnings.is_empty(),
             "unexpected weight warning: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn export_model_method_without_self_produces_error() {
+        let src = r#"
+model Net:
+    W: Tensor<[4, 4], f32>
+
+    @export
+    fn helper(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+        let diags = parse_and_validate(src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Error)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("requires `self`") && d.message.contains("helper")),
+            "expected self-required error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn export_model_method_with_self_accesses_weights_no_warning() {
+        let src = r#"
+model Net:
+    W: Tensor<[4, 4], f32>
+
+    @export
+    fn predict(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return self.W @ x
+"#;
+        let diags = parse_and_validate(src);
+        let weight_warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Warning && d.message.contains("weight"))
+            .collect();
+        assert!(
+            weight_warnings.is_empty(),
+            "@export model method with self should not warn; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn export_top_level_with_model_field_still_warns() {
+        let src = r#"
+model Net:
+    W: Tensor<[4, 4], f32>
+
+@export
+fn predict_toplevel(net: Net, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return net.W @ x
+"#;
+        let diags = parse_and_validate(src);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Warning)
+            .collect();
+        assert!(
+            warnings.iter().any(|d| d.message.contains("weight")),
+            "top-level @export with model field should still warn; got: {:?}",
             diags
         );
     }
