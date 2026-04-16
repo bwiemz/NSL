@@ -2418,6 +2418,9 @@ fn run_build_shared_multi(
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
             entry_options.export_functions_out = Some(exports_slot.clone());
+            // M62: route entry-module weight_index_map so @export model methods
+            // can resolve `self.<field>` → weight index on the multi-file path.
+            entry_options.weight_index_map = mod_data.weight_index_map.clone();
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(
@@ -2485,7 +2488,23 @@ fn run_build_shared_multi(
         .ok()
         .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
         .unwrap_or_default();
-    let export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    // M62 Task 9: mirror the single-file path and re-export runtime lifecycle
+    // symbols so ctypes callers can load weights + call exports through the
+    // generated DLL without loading a separate runtime DLL.
+    let runtime_exports = [
+        "nsl_model_create",
+        "nsl_model_destroy",
+        "nsl_model_get_weight_ptrs",
+        "nsl_model_get_num_weights",
+        "nsl_model_num_weights",
+        "nsl_get_last_error",
+        "nsl_set_error_cstr",
+        "nsl_desc_to_tensor",
+        "nsl_tensor_to_desc_ffi",
+        "nsl_tensor_free",
+    ];
+    let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    export_refs.extend_from_slice(&runtime_exports);
 
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
