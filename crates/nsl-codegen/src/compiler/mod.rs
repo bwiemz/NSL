@@ -263,6 +263,10 @@ pub struct FeatureConfigs {
     /// declaration so the CLI can emit a matching C header after the
     /// shared-lib build completes.
     pub export_functions: Vec<crate::c_header::ExportInfo>,
+    /// M62: C-ABI wrapper functions for `@export`-decorated NSL functions.
+    /// Populated during codegen; used by the CLI to finalize wrapper functions
+    /// in the shared-lib object file.
+    pub export_wrappers: Vec<crate::c_wrapper::ExportWrapper>,
     /// M35: Model quantization configs — "ModelName" -> QuantConfig
     pub quant_configs: HashMap<String, QuantConfig>,
 
@@ -319,6 +323,7 @@ impl FeatureConfigs {
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
             export_functions: Vec::new(),
+            export_wrappers: Vec::new(),
             quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
             ownership_info: options.ownership_info.clone(),
@@ -1118,6 +1123,19 @@ impl<'a> Compiler<'a> {
         })?;
 
         Ok(data_id)
+    }
+
+    /// After all internal function bodies have been emitted, synthesize the
+    /// Cranelift body of each `@export` C-ABI wrapper registered during
+    /// `declare_user_functions_with_linkage`. See `crate::c_wrapper`.
+    pub fn emit_export_wrappers(&mut self) -> Result<(), CodegenError> {
+        // Clone to side-step borrow of `self.features` during emission, which
+        // itself calls `&mut self.module`.
+        let wrappers = self.features.export_wrappers.clone();
+        for wrapper in &wrappers {
+            crate::c_wrapper::emit_c_abi_wrapper(self, wrapper)?;
+        }
+        Ok(())
     }
 
     pub fn finalize(self) -> Result<Vec<u8>, CodegenError> {

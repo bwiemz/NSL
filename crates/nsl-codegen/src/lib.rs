@@ -1,6 +1,7 @@
 pub mod autotune;
 pub mod builtins;
 pub mod c_header;
+pub mod c_wrapper;
 pub mod calibration;
 pub mod compiler;
 pub mod context;

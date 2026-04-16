@@ -329,6 +329,8 @@ pub fn compile_returning_plan(
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
     let plan = compiler.last_wrga_plan.clone();
+    // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
+    compiler.emit_export_wrappers()?;
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize
     // consumes the compiler.
     write_manifest_if_needed(&mut compiler, options);
@@ -483,6 +485,8 @@ fn compile_with_zk_info_best_effort_plan(
 
         // M52: Embed weight hash if weights were loaded
         compiler.embed_weight_hash()?;
+        // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
+        compiler.emit_export_wrappers()?;
         Ok(())
     })();
 
@@ -628,6 +632,8 @@ fn compile_standalone_best_effort_plan(
         }
         // Task 4: Declare the calibration retention arena global (zeroinit .bss).
         compiler.emit_retention_arena()?;
+        // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
+        compiler.emit_export_wrappers()?;
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
@@ -672,6 +678,8 @@ pub fn compile_test(
         return Err(CodegenError::new("no @test functions found".to_string()));
     }
     compiler.compile_test_main()?;
+    // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
+    compiler.emit_export_wrappers()?;
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
     write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
@@ -815,6 +823,8 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.compile_pending_lambdas()?;
         // Task 4: Declare the calibration retention arena global (zeroinit .bss).
         compiler.emit_retention_arena()?;
+        // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
+        compiler.emit_export_wrappers()?;
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
@@ -956,6 +966,8 @@ pub fn compile_entry_returning_plan(
         );
     }
     let plan = compiler.last_wrga_plan.clone();
+    // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
+    compiler.emit_export_wrappers()?;
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
     write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;

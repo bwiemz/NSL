@@ -56,37 +56,61 @@ impl Compiler<'_> {
                 Some(decos) => extract_export_decorator(decos, self.interner),
                 None => (false, None),
             };
-            let effective_linkage = if is_export {
-                Linkage::Export
-            } else {
-                linkage
-            };
-            let symbol_name = if is_export {
-                override_name.unwrap_or_else(|| raw_name.clone())
-            } else {
-                cranelift_name.clone()
-            };
-
-            let func_id = self
-                .module
-                .declare_function(&symbol_name, effective_linkage, &sig)
-                .map_err(|e| {
-                    CodegenError::new(format!("failed to declare fn '{raw_name}': {e}"))
-                })?;
-            self.registry
-                .functions
-                .insert(raw_name.clone(), (func_id, sig));
-
-            // M62: record ExportInfo for @export functions so the CLI can
-            // emit a matching C header after codegen finishes.
             if is_export {
+                // 1. Internal implementation: mangled name + Linkage::Local + NSL-internal ABI.
+                let impl_symbol = format!("__nsl_export_impl_{}", raw_name);
+                let impl_func_id = self
+                    .module
+                    .declare_function(&impl_symbol, Linkage::Local, &sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!("failed to declare impl fn '{raw_name}': {e}"))
+                    })?;
+                self.registry
+                    .functions
+                    .insert(raw_name.clone(), (impl_func_id, sig.clone()));
+
+                // 2. C-ABI wrapper: exported name + Linkage::Export + C-ABI signature.
+                let wrapper_symbol = override_name
+                    .unwrap_or_else(|| raw_name.clone());
                 let info = crate::c_header::ExportInfo::from_fn_def(
                     fn_def,
                     &raw_name,
-                    &symbol_name,
+                    &wrapper_symbol,
                     self.interner,
                 );
+                let call_conv = self.module.target_config().default_call_conv;
+                let wrapper_sig =
+                    crate::c_wrapper::build_c_abi_wrapper_signature(&info, call_conv);
+                let wrapper_func_id = self
+                    .module
+                    .declare_function(&wrapper_symbol, Linkage::Export, &wrapper_sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!(
+                            "failed to declare wrapper fn '{wrapper_symbol}': {e}"
+                        ))
+                    })?;
+
+                // 3. Track for wrapper-body emission + header emission.
+                self.features
+                    .export_wrappers
+                    .push(crate::c_wrapper::ExportWrapper {
+                        impl_func_id,
+                        impl_sig: sig,
+                        wrapper_func_id,
+                        raw_name: raw_name.clone(),
+                        export_info: info.clone(),
+                    });
                 self.features.export_functions.push(info);
+            } else {
+                let func_id = self
+                    .module
+                    .declare_function(&cranelift_name, linkage, &sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!("failed to declare fn '{raw_name}': {e}"))
+                    })?;
+                self.registry
+                    .functions
+                    .insert(raw_name.clone(), (func_id, sig));
             }
 
             // Track decorated functions
