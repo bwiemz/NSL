@@ -201,6 +201,39 @@ pub enum PrimalOp {
     CshaFusedBackwardExtract {
         component: u8,
     },
+    /// Gap D: fused CSHA backward kernel launch op.
+    ///
+    /// Represents a call to `nsl_flash_attention_csha_backward` — the
+    /// 44-arg FFI that consumes the forward kernel's saved activations
+    /// (q_proj / k_proj / v_proj / row_max / row_sum / x_raw, stashed
+    /// per-layer on `Compiler.csha_forward_saves`) and the adjoint of
+    /// the attention output (`do_ptr`), and writes seven gradient
+    /// tensors: dq / dk / dv / dwq / dwk / dwv / dx.
+    ///
+    /// The op produces a single placeholder result VarId (a `Broadcast`
+    /// over a constant zero from the lowerer's perspective) — the seven
+    /// *real* outputs are side-channeled through
+    /// `Compiler.csha_fused_bwd_cache`, keyed by the op's first input
+    /// Cranelift Value.  Gap D's `EmitFused` arm pairs one
+    /// `FusedCshaBackward` with seven `CshaFusedBackwardExtract` ops
+    /// that share the same chain-key VarId as their first input, so
+    /// they all look up the same cache entry.
+    ///
+    /// Inputs (variadic, but conventionally):
+    ///   `[chain_key, do_adjoint, q_proj_result, k_proj_result,
+    ///     v_proj_result, x_input, wq, wk, wv]`
+    ///
+    /// `chain_key` is any VarId chosen by the AD emitter that's both
+    /// (a) distinct across layers in the same compile unit and (b)
+    /// shared verbatim by the seven extracts that follow.  Typical
+    /// choice: the chain's `matmul_op` result VarId.  The lowerer uses
+    /// the lowered Cranelift Value of `chain_key` as the cache key.
+    ///
+    /// `layer` carries the layer name so the lowerer can look up the
+    /// saved-activation pointer record on `Compiler.csha_forward_saves`.
+    FusedCshaBackward {
+        layer: String,
+    },
     RoPE {
         dim: usize,
     },
