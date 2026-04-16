@@ -169,7 +169,7 @@ pub fn emit_xnorm_recompute(ptx: &mut String, config: &FlashAttentionConfig) {
 /// head_dim]`). Each pair `(d[2i], d[2i+1])` gets inverse-rotated:
 ///   dx0 =  dY[2i]*cos + dY[2i+1]*sin
 ///   dx1 = -dY[2i]*sin + dY[2i+1]*cos
-/// cos/sin share the forward layout `[seq, head_dim/2]` f32.
+/// cos/sin share the forward layout `[seq, head_dim/2]` f16 in HBM.
 ///
 /// Work partition: 128 threads cooperatively cover `rows * half` pairs,
 /// `pairs_per_lane = ceil(total/128)` each. V is never rotated (matches
@@ -240,8 +240,8 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 "    rem.u64 %rd34, %rd32, {};  // pair_in_row\n", half
             ));
 
-            // cos/sin addr: cos_ptr + ((q_start + row) * half + pair_in_row)*4
-            // (f32 stride). For K tile we use row directly against kv_start=0
+            // cos/sin addr: cos_ptr + ((q_start + row) * half + pair_in_row)*2
+            // (f16 stride). For K tile we use row directly against kv_start=0
             // in the smoke scope; matching emit_rope_pair_sweep's q_start use.
             if label == "Q" {
                 ptx.push_str("    add.u64 %rd35, %rd33, %q_start;\n");
@@ -255,12 +255,14 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 "    mul.lo.u64 %rd35, %rd35, {};\n", half
             ));
             ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
-            ptx.push_str("    shl.b64 %rd35, %rd35, 2;  // *4 (f32 cos/sin)\n");
+            ptx.push_str("    shl.b64 %rd35, %rd35, 1;  // *2 (f16 cos/sin)\n");
 
             ptx.push_str("    add.u64 %rd36, %rd30, %rd35;\n");
-            ptx.push_str("    ld.global.f32 %f0, [%rd36];  // cos\n");
+            ptx.push_str("    ld.global.b16 %h_tmp, [%rd36];  // cos (f16)\n");
+            ptx.push_str("    cvt.f32.f16 %f0, %h_tmp;\n");
             ptx.push_str("    add.u64 %rd36, %rd31, %rd35;\n");
-            ptx.push_str("    ld.global.f32 %f1, [%rd36];  // sin\n");
+            ptx.push_str("    ld.global.b16 %h_tmp, [%rd36];  // sin (f16)\n");
+            ptx.push_str("    cvt.f32.f16 %f1, %h_tmp;\n");
 
             // dY addr: tile_off + (row*head_dim + 2*pair_in_row)*4 (f32 tile)
             ptx.push_str(&format!(
