@@ -1327,6 +1327,35 @@ impl Compiler<'_> {
         ) as i64;
         for d in diags { eprintln!("warning: {d}"); }
 
+        // Gap B: capture the CSHA-with-saves PTX / name / shmem triple up
+        // front so the `save_activations_for_backward` branch below can
+        // launch the training-specialised kernel instead of the
+        // inference-only PTX registered as `ptx_data_id` / `name_data_id`.
+        //
+        // When `compile_flash_attention_kernels` detected a `@train` block
+        // at module-scan time, it synthesized a second PTX with
+        // `csha=Some(save_activations_for_backward=true)` so the save
+        // code paths (`emit_save_activations_subset`) actually make it
+        // into kernel bytes. Runtime null guards on the save pointers
+        // keep the same PTX safe for inference launches — but we still
+        // prefer the non-CSHA PTX for inference to avoid paying CSHA's
+        // extra register pressure when no saves are needed.
+        let csha_with_saves_ptx_id = ctx.csha_forward_with_saves_ptx_id;
+        let csha_with_saves_name_id = ctx.csha_forward_with_saves_name_id;
+        let csha_training_shmem_bytes = ctx
+            .csha_training_config
+            .as_ref()
+            .map(|c| {
+                let mut d = Vec::<String>::new();
+                let bytes =
+                    crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+                        c, &mut d,
+                    ) as i64;
+                for s in d { eprintln!("warning: {s}"); }
+                bytes
+            })
+            .unwrap_or(shmem_bytes);
+
         // Allocate output tensor (same shape as Q, same device)
         let out_val = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[q_val])?;
 
@@ -1530,6 +1559,16 @@ impl Compiler<'_> {
                 let layer_key = csha_layer
                     .clone()
                     .unwrap_or_else(|| format!("csha_fa_ord_{}", ordinal));
+                // Gap B: copy the backward-PTX DataIds from the flash context
+                // into the per-layer save record so Gap C/D's adjoint emitter
+                // has everything needed to launch `nsl_flash_attention_csha_backward`
+                // from one lookup keyed by layer name.
+                let (bwd_ptx_id, bwd_name_id) = self
+                    .kernels
+                    .flash_attention_context
+                    .as_ref()
+                    .map(|c| (c.csha_backward_ptx_data_id, c.csha_backward_name_data_id))
+                    .unwrap_or((None, None));
                 self.csha_forward_saves.insert(
                     layer_key,
                     crate::csha_apply::CshaSavePointers {
@@ -1539,9 +1578,36 @@ impl Compiler<'_> {
                         row_max: row_max_v,
                         row_sum: row_sum_v,
                         x_raw: x_raw_v,
+                        backward_ptx_data_id: bwd_ptx_id,
+                        backward_name_data_id: bwd_name_id,
                     },
                 );
 
+                // Gap B: route the launch to the CSHA-with-saves PTX / name
+                // when they were synthesized at module scan. Without this
+                // the launch ends up on the inference PTX which has the
+                // save-writes gated-out by the
+                // `save_activations_for_backward` flag at synth time —
+                // pointers flow but the kernel never writes them.  Fall
+                // back to the default PTX on older compile paths that
+                // didn't run the Gap B synthesis (keeps the regression
+                // surface small — the save pointers will simply stay
+                // zeroed, matching pre-Gap-B behaviour).
+                let (save_ptx_ptr, save_name_ptr) =
+                    match (csha_with_saves_ptx_id, csha_with_saves_name_id) {
+                        (Some(pid), Some(nid)) => {
+                            let pgv = self.module.declare_data_in_func(pid, builder.func);
+                            let ngv = self.module.declare_data_in_func(nid, builder.func);
+                            (
+                                builder.ins().symbol_value(pointer_type(), pgv),
+                                builder.ins().symbol_value(pointer_type(), ngv),
+                            )
+                        }
+                        _ => (ptx_ptr, name_ptr),
+                    };
+                let save_shmem_val = builder
+                    .ins()
+                    .iconst(cl_types::I64, csha_training_shmem_bytes);
                 let _err = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha_with_saves",
@@ -1553,8 +1619,8 @@ impl Compiler<'_> {
                         null, null, null, null, // paged
                         null, null,             // RoPE
                         null, null,             // seq_ids, seq_lens
-                        shmem_val,
-                        ptx_ptr, name_ptr,
+                        save_shmem_val,
+                        save_ptx_ptr, save_name_ptr,
                         block_q_val, block_kv_val,
                         causal_val,
                         x_v, norm_w_v,

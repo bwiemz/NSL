@@ -21,6 +21,28 @@ pub(crate) fn parse_gpu_sm_from_target(target: &str) -> u32 {
         .unwrap_or_else(|| panic!("invalid compile target: {target}"))
 }
 
+/// Gap B: does the top-level statement list contain at least one
+/// `@train` block? Drives whether `compile_flash_attention_kernels`
+/// synthesizes the extra CSHA-with-saves forward PTX and the fused
+/// backward PTX.  Recursively scans `Decorated` wrappers because
+/// train blocks often sit inside test/bench decorators.
+fn stmts_contain_train_block(stmts: &[Stmt]) -> bool {
+    for s in stmts {
+        if contains_train_block_stmt(s) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_train_block_stmt(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::TrainBlock(_) => true,
+        StmtKind::Decorated { stmt: inner, .. } => contains_train_block_stmt(inner),
+        _ => false,
+    }
+}
+
 impl Compiler<'_> {
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
@@ -450,6 +472,7 @@ impl Compiler<'_> {
                         if let ModelMember::LayerDecl { decorators, .. } = member {
                             if let Some(ctx) = self.try_build_flash_context(decorators)? {
                                 self.kernels.flash_attention_context = Some(ctx);
+                                self.maybe_synthesize_csha_training_ptx(stmts)?;
                                 return Ok(());
                             }
                         }
@@ -461,8 +484,128 @@ impl Compiler<'_> {
 
             if let Some(ctx) = self.try_build_flash_context(decorators)? {
                 self.kernels.flash_attention_context = Some(ctx);
+                self.maybe_synthesize_csha_training_ptx(stmts)?;
                 return Ok(());
             }
+        }
+        Ok(())
+    }
+
+    /// Gap B: when the module contains a `@train` block AND a flash-attention
+    /// context was established, synthesize two extra PTX strings and attach
+    /// them to the context:
+    ///
+    ///   1. Forward PTX with `csha.save_activations_for_backward=true` —
+    ///      needed so `emit_save_activations_subset` actually generates the
+    ///      HBM save-writes.  The non-CSHA forward PTX has
+    ///      `csha=None`, which suppresses save emission at PTX level.
+    ///   2. Fused-backward PTX via `synthesize_backward(config)` — Gap C/D
+    ///      reads the resulting DataIds off `CshaSavePointers` to launch
+    ///      `nsl_flash_attention_csha_backward`.
+    ///
+    /// Both run against a CSHA-tweaked clone of the forward config.  We
+    /// use the minimum-invasive CSHA preset: `level=1`, no projection
+    /// fusion, no output-proj fusion, `save_activations_for_backward=true`.
+    /// That keeps the forward kernel's SMEM budget identical to the
+    /// inference baseline while wiring up the Tier C save codepaths.
+    ///
+    /// On any synthesis failure (e.g. backward SMEM validator rejects the
+    /// config) we log a diagnostic and leave the fields `None` — the
+    /// forward inference PTX still works, and the Gap A save-pointer
+    /// allocation continues to run (just into a kernel that ignores
+    /// them).  Non-regression is preserved.
+    fn maybe_synthesize_csha_training_ptx(
+        &mut self,
+        stmts: &[Stmt],
+    ) -> Result<(), CodegenError> {
+        if !stmts_contain_train_block(stmts) {
+            return Ok(());
+        }
+        let base_config = match self.kernels.flash_attention_context.as_ref() {
+            Some(ctx) => ctx.config.clone(),
+            None => return Ok(()),
+        };
+
+        // Minimum-invasive CSHA preset: boundary level + saves. Level 0
+        // is explicitly rejected by the kernel-name encoder, so we use
+        // level=1 without turning on any fusion flags — the only bit
+        // that actually matters for Gap B is
+        // `save_activations_for_backward=true`.
+        let csha_extras = crate::flash_attention::CshaExtras {
+            level: 1,
+            fused_rmsnorm: false,
+            fused_projections: false,
+            fused_output_proj: false,
+            active_heads: 0,
+            rmsnorm_eps: 1e-5,
+            d_model: 0,
+            save_activations_for_backward: true,
+        };
+        let training_config = crate::flash_attention::FlashAttentionConfig {
+            csha: Some(csha_extras),
+            ..base_config
+        };
+
+        // ── Forward with saves ─────────────────────────────
+        let mut diags = Vec::<String>::new();
+        let fwd_ptx_bytes =
+            crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+                &training_config, &mut diags,
+            );
+        for d in diags { eprintln!("warning: {d}"); }
+        let mut diags = Vec::<String>::new();
+        let fwd_kernel_name =
+            crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                &training_config, &mut diags,
+            );
+        for d in diags { eprintln!("warning: {d}"); }
+
+        let fwd_ptx_id = self.embed_raw_data(
+            &format!("__nsl_flash_ptx_csha_saves_{}", fwd_kernel_name),
+            fwd_ptx_bytes,
+        )?;
+        let mut fwd_name_bytes = fwd_kernel_name.as_bytes().to_vec();
+        fwd_name_bytes.push(0);
+        let fwd_name_id = self.embed_raw_data(
+            &format!("__nsl_flash_name_csha_saves_{}", fwd_kernel_name),
+            fwd_name_bytes,
+        )?;
+
+        // ── Fused backward ─────────────────────────────────
+        // The Tier C fused-backward validator has a tighter SMEM budget
+        // (adds dQ/dK/dV tiles).  If it rejects the training config we
+        // leave the backward IDs None — Gap C/D will detect this and
+        // fall through to the legacy tape-op backward path.
+        let (bwd_ptx_id, bwd_name_id) =
+            match crate::flash_attention_v2::synthesize_backward(&training_config) {
+                Ok(bwd_ptx_string) => {
+                    let bwd_kernel_name = format!("{}_bwd", fwd_kernel_name);
+                    let bwd_ptx_id = self.embed_raw_data(
+                        &format!("__nsl_flash_ptx_csha_bwd_{}", fwd_kernel_name),
+                        bwd_ptx_string.into_bytes(),
+                    )?;
+                    let mut name_bytes = bwd_kernel_name.as_bytes().to_vec();
+                    name_bytes.push(0);
+                    let bwd_name_id = self.embed_raw_data(
+                        &format!("__nsl_flash_name_csha_bwd_{}", fwd_kernel_name),
+                        name_bytes,
+                    )?;
+                    (Some(bwd_ptx_id), Some(bwd_name_id))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[csha-gap-b] backward PTX synthesis skipped — validator rejected: {e}"
+                    );
+                    (None, None)
+                }
+            };
+
+        if let Some(ctx) = self.kernels.flash_attention_context.as_mut() {
+            ctx.csha_forward_with_saves_ptx_id = Some(fwd_ptx_id);
+            ctx.csha_forward_with_saves_name_id = Some(fwd_name_id);
+            ctx.csha_backward_ptx_data_id = bwd_ptx_id;
+            ctx.csha_backward_name_data_id = bwd_name_id;
+            ctx.csha_training_config = Some(training_config);
         }
         Ok(())
     }
@@ -754,6 +897,16 @@ impl Compiler<'_> {
                 bwd_phase1_name_data_id: Some(bwd_p1_name_id),
                 bwd_phase2_name_data_id: Some(bwd_p2_name_id),
                 bwd_config: Some(bwd_config),
+                // Gap B: these are populated in `compile_flash_attention_kernels`
+                // after the context is built, if the module contains a `@train`
+                // block. The autotune path here doesn't handle training
+                // specialisation — Gap B wiring uses the single-config fallback
+                // below for both autotune and non-autotune programs.
+                csha_forward_with_saves_ptx_id: None,
+                csha_forward_with_saves_name_id: None,
+                csha_backward_ptx_data_id: None,
+                csha_backward_name_data_id: None,
+                csha_training_config: None,
             }))
         } else {
             // No @autotune — single-config path (original behaviour)
@@ -869,6 +1022,15 @@ impl Compiler<'_> {
                 bwd_phase1_name_data_id: Some(bwd_p1_name_id),
                 bwd_phase2_name_data_id: Some(bwd_p2_name_id),
                 bwd_config: Some(bwd_config),
+                // Gap B: filled in by `compile_flash_attention_kernels` after
+                // this method returns — it decides whether to synthesize the
+                // CSHA with-saves forward PTX and the fused backward PTX
+                // based on a `@train`-block pre-scan of the top-level stmts.
+                csha_forward_with_saves_ptx_id: None,
+                csha_forward_with_saves_name_id: None,
+                csha_backward_ptx_data_id: None,
+                csha_backward_name_data_id: None,
+                csha_training_config: None,
             }))
         }
     }

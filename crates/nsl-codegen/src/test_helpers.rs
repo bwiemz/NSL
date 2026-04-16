@@ -217,3 +217,48 @@ pub fn flash_sm_for_compile_target(target: &str) -> u32 {
         .config
         .gpu_sm
 }
+
+/// Gap B observation helper: what `compile_flash_attention_kernels`
+/// wired onto the `FlashAttentionCompileContext` when given a program
+/// that (optionally) contains a `@train` block.
+///
+/// Returns `(has_forward_with_saves, has_backward_ptx, training_config_level)`
+/// where the third field is `Some(level)` iff the training CSHA config
+/// was recorded (meaning the pre-scan saw `@train`).  Used by the
+/// Gap B integration test to assert the forward PTX actually grew the
+/// save-write codepaths and that Gap C/D's expected backward-PTX
+/// DataId arrived on the context.
+pub fn flash_gap_b_context_for_source(src: &str) -> (bool, bool, Option<u8>) {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    // `parse_gpu_sm_from_target` panics on anything that isn't `sm_<N>`;
+    // the default is `"cuda"` (valid at link time, not PTX time), so we
+    // override to `sm_80` which matches the other test harnesses.
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new failed in flash_gap_b_context_for_source");
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .expect("compile_flash_attention_kernels failed in flash_gap_b_context_for_source");
+
+    match compiler.kernels.flash_attention_context {
+        Some(ctx) => (
+            ctx.csha_forward_with_saves_ptx_id.is_some(),
+            ctx.csha_backward_ptx_data_id.is_some(),
+            ctx.csha_training_config
+                .as_ref()
+                .and_then(|c| c.csha.as_ref().map(|e| e.level)),
+        ),
+        None => (false, false, None),
+    }
+}
