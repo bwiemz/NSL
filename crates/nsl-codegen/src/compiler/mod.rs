@@ -464,6 +464,20 @@ pub struct Compiler<'a> {
     /// the same hook that sets `last_csha_bridge`.  `None` when CSHA
     /// is off or no boundary chains exist.
     pub csha_backward_claims: Option<crate::source_ad::CshaBackwardClaims>,
+    /// Gap A: per-layer CSHA activation-save pointers emitted by the
+    /// forward FA call site. Keyed by layer name (matching
+    /// `BridgeResult.extras` / `csha_backward_claims.chain_marks[_].layer`).
+    /// The fused source-AD backward emission consumes this map to
+    /// thread `q_proj` / `k_proj` / `v_proj` / `row_max` / `row_sum` /
+    /// `x_raw` device pointers into `nsl_flash_attention_csha_backward`.
+    ///
+    /// Lives on `Compiler` (not `FusionMark`) because the bridge's
+    /// `BridgeResult.marks` and `CshaBackwardClaims.chain_marks` are
+    /// independent clones — a mark-local stash would not be visible
+    /// across both paths. Keyed by layer name keeps the map in sync
+    /// with everything else that addresses CSHA state by layer.
+    pub csha_forward_saves:
+        std::collections::HashMap<String, crate::csha_apply::CshaSavePointers>,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
     /// (but potentially different α/rank scales) share one PTX string.
@@ -631,6 +645,7 @@ impl<'a> Compiler<'a> {
             csha_fa_call_ordinal: 0,
             csha_claimed_ops: std::collections::HashSet::new(),
             csha_backward_claims: None,
+            csha_forward_saves: std::collections::HashMap::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,

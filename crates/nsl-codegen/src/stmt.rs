@@ -4010,14 +4010,24 @@ impl Compiler<'_> {
                             // to keep the kernels / marks / configs map
                             // available to downstream code.
                             let mut diags = Vec::<String>::new();
-                            self.last_csha_bridge = Some(crate::csha_apply::bridge(
+                            let mut bridge_out = crate::csha_apply::bridge(
                                 &plan,
                                 plan.per_layer
                                     .first()
                                     .map(|lp| lp.tiles.head_dim as i64)
                                     .unwrap_or(64),
                                 &mut diags,
-                            ));
+                            );
+                            // Gap A: we're inside `compile_train_block`, so
+                            // `@train` is active — flip the save flag on
+                            // every per-layer CshaExtras. The forward FA
+                            // call site (`compile_flash_attention_call`)
+                            // reads this to decide between the no-saves
+                            // and with-saves FFI variants.
+                            for extras in bridge_out.extras.values_mut() {
+                                extras.save_activations_for_backward = true;
+                            }
+                            self.last_csha_bridge = Some(bridge_out);
                             for d in diags { eprintln!("warning: {d}"); }
                             // A.2.1d: record the Wengert op indices CSHA
                             // has claimed across all boundary chains so

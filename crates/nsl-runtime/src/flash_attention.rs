@@ -1761,6 +1761,61 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations(
     { let _ = a; }
 }
 
+/// Gap A: codegen-friendly wrapper around
+/// `nsl_csha_alloc_backward_activations` that writes the 6 device pointers
+/// into `out_ptr` as a contiguous `[i64; 6]` array.
+///
+/// Struct-by-value returns are fiddly to emit from Cranelift (sret),
+/// so the compiler-side emission uses this i64-array variant instead.
+/// Layout matches `CshaBackwardActivations` field order:
+///   \[0] q_proj, \[1] k_proj, \[2] v_proj,
+///   \[3] row_max, \[4] row_sum, \[5] x_raw
+///
+/// Returns `0` on success. A zero pointer in any slot indicates allocation
+/// failure (matches `nsl_csha_alloc_backward_activations` semantics).
+///
+/// SAFETY: `out_ptr` must point to at least 48 bytes (6 × i64) of writable
+/// memory and be 8-byte aligned.
+#[no_mangle]
+pub unsafe extern "C" fn nsl_csha_alloc_backward_activations_into(
+    batch: i64, heads: i64, seq: i64, head_dim: i64,
+    out_ptr: i64,
+) -> i64 {
+    let a = nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim);
+    if out_ptr == 0 {
+        // No slot to write into — free immediately to avoid leak and fail.
+        nsl_csha_free_backward_activations(a);
+        return -1;
+    }
+    let slots = out_ptr as *mut i64;
+    // SAFETY: caller guarantees at least 6 i64 slots.
+    slots.add(0).write(a.q_proj);
+    slots.add(1).write(a.k_proj);
+    slots.add(2).write(a.v_proj);
+    slots.add(3).write(a.row_max);
+    slots.add(4).write(a.row_sum);
+    slots.add(5).write(a.x_raw);
+    0
+}
+
+/// Gap A: codegen-friendly free variant taking 6 individual i64 pointers
+/// (matches the i64-array produced by
+/// `nsl_csha_alloc_backward_activations_into`). Avoids passing
+/// `CshaBackwardActivations` by-value across the Cranelift ABI boundary.
+///
+/// Safe to call with zero pointers — they are silently skipped, mirroring
+/// `nsl_csha_free_backward_activations`.
+#[no_mangle]
+pub unsafe extern "C" fn nsl_csha_free_backward_activations_from(
+    q_proj: i64, k_proj: i64, v_proj: i64,
+    row_max: i64, row_sum: i64, x_raw: i64,
+) {
+    let a = CshaBackwardActivations {
+        q_proj, k_proj, v_proj, row_max, row_sum, x_raw,
+    };
+    nsl_csha_free_backward_activations(a);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
