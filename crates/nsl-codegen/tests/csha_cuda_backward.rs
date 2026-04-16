@@ -474,6 +474,146 @@ fn t6_3_smoke_single_config() {
     }
 }
 
+/// Numerical sweep across (head_dim, causal, rope_q). One line per config
+/// with per-gradient max_abs and PASS/FAIL. Gated by the same three
+/// NUMERICAL_GATE_* consts as the smoke — only enabled gates panic.
+///
+/// Matrix: head_dim ∈ {32, 64, 128}, heads=1, causal ∈ {0,1}, rope_q ∈ {0,1}.
+/// Configs rejected by `validate_scalar_v2_config(.., Backward)` are
+/// skipped with a log line. Configs with rc≠0 at forward/backward
+/// launch are logged as FAIL but do not abort the sweep.
+#[test]
+#[ignore]
+fn t6_3_matrix_sweep_numerical() {
+    if !cuda_available() {
+        eprintln!("[T6.3 num] skipping — no CUDA");
+        return;
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        pass: u32,
+        fail: u32,
+        skipped_validator: u32,
+        skipped_launch: u32,
+        fail_detail: Vec<String>,
+    }
+    let mut tally = Tally::default();
+
+    // Iterate in a deterministic order.
+    for &hd in &[32u32, 64, 128] {
+        for &causal in &[false, true] {
+            for &rope_q in &[false, true] {
+                // Use block_q == block_kv == head_dim (fused_projections
+                // validator requirement + Tier A smoke convention).
+                let bq = hd;
+                let bkv = hd;
+                let heads = 1u32;
+                let dm = hd;
+
+                // Pre-check validator so we can log a clean skip before
+                // forward alloc.  Construct the same config shape as
+                // run_fused_backward_config.
+                let pre_cfg = FlashAttentionConfig {
+                    block_q: bq as i64, block_kv: bkv as i64, head_dim: hd as i64,
+                    causal, paged: false, rope_q,
+                    rope_style: RopeStyle::Adjacent,
+                    gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+                    csha: Some(CshaExtras {
+                        level: 2, fused_rmsnorm: true, fused_projections: true,
+                        fused_output_proj: false,
+                        save_activations_for_backward: true,
+                        active_heads: heads,
+                        rmsnorm_eps: 1e-5, d_model: dm,
+                    }),
+                };
+                if let Err(e) = smem_layout::validate_scalar_v2_config(
+                    &pre_cfg, Direction::Backward,
+                ) {
+                    let fwd = smem_layout::total_bytes(&pre_cfg);
+                    let extra = smem_layout::backward_extra_bytes(&pre_cfg);
+                    eprintln!(
+                        "[sweep] hd={hd} causal={} rope={} SKIP validator \
+                         (fwd={fwd}B extra={extra}B total={}B): {e}",
+                        causal as u8, rope_q as u8, fwd + extra
+                    );
+                    tally.skipped_validator += 1;
+                    continue;
+                }
+
+                let (gpu, cpu) = match run_fused_backward_config(
+                    bq, bkv, hd, heads, dm, causal, rope_q,
+                ) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!(
+                            "[sweep] hd={hd} causal={} rope={} SKIP launch: {e}",
+                            causal as u8, rope_q as u8
+                        );
+                        tally.skipped_launch += 1;
+                        continue;
+                    }
+                };
+
+                let dq = max_abs_diff(&gpu.dq, &cpu.dq);
+                let dk = max_abs_diff(&gpu.dk, &cpu.dk);
+                let dv = max_abs_diff(&gpu.dv, &cpu.dv);
+                let dwq = max_abs_diff(&gpu.dwq, &cpu.dwq);
+                let dwk = max_abs_diff(&gpu.dwk, &cpu.dwk);
+                let dwv = max_abs_diff(&gpu.dwv, &cpu.dwv);
+                let dx = max_abs_diff(&gpu.dx, &cpu.dx);
+
+                let tol = tol_for_head_dim(hd);
+                let dx_tol = (tol * 6.0).max(1e-2);
+
+                let mut fails: Vec<String> = Vec::new();
+                if NUMERICAL_GATE_DQKV_ENABLED {
+                    if dq >= tol { fails.push(format!("dq={dq:.2e}>{tol:.0e}")); }
+                    if dk >= tol { fails.push(format!("dk={dk:.2e}>{tol:.0e}")); }
+                    if dv >= tol { fails.push(format!("dv={dv:.2e}>{tol:.0e}")); }
+                }
+                if NUMERICAL_GATE_DW_ENABLED {
+                    if dwq >= tol { fails.push(format!("dwq={dwq:.2e}>{tol:.0e}")); }
+                    if dwk >= tol { fails.push(format!("dwk={dwk:.2e}>{tol:.0e}")); }
+                    if dwv >= tol { fails.push(format!("dwv={dwv:.2e}>{tol:.0e}")); }
+                }
+                if NUMERICAL_GATE_DX_ENABLED && dx >= dx_tol {
+                    fails.push(format!("dx={dx:.2e}>{dx_tol:.0e}"));
+                }
+
+                let status = if fails.is_empty() { "PASS" } else { "FAIL" };
+                eprintln!(
+                    "[sweep] hd={hd} causal={} rope={}: dq={dq:.2e} dk={dk:.2e} \
+                     dv={dv:.2e} dwq={dwq:.2e} dwk={dwk:.2e} dwv={dwv:.2e} dx={dx:.2e} \
+                     [{status}]{}",
+                    causal as u8, rope_q as u8,
+                    if fails.is_empty() { "".into() } else { format!(" ({})", fails.join(",")) }
+                );
+                if fails.is_empty() {
+                    tally.pass += 1;
+                } else {
+                    tally.fail += 1;
+                    tally.fail_detail.push(format!(
+                        "hd={hd} causal={} rope={}: {}",
+                        causal as u8, rope_q as u8, fails.join(",")
+                    ));
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "[sweep] tally: pass={} fail={} skipped_validator={} skipped_launch={}",
+        tally.pass, tally.fail, tally.skipped_validator, tally.skipped_launch
+    );
+    if tally.fail > 0 {
+        panic!(
+            "numerical sweep: {} config(s) failed:\n  {}",
+            tally.fail, tally.fail_detail.join("\n  ")
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn t6_3_matrix_sweep_structural() {
