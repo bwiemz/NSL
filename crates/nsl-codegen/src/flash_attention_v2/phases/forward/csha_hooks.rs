@@ -53,6 +53,11 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         q_tile_iter
     ));
 
+    // Tier C: load x_raw_ptr once (for the per-slice raw-x save below).
+    // Null x_raw_ptr -> %p1 set, save stores are gated off per slice.
+    ptx.push_str("    ld.param.u64 %rd58, [x_raw_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p1, %rd58, 0;\n");
+
     // Each warp normalizes its own x_row. Lane-strided sumsq across
     // head_dim slices, warp butterfly reduce, divide, multiply by
     // per-dim norm_weight.
@@ -81,6 +86,11 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         ptx.push_str("    add.u64 %rd54, %rd52, %rd54;\n");
         ptx.push_str("    ld.global.f32 %f1, [%rd54];\n");
         ptx.push_str("    fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x\n");
+        // Tier C: save raw x[d] to x_raw_ptr at the same offset (skip if null).
+        // %rd58 holds x_raw_ptr base, %p1 = (x_raw_ptr == 0).
+        ptx.push_str("    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base\n");
+        ptx.push_str("    add.u64 %rd59, %rd58, %rd59;        // x_raw addr\n");
+        ptx.push_str("    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)\n");
     }
     // 5-step butterfly sum.
     for offset in [16u32, 8, 4, 2, 1] {

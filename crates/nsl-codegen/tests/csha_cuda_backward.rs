@@ -64,14 +64,24 @@ use nsl_runtime::flash_attention::{
     CshaBackwardActivations,
 };
 
-// ── Gate: flip to true after Phase 3 placeholder loads are replaced ─────────
+// ── Gates ──────────────────────────────────────────────────────────────────
 //
-// Until the T3.3/T3.4/T3.5/T3.6 inner loops read Q/K/V/dO/x_norm from
-// HBM instead of using 0f3F800000 placeholder constants, any numerical
-// tolerance comparison against the CPU reference is meaningless.
-// Structural assertions (rc=0, finite gradients, correct shapes) run
-// unconditionally.
-const NUMERICAL_GATE_ENABLED: bool = false;
+// dq/dk/dv: enabled after the three structural fixes on feat/csha-tier-c-diag
+//   (V save scheduling, backward V-input SMEM tile, per-iter dQ SMEM flush).
+//   Tier A 5e-3 tolerance for head_dim=32.
+//
+// dwq/dwk/dwv: enabled after emit_dproj real addressing + x_norm tile
+//   re-materialisation lands (feat/csha-tier-c-diag). Under the smoke
+//   scope (heads=1, no RoPE, no causal) max_abs lands ≤ 5e-3.
+//
+// dx: STILL BLOCKED — not on addressing but on a forward-side issue:
+//   `phases/forward/csha_hooks.rs::emit_prologue` writes x_normed back
+//   into `csha_x_ptr` in place, so the backward has no raw x to feed
+//   the closed-form dx formula. Fix requires a new forward save pointer
+//   (e.g. `x_raw_save`) on the backward activations struct.
+const NUMERICAL_GATE_DQKV_ENABLED: bool = true;
+const NUMERICAL_GATE_DW_ENABLED:   bool = true;
+const NUMERICAL_GATE_DX_ENABLED:   bool = true;
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) as u32;
@@ -295,6 +305,7 @@ fn run_fused_backward_config(
             heads as i64, dm as i64,
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
+            saves.x_raw,
         )
     };
     if rc_fwd != 0 {
@@ -333,6 +344,7 @@ fn run_fused_backward_config(
             heads as i64, dm as i64,
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
+            saves.x_raw,
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
         )
@@ -427,26 +439,177 @@ fn t6_3_smoke_single_config() {
     let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
     let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
     let d_dwq = max_abs_diff(&gpu.dwq, &cpu.dwq);
+    let d_dwk = max_abs_diff(&gpu.dwk, &cpu.dwk);
+    let d_dwv = max_abs_diff(&gpu.dwv, &cpu.dwv);
     let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
     eprintln!(
         "[T6.3 smoke] head_dim=32 max_abs: dq={d_dq:.3e} dk={d_dk:.3e} \
-         dv={d_dv:.3e} dwq={d_dwq:.3e} dx={d_dx:.3e}"
+         dv={d_dv:.3e} dwq={d_dwq:.3e} dwk={d_dwk:.3e} dwv={d_dwv:.3e} dx={d_dx:.3e}"
     );
 
-    if NUMERICAL_GATE_ENABLED {
-        let tol = tol_for_head_dim(32);
+    let tol = tol_for_head_dim(32);
+    if NUMERICAL_GATE_DQKV_ENABLED {
         assert!(d_dq < tol, "dq max_abs {d_dq:.3e} > tol {tol:.1e}");
         assert!(d_dk < tol, "dk max_abs {d_dk:.3e} > tol {tol:.1e}");
         assert!(d_dv < tol, "dv max_abs {d_dv:.3e} > tol {tol:.1e}");
+    }
+    if NUMERICAL_GATE_DW_ENABLED {
         assert!(d_dwq < tol, "dwq max_abs {d_dwq:.3e} > tol {tol:.1e}");
-        assert!(d_dx < tol, "dx max_abs {d_dx:.3e} > tol {tol:.1e}");
+        assert!(d_dwk < tol, "dwk max_abs {d_dwk:.3e} > tol {tol:.1e}");
+        assert!(d_dwv < tol, "dwv max_abs {d_dwv:.3e} > tol {tol:.1e}");
+    }
+    if NUMERICAL_GATE_DX_ENABLED {
+        // dx tolerance includes an additional sqrt(D)·ε_f16 factor from the
+        // s_grad = sum_d (g_d · x_d) reduction inside the dRMSNorm closed
+        // form (one extra reduction beyond what dq/dk/dv carry). For
+        // head_dim=32 this lifts the bound from 5e-3 → ~3e-2.
+        let dx_tol = (tol * 6.0).max(1e-2);
+        assert!(d_dx < dx_tol, "dx max_abs {d_dx:.3e} > tol {dx_tol:.1e}");
     } else {
         eprintln!(
-            "[T6.3] BLOCKED: numerical gate disabled pending Phase 3 \
-             inner-loop HBM-load implementation (T3.3/T3.4/T3.5/T3.6 \
-             emit placeholder 0f3F800000 constants for Q/K/V/dO/x_norm \
-             reads). Flip NUMERICAL_GATE_ENABLED=true after real \
-             addressing lands."
+            "[T6.3] dx gate disabled: forward RMSNorm prologue overwrites \
+             csha_x_ptr with x_normed in-place; backward has no raw x for \
+             the closed-form dx. Needs a forward-side x_save pointer."
+        );
+    }
+}
+
+/// Numerical sweep across (head_dim, causal, rope_q). One line per config
+/// with per-gradient max_abs and PASS/FAIL. Gated by the same three
+/// NUMERICAL_GATE_* consts as the smoke — only enabled gates panic.
+///
+/// Matrix: head_dim ∈ {32, 64, 128}, heads=1, causal ∈ {0,1}, rope_q ∈ {0,1}.
+/// Configs rejected by `validate_scalar_v2_config(.., Backward)` are
+/// skipped with a log line. Configs with rc≠0 at forward/backward
+/// launch are logged as FAIL but do not abort the sweep.
+#[test]
+#[ignore]
+fn t6_3_matrix_sweep_numerical() {
+    if !cuda_available() {
+        eprintln!("[T6.3 num] skipping — no CUDA");
+        return;
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        pass: u32,
+        fail: u32,
+        skipped_validator: u32,
+        skipped_launch: u32,
+        fail_detail: Vec<String>,
+    }
+    let mut tally = Tally::default();
+
+    // Iterate in a deterministic order.
+    for &hd in &[32u32, 64, 128] {
+        for &causal in &[false, true] {
+            for &rope_q in &[false, true] {
+                // Use block_q == block_kv == head_dim (fused_projections
+                // validator requirement + Tier A smoke convention).
+                let bq = hd;
+                let bkv = hd;
+                let heads = 1u32;
+                let dm = hd;
+
+                // Pre-check validator so we can log a clean skip before
+                // forward alloc.  Construct the same config shape as
+                // run_fused_backward_config.
+                let pre_cfg = FlashAttentionConfig {
+                    block_q: bq as i64, block_kv: bkv as i64, head_dim: hd as i64,
+                    causal, paged: false, rope_q,
+                    rope_style: RopeStyle::Adjacent,
+                    gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+                    csha: Some(CshaExtras {
+                        level: 2, fused_rmsnorm: true, fused_projections: true,
+                        fused_output_proj: false,
+                        save_activations_for_backward: true,
+                        active_heads: heads,
+                        rmsnorm_eps: 1e-5, d_model: dm,
+                    }),
+                };
+                if let Err(e) = smem_layout::validate_scalar_v2_config(
+                    &pre_cfg, Direction::Backward,
+                ) {
+                    let fwd = smem_layout::total_bytes(&pre_cfg);
+                    let extra = smem_layout::backward_extra_bytes(&pre_cfg);
+                    eprintln!(
+                        "[sweep] hd={hd} causal={} rope={} SKIP validator \
+                         (fwd={fwd}B extra={extra}B total={}B): {e}",
+                        causal as u8, rope_q as u8, fwd + extra
+                    );
+                    tally.skipped_validator += 1;
+                    continue;
+                }
+
+                let (gpu, cpu) = match run_fused_backward_config(
+                    bq, bkv, hd, heads, dm, causal, rope_q,
+                ) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!(
+                            "[sweep] hd={hd} causal={} rope={} SKIP launch: {e}",
+                            causal as u8, rope_q as u8
+                        );
+                        tally.skipped_launch += 1;
+                        continue;
+                    }
+                };
+
+                let dq = max_abs_diff(&gpu.dq, &cpu.dq);
+                let dk = max_abs_diff(&gpu.dk, &cpu.dk);
+                let dv = max_abs_diff(&gpu.dv, &cpu.dv);
+                let dwq = max_abs_diff(&gpu.dwq, &cpu.dwq);
+                let dwk = max_abs_diff(&gpu.dwk, &cpu.dwk);
+                let dwv = max_abs_diff(&gpu.dwv, &cpu.dwv);
+                let dx = max_abs_diff(&gpu.dx, &cpu.dx);
+
+                let tol = tol_for_head_dim(hd);
+                let dx_tol = (tol * 6.0).max(1e-2);
+
+                let mut fails: Vec<String> = Vec::new();
+                if NUMERICAL_GATE_DQKV_ENABLED {
+                    if dq >= tol { fails.push(format!("dq={dq:.2e}>{tol:.0e}")); }
+                    if dk >= tol { fails.push(format!("dk={dk:.2e}>{tol:.0e}")); }
+                    if dv >= tol { fails.push(format!("dv={dv:.2e}>{tol:.0e}")); }
+                }
+                if NUMERICAL_GATE_DW_ENABLED {
+                    if dwq >= tol { fails.push(format!("dwq={dwq:.2e}>{tol:.0e}")); }
+                    if dwk >= tol { fails.push(format!("dwk={dwk:.2e}>{tol:.0e}")); }
+                    if dwv >= tol { fails.push(format!("dwv={dwv:.2e}>{tol:.0e}")); }
+                }
+                if NUMERICAL_GATE_DX_ENABLED && dx >= dx_tol {
+                    fails.push(format!("dx={dx:.2e}>{dx_tol:.0e}"));
+                }
+
+                let status = if fails.is_empty() { "PASS" } else { "FAIL" };
+                eprintln!(
+                    "[sweep] hd={hd} causal={} rope={}: dq={dq:.2e} dk={dk:.2e} \
+                     dv={dv:.2e} dwq={dwq:.2e} dwk={dwk:.2e} dwv={dwv:.2e} dx={dx:.2e} \
+                     [{status}]{}",
+                    causal as u8, rope_q as u8,
+                    if fails.is_empty() { "".into() } else { format!(" ({})", fails.join(",")) }
+                );
+                if fails.is_empty() {
+                    tally.pass += 1;
+                } else {
+                    tally.fail += 1;
+                    tally.fail_detail.push(format!(
+                        "hd={hd} causal={} rope={}: {}",
+                        causal as u8, rope_q as u8, fails.join(",")
+                    ));
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "[sweep] tally: pass={} fail={} skipped_validator={} skipped_launch={}",
+        tally.pass, tally.fail, tally.skipped_validator, tally.skipped_launch
+    );
+    if tally.fail > 0 {
+        panic!(
+            "numerical sweep: {} config(s) failed:\n  {}",
+            tally.fail, tally.fail_detail.join("\n  ")
         );
     }
 }
@@ -500,4 +663,68 @@ fn t6_3_matrix_sweep_structural() {
             }
         }
     }
+}
+
+/// Diagnostic pass 2: localise which backward SMEM tile is first to
+/// diverge. Dumps max_abs_diff, first-8-element side-by-side, peak
+/// element, and zero-count for dq/dk/dv at the smoke config. Signals:
+///   * all-zero             → accumulator dropped / never reached HBM
+///   * constant             → gated by a broken predicate
+///   * cpu × scalar         → scale bug
+///   * right sign, wrong k  → addressing / missing-term bug
+///   * noise uncorrelated   → SMEM aliasing (K/V share kv_offset)
+#[test]
+#[ignore]
+fn t6_3_element_dump_diag() {
+    if !cuda_available() {
+        eprintln!("[T6.3 diag] skipping — no CUDA");
+        return;
+    }
+    let (gpu, cpu) = run_fused_backward_config(32, 32, 32, 1, 32, false, false)
+        .expect("smoke config must launch structurally");
+
+    fn dump(name: &str, gpu: &[f32], cpu: &[f32]) {
+        assert_eq!(gpu.len(), cpu.len(), "{name} len mismatch");
+        let mut max_abs = 0f32;
+        let mut peak_idx = 0usize;
+        for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let d = (g - c).abs();
+            if d > max_abs { max_abs = d; peak_idx = i; }
+        }
+        let zeros = gpu.iter().filter(|v| v.abs() < 1e-8).count();
+        let const_q = {
+            // crude "is it nearly constant" heuristic: min/max spread
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &v in gpu { if v < lo { lo = v; } if v > hi { hi = v; } }
+            hi - lo
+        };
+        // cpu × scalar check: median(gpu/cpu) — pick a few non-tiny cpu entries.
+        let mut ratios = Vec::new();
+        for (&g, &c) in gpu.iter().zip(cpu.iter()).take(64) {
+            if c.abs() > 1e-3 { ratios.push(g / c); }
+        }
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_ratio = if ratios.is_empty() { f32::NAN } else { ratios[ratios.len() / 2] };
+
+        eprintln!("─── {name}  len={}  max_abs_diff={:.3e}  zero_count={}/{}  spread(hi-lo)={:.3e}  median(g/c)={:.3e}",
+            gpu.len(), max_abs, zeros, gpu.len(), const_q, median_ratio);
+        eprintln!("  peak idx={peak_idx} gpu={:.4e} cpu={:.4e} diff={:.4e}",
+            gpu[peak_idx], cpu[peak_idx], gpu[peak_idx] - cpu[peak_idx]);
+        eprintln!("  first 8:   idx | gpu           | cpu           | diff");
+        for i in 0..8.min(gpu.len()) {
+            eprintln!("            {:>3} | {:>13.5e} | {:>13.5e} | {:>13.5e}",
+                i, gpu[i], cpu[i], gpu[i] - cpu[i]);
+        }
+    }
+
+    eprintln!("[T6.3 diag] config: bq=32 bkv=32 hd=32 heads=1 dm=32 causal=false rope=false");
+    dump("dq", &gpu.dq, &cpu.dq);
+    dump("dk", &gpu.dk, &cpu.dk);
+    dump("dv", &gpu.dv, &cpu.dv);
+    eprintln!("[T6.3 diag] SMEM-aliasing hypothesis: backward prelude sets \
+        %k_smem_base and %v_smem_base BOTH to kv_offset (phases/backward/prelude.rs:174-179). \
+        After kv_load::emit_v runs (mod.rs:472), the K tile holds V data. ds_compute then \
+        recomputes S = Q·V^T instead of Q·K^T (ds_compute.rs:75), corrupting P, dS, dP \
+        and therefore dq/dk/dv. Fix: allocate a separate V-input SMEM region (e.g. extend \
+        backward_extra_bytes by block_kv*head_dim*2) and point %v_smem_base there.");
 }

@@ -826,9 +826,9 @@ fn run_with_saves(
     let smem_total = shared_mem_bytes_selected(&config);
     let smem_dynamic = if needs_dynamic_smem(&config) { smem_total as i64 } else { 0 };
 
-    let (qp, kp, vp, rmx, rsm) = saves
-        .map(|s| (s.q_proj, s.k_proj, s.v_proj, s.row_max, s.row_sum))
-        .unwrap_or((0, 0, 0, 0, 0));
+    let (qp, kp, vp, rmx, rsm, xr) = saves
+        .map(|s| (s.q_proj, s.k_proj, s.v_proj, s.row_max, s.row_sum, s.x_raw))
+        .unwrap_or((0, 0, 0, 0, 0, 0));
 
     let rc = unsafe {
         nsl_flash_attention_csha_with_saves(
@@ -846,7 +846,7 @@ fn run_with_saves(
             x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
             0, norm_eps.to_bits() as i64,
             heads as i64, dm as i64,
-            qp, kp, vp, rmx, rsm,
+            qp, kp, vp, rmx, rsm, xr,
         )
     };
     if rc != 0 {
@@ -1025,6 +1025,7 @@ fn t4_csha_backward_ffi_smoke() {
             heads, d_model,
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
+            saves.x_raw,
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
         )
