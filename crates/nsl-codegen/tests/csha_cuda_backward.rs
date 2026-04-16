@@ -81,7 +81,7 @@ use nsl_runtime::flash_attention::{
 //   (e.g. `x_raw_save`) on the backward activations struct.
 const NUMERICAL_GATE_DQKV_ENABLED: bool = true;
 const NUMERICAL_GATE_DW_ENABLED:   bool = true;
-const NUMERICAL_GATE_DX_ENABLED:   bool = false;
+const NUMERICAL_GATE_DX_ENABLED:   bool = true;
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) as u32;
@@ -305,6 +305,7 @@ fn run_fused_backward_config(
             heads as i64, dm as i64,
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
+            saves.x_raw,
         )
     };
     if rc_fwd != 0 {
@@ -343,6 +344,7 @@ fn run_fused_backward_config(
             heads as i64, dm as i64,
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
+            saves.x_raw,
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
         )
@@ -457,7 +459,12 @@ fn t6_3_smoke_single_config() {
         assert!(d_dwv < tol, "dwv max_abs {d_dwv:.3e} > tol {tol:.1e}");
     }
     if NUMERICAL_GATE_DX_ENABLED {
-        assert!(d_dx < tol, "dx max_abs {d_dx:.3e} > tol {tol:.1e}");
+        // dx tolerance includes an additional sqrt(D)·ε_f16 factor from the
+        // s_grad = sum_d (g_d · x_d) reduction inside the dRMSNorm closed
+        // form (one extra reduction beyond what dq/dk/dv carry). For
+        // head_dim=32 this lifts the bound from 5e-3 → ~3e-2.
+        let dx_tol = (tol * 6.0).max(1e-2);
+        assert!(d_dx < dx_tol, "dx max_abs {d_dx:.3e} > tol {dx_tol:.1e}");
     } else {
         eprintln!(
             "[T6.3] dx gate disabled: forward RMSNorm prologue overwrites \

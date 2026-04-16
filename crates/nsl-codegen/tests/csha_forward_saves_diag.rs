@@ -291,6 +291,7 @@ fn forward_saves_match_cpu_reference() {
             heads as i64, d_model as i64,
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
+            saves.x_raw,
         )
     };
     assert_eq!(rc, 0, "forward-with-saves rc={rc}");

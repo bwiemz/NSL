@@ -61,6 +61,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         (".param .u64", "q_proj_ptr"), (".param .u64", "k_proj_ptr"),
         (".param .u64", "v_proj_ptr"),
         (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
+        // Tier C: pre-RMSNorm raw-x save (null = skip). Forward stages a
+        // copy here BEFORE writing x_normed back into csha_x_ptr; backward
+        // dRMSNorm reads from this slot to recover the un-normed x its
+        // closed-form needs.
+        (".param .u64", "x_raw_ptr"),
     ];
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };

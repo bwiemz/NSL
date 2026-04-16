@@ -86,6 +86,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         (".param .u64", "q_proj_ptr"), (".param .u64", "k_proj_ptr"),
         (".param .u64", "v_proj_ptr"),
         (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
+        // Tier C: pre-RMSNorm raw-x save (forward staged it; backward reads it).
+        (".param .u64", "x_raw_ptr"),
         // Tier C backward-specific append.
         (".param .u64", "dO_ptr"),
         (".param .u64", "dq_ptr"), (".param .u64", "dk_ptr"), (".param .u64", "dv_ptr"),

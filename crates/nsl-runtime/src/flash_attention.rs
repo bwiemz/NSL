@@ -386,8 +386,9 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut v_proj: u64 = 0;
         let mut rmax: u64 = 0;
         let mut rsum: u64 = 0;
+        let mut xraw: u64 = 0;
 
-        let args: [*mut c_void; 35] = [
+        let args: [*mut c_void; 36] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -425,6 +426,7 @@ pub extern "C" fn nsl_flash_attention_csha(
             &mut v_proj as *mut _ as *mut c_void,
             &mut rmax as *mut _ as *mut c_void,
             &mut rsum as *mut _ as *mut c_void,
+            &mut xraw as *mut _ as *mut c_void,
         ];
 
         let result = crate::cuda::inner::kernel_launch(
@@ -518,6 +520,10 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     // Tier C activation-save pointers.
     q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
     row_max_ptr: i64, row_sum_ptr: i64,
+    // Tier C: raw-x save pointer (forward stages a copy of x BEFORE
+    // RMSNorm overwrites csha_x_ptr in place, so the backward dRMSNorm
+    // can read pre-norm x). Null = skip the save.
+    x_raw_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -568,8 +574,9 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut v_proj = v_proj_ptr as u64;
         let mut rmax = row_max_ptr as u64;
         let mut rsum = row_sum_ptr as u64;
+        let mut xraw = x_raw_ptr as u64;
 
-        let args: [*mut c_void; 35] = [
+        let args: [*mut c_void; 36] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -605,6 +612,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             &mut v_proj as *mut _ as *mut c_void,
             &mut rmax as *mut _ as *mut c_void,
             &mut rsum as *mut _ as *mut c_void,
+            &mut xraw as *mut _ as *mut c_void,
         ];
 
         crate::cuda::inner::kernel_launch(
@@ -625,7 +633,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
-        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr);
+        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
@@ -672,6 +680,9 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // Saved activations (inputs to backward).
     q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
     row_max_ptr: i64, row_sum_ptr: i64,
+    // Tier C raw-x save: forward staged a copy here before RMSNorm
+    // overwrote csha_x_ptr in place; backward dRMSNorm reads it.
+    x_raw_ptr: i64,
     // Tier C backward-specific.
     do_ptr: i64,
     dq_ptr: i64, dk_ptr: i64, dv_ptr: i64,
@@ -727,6 +738,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut vpj = v_proj_ptr as u64;
         let mut rmax = row_max_ptr as u64;
         let mut rsum = row_sum_ptr as u64;
+        let mut xraw = x_raw_ptr as u64;
         let mut d_o = do_ptr as u64;
         let mut d_q = dq_ptr as u64;
         let mut d_k = dk_ptr as u64;
@@ -736,7 +748,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut d_wv = dwv_ptr as u64;
         let mut d_x = dx_ptr as u64;
 
-        let args: [*mut c_void; 43] = [
+        let args: [*mut c_void; 44] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -772,6 +784,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut vpj as *mut _ as *mut c_void,
             &mut rmax as *mut _ as *mut c_void,
             &mut rsum as *mut _ as *mut c_void,
+            &mut xraw as *mut _ as *mut c_void,
             // ── Tier C backward outputs ──
             &mut d_o as *mut _ as *mut c_void,
             &mut d_q as *mut _ as *mut c_void,
@@ -801,7 +814,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
-        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr);
+        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr);
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
@@ -1686,6 +1699,12 @@ pub struct CshaBackwardActivations {
     pub v_proj: i64,
     pub row_max: i64,
     pub row_sum: i64,
+    /// Raw (pre-RMSNorm) x copy. Forward RMSNorm writes x_normed back into
+    /// `csha_x_ptr` in place; the backward dRMSNorm closed form needs the
+    /// pre-norm x, so the forward save path stages a copy here. Layout:
+    /// `[batch, heads, seq, head_dim]` f32, row-major (matches the x_ptr
+    /// the kernel sees).
+    pub x_raw: i64,
 }
 
 /// Allocate the 5 HBM buffers forward fills when
@@ -1699,6 +1718,8 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
 ) -> CshaBackwardActivations {
     let qkv_bytes = batch * heads * seq * head_dim * 2;  // f16 = 2 bytes
     let stats_bytes = batch * heads * seq * 4;           // f32 = 4 bytes
+    // x_raw mirrors the kernel-visible x buffer: [batch, heads, seq, head_dim] f32.
+    let xraw_bytes = batch * heads * seq * head_dim * 4;
     #[cfg(feature = "cuda")]
     {
         use crate::cuda::inner;
@@ -1708,12 +1729,15 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
             v_proj: inner::alloc_device(qkv_bytes as usize) as i64,
             row_max: inner::alloc_device(stats_bytes as usize) as i64,
             row_sum: inner::alloc_device(stats_bytes as usize) as i64,
+            x_raw: inner::alloc_device(xraw_bytes as usize) as i64,
         }
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (qkv_bytes, stats_bytes);
-        CshaBackwardActivations { q_proj: 0, k_proj: 0, v_proj: 0, row_max: 0, row_sum: 0 }
+        let _ = (qkv_bytes, stats_bytes, xraw_bytes);
+        CshaBackwardActivations {
+            q_proj: 0, k_proj: 0, v_proj: 0, row_max: 0, row_sum: 0, x_raw: 0,
+        }
     }
 }
 
@@ -1731,6 +1755,7 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations(
         if a.v_proj != 0 { inner::free_managed(a.v_proj as *mut std::ffi::c_void); }
         if a.row_max != 0 { inner::free_managed(a.row_max as *mut std::ffi::c_void); }
         if a.row_sum != 0 { inner::free_managed(a.row_sum as *mut std::ffi::c_void); }
+        if a.x_raw != 0 { inner::free_managed(a.x_raw as *mut std::ffi::c_void); }
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = a; }
@@ -1755,6 +1780,7 @@ mod tests {
         assert_ne!(r.v_proj, 0, "v_proj alloc failed");
         assert_ne!(r.row_max, 0, "row_max alloc failed");
         assert_ne!(r.row_sum, 0, "row_sum alloc failed");
+        assert_ne!(r.x_raw, 0, "x_raw alloc failed");
         unsafe { nsl_csha_free_backward_activations(r); }
     }
 

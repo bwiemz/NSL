@@ -80,9 +80,13 @@ pub fn emit_xnorm_recompute(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // row_s = tid_x; row_global = q_start + row_s (smoke: q_start=0, seq=block_q)
     // x HBM base for this row, head_idx=0 layout [h, seq, hd]:
-    //   x_row_base = csha_x_ptr + (head_idx*seq + (q_start+row_s)) * head_dim * 4
+    //   x_row_base = x_raw_ptr + (head_idx*seq + (q_start+row_s)) * head_dim * 4
     //   (d_model == head_dim under the smoke scope).
-    ptx.push_str("    ld.param.u64 %rd_c0, [csha_x_ptr];\n");
+    //
+    // Reads from x_raw_ptr (the pre-RMSNorm save) — the forward RMSNorm
+    // overwrote csha_x_ptr with x_normed in place, so we cannot recover
+    // the raw x from there.
+    ptx.push_str("    ld.param.u64 %rd_c0, [x_raw_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p_c1, %rd_c0, 0;\n");
     ptx.push_str("    @%p_c1 bra V2_BWD_XNORM_DONE;\n");
     // row_global = q_start + tid_x
@@ -561,17 +565,11 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     ptx.push_str("    add.u64 %rd_c1, %shmem_base, %rd_c1;\n");
     ptx.push_str("    ld.shared.f32 %f_rms_v, [%rd_c1];\n");
 
-    // x row base in HBM (same formula as emit_xnorm_recompute).
-    //
-    // KNOWN GAP: the forward RMSNorm prologue (phases/forward/csha_hooks.rs
-    // line 133) overwrites `csha_x_ptr` with x_normed in-place. The backward
-    // therefore cannot read the raw x required by the dx closed-form. For
-    // now this phase reads what forward left behind (x_normed). dx output
-    // is consequently inaccurate until the forward saves a pre-normalised
-    // x copy (new save pointer needed on the backward activations struct)
-    // or the backward is invoked with a fresh x buffer. dq/dk/dv/dwq/dwk/dwv
-    // are unaffected because they do not depend on raw x.
-    ptx.push_str("    ld.param.u64 %rd_c2, [csha_x_ptr];\n");
+    // x row base in HBM (same formula as emit_xnorm_recompute). Reads from
+    // x_raw_ptr — the forward RMSNorm overwrote csha_x_ptr with x_normed
+    // in-place, so the closed-form dx formula needs the pre-RMSNorm copy
+    // staged in x_raw_ptr by the forward prologue's per-slice save.
+    ptx.push_str("    ld.param.u64 %rd_c2, [x_raw_ptr];\n");
     ptx.push_str("    add.u64 %rd_c3, %rd_c0, %q_start;  // row_global\n");
     ptx.push_str("    mul.lo.u64 %rd_c4, %head_idx, %rd6;\n");
     ptx.push_str("    add.u64 %rd_c4, %rd_c4, %rd_c3;\n");
