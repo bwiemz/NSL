@@ -286,6 +286,16 @@ pub struct CshaSavePointers {
     pub row_max: cranelift_codegen::ir::Value,
     pub row_sum: cranelift_codegen::ir::Value,
     pub x_raw: cranelift_codegen::ir::Value,
+    /// Gap B: data-section IDs for the CSHA fused backward PTX + name.
+    /// Mirror of `FlashAttentionCompileContext.csha_backward_{ptx,name}_data_id`
+    /// — copied here so Gap C/D's adjoint emitter has everything it needs
+    /// to launch the backward kernel from a single lookup keyed by layer
+    /// name (saves + PTX in the same record).  `None` means either the
+    /// module has no `@train` block or the backward PTX synthesis was
+    /// rejected by the SMEM validator — either way the legacy CPU tape-op
+    /// backward remains the fallback.
+    pub backward_ptx_data_id: Option<cranelift_module::DataId>,
+    pub backward_name_data_id: Option<cranelift_module::DataId>,
 }
 
 // ---------------------------------------------------------------------------

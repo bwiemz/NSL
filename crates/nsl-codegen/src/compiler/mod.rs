@@ -49,6 +49,30 @@ pub struct FlashAttentionCompileContext {
     pub bwd_phase1_name_data_id: Option<DataId>,
     pub bwd_phase2_name_data_id: Option<DataId>,
     pub bwd_config: Option<crate::flash_attention::FlashAttentionBackwardConfig>,
+    /// Gap B: CSHA-enabled forward PTX synthesized with
+    /// `csha=Some(..save_activations_for_backward=true)`. `Some` only when
+    /// the module contains a `@train` block — the forward FA call site in
+    /// `compile_flash_attention_call` routes to these IDs (instead of
+    /// `ptx_data_id` / `name_data_id`) when it decides to emit the
+    /// `_with_saves` FFI dispatch. Save-writes are null-guarded inside the
+    /// PTX so this PTX is safe to use even for inference-style launches.
+    pub csha_forward_with_saves_ptx_id: Option<DataId>,
+    pub csha_forward_with_saves_name_id: Option<DataId>,
+    /// Gap B: CSHA fused backward PTX (`synthesize_backward(config)`).
+    /// `Some` only when the module contains a `@train` block. Gap C/D
+    /// consumes this to launch `nsl_flash_attention_csha_backward` — the
+    /// PTX+name pointers get threaded into the backward FFI at adjoint
+    /// emission time. The config key is the same one used for the
+    /// with-saves forward PTX, so launch-time block_q/block_kv/head_dim
+    /// match between the two halves of the primal/adjoint pair.
+    pub csha_backward_ptx_data_id: Option<DataId>,
+    pub csha_backward_name_data_id: Option<DataId>,
+    /// Gap B: the CSHA-tweaked config used to synthesize
+    /// `csha_forward_with_saves_ptx_id` / `csha_backward_ptx_data_id`.
+    /// `None` when `@train` is absent. Carried so the FA call site can
+    /// re-derive kernel name / SMEM bytes / launch dims for the
+    /// with-saves PTX without re-running `synthesize_*` at call sites.
+    pub csha_training_config: Option<crate::flash_attention::FlashAttentionConfig>,
 }
 
 /// A lambda body to be compiled after the current function.
