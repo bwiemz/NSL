@@ -182,6 +182,26 @@ impl Default for CodegenFlags {
     }
 }
 
+/// Controls how `self` and `self.<field>` are lowered inside model methods.
+#[derive(Debug, Clone)]
+pub enum SelfResolution {
+    /// Normal model method: `self` is bound to block_params[0] (struct pointer)
+    /// and field accesses go through `struct_layouts`. Existing behavior.
+    StructPointer,
+    /// @export model method: `self` is phantom. `self.<field>` lowers to
+    /// `load(weight_ptrs + field_index*8)` where `weight_ptrs_var` holds the
+    /// Cranelift variable carrying the leading arg.
+    WeightPtrsArray {
+        weight_ptrs_var: cranelift_frontend::Variable,
+    },
+}
+
+impl Default for SelfResolution {
+    fn default() -> Self {
+        SelfResolution::StructPointer
+    }
+}
+
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {
     pub variables: HashMap<Symbol, (Variable, cl_types::Type)>,
@@ -232,6 +252,10 @@ pub struct FuncState {
     /// predeclare pass, and nsl_tensor_free_if_valid tolerates the null
     /// pointer on the first iteration.
     pub eltls_loop_predeclared: HashSet<Symbol>,
+    /// M62 Task 4: controls how `self` and `self.<field>` are lowered
+    /// inside model methods. Default is `StructPointer` (existing behavior).
+    /// Set to `WeightPtrsArray` by the @export method compiler (Task 6).
+    pub self_resolution: SelfResolution,
 }
 
 impl Default for FuncState {
@@ -262,6 +286,7 @@ impl FuncState {
             current_function_name: None,
             variable_types: HashMap::new(),
             eltls_loop_predeclared: HashSet::new(),
+            self_resolution: SelfResolution::StructPointer,
         }
     }
 

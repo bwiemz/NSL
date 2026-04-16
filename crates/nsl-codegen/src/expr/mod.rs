@@ -169,13 +169,22 @@ impl Compiler<'_> {
             }
 
             ExprKind::SelfRef => {
-                // Find the "self" variable in state (set by model method compilation)
-                for (sym, (var, _ty)) in &state.variables {
-                    if self.resolve_sym(*sym) == "self" {
-                        return Ok(builder.use_var(*var));
+                match &state.self_resolution {
+                    crate::context::SelfResolution::StructPointer => {
+                        // Find the "self" variable in state (set by model method compilation)
+                        for (sym, (var, _ty)) in &state.variables {
+                            if self.resolve_sym(*sym) == "self" {
+                                return Ok(builder.use_var(*var));
+                            }
+                        }
+                        Err(CodegenError::new("`self` used outside of model method"))
+                    }
+                    crate::context::SelfResolution::WeightPtrsArray { .. } => {
+                        Err(CodegenError::new(
+                            "@export method: bare `self` has no runtime value — only `self.<weight_field>` access is supported",
+                        ))
                     }
                 }
-                Err(CodegenError::new("`self` used outside of model method"))
             }
 
             ExprKind::Error => Ok(builder.ins().iconst(cl_types::I64, 0)),

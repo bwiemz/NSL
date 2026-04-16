@@ -39,6 +39,10 @@ pub struct ModuleData {
     pub freeze_configs: Vec<nsl_semantic::wrga::FreezeConfig>,
     /// `@adapter` decorator configs captured by nsl-semantic.
     pub adapter_configs: Vec<nsl_semantic::wrga::AdapterConfig>,
+    /// M62: per-NodeId weight index resolutions for `self.<field>` accesses
+    /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
+    /// for the entry module on the multi-file shared-lib path.
+    pub weight_index_map: std::collections::HashMap<nsl_ast::NodeId, usize>,
 }
 
 /// The complete module graph for a compilation unit.
@@ -400,6 +404,7 @@ pub fn load_all_modules(
             wrga_configs: analysis.wrga_configs,
             freeze_configs: analysis.freeze_configs,
             adapter_configs: analysis.adapter_configs,
+            weight_index_map: analysis.weight_index_map,
         });
     }
 

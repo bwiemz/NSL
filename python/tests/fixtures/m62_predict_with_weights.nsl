@@ -1,0 +1,6 @@
+model Net:
+    W: Tensor<[4, 4], f32>
+
+    @export
+    fn predict(self, x: Tensor<[4, 1], f32>) -> Tensor<[4, 1], f32>:
+        return self.W @ x

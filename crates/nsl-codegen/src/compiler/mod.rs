@@ -147,6 +147,10 @@ pub struct ModelMetadata {
     /// accidentally treat tensor shapes as nested model types. Consumed
     /// by `wrga_adapter_inject::resolve_dims_for_target`.
     pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
+    /// M62 Task 5: impl FuncId + signature for @export model methods.
+    /// Key: (model_name, method_name). Consumed by Task 6 when compiling
+    /// the impl body so it can reference the declared FuncId.
+    pub export_method_impls: std::collections::HashMap<(String, String), (cranelift_module::FuncId, cranelift_codegen::ir::Signature)>,
 }
 
 impl ModelMetadata {
@@ -159,6 +163,7 @@ impl ModelMetadata {
             paged_kv_configs: HashMap::new(),
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
+            export_method_impls: std::collections::HashMap::new(),
         }
     }
 }
@@ -535,6 +540,15 @@ pub struct Compiler<'a> {
     /// diagnostics section of `compile_quant_block` when `--wggo` is on;
     /// read by CSHA, WRGA, and (future) FASE/Prune/Sharding consumers.
     pub(crate) wggo_overrides: Option<crate::wggo_overrides::WggoOverrides>,
+
+    // ── M62 Task 4: @export self-field weight-index map ─────────────────────
+    /// Maps each `MemberAccess` `NodeId` (for `self.<field>` in @export model
+    /// methods) to the declaration-order weight index.  Populated from
+    /// `nsl_semantic::AnalysisResult.weight_index_map` after the Compiler is
+    /// constructed (Task 6 sets this before compiling @export method bodies).
+    /// Empty on the default path — only consulted when
+    /// `FuncState.self_resolution` is `WeightPtrsArray`.
+    pub weight_index_map: HashMap<NodeId, usize>,
 }
 
 /// Quantization configuration for a model.
@@ -687,6 +701,7 @@ impl<'a> Compiler<'a> {
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
             wggo_overrides: None,
+            weight_index_map: options.weight_index_map.clone(),
         })
     }
 

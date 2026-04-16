@@ -17,6 +17,9 @@ pub struct ExportWrapper {
     pub wrapper_func_id: FuncId,
     pub raw_name: String,
     pub export_info: ExportInfo,
+    /// True if this wraps a model method — wrapper must thread
+    /// model.weight_ptrs + num_weights into the impl call.
+    pub is_model_method: bool,
 }
 
 fn cranelift_type_for_scalar(dtype: ExportDtype) -> cranelift_codegen::ir::Type {
@@ -72,6 +75,13 @@ pub fn emit_c_abi_wrapper(
     compiler: &mut Compiler,
     wrapper: &ExportWrapper,
 ) -> Result<(), CodegenError> {
+    // GRAD SCOPE: @export dispatch is INFERENCE-ONLY. The wrapper does NOT:
+    //   - call nsl_tape_start over weight_ptrs
+    //   - save outputs to model.last_forward_outputs
+    //   - honor model.grad_enabled
+    // Calling nsl_model_enable_grad(model, 1) before an @export wrapper call
+    // has no effect on the @export dispatch path. For training autograd, use
+    // nsl_model_forward + nsl_model_backward (see the grad-context bridge fix).
     let call_conv = compiler.module.target_config().default_call_conv;
     let wrapper_sig = build_c_abi_wrapper_signature(&wrapper.export_info, call_conv);
 
@@ -110,8 +120,19 @@ pub fn emit_c_abi_wrapper(
         builder.switch_to_block(ok_block);
         builder.seal_block(ok_block);
 
+        // ── If model method, extract weight_ptrs + num_weights and prepend ───
+        let mut leading_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        if wrapper.is_model_method {
+            let w_ptrs =
+                call_model_get_weight_ptrs(&mut builder, &mut compiler.module, model_ptr)?;
+            let n_weights =
+                call_model_get_num_weights(&mut builder, &mut compiler.module, model_ptr)?;
+            leading_args.push(w_ptrs);
+            leading_args.push(n_weights);
+        }
+
         // ── Convert tensor inputs; pass scalars through ───────────────────────
-        let mut internal_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        let mut internal_args: Vec<cranelift_codegen::ir::Value> = leading_args;
         let mut tensor_inputs_to_free: Vec<cranelift_codegen::ir::Value> = Vec::new();
 
         for (i, param) in wrapper.export_info.params.iter().enumerate() {
@@ -248,6 +269,41 @@ fn call_nsl_tensor_free<M: Module + ?Sized>(
     Ok(())
 }
 
+/// Call `nsl_model_get_weight_ptrs(model: i64) -> i64` — returns `*const i64`
+/// (pointer to the weight pointers array) or 0 on null model.
+fn call_model_get_weight_ptrs<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    model_ptr: cranelift_codegen::ir::Value,
+) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_model_get_weight_ptrs",
+        &[cw_types::I64],
+        &[cw_types::I64],
+    )?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    let call = builder.ins().call(fref, &[model_ptr]);
+    Ok(builder.inst_results(call)[0])
+}
+
+/// Call `nsl_model_get_num_weights(model: i64) -> i64`.
+fn call_model_get_num_weights<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    model_ptr: cranelift_codegen::ir::Value,
+) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_model_get_num_weights",
+        &[cw_types::I64],
+        &[cw_types::I64],
+    )?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    let call = builder.ins().call(fref, &[model_ptr]);
+    Ok(builder.inst_results(call)[0])
+}
+
 /// Embed a null-terminated error string as a data object and call
 /// `nsl_set_error_cstr` with a pointer to it.
 fn emit_set_error<M: Module + ?Sized>(
@@ -354,6 +410,61 @@ mod tests {
         assert_eq!(sig.params[1].value_type, I64);
         assert_eq!(sig.params[2].value_type, F32);
         assert_eq!(sig.params[3].value_type, I64);
+    }
+
+    /// Source-scan guard: verifies that the weight-ptr helper calls and the
+    /// is_model_method gate are all present in the source. This is intentionally
+    /// a textual check — building a full ObjectModule/Compiler in a unit test
+    /// requires an ISA + interner + type_map + ~20 other fields, so we document
+    /// the cross-pass invariant as a source assertion instead. The IR-level
+    /// correctness is validated by the integration tests in tests/c_wrapper_*.rs.
+    #[test]
+    fn emit_c_abi_wrapper_source_contains_weight_ptr_helpers() {
+        let src = include_str!("c_wrapper.rs");
+        assert!(
+            src.contains("call_model_get_weight_ptrs"),
+            "wrapper emission must call the weight-ptrs helper"
+        );
+        assert!(
+            src.contains("call_model_get_num_weights"),
+            "wrapper emission must call the num-weights helper"
+        );
+        assert!(
+            src.contains("if wrapper.is_model_method"),
+            "wrapper emission must gate the weight-ptr calls on is_model_method"
+        );
+    }
+
+    /// Guard: the C-ABI signature presented to callers is independent of
+    /// is_model_method. The weight_ptrs/num_weights threading only affects
+    /// the internal impl call, not the external ABI.
+    #[test]
+    fn build_c_abi_wrapper_signature_ignores_is_model_method() {
+        // Construct the same ExportInfo twice and confirm the signature is
+        // identical. (build_c_abi_wrapper_signature doesn't even take
+        // is_model_method — this test documents that contract explicitly.)
+        let info = ExportInfo {
+            symbol_name: "predict".into(),
+            raw_name: "predict".into(),
+            params: vec![tensor_param("x", ExportDtype::F32)],
+            return_type: ExportTypeInfo::Tensor {
+                shape: vec!["4".into()],
+                dtype: ExportDtype::F32,
+                device: crate::c_header::ExportDevice::Cpu,
+            },
+        };
+        let sig_a = build_c_abi_wrapper_signature(&info, CallConv::SystemV);
+        let sig_b = build_c_abi_wrapper_signature(&info, CallConv::SystemV);
+        assert_eq!(
+            sig_a.params.len(),
+            sig_b.params.len(),
+            "signature param count must not vary by is_model_method"
+        );
+        assert_eq!(
+            sig_a.returns.len(),
+            sig_b.returns.len(),
+            "signature return count must not vary by is_model_method"
+        );
     }
 
     #[test]

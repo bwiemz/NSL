@@ -531,6 +531,12 @@ pub struct CompileOptions {
     /// `Some`.  Callers that exercise retention in tests without real calib
     /// data fall back to (8, 4) when this is `None`.
     pub calibration_batch_seq: Option<(u32, u32)>,
+    /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
+    /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
+    /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
+    /// calling any codegen entry point.  Empty map = no @export methods (safe
+    /// default, nothing to look up).
+    pub weight_index_map: HashMap<nsl_ast::NodeId, usize>,
 }
 
 impl Default for CompileOptions {
@@ -602,6 +608,7 @@ impl Default for CompileOptions {
             calibration_sidecar: None,
             calibration_retention: None,
             calibration_batch_seq: None,
+            weight_index_map: HashMap::new(),
         }
     }
 }

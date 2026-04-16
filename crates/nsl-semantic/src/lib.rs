@@ -41,6 +41,7 @@ use nsl_errors::Diagnostic;
 use nsl_lexer::Interner;
 
 use crate::checker::{TypeChecker, TypeMap};
+use crate::export::WeightIndexMap;
 use crate::scope::ScopeMap;
 use crate::types::Type;
 
@@ -71,6 +72,11 @@ pub struct AnalysisResult {
     pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
     /// WRGA: validated `@adapter(...)` configurations.
     pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
+    /// M62: Maps each `self.<field>` MemberAccess expression NodeId (inside an
+    /// `@export` model method) to the declaration-order index of that field in
+    /// the model's tensor-weight list.  Consumed by codegen to lower
+    /// `self.W` → `load(weight_ptrs + index * 8)`.
+    pub weight_index_map: WeightIndexMap,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -106,8 +112,10 @@ pub fn analyze_with_imports(
     let adapter_configs = checker.adapter_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
-    // diagnostics without touching other analysis state.
-    diagnostics.extend(crate::export::validate_exports(module, interner));
+    // diagnostics without touching other analysis state.  Also returns the
+    // weight-index side-table for codegen consumption.
+    let (export_diags, weight_index_map) = crate::export::validate_exports(module, interner);
+    diagnostics.extend(export_diags);
 
     // M38a: Run ownership analysis when --linear-types is active.
     // Runs after type checking so we have the TypeMap for tensor type detection.
@@ -128,5 +136,6 @@ pub fn analyze_with_imports(
         wrga_configs,
         freeze_configs,
         adapter_configs,
+        weight_index_map,
     }
 }

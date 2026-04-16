@@ -72,6 +72,9 @@ impl Compiler<'_> {
             self.compile_model_constructor(md)?;
         }
         self.compile_model_methods(stmts)?;
+        // M62 Task 6: define bodies for @export model method impls using
+        // WeightPtrsArray self-resolution (weight-pointer array, not struct ptr).
+        self.compile_export_model_methods(stmts)?;
 
         self.compile_pending_lambdas()?;
         Ok(())
@@ -665,6 +668,166 @@ impl Compiler<'_> {
                                 "failed to define model method '{mangled}': {e}"
                             ))
                         })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// M62 Task 6: emit the Cranelift body for each `@export` model method's
+    /// internal impl function (`__nsl_export_impl_<M>_<m>`), using
+    /// `SelfResolution::WeightPtrsArray` so that `self.<field>` accesses are
+    /// lowered to indexed loads from the caller-supplied weight-pointer array
+    /// rather than struct-pointer offsets.
+    ///
+    /// Must be called *after* `compile_model_methods` (so normal method bodies
+    /// are already defined) and *before* `finalize` (so the module has bodies
+    /// for all declared FuncIds).
+    pub fn compile_export_model_methods(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        use crate::context::SelfResolution;
+
+        let model_defs: Vec<_> = stmts
+            .iter()
+            .filter_map(|s| {
+                if let StmtKind::ModelDef(md) = &s.kind {
+                    Some(md.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for md in &model_defs {
+            let model_name = self.resolve_sym(md.name).to_string();
+            for member in &md.members {
+                if let ModelMember::Method(fn_def, decos) = member {
+                    let is_export = decos.iter().any(|d| {
+                        d.name.len() == 1 && self.resolve_sym(d.name[0]) == "export"
+                    });
+                    if !is_export {
+                        continue;
+                    }
+
+                    let method_name = self.resolve_sym(fn_def.name).to_string();
+                    let key = (model_name.clone(), method_name.clone());
+                    let (func_id, sig) = self
+                        .models
+                        .export_method_impls
+                        .get(&key)
+                        .ok_or_else(|| {
+                            CodegenError::new(format!(
+                                "@export impl '{}::{}' not registered in export_method_impls",
+                                model_name, method_name
+                            ))
+                        })?
+                        .clone();
+
+                    let mut ctx = Context::for_function(Function::with_name_signature(
+                        UserFuncName::user(0, self.next_func_index()),
+                        sig.clone(),
+                    ));
+                    let mut fn_builder_ctx = FunctionBuilderContext::new();
+
+                    {
+                        let mut builder =
+                            FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+                        let mut state = FuncState::new();
+
+                        let entry = builder.create_block();
+                        builder.append_block_params_for_function_params(entry);
+                        builder.switch_to_block(entry);
+                        builder.seal_block(entry);
+                        state.current_block = Some(entry);
+
+                        // Leading Cranelift params: (weight_ptrs: i64, num_weights: i64)
+                        let weight_ptrs_val = builder.block_params(entry)[0];
+                        // num_weights is the second param; not used directly in the body
+                        // but callers must pass it.  Bind it to a variable so CLIF does
+                        // not complain about an unused param.
+                        let _num_weights_val = builder.block_params(entry)[1];
+
+                        let weight_ptrs_var = state.new_variable();
+                        builder.declare_var(weight_ptrs_var, cl_types::I64);
+                        builder.def_var(weight_ptrs_var, weight_ptrs_val);
+
+                        state.self_resolution =
+                            SelfResolution::WeightPtrsArray { weight_ptrs_var };
+
+                        // Bind non-self method params starting at Cranelift param index 2.
+                        let mut cl_param_idx = 2usize;
+                        for param in &fn_def.params {
+                            let pname = self.resolve_sym(param.name).to_string();
+                            if pname == "self" {
+                                continue;
+                            }
+                            let param_val = builder.block_params(entry)[cl_param_idx];
+                            let cl_type = if cl_param_idx < sig.params.len() {
+                                sig.params[cl_param_idx].value_type
+                            } else {
+                                cl_types::I64
+                            };
+                            let var = state.new_variable();
+                            builder.declare_var(var, cl_type);
+                            builder.def_var(var, param_val);
+                            state.variables.insert(param.name, (var, cl_type));
+                            cl_param_idx += 1;
+                        }
+
+                        // Set model context so compile_member_access can resolve
+                        // synthesized adapter field accesses.
+                        self.current_method_model_name = Some(model_name.clone());
+
+                        // Compile method body statements.
+                        let mut body_err: Option<CodegenError> = None;
+                        for stmt in &fn_def.body.stmts {
+                            if let Err(e) = self.compile_stmt(&mut builder, &mut state, stmt) {
+                                body_err = Some(e);
+                                break;
+                            }
+                        }
+                        self.current_method_model_name = None;
+                        if let Some(e) = body_err {
+                            return Err(e);
+                        }
+
+                        // Add implicit return if body doesn't end with one.
+                        let current = state.current_block.unwrap_or(entry);
+                        if !crate::types::is_block_filled(&builder, current) {
+                            if sig.returns.is_empty() {
+                                builder.ins().return_(&[]);
+                            } else {
+                                let ret_type = sig.returns[0].value_type;
+                                let zero = if ret_type == cl_types::F64 {
+                                    builder.ins().f64const(0.0)
+                                } else if ret_type == cl_types::F32 {
+                                    builder.ins().f32const(0.0)
+                                } else {
+                                    builder.ins().iconst(ret_type, 0)
+                                };
+                                builder.ins().return_(&[zero]);
+                            }
+                        }
+
+                        builder.finalize();
+                    }
+
+                    if self.dump_ir {
+                        let impl_name =
+                            format!("__nsl_export_impl_{model_name}_{method_name}");
+                        eprintln!(
+                            "--- IR: @export impl '{impl_name}' ---\n{}",
+                            ctx.func.display()
+                        );
+                    }
+
+                    self.module.define_function(func_id, &mut ctx).map_err(
+                        |e| {
+                            CodegenError::new(format!(
+                                "failed to define @export impl '{}::{}': {:?}",
+                                model_name, method_name, e
+                            ))
+                        },
+                    )?;
                 }
             }
         }

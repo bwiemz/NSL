@@ -56,6 +56,37 @@ impl Compiler<'_> {
             }
         }
 
+        // M62 Task 4: @export weight-array self resolution.
+        // self.<field> → load(weight_ptrs + idx*8)
+        // Must fire before compile_expr(object) to avoid the bare-SelfRef error
+        // that WeightPtrsArray mode emits for phantom `self`.
+        if matches!(object.kind, ExprKind::SelfRef) {
+            if let crate::context::SelfResolution::WeightPtrsArray { weight_ptrs_var } =
+                state.self_resolution.clone()
+            {
+                let idx = self
+                    .weight_index_map
+                    .get(&expr.id)
+                    .copied()
+                    .ok_or_else(|| {
+                        CodegenError::new(format!(
+                            "@export method: self.{} missing weight-index annotation \
+                             (semantic bug — expected in weight_index_map)",
+                            member_name
+                        ))
+                    })?;
+                let weight_ptrs = builder.use_var(weight_ptrs_var);
+                let offset_bytes = (idx as i64) * 8;
+                let tensor_ptr = builder.ins().load(
+                    cl_types::I64,
+                    MemFlags::trusted(),
+                    weight_ptrs,
+                    offset_bytes as i32,
+                );
+                return Ok(tensor_ptr);
+            }
+        }
+
         let obj_val = self.compile_expr(builder, state, object)?;
         let mut obj_type = self.node_type(object.id).clone();
         // B.2.1 Task 5.5: synthesized SelfRef nodes produced by the LoRA

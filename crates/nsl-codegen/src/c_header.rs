@@ -172,9 +172,13 @@ impl ExportInfo {
         symbol_name: &str,
         interner: &Interner,
     ) -> Self {
+        // Skip `self` — for @export model methods, `self` is implicit in the
+        // C ABI as the `NslModel*` leading argument; it must not appear as a
+        // separate input parameter in the header or wrapper signature.
         let params = fn_def
             .params
             .iter()
+            .filter(|p| interner.resolve(p.name.0).unwrap_or("") != "self")
             .map(|p| ExportParamInfo {
                 name: interner.resolve(p.name.0).unwrap_or("").to_string(),
                 ty: match &p.type_ann {
@@ -249,6 +253,8 @@ fn sanitize_header_guard(name: &str) -> String {
 }
 
 fn emit_prototype(out: &mut String, info: &ExportInfo) {
+    out.push_str("/* @export dispatch is inference-only. Gradient recording does not flow\n");
+    out.push_str(" * through this call path — use nsl_model_forward for training autograd. */\n");
     out.push_str(&format!("int {}(NslModel* model", info.symbol_name));
     for param in &info.params {
         out.push_str(",\n        ");
