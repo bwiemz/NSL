@@ -18,9 +18,8 @@
 use serde::Serialize;
 
 use crate::csha::CshaPlan;
-use crate::csha_boundary::{BoundaryChain, ProjKind};
+use crate::csha_boundary::ProjKind;
 use crate::csha_pipeline::{FusionLevel, LayerPlan};
-use crate::csha_specialize::LayerSpec;
 use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use crate::fusion_graph::{FusionGraph, FusionOp};
 
@@ -331,6 +330,75 @@ pub fn collect_norm_input_varids(
         out.entry(layer.clone()).or_insert(x_varid);
     }
     out
+}
+
+/// T7.1: Build the dispatch map used by `AdjointGenerator` during the
+/// reverse walk.  For each boundary chain in the plan, returns:
+///   - A `HashMap<u32, usize>` mapping every claimed Wengert op index
+///     (norm_op, matmul_op, rope_op) to a chain index.
+///   - A `Vec<FusionMark>` with one canonical mark per chain.  All ops
+///     belonging to the same chain share the same `backward_emitted`
+///     `Cell` so the "emit once, skip rest" logic works correctly.
+///
+/// The returned marks are purpose-built for the AD dispatcher — they
+/// are NOT the same as `BridgeResult.marks` (which are per-role and
+/// have independent Cells).  The config is cloned from the bridge's
+/// per-layer config so `csha_dispatch_for_op` can validate the
+/// backward SMEM budget.
+///
+/// Returns `(op_to_chain, chain_marks)`.  Empty when CSHA is off or
+/// the plan has no boundary chains.
+pub fn collect_chain_dispatch_map(
+    plan: &CshaPlan,
+    bridge_result: &BridgeResult,
+) -> (std::collections::HashMap<u32, usize>, Vec<FusionMark>) {
+    let mut op_to_chain: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut chain_marks: Vec<FusionMark> = Vec::new();
+
+    for chain in &plan.boundary.chains {
+        let layer = match chain.layer.as_ref() {
+            Some(l) => l.clone(),
+            None => continue,
+        };
+        let chain_idx = chain_marks.len();
+
+        // Map all ops in this chain to the same chain index.
+        op_to_chain.insert(chain.norm_op, chain_idx);
+        op_to_chain.insert(chain.matmul_op, chain_idx);
+        if let Some(rope_op) = chain.rope_op {
+            op_to_chain.insert(rope_op, chain_idx);
+        }
+
+        // Build one canonical FusionMark per chain with a shared Cell.
+        let config = bridge_result
+            .extras_for_layer(&layer)
+            .and_then(|_| {
+                // Reconstruct the FlashAttentionConfig from the bridge's
+                // marks — pick the first NormPrologue mark for this layer
+                // and kind that carries a config.
+                bridge_result
+                    .marks
+                    .iter()
+                    .find(|m| {
+                        m.layer == layer
+                            && m.kind == Some(chain.kind)
+                            && m.role == MarkRole::NormPrologue
+                            && m.config.is_some()
+                    })
+                    .and_then(|m| m.config.clone())
+            });
+
+        chain_marks.push(FusionMark {
+            layer,
+            kind: Some(chain.kind),
+            param_name: chain.weight_param.clone(),
+            role: MarkRole::NormPrologue,
+            config,
+            backward_emitted: std::cell::Cell::new(false),
+        });
+    }
+
+    (op_to_chain, chain_marks)
 }
 
 /// Build the downstream artefacts from a CSHA plan.

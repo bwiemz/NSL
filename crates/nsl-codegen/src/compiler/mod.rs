@@ -459,6 +459,11 @@ pub struct Compiler<'a> {
     /// chain. Populated at the same hook that sets `last_csha_bridge`
     /// (stmt.rs), from `plan.boundary.chains`.
     pub csha_claimed_ops: std::collections::HashSet<u32>,
+    /// T7.1: CSHA backward dispatch map — maps Wengert op indices to
+    /// chain-level FusionMarks for the AD reverse walk.  Populated at
+    /// the same hook that sets `last_csha_bridge`.  `None` when CSHA
+    /// is off or no boundary chains exist.
+    pub csha_backward_claims: Option<crate::source_ad::CshaBackwardClaims>,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
     /// (but potentially different α/rank scales) share one PTX string.
@@ -625,6 +630,7 @@ impl<'a> Compiler<'a> {
             last_csha_bridge: None,
             csha_fa_call_ordinal: 0,
             csha_claimed_ops: std::collections::HashSet::new(),
+            csha_backward_claims: None,
             fused_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,

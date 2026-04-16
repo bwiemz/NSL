@@ -4027,6 +4027,22 @@ impl Compiler<'_> {
                             // before emitting a redundant launch.
                             self.csha_claimed_ops =
                                 crate::csha_apply::collect_claimed_ops(&plan);
+                            // T7.1: build the chain-level dispatch map for the
+                            // AD reverse walk. Each chain's ops share a single
+                            // FusionMark so backward_emitted gating works.
+                            if let Some(ref bridge) = self.last_csha_bridge {
+                                let (op_to_chain, chain_marks) =
+                                    crate::csha_apply::collect_chain_dispatch_map(
+                                        &plan, bridge,
+                                    );
+                                if !chain_marks.is_empty() {
+                                    self.csha_backward_claims =
+                                        Some(crate::source_ad::CshaBackwardClaims {
+                                            op_to_chain,
+                                            chain_marks,
+                                        });
+                                }
+                            }
                         }
                     }
                 }
@@ -4186,7 +4202,17 @@ impl Compiler<'_> {
                 //    pruned) primal list.
                 let start_var = extractor.next_var_id();
                 let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+                // T7.1: thread CSHA backward claims into the generator so
+                // the reverse walk can route claimed ops through the fused
+                // backward dispatcher instead of per-op AD rules.
+                if let Some(claims) = self.csha_backward_claims.take() {
+                    gen.set_csha_claims(claims);
+                }
                 let mut adjoint = gen.generate(&effective_primal);
+                // T7.1: surface any CSHA fallback diagnostics.
+                for diag in gen.csha_diagnostics() {
+                    eprintln!("[nsl] {diag}");
+                }
 
                 // 6a. Task 4: WRGA backward-live filter — drop adjoint ops
                 // that the WRGA prune pass proved to be on frozen branches.
