@@ -551,6 +551,31 @@ pub fn desc_to_nsl_tensor_pub(desc: &NslTensorDesc) -> i64 {
     desc_to_nsl_tensor(desc)
 }
 
+/// C-ABI version of `desc_to_nsl_tensor` for use by Cranelift-emitted
+/// `@export` wrapper bodies. Takes an `NslTensorDesc*` as an i64 pointer
+/// and returns a newly-allocated `NslTensor*` (also as i64).
+/// The caller is responsible for freeing the result via `nsl_tensor_free`.
+#[no_mangle]
+pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
+    if desc_ptr == 0 {
+        return 0;
+    }
+    let desc = unsafe { &*(desc_ptr as *const NslTensorDesc) };
+    desc_to_nsl_tensor(desc)
+}
+
+/// C-ABI version of `nsl_tensor_to_desc` for use by Cranelift-emitted
+/// `@export` wrapper bodies. Writes the NslTensor pointed to by `tensor_ptr`
+/// into the `NslTensorDesc` pointed to by `desc_ptr`.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_desc_ffi(tensor_ptr: i64, desc_ptr: i64) {
+    if tensor_ptr == 0 || desc_ptr == 0 {
+        return;
+    }
+    let desc = unsafe { &mut *(desc_ptr as *mut NslTensorDesc) };
+    nsl_tensor_to_desc(tensor_ptr, desc);
+}
+
 /// Convert an NslTensorDesc (C API) into an NslTensor pointer.
 /// The resulting tensor borrows the data buffer — caller must not free the
 /// original data while the tensor is live.
