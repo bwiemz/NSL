@@ -421,6 +421,17 @@ pub struct Compiler<'a> {
     /// so only the first component (dQ) triggers the backward call and dK/dV
     /// extract from the cached list.
     pub flash_attn_bwd_cache: HashMap<Value, Value>,
+    /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
+    /// Cranelift Value Gap D chooses as the "chain key" (see
+    /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The seven
+    /// slots map to dq, dk, dv, dwq, dwk, dwv, dx — one Cranelift Value
+    /// each, produced by the fused CSHA backward launch that Gap D will
+    /// emit inside `AdjointGenerator::generate`'s EmitFused arm.
+    ///
+    /// Gap C lands the storage so Gap D can populate it without further
+    /// plumbing work.  The `wengert_lower.rs` extract arm reads from this
+    /// cache and evicts on the last component (dx / component=6).
+    pub csha_fused_bwd_cache: HashMap<Value, [Value; 7]>,
 
     // ── WRGA side-channel (Milestone A) ─────────────────────────────
     /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.
@@ -648,6 +659,7 @@ impl<'a> Compiler<'a> {
             fase_table_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
+            csha_fused_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
             cpdt_mode: options.cpdt_mode,
