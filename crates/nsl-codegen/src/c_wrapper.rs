@@ -17,6 +17,9 @@ pub struct ExportWrapper {
     pub wrapper_func_id: FuncId,
     pub raw_name: String,
     pub export_info: ExportInfo,
+    /// True if this wraps a model method — wrapper must thread
+    /// model.weight_ptrs + num_weights into the impl call.
+    pub is_model_method: bool,
 }
 
 fn cranelift_type_for_scalar(dtype: ExportDtype) -> cranelift_codegen::ir::Type {

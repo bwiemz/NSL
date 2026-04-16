@@ -99,6 +99,7 @@ impl Compiler<'_> {
                         wrapper_func_id,
                         raw_name: raw_name.clone(),
                         export_info: info.clone(),
+                        is_model_method: false,
                     });
                 self.features.export_functions.push(info);
             } else {
@@ -358,6 +359,118 @@ impl Compiler<'_> {
                             self.resolve_sym(sym)
                         }) {
                             self.features.zk_proof_fns.insert(mangled.clone(), mode);
+                        }
+
+                        // M62 Task 5: If the method is decorated with @export, declare:
+                        //   1. An internal impl `__nsl_export_impl_<Model>_<method>` with
+                        //      `(weight_ptrs: i64, num_weights: i64, ...tensor_inputs) -> i64`
+                        //   2. A C-ABI wrapper under the exported symbol name.
+                        let (is_export, override_name) =
+                            extract_export_decorator(decos, self.interner);
+                        if is_export {
+                            // Build impl signature: leading weight_ptrs + num_weights,
+                            // then tensor/scalar inputs (skip "self"), same return as method.
+                            let mut impl_sig = self.module.make_signature();
+                            impl_sig.call_conv = self.call_conv;
+                            // weight_ptrs: i64 (pointer-to-pointer array)
+                            impl_sig
+                                .params
+                                .push(AbiParam::new(cl_types::I64));
+                            // num_weights: i64
+                            impl_sig
+                                .params
+                                .push(AbiParam::new(cl_types::I64));
+                            // Remaining non-self params
+                            for param in &fn_def.params {
+                                let pname = self.resolve_sym(param.name).to_string();
+                                if pname == "self" {
+                                    continue;
+                                }
+                                let cl_type = if let Some(ref type_ann) = param.type_ann {
+                                    match &type_ann.kind {
+                                        TypeExprKind::Named(sym) => {
+                                            self.resolve_type_name_to_cl(*sym)
+                                        }
+                                        _ => cl_types::I64,
+                                    }
+                                } else {
+                                    cl_types::I64
+                                };
+                                impl_sig.params.push(AbiParam::new(cl_type));
+                            }
+                            // Return type mirrors the normal method return
+                            if let Some(ref ret_type) = fn_def.return_type {
+                                match &ret_type.kind {
+                                    TypeExprKind::Named(sym) => {
+                                        let rname = self.resolve_sym(*sym);
+                                        if rname != "void" {
+                                            impl_sig.returns.push(AbiParam::new(
+                                                self.resolve_type_name_to_cl(*sym),
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        impl_sig.returns.push(AbiParam::new(cl_types::I64));
+                                    }
+                                }
+                            } else {
+                                impl_sig.returns.push(AbiParam::new(cl_types::I64));
+                            }
+
+                            let impl_name =
+                                format!("__nsl_export_impl_{model_name}_{method_name}");
+                            let impl_func_id = self
+                                .module
+                                .declare_function(&impl_name, Linkage::Local, &impl_sig)
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to declare @export impl '{impl_name}': {e}"
+                                    ))
+                                })?;
+
+                            self.models.export_method_impls.insert(
+                                (model_name.clone(), method_name.clone()),
+                                (impl_func_id, impl_sig.clone()),
+                            );
+
+                            // Build ExportInfo from the fn_def (skips "self"; that param will
+                            // not appear in the C header — the model pointer is implicit).
+                            let wrapper_symbol = override_name
+                                .clone()
+                                .unwrap_or_else(|| method_name.clone());
+                            let info = crate::c_header::ExportInfo::from_fn_def(
+                                fn_def,
+                                &method_name,
+                                &wrapper_symbol,
+                                self.interner,
+                            );
+                            let call_conv = self.module.target_config().default_call_conv;
+                            let wrapper_sig =
+                                crate::c_wrapper::build_c_abi_wrapper_signature(&info, call_conv);
+                            let wrapper_func_id = self
+                                .module
+                                .declare_function(
+                                    &wrapper_symbol,
+                                    Linkage::Export,
+                                    &wrapper_sig,
+                                )
+                                .map_err(|e| {
+                                    CodegenError::new(format!(
+                                        "failed to declare @export wrapper '{wrapper_symbol}': {e}"
+                                    ))
+                                })?;
+
+                            self.features
+                                .export_wrappers
+                                .push(crate::c_wrapper::ExportWrapper {
+                                    impl_func_id,
+                                    impl_sig: impl_sig.clone(),
+                                    wrapper_func_id,
+                                    raw_name: method_name.clone(),
+                                    export_info: info.clone(),
+                                    is_model_method: true,
+                                });
+                            self.features.export_functions.push(info);
                         }
                     }
 

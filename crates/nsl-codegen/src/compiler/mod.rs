@@ -123,6 +123,10 @@ pub struct ModelMetadata {
     /// accidentally treat tensor shapes as nested model types. Consumed
     /// by `wrga_adapter_inject::resolve_dims_for_target`.
     pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
+    /// M62 Task 5: impl FuncId + signature for @export model methods.
+    /// Key: (model_name, method_name). Consumed by Task 6 when compiling
+    /// the impl body so it can reference the declared FuncId.
+    pub export_method_impls: std::collections::HashMap<(String, String), (cranelift_module::FuncId, cranelift_codegen::ir::Signature)>,
 }
 
 impl ModelMetadata {
@@ -135,6 +139,7 @@ impl ModelMetadata {
             paged_kv_configs: HashMap::new(),
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
+            export_method_impls: std::collections::HashMap::new(),
         }
     }
 }
