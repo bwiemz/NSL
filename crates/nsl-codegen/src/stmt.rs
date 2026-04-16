@@ -4037,13 +4037,19 @@ impl Compiler<'_> {
                             // before emitting a redundant launch.
                             self.csha_claimed_ops =
                                 crate::csha_apply::collect_claimed_ops(&plan);
-                            // T7.1: build the chain-level dispatch map for the
-                            // AD reverse walk. Each chain's ops share a single
-                            // FusionMark so backward_emitted gating works.
+                            // T7.1 / Gap D.1: build the chain-level dispatch
+                            // map for the AD reverse walk. Gap D.1 passes the
+                            // Wengert list so the dispatcher can resolve
+                            // per-chain VarIds (Q/K/V outputs, weights,
+                            // RMSNorm-out) and detect the shared SDPA op —
+                            // which is the correct primary claim site for
+                            // `EmitFused`.
                             if let Some(ref bridge) = self.last_csha_bridge {
                                 let (op_to_chain, chain_marks) =
-                                    crate::csha_apply::collect_chain_dispatch_map(
-                                        &plan, bridge,
+                                    crate::csha_apply::collect_chain_dispatch_map_with_wengert(
+                                        &plan,
+                                        bridge,
+                                        Some(extractor.wengert_list()),
                                     );
                                 if !chain_marks.is_empty() {
                                     self.csha_backward_claims =

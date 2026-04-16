@@ -249,6 +249,61 @@ pub struct FusionMark {
     /// not plan metadata.
     #[serde(skip)]
     pub backward_emitted: std::cell::Cell<bool>,
+    /// Gap D.1: VarId routing table for the fused backward's 7 gradient
+    /// outputs. Populated by `collect_chain_dispatch_map` when a full
+    /// Q/K/V chain group is detected for the layer; `None` for partial
+    /// groups, floating chains, or structural tests.
+    ///
+    /// When present, the EmitFused arm of `AdjointGenerator::generate`
+    /// routes:
+    ///   - component 0 (dq) → `y_bar(q_out_var)` — the Q-matmul or RoPE-Q output
+    ///   - component 1 (dk) → `y_bar(k_out_var)` — the K-matmul or RoPE-K output
+    ///   - component 2 (dv) → `y_bar(v_out_var)` — the V-matmul output
+    ///   - component 3 (dwq) → `y_bar(wq_var)` — the Wq weight param
+    ///   - component 4 (dwk) → `y_bar(wk_var)` — the Wk weight param
+    ///   - component 5 (dwv) → `y_bar(wv_var)` — the Wv weight param
+    ///   - component 6 (dx) → `y_bar(x_norm_var)` — the RMSNorm output
+    ///     (a.k.a. "x-after-norm")
+    ///
+    /// When absent, the EmitFused arm falls back to the best-effort
+    /// routing (which is incorrect but structurally valid — see the
+    /// Gap D report for details).
+    #[serde(skip)]
+    pub chain_varids: Option<CshaChainVarIds>,
+}
+
+/// Gap D.1: per-chain VarId routing table attached to a canonical
+/// `FusionMark` so the fused-backward emitter knows where to write each
+/// of the kernel's seven gradient outputs.
+///
+/// All fields refer to the **primal** Wengert VarId namespace. The
+/// adjoint generator translates each into a y_bar slot via
+/// `accumulate_adjoint`, which then maps it into the adjoint namespace
+/// downstream.
+#[derive(Debug, Clone, Copy)]
+pub struct CshaChainVarIds {
+    /// Output of the Q chain — the RoPE op's result when RoPE is present,
+    /// else the Q matmul's result.
+    pub q_out_var: u32,
+    /// Output of the K chain — same convention as Q.
+    pub k_out_var: u32,
+    /// Output of the V chain — always the V matmul's result (V has no RoPE).
+    pub v_out_var: u32,
+    /// Param VarId for Wq.
+    pub wq_var: u32,
+    /// Param VarId for Wk.
+    pub wk_var: u32,
+    /// Param VarId for Wv.
+    pub wv_var: u32,
+    /// Output of the RMSNorm op — feeds into Q/K/V matmuls as the
+    /// "x-after-norm" tensor. dx gradient from the fused kernel
+    /// accumulates here; per-op RMSNorm backward (which runs on the
+    /// RMSNorm op itself, which is suppressed via `AlreadyEmitted`) is
+    /// replaced by this direct accumulation.
+    pub x_norm_var: u32,
+    /// Output of the SDPA op — this is the VarId whose y_bar we read as
+    /// `dO` when `EmitFused` fires at the SDPA reverse-walk visit.
+    pub sdpa_out_var: u32,
 }
 
 /// Why CSHA is claiming a node.
@@ -367,19 +422,32 @@ pub fn collect_norm_input_varids(
     out
 }
 
-/// T7.1: Build the dispatch map used by `AdjointGenerator` during the
-/// reverse walk.  For each boundary chain in the plan, returns:
-///   - A `HashMap<u32, usize>` mapping every claimed Wengert op index
-///     (norm_op, matmul_op, rope_op) to a chain index.
-///   - A `Vec<FusionMark>` with one canonical mark per chain.  All ops
-///     belonging to the same chain share the same `backward_emitted`
-///     `Cell` so the "emit once, skip rest" logic works correctly.
+/// T7.1 / Gap D.1: Build the dispatch map used by `AdjointGenerator`
+/// during the reverse walk.
 ///
-/// The returned marks are purpose-built for the AD dispatcher — they
-/// are NOT the same as `BridgeResult.marks` (which are per-role and
-/// have independent Cells).  The config is cloned from the bridge's
-/// per-layer config so `csha_dispatch_for_op` can validate the
-/// backward SMEM budget.
+/// **Gap D.1 claim-site change:** when a layer has all three (Q/K/V)
+/// chains AND they all share the same detected SDPA consumer, the
+/// dispatcher claims the **SDPA op** (not the projection matmul) as the
+/// first `EmitFused` trigger. This is the correct site because by the
+/// time the reverse walk hits SDPA, `y_bar(SDPA_output)` — the `dO`
+/// the fused kernel consumes — has already been populated by downstream
+/// ops (output projection, residual add, etc.). If we claimed the
+/// matmul instead, SDPA would run its per-op AD BEFORE the fused kernel
+/// fires, causing 2x over-accumulation of dQ/dK/dV into the projection
+/// outputs.
+///
+/// For each layer group with a full SDPA-bearing Q/K/V chain triple:
+///   - Map SDPA's op idx → chain index (EmitFused primary).
+///   - Map all three chains' (norm_op, matmul_op, rope_op) → same chain
+///     index (AlreadyEmitted — the fused kernel overrides per-op AD).
+///   - Build ONE canonical mark with `chain_varids` populated so the
+///     EmitFused arm knows where to route each of the 7 gradient outputs.
+///
+/// For layers without a detected SDPA (structural tests, open-coded
+/// attention, floating chains), fall back to the legacy behavior: map
+/// per-chain norm/matmul/rope ops to a per-chain mark with
+/// `chain_varids = None`, and the EmitFused arm uses its best-effort
+/// placeholder routing.
 ///
 /// Returns `(op_to_chain, chain_marks)`.  Empty when CSHA is off or
 /// the plan has no boundary chains.
@@ -387,50 +455,194 @@ pub fn collect_chain_dispatch_map(
     plan: &CshaPlan,
     bridge_result: &BridgeResult,
 ) -> (std::collections::HashMap<u32, usize>, Vec<FusionMark>) {
+    collect_chain_dispatch_map_with_wengert(plan, bridge_result, None)
+}
+
+/// Gap D.1 internal: version that optionally accepts a Wengert list so
+/// the mark can resolve its per-chain VarIds (Q/K/V outputs, weights,
+/// RMSNorm-out) for correct gradient routing. Callers that already have
+/// the Wengert list should prefer this variant; the one-arg helper above
+/// stays for back-compat with existing tests.
+pub fn collect_chain_dispatch_map_with_wengert(
+    plan: &CshaPlan,
+    bridge_result: &BridgeResult,
+    wengert: Option<&crate::wengert::WengertList>,
+) -> (std::collections::HashMap<u32, usize>, Vec<FusionMark>) {
     let mut op_to_chain: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     let mut chain_marks: Vec<FusionMark> = Vec::new();
 
+    // Group chains by layer so a single FusionMark + SDPA claim can cover
+    // all three Q/K/V chains of one attention block.
+    let mut by_layer: std::collections::BTreeMap<String, Vec<&crate::csha_boundary::BoundaryChain>> =
+        std::collections::BTreeMap::new();
     for chain in &plan.boundary.chains {
-        let layer = match chain.layer.as_ref() {
-            Some(l) => l.clone(),
-            None => continue,
-        };
-        let chain_idx = chain_marks.len();
-
-        // Map all ops in this chain to the same chain index.
-        op_to_chain.insert(chain.norm_op, chain_idx);
-        op_to_chain.insert(chain.matmul_op, chain_idx);
-        if let Some(rope_op) = chain.rope_op {
-            op_to_chain.insert(rope_op, chain_idx);
+        if let Some(layer) = chain.layer.as_ref() {
+            by_layer.entry(layer.clone()).or_default().push(chain);
         }
+    }
 
-        // Build one canonical FusionMark per chain with a shared Cell.
+    for (layer, chains) in &by_layer {
+        // Look up the bridge's per-layer FlashAttentionConfig (via any
+        // matching NormPrologue mark).
         let config = bridge_result
-            .extras_for_layer(&layer)
+            .extras_for_layer(layer)
             .and_then(|_| {
-                // Reconstruct the FlashAttentionConfig from the bridge's
-                // marks — pick the first NormPrologue mark for this layer
-                // and kind that carries a config.
                 bridge_result
                     .marks
                     .iter()
                     .find(|m| {
-                        m.layer == layer
-                            && m.kind == Some(chain.kind)
+                        m.layer == *layer
                             && m.role == MarkRole::NormPrologue
                             && m.config.is_some()
                     })
                     .and_then(|m| m.config.clone())
             });
 
-        chain_marks.push(FusionMark {
-            layer,
-            kind: Some(chain.kind),
-            param_name: chain.weight_param.clone(),
-            role: MarkRole::NormPrologue,
-            config,
-            backward_emitted: std::cell::Cell::new(false),
-        });
+        // Classify chains by projection.
+        let q = chains.iter().find(|c| c.kind == ProjKind::Q).copied();
+        let k = chains.iter().find(|c| c.kind == ProjKind::K).copied();
+        let v = chains.iter().find(|c| c.kind == ProjKind::V).copied();
+
+        // All three chains must share the same SDPA op for the grouped
+        // claim to make sense. If any is missing or they disagree, fall
+        // back to per-chain legacy marks.
+        let shared_sdpa = match (q, k, v) {
+            (Some(qc), Some(kc), Some(vc)) => match (qc.sdpa_op, kc.sdpa_op, vc.sdpa_op) {
+                (Some(qo), Some(ko), Some(vo)) if qo == ko && ko == vo => Some(qo),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let (Some(sdpa_op), Some(qc), Some(kc), Some(vc), Some(w)) =
+            (shared_sdpa, q, k, v, wengert)
+        {
+            // Grouped claim: one mark for the whole layer, SDPA is
+            // primary, Q/K/V norm+matmul+rope are secondary.
+            let chain_idx = chain_marks.len();
+
+            // Map SDPA first so it's the primary EmitFused target when
+            // walked in reverse. Every other op in the chain maps to
+            // the same idx → AlreadyEmitted on subsequent visits.
+            op_to_chain.insert(sdpa_op, chain_idx);
+
+            // Per-chain secondary ops: norm (shared across chains, inserted
+            // once), matmul, rope (when present).
+            let norm_op = qc.norm_op;
+            op_to_chain.insert(norm_op, chain_idx);
+            for c in [qc, kc, vc] {
+                op_to_chain.insert(c.matmul_op, chain_idx);
+                if let Some(rope) = c.rope_op {
+                    op_to_chain.insert(rope, chain_idx);
+                }
+            }
+
+            // Resolve VarIds from the Wengert list.
+            let resolve_weight_var = |param: &str| -> Option<u32> {
+                w.ops
+                    .iter()
+                    .find(|o| matches!(&o.op, crate::wengert::PrimalOp::Param(n) if n == param))
+                    .map(|o| o.result)
+            };
+            let q_out_var = match qc.rope_op {
+                Some(ri) => w.ops.get(ri as usize).map(|o| o.result),
+                None => w.ops.get(qc.matmul_op as usize).map(|o| o.result),
+            };
+            let k_out_var = match kc.rope_op {
+                Some(ri) => w.ops.get(ri as usize).map(|o| o.result),
+                None => w.ops.get(kc.matmul_op as usize).map(|o| o.result),
+            };
+            let v_out_var = w.ops.get(vc.matmul_op as usize).map(|o| o.result);
+            let wq_var = resolve_weight_var(&qc.weight_param);
+            let wk_var = resolve_weight_var(&kc.weight_param);
+            let wv_var = resolve_weight_var(&vc.weight_param);
+            let x_norm_var = w.ops.get(norm_op as usize).map(|o| o.result);
+            let sdpa_out_var = w.ops.get(sdpa_op as usize).map(|o| o.result);
+
+            let chain_varids = match (
+                q_out_var,
+                k_out_var,
+                v_out_var,
+                wq_var,
+                wk_var,
+                wv_var,
+                x_norm_var,
+                sdpa_out_var,
+            ) {
+                (
+                    Some(qv),
+                    Some(kv),
+                    Some(vv),
+                    Some(wq),
+                    Some(wk),
+                    Some(wv_id),
+                    Some(xn),
+                    Some(so),
+                ) => Some(CshaChainVarIds {
+                    q_out_var: qv,
+                    k_out_var: kv,
+                    v_out_var: vv,
+                    wq_var: wq,
+                    wk_var: wk,
+                    wv_var: wv_id,
+                    x_norm_var: xn,
+                    sdpa_out_var: so,
+                }),
+                _ => None,
+            };
+
+            chain_marks.push(FusionMark {
+                layer: layer.clone(),
+                // The grouped mark represents the whole layer; pick Q as
+                // a canonical `kind` since tests that filter by kind
+                // still expect a non-None value.
+                kind: Some(ProjKind::Q),
+                param_name: qc.weight_param.clone(),
+                role: MarkRole::NormPrologue,
+                config: config.clone(),
+                backward_emitted: std::cell::Cell::new(false),
+                chain_varids,
+            });
+        } else {
+            // Legacy path: no SDPA detected (or Wengert list not
+            // available) → emit a mark per chain. This preserves the
+            // pre-Gap-D.1 behavior for structural tests and any Wengert
+            // topology that doesn't include the fused SDPA primitive.
+            for chain in chains {
+                let chain_idx = chain_marks.len();
+                op_to_chain.insert(chain.norm_op, chain_idx);
+                op_to_chain.insert(chain.matmul_op, chain_idx);
+                if let Some(rope_op) = chain.rope_op {
+                    op_to_chain.insert(rope_op, chain_idx);
+                }
+
+                let per_kind_config = bridge_result
+                    .extras_for_layer(layer)
+                    .and_then(|_| {
+                        bridge_result
+                            .marks
+                            .iter()
+                            .find(|m| {
+                                m.layer == *layer
+                                    && m.kind == Some(chain.kind)
+                                    && m.role == MarkRole::NormPrologue
+                                    && m.config.is_some()
+                            })
+                            .and_then(|m| m.config.clone())
+                    })
+                    .or_else(|| config.clone());
+
+                chain_marks.push(FusionMark {
+                    layer: layer.clone(),
+                    kind: Some(chain.kind),
+                    param_name: chain.weight_param.clone(),
+                    role: MarkRole::NormPrologue,
+                    config: per_kind_config,
+                    backward_emitted: std::cell::Cell::new(false),
+                    chain_varids: None,
+                });
+            }
+        }
     }
 
     (op_to_chain, chain_marks)
@@ -494,6 +706,7 @@ pub fn bridge(
                 role: MarkRole::NormPrologue,
                 config: cfg.clone(),
                 backward_emitted: std::cell::Cell::new(false),
+                chain_varids: None,
             });
             if chain.rope_op.is_some() {
                 out.marks.push(FusionMark {
@@ -503,6 +716,7 @@ pub fn bridge(
                     role: MarkRole::RoPEEpilogue,
                     config: cfg,
                     backward_emitted: std::cell::Cell::new(false),
+                    chain_varids: None,
                 });
             }
         }
@@ -518,6 +732,7 @@ pub fn bridge(
                 role: MarkRole::OutputProjEpilogue,
                 config: full_configs.get(&layer_plan.layer).cloned(),
                 backward_emitted: std::cell::Cell::new(false),
+                chain_varids: None,
             });
         }
     }
@@ -649,6 +864,7 @@ mod tests {
             role: MarkRole::NormPrologue,
             config: None,
             backward_emitted: std::cell::Cell::new(false),
+            chain_varids: None,
         };
         assert!(!m.backward_emitted.get());
     }
@@ -662,6 +878,7 @@ mod tests {
             role: MarkRole::NormPrologue,
             config: None,
             backward_emitted: std::cell::Cell::new(false),
+            chain_varids: None,
         };
         // No &mut — interior mutability for the AD dispatcher.
         m.backward_emitted.set(true);
@@ -677,6 +894,7 @@ mod tests {
             role: MarkRole::OutputProjEpilogue,
             config: None,
             backward_emitted: std::cell::Cell::new(true),
+            chain_varids: None,
         };
         let json = serde_json::to_string(&m).expect("serialize");
         // #[serde(skip)] fields must NOT appear in the sidecar output.
@@ -1010,6 +1228,7 @@ mod tests {
                 matmul_op: 3,
                 rope_op: None,
                 weight_param: "unrooted.wq".to_string(),
+                sdpa_op: None,
             }],
         };
         let norm_inputs = collect_norm_input_varids(&plan, &attn_wengert());

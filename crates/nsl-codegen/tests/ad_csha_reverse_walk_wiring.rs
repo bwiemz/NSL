@@ -105,6 +105,7 @@ fn build_claims(
         role: MarkRole::NormPrologue,
         config: Some(config),
         backward_emitted: std::cell::Cell::new(false),
+        chain_varids: None,
     }];
 
     CshaBackwardClaims {

@@ -391,6 +391,7 @@ mod tests {
                 matmul_op: 1,
                 rope_op: Some(2),
                 weight_param: "blocks.0.attn.wq".into(),
+                sdpa_op: None,
             }],
         };
         let plan = analyze(&scan, None, 8, &SpecConfig::default());

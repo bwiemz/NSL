@@ -474,6 +474,7 @@ mod tests {
                     matmul_op: 1,
                     rope_op: Some(2),
                     weight_param: "blocks.0.attn.wq".into(),
+                    sdpa_op: None,
                 },
                 BoundaryChain {
                     layer: Some("blocks.0".into()),
@@ -482,6 +483,7 @@ mod tests {
                     matmul_op: 3,
                     rope_op: Some(4),
                     weight_param: "blocks.0.attn.wk".into(),
+                    sdpa_op: None,
                 },
                 BoundaryChain {
                     layer: Some("blocks.1".into()),
@@ -490,6 +492,7 @@ mod tests {
                     matmul_op: 6,
                     rope_op: Some(7),
                     weight_param: "blocks.1.attn.wq".into(),
+                    sdpa_op: None,
                 },
             ],
         };

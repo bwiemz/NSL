@@ -75,6 +75,19 @@ pub struct BoundaryChain {
     pub rope_op: Option<u32>,
     /// Parameter name of the projection weight (`blocks.3.attn.wq`).
     pub weight_param: String,
+    /// Gap D.1: `ScaledDotProductAttention` op index that consumes this
+    /// chain's output (matmul_op result for V, rope_op result for Q/K).
+    /// `None` when no SDPA is found in the Wengert list — e.g. structural
+    /// tests where the chain is cut off at the projection, or models whose
+    /// attention is open-coded rather than using the fused SDPA primitive.
+    ///
+    /// When present, the AD reverse-walk dispatcher claims the SDPA op
+    /// (not the projection matmul) as the first `EmitFused` trigger point.
+    /// This is the correct site for fused-backward emission because by the
+    /// time the reverse walk hits SDPA, the SDPA output's y_bar is already
+    /// populated (downstream ops like the output projection ran earlier in
+    /// reverse order), so `dO` is available for the fused kernel to consume.
+    pub sdpa_op: Option<u32>,
 }
 
 impl BoundaryChain {
@@ -210,6 +223,25 @@ pub fn scan(list: &WengertList) -> BoundaryScan {
             }
         }
 
+        // Gap D.1: detect the SDPA op that consumes this chain's output.
+        // Q/K chains feed SDPA through the RoPE output (when present),
+        // else through the matmul output. V always feeds SDPA through the
+        // matmul output directly.
+        let chain_output_var = match rope_op_idx {
+            Some(ri) => list.ops[ri as usize].result,
+            None => mm_op.result,
+        };
+        let sdpa_op_idx = consumers.get(&chain_output_var).and_then(|cs| {
+            cs.iter()
+                .find(|&&c| {
+                    matches!(
+                        list.ops[c as usize].op,
+                        PrimalOp::ScaledDotProductAttention { .. }
+                    )
+                })
+                .copied()
+        });
+
         chains.push(BoundaryChain {
             // A.2.1c: use the fallback-aware layer-key derivation so
             // single-class models (whose Wengert Param names are
@@ -222,6 +254,7 @@ pub fn scan(list: &WengertList) -> BoundaryScan {
             matmul_op: mm_idx as u32,
             rope_op: rope_op_idx,
             weight_param,
+            sdpa_op: sdpa_op_idx,
         });
     }
 
@@ -349,6 +382,7 @@ mod tests {
             matmul_op: 1,
             rope_op: Some(2),
             weight_param: "blocks.0.attn.wq".into(),
+            sdpa_op: None,
         };
         let small = c.hbm_bytes_saved(1, 1024, 512, 2);
         let big = c.hbm_bytes_saved(4, 1024, 512, 2);

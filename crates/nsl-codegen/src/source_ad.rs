@@ -184,64 +184,45 @@ impl AdjointGenerator {
                             // Gap D: real kernel-launch emission for the fused
                             // backward.  See `PrimalOp::FusedCshaBackward` in
                             // wengert.rs + its lowerer arm in wengert_lower.rs
-                            // for the mechanical details of the launch; this
-                            // arm is responsible for *deciding* to emit it
-                            // and wiring the resulting seven extract ops into
-                            // the adjoint map.
+                            // for the mechanical details of the launch.
                             //
-                            // Design notes & known gaps:
-                            //   - The fused kernel replaces per-op AD for the
-                            //     WHOLE chain (RMSNorm → Q/K/V matmul → RoPE)
-                            //     AND the SDPA op immediately downstream.  The
-                            //     per-op AD dispatcher is keyed on the chain's
-                            //     claimed ops (norm/matmul/rope) — SDPA itself
-                            //     is NOT claimed.  We resolve this by skipping
-                            //     per-op AD for claimed ops via the
-                            //     `AlreadyEmitted` return from the dispatcher;
-                            //     SDPA's per-op AD still runs separately and
-                            //     seeds dQ/dK/dV for the projection outputs via
-                            //     the normal tape.  The fused kernel's outputs
-                            //     (dq/dk/dv/dwq/dwk/dwv/dx) then *overwrite*
-                            //     that seed via `accumulate_adjoint`.  Because
-                            //     SDPA's per-op dQ/dK/dV and the fused
-                            //     kernel's dq/dk/dv ARE both trying to be the
-                            //     adjoint of the same VarIds (the Q_proj/
-                            //     K_proj/V_proj outputs), accumulate_adjoint
-                            //     will sum them — producing a 2×
-                            //     over-accumulation.  This is a known gap;
-                            //     documented as "Gap D adjoint wiring limited
-                            //     — structural-only landing" in the milestone
-                            //     report.  Until the dispatcher learns to
-                            //     claim SDPA or we move emission to SDPA's
-                            //     site, the structural path is what we ship.
-                            //
-                            //   - Adjoint registration is best-effort: for the
-                            //     matmul_op we treat `op.result` as the
-                            //     chain's key and try to register the
-                            //     corresponding extract result as that op's
-                            //     adjoint.  For norm/rope ops we emit the
-                            //     launch on the first hit but do not overwrite
-                            //     their adjoints (that would fight per-op AD
-                            //     even harder).
-                            // Clone mark-side data out of the immutable borrow
-                            // so the remainder of this arm can call mutable
-                            // methods on `self` without running into
-                            // simultaneous-borrow errors.
+                            // Gap D.1 claim-site fix:
+                            //   - When the dispatch map was built with a
+                            //     Wengert list that contained the SDPA op
+                            //     (production path), the primary claim is
+                            //     the SDPA op itself — by the time the
+                            //     reverse walk hits it, `y_bar(SDPA_output)`
+                            //     is already populated by downstream ops
+                            //     (output projection, residual add, etc.),
+                            //     so we consume that as `dO`. The fused
+                            //     kernel's 7 outputs then land on the
+                            //     correct VarIds (q_out/k_out/v_out/wq/wk/
+                            //     wv/x_norm) via `mark.chain_varids`. The
+                            //     Q/K/V matmul ops + RMSNorm + RoPE ops in
+                            //     the same chain map to the same chain_idx
+                            //     and return `AlreadyEmitted` on subsequent
+                            //     reverse-walk visits, suppressing their
+                            //     per-op AD (no double-accumulation).
+                            //   - When `chain_varids` is absent (structural
+                            //     tests, open-coded attention, or a partial
+                            //     chain group), we fall back to the legacy
+                            //     best-effort routing that treats `op` as a
+                            //     matmul. This is the path the T7.x unit
+                            //     tests in ad_csha_reverse_walk_wiring.rs
+                            //     exercise.
                             let mark_layer = mark.layer.clone();
                             let mark_kind = mark.kind;
                             let cfg = mark.config.clone().expect(
                                 "dispatcher accepted EmitFused with None config — \
                                  csha_dispatch_for_op contract violated",
                             );
+                            let chain_varids = mark.chain_varids;
                             let is_smoke = cfg.head_dim == 32
                                 && cfg.block_q == 32
                                 && cfg.block_kv == 32
                                 && cfg.csha.as_ref().map_or(false, |c| c.d_model == 32);
 
-                            // One event per chain (the stub used to reset the
-                            // Cell so we iterate multiple times; Gap D keeps
-                            // the Cell set so subsequent claimed ops for the
-                            // same chain return AlreadyEmitted).
+                            // One event per chain.
                             if fused_event_emitted.insert(chain_idx) {
                                 self.csha_fused_events.push(CshaFusedBackwardEvent {
                                     layer: mark_layer.clone(),
@@ -263,37 +244,34 @@ impl AdjointGenerator {
                                     is_smoke,
                                 );
 
-                                // Chain-key VarId: use the op's result (the
-                                // matmul or rope output of the chain).  All
-                                // seven extract ops will share this VarId as
-                                // their first input, so they look up the
-                                // same cache entry at lowering time.
+                                // Chain-key VarId: the op's result (the SDPA
+                                // output when chain_varids is present, or
+                                // the matmul/rope output in the legacy
+                                // path). All 7 extract ops share this as
+                                // their first input so they hit the same
+                                // cache entry at lowering time.
                                 let chain_key = op.result;
 
-                                // Best-effort dO: the adjoint of the attention
-                                // output isn't in the adjoint_vars map yet for
-                                // most chain.output_op instances (SDPA's
-                                // backward populates Q/K/V projection
-                                // adjoints, but not the attention output's
-                                // adjoint for THIS chain).  We use the
-                                // current op's y_bar as a placeholder — this
-                                // is wrong semantically but keeps the launch
-                                // firing structurally.  Future work: wire the
-                                // actual SDPA-output adjoint through via a
-                                // claim on SDPA.
-                                let do_var = self.get_or_create_adjoint(op.result);
+                                // dO (adjoint of the fused kernel's "output"
+                                // tensor) — the Gap D.1 routing:
+                                //   - With `chain_varids`: read y_bar of the
+                                //     SDPA output (already populated by
+                                //     downstream reverse-walk iterations).
+                                //   - Without: fall back to the current op's
+                                //     y_bar (legacy best-effort placeholder).
+                                let do_source_var = chain_varids
+                                    .as_ref()
+                                    .map(|v| v.sdpa_out_var)
+                                    .unwrap_or(op.result);
+                                let do_var = self.get_or_create_adjoint(do_source_var);
 
-                                // Inputs[0] = chain_key, [1] = do_var, [2..]
-                                // = optional pass-throughs for q/k/v/x/wq/
-                                // wk/wv/norm_w.  For now pass [chain_key,
-                                // do_var] + the op's own inputs (which, for
-                                // a matmul op, is [x_after_norm, weight]).
+                                // Launch-op inputs: the lowerer only reads
+                                // inputs[0] (chain_key) and inputs[1]
+                                // (do_ptr) in the Gap D launch. Keep the
+                                // extra pass-throughs for forward compat.
                                 let mut launch_inputs = vec![chain_key, do_var];
                                 launch_inputs.extend(op.inputs.iter().copied());
 
-                                // Emit the launch op (its own result is a
-                                // placeholder tensor; extracts pull real
-                                // outputs from the side-channel cache).
                                 let _launch_result = self.emit_op(
                                     PrimalOp::FusedCshaBackward {
                                         layer: mark_layer.clone(),
@@ -311,54 +289,53 @@ impl AdjointGenerator {
                                     extract_results[component as usize] = r;
                                 }
 
-                                // Best-effort adjoint registration: the
-                                // matmul_op's inputs are [x_after_norm,
-                                // weight] per the conventional NSL matmul
-                                // calling convention.  We register:
-                                //   - component 0 (dq for Q chain, or the
-                                //     kind's equivalent) → adjoint for
-                                //     op.result (the projection output).
-                                //   - Weight adjoint: component 3 (dwq) or
-                                //     4 (dwk) or 5 (dwv) depending on kind.
-                                //   - x adjoint: component 6 (dx) → adjoint
-                                //     for op.inputs[0].
-                                //
-                                // When the chain's op is a RoPE op, inputs
-                                // differ and this best-effort mapping is
-                                // wrong — we still register for mechanical
-                                // testability but the numerical gradient
-                                // will be off; documented as a known gap.
-                                use crate::csha_boundary::ProjKind;
-                                let (proj_component, weight_component) = match mark_kind {
-                                    Some(ProjKind::Q) => (0u8, 3u8),
-                                    Some(ProjKind::K) => (1u8, 4u8),
-                                    Some(ProjKind::V) => (2u8, 5u8),
-                                    None => (0u8, 3u8),
-                                };
-                                let _ = (proj_component, weight_component);
-
-                                // Register the projection-output adjoint.
-                                self.accumulate_adjoint(
-                                    op.result,
-                                    extract_results[proj_component as usize],
-                                );
-                                // Register the weight adjoint (inputs[1] of
-                                // a conventional matmul op; skip if the op
-                                // doesn't have a second input, e.g. a norm
-                                // op that lists only [x]).
-                                if let Some(&weight_vid) = op.inputs.get(1) {
+                                // Route the 7 outputs to the right VarIds.
+                                if let Some(v) = chain_varids {
+                                    // Gap D.1 primary routing: outputs land
+                                    // on the correct primal VarIds, so
+                                    // downstream accumulate_adjoint calls
+                                    // for the SUPPRESSED per-op backward
+                                    // (matmul/RMSNorm/RoPE) don't run and
+                                    // no double-accumulation occurs.
+                                    //   0 = dq → q_out_var (Q matmul or RoPE-Q output)
+                                    //   1 = dk → k_out_var
+                                    //   2 = dv → v_out_var
+                                    //   3 = dwq → wq_var
+                                    //   4 = dwk → wk_var
+                                    //   5 = dwv → wv_var
+                                    //   6 = dx  → x_norm_var
+                                    self.accumulate_adjoint(v.q_out_var, extract_results[0]);
+                                    self.accumulate_adjoint(v.k_out_var, extract_results[1]);
+                                    self.accumulate_adjoint(v.v_out_var, extract_results[2]);
+                                    self.accumulate_adjoint(v.wq_var, extract_results[3]);
+                                    self.accumulate_adjoint(v.wk_var, extract_results[4]);
+                                    self.accumulate_adjoint(v.wv_var, extract_results[5]);
+                                    self.accumulate_adjoint(v.x_norm_var, extract_results[6]);
+                                } else {
+                                    // Legacy best-effort routing: treat `op`
+                                    // as a matmul. Wrong for RoPE/norm, but
+                                    // kept for the structural unit tests
+                                    // that don't construct a full SDPA op.
+                                    use crate::csha_boundary::ProjKind;
+                                    let (proj_component, weight_component) = match mark_kind {
+                                        Some(ProjKind::Q) => (0u8, 3u8),
+                                        Some(ProjKind::K) => (1u8, 4u8),
+                                        Some(ProjKind::V) => (2u8, 5u8),
+                                        None => (0u8, 3u8),
+                                    };
                                     self.accumulate_adjoint(
-                                        weight_vid,
-                                        extract_results[weight_component as usize],
+                                        op.result,
+                                        extract_results[proj_component as usize],
                                     );
-                                }
-                                // Register the x-adjoint (inputs[0]) —
-                                // component 6 (dx).
-                                if let Some(&x_vid) = op.inputs.first() {
-                                    self.accumulate_adjoint(
-                                        x_vid,
-                                        extract_results[6],
-                                    );
+                                    if let Some(&weight_vid) = op.inputs.get(1) {
+                                        self.accumulate_adjoint(
+                                            weight_vid,
+                                            extract_results[weight_component as usize],
+                                        );
+                                    }
+                                    if let Some(&x_vid) = op.inputs.first() {
+                                        self.accumulate_adjoint(x_vid, extract_results[6]);
+                                    }
                                 }
 
                                 // We emitted the fused launch + extracts;

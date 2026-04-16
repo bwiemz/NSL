@@ -1397,6 +1397,7 @@ mod tests {
             role: crate::csha_apply::MarkRole::NormPrologue,
             config: cfg,
             backward_emitted: std::cell::Cell::new(false),
+            chain_varids: None,
         }
     }
 

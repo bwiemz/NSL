@@ -85,6 +85,7 @@ fn mark_for_layer(cfg: FlashAttentionConfig) -> FusionMark {
         role: MarkRole::NormPrologue,
         config: Some(cfg),
         backward_emitted: std::cell::Cell::new(false),
+        chain_varids: None,
     }
 }
 

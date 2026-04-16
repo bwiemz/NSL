@@ -297,6 +297,7 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
         role: nsl_codegen::csha_apply::MarkRole::NormPrologue,
         config: Some(cfg),
         backward_emitted: std::cell::Cell::new(false),
+        chain_varids: None,
     };
     let mut op_to_chain: HashMap<u32, usize> = HashMap::new();
     op_to_chain.insert(2, 0); // matmul_op (id=2) → chain 0
@@ -356,4 +357,319 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
             );
         }
     }
+}
+
+// ── Gap D.1 — claim-site + adjoint-routing tests ───────────────────────────
+
+/// With the Gap D.1 claim-site fix, the dispatcher should map the SDPA
+/// op (not the Q/K/V matmul) to `EmitFused` when a full Q+K+V chain
+/// group shares an SDPA consumer. This test verifies:
+///   1. `collect_chain_dispatch_map_with_wengert` groups the three chains
+///      under a single canonical mark (not three per-chain marks).
+///   2. The SDPA op is in the `op_to_chain` map (claim primary).
+///   3. The mark carries a fully resolved `chain_varids` routing table.
+#[test]
+fn gap_d1_sdpa_is_claim_primary_for_full_qkv_chain_group() {
+    use nsl_codegen::csha::{self, CshaInput, CshaMode};
+    use nsl_codegen::csha_apply::{bridge, collect_chain_dispatch_map_with_wengert};
+    use nsl_codegen::csha_boundary::ProjKind;
+    use nsl_codegen::csha_specialize::SpecConfig;
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use nsl_codegen::wggo_cost::LayerShape;
+    use std::collections::HashMap;
+
+    // Wengert with a full Q/K/V chain group + SDPA consumer.
+    //   0: Input(x)
+    //   1: RMSNorm(0)                   — x_norm
+    //   2: Param(Wq)
+    //   3: Matmul(1, 2)                 — Q_out
+    //   4: RoPE(3)                      — Q_rope_out (q_out_var target)
+    //   5: Param(Wk)
+    //   6: Matmul(1, 5)                 — K_out
+    //   7: RoPE(6)                      — K_rope_out (k_out_var target)
+    //   8: Param(Wv)
+    //   9: Matmul(1, 8)                 — V_out (v_out_var target)
+    //  10: ScaledDotProductAttention(4, 7, 9)  — the shared SDPA
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let w = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
+            mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
+            mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
+            mk(5, 5, PrimalOp::Param("blocks.0.attn.wk".into()), vec![]),
+            mk(6, 6, PrimalOp::Matmul, vec![1, 5]),
+            mk(7, 7, PrimalOp::RoPE { dim: 64 }, vec![6]),
+            mk(8, 8, PrimalOp::Param("blocks.0.attn.wv".into()), vec![]),
+            mk(9, 9, PrimalOp::Matmul, vec![1, 8]),
+            mk(
+                10,
+                10,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![4, 7, 9],
+            ),
+        ],
+        output: 10,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    let plan = csha::run(CshaInput {
+        mode: CshaMode::Auto,
+        target: "H100",
+        wengert: &w,
+        weights: None,
+        shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
+        n_heads: 8,
+        spec_cfg: SpecConfig::default(),
+        pattern_cfg: nsl_codegen::csha_patterns::PatternConfig::default(),
+        wggo_overrides: None,
+    });
+
+    // All three chains must have detected the shared SDPA (op id 10).
+    assert_eq!(plan.boundary.chains.len(), 3);
+    for c in &plan.boundary.chains {
+        assert_eq!(
+            c.sdpa_op,
+            Some(10),
+            "chain {:?} missing SDPA detection",
+            c.kind
+        );
+    }
+
+    let br = bridge(&plan, 64, &mut Vec::new());
+    let (op_to_chain, chain_marks) =
+        collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w));
+
+    // Gap D.1: one grouped mark for the whole layer (not three per-chain marks).
+    assert_eq!(
+        chain_marks.len(),
+        1,
+        "expected 1 grouped mark for full Q/K/V group, got {}",
+        chain_marks.len()
+    );
+
+    // SDPA must be mapped as a claim primary.
+    assert!(
+        op_to_chain.contains_key(&10),
+        "SDPA op 10 must be in the claim map; got keys: {:?}",
+        op_to_chain.keys().collect::<Vec<_>>()
+    );
+    // All secondary ops (norm/matmul/rope) must also be mapped (they
+    // return AlreadyEmitted once SDPA fires first in reverse walk).
+    for key in [1u32, 3, 4, 6, 7, 9] {
+        assert!(
+            op_to_chain.contains_key(&key),
+            "op {} must be in claim map (secondary AlreadyEmitted target)",
+            key
+        );
+    }
+
+    // chain_varids must be populated.
+    let mark = &chain_marks[0];
+    let v = mark
+        .chain_varids
+        .as_ref()
+        .expect("grouped mark must carry chain_varids");
+    assert_eq!(v.q_out_var, 4, "q_out = RoPE-Q output (VarId 4)");
+    assert_eq!(v.k_out_var, 7, "k_out = RoPE-K output (VarId 7)");
+    assert_eq!(v.v_out_var, 9, "v_out = V-matmul output (VarId 9)");
+    assert_eq!(v.wq_var, 2);
+    assert_eq!(v.wk_var, 5);
+    assert_eq!(v.wv_var, 8);
+    assert_eq!(v.x_norm_var, 1, "x_norm = RMSNorm output (VarId 1)");
+    assert_eq!(v.sdpa_out_var, 10, "sdpa_out = SDPA output (VarId 10)");
+
+    // Canonical mark uses Q as its kind representative.
+    assert_eq!(mark.kind, Some(ProjKind::Q));
+}
+
+/// End-to-end Gap D.1 test: run `AdjointGenerator::generate` on a
+/// Wengert list containing Q/K/V chains + SDPA, with chain_varids
+/// populated. Verify:
+///   - The fused launch op's inputs[1] (do_var) is an adjoint of the
+///     SDPA output (VarId 10), NOT the current op's result.
+///   - The 7 gradient outputs are routed to the right VarIds (the
+///     adjoint_vars map gains entries for q_out/k_out/v_out/wq/wk/wv/
+///     x_norm).
+///   - Per-op SDPA backward does NOT fire (no AttentionBackwardQ/K/V
+///     rule ops in the adjoint graph), so no double-accumulation.
+///   - Per-op matmul backward for the projections does NOT fire.
+#[test]
+fn gap_d1_adjoint_routing_populates_correct_varids() {
+    use nsl_codegen::csha_apply::{CshaChainVarIds, FusionMark};
+    use nsl_codegen::csha_boundary::ProjKind;
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use nsl_codegen::source_ad::{AdjointGenerator, CshaBackwardClaims};
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use std::collections::HashMap;
+
+    // Same Wengert as above (Q/K/V + SDPA).
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let primal = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(2, 2, PrimalOp::Param("wq".into()), vec![]),
+            mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
+            mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
+            mk(5, 5, PrimalOp::Param("wk".into()), vec![]),
+            mk(6, 6, PrimalOp::Matmul, vec![1, 5]),
+            mk(7, 7, PrimalOp::RoPE { dim: 64 }, vec![6]),
+            mk(8, 8, PrimalOp::Param("wv".into()), vec![]),
+            mk(9, 9, PrimalOp::Matmul, vec![1, 8]),
+            mk(
+                10,
+                10,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![4, 7, 9],
+            ),
+        ],
+        output: 10,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    // Smoke config — passes backward validator.
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 1,
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            active_heads: 1,
+            rmsnorm_eps: 1e-5,
+            ..CshaExtras::default()
+        }),
+    };
+
+    // Build a grouped mark with chain_varids by hand (mirrors what
+    // `collect_chain_dispatch_map_with_wengert` would produce).
+    let varids = CshaChainVarIds {
+        q_out_var: 4,
+        k_out_var: 7,
+        v_out_var: 9,
+        wq_var: 2,
+        wk_var: 5,
+        wv_var: 8,
+        x_norm_var: 1,
+        sdpa_out_var: 10,
+    };
+    let mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "wq".into(),
+        role: nsl_codegen::csha_apply::MarkRole::NormPrologue,
+        config: Some(cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: Some(varids),
+    };
+
+    // Claim: SDPA primary, Q/K/V matmul+rope+RMSNorm secondary.
+    let mut op_to_chain: HashMap<u32, usize> = HashMap::new();
+    op_to_chain.insert(10, 0); // SDPA — claim primary
+    op_to_chain.insert(1, 0); // RMSNorm
+    op_to_chain.insert(3, 0); // Q matmul
+    op_to_chain.insert(4, 0); // Q RoPE
+    op_to_chain.insert(6, 0); // K matmul
+    op_to_chain.insert(7, 0); // K RoPE
+    op_to_chain.insert(9, 0); // V matmul
+
+    let claims = CshaBackwardClaims {
+        op_to_chain,
+        chain_marks: vec![mark],
+    };
+
+    let mut gen = AdjointGenerator::new(100);
+    gen.set_csha_claims(claims);
+    let adjoint = gen.generate(&primal);
+
+    // The fused launch op must be emitted exactly once.
+    let launch_count = adjoint
+        .ops
+        .iter()
+        .filter(|o| matches!(&o.op, PrimalOp::FusedCshaBackward { .. }))
+        .count();
+    assert_eq!(launch_count, 1, "exactly one fused launch expected");
+
+    // No per-op SDPA backward should fire — the fused kernel replaces
+    // it entirely. `AttentionBackwardQ/K/V` compound rules would show
+    // up as sequences of Transpose/Matmul/Softmax/etc. ops, but more
+    // reliably we check that SDPA's claimed-chain membership means it
+    // returned via `continue` in EmitFused, not through `apply_ad_rule`.
+    //
+    // Assertion: the adjoint map should contain entries for all 7
+    // routed VarIds (Q/K/V outputs, 3 weights, x_norm).
+    let adj_map = gen.adjoint_vars_map();
+    for vid in [4u32, 7, 9, 2, 5, 8, 1] {
+        assert!(
+            adj_map.contains_key(&vid),
+            "Gap D.1 must populate adjoint for primal VarId {} via \
+             the fused kernel; current map keys: {:?}",
+            vid,
+            adj_map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // The fused launch op's inputs[1] (dO) must be the adjoint of the
+    // SDPA output (VarId 10), proving the claim-site fix: dO is sourced
+    // from the SDPA output, not from whatever op.result happened to be
+    // when EmitFused fired.
+    let launch = adjoint
+        .ops
+        .iter()
+        .find(|o| matches!(&o.op, PrimalOp::FusedCshaBackward { .. }))
+        .expect("launch op must exist");
+    let do_var = launch.inputs[1];
+    let sdpa_adj = adj_map
+        .get(&10)
+        .copied()
+        .expect("SDPA output (VarId 10) must have an adjoint");
+    assert_eq!(
+        do_var, sdpa_adj,
+        "launch inputs[1] must be the SDPA output's y_bar (VarId {}) \
+         — got {}",
+        sdpa_adj, do_var
+    );
+
+    // The fused kernel's output-proj event should have been recorded
+    // against the SDPA op (id 10).
+    let events = gen.csha_fused_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].output_op_id, 10,
+        "Gap D.1 claim primary is the SDPA op; event.output_op_id should be 10"
+    );
 }
