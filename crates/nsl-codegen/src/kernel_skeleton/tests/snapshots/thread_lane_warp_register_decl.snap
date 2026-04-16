@@ -1,0 +1,1 @@
+    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;

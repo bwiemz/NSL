@@ -4,6 +4,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes};
+use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 
 /// Emit the PTX file header up through the index-computation block.
 ///
@@ -89,7 +90,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Pool size N declares %f<N> = %f0..%f(N-1), so N = 48 + head_dim/32
     // to make %f{O_BASE + head_dim/32 - 1} a valid register.
     let f32_pool = 48 + (config.head_dim / 32) as u32;
-    ptx.push_str("    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;\n");
+    emit_thread_lane_warp_register_decl(ptx);
     ptx.push_str("    .reg .u64 %rd<64>;\n");
     ptx.push_str(&format!("    .reg .f32 %f<{}>;\n", f32_pool));
     ptx.push_str("    .reg .b16 %h<32>;\n");
