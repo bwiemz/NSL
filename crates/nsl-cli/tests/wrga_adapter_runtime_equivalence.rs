@@ -294,6 +294,39 @@ let y = m.forward(x)
 print(y)
 "#;
 
+// GPU-resident variant of BUILD4_SRC used ONLY by the `#[ignore]`-d
+// hardening test `build_4_fused_cuda_actually_fires`.  Every tensor that
+// feeds into `m.forward(x)` — the model weight, the input, and both
+// seeded adapter tensors — is placed on CUDA so the fused FFI's "inputs
+// on GPU" gate is satisfied and the real cudarc PTX launch fires.
+//
+// Kept separate from BUILD4_SRC because the non-ignored build_4* tests
+// must continue to exercise the CPU-fallback path on machines without
+// a CUDA device.
+const BUILD4_SRC_GPU: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = zeros([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_A_Toy_w__lora = ones([8, 2]).to(cuda)
+m.lora_B_Toy_w__lora = ones([2, 8]).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
 // ─── B.3 Task 4: fused FFI reachability when target=cuda_sm80 ───────────
 //
 // Same load-bearing source as Build 4, but compiled with `--target
@@ -456,7 +489,7 @@ fn build_5_fused_launches_one_kernel_per_site() {
 fn build_4_fused_cuda_actually_fires() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("build4_gpu.nsl");
-    fs::write(&src_path, BUILD4_SRC).unwrap();
+    fs::write(&src_path, BUILD4_SRC_GPU).unwrap();
 
     let root = workspace_root();
     let stdlib = root.join("stdlib");
