@@ -58,7 +58,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
 
     let dyn_smem = backward_needs_dynamic_smem(config);
     if dyn_smem {
-        ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+        use crate::kernel_skeleton::smem::emit_dynamic_smem_extern;
+        emit_dynamic_smem_extern(ptx);
     }
 
     let name = kernel_name(config);
@@ -100,10 +101,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str(")\n{\n");
 
     if !dyn_smem {
-        ptx.push_str(&format!(
-            "    .shared .align 16 .b8 shmem[{}];\n",
-            backward_total_bytes(config)
-        ));
+        use crate::kernel_skeleton::smem::emit_static_smem_decl;
+        emit_static_smem_decl(ptx, backward_total_bytes(config) as usize);
     }
 
     // Base register pool. f32 pool: 48 scratch + head_dim/32 Q slice +
@@ -175,7 +174,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     ptx.push_str("    .reg .u64 %warp_row;\n");
 
-    ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
+    crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // log2(e)\n");
 
     // Initialise SMEM tile bases. Q tile at byte 0 (Tier A layout); K

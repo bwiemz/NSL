@@ -33,7 +33,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // the declaration moves here; the static `.shared .align 16 .b8 shmem[N]`
     // form (which CAN appear inside a function body) is used for smaller configs.
     if needs_dynamic_smem(config) {
-        ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+        use crate::kernel_skeleton::smem::emit_dynamic_smem_extern;
+        emit_dynamic_smem_extern(ptx);
     }
 
     // Kernel entry + param block. All 30 params declared even when a
@@ -76,10 +77,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Dynamic SMEM configs use `.extern .shared` at module scope (emitted above,
     // before the .visible .entry).  Static configs declare the array here.
     if !needs_dynamic_smem(config) {
-        ptx.push_str(&format!(
-            "    .shared .align 16 .b8 shmem[{}];\n",
-            total_bytes(config)
-        ));
+        use crate::kernel_skeleton::smem::emit_static_smem_decl;
+        emit_static_smem_decl(ptx, total_bytes(config) as usize);
     }
 
     // Register declarations. f32 pool must cover the highest-indexed
@@ -184,7 +183,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
     }
 
-    ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
+    crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))\n");
 
     // Load scalar params.
