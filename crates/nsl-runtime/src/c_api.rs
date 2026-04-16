@@ -452,6 +452,30 @@ pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: 
     model.weights.get(name).copied().unwrap_or(0)
 }
 
+/// Returns a pointer to the model's weight_ptrs array. The array contains
+/// `nsl_model_get_num_weights(model)` entries; each is an i64 that is a
+/// *mut NslTensor. The pointer is valid for the model's lifetime.
+#[no_mangle]
+pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
+    if model_ptr == 0 {
+        set_error("nsl_model_get_weight_ptrs: null model\0".to_string());
+        return 0;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    model.weight_ptrs.as_ptr() as i64
+}
+
+/// Returns the number of weights in the model.
+#[no_mangle]
+pub extern "C" fn nsl_model_get_num_weights(model_ptr: i64) -> i64 {
+    if model_ptr == 0 {
+        set_error("nsl_model_get_num_weights: null model\0".to_string());
+        return 0;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    model.weight_ptrs.len() as i64
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -1017,5 +1041,56 @@ mod tests {
 
         // Cleanup: destroy the model (frees weight tensor).
         nsl_model_destroy(model_ptr);
+    }
+
+
+    #[test]
+    fn nsl_model_get_weight_ptrs_returns_valid_pointer() {
+        // Create a model with a single weight pointer.
+        // To avoid freeing invalid pointers on drop, we clear weight_ptrs manually.
+        let fake_weight_ptr: i64 = 0xDEADBEEF_i64;
+        let mut model = Box::new(NslModel {
+            version: 2,
+            weights: HashMap::new(),
+            weight_ptrs: vec![fake_weight_ptr],
+            forward_fn: None,
+            weights_path: String::new(),
+            grad_enabled: false,
+            last_forward_outputs: vec![],
+        });
+        let model_ptr = &mut *model as *mut NslModel as i64;
+
+        let got = nsl_model_get_weight_ptrs(model_ptr);
+        assert_ne!(got, 0);
+        let first: i64 = unsafe { *(got as *const i64) };
+        assert_eq!(first, fake_weight_ptr);
+
+        // Clear weight_ptrs so drop() won't try to free the fake pointers
+        model.weight_ptrs.clear();
+    }
+
+    #[test]
+    fn nsl_model_get_num_weights_returns_length() {
+        let mut model = Box::new(NslModel {
+            version: 2,
+            weights: HashMap::new(),
+            weight_ptrs: vec![0x100, 0x200, 0x300],  // Use larger values to avoid null-like misalignment
+            forward_fn: None,
+            weights_path: String::new(),
+            grad_enabled: false,
+            last_forward_outputs: vec![],
+        });
+        let model_ptr = &mut *model as *mut NslModel as i64;
+
+        assert_eq!(nsl_model_get_num_weights(model_ptr), 3);
+
+        // Clear weight_ptrs so drop() won't try to free
+        model.weight_ptrs.clear();
+    }
+
+    #[test]
+    fn nsl_model_get_weight_ptrs_null_returns_zero() {
+        assert_eq!(nsl_model_get_weight_ptrs(0), 0);
+        assert_eq!(nsl_model_get_num_weights(0), 0);
     }
 }
