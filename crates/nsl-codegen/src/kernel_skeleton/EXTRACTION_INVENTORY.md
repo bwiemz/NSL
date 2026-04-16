@@ -150,3 +150,51 @@ Every variation observed in steps 1-6 is covered by the proposed API:
 backward preludes. `emit_ld_param_u32(dest_reg, param_name)` is now included in the proposed
 API above alongside `emit_ld_param_u64` and `emit_ld_param_f32`, completing full coverage of
 FA's emission patterns. Implement alongside the other line-level helpers in Task A2/A3.
+
+## Extraction completed on HEAD+1
+
+Extracted helpers (with snapshot coverage):
+
+- emit_ptx_header ×2 variants (V8_7/Sm75 for FA, V7_0/Sm80 for WRGA)
+- emit_static_smem_decl ×2 variants (1536 bytes for WRGA LoRA, 768 bytes for WRGA IA3)
+- emit_dynamic_smem_extern — FA's > 48 KB path
+- emit_shmem_base_cvta — cvta.shared.u64 line
+- emit_thread_lane_warp_register_decl — register declaration only
+- emit_thread_lane_warp_register_init — 5-line mov/shr/and/mov/mov block
+- emit_param_block — with ParamTy enum (U64, U32, F32)
+- emit_ld_param_u64 — line-level helper
+- emit_ld_param_u32 — line-level helper (covers csha_active_heads, csha_d_model — A1 finding)
+- emit_ld_param_f32 — line-level helper
+- emit_smem_zero_pad_predicated ×2 variants (4→16 f16 for sub-MMA padding, 16→16 no-op)
+
+FA v2 migrations applied (byte-identical PTX preserved):
+
+- Forward prelude: ptx_header, dynamic_smem_extern, static_smem_decl, shmem_base_cvta, thread_lane_warp_register_decl
+- Backward prelude: ptx_header, dynamic_smem_extern, static_smem_decl, shmem_base_cvta, thread_lane_warp_register_decl, thread_lane_warp_register_init
+
+FA v2 migrations deliberately skipped (would require snapshot regeneration or FA-specific register naming):
+
+- Forward prelude init block (inline comments on `shr`/`and` lines not in skeleton helper)
+- Param block + ld.param loads for all 30+ FA params (FA uses %rd0..%rd9 numbered pool; WRGA uses named registers — separate migration cleanup)
+
+NOT extracted (genuinely FA-specific, stays in prelude.rs):
+
+- 30+ param declaration block (FA's specific FFI-stable list with 32 u64 + 2 u32 + 2 f32 = 36 params forward, 44 backward)
+- CSHA conditional register blocks (fused_projections, save_activations, fused_output_proj)
+- rope_q register block
+- Tier C save_activations scratch registers
+- FA's %rd0..%rd9 parameter-register loading
+- Block-index routing math (q_start = bid_x * block_q; head_idx = bid_y % heads)
+- FA-specific register pool declarations (`%rd<64>`, `%f<N>`)
+
+Pre-existing FA v2 snapshot state at Task Group A completion:
+
+- 17 passed
+- 6 failed — unrelated CSHA Tier C snapshot drift that predated this branch. Specifically:
+  - kernel_full__32x32x32_csha_l2_rope
+  - kernel_full__32x32x32_nocsha
+  - kernel_full__64x64x128_nocsha
+  - phase_csha_hooks__prologue_active_l2_rope
+  - phase_prelude__32x32x32_snapshot
+  - phase_prelude__64x64x128_snapshot
+- Task Group A introduced ZERO new failures. These 6 are tracked as a separate CSHA close-out concern.
