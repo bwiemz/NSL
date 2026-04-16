@@ -70,11 +70,18 @@ use nsl_runtime::flash_attention::{
 //   (V save scheduling, backward V-input SMEM tile, per-iter dQ SMEM flush).
 //   Tier A 5e-3 tolerance for head_dim=32.
 //
-// dwq/dwk/dwv/dx: still blocked on csha_hooks_backward::emit_dproj and
-//   emit_drmsnorm using 0f3F800000 placeholders for their x_norm / x /
-//   norm_weight HBM reads. Flip after real addressing lands.
+// dwq/dwk/dwv: enabled after emit_dproj real addressing + x_norm tile
+//   re-materialisation lands (feat/csha-tier-c-diag). Under the smoke
+//   scope (heads=1, no RoPE, no causal) max_abs lands ≤ 5e-3.
+//
+// dx: STILL BLOCKED — not on addressing but on a forward-side issue:
+//   `phases/forward/csha_hooks.rs::emit_prologue` writes x_normed back
+//   into `csha_x_ptr` in place, so the backward has no raw x to feed
+//   the closed-form dx formula. Fix requires a new forward save pointer
+//   (e.g. `x_raw_save`) on the backward activations struct.
 const NUMERICAL_GATE_DQKV_ENABLED: bool = true;
-const NUMERICAL_GATE_DW_DX_ENABLED: bool = false;
+const NUMERICAL_GATE_DW_ENABLED:   bool = true;
+const NUMERICAL_GATE_DX_ENABLED:   bool = false;
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) as u32;
@@ -430,10 +437,12 @@ fn t6_3_smoke_single_config() {
     let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
     let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
     let d_dwq = max_abs_diff(&gpu.dwq, &cpu.dwq);
+    let d_dwk = max_abs_diff(&gpu.dwk, &cpu.dwk);
+    let d_dwv = max_abs_diff(&gpu.dwv, &cpu.dwv);
     let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
     eprintln!(
         "[T6.3 smoke] head_dim=32 max_abs: dq={d_dq:.3e} dk={d_dk:.3e} \
-         dv={d_dv:.3e} dwq={d_dwq:.3e} dx={d_dx:.3e}"
+         dv={d_dv:.3e} dwq={d_dwq:.3e} dwk={d_dwk:.3e} dwv={d_dwv:.3e} dx={d_dx:.3e}"
     );
 
     let tol = tol_for_head_dim(32);
@@ -442,14 +451,18 @@ fn t6_3_smoke_single_config() {
         assert!(d_dk < tol, "dk max_abs {d_dk:.3e} > tol {tol:.1e}");
         assert!(d_dv < tol, "dv max_abs {d_dv:.3e} > tol {tol:.1e}");
     }
-    if NUMERICAL_GATE_DW_DX_ENABLED {
+    if NUMERICAL_GATE_DW_ENABLED {
         assert!(d_dwq < tol, "dwq max_abs {d_dwq:.3e} > tol {tol:.1e}");
+        assert!(d_dwk < tol, "dwk max_abs {d_dwk:.3e} > tol {tol:.1e}");
+        assert!(d_dwv < tol, "dwv max_abs {d_dwv:.3e} > tol {tol:.1e}");
+    }
+    if NUMERICAL_GATE_DX_ENABLED {
         assert!(d_dx < tol, "dx max_abs {d_dx:.3e} > tol {tol:.1e}");
     } else {
         eprintln!(
-            "[T6.3] dwq/dx gate disabled: csha_hooks_backward emit_dproj \
-             and emit_drmsnorm still use 0f3F800000 placeholders for \
-             x_norm/x/norm_weight HBM reads."
+            "[T6.3] dx gate disabled: forward RMSNorm prologue overwrites \
+             csha_x_ptr with x_normed in-place; backward has no raw x for \
+             the closed-form dx. Needs a forward-side x_save pointer."
         );
     }
 }

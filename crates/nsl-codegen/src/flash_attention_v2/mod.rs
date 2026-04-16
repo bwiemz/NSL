@@ -578,11 +578,15 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     }
     ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete\n");
 
-    // Phase 3: CSHA hooks (inverse RoPE, weight gradients, dRMSNorm).
-    // Fire once — they operate on the accumulated dQ/dK/dV tiles.
+    // Phase 3: CSHA hooks (x_norm recompute, inverse RoPE, dW{q,k,v},
+    // dRMSNorm). Each writes directly to HBM except the dRoPE rotation
+    // which mutates the dQ/dK SMEM tiles in place.
+    phases::backward::csha_hooks_backward::emit_xnorm_recompute(&mut ptx, config);
     phases::backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
     phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
     phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
+    // phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
+    // phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
 
     // Phase 4: cooperative global stores of the 7 gradients + final fence.
     phases::backward::finalize::emit(&mut ptx, config, 0);

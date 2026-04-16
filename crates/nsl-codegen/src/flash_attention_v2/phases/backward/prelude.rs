@@ -153,6 +153,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .f32 %f_dq_tmp;\n");
     ptx.push_str("    .reg .pred %p_dq_g;\n");
     ptx.push_str("    .reg .u64 %rd_dqs_row, %rd_dqs_col, %rd_dqs_addr;\n");
+    // Tier C dproj / dRMSNorm scratch registers.
+    ptx.push_str("    .reg .u64 %rd_c0, %rd_c1, %rd_c2, %rd_c3, %rd_c4, %rd_c5;\n");
+    ptx.push_str("    .reg .u32 %r_c0, %r_c1, %r_c2, %r_c3;\n");
+    ptx.push_str("    .reg .f32 %f_xn, %f_dy, %f_dw, %f_rms_v, %f_rms_inv, %f_ms;\n");
+    ptx.push_str("    .reg .f32 %f_nw, %f_xraw, %f_sgrad, %f_dxn, %f_gd, %f_dxv;\n");
+    ptx.push_str("    .reg .pred %p_c0, %p_c1;\n");
+    ptx.push_str("    .reg .b16 %h_tmp;\n");
 
     // Backward HBM pointer registers (saved-activation inputs +
     // gradient outputs). Separate name so an unsuspecting forward

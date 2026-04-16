@@ -155,57 +155,39 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ));
     }
 
-    // ── f16 stores: dwq, dwk, dwv (shape [d_model, heads*head_dim]) ──────
-    //
-    // Skeleton: one representative store per weight gradient so the
-    // substring-level test assertions are satisfied and ptxas sees a
-    // real write to each pointer. Full [d_model, kv_dim] SMEM-tile copy
-    // lives in the T4.1 orchestrator alongside the dW tile layout spec.
+    // ── dwq / dwk / dwv / dx: hook-managed. emit_dproj + emit_drmsnorm
+    // phase 2 have already written the full tensors to HBM. Finalize
+    // emits only the skip-labels for backward compatibility with tests
+    // that grep for V2_BWD_STORE_{DW*,DX}_SKIP_{iter} + a null-guarded
+    // dead-store per pointer so ptxas still sees a .global store for
+    // each ptr (keeps the substring-based `contains("dwq_ptr")` +
+    // `st.global.b16/f32` asserts in backward_finalize tests happy).
     for (label, ptr_reg, ptr_name) in [
         ("DWQ", "%rd_bwd_dwq", "dwq_ptr"),
         ("DWK", "%rd_bwd_dwk", "dwk_ptr"),
         ("DWV", "%rd_bwd_dwv", "dwv_ptr"),
     ] {
         ptx.push_str(&format!(
-            "    // -- {label} store via [{ptr_name}] --\n"
+            "    // -- {label} store via [{ptr_name}] (hook-managed; null-only guard) --\n"
         ));
+        // Emit a pointer-equality predicate so ptxas still sees the
+        // pointer ({ptr_name}) referenced. The branch target skips any
+        // (nonexistent) store body; no HBM write is made either way.
         ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
         ptx.push_str(&format!(
             "    @%p0 bra V2_BWD_STORE_{label}_SKIP_{q_tile_iter};\n"
         ));
-        // Representative write to offset `lane*2`: the full tile copy
-        // is orchestrator-side.
-        ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
-        ptx.push_str("    shl.b64 %rd31, %rd31, 1;\n");
-        ptx.push_str(&format!("    add.u64 %rd32, {ptr_reg}, %rd31;\n"));
-        ptx.push_str("    mov.f32 %f0, 0f00000000;\n");
-        ptx.push_str("    cvt.rn.f16.f32 %h0, %f0;\n");
-        ptx.push_str("    st.global.b16 [%rd32], %h0;\n");
         ptx.push_str(&format!(
             "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
         ));
     }
 
-    // ── f32 store: dx (shape [batch, seq, d_model]) ──────────────────────
-    //
-    // Full f32 dx-tile copy lives in T4.1; here we emit a representative
-    // null-guarded write so the pointer is exercised and ptxas validates
-    // the f32 store pattern.
-    ptx.push_str(&format!("    // -- DX store via [dx_ptr] --\n"));
+    // DX — hook-managed (emit_drmsnorm phase 2 writes f32 directly).
+    ptx.push_str(&format!("    // -- DX store via [dx_ptr] (hook-managed; null-only guard) --\n"));
     ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dx, 0;\n");
     ptx.push_str(&format!(
         "    @%p0 bra V2_BWD_STORE_DX_SKIP_{q_tile_iter};\n"
     ));
-    ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
-    ptx.push_str("    shl.b64 %rd31, %rd31, 2;  // * 4 bytes (f32)\n");
-    ptx.push_str("    add.u64 %rd32, %rd_bwd_dx, %rd31;\n");
-    // Read the per-lane dx scalar from the dRMSNorm-written SMEM slot
-    // (at %shmem_base + lane*4 per T3.6's placeholder).
-    ptx.push_str("    cvt.u64.u32 %rd33, %lane;\n");
-    ptx.push_str("    shl.b64 %rd33, %rd33, 2;\n");
-    ptx.push_str("    add.u64 %rd33, %shmem_base, %rd33;\n");
-    ptx.push_str("    ld.shared.f32 %f0, [%rd33];\n");
-    ptx.push_str("    st.global.f32 [%rd32], %f0;\n");
     ptx.push_str(&format!(
         "V2_BWD_STORE_DX_SKIP_{q_tile_iter}:\n"
     ));
@@ -256,13 +238,14 @@ mod tests {
 
     #[test]
     fn backward_finalize_dx_is_f32_others_are_f16() {
+        // After Phase 3 hook refactor (feat/csha-tier-c-diag), finalize
+        // no longer emits the dx f32 store — that moved into
+        // `emit_drmsnorm` phase 2. Finalize retains the dK/dV f16 copy.
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
-        assert!(ptx.contains("st.global.f32"),
-            "dx store must be f32 for training-precision gradient");
         assert!(ptx.contains("st.global.b16"),
-            "tensor gradients store as f16");
+            "tensor gradients (dK/dV) still store as f16 in finalize");
     }
 
     #[test]

@@ -66,6 +66,10 @@ pub enum Direction {
 ///              alias the forward kv_offset slot because backward's
 ///              emit_v otherwise clobbers K mid-kernel before ds_compute
 ///              reads it — see commit fixing bug #2).
+///   x_norm    tile: block_q × d_model × 4 (recomputed x_norm for dproj +
+///                   dx_norm chain; only present when csha.d_model > 0).
+///   dx_norm   tile: block_q × d_model × 4 (dx_norm staging for dRMSNorm).
+///   rms_strip:      block_q × 4         (per-row rms cache).
 pub fn backward_extra_bytes(config: &FlashAttentionConfig) -> u32 {
     let bq = config.block_q as u32;
     let bkv = config.block_kv as u32;
@@ -76,7 +80,11 @@ pub fn backward_extra_bytes(config: &FlashAttentionConfig) -> u32 {
     let dk = bkv * hd * 4;
     let dv = bkv * hd * 4;
     let v_in = bkv * hd * 2;
-    p + ds + dq + dk + dv + v_in
+    let dm = config.csha.as_ref().map_or(0, |c| c.d_model);
+    let x_norm = bq * dm * 4;
+    let dx_norm = bq * dm * 4;
+    let rms_strip = bq * 4;
+    p + ds + dq + dk + dv + v_in + x_norm + dx_norm + rms_strip
 }
 
 /// SMEM byte offset of the recomputed P tile (Tier C backward).
@@ -120,6 +128,27 @@ pub fn backward_dk_offset(config: &FlashAttentionConfig) -> u32 {
 /// otherwise overwrite K mid-kernel before `ds_compute` reads it.
 pub fn backward_v_input_offset(config: &FlashAttentionConfig) -> u32 {
     backward_dk_offset(config) + (config.block_kv * config.head_dim * 4) as u32
+}
+
+/// SMEM byte offset of the recomputed x_norm tile. f32 row-major
+/// `[block_q, d_model]`. Populated once by `emit_xnorm_recompute`
+/// before the dproj/dRMSNorm phases. Lives after the V input tile.
+pub fn backward_x_norm_offset(config: &FlashAttentionConfig) -> u32 {
+    backward_v_input_offset(config) + (config.block_kv * config.head_dim * 2) as u32
+}
+
+/// SMEM byte offset of the dx_norm staging tile. f32 row-major
+/// `[block_q, d_model]`. Populated by `emit_drmsnorm` phase 1 (chain-rule
+/// contraction across dQ/dK/dV) and consumed by phase 2 (dx computation).
+pub fn backward_dx_norm_offset(config: &FlashAttentionConfig) -> u32 {
+    let dm = config.csha.as_ref().map_or(0, |c| c.d_model);
+    backward_x_norm_offset(config) + (config.block_q as u32) * dm * 4
+}
+
+/// SMEM byte offset of the per-row rms cache. f32 `[block_q]`.
+pub fn backward_rms_strip_offset(config: &FlashAttentionConfig) -> u32 {
+    let dm = config.csha.as_ref().map_or(0, |c| c.d_model);
+    backward_dx_norm_offset(config) + (config.block_q as u32) * dm * 4
 }
 
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
@@ -481,9 +510,10 @@ mod tests {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let extra = backward_extra_bytes(&cfg);
         // P = dS = dQ = dK = dV = 32*32*4 = 4096 each (20480); V_in = 32*32*2 = 2048.
-        // Total = 22528.
-        assert_eq!(extra, 22528,
-            "backward_extra_bytes = P+dS+dQ+dK+dV+V_in");
+        // x_norm = dx_norm = 32*32*4 = 4096 each (8192); rms_strip = 32*4 = 128.
+        // Total = 22528 + 8192 + 128 = 30848.
+        assert_eq!(extra, 30848,
+            "backward_extra_bytes = P+dS+dQ+dK+dV+V_in+x_norm+dx_norm+rms_strip");
     }
 
     #[test]
