@@ -82,6 +82,7 @@ pub mod pca_segment;
 pub mod pca_tileskip;
 pub mod training_report;
 pub mod pipeline;
+pub mod ptxas_validation;
 pub mod reduction_fusion;
 pub mod serve;
 pub mod source_ad;

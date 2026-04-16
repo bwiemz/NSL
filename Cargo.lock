@@ -1196,6 +1196,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "cudarc",
  "half",
  "insta",
  "libloading 0.8.9",
