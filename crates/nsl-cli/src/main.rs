@@ -1187,6 +1187,9 @@ fn main_inner() {
                 // calibration_data is set; the CLI passes None here and the
                 // compiler resolves the real (batch, seq) from the data header.
                 calibration_batch_seq: None,
+                // M62 Task 6: weight_index_map is populated from analysis in
+                // run_build_single/run_build_multi (where analysis is in scope).
+                weight_index_map: std::collections::HashMap::new(),
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1479,6 +1482,9 @@ fn main_inner() {
                 calibration_sidecar: None,
                 calibration_retention: None,
                 calibration_batch_seq: None,
+                // M62 Task 6: weight_index_map is populated from analysis in
+                // run_build_single (where analysis is in scope).
+                weight_index_map: std::collections::HashMap::new(),
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
@@ -2151,6 +2157,8 @@ fn run_build_shared_single(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // M62 Task 6: route weight_index_map from semantic analysis into codegen.
+    options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
     // so we can emit the C header after the shared library is linked.
     let exports_slot: std::sync::Arc<
@@ -2499,6 +2507,8 @@ fn run_build_zk(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // M62 Task 6: route weight_index_map from semantic analysis into codegen.
+    options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
 
     // Task 4 (B.2): use the `_returning_plan` variant so the WRGA plan is
@@ -2724,6 +2734,8 @@ fn run_build_standalone(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // M62 Task 6: route weight_index_map from semantic analysis into codegen.
+    options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
 
     // 5. Determine output path
@@ -2859,6 +2871,9 @@ fn run_build_single(
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // M62 Task 6: route weight_index_map from semantic analysis into codegen so
+    // compile_export_model_methods can resolve self.<field> → weight-array index.
+    options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
 
     // M45: Run compile-time NaN risk analysis before codegen if --nan-analysis is set.

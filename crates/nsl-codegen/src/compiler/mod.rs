@@ -650,7 +650,7 @@ impl<'a> Compiler<'a> {
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
             wggo_overrides: None,
-            weight_index_map: HashMap::new(),
+            weight_index_map: options.weight_index_map.clone(),
         })
     }
 
