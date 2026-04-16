@@ -143,6 +143,10 @@ pub fn emit_c_abi_wrapper(
         let impl_rets = builder.inst_results(call_inst).to_vec();
 
         // ── Write result into caller's __ret(s) ───────────────────────────────
+        // NOTE: nsl_tensor_to_desc_ffi copies raw data/shape/strides pointers into
+        // the caller's NslTensorDesc — it does NOT deep-copy the buffer. The result
+        // NslTensor struct leaks (~80 bytes/call). Same pattern as nsl_model_forward.
+        // A proper fix (memcpy + free, or caller-side nsl_desc_free_data) is deferred.
         match &wrapper.export_info.return_type {
             ExportTypeInfo::Tensor { .. } => {
                 let ret_desc_ptr = params[1 + wrapper.export_info.params.len()];
@@ -254,7 +258,7 @@ fn emit_set_error<M: Module + ?Sized>(
     let mut bytes = msg.as_bytes().to_vec();
     bytes.push(0u8); // null terminator
 
-    let sym = format!("__nsl_wrapper_errstr_{:016x}", fxhash(msg));
+    let sym = format!("__nsl_wrapper_errstr_{:016x}", fnv1a_hash(msg));
     let data_id = module
         .declare_data(&sym, ModuleLinkage::Local, false, false)
         .map_err(|e| CodegenError::new(format!("declare errstr data: {e:?}")))?;
@@ -273,7 +277,7 @@ fn emit_set_error<M: Module + ?Sized>(
     Ok(())
 }
 
-fn fxhash(s: &str) -> u64 {
+fn fnv1a_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
@@ -350,5 +354,35 @@ mod tests {
         assert_eq!(sig.params[1].value_type, I64);
         assert_eq!(sig.params[2].value_type, F32);
         assert_eq!(sig.params[3].value_type, I64);
+    }
+
+    #[test]
+    fn wrapper_signature_for_tuple_return_has_rets_and_num_rets() {
+        let info = ExportInfo {
+            symbol_name: "split".into(),
+            raw_name: "split".into(),
+            params: vec![tensor_param("x", ExportDtype::F32)],
+            return_type: ExportTypeInfo::Tuple(vec![
+                ExportTypeInfo::Tensor {
+                    shape: vec!["2".into()],
+                    dtype: ExportDtype::F32,
+                    device: ExportDevice::Cpu,
+                },
+                ExportTypeInfo::Tensor {
+                    shape: vec!["2".into()],
+                    dtype: ExportDtype::F32,
+                    device: ExportDevice::Cpu,
+                },
+            ]),
+        };
+        let sig = build_c_abi_wrapper_signature(&info, CallConv::SystemV);
+        // [i64 model, i64 x_desc, i64 rets_array, i64 num_rets_ptr] -> i32
+        assert_eq!(sig.params.len(), 4);
+        assert_eq!(sig.params[0].value_type, I64);
+        assert_eq!(sig.params[1].value_type, I64);
+        assert_eq!(sig.params[2].value_type, I64);
+        assert_eq!(sig.params[3].value_type, I64);
+        assert_eq!(sig.returns.len(), 1);
+        assert_eq!(sig.returns[0].value_type, I32);
     }
 }
