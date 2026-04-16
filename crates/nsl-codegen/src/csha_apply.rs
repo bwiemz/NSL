@@ -263,6 +263,31 @@ pub enum MarkRole {
     OutputProjEpilogue,
 }
 
+/// Gap A: the six device-pointer `cranelift_codegen::ir::Value`s produced
+/// by `nsl_csha_alloc_backward_activations_into` at forward-emission time.
+///
+/// Stashed on `Compiler.csha_forward_saves` keyed by layer name (matching
+/// `BridgeResult.extras` keys). The fused source-AD backward emission
+/// (Gap C/D) reads this map to feed save pointers into
+/// `nsl_flash_attention_csha_backward`.
+///
+/// `Value`s are `FunctionBuilder`-scoped; the stash is therefore only
+/// valid while the same function body is being compiled. The Gap A
+/// lifetime pattern allocates at the FA call site, stashes, and the
+/// free is emitted in the same scope (so Gap C/D can lift the free
+/// out once backward emission lands in the same function body, which
+/// it does today — `compile_train_block` runs both primal and adjoint
+/// lowering in a single `FunctionBuilder`).
+#[derive(Debug, Clone, Copy)]
+pub struct CshaSavePointers {
+    pub q_proj: cranelift_codegen::ir::Value,
+    pub k_proj: cranelift_codegen::ir::Value,
+    pub v_proj: cranelift_codegen::ir::Value,
+    pub row_max: cranelift_codegen::ir::Value,
+    pub row_sum: cranelift_codegen::ir::Value,
+    pub x_raw: cranelift_codegen::ir::Value,
+}
+
 // ---------------------------------------------------------------------------
 // Bridge
 // ---------------------------------------------------------------------------

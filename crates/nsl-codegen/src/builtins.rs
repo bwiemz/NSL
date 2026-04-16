@@ -1031,6 +1031,71 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // Gap A: CSHA FA launcher with activation-save pointers for source-AD
+    // backward. Identical to `nsl_flash_attention_csha` plus 6 trailing
+    // save-pointer args (q_proj, k_proj, v_proj, row_max, row_sum, x_raw).
+    // Emitted by `compile_flash_attention_call` when
+    // `CshaExtras.save_activations_for_backward` is true (i.e. inside a
+    // `@train` block with CSHA fused).
+    (
+        "nsl_flash_attention_csha_with_saves",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // q, k, v, out
+            types::I64, // logsumexp
+            types::I64, // scale_bits
+            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
+            types::I64, types::I64, types::I64, types::I64, // block_table, k_pool, v_pool, block_size
+            types::I64, types::I64, // cos, sin
+            types::I64, types::I64, // seq_ids, seq_lens
+            types::I64, // shared_mem_bytes
+            types::I64, types::I64, // ptx_ptr, name_ptr
+            types::I64, types::I64, // block_q, block_kv
+            types::I64, // causal
+            // CSHA extras (9):
+            types::I64, // x_ptr
+            types::I64, // norm_weight_ptr
+            types::I64, types::I64, types::I64, types::I64, // Wq, Wk, Wv, Wo
+            types::I64, // rmsnorm_eps_bits
+            types::I64, // active_heads
+            types::I64, // d_model
+            // Tier C activation-save pointers (6):
+            types::I64, // q_proj_ptr
+            types::I64, // k_proj_ptr
+            types::I64, // v_proj_ptr
+            types::I64, // row_max_ptr
+            types::I64, // row_sum_ptr
+            types::I64, // x_raw_ptr
+        ],
+        Some(types::I64),
+    ),
+    // Gap A: codegen-side allocator for the 6 CSHA backward-activation
+    // HBM buffers. Writes 6 device-pointer i64s contiguously into
+    // `out_ptr` (caller-supplied stack-slot). Returns 0 on success.
+    (
+        "nsl_csha_alloc_backward_activations_into",
+        &[
+            types::I64, // batch
+            types::I64, // heads
+            types::I64, // seq
+            types::I64, // head_dim
+            types::I64, // out_ptr (writes 6 * i64)
+        ],
+        Some(types::I64),
+    ),
+    // Gap A: codegen-side free helper. Takes 6 i64 pointers matching the
+    // layout written by `nsl_csha_alloc_backward_activations_into`.
+    (
+        "nsl_csha_free_backward_activations_from",
+        &[
+            types::I64, // q_proj
+            types::I64, // k_proj
+            types::I64, // v_proj
+            types::I64, // row_max
+            types::I64, // row_sum
+            types::I64, // x_raw
+        ],
+        None,
+    ),
     // FlashAttention-2 backward (M27 backward pass)
     // Returns NslList [dQ, dK, dV]. When logsumexp_ptr == 0, auto-computes lse.
     (

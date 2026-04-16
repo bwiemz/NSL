@@ -38,3 +38,4 @@ string-interner.workspace = true
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.8"
+object = "0.36"

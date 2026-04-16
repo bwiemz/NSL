@@ -1482,47 +1482,150 @@ impl Compiler<'_> {
                 x_v = builder.use_var(var);
             }
 
-            let _err = self.compile_call_by_name(
-                builder,
-                "nsl_flash_attention_csha",
-                &[
-                    q_val, k_val, v_val, out_val,
-                    lse_val,
-                    scale_val,
-                    batch, heads, seq_len, head_dim,
-                    null, null, null, null, // paged
-                    null, null,             // RoPE
-                    null, null,             // seq_ids, seq_lens
-                    shmem_val,
-                    ptx_ptr, name_ptr,
-                    block_q_val, block_kv_val,
-                    causal_val,
-                    // CSHA extras (A.2.1a + A.2.1e + A.2.1g):
-                    //
-                    // x_v comes from a `state.variables` probe for a
-                    // tensor-typed parameter named by one of the
-                    // common conventions (`x`, `hidden_states`, ...).
-                    // Works without cross-function-body machinery
-                    // because the FA call site runs inside the same
-                    // FunctionBuilder that declared the
-                    // `@flash_attention` function's params. Null when
-                    // no conventional name hits — A.2.2 prologue's
-                    // runtime null-check falls through to the classic
-                    // Q-from-HBM path.
-                    //
-                    // The plan-level VarId resolver from A.2.1f
-                    // (`csha_apply::collect_norm_input_varids`)
-                    // remains available for future callers that need
-                    // to resolve x by Wengert position rather than
-                    // Cranelift-parameter name.
-                    x_v,                       // A.2.1g: param probe
-                    norm_w_v,                  // resolved via conventional-name probe
-                    wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
-                    eps_bits,
-                    active_heads_val,
-                    d_model_val,
-                ],
-            )?;
+            // Gap A: when `save_activations_for_backward` is on (set by
+            // `compile_train_block` after `csha_apply::bridge` when inside
+            // a `@train` block), allocate the 6 backward-activation
+            // buffers via `nsl_csha_alloc_backward_activations_into`,
+            // stash the returned device pointers on `Compiler.csha_forward_saves`
+            // keyed by layer name, and dispatch to the `_with_saves` FFI.
+            //
+            // Rationale for the i64-array wrapper (vs. the struct-return
+            // `nsl_csha_alloc_backward_activations`): Cranelift's ABI
+            // for struct-by-value returns uses an sret hidden first
+            // argument, which is awkward to model in `compile_call_by_name`
+            // against the runtime-function signature table. The
+            // `_into` variant writes the 6 i64 fields contiguously into
+            // a caller-supplied stack slot.
+            if extras.save_activations_for_backward {
+                // 6 × i64 = 48 bytes, aligned to 8.
+                let saves_slot = builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        48,
+                        8,
+                    ),
+                );
+                let saves_ptr = builder.ins().stack_addr(cl_types::I64, saves_slot, 0);
+                // The alloc helper sizes each buffer from (batch, heads, seq, head_dim),
+                // matching the forward kernel's launch dims.
+                let _alloc_rc = self.compile_call_by_name(
+                    builder,
+                    "nsl_csha_alloc_backward_activations_into",
+                    &[batch, heads, seq_len, head_dim, saves_ptr],
+                )?;
+
+                // Load the 6 device pointers out of the stack slot.
+                let q_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 0);
+                let k_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 8);
+                let v_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 16);
+                let row_max_v = builder.ins().stack_load(cl_types::I64, saves_slot, 24);
+                let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
+                let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
+
+                // Stash on Compiler so the fused source-AD backward
+                // emission (Gap C/D) can read these when lowering the
+                // chain's output op. Key = layer name (falls back to a
+                // synthetic ordinal-based key when the layer is
+                // unresolved — unlikely in practice but defensive).
+                let layer_key = csha_layer
+                    .clone()
+                    .unwrap_or_else(|| format!("csha_fa_ord_{}", ordinal));
+                self.csha_forward_saves.insert(
+                    layer_key,
+                    crate::csha_apply::CshaSavePointers {
+                        q_proj: q_proj_v,
+                        k_proj: k_proj_v,
+                        v_proj: v_proj_v,
+                        row_max: row_max_v,
+                        row_sum: row_sum_v,
+                        x_raw: x_raw_v,
+                    },
+                );
+
+                let _err = self.compile_call_by_name(
+                    builder,
+                    "nsl_flash_attention_csha_with_saves",
+                    &[
+                        q_val, k_val, v_val, out_val,
+                        lse_val,
+                        scale_val,
+                        batch, heads, seq_len, head_dim,
+                        null, null, null, null, // paged
+                        null, null,             // RoPE
+                        null, null,             // seq_ids, seq_lens
+                        shmem_val,
+                        ptx_ptr, name_ptr,
+                        block_q_val, block_kv_val,
+                        causal_val,
+                        x_v, norm_w_v,
+                        wq_v, wk_v, wv_v, wo_v,
+                        eps_bits,
+                        active_heads_val,
+                        d_model_val,
+                        // Tier C activation-save pointers.
+                        q_proj_v, k_proj_v, v_proj_v,
+                        row_max_v, row_sum_v,
+                        x_raw_v,
+                    ],
+                )?;
+
+                // Gap A (scope-limited lifetime): emit the free right
+                // after the FA call. Cranelift `Value`s live until end
+                // of block, so the stash in `csha_forward_saves` is
+                // only valid until this point — but that's fine for
+                // Gap A's isolation: Gap C/D will replace this
+                // immediate free with a backward-aware lifetime
+                // (either by lifting the free after the backward call
+                // or by re-emitting the save allocation inside the
+                // adjoint emitter).
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_csha_free_backward_activations_from",
+                    &[q_proj_v, k_proj_v, v_proj_v, row_max_v, row_sum_v, x_raw_v],
+                )?;
+            } else {
+                let _err = self.compile_call_by_name(
+                    builder,
+                    "nsl_flash_attention_csha",
+                    &[
+                        q_val, k_val, v_val, out_val,
+                        lse_val,
+                        scale_val,
+                        batch, heads, seq_len, head_dim,
+                        null, null, null, null, // paged
+                        null, null,             // RoPE
+                        null, null,             // seq_ids, seq_lens
+                        shmem_val,
+                        ptx_ptr, name_ptr,
+                        block_q_val, block_kv_val,
+                        causal_val,
+                        // CSHA extras (A.2.1a + A.2.1e + A.2.1g):
+                        //
+                        // x_v comes from a `state.variables` probe for a
+                        // tensor-typed parameter named by one of the
+                        // common conventions (`x`, `hidden_states`, ...).
+                        // Works without cross-function-body machinery
+                        // because the FA call site runs inside the same
+                        // FunctionBuilder that declared the
+                        // `@flash_attention` function's params. Null when
+                        // no conventional name hits — A.2.2 prologue's
+                        // runtime null-check falls through to the classic
+                        // Q-from-HBM path.
+                        //
+                        // The plan-level VarId resolver from A.2.1f
+                        // (`csha_apply::collect_norm_input_varids`)
+                        // remains available for future callers that need
+                        // to resolve x by Wengert position rather than
+                        // Cranelift-parameter name.
+                        x_v,                       // A.2.1g: param probe
+                        norm_w_v,                  // resolved via conventional-name probe
+                        wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
+                        eps_bits,
+                        active_heads_val,
+                        d_model_val,
+                    ],
+                )?;
+            }
         } else {
             let _err = self.compile_call_by_name(
                 builder,
