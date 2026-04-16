@@ -1,7 +1,10 @@
 //! M40: Source-to-source AD — adjoint generation, dead gradient elimination,
 //! and saved tensor analysis.
 
-use crate::ad_rules::{apply_ad_rule, AdjointExpr, InputAdjoint};
+use crate::ad_rules::{
+    apply_ad_rule, csha_dispatch_for_op, AdjointExpr, CshaDispatchDecision, InputAdjoint,
+};
+use crate::csha_apply::FusionMark;
 use crate::wengert::{
     type_for_op, CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, WengertType,
 };
@@ -17,12 +20,29 @@ use nsl_lexer::Interner;
 // Adjoint generation
 // ---------------------------------------------------------------------------
 
+/// T7.1: CSHA backward dispatch claims threaded into the adjoint generator.
+///
+/// Built by `collect_chain_dispatch_map` in `csha_apply.rs`.  When
+/// present, the reverse walk checks each op against `op_to_chain`
+/// before falling through to `apply_ad_rule`.
+pub struct CshaBackwardClaims {
+    /// Maps Wengert op index → chain index in `chain_marks`.
+    pub op_to_chain: HashMap<u32, usize>,
+    /// One canonical FusionMark per boundary chain.  All ops in a chain
+    /// share the same mark (and its `backward_emitted` Cell).
+    pub chain_marks: Vec<FusionMark>,
+}
+
 /// Generates the backward (adjoint) Wengert list from a forward (primal) list.
 pub struct AdjointGenerator {
     adjoint_ops: Vec<WengertOp>,
     adjoint_vars: HashMap<VarId, VarId>,
     var_counter: VarId,
     op_counter: OpId,
+    /// T7.1: optional CSHA claims for fused backward dispatch.
+    csha_claims: Option<CshaBackwardClaims>,
+    /// T7.1: diagnostics emitted when a CSHA chain falls back to per-op AD.
+    csha_diagnostics: Vec<String>,
 }
 
 impl AdjointGenerator {
@@ -32,7 +52,23 @@ impl AdjointGenerator {
             adjoint_vars: HashMap::new(),
             var_counter: start_var,
             op_counter: 0,
+            csha_claims: None,
+            csha_diagnostics: Vec::new(),
         }
+    }
+
+    /// T7.1: attach CSHA backward claims to this generator.  Must be
+    /// called before `generate()`.  When set, the reverse walk will
+    /// check each op against the claims map and route to the fused
+    /// backward path (or skip) instead of per-op AD rules.
+    pub fn set_csha_claims(&mut self, claims: CshaBackwardClaims) {
+        self.csha_claims = Some(claims);
+    }
+
+    /// T7.1: return diagnostics collected during the reverse walk for
+    /// CSHA chains that fell back to per-op AD.
+    pub fn csha_diagnostics(&self) -> &[String] {
+        &self.csha_diagnostics
     }
 
     fn next_var(&mut self) -> VarId {
@@ -83,6 +119,59 @@ impl AdjointGenerator {
         });
 
         for op in primal.ops.iter().rev() {
+            // T7.1: check CSHA backward dispatch before per-op AD.
+            if let Some(ref claims) = self.csha_claims {
+                if let Some(&chain_idx) = claims.op_to_chain.get(&op.id) {
+                    let mark = &claims.chain_marks[chain_idx];
+                    match csha_dispatch_for_op(mark, op.id) {
+                        CshaDispatchDecision::EmitFused => {
+                            // TODO(T7.2): Emit the fused backward kernel call.
+                            //
+                            // The full EmitFused codegen requires:
+                            //   1. Saved activation pointers from the forward pass
+                            //      (Q, K, V, O, logsumexp) — not yet plumbed through
+                            //      the Wengert list / runtime save stash.
+                            //   2. Gradient buffer allocation for dQ, dK, dV, dWq,
+                            //      dWk, dWv, dx.
+                            //   3. PTX synthesis via `synthesize_backward(&config)`
+                            //      and JIT launch via `nsl_flash_attention_csha_backward`.
+                            //
+                            // For now, emit a diagnostic and fall through to per-op
+                            // AD so gradients are still correct.  The dispatch logic
+                            // is wired and tested — only the kernel emission is
+                            // deferred.
+                            //
+                            // When this TODO is resolved, the per-op fallback below
+                            // should be replaced with:
+                            //   - Emit a single CshaFusedBackward adjoint op
+                            //   - Register output VarIds (dQ/dK/dV/dWq/dWk/dWv/dx)
+                            //   - Skip to the next op (the Cell is already set)
+                            eprintln!(
+                                "[nsl] CSHA fused backward: dispatch accepted for layer '{}' \
+                                 (chain kind={:?}), but kernel emission not yet implemented — \
+                                 falling back to per-op AD",
+                                mark.layer,
+                                mark.kind,
+                            );
+                            // Reset the Cell so subsequent ops in this chain also
+                            // fall through to per-op AD (they'd otherwise get
+                            // AlreadyEmitted and produce no gradients).
+                            mark.backward_emitted.set(false);
+                            // Fall through to per-op AD below.
+                        }
+                        CshaDispatchDecision::AlreadyEmitted => {
+                            // The fused kernel already handles this op's gradient.
+                            // Skip per-op AD entirely.
+                            continue;
+                        }
+                        CshaDispatchDecision::Fallback { diagnostic } => {
+                            self.csha_diagnostics.push(diagnostic);
+                            // Fall through to per-op AD below.
+                        }
+                    }
+                }
+            }
+
             let output_bar = self.get_or_create_adjoint(op.result);
             let input_adjoints = apply_ad_rule(op, output_bar);
 
