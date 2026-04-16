@@ -222,8 +222,12 @@ fn run_fused_backward_config(
     let sin_f16: Vec<u16> = sin_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
     let cos: Vec<f32> = cos_f16.iter().map(|&b| f16_to_f32(b)).collect();
     let sin: Vec<f32> = sin_f16.iter().map(|&b| f16_to_f32(b)).collect();
-    let do_host = det_seq(99, seq * kv_dim);
-    let do_f16: Vec<u16> = do_host.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_host_f32 = det_seq(99, seq * kv_dim);
+    let do_f16: Vec<u16> = do_host_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    // Use f16-rounded dO for the CPU reference so both sides see the same
+    // precision (avoids spurious divergence from f32-only dO in CPU vs
+    // f16-truncated dO in GPU — same pattern as cos/sin above).
+    let do_host: Vec<f32> = do_f16.iter().map(|&b| f16_to_f32(b)).collect();
 
     // ── CPU reference ──────────────────────────────────────────────────────
     let inputs = CshaInputs {

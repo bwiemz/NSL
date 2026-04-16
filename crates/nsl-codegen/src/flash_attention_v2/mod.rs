@@ -473,7 +473,15 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // tiles. Fired once; subsequent q_tile_iter iterations read from
     // these tiles. K and V are loaded via kv_load so ds_compute can
     // recompute S = Q @ K^T and dP = dO · V^T with real addressing.
-    phases::backward::q_load::emit(&mut ptx, config, 0);
+    //
+    // Q load must cover ALL block_q rows — each q_tile_iter loads 4 rows
+    // (one per warp), so we iterate all q_tile_iters to fill the full
+    // Q SMEM tile. Without this, only rows 0..3 would be populated and
+    // ds_compute for q_tile_iter > 0 would read uninitialised SMEM.
+    let q_load_iters = (config.block_q as u32).div_ceil(4);
+    for qi in 0..q_load_iters {
+        phases::backward::q_load::emit(&mut ptx, config, qi);
+    }
     phases::backward::kv_load::emit_k(&mut ptx, config);
     phases::backward::kv_load::emit_v(&mut ptx, config);
 
