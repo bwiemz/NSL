@@ -53,9 +53,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // a misrouted caller can't produce an invalid kernel.
     let _ = Direction::Backward;
 
-    ptx.push_str(".version 8.7\n");
-    ptx.push_str(".target sm_75\n");
-    ptx.push_str(".address_size 64\n\n");
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
 
     let dyn_smem = backward_needs_dynamic_smem(config);
     if dyn_smem {

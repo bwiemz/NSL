@@ -24,9 +24,8 @@ use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes};
 /// `shmem` byte array declared here.
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // File header.
-    ptx.push_str(".version 8.7\n");
-    ptx.push_str(".target sm_75\n");
-    ptx.push_str(".address_size 64\n\n");
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
 
     // Dynamic SMEM module-scope declaration (must precede the .visible .entry).
     // In PTX, `.extern .shared` is a module-level directive — it CANNOT appear
