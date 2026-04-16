@@ -197,6 +197,113 @@ fn no_claims_produces_normal_adjoints() {
         adjoint.ops.len()
     );
     assert!(gen.csha_diagnostics().is_empty());
+    // No claims → no fused-backward events either.
+    assert!(gen.csha_fused_events().is_empty());
+}
+
+/// T7.2: smoke config (hd=32, seq=32, block_q=block_kv=32, d_model=32)
+/// records a `CshaFusedBackwardEvent{smoke_config=true}` so downstream
+/// tools know which chains WOULD go fused once the kernel-launch codegen
+/// lands.
+#[test]
+fn smoke_config_records_fused_event() {
+    let primal = mixed_wengert();
+    let claims = build_claims(ok_config()); // smoke config
+
+    let mut gen = AdjointGenerator::new(10);
+    gen.set_csha_claims(claims);
+    let _adjoint = gen.generate(&primal);
+
+    let events = gen.csha_fused_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "smoke config should record one fused-backward event, got {:?}",
+        events
+    );
+    let ev = &events[0];
+    assert_eq!(ev.layer, "blocks.0");
+    assert_eq!(ev.head_dim, 32);
+    assert_eq!(ev.block_q, 32);
+    assert_eq!(ev.block_kv, 32);
+    assert!(ev.smoke_config, "hd=32 smoke config must mark smoke_config=true");
+}
+
+/// T7.2: scope gate — configs bigger than the smoke shape still get an
+/// event recorded (so reports can show the fused path WOULD have fired)
+/// but with `smoke_config=false`. The kernel-launch codegen is pinned to
+/// smoke config only in this build; everything else falls back to per-op AD.
+#[test]
+fn non_smoke_config_records_event_with_scope_gate() {
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    // hd=64 passes the backward validator but is outside the smoke scope.
+    let hd64_ok_cfg = FlashAttentionConfig {
+        block_q: 32, block_kv: 32, head_dim: 64,
+        causal: false, paged: false, rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+        csha: Some(CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 64,
+            ..CshaExtras::default()
+        }),
+    };
+
+    // Ensure the config passes the backward validator — otherwise this
+    // test is silently exercising the fallback path.
+    use nsl_codegen::flash_attention_v2::smem_layout::{
+        validate_scalar_v2_config, Direction,
+    };
+    assert!(
+        validate_scalar_v2_config(&hd64_ok_cfg, Direction::Backward).is_ok(),
+        "harness config must pass backward validation"
+    );
+
+    let primal = mixed_wengert();
+    let claims = build_claims(hd64_ok_cfg);
+
+    let mut gen = AdjointGenerator::new(10);
+    gen.set_csha_claims(claims);
+    let _adjoint = gen.generate(&primal);
+
+    let events = gen.csha_fused_events();
+    assert_eq!(events.len(), 1, "hd=64 chain should still record an event");
+    let ev = &events[0];
+    assert_eq!(ev.head_dim, 64);
+    assert!(
+        !ev.smoke_config,
+        "hd=64 config must be flagged smoke_config=false (scope-gated)"
+    );
+
+    // Still no fallback diagnostics — the dispatcher accepted the chain;
+    // the fallback is a scope-gate decision, not a validator rejection.
+    assert!(
+        gen.csha_diagnostics().is_empty(),
+        "scope-gated fallback should not emit a rejection diagnostic"
+    );
+}
+
+/// T7.2: validator-rejected configs should NOT record a fused event —
+/// the dispatcher never reached EmitFused.
+#[test]
+fn fallback_chain_records_no_fused_event() {
+    let primal = mixed_wengert();
+    let claims = build_claims(over_budget_config());
+
+    let mut gen = AdjointGenerator::new(10);
+    gen.set_csha_claims(claims);
+    let _adjoint = gen.generate(&primal);
+
+    assert!(
+        gen.csha_fused_events().is_empty(),
+        "validator-rejected chain must not record a fused event, got {:?}",
+        gen.csha_fused_events()
+    );
+    // The fallback diagnostic is the authoritative surface for this
+    // case — events stay empty.
+    assert!(!gen.csha_diagnostics().is_empty());
 }
 
 /// Verify that the `collect_chain_dispatch_map` helper correctly

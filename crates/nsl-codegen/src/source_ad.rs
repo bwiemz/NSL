@@ -33,6 +33,42 @@ pub struct CshaBackwardClaims {
     pub chain_marks: Vec<FusionMark>,
 }
 
+/// T7.2: a single "fused backward would be emitted" event produced by
+/// the dispatcher when a claimed chain's config is accepted.
+///
+/// Records the chain metadata downstream tooling (`nsl profile`, sidecar
+/// reports, planner consumers) needs to show the user which layers
+/// WOULD go through the fused path — even while the full kernel-launch
+/// codegen is deferred behind the forward save-buffer plumbing.
+///
+/// When the actual kernel-launch emission is wired up (see the
+/// architectural-gaps list in `generate`), consumers can diff
+/// `csha_fused_events.len()` against a run that uses per-op AD to
+/// quantify the fusion coverage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CshaFusedBackwardEvent {
+    /// Layer prefix (e.g. `blocks.0`) the chain targets.
+    pub layer: String,
+    /// The chain's output-op Wengert index (RoPE when present, else
+    /// the Q/K/V projection matmul). Used by downstream tools to
+    /// correlate fused events with primal ops in a profile trace.
+    pub output_op_id: u32,
+    /// Head dim from the resolved config — useful to tell Track A
+    /// (head_dim=32/64) from Track B (head_dim=128) chains apart in
+    /// reports without hauling the full FlashAttentionConfig around.
+    pub head_dim: i64,
+    /// block_q/block_kv pair — recorded so the smoke-config gate can
+    /// be audited from downstream tests.
+    pub block_q: i64,
+    pub block_kv: i64,
+    /// `true` when this event fired on the smoke config and the
+    /// dispatcher took the `EmitFused` path (stub today; kernel-launch
+    /// codegen deferred). `false` when the dispatcher scope-gated the
+    /// chain to per-op AD even though the backward validator accepted
+    /// it (e.g. head_dim > 32). Kept so tests can pin the scope gate.
+    pub smoke_config: bool,
+}
+
 /// Generates the backward (adjoint) Wengert list from a forward (primal) list.
 pub struct AdjointGenerator {
     adjoint_ops: Vec<WengertOp>,
@@ -43,6 +79,11 @@ pub struct AdjointGenerator {
     csha_claims: Option<CshaBackwardClaims>,
     /// T7.1: diagnostics emitted when a CSHA chain falls back to per-op AD.
     csha_diagnostics: Vec<String>,
+    /// T7.2: one event per claimed chain whose config was accepted by the
+    /// backward validator (regardless of whether the smoke-config scope
+    /// gate caused the dispatcher to actually take the fused path). See
+    /// [`CshaFusedBackwardEvent`].
+    csha_fused_events: Vec<CshaFusedBackwardEvent>,
 }
 
 impl AdjointGenerator {
@@ -54,6 +95,7 @@ impl AdjointGenerator {
             op_counter: 0,
             csha_claims: None,
             csha_diagnostics: Vec::new(),
+            csha_fused_events: Vec::new(),
         }
     }
 
@@ -69,6 +111,12 @@ impl AdjointGenerator {
     /// CSHA chains that fell back to per-op AD.
     pub fn csha_diagnostics(&self) -> &[String] {
         &self.csha_diagnostics
+    }
+
+    /// T7.2: return the per-chain "fused backward accepted" events
+    /// recorded during the reverse walk. See [`CshaFusedBackwardEvent`].
+    pub fn csha_fused_events(&self) -> &[CshaFusedBackwardEvent] {
+        &self.csha_fused_events
     }
 
     fn next_var(&mut self) -> VarId {
@@ -118,6 +166,14 @@ impl AdjointGenerator {
             checkpointed: false,
         });
 
+        // T7.2: track chain indices whose fused event has already been
+        // recorded in this generate() call. Because the stub resets
+        // `backward_emitted = false` after recording the event (so the
+        // other claimed ops in the chain still go through per-op AD),
+        // we can't rely on the mark's Cell for single-event semantics —
+        // local state gives us one event per chain.
+        let mut fused_event_emitted: HashSet<usize> = HashSet::new();
+
         for op in primal.ops.iter().rev() {
             // T7.1: check CSHA backward dispatch before per-op AD.
             if let Some(ref claims) = self.csha_claims {
@@ -125,34 +181,125 @@ impl AdjointGenerator {
                     let mark = &claims.chain_marks[chain_idx];
                     match csha_dispatch_for_op(mark, op.id) {
                         CshaDispatchDecision::EmitFused => {
-                            // TODO(T7.2): Emit the fused backward kernel call.
+                            // T7.2: Kernel-launch codegen for the fused backward.
                             //
-                            // The full EmitFused codegen requires:
-                            //   1. Saved activation pointers from the forward pass
-                            //      (Q, K, V, O, logsumexp) — not yet plumbed through
-                            //      the Wengert list / runtime save stash.
-                            //   2. Gradient buffer allocation for dQ, dK, dV, dWq,
-                            //      dWk, dWv, dx.
-                            //   3. PTX synthesis via `synthesize_backward(&config)`
-                            //      and JIT launch via `nsl_flash_attention_csha_backward`.
+                            // Architectural reality (2026-04-16): even though the
+                            // backward validator accepted the config, end-to-end
+                            // kernel emission from inside the AD reverse walk is
+                            // gated on plumbing that doesn't exist yet at the
+                            // compiler level (see "Architectural gaps" below).
+                            // Rather than hack around those gaps, we:
                             //
-                            // For now, emit a diagnostic and fall through to per-op
-                            // AD so gradients are still correct.  The dispatch logic
-                            // is wired and tested — only the kernel emission is
-                            // deferred.
+                            //   1. Record a `CshaFusedBackwardEvent` so downstream
+                            //      tooling (nsl profile, sidecar reports) can
+                            //      enumerate which chains were accepted.
+                            //   2. Scope-gate to the T6.3 smoke config
+                            //      (hd=32, seq=32, block_q=block_kv=32, d_model=32,
+                            //      single head) — larger configs get a sharper
+                            //      diagnostic so users understand why they see
+                            //      per-op AD even though CSHA "fired".
+                            //   3. Fall through to per-op AD (the gradients are
+                            //      still correct; we just lose the fused-kernel
+                            //      perf win). This keeps @train compilations
+                            //      producing runnable artefacts.
                             //
-                            // When this TODO is resolved, the per-op fallback below
-                            // should be replaced with:
-                            //   - Emit a single CshaFusedBackward adjoint op
-                            //   - Register output VarIds (dQ/dK/dV/dWq/dWk/dWv/dx)
-                            //   - Skip to the next op (the Cell is already set)
-                            eprintln!(
-                                "[nsl] CSHA fused backward: dispatch accepted for layer '{}' \
-                                 (chain kind={:?}), but kernel emission not yet implemented — \
-                                 falling back to per-op AD",
-                                mark.layer,
-                                mark.kind,
+                            // Architectural gaps blocking the real kernel launch:
+                            //   A. Forward path emits `nsl_flash_attention_csha`,
+                            //      not `..._with_saves`. No Q_proj / K_proj /
+                            //      V_proj / row_max / row_sum / x_raw HBM
+                            //      buffers are allocated or captured. The
+                            //      backward kernel would read garbage for every
+                            //      saved-activation pointer. Fixing this needs:
+                            //        - Forward-side allocation via
+                            //          `nsl_csha_alloc_backward_activations`
+                            //          (conditional on `@train` context).
+                            //        - Forward call site in
+                            //          `expr/advanced.rs::compile_call_by_name`
+                            //          switching to the `_with_saves` variant.
+                            //        - A `Compiler`-level stash keyed by
+                            //          (layer, FusionMark id) → save pointers
+                            //          that the AD-lowering phase can read.
+                            //   B. No backward PTX compile context.
+                            //      `FlashAttentionCompileContext` carries only
+                            //      classic FA-2 backward PTX data-ids
+                            //      (bwd_phase1 / bwd_phase2). The CSHA Tier-C
+                            //      backward needs its own pair plus a
+                            //      `synthesize_backward` call on each CSHA-active
+                            //      config.
+                            //   C. No PrimalOp variant for the fused backward.
+                            //      A Wengert op produces ONE VarId by design;
+                            //      the fused backward produces seven
+                            //      (dq/dk/dv/dwq/dwk/dwv/dx). Handling this
+                            //      requires either:
+                            //        - Seven `CshaFusedBackwardExtract`
+                            //          Passthrough-like ops (mirror of
+                            //          `FlashAttentionBackwardExtract` in
+                            //          wengert_lower.rs), keyed on a shared
+                            //          `(layer, chain_idx)` cache, OR
+                            //        - A structural change to `WengertOp` to
+                            //          carry a `Vec<VarId>` result list.
+                            //   D. No output tensor allocation inside the AD
+                            //      reverse walk. `AdjointGenerator::generate`
+                            //      is a pure builder — it synthesises Wengert
+                            //      ops; actual `nsl_tensor_alloc` calls happen
+                            //      in `wengert_lower.rs`. The seven f16/f32
+                            //      output buffers need to be allocated there
+                            //      with the right dtype + shape derived from
+                            //      the FusionMark's `FlashAttentionConfig`.
+                            //
+                            // Scope-gate: only record events for the smoke
+                            // config. Everything else still falls back but
+                            // the diagnostic is sharper.
+                            let cfg = mark.config.as_ref().expect(
+                                "dispatcher accepted EmitFused with None config — \
+                                 csha_dispatch_for_op contract violated",
                             );
+                            let is_smoke = cfg.head_dim == 32
+                                && cfg.block_q == 32
+                                && cfg.block_kv == 32
+                                && cfg.csha.as_ref().map_or(false, |c| c.d_model == 32);
+
+                            // Guard: record at most ONE event per chain even
+                            // though the stub falls through and other ops in
+                            // the chain will re-enter EmitFused.
+                            if fused_event_emitted.insert(chain_idx) {
+                                self.csha_fused_events.push(CshaFusedBackwardEvent {
+                                    layer: mark.layer.clone(),
+                                    output_op_id: op.id,
+                                    head_dim: cfg.head_dim,
+                                    block_q: cfg.block_q,
+                                    block_kv: cfg.block_kv,
+                                    smoke_config: is_smoke,
+                                });
+
+                                if is_smoke {
+                                    eprintln!(
+                                        "[nsl] CSHA fused backward: smoke config accepted \
+                                         for layer '{}' (hd={}, block_q/kv={}x{}, d_model={}); \
+                                         kernel-launch codegen is a stub (see architectural-gaps \
+                                         list in AdjointGenerator::generate) — falling back to \
+                                         per-op AD. Set NSL_CSHA_BWD_FUSED=1 once the plumbing \
+                                         lands to opt in.",
+                                        mark.layer,
+                                        cfg.head_dim,
+                                        cfg.block_q,
+                                        cfg.block_kv,
+                                        cfg.csha.as_ref().map_or(0, |c| c.d_model),
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[nsl] CSHA fused backward: non-smoke config accepted \
+                                         for layer '{}' (hd={}, block_q/kv={}x{}) — scope-gated \
+                                         to smoke config only in this build (T7.2). Falling \
+                                         back to per-op AD.",
+                                        mark.layer,
+                                        cfg.head_dim,
+                                        cfg.block_q,
+                                        cfg.block_kv,
+                                    );
+                                }
+                            }
+
                             // Reset the Cell so subsequent ops in this chain also
                             // fall through to per-op AD (they'd otherwise get
                             // AlreadyEmitted and produce no gradients).
