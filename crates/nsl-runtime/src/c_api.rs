@@ -146,6 +146,25 @@ pub extern "C" fn nsl_clear_error() -> i64 {
     0
 }
 
+/// Set the thread-local error string from a null-terminated C string pointer.
+/// Used by Cranelift-emitted `@export` wrappers; they can't call the Rust-typed
+/// `set_error(String)` directly.
+///
+/// # Arguments
+/// * `msg_ptr` - A pointer (as i64) to a null-terminated C string, or 0 for no-op.
+#[no_mangle]
+pub extern "C" fn nsl_set_error_cstr(msg_ptr: i64) {
+    if msg_ptr == 0 {
+        return;
+    }
+    let msg = unsafe {
+        CStr::from_ptr(msg_ptr as *const c_char)
+            .to_string_lossy()
+            .into_owned()
+    };
+    set_error(msg);
+}
+
 // ---------------------------------------------------------------------------
 // FFI: Model lifecycle
 // ---------------------------------------------------------------------------
@@ -886,6 +905,32 @@ mod tests {
 
         unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
         nsl_clear_error();
+    }
+
+    #[test]
+    fn nsl_set_error_cstr_sets_thread_local() {
+        nsl_clear_error();
+        let msg = std::ffi::CString::new("hello from wrapper").unwrap();
+        nsl_set_error_cstr(msg.as_ptr() as i64);
+        let err_ptr = nsl_get_last_error();
+        assert_ne!(err_ptr, 0);
+        let got = unsafe {
+            CStr::from_ptr(err_ptr as *const c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(got, "hello from wrapper");
+        nsl_clear_error();
+    }
+
+    #[test]
+    fn nsl_set_error_cstr_null_is_noop() {
+        nsl_clear_error();
+        nsl_set_error_cstr(0);
+        // Should not panic; clear_error still works after
+        let err_ptr = nsl_get_last_error();
+        let err_msg = unsafe { CStr::from_ptr(err_ptr as *const c_char).to_str().unwrap_or("") };
+        assert_eq!(err_msg, "");
     }
 
     #[test]
