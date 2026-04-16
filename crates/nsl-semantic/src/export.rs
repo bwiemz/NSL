@@ -5,8 +5,8 @@
 //! assumes signatures are already validated.
 
 use nsl_ast::decl::{Decorator, FnDef, Param};
-use nsl_ast::expr::ExprKind;
-use nsl_ast::stmt::{Stmt, StmtKind};
+use nsl_ast::expr::{Expr, ExprKind};
+use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::types::{TypeExpr, TypeExprKind};
 use nsl_ast::Module;
 use nsl_errors::Diagnostic;
@@ -165,6 +165,10 @@ fn validate_fn_signature(
             );
         }
     }
+
+    // Warn if the body references model weights — these are silently absent
+    // at C-ABI call time because @export functions use compile-time-baked weights.
+    check_no_model_weight_access(fn_def, interner, diagnostics);
 }
 
 fn validate_param(param: &Param, interner: &Interner, diagnostics: &mut Vec<Diagnostic>) {
@@ -196,6 +200,322 @@ fn validate_param(param: &Param, interner: &Interner, diagnostics: &mut Vec<Diag
             ))
             .with_label(type_ann.span, "non-ABI parameter type"),
         );
+    }
+}
+
+/// Warn when an `@export` function body accesses fields on model-typed parameters.
+///
+/// C-ABI wrappers do not load weights at runtime — they use compile-time-baked
+/// weights instead.  A field access like `net.W` inside an `@export` function
+/// silently does the wrong thing at the call site.  This is a syntactic heuristic
+/// (§5 CAUTION): a parameter is considered model-typed if it has a `Named` type
+/// annotation that does not resolve to a primitive scalar.  `self` (rendered as
+/// `ExprKind::SelfRef`) is always treated as model-typed.
+fn check_no_model_weight_access(
+    fn_def: &FnDef,
+    interner: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let fn_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>");
+
+    // Build the set of "suspect" parameter names: self + Named-typed params.
+    let mut suspect_syms: std::collections::HashSet<nsl_ast::Symbol> =
+        std::collections::HashSet::new();
+    let mut has_self_param = false;
+
+    for param in &fn_def.params {
+        let param_name = interner.resolve(param.name.0).unwrap_or("");
+        if param_name == "self" {
+            has_self_param = true;
+            suspect_syms.insert(param.name);
+        } else if let Some(ref ty) = param.type_ann {
+            if is_model_typed(ty, interner) {
+                suspect_syms.insert(param.name);
+            }
+        }
+    }
+
+    if suspect_syms.is_empty() && !has_self_param {
+        return;
+    }
+
+    // Walk every expression in the function body looking for MemberAccess on a
+    // suspect receiver.
+    let found = find_weight_access_in_block(&fn_def.body, &suspect_syms, has_self_param);
+    if let Some(span) = found {
+        diagnostics.push(
+            Diagnostic::warning(format!(
+                "@export function '{}' accesses model weights via field access — \
+                 C-ABI wrappers do not load weights at runtime; \
+                 weight values are baked at compile time",
+                fn_name
+            ))
+            .with_label(span, "model-weight reference"),
+        );
+    }
+}
+
+/// Returns `true` if `ty` is a user-defined named type (not a primitive scalar).
+fn is_model_typed(ty: &TypeExpr, interner: &Interner) -> bool {
+    if let TypeExprKind::Named(sym) = &ty.kind {
+        let name = interner.resolve(sym.0).unwrap_or("");
+        !matches!(
+            name,
+            "f32" | "f64" | "f16" | "bf16" | "fp32" | "fp64" | "fp16"
+                | "i8" | "i16" | "i32" | "i64"
+                | "u8" | "u16" | "u32" | "u64"
+                | "int" | "long" | "bool"
+                | "float" | "double"
+                | "str" | "string"
+        )
+    } else {
+        false
+    }
+}
+
+/// Search a `Block` for the first `MemberAccess` whose object is a suspect
+/// identifier.  Returns the span of the offending expression.
+fn find_weight_access_in_block(
+    block: &Block,
+    suspects: &std::collections::HashSet<nsl_ast::Symbol>,
+    has_self_param: bool,
+) -> Option<nsl_ast::Span> {
+    for stmt in &block.stmts {
+        if let Some(span) = find_weight_access_in_stmt(stmt, suspects, has_self_param) {
+            return Some(span);
+        }
+    }
+    None
+}
+
+fn find_weight_access_in_stmt(
+    stmt: &nsl_ast::stmt::Stmt,
+    suspects: &std::collections::HashSet<nsl_ast::Symbol>,
+    has_self_param: bool,
+) -> Option<nsl_ast::Span> {
+    match &stmt.kind {
+        StmtKind::Return(Some(expr)) | StmtKind::Yield(Some(expr)) | StmtKind::Expr(expr) => {
+            find_weight_access_in_expr(expr, suspects, has_self_param)
+        }
+        StmtKind::VarDecl { value: Some(expr), .. } => {
+            find_weight_access_in_expr(expr, suspects, has_self_param)
+        }
+        StmtKind::Assign { target, value, .. } => {
+            find_weight_access_in_expr(target, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_expr(value, suspects, has_self_param))
+        }
+        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+            find_weight_access_in_expr(condition, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_block(then_block, suspects, has_self_param))
+                .or_else(|| {
+                    for (cond, blk) in elif_clauses {
+                        if let Some(s) = find_weight_access_in_expr(cond, suspects, has_self_param)
+                            .or_else(|| find_weight_access_in_block(blk, suspects, has_self_param))
+                        {
+                            return Some(s);
+                        }
+                    }
+                    None
+                })
+                .or_else(|| {
+                    else_block
+                        .as_ref()
+                        .and_then(|b| find_weight_access_in_block(b, suspects, has_self_param))
+                })
+        }
+        StmtKind::For { iterable, body, .. } => {
+            find_weight_access_in_expr(iterable, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_block(body, suspects, has_self_param))
+        }
+        StmtKind::While { condition, body } => {
+            find_weight_access_in_expr(condition, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_block(body, suspects, has_self_param))
+        }
+        StmtKind::WhileLet { expr, body, .. } => {
+            find_weight_access_in_expr(expr, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_block(body, suspects, has_self_param))
+        }
+        StmtKind::Decorated { stmt: inner, .. } => {
+            find_weight_access_in_stmt(inner, suspects, has_self_param)
+        }
+        _ => None,
+    }
+}
+
+fn find_weight_access_in_expr(
+    expr: &Expr,
+    suspects: &std::collections::HashSet<nsl_ast::Symbol>,
+    has_self_param: bool,
+) -> Option<nsl_ast::Span> {
+    match &expr.kind {
+        ExprKind::MemberAccess { object, .. } => {
+            // Check if receiver is a suspect.
+            let receiver_is_suspect = match &object.kind {
+                ExprKind::SelfRef => has_self_param,
+                ExprKind::Ident(sym) => suspects.contains(sym),
+                _ => false,
+            };
+            if receiver_is_suspect {
+                return Some(expr.span);
+            }
+            // Recurse into the object in case it's a chained access.
+            find_weight_access_in_expr(object, suspects, has_self_param)
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            find_weight_access_in_expr(left, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_expr(right, suspects, has_self_param))
+        }
+        ExprKind::UnaryOp { operand, .. } | ExprKind::Paren(operand) | ExprKind::Await(operand) => {
+            find_weight_access_in_expr(operand, suspects, has_self_param)
+        }
+        ExprKind::Pipe { left, right } => {
+            find_weight_access_in_expr(left, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_expr(right, suspects, has_self_param))
+        }
+        ExprKind::Call { callee, args } => {
+            find_weight_access_in_expr(callee, suspects, has_self_param).or_else(|| {
+                for arg in args {
+                    if let Some(s) =
+                        find_weight_access_in_expr(&arg.value, suspects, has_self_param)
+                    {
+                        return Some(s);
+                    }
+                }
+                None
+            })
+        }
+        ExprKind::Subscript { object, index } => {
+            find_weight_access_in_expr(object, suspects, has_self_param).or_else(|| {
+                find_weight_access_in_subscript(index, suspects, has_self_param)
+            })
+        }
+        ExprKind::ListLiteral(exprs) | ExprKind::TupleLiteral(exprs) => {
+            for e in exprs {
+                if let Some(s) = find_weight_access_in_expr(e, suspects, has_self_param) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        ExprKind::DictLiteral(pairs) => {
+            for (k, v) in pairs {
+                if let Some(s) = find_weight_access_in_expr(k, suspects, has_self_param)
+                    .or_else(|| find_weight_access_in_expr(v, suspects, has_self_param))
+                {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        ExprKind::IfExpr { condition, then_expr, else_expr } => {
+            find_weight_access_in_expr(condition, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_expr(then_expr, suspects, has_self_param))
+                .or_else(|| find_weight_access_in_expr(else_expr, suspects, has_self_param))
+        }
+        ExprKind::BlockExpr(block) => {
+            find_weight_access_in_block(block, suspects, has_self_param)
+        }
+        ExprKind::FString(parts) => {
+            for part in parts {
+                if let nsl_ast::expr::FStringPart::Expr(e) = part {
+                    if let Some(s) = find_weight_access_in_expr(e, suspects, has_self_param) {
+                        return Some(s);
+                    }
+                }
+            }
+            None
+        }
+        ExprKind::Lambda { body, .. } => {
+            find_weight_access_in_expr(body, suspects, has_self_param)
+        }
+        ExprKind::ListComp { element, generators } => {
+            find_weight_access_in_expr(element, suspects, has_self_param).or_else(|| {
+                for gen in generators {
+                    if let Some(s) =
+                        find_weight_access_in_expr(&gen.iterable, suspects, has_self_param)
+                    {
+                        return Some(s);
+                    }
+                    for cond in &gen.conditions {
+                        if let Some(s) =
+                            find_weight_access_in_expr(cond, suspects, has_self_param)
+                        {
+                            return Some(s);
+                        }
+                    }
+                }
+                None
+            })
+        }
+        ExprKind::MatchExpr { subject, arms } => {
+            find_weight_access_in_expr(subject, suspects, has_self_param).or_else(|| {
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        if let Some(s) =
+                            find_weight_access_in_expr(guard, suspects, has_self_param)
+                        {
+                            return Some(s);
+                        }
+                    }
+                    if let Some(s) =
+                        find_weight_access_in_block(&arm.body, suspects, has_self_param)
+                    {
+                        return Some(s);
+                    }
+                }
+                None
+            })
+        }
+        ExprKind::Range { start, end, .. } => {
+            start
+                .as_ref()
+                .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+                .or_else(|| {
+                    end.as_ref()
+                        .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+                })
+        }
+        // Leaf nodes — no sub-expressions.
+        ExprKind::Ident(_)
+        | ExprKind::SelfRef
+        | ExprKind::IntLiteral(_)
+        | ExprKind::FloatLiteral(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::BoolLiteral(_)
+        | ExprKind::NoneLiteral
+        | ExprKind::Error => None,
+    }
+}
+
+fn find_weight_access_in_subscript(
+    index: &nsl_ast::expr::SubscriptKind,
+    suspects: &std::collections::HashSet<nsl_ast::Symbol>,
+    has_self_param: bool,
+) -> Option<nsl_ast::Span> {
+    match index {
+        nsl_ast::expr::SubscriptKind::Index(e) => {
+            find_weight_access_in_expr(e, suspects, has_self_param)
+        }
+        nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => lower
+            .as_ref()
+            .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+            .or_else(|| {
+                upper
+                    .as_ref()
+                    .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+            })
+            .or_else(|| {
+                step.as_ref()
+                    .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+            }),
+        nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
+            for d in dims {
+                if let Some(s) = find_weight_access_in_subscript(d, suspects, has_self_param) {
+                    return Some(s);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -365,6 +685,50 @@ fn foo(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
             errs.iter().any(|d| d.message.contains("multiple times")),
             "expected 'multiple times' error, got: {:?}",
             errs
+        );
+    }
+
+    #[test]
+    fn export_function_referencing_model_field_produces_warning() {
+        // An @export function that accesses a field on a Named-typed parameter
+        // (model weight reference) should produce a warning.
+        let src = "\
+@export
+fn predict(net: Net, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return net.W @ x
+";
+        let diags = parse_and_validate(src);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Warning)
+            .collect();
+        assert!(
+            warnings.iter().any(|d| d.message.contains("weight") && d.message.contains("predict")),
+            "expected weight-reference warning for 'predict', got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn export_pure_function_has_no_weight_warning() {
+        // An @export function with only tensor/scalar params and no field access
+        // should not produce any weight warning.
+        let src = "\
+@export
+fn add(a: Tensor<[4], f32>, b: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return a + b
+";
+        let diags = parse_and_validate(src);
+        let weight_warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.level == nsl_errors::Level::Warning && d.message.contains("weight")
+            })
+            .collect();
+        assert!(
+            weight_warnings.is_empty(),
+            "unexpected weight warning: {:?}",
+            diags
         );
     }
 }
