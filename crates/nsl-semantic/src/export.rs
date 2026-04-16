@@ -4,40 +4,84 @@
 //! Errors here block codegen — `declaration.rs`'s `@export` branch
 //! assumes signatures are already validated.
 
+use std::collections::HashMap;
+
 use nsl_ast::decl::{Decorator, FnDef, ModelMember, Param};
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::types::{TypeExpr, TypeExprKind};
-use nsl_ast::Module;
+use nsl_ast::{Module, NodeId};
 use nsl_errors::Diagnostic;
 use nsl_lexer::Interner;
+
+/// Maps each `self.<field>` expression NodeId (a `MemberAccess` on `SelfRef`) to
+/// the declaration-order index of that field in the enclosing model's tensor-weight list.
+///
+/// Populated by `validate_exports`; consumed by M62 codegen to lower
+/// `self.W` → `load(weight_ptrs + index * 8)`.
+pub type WeightIndexMap = HashMap<NodeId, usize>;
 
 /// Run `@export` validation over the top-level statements of a module.
 ///
 /// Returns diagnostics that should be appended to the rest of the
-/// analysis diagnostics.  Pure-additive: does not read or modify
-/// other analysis state.
-pub fn validate_exports(module: &Module, interner: &Interner) -> Vec<Diagnostic> {
+/// analysis diagnostics, plus a `WeightIndexMap` side-table mapping each
+/// resolved `self.<field>` expression to its tensor-weight index.
+pub fn validate_exports(module: &Module, interner: &Interner) -> (Vec<Diagnostic>, WeightIndexMap) {
     let mut diagnostics = Vec::new();
+    let mut weight_index_map = WeightIndexMap::new();
     for stmt in &module.stmts {
         validate_stmt(stmt, interner, &mut diagnostics);
-        validate_model_method_exports(stmt, interner, &mut diagnostics);
+        validate_model_method_exports(stmt, interner, &mut diagnostics, &mut weight_index_map);
     }
-    diagnostics
+    (diagnostics, weight_index_map)
 }
 
 /// Validate `@export` decorators on methods inside `model` blocks.
 ///
 /// Rule 1 — method has `self` as first param: accepted, no error.
 /// Rule 2 — method lacks `self`: error with a pointed diagnostic.
+///
+/// For methods with `self`, also walks the body and resolves every
+/// `self.<field>` expression:
+/// - Tensor fields → records the declaration-order index in `weight_index_map`.
+/// - Non-tensor fields → emits an error diagnostic.
 fn validate_model_method_exports(
     stmt: &Stmt,
     interner: &Interner,
     diagnostics: &mut Vec<Diagnostic>,
+    weight_index_map: &mut WeightIndexMap,
 ) {
     let StmtKind::ModelDef(md) = &stmt.kind else {
         return;
     };
+
+    // Build declaration-order tensor-weight field name list once per model.
+    let weight_fields: Vec<&str> = md
+        .members
+        .iter()
+        .filter_map(|m| {
+            if let ModelMember::LayerDecl { name, type_ann, .. } = m {
+                if is_tensor_type(type_ann) {
+                    return Some(interner.resolve(name.0).unwrap_or(""));
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Also build a set of *all* field names (tensor + non-tensor) for error reporting.
+    let all_fields: Vec<(&str, bool)> = md
+        .members
+        .iter()
+        .filter_map(|m| {
+            if let ModelMember::LayerDecl { name, type_ann, .. } = m {
+                let field_name = interner.resolve(name.0).unwrap_or("");
+                Some((field_name, is_tensor_type(type_ann)))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for member in &md.members {
         let ModelMember::Method(fn_def, decos) = member else {
@@ -66,6 +110,333 @@ fn validate_model_method_exports(
                      for a standalone function export use a top-level `@export fn`"
                 )),
             );
+            continue;
+        }
+
+        // Walk the body; resolve self.<field> accesses.
+        resolve_self_field_accesses(
+            &fn_def.body,
+            interner,
+            &weight_fields,
+            &all_fields,
+            diagnostics,
+            weight_index_map,
+        );
+    }
+}
+
+/// Returns `true` if `type_ann` is a tensor-like type (Tensor, Param, or Buffer).
+fn is_tensor_type(type_ann: &TypeExpr) -> bool {
+    matches!(
+        type_ann.kind,
+        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } | TypeExprKind::Buffer { .. }
+    )
+}
+
+/// Walk all expressions in `block`, find `self.<field>` MemberAccess nodes,
+/// and either record their weight index or emit an error.
+fn resolve_self_field_accesses(
+    block: &Block,
+    interner: &Interner,
+    weight_fields: &[&str],
+    all_fields: &[(&str, bool)],
+    diagnostics: &mut Vec<Diagnostic>,
+    weight_index_map: &mut WeightIndexMap,
+) {
+    for stmt in &block.stmts {
+        resolve_self_field_accesses_in_stmt(
+            stmt,
+            interner,
+            weight_fields,
+            all_fields,
+            diagnostics,
+            weight_index_map,
+        );
+    }
+}
+
+fn resolve_self_field_accesses_in_stmt(
+    stmt: &Stmt,
+    interner: &Interner,
+    weight_fields: &[&str],
+    all_fields: &[(&str, bool)],
+    diagnostics: &mut Vec<Diagnostic>,
+    weight_index_map: &mut WeightIndexMap,
+) {
+    match &stmt.kind {
+        StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::Expr(e) => {
+            resolve_self_field_accesses_in_expr(
+                e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        StmtKind::VarDecl { value: Some(e), .. } => {
+            resolve_self_field_accesses_in_expr(
+                e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        StmtKind::Assign { target, value, .. } => {
+            resolve_self_field_accesses_in_expr(
+                target, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses_in_expr(
+                value, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+            resolve_self_field_accesses_in_expr(
+                condition, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses(
+                then_block, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            for (cond, blk) in elif_clauses {
+                resolve_self_field_accesses_in_expr(
+                    cond, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+                resolve_self_field_accesses(
+                    blk, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+            if let Some(eb) = else_block {
+                resolve_self_field_accesses(
+                    eb, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        StmtKind::For { iterable, body, .. } => {
+            resolve_self_field_accesses_in_expr(
+                iterable, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses(
+                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        StmtKind::While { condition, body } => {
+            resolve_self_field_accesses_in_expr(
+                condition, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses(
+                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        StmtKind::WhileLet { expr, body, .. } => {
+            resolve_self_field_accesses_in_expr(
+                expr, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses(
+                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        StmtKind::Decorated { stmt: inner, .. } => {
+            resolve_self_field_accesses_in_stmt(
+                inner, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn resolve_self_field_accesses_in_expr(
+    expr: &Expr,
+    interner: &Interner,
+    weight_fields: &[&str],
+    all_fields: &[(&str, bool)],
+    diagnostics: &mut Vec<Diagnostic>,
+    weight_index_map: &mut WeightIndexMap,
+) {
+    match &expr.kind {
+        ExprKind::MemberAccess { object, member } => {
+            if matches!(object.kind, ExprKind::SelfRef) {
+                let field_name = interner.resolve(member.0).unwrap_or("");
+                if let Some(idx) = weight_fields.iter().position(|&f| f == field_name) {
+                    weight_index_map.insert(expr.id, idx);
+                } else {
+                    // Check if it's a known non-tensor field or entirely unknown.
+                    let is_non_tensor_field = all_fields.iter().any(|&(f, _)| f == field_name);
+                    if is_non_tensor_field {
+                        diagnostics.push(Diagnostic::error(format!(
+                            "@export method references `self.{field_name}` but it is not a weight tensor"
+                        )));
+                    }
+                    // If the field isn't in all_fields at all (e.g. dynamic), we silently skip —
+                    // the type checker will catch undefined fields separately.
+                }
+            } else {
+                // Recurse into the object (chained access).
+                resolve_self_field_accesses_in_expr(
+                    object, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            resolve_self_field_accesses_in_expr(
+                left, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses_in_expr(
+                right, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Paren(operand)
+        | ExprKind::Await(operand) => {
+            resolve_self_field_accesses_in_expr(
+                operand, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::Pipe { left, right } => {
+            resolve_self_field_accesses_in_expr(
+                left, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses_in_expr(
+                right, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::Call { callee, args } => {
+            resolve_self_field_accesses_in_expr(
+                callee, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            for arg in args {
+                resolve_self_field_accesses_in_expr(
+                    &arg.value, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        ExprKind::Subscript { object, index } => {
+            resolve_self_field_accesses_in_expr(
+                object, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses_in_subscript(
+                index, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::ListLiteral(exprs) | ExprKind::TupleLiteral(exprs) => {
+            for e in exprs {
+                resolve_self_field_accesses_in_expr(
+                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        ExprKind::DictLiteral(pairs) => {
+            for (k, v) in pairs {
+                resolve_self_field_accesses_in_expr(
+                    k, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+                resolve_self_field_accesses_in_expr(
+                    v, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        ExprKind::IfExpr { condition, then_expr, else_expr } => {
+            resolve_self_field_accesses_in_expr(
+                condition, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses_in_expr(
+                then_expr, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            resolve_self_field_accesses_in_expr(
+                else_expr, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::BlockExpr(block) => {
+            resolve_self_field_accesses(
+                block, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::FString(parts) => {
+            for part in parts {
+                if let nsl_ast::expr::FStringPart::Expr(e) = part {
+                    resolve_self_field_accesses_in_expr(
+                        e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    );
+                }
+            }
+        }
+        ExprKind::Lambda { body, .. } => {
+            resolve_self_field_accesses_in_expr(
+                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        ExprKind::ListComp { element, generators } => {
+            resolve_self_field_accesses_in_expr(
+                element, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            for gen in generators {
+                resolve_self_field_accesses_in_expr(
+                    &gen.iterable, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+                for cond in &gen.conditions {
+                    resolve_self_field_accesses_in_expr(
+                        cond, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    );
+                }
+            }
+        }
+        ExprKind::MatchExpr { subject, arms } => {
+            resolve_self_field_accesses_in_expr(
+                subject, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    resolve_self_field_accesses_in_expr(
+                        guard, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    );
+                }
+                resolve_self_field_accesses(
+                    &arm.body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(e) = start {
+                resolve_self_field_accesses_in_expr(
+                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+            if let Some(e) = end {
+                resolve_self_field_accesses_in_expr(
+                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        // Leaf nodes — no sub-expressions.
+        ExprKind::Ident(_)
+        | ExprKind::SelfRef
+        | ExprKind::IntLiteral(_)
+        | ExprKind::FloatLiteral(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::BoolLiteral(_)
+        | ExprKind::NoneLiteral
+        | ExprKind::Error => {}
+    }
+}
+
+fn resolve_self_field_accesses_in_subscript(
+    index: &nsl_ast::expr::SubscriptKind,
+    interner: &Interner,
+    weight_fields: &[&str],
+    all_fields: &[(&str, bool)],
+    diagnostics: &mut Vec<Diagnostic>,
+    weight_index_map: &mut WeightIndexMap,
+) {
+    match index {
+        nsl_ast::expr::SubscriptKind::Index(e) => {
+            resolve_self_field_accesses_in_expr(
+                e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+            );
+        }
+        nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => {
+            for e in [lower, upper, step].into_iter().flatten() {
+                resolve_self_field_accesses_in_expr(
+                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
+        }
+        nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
+            for d in dims {
+                resolve_self_field_accesses_in_subscript(
+                    d, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                );
+            }
         }
     }
 }
@@ -623,6 +994,11 @@ mod tests {
     use nsl_errors::FileId;
 
     fn parse_and_validate(src: &str) -> Vec<Diagnostic> {
+        let (diags, _) = parse_and_validate_full(src);
+        diags
+    }
+
+    fn parse_and_validate_full(src: &str) -> (Vec<Diagnostic>, WeightIndexMap) {
         let mut interner: Interner = Interner::new();
         let (tokens, lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
         assert!(
@@ -852,5 +1228,60 @@ fn predict_toplevel(net: Net, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
             "top-level @export with model field should still warn; got: {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn export_method_accesses_non_tensor_field_errors() {
+        let src = r#"
+model Net:
+    name: string
+    W: Tensor<[4, 4], f32>
+
+    @export
+    fn predict(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return self.name
+"#;
+        let diags = parse_and_validate(src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Error)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("not a weight tensor") && d.message.contains("name")),
+            "expected non-tensor field error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn export_method_accesses_valid_tensor_field_no_error() {
+        let src = r#"
+model Net:
+    W: Tensor<[4, 4], f32>
+    b: Tensor<[4], f32>
+
+    @export
+    fn predict(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return (self.W @ x) + self.b
+"#;
+        let (diags, weight_map) = parse_and_validate_full(src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Error)
+            .collect();
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", diags);
+        // The weight_map should have two entries (self.W at index 0, self.b at index 1).
+        assert_eq!(
+            weight_map.len(),
+            2,
+            "expected 2 weight-index entries (W=0, b=1), got map: {:?}",
+            weight_map
+        );
+        // Both indices must be 0 and 1 (order may vary by NodeId).
+        let mut indices: Vec<usize> = weight_map.values().copied().collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1], "expected indices [0, 1], got: {:?}", indices);
     }
 }
