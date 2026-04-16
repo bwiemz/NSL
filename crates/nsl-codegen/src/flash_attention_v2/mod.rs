@@ -78,6 +78,12 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
         }
         ptx.push_str("    bar.sync 0; // K tile complete; safe for all S-computes\n");
 
+        // ── Step 3b: K RoPE rotation — rotate the full K SMEM tile in-place.
+        //   Must run ONCE after K pre-pass (all rows populated) and BEFORE any
+        //   S-compute reads K for QK^T.  Q rotation runs per-q_iter inside
+        //   emit_rope_epilogue; K rotation runs once here for the whole tile.
+        phases::csha_hooks::emit_rope_k_epilogue(&mut ptx, config);
+
         // ── Step 4: S-compute pass — Q sweep + RoPE + Q-load + S-compute + softmax.
         // RMSNorm already done above; do NOT call emit_prologue again here.
         // Row_max/row_sum saved to SMEM after each iter so the V pre-pass can

@@ -989,11 +989,9 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         q_tile_iter
     ));
 
-    // Rotate Q tile in-place.  K is NOT rotated here because in the
-    // fused_projections path K comes from pre-RoPEd HBM k_ptr and the
-    // K-SMEM region has not been populated yet at this point (k_tile_load
-    // fires later inside the KV loop).  Callers must supply a pre-RoPEd K
-    // in k_ptr when rope_q=true with fused_projections=true.
+    // Rotate Q tile in-place.  K rotation for the fused_projections path
+    // is handled by `emit_rope_k_epilogue`, called ONCE after the K
+    // pre-pass completes (before the S-compute loop).
     emit_rope_pair_sweep(
         ptx,
         q_tile_iter,
@@ -1007,6 +1005,70 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
 
     ptx.push_str(&format!("V2_CSHA_ROPE_SKIP_{}:\n", q_tile_iter));
     ptx.push_str("    bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads\n");
+}
+
+/// Rotate the full K SMEM tile in-place using Adjacent RoPE.
+///
+/// Called ONCE after the K pre-pass completes and before the S-compute loop
+/// in the fused_projections path.  The K pre-pass writes `Wk * x_norm` into
+/// `%k_smem_base` (kv_offset) but does NOT apply RoPE, so without this call
+/// the S-compute pass would compute `QK^T` with rotated Q but unrotated K,
+/// breaking attention semantics and all backward gradients.
+///
+/// Uses the same rotation math as `emit_rope_pair_sweep` (Adjacent layout):
+///   new_k[2i]   = k[2i]*cos[i] - k[2i+1]*sin[i]
+///   new_k[2i+1] = k[2i]*sin[i] + k[2i+1]*cos[i]
+///
+/// Null-guarded on `cos_ptr` AND `sin_ptr`.  Only emits when `rope_q=true`
+/// AND `csha.fused_projections=true`.
+pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
+    if config.csha.is_none() || !config.rope_q {
+        ptx.push_str("    // CSHA RoPE K epilogue: rope_q=false or no CSHA, skip\n");
+        return;
+    }
+    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+        ptx.push_str("    // CSHA RoPE K epilogue: fused_projections=false, skip\n");
+        return;
+    }
+
+    assert!(
+        matches!(config.rope_style, RopeStyle::Adjacent),
+        "emit_rope_k_epilogue only implements RopeStyle::Adjacent; got {:?}",
+        config.rope_style
+    );
+
+    let block_kv = config.block_kv as u32;
+    let head_dim = config.head_dim as u32;
+    let half_dim = head_dim / 2;
+    let total_pairs = block_kv * half_dim;
+    let pairs_per_lane = total_pairs.div_ceil(128);
+
+    ptx.push_str(&format!(
+        "    // CSHA RoPE K rotation (fused path): block_kv={}, head_dim={}, pairs_per_lane={}\n",
+        block_kv, head_dim, pairs_per_lane
+    ));
+
+    // Null-guard: skip if either cos_ptr or sin_ptr is zero.
+    ptx.push_str("    ld.param.u64 %rd_rope_cos, [cos_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_rope_sin, [sin_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p_rope_cos_null, %rd_rope_cos, 0;\n");
+    ptx.push_str("    setp.eq.u64 %p_rope_sin_null, %rd_rope_sin, 0;\n");
+    ptx.push_str("    or.pred %p_rope_skip, %p_rope_cos_null, %p_rope_sin_null;\n");
+    ptx.push_str("    @%p_rope_skip bra V2_CSHA_ROPE_K_FUSED_SKIP;\n");
+
+    emit_rope_pair_sweep(
+        ptx,
+        0, // not per-q_iter; runs once for the whole K tile
+        "K",
+        "%k_smem_base",
+        block_kv,
+        head_dim,
+        half_dim,
+        pairs_per_lane,
+    );
+
+    ptx.push_str("V2_CSHA_ROPE_K_FUSED_SKIP:\n");
+    ptx.push_str("    bar.sync 0;  // FENCE: K RoPE rotation writes visible to all threads\n");
 }
 
 /// Emit one cooperative pair-loop sweep that applies RoPE to a single
@@ -1203,9 +1265,9 @@ mod tests {
 
         assert!(ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"), "cos_ptr load missing");
         assert!(ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"), "sin_ptr load missing");
-        // Only Q is rotated in the fused_projections path; K comes pre-RoPEd in k_ptr.
+        // emit_rope_epilogue only rotates Q; K rotation is in emit_rope_k_epilogue (called once after K pre-pass).
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"), "Q rotation loop label missing");
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K must not be rotated here (comes pre-RoPEd from k_ptr)");
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation belongs in emit_rope_k_epilogue, not here");
         assert!(!ptx.contains("V2_CSHA_ROPE_V_LOOP"), "V must not be rotated");
         // 4 fma.rn.f32 per pair (2 for new_x0, 2 for new_x1) for Q sweep only
         assert!(
@@ -1236,12 +1298,52 @@ mod tests {
         let mut ptx = String::new();
         emit_rope_epilogue(&mut ptx, &cfg, 0);
         emit_rope_epilogue(&mut ptx, &cfg, 1);
-        // Only Q is rotated; labels must be unique across q_tile_iters.
+        // Q labels must be unique across q_tile_iters.
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"));
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_1:"));
-        // K is not rotated (comes pre-RoPEd from k_ptr).
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K must not be rotated");
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"), "K must not be rotated");
+        // K rotation is in emit_rope_k_epilogue, not here.
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation belongs in emit_rope_k_epilogue");
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"), "K rotation belongs in emit_rope_k_epilogue");
+    }
+
+    #[test]
+    fn a4_rope_k_epilogue_emits_k_rotation_for_fused_path() {
+        let cfg = base_cfg_for_rope_test();
+        let mut ptx = String::new();
+        emit_rope_k_epilogue(&mut ptx, &cfg);
+
+        // K rotation loop must be present.
+        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation loop label missing");
+        assert!(ptx.contains("V2_CSHA_ROPE_K_FUSED_SKIP:"), "K skip label missing");
+        // Null-guard on cos/sin.
+        assert!(ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"), "cos_ptr load missing");
+        assert!(ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"), "sin_ptr load missing");
+        // Must NOT rotate Q or V.
+        assert!(!ptx.contains("V2_CSHA_ROPE_Q_LOOP"), "Q must not be rotated in K epilogue");
+        assert!(!ptx.contains("V2_CSHA_ROPE_V_LOOP"), "V must not be rotated");
+        // fma instructions for rotation math.
+        assert!(
+            ptx.matches("fma.rn.f32").count() >= 2,
+            "expected at least 2 fma.rn.f32 for K rotation"
+        );
+    }
+
+    #[test]
+    fn a4_rope_k_epilogue_skipped_when_not_fused() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.csha = Some(CshaExtras { fused_projections: false, d_model: 128, ..CshaExtras::default() });
+        let mut ptx = String::new();
+        emit_rope_k_epilogue(&mut ptx, &cfg);
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when fused_projections=false");
+    }
+
+    #[test]
+    fn a4_rope_k_epilogue_skipped_when_rope_q_false() {
+        let mut cfg = base_cfg_for_rope_test();
+        cfg.rope_q = false;
+        let mut ptx = String::new();
+        emit_rope_k_epilogue(&mut ptx, &cfg);
+        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when rope_q=false");
     }
 
     #[test]
@@ -1560,6 +1662,30 @@ mod tests {
             rope_q_idx < attn_body_idx,
             "RoPE must run pre-attention (before QK^T / S-compute); \
              found ROPE_Q @ byte {rope_q_idx} but S-compute @ byte {attn_body_idx}"
+        );
+    }
+
+    /// Verifies that `emit_rope_k_epilogue` fires in the fused path and
+    /// produces a K rotation sweep before the S-compute body.
+    #[test]
+    fn a4_rope_k_epilogue_placed_before_s_compute_in_full_ptx() {
+        let cfg = base_cfg_for_rope_test();
+        let ptx_bytes =
+            crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len().saturating_sub(1)])
+            .expect("PTX should be valid UTF-8");
+
+        let rope_k_idx = ptx
+            .find("V2_CSHA_ROPE_K_LOOP_0:")
+            .expect("ROPE_K label missing — emit_rope_k_epilogue did not fire in fused path");
+        let attn_body_idx = ptx
+            .find("V2_LOOP_S_OVER_K_")
+            .expect("S-compute loop label missing");
+
+        assert!(
+            rope_k_idx < attn_body_idx,
+            "K RoPE must run before S-compute; \
+             found ROPE_K @ byte {rope_k_idx} but S-compute @ byte {attn_body_idx}"
         );
     }
 }
