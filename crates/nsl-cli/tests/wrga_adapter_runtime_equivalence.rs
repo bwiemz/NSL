@@ -480,12 +480,13 @@ fn build_5_fused_launches_one_kernel_per_site() {
 // when `NSL_WRGA_FUSED_CUDA=1` is set, using a runtime counter that
 // only increments on successful cudarc launch — never on fallback.
 //
-// Test is `#[ignore]` by default: it requires a CUDA-capable device and
-// `NSL_WRGA_FUSED_CUDA=1`.  Run with:
+// Test is `#[cfg(feature = "cuda")]`-gated: runs automatically on CUDA
+// machines when the `cuda` feature is enabled.  The fused LoRA PTX
+// kernel is now valid (Tasks A-E) so the real cudarc launch fires.
 //   cargo test -p nsl-cli --test wrga_adapter_runtime_equivalence \
-//     build_4_fused_cuda_actually_fires -- --ignored
+//     --features cuda build_4_fused_cuda_actually_fires
+#[cfg(feature = "cuda")]
 #[test]
-#[ignore]
 fn build_4_fused_cuda_actually_fires() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("build4_gpu.nsl");
