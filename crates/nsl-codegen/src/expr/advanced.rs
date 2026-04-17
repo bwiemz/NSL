@@ -1374,6 +1374,55 @@ impl Compiler<'_> {
 
         let null = builder.ins().iconst(cl_types::I64, 0);
 
+        // Gap G: the FFI signatures for `nsl_flash_attention`,
+        // `nsl_flash_attention_csha`, and `nsl_flash_attention_csha_with_saves`
+        // all declare the scale slot as `I64` carrying the f32 bit pattern
+        // (matches the test-harness convention `scale.to_bits() as i64`
+        // and the `wengert_lower.rs` scale_bits codegen pattern).
+        //
+        // `scale_val` however came from `compile_expr` on the source-level
+        // 4th argument to `scaled_dot_product_attention`, which for
+        // `1.0 / sqrt(32.0)` materialises as a Cranelift F64 (NSL float
+        // literals lower to F64). Passing that directly to `builder.ins().call`
+        // against the registered I64 signature fails the Cranelift verifier
+        // (f64 scale vs i64 arg-5 slot).
+        //
+        // Convert once up front, matching the canonical path in
+        // `wengert_lower.rs::emit_fused_attention_call`:
+        //   F64 → F32 (fdemote) → I32 bits (bitcast) → I64 (uextend)
+        //   F32 → I32 bits (bitcast) → I64 (uextend)
+        //   I64 → passthrough (already an integer; pre-bitcast-ready caller)
+        //
+        // `uextend` (not `sextend`) to preserve the raw bit pattern of
+        // the f32 without sign-extending the MSB. Signed extension would
+        // corrupt negative-float encodings; for scale=1/sqrt(d) today it
+        // happens to be positive so sextend also works, but uextend is
+        // the correct choice for a bits-as-i64 payload.
+        let scale_bits = {
+            let scale_ty = builder.func.dfg.value_type(scale_val);
+            if scale_ty == cl_types::F64 {
+                let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_val);
+                let scale_bits_i32 = builder.ins().bitcast(
+                    cl_types::I32,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    scale_f32,
+                );
+                builder.ins().uextend(cl_types::I64, scale_bits_i32)
+            } else if scale_ty == cl_types::F32 {
+                let scale_bits_i32 = builder.ins().bitcast(
+                    cl_types::I32,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    scale_val,
+                );
+                builder.ins().uextend(cl_types::I64, scale_bits_i32)
+            } else {
+                // Already an integer Value (e.g. a caller pre-bitcast
+                // the scale to I64 bits, or passed it as an I64 literal).
+                // Trust the caller; pass through.
+                scale_val
+            }
+        };
+
         // Extract tensor dimensions: Q is [batch, heads, seq_len, head_dim]
         let dim0 = builder.ins().iconst(cl_types::I64, 0);
         let dim1 = builder.ins().iconst(cl_types::I64, 1);
@@ -1614,7 +1663,7 @@ impl Compiler<'_> {
                     &[
                         q_val, k_val, v_val, out_val,
                         lse_val,
-                        scale_val,
+                        scale_bits,
                         batch, heads, seq_len, head_dim,
                         null, null, null, null, // paged
                         null, null,             // RoPE
@@ -1657,7 +1706,7 @@ impl Compiler<'_> {
                     &[
                         q_val, k_val, v_val, out_val,
                         lse_val,
-                        scale_val,
+                        scale_bits,
                         batch, heads, seq_len, head_dim,
                         null, null, null, null, // paged
                         null, null,             // RoPE
@@ -1703,7 +1752,7 @@ impl Compiler<'_> {
                     v_val,
                     out_val,
                     lse_val, // logsumexp auxiliary output
-                    scale_val,
+                    scale_bits,
                     batch,
                     heads,
                     seq_len,

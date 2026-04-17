@@ -231,31 +231,48 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
     let obj = match compile_training_to_object(TOY_PRETRAIN_HD32_SRC) {
         Some(b) => b,
         None => {
-            // Gap F successfully wires the scanner through the method
-            // decorator AND threads head_dim=32 through — proven by
-            // the `csha_gap_f_decorator.rs` unit tests.  What Gap F
-            // exposes is a PRE-EXISTING downstream bug in
-            // `compile_flash_attention_call`: once the scanner picks
-            // up the method decorator, the SDPA call reaches the FA
-            // inference FFI lowerer, which has a Cranelift verifier
-            // error (documented in the Gap E standalone observation
-            // test — f64 scale vs i64 arg-5 slot).  Pre-Gap-F this
-            // was hidden because the scanner silently dropped the
-            // decorator and SDPA fell back to the naive path.
+            // Post-Gap-G: the Cranelift verifier error from the
+            // `f64-scale-into-i64-slot` mismatch in
+            // `compile_flash_attention_call` is resolved — see
+            // `csha_gap_g_ffi_scale_bits.rs` for the isolating
+            // regression test.  Two downstream blockers remain on the
+            // full `@train` end-to-end path which are out of Gap G's
+            // "fix ONLY the type mismatch" scope:
             //
-            // That's out of scope for this PR (brief: "do NOT change
-            // PTX emission, do NOT change the AD dispatcher").  Skip
-            // with a diagnostic so the reviewer sees the upstream
-            // failure surface; the source-language-surface gaps F.1
-            // and F.2 are still pinned by the unit tests.
+            //   (1) Gap F.2 decorator-arg threading into the bridge
+            //       mark's `FlashAttentionConfig` — the fused backward
+            //       validator still sees `head_dim=64` at plan time
+            //       even when source says `@flash_attention(head_dim=32)`,
+            //       so the 99 KB SMEM cap rejects the backward tile
+            //       and the dispatcher silently falls back to per-op
+            //       adjoints ("CSHA fused Backward rejected: 713472
+            //       bytes > 101376 byte cap at (block_q=64,
+            //       head_dim=64)").
+            //
+            //   (2) Optimizer FFI symbol-name mismatch — source-level
+            //       `SGD(lr=0.001)` resolves to
+            //       `nsl__optim__sgd__sgd_step` (stdlib-loader
+            //       convention) but the call site emits
+            //       `nsl_optim_sgd__sgd_step`.  `compile_entry` fails
+            //       at the linker-reference step with "undefined
+            //       function 'nsl__optim__sgd__sgd_step'".
+            //
+            // Both are legitimate follow-ups unblocked by Gap G;
+            // neither touches the FFI verifier surface this PR pins.
+            // Codegen-level F.1/F.2 verification at the context
+            // population layer still happens in
+            // `csha_gap_f_decorator.rs`, and the Gap G type-mismatch
+            // regression is pinned by `csha_gap_g_ffi_scale_bits.rs`.
             eprintln!(
-                "[gap-f] end-to-end compile_entry failed — pre-existing \
-                 FFI-call-type bug in compile_flash_attention_call is \
-                 now reachable because Gap F.1 correctly routes \
-                 through the method decorator.  Codegen-level F.1/F.2 \
-                 verification happens in csha_gap_f_decorator.rs; this \
-                 test can only go hard-green after the FFI signature \
-                 mismatch is patched (separate PR)."
+                "[gap-f] end-to-end compile_entry failed after Gap G — \
+                 the FFI verifier error is resolved (see \
+                 csha_gap_g_ffi_scale_bits.rs) but two out-of-scope \
+                 follow-ups remain: (1) Gap F.2 decorator-arg threading \
+                 into the bridge mark's FlashAttentionConfig (hd=32 not \
+                 propagating to the SMEM validator), and (2) optimizer \
+                 FFI symbol-name mismatch (SGD(...) resolves to \
+                 nsl__optim__sgd__sgd_step not nsl_optim_sgd__sgd_step). \
+                 This test goes hard-green only after both follow-ups land."
             );
             return;
         }
