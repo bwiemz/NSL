@@ -74,102 +74,208 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     );
     assert!(config.target_sm >= 80, "B.3 requires sm_80+");
 
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_init;
+    use crate::kernel_skeleton::params::{
+        emit_ld_param_f32, emit_ld_param_u64, emit_param_block, Param, ParamTy,
+    };
+    use crate::kernel_skeleton::smem::{emit_shmem_base_cvta, emit_static_smem_decl};
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    use crate::wrga_kernel_helpers::{
+        emit_lora_output_tile_coords, emit_lora_register_pool, emit_lora_stage_a_tile,
+        emit_lora_stage_b_tile, emit_lora_stage_w_tile, emit_lora_stage_x_tile,
+        emit_lora_store_output, emit_lora_tile_bases, emit_matmul_mma_lane_init,
+        emit_zero_accumulators, wrga_lora_register_budget,
+    };
+
     let mut ptx = String::new();
+    let budget = wrga_lora_register_budget(config);
 
-    // Header.
-    ptx.push_str(".version 7.0\n");
-    ptx.push_str(&format!(".target sm_{}\n", config.target_sm));
-    ptx.push_str(".address_size 64\n\n");
+    // 1. File header.
+    emit_ptx_header(&mut ptx, PtxVersion::V7_0, TargetSm::Sm80);
 
-    ptx.push_str(&format!(
-        ".visible .entry nsl_wrga_fused_lora_m{}n{}k{}r{}(\n",
+    // 2. Param block (opens entry + `{` body).
+    let entry_name = format!(
+        "nsl_wrga_fused_lora_m{}n{}k{}r{}",
         config.m, config.n, config.k, config.rank,
-    ));
-    ptx.push_str("    .param .u64 x_ptr,\n");
-    ptx.push_str("    .param .u64 w_ptr,\n");
-    ptx.push_str("    .param .u64 a_ptr,\n");
-    ptx.push_str("    .param .u64 b_ptr,\n");
-    ptx.push_str("    .param .f32 scale,       // alpha/rank — launch-time value for dedup\n");
-    ptx.push_str("    .param .u64 y_ptr\n");
-    ptx.push_str(")\n{\n");
+    );
+    let params = [
+        Param { ty: ParamTy::U64, name: "x_ptr" },
+        Param { ty: ParamTy::U64, name: "w_ptr" },
+        Param { ty: ParamTy::U64, name: "a_ptr" },
+        Param { ty: ParamTy::U64, name: "b_ptr" },
+        Param { ty: ParamTy::F32, name: "scale" },
+        Param { ty: ParamTy::U64, name: "y_ptr" },
+    ];
+    emit_param_block(&mut ptx, &entry_name, &params);
 
-    // Register decls.
-    ptx.push_str("    // === Register declarations ===\n");
-    ptx.push_str("    .reg .f32 %main_accum<8>;        // x @ W f32 accumulator\n");
-    ptx.push_str("    .reg .b32 %main_a_frag<4>;       // current x tile fragment\n");
-    ptx.push_str("    .reg .b32 %main_b_frag<2>;       // current W tile fragment\n");
-    ptx.push_str("    .reg .b32 %epi_a_frag<4>;        // A-matrix tile (NOT x@A!)\n");
-    ptx.push_str("    .reg .f32 %epi_interm<4>;        // incremental x @ A accumulator\n");
-    ptx.push_str("    .reg .b32 %epi_b_frag<2>;        // B-matrix tile\n");
-    ptx.push_str("    .reg .f32 %epi_final<8>;         // (x@A) @ B accumulator\n");
-    ptx.push_str("    .reg .u64 %smem_base_x, %smem_base_w, %smem_base_a, %smem_base_b;\n");
-    ptx.push_str("    .reg .u32 %k_idx, %mma_addr, %mma_a_row, %mma_b_row;\n");
-    ptx.push_str("    .reg .pred %k_pred;\n");
-    ptx.push_str("    .reg .f32 %scale_reg;\n\n");
+    // 3. SMEM decl + register pool + shmem base + thread/lane/warp init.
+    emit_static_smem_decl(&mut ptx, 1536);
+    emit_lora_register_pool(&mut ptx, &budget);
+    // u32 tile-base shadow regs for use in mad.lo.u32 SMEM addressing.
+    ptx.push_str("    .reg .u32 %smem_base_x_u32, %smem_base_w_u32, %smem_base_a_u32, %smem_base_b_u32;\n");
+    // packed f16x2 regs for converting epi_interm f32 → b32 before final MMA.
+    ptx.push_str("    .reg .b32 %epi_packed0, %epi_packed1, %epi_packed2, %epi_packed3;\n");
+    emit_shmem_base_cvta(&mut ptx);
+    emit_thread_lane_warp_register_init(&mut ptx);
+    emit_lora_tile_bases(&mut ptx);
+    // Convert u64 tile bases to u32 shared addresses for matmul_mma helpers.
+    ptx.push_str("    cvt.u32.u64 %smem_base_x_u32, %x_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_w_u32, %w_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_a_u32, %a_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_b_u32, %b_tile_base;\n");
+    emit_matmul_mma_lane_init(&mut ptx);
 
-    // Load scale once before the K-loop.
-    ptx.push_str("    // Load scale (alpha/rank) from parameter — dedup-friendly\n");
-    ptx.push_str("    ld.param.f32 %scale_reg, [scale];\n\n");
+    // 4. Load params into named registers.
+    emit_ld_param_u64(&mut ptx, "%rd_x", "x_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_w", "w_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_a", "a_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_b", "b_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_y", "y_ptr");
+    emit_ld_param_f32(&mut ptx, "%scale_reg", "scale");
 
-    // Init main_accum + epi_interm to zero.
-    ptx.push_str("    // Init accumulators\n");
-    for i in 0..8 {
-        ptx.push_str(&format!("    mov.f32 %main_accum{}, 0f00000000;\n", i));
-    }
-    for i in 0..4 {
-        ptx.push_str(&format!("    mov.f32 %epi_interm{}, 0f00000000;\n", i));
-    }
-    ptx.push_str("\n");
+    // 5. Output-tile coords + zero accumulators.
+    emit_lora_output_tile_coords(&mut ptx, config.m, config.n);
+    emit_zero_accumulators(&mut ptx, "main_accum", 8);
+    emit_zero_accumulators(&mut ptx, "epi_interm", 4);
 
-    // Interleaved K-tile loop.
-    let k_iters = config.k / MMA_K_U32;
-    ptx.push_str(&format!(
-        "    // === Interleaved main K-loop: {} tiles ===\n",
-        k_iters,
-    ));
+    // 6. Main K-loop with interleaved epilogue.
+    //
+    // NOTE: Each K-iteration stages x, w, and a into SMEM, then loads MMA
+    // fragments.  The epi_interm MMA reuses %main_a_frag (x tile fragment)
+    // as its A-operand — this is correct per spec §3 invariant (1): the
+    // m16n8k16 A-fragment encodes only the m×k tile, independent of B.
+    let k_iters = (config.k + MMA_K_U32 - 1) / MMA_K_U32;
+
+    // Fragment register names for matmul_mma load helpers (without % — helpers add it).
+    let main_a_frag_names: [String; 4] = [
+        "main_a_frag0".into(), "main_a_frag1".into(),
+        "main_a_frag2".into(), "main_a_frag3".into(),
+    ];
+    let main_b_frag_names: [String; 2] = [
+        "main_b_frag0".into(), "main_b_frag1".into(),
+    ];
+    let epi_a_frag_names: [String; 4] = [
+        "epi_a_frag0".into(), "epi_a_frag1".into(),
+        "epi_a_frag2".into(), "epi_a_frag3".into(),
+    ];
+    let epi_b_frag_names: [String; 2] = [
+        "epi_b_frag0".into(), "epi_b_frag1".into(),
+    ];
+
+    // MMA operand arrays (with % — emit_mma_instruction uses names as-is).
+    let main_a_frag: [String; 4] = [
+        "%main_a_frag0".into(), "%main_a_frag1".into(),
+        "%main_a_frag2".into(), "%main_a_frag3".into(),
+    ];
+    let main_b_frag: [String; 2] = [
+        "%main_b_frag0".into(), "%main_b_frag1".into(),
+    ];
+    let epi_a_frag: [String; 2] = [
+        "%epi_a_frag0".into(), "%epi_a_frag1".into(),
+    ];
+    let epi_b_frag: [String; 2] = [
+        "%epi_b_frag0".into(), "%epi_b_frag1".into(),
+    ];
+    let main_accum: [String; 4] = [
+        "%main_accum0".into(), "%main_accum1".into(),
+        "%main_accum2".into(), "%main_accum3".into(),
+    ];
+    let epi_interm: [String; 4] = [
+        "%epi_interm0".into(), "%epi_interm1".into(),
+        "%epi_interm2".into(), "%epi_interm3".into(),
+    ];
+    let epi_final: [String; 4] = [
+        "%epi_final0".into(), "%epi_final1".into(),
+        "%epi_final2".into(), "%epi_final3".into(),
+    ];
+
     for k_tile in 0..k_iters {
-        ptx.push_str(&format!("    // --- K-tile {} ---\n", k_tile));
-        ptx.push_str(&format!("    // Load x tile [k={}]\n", k_tile * MMA_K_U32));
-        emit_load_frag_a_main(&mut ptx, k_tile);
-        ptx.push_str(&format!("    // Load W tile [k={}]\n", k_tile * MMA_K_U32));
-        emit_load_frag_b_main(&mut ptx, k_tile);
-        // (a) Main MMA: main_accum += x_tile @ W_tile
-        emit_main_mma(&mut ptx);
-        // (c) Load A tile for this K-chunk.
-        ptx.push_str(&format!("    // Load A tile [k={}]\n", k_tile * MMA_K_U32));
-        emit_load_frag_a_epi(&mut ptx, k_tile);
-        // (b) Epilogue MMA: epi_interm += x_tile @ A_tile
-        emit_epi_interm_mma(&mut ptx);
-    }
-    ptx.push_str("\n");
+        ptx.push_str(&format!("    // ===== K-iteration {} =====\n", k_tile));
 
-    // Post-loop epilogue.
-    ptx.push_str("    // === Post-loop epilogue: (x@A) @ B * scale, fold into main_accum ===\n");
-    ptx.push_str("    // Load B tile\n");
-    emit_load_frag_b_epi(&mut ptx);
-    emit_epi_final_mma(&mut ptx);
-    // epi_final *= scale
-    for i in 0..8 {
+        emit_lora_stage_x_tile(&mut ptx, k_tile, config.m, config.k);
+        emit_lora_stage_w_tile(&mut ptx, k_tile, config.n, config.k);
+        emit_lora_stage_a_tile(&mut ptx, k_tile, config.rank, config.k);
+
+        ptx.push_str("    bar.sync 0;\n");
+
+        // Load A and B fragments from SMEM using u32 tile base addresses.
+        // k_tile offset within the tile is handled at stage time (fresh per-iter).
+        emit_load_a_fragment_smem(&mut ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
+        emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_u32", 16);
+        emit_load_a_fragment_smem(&mut ptx, &epi_a_frag_names, "%smem_base_a_u32", 32);
+
+        // Main MMA: main_accum += x_tile @ w_tile
+        emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+
+        // Epilogue interleaved MMA: epi_interm += x_tile @ a_tile
+        // Reuses %main_a_frag as A-operand; uses epi_a_frag[0..2] as B-operand
+        // (m16n8k16 B-fragment is 2 b32 regs; epi_a_frag was loaded as 4 b32
+        // but the B-slot only consumes the first 2).
+        emit_mma_instruction(&mut ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
+
+        ptx.push_str("    bar.sync 0;\n");
+    }
+
+    // 7. Post-loop: stage b once, compute (x@A) @ B.
+    emit_lora_stage_b_tile(&mut ptx, config.rank, config.n);
+    ptx.push_str("    bar.sync 0;\n");
+    emit_load_b_fragment_smem(&mut ptx, &epi_b_frag_names, "%smem_base_b_u32", 16);
+
+    // 8. Convert epi_interm (f32) → packed f16x2 (b32) for final MMA A-operand.
+    //
+    // MMA requires A-operand registers to be .b32 (packed f16 pairs).  epi_interm
+    // holds f32 accumulators from the K-loop.  We convert per PTX invariant:
+    //   cvt.rn.f16x2.f32 %dst, %f32_hi, %f32_lo
+    // Packs: lower f16 = f32_lo, upper f16 = f32_hi.
+    // Per m16n8k16 A-fragment layout, each thread holds 8 f16 values packed into
+    // 4 b32 registers.  epi_interm[0..3] holds 4 f32 values → 2 packed b32.
+    // The upper 2 b32 (for the k=8..15 half) are zero-padded.
+    ptx.push_str("    // Pack epi_interm f32 → f16x2 b32 for final MMA A-operand\n");
+    ptx.push_str("    cvt.rn.f16x2.f32 %epi_packed0, %epi_interm1, %epi_interm0;\n");
+    ptx.push_str("    cvt.rn.f16x2.f32 %epi_packed1, %epi_interm3, %epi_interm2;\n");
+    ptx.push_str("    mov.b32 %epi_packed2, 0;\n");
+    ptx.push_str("    mov.b32 %epi_packed3, 0;\n");
+    let epi_packed: [String; 4] = [
+        "%epi_packed0".into(), "%epi_packed1".into(),
+        "%epi_packed2".into(), "%epi_packed3".into(),
+    ];
+
+    // Zero-init epi_final and compute (x@A) @ B using packed A-fragments.
+    emit_zero_accumulators(&mut ptx, "epi_final", 4);
+    emit_mma_instruction(&mut ptx, &epi_final, &epi_packed, &epi_b_frag, &epi_final);
+
+    // 9. Scale epi_final, fold into main_accum.
+    for i in 0..4u32 {
         ptx.push_str(&format!(
-            "    mul.f32 %epi_final{}, %epi_final{}, %scale_reg;\n",
-            i, i,
+            "    mul.f32 %epi_final{i}, %epi_final{i}, %scale_reg;\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.f32 %main_accum{i}, %main_accum{i}, %epi_final{i};\n"
         ));
     }
-    // main_accum += epi_final (the "epilogue fusion" step)
-    for i in 0..8 {
-        ptx.push_str(&format!(
-            "    add.f32 %main_accum{}, %main_accum{}, %epi_final{};\n",
-            i, i, i,
-        ));
-    }
-    ptx.push_str("\n");
 
-    // Store main_accum to y.
-    ptx.push_str("    // === Store y ===\n");
-    emit_store_y(&mut ptx);
+    // 10. Store to y with predication.
+    emit_lora_store_output(&mut ptx, config.n);
 
+    // 11. Close the entry body.
+    ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
+
     ptx
+}
+
+fn emit_store_y(ptx: &mut String) {
+    ptx.push_str("    // (store sequence — per-thread writes of main_accum to global y)\n");
+    for i in 0..8 {
+        ptx.push_str(&format!(
+            "    st.global.f32 [%y_ptr + {}], %main_accum{};\n",
+            i * 4,
+            i,
+        ));
+    }
 }
 
 fn emit_load_frag_a_main(ptx: &mut String, k_tile: u32) {
@@ -195,24 +301,6 @@ fn emit_load_frag_b_main(ptx: &mut String, k_tile: u32) {
         16,
     );
 }
-fn emit_load_frag_a_epi(ptx: &mut String, k_tile: u32) {
-    let regs: [String; 4] = [
-        "epi_a_frag0".into(),
-        "epi_a_frag1".into(),
-        "epi_a_frag2".into(),
-        "epi_a_frag3".into(),
-    ];
-    matmul_mma::emit_load_a_fragment_smem(
-        ptx,
-        &regs,
-        &format!("%smem_base_a + {}", k_tile * 32),
-        32,
-    );
-}
-fn emit_load_frag_b_epi(ptx: &mut String) {
-    let regs: [String; 2] = ["epi_b_frag0".into(), "epi_b_frag1".into()];
-    matmul_mma::emit_load_b_fragment_smem(ptx, &regs, "%smem_base_b", 16);
-}
 fn emit_main_mma(ptx: &mut String) {
     let d: [String; 4] = [
         "main_accum0".into(),
@@ -234,60 +322,6 @@ fn emit_main_mma(ptx: &mut String) {
         "main_accum3".into(),
     ];
     matmul_mma::emit_mma_instruction(ptx, &d, &a, &b, &c);
-}
-fn emit_epi_interm_mma(ptx: &mut String) {
-    let d: [String; 4] = [
-        "epi_interm0".into(),
-        "epi_interm1".into(),
-        "epi_interm2".into(),
-        "epi_interm3".into(),
-    ];
-    let a: [String; 4] = [
-        "main_a_frag0".into(),
-        "main_a_frag1".into(),
-        "main_a_frag2".into(),
-        "main_a_frag3".into(),
-    ];
-    let b: [String; 2] = ["epi_a_frag0".into(), "epi_a_frag1".into()];
-    let c: [String; 4] = [
-        "epi_interm0".into(),
-        "epi_interm1".into(),
-        "epi_interm2".into(),
-        "epi_interm3".into(),
-    ];
-    matmul_mma::emit_mma_instruction(ptx, &d, &a, &b, &c);
-}
-fn emit_epi_final_mma(ptx: &mut String) {
-    let d: [String; 4] = [
-        "epi_final0".into(),
-        "epi_final1".into(),
-        "epi_final2".into(),
-        "epi_final3".into(),
-    ];
-    let a: [String; 4] = [
-        "epi_interm0".into(),
-        "epi_interm1".into(),
-        "epi_interm2".into(),
-        "epi_interm3".into(),
-    ];
-    let b: [String; 2] = ["epi_b_frag0".into(), "epi_b_frag1".into()];
-    let c: [String; 4] = [
-        "epi_final0".into(),
-        "epi_final1".into(),
-        "epi_final2".into(),
-        "epi_final3".into(),
-    ];
-    matmul_mma::emit_mma_instruction(ptx, &d, &a, &b, &c);
-}
-fn emit_store_y(ptx: &mut String) {
-    ptx.push_str("    // (store sequence — per-thread writes of main_accum to global y)\n");
-    for i in 0..8 {
-        ptx.push_str(&format!(
-            "    st.global.f32 [%y_ptr + {}], %main_accum{};\n",
-            i * 4,
-            i,
-        ));
-    }
 }
 
 /// Synthesize the full PTX for an epilogue-fused IA³ matmul kernel.
@@ -386,8 +420,10 @@ mod tests {
 
     #[test]
     fn lora_ptx_folds_epilogue_into_main_accum() {
+        // m16n8k16 epi_final accumulator is 4 f32 values (one D-fragment),
+        // so the fold loop runs 0..4 (not 0..8).
         let ptx = synthesize_fused_lora_ptx(&mk_lora_config());
-        for i in 0..8 {
+        for i in 0..4 {
             let expected =
                 format!("add.f32 %main_accum{}, %main_accum{}, %epi_final{}", i, i, i);
             assert!(
