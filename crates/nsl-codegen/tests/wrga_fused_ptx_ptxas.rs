@@ -74,3 +74,60 @@ fn lora_ptx_validates__16_8_8_16() {
     assert_lora_ptx_valid(lora_cfg(16, 8, 8, 16));
 }
 
+// ─── IA³ ptxas validation — Task E1 ─────────────────────────────────
+
+use nsl_codegen::wrga_fused_ptx::{synthesize_fused_ia3_ptx, FusedIa3Config};
+
+fn ia3_cfg(m: u32, n: u32, k: u32) -> FusedIa3Config {
+    FusedIa3Config {
+        site_id: format!("test.m{}n{}k{}", m, n, k),
+        m,
+        n,
+        k,
+        target_sm: 80,
+    }
+}
+
+fn assert_ia3_ptx_valid(cfg: FusedIa3Config) {
+    let ptx = synthesize_fused_ia3_ptx(&cfg);
+    match validate_ptx(&ptx) {
+        Ok(()) => {}
+        Err(msg) if msg.contains("nvcc not available") => {
+            eprintln!(
+                "[skip] IA3 ptxas validation for ({},{},{}) — no validator available: {}",
+                cfg.m, cfg.n, cfg.k, msg,
+            );
+        }
+        Err(msg) => panic!(
+            "IA3 PTX rejected for config (m={}, n={}, k={}):\n{}\n\nEmitted PTX:\n{}",
+            cfg.m, cfg.n, cfg.k, msg, ptx
+        ),
+    }
+}
+
+#[test]
+fn ia3_ptx_validates__16_8_16() {
+    assert_ia3_ptx_valid(ia3_cfg(16, 8, 16));
+}
+
+#[test]
+fn ia3_ptx_validates__16_8_32() {
+    assert_ia3_ptx_valid(ia3_cfg(16, 8, 32));
+}
+
+#[test]
+fn ia3_ptx_validates__1_8_8() {
+    assert_ia3_ptx_valid(ia3_cfg(1, 8, 8));
+}
+
+#[test]
+fn ia3_ptx_validates__4_8_8() {
+    // BUILD4 hardening-test shape equivalent for IA3.
+    assert_ia3_ptx_valid(ia3_cfg(4, 8, 8));
+}
+
+#[test]
+fn ia3_ptx_validates__32_16_64() {
+    assert_ia3_ptx_valid(ia3_cfg(32, 16, 64));
+}
+
