@@ -90,6 +90,12 @@ fn compile_training_to_object(src: &str) -> Option<Vec<u8>> {
     }
     let opts = CompileOptions {
         csha_mode: Some("auto".into()),
+        // Post-Gap-F the method-decorator scan path now reaches
+        // `parse_gpu_sm_from_target`, which panics on the default
+        // `"cuda"` target.  Pick an explicit `sm_*` to keep this
+        // test stable.  See csha_gap_a_forward_saves.rs for the
+        // identical pattern.
+        target: "sm_75".to_string(),
         ..Default::default()
     };
     match nsl_codegen::compile_module(

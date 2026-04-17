@@ -263,3 +263,48 @@ pub fn flash_gap_b_context_for_source(src: &str) -> (bool, bool, Option<u8>) {
         None => (false, false, None),
     }
 }
+
+/// Gap F observation helper: does `compile_flash_attention_kernels`
+/// detect `@flash_attention` on a `ModelMember::Method`, and does it
+/// honour an optional `head_dim=N` decorator argument?
+///
+/// Returns `(context_set, head_dim, has_backward_ptx)` where:
+/// - `context_set` is `true` iff a `FlashAttentionCompileContext`
+///   landed on the compiler (proof the scanner descended into the
+///   method decorators — pre-F.1 this stayed `false`).
+/// - `head_dim` is the value that the v2 emitter will see
+///   (`None` when no context was built).
+/// - `has_backward_ptx` is `true` iff the Tier C SMEM validator
+///   accepted the config and embedded the fused-backward PTX
+///   (at hd=64 this is always false; at hd=32 it is true).
+pub fn flash_gap_f_context_for_source(
+    src: &str,
+) -> (bool, Option<i64>, bool) {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new failed in flash_gap_f_context_for_source");
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .expect("compile_flash_attention_kernels failed in flash_gap_f_context_for_source");
+
+    match compiler.kernels.flash_attention_context {
+        Some(ctx) => (
+            true,
+            Some(ctx.config.head_dim),
+            ctx.csha_backward_ptx_data_id.is_some(),
+        ),
+        None => (false, None, false),
+    }
+}
