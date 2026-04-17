@@ -465,16 +465,25 @@ impl Compiler<'_> {
                         continue;
                     }
                 }
-                // Check model layer declarations for @flash_attention
-                // (model methods with decorators are stored on LayerDecl members)
+                // Check model layer declarations AND model methods for
+                // `@flash_attention`.  Pre-Gap-F, only `ModelMember::LayerDecl`
+                // decorators were scanned; decorators on `ModelMember::Method`
+                // were silently dropped, so `@flash_attention fn forward(...)`
+                // inside a `model` block had no effect and the SDPA call
+                // lowered through the naive transpose/matmul/softmax path.
+                // DOC-GAP F.1 fix: also descend into `ModelMember::Method`
+                // so the natural "decorate the method that does attention"
+                // idiom actually reaches `try_build_flash_context`.
                 StmtKind::ModelDef(md) => {
                     for member in &md.members {
-                        if let ModelMember::LayerDecl { decorators, .. } = member {
-                            if let Some(ctx) = self.try_build_flash_context(decorators)? {
-                                self.kernels.flash_attention_context = Some(ctx);
-                                self.maybe_synthesize_csha_training_ptx(stmts)?;
-                                return Ok(());
-                            }
+                        let decorators = match member {
+                            ModelMember::LayerDecl { decorators, .. } => decorators,
+                            ModelMember::Method(_fn_def, decorators) => decorators,
+                        };
+                        if let Some(ctx) = self.try_build_flash_context(decorators)? {
+                            self.kernels.flash_attention_context = Some(ctx);
+                            self.maybe_synthesize_csha_training_ptx(stmts)?;
+                            return Ok(());
                         }
                     }
                     continue;
@@ -541,8 +550,24 @@ impl Compiler<'_> {
             d_model: 0,
             save_activations_for_backward: true,
         };
+        // Tier C's backward emitter (ds_compute/dqdk_accum/dv_accum)
+        // currently hard-asserts `block_kv=32` (T3.3–T3.5 landed with
+        // that single tile width; T3.6+ is planned to generalise).
+        // The forward inference config inherits block_kv from the
+        // user's `@flash_attention` / `@autotune` args — which often
+        // set it to 64.  We only use `training_config` to synthesize
+        // the with-saves forward PTX and the fused-backward PTX; the
+        // primary forward PTX was already embedded from `base_config`.
+        // So: clamp block_kv to 32 here, independent of the user's
+        // forward tile width, so the backward validator + emitter
+        // both accept the config.  The saved activations use block_kv
+        // only as a stride, and 32 is a valid stride for any forward
+        // block_kv (the runtime dispatcher reads sequence length from
+        // the tensor shape, not the PTX-baked block_kv).
+        let backward_block_kv: i64 = 32;
         let training_config = crate::flash_attention::FlashAttentionConfig {
             csha: Some(csha_extras),
+            block_kv: backward_block_kv,
             ..base_config
         };
 
@@ -631,6 +656,14 @@ impl Compiler<'_> {
         let mut rope_q = false;
         let mut rope_style = crate::flash_attention::RopeStyle::HalfSplit;
         let mut gqa_group_size: u32 = 1;
+        // DOC-GAP F.2: optional `head_dim` argument on `@flash_attention`.
+        // Default 64 matches historical behaviour; set explicitly via
+        // `@flash_attention(head_dim=32)` to pick a config that fits the
+        // Tier C fused-backward SMEM budget.  Validated against
+        // `ALLOWED_HEAD_DIM` before being threaded through.  `None` means
+        // "use the historical default of 64" — keeps existing code paths
+        // byte-identical when the arg is omitted.
+        let mut head_dim_override: Option<i64> = None;
 
         for deco in decorators {
             if deco.name.len() != 1 {
@@ -639,7 +672,7 @@ impl Compiler<'_> {
             let dname = self.interner.resolve(deco.name[0].0).unwrap_or("");
             match dname {
                 "flash_attention" => {
-                    // Extract causal= arg if present
+                    // Extract causal= / head_dim= args if present
                     if let Some(ref args) = deco.args {
                         for arg in args {
                             let aname = arg
@@ -650,6 +683,23 @@ impl Compiler<'_> {
                             if aname == "causal" {
                                 if let ExprKind::BoolLiteral(b) = arg.value.kind {
                                     causal = b;
+                                }
+                            } else if aname == "head_dim" {
+                                if let ExprKind::IntLiteral(v) = arg.value.kind {
+                                    // Validate against the v2 emitter's
+                                    // allowed set. Everything downstream
+                                    // (SMEM validator, kernel-name encoder,
+                                    // backward synthesizer) assumes this.
+                                    if !crate::flash_attention_v2::smem_layout::ALLOWED_HEAD_DIM
+                                        .contains(&v)
+                                    {
+                                        return Err(CodegenError::new(format!(
+                                            "@flash_attention(head_dim={}) is not allowed — must be one of {:?}",
+                                            v,
+                                            crate::flash_attention_v2::smem_layout::ALLOWED_HEAD_DIM,
+                                        )));
+                                    }
+                                    head_dim_override = Some(v);
                                 }
                             }
                         }
@@ -725,7 +775,12 @@ impl Compiler<'_> {
             d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
         });
 
-        let default_head_dim: i64 = 64; // runtime extracts actual head_dim from tensor shape
+        // DOC-GAP F.2: allow `@flash_attention(head_dim=N)` to override
+        // the baked-in 64.  Without this, the Tier C fused-backward SMEM
+        // validator rejects every block_q/block_kv tuple at hd=64
+        // (713 KB > 99 KB cap) and no source-level NSL program can reach
+        // the fused backward — hd=32 is the only config reachable today.
+        let default_head_dim: i64 = head_dim_override.unwrap_or(64);
 
         if has_autotune {
             let params = self.extract_autotune_params(decorators)?;

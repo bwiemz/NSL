@@ -1,0 +1,46 @@
+# Gap F — minimal end-to-end CSHA fused-backward smoke with
+# `@flash_attention(head_dim=32)` on a model method.
+#
+# Pre-Gap-F, this file could not reach the fused CSHA backward from
+# real source:
+#   - DOC-GAP A: `@flash_attention` on `ModelMember::Method` was
+#     silently dropped by the compile_flash_attention_kernels scanner
+#     (only `LayerDecl` decorators were matched).
+#   - DOC-GAP B: `@flash_attention` baked head_dim=64; the Tier C
+#     backward SMEM validator rejected every block_q/block_kv tuple at
+#     that head_dim (~713 KB > 99 KB cap).
+# Gap F fixes both: the scanner now descends into methods AND the
+# decorator accepts `head_dim=N` for N in {32, 64, 128, 256}.  At
+# hd=32 the fused backward fits the SMEM budget and the emitted
+# object contains `nsl_flash_attention_csha_backward` and
+# `nsl_csha_alloc_backward_activations_into`.
+#
+# Weight names follow the CSHA boundary-scan convention (wq/wk/wv) so
+# `ProjKind::from_param_name` classifies the chain correctly and the
+# dispatcher can claim the shared SDPA op (Gap D.1).
+
+model TinyAttn:
+    w_norm: Tensor = ones([32])
+    wq: Tensor = ones([32, 32])
+    wk: Tensor = ones([32, 32])
+    wv: Tensor = ones([32, 32])
+
+    @flash_attention(head_dim=32)
+    fn forward(self, x: Tensor) -> Tensor:
+        let x_norm = rmsnorm(x, self.w_norm, 0.00001)
+        let q = x_norm @ self.wq
+        let k = x_norm @ self.wk
+        let v = x_norm @ self.wv
+        let scale = 1.0 / sqrt(32.0)
+        return scaled_dot_product_attention(q, k, v, scale)
+
+let m = TinyAttn()
+let x = ones([32, 32])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out)
+
+print("csha_toy_pretrain_hd32: PASS")
