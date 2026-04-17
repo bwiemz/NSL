@@ -5,13 +5,16 @@
 //! (single-warp-per-tile, m16n8k16 fixed, fp32 output) and would drag
 //! FA-irrelevant config surface into the skeleton.
 //!
-//! This module is populated incrementally across Tasks C1-C3:
+//! This module is populated incrementally across Tasks C1-C3, then E2:
 //! - C1: register budget, register pool emitter, output-tile coords,
 //!       matmul_mma lane-init.
 //! - C2: tile-staging helpers (emit_lora_stage_{x,w,a,b}_tile).
 //! - C3: accumulator init, predicated store.
+//! - E2: IA³-specific helpers (register budget/pool, tile bases,
+//!       γ-load, γ-broadcast-multiply).  IA³ reuses LoRA's staging,
+//!       lane-init, and store helpers unchanged.
 
-use crate::wrga_fused_ptx::FusedLoraConfig;
+use crate::wrga_fused_ptx::{FusedIa3Config, FusedLoraConfig};
 
 /// Register pool spec for WRGA fused LoRA kernel.
 #[derive(Debug, Clone)]
@@ -398,6 +401,9 @@ pub fn emit_zero_accumulators(ptx: &mut String, base: &str, count: u32) {
 /// Stores are predicated on (row_in_tile < m_real && col_in_tile < n_real)
 /// so tail boundary tiles (m%16 != 0 or n%8 != 0) don't overwrite
 /// neighboring memory.
+///
+/// Shared by both LoRA and IA³ — both use the identical m16n8k16 D-fragment
+/// layout and the same main_accum<8> pool.
 pub fn emit_lora_store_output(ptx: &mut String, n: u32) {
     ptx.push_str("    // Store main_accum to y with m_real/n_real predication\n");
     // row_base_in_tile = tid / 4
@@ -427,4 +433,184 @@ pub fn emit_lora_store_output(ptx: &mut String, n: u32) {
         ptx.push_str("    add.u64 %rd0, %rd_y, %rd0;\n");
         ptx.push_str(&format!("    @%p1 st.global.f32 [%rd0], %main_accum{};\n", i));
     }
+}
+
+// ─── E2: IA³-specific helpers ─────────────────────────────────────────────
+//
+// IA³ reuses the following LoRA helpers unchanged:
+//   emit_lora_stage_x_tile      — f32 global → f16x2 SMEM, runtime m-predicate
+//   emit_lora_stage_w_tile      — f32 global → col-major f16 SMEM
+//   emit_matmul_mma_lane_init   — %mma_a_row / %mma_b_row init
+//   emit_lora_store_output      — predicated D-fragment store to y
+//
+// IA³-specific helpers added here:
+//   Ia3RegisterBudget           — budget struct (no epilogue regs, 2-reg gamma)
+//   wrga_ia3_register_budget    — fills the budget
+//   emit_ia3_register_pool      — emits .reg declarations
+//   emit_ia3_tile_bases         — sets x/w SMEM base registers (no a/b tiles)
+//   emit_ia3_load_gamma         — per-thread γ load (2 f32 values per thread)
+//   emit_ia3_gamma_multiply     — broadcast-mul main_accum0..3 by gamma0/gamma1
+//   emit_ia3_store_output       — thin wrapper delegating to emit_lora_store_output
+
+/// Register pool spec for WRGA fused IA³ kernel.
+///
+/// Compared to `LoraRegisterBudget`:
+///   - No epi_interm/epi_final/epi_a_frag/epi_b_frag (no epilogue MMA)
+///   - No scale_reg (IA³ has no per-site scale)
+///   - No rd_a/rd_b/smem_base_a/smem_base_b (no A/B adapter matrices)
+///   - gamma_count = 2 (per-thread 2-col load; avoids PTX dynamic reg indexing)
+#[derive(Debug, Clone)]
+pub struct Ia3RegisterBudget {
+    pub main_accum_count: u32,  // 8 (f32, x@W output accumulator)
+    pub gamma_count: u32,       // 2 (f32: gamma0 = γ[col+0], gamma1 = γ[col+1])
+    pub main_a_frag_count: u32, // 4 (b32, x fragment)
+    pub main_b_frag_count: u32, // 2 (b32, W fragment)
+    pub rd_scratch: u32,        // 12 (u64 scratch)
+    pub u32_scratch: u32,       // 10 (u32 scratch, lane math, tile math)
+    pub pred_count: u32,        // 4  (%p0..%p3)
+}
+
+pub fn wrga_ia3_register_budget(_cfg: &FusedIa3Config) -> Ia3RegisterBudget {
+    Ia3RegisterBudget {
+        main_accum_count: 8,
+        gamma_count: 2,
+        main_a_frag_count: 4,
+        main_b_frag_count: 2,
+        rd_scratch: 12,
+        u32_scratch: 10,
+        pred_count: 4,
+    }
+}
+
+/// Emit the WRGA-IA³ register pool declarations.
+///
+/// Matches the LoRA pool shape but drops epilogue registers and the scale reg.
+/// Keeps all lane-addressing registers (%mma_a_row, %mma_b_row, %mma_addr,
+/// %smem_base_x/w, %smem_base_w_lane_u32) because the matmul_mma helpers
+/// require them by name.
+///
+/// %gamma<2> holds the 2 per-thread γ column values loaded by
+/// emit_ia3_load_gamma.
+pub fn emit_ia3_register_pool(ptx: &mut String, b: &Ia3RegisterBudget) {
+    ptx.push_str(&format!("    .reg .f32 %main_accum<{}>;\n", b.main_accum_count));
+    ptx.push_str(&format!("    .reg .f32 %gamma<{}>;\n", b.gamma_count));
+    ptx.push_str(&format!("    .reg .b32 %main_a_frag<{}>;\n", b.main_a_frag_count));
+    ptx.push_str(&format!("    .reg .b32 %main_b_frag<{}>;\n", b.main_b_frag_count));
+    ptx.push_str(&format!("    .reg .u64 %rd<{}>;\n", b.rd_scratch));
+    ptx.push_str(&format!("    .reg .u32 %r<{}>;\n", b.u32_scratch));
+    ptx.push_str(&format!("    .reg .pred %p<{}>;\n", b.pred_count));
+    // Named pointer/base registers (subset of LoRA — no rd_a/rd_b).
+    ptx.push_str("    .reg .u64 %rd_x, %rd_w, %rd_gamma, %rd_y;\n");
+    ptx.push_str("    .reg .u64 %x_tile_base, %w_tile_base;\n");
+    ptx.push_str("    .reg .u64 %shmem_base;\n");
+    ptx.push_str("    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;\n");
+    // Lane-derived addressing registers (required by matmul_mma helpers).
+    ptx.push_str("    .reg .u32 %mma_a_row, %mma_b_row, %mma_addr;\n");
+    ptx.push_str("    .reg .u64 %smem_base_x, %smem_base_w;\n");
+    // Output tile coords.
+    ptx.push_str("    .reg .u32 %row_base, %col_base;\n");
+    ptx.push_str("    .reg .u32 %m_real, %n_real;\n");
+}
+
+/// SMEM byte offsets for the IA³ kernel.
+///
+/// IA³ only needs x_tile and w_tile (no adapter A/B tiles).
+/// Sizes and offsets are identical to the LoRA x/w sub-allocation
+/// so the same staging helpers work without modification:
+///   [  0,  512) — x_tile  (16×16 f16, 512 bytes)
+///   [512,  768) — w_tile  (16× 8 f16, 256 bytes, col-major)
+pub const IA3_X_TILE_OFFSET: u32 = 0;
+pub const IA3_W_TILE_OFFSET: u32 = 512;
+
+/// Initialize the x/w SMEM base registers for the IA³ kernel.
+///
+/// Must be called after `emit_shmem_base_cvta` has set %shmem_base.
+/// Sets %x_tile_base, %w_tile_base, and their %smem_base_x/w aliases
+/// (required by emit_lora_stage_x_tile and emit_lora_stage_w_tile).
+///
+/// Also sets the per-lane B-fragment column base %smem_base_w_lane_u32
+/// needed by emit_load_b_fragment_smem.  The col-major B-tile lane
+/// formula is identical to LoRA: (tid/4)*32 bytes.
+pub fn emit_ia3_tile_bases(ptx: &mut String) {
+    ptx.push_str(&format!("    add.u64 %x_tile_base, %shmem_base, {};\n", IA3_X_TILE_OFFSET));
+    ptx.push_str(&format!("    add.u64 %w_tile_base, %shmem_base, {};\n", IA3_W_TILE_OFFSET));
+    // matmul_mma helpers look up %smem_base_x/w by name — alias.
+    ptx.push_str("    mov.u64 %smem_base_x, %x_tile_base;\n");
+    ptx.push_str("    mov.u64 %smem_base_w, %w_tile_base;\n");
+}
+
+/// Load the 2 per-thread γ values from global memory into %gamma0 and %gamma1.
+///
+/// Per-thread column layout (m16n8k16 D-fragment):
+///   col_base_in_tile = (tid % 4) * 2   → 0, 2, 4, or 6
+/// This thread owns output cols (col_base + col_base_in_tile + 0) and
+/// (col_base + col_base_in_tile + 1).  Loading exactly 2 f32 values per
+/// thread avoids PTX's lack of dynamic register indexing (option c from spec).
+///
+/// γ is a 1-D f32 array of length n.  The byte offset for this thread is:
+///   (col_base + col_base_in_tile) * 4
+///
+/// Stores:
+///   %gamma0 = γ[col_base + col_base_in_tile + 0]
+///   %gamma1 = γ[col_base + col_base_in_tile + 1]
+///
+/// NOTE: n-bound predication is intentionally omitted here (emit_ia3_store_output
+/// already predicates on n_real per column); γ OOB loads on tail columns only
+/// produce garbage values that are never written to y.
+pub fn emit_ia3_load_gamma(ptx: &mut String) {
+    ptx.push_str("    // Load per-thread γ slice (2 cols per thread)\n");
+    // col_base_in_tile = (tid % 4) * 2
+    ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
+    ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
+    // Global gamma byte offset: (col_base + col_base_in_tile) * 4
+    ptx.push_str("    add.u32 %r6, %col_base, %r5;\n");
+    ptx.push_str("    shl.b32 %r6, %r6, 2;\n");
+    ptx.push_str("    cvt.u64.u32 %rd0, %r6;\n");
+    ptx.push_str("    add.u64 %rd0, %rd_gamma, %rd0;\n");
+    // Load 2 γ values: gamma0 at col+0, gamma1 at col+1.
+    ptx.push_str("    ld.global.f32 %gamma0, [%rd0];\n");
+    ptx.push_str("    ld.global.f32 %gamma1, [%rd0 + 4];\n");
+}
+
+/// Broadcast-multiply main_accum0..3 by the per-thread γ values.
+///
+/// Per m16n8k16 D-fragment layout each thread owns 4 output values:
+///   main_accum0: (row+0, col+0) → multiply by gamma0
+///   main_accum1: (row+0, col+1) → multiply by gamma1
+///   main_accum2: (row+8, col+0) → multiply by gamma0
+///   main_accum3: (row+8, col+1) → multiply by gamma1
+///
+/// main_accum4..7 are the corresponding values from the second half of the
+/// m16n8 output tile (col offset +4 and +5 for the same two-column pair).
+/// They use the same gamma0/gamma1 because γ is indexed by the OUTPUT column
+/// of the m16n8k16 result, and for a given thread the 4-accum and 8-accum
+/// halves differ only in their ROW, not their column.
+///
+/// Must be called AFTER emit_ia3_load_gamma (uses %gamma0/%gamma1) and
+/// BEFORE emit_ia3_store_output.
+pub fn emit_ia3_gamma_multiply(ptx: &mut String) {
+    ptx.push_str("    // Broadcast-multiply main_accum by γ (per-thread 2-col)\n");
+    // First D-fragment half (rows 0 and 8 of the tile):
+    ptx.push_str("    mul.f32 %main_accum0, %main_accum0, %gamma0;\n");
+    ptx.push_str("    mul.f32 %main_accum1, %main_accum1, %gamma1;\n");
+    ptx.push_str("    mul.f32 %main_accum2, %main_accum2, %gamma0;\n");
+    ptx.push_str("    mul.f32 %main_accum3, %main_accum3, %gamma1;\n");
+    // Second D-fragment half (same column pair, rows 0+8 of upper sub-tile).
+    // m16n8k16 has only 4 D-fragment registers per thread for the n=8 output;
+    // main_accum4..7 are the second m16n8 tile's results (from the second
+    // half of main_accum<8> used when two MMA tiles cover the full 16×8 block).
+    // They share the same gamma0/gamma1 because their output columns are
+    // col+0 and col+1 relative to this thread's col_base_in_tile.
+    ptx.push_str("    mul.f32 %main_accum4, %main_accum4, %gamma0;\n");
+    ptx.push_str("    mul.f32 %main_accum5, %main_accum5, %gamma1;\n");
+    ptx.push_str("    mul.f32 %main_accum6, %main_accum6, %gamma0;\n");
+    ptx.push_str("    mul.f32 %main_accum7, %main_accum7, %gamma1;\n");
+}
+
+/// Store the IA³ output tile to y — delegates to the shared LoRA helper.
+///
+/// Both LoRA and IA³ use the identical m16n8k16 D-fragment layout and the
+/// same main_accum<8> pool, so the store sequence is bit-for-bit identical.
+pub fn emit_ia3_store_output(ptx: &mut String, n: u32) {
+    emit_lora_store_output(ptx, n);
 }

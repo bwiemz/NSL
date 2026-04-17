@@ -14,8 +14,6 @@
 //! Scale is a `.param .f32` — see the `scale` parameter below.  This
 //! enables kernel dedup across sites with different alpha values.
 
-use crate::matmul_mma;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FusedLoraConfig {
     pub site_id: String,
@@ -315,111 +313,148 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     ptx
 }
 
-fn emit_store_y(ptx: &mut String) {
-    ptx.push_str("    // (store sequence — per-thread writes of main_accum to global y)\n");
-    for i in 0..8 {
-        ptx.push_str(&format!(
-            "    st.global.f32 [%y_ptr + {}], %main_accum{};\n",
-            i * 4,
-            i,
-        ));
-    }
-}
-
-fn emit_load_frag_a_main(ptx: &mut String, k_tile: u32) {
-    let regs: [String; 4] = [
-        "main_a_frag0".into(),
-        "main_a_frag1".into(),
-        "main_a_frag2".into(),
-        "main_a_frag3".into(),
-    ];
-    matmul_mma::emit_load_a_fragment_smem(
-        ptx,
-        &regs,
-        &format!("%smem_base_x + {}", k_tile * 32),
-        32,
-    );
-}
-fn emit_load_frag_b_main(ptx: &mut String, k_tile: u32) {
-    let regs: [String; 2] = ["main_b_frag0".into(), "main_b_frag1".into()];
-    matmul_mma::emit_load_b_fragment_smem(
-        ptx,
-        &regs,
-        &format!("%smem_base_w + {}", k_tile * 16),
-        16,
-    );
-}
-fn emit_main_mma(ptx: &mut String) {
-    let d: [String; 4] = [
-        "main_accum0".into(),
-        "main_accum1".into(),
-        "main_accum2".into(),
-        "main_accum3".into(),
-    ];
-    let a: [String; 4] = [
-        "main_a_frag0".into(),
-        "main_a_frag1".into(),
-        "main_a_frag2".into(),
-        "main_a_frag3".into(),
-    ];
-    let b: [String; 2] = ["main_b_frag0".into(), "main_b_frag1".into()];
-    let c: [String; 4] = [
-        "main_accum0".into(),
-        "main_accum1".into(),
-        "main_accum2".into(),
-        "main_accum3".into(),
-    ];
-    matmul_mma::emit_mma_instruction(ptx, &d, &a, &b, &c);
-}
-
 /// Synthesize the full PTX for an epilogue-fused IA³ matmul kernel.
-/// IA³'s epilogue is `y = (x @ W) * γ` — one broadcast-mul after the
-/// main matmul.  No epilogue interleaving needed.
+///
+/// IA³ epilogue: `y = (x @ W) * γ` — one broadcast-mul after the main
+/// matmul.  No epilogue interleaving is needed (unlike LoRA).
+///
+/// Kernel structure mirrors the LoRA synthesizer but:
+///   - No A/B adapter matrices or epilogue MMA
+///   - No scale parameter
+///   - Per-thread γ load: each thread loads 2 f32 values for its 2 owned
+///     output columns, avoiding PTX's lack of dynamic register indexing
 pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     assert!(config.target_sm >= 80, "B.3 requires sm_80+");
+
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_init;
+    use crate::kernel_skeleton::params::{
+        emit_ld_param_u32, emit_ld_param_u64, emit_param_block, Param, ParamTy,
+    };
+    use crate::kernel_skeleton::smem::{emit_shmem_base_cvta, emit_static_smem_decl};
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    use crate::wrga_kernel_helpers::{
+        emit_ia3_gamma_multiply, emit_ia3_load_gamma, emit_ia3_register_pool,
+        emit_ia3_store_output, emit_ia3_tile_bases, emit_lora_output_tile_coords_dynamic,
+        emit_lora_stage_w_tile, emit_lora_stage_x_tile, emit_matmul_mma_lane_init,
+        emit_zero_accumulators, wrga_ia3_register_budget,
+    };
+
     let mut ptx = String::new();
-    ptx.push_str(".version 7.0\n");
-    ptx.push_str(&format!(".target sm_{}\n", config.target_sm));
-    ptx.push_str(".address_size 64\n\n");
-    ptx.push_str(&format!(
-        ".visible .entry nsl_wrga_fused_ia3_m{}n{}k{}(\n",
+    let budget = wrga_ia3_register_budget(config);
+
+    // 1. File header.
+    emit_ptx_header(&mut ptx, PtxVersion::V7_0, TargetSm::Sm80);
+
+    // 2. Param block.
+    let entry_name = format!(
+        "nsl_wrga_fused_ia3_m{}n{}k{}",
         config.m, config.n, config.k,
-    ));
-    ptx.push_str("    .param .u64 x_ptr,\n");
-    ptx.push_str("    .param .u64 w_ptr,\n");
-    ptx.push_str("    .param .u64 gamma_ptr,\n");
-    ptx.push_str("    .param .u64 y_ptr\n");
-    ptx.push_str(")\n{\n");
-    ptx.push_str("    // === Register declarations (IA³ — simpler than LoRA) ===\n");
-    ptx.push_str("    .reg .f32 %main_accum<8>;\n");
-    ptx.push_str("    .reg .b32 %main_a_frag<4>;\n");
-    ptx.push_str("    .reg .b32 %main_b_frag<2>;\n");
-    ptx.push_str("    .reg .f32 %gamma<8>;\n");
-    ptx.push_str("    .reg .u64 %smem_base_x, %smem_base_w;\n");
-    ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n\n");
-    for i in 0..8 {
-        ptx.push_str(&format!("    mov.f32 %main_accum{}, 0f00000000;\n", i));
-    }
-    let k_iters = config.k / MMA_K_U32;
+    );
+    let params = [
+        Param { ty: ParamTy::U64, name: "x_ptr" },
+        Param { ty: ParamTy::U64, name: "w_ptr" },
+        Param { ty: ParamTy::U64, name: "gamma_ptr" },
+        Param { ty: ParamTy::U64, name: "y_ptr" },
+        // Runtime m/n for tail predication (same pattern as LoRA).
+        Param { ty: ParamTy::U32, name: "m_rows" },
+        Param { ty: ParamTy::U32, name: "n_cols" },
+    ];
+    emit_param_block(&mut ptx, &entry_name, &params);
+
+    // 3. SMEM decl + register pool + shmem base + thread/lane/warp init.
+    //    IA³ only needs x_tile + w_tile: 512 + 256 = 768 bytes.
+    emit_static_smem_decl(&mut ptx, 768);
+    emit_ia3_register_pool(&mut ptx, &budget);
+    // u32 tile-base shadow for matmul_mma helpers (require u32 addresses).
+    ptx.push_str("    .reg .u32 %smem_base_x_u32, %smem_base_w_u32;\n");
+    // f32 and b16 scratch for tile-staging f32→f16 conversion.
+    ptx.push_str("    .reg .f32 %stg_f0, %stg_f1;\n");
+    ptx.push_str("    .reg .b16 %stg_h0, %stg_h1;\n");
+    // Per-lane B-fragment column base (same col-major geometry as LoRA W-tile).
+    ptx.push_str("    .reg .u32 %smem_base_w_lane_u32;\n");
+    // Runtime m/n registers for tile predication.
+    ptx.push_str("    .reg .u32 %m_param, %n_param;\n");
+
+    emit_shmem_base_cvta(&mut ptx);
+    emit_thread_lane_warp_register_init(&mut ptx);
+    emit_ia3_tile_bases(&mut ptx);
+
+    // Convert u64 tile bases to u32 shared addresses for matmul_mma helpers.
+    ptx.push_str("    cvt.u32.u64 %smem_base_x_u32, %x_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_w_u32, %w_tile_base;\n");
+
+    emit_matmul_mma_lane_init(&mut ptx);
+
+    // Per-lane B-fragment column base: (tid/4)*32 bytes (col-major stride=32).
+    // Identical derivation to LoRA's %smem_base_w_lane_u32.
+    ptx.push_str("    // Per-lane B-frag column base: (tid/4)*32 bytes\n");
+    ptx.push_str("    shr.u32 %r9, %tid_x, 2;\n");
+    ptx.push_str("    shl.b32 %r9, %r9, 5;\n");
+    ptx.push_str("    add.u32 %smem_base_w_lane_u32, %smem_base_w_u32, %r9;\n");
+
+    // 4. Load params into named registers.
+    emit_ld_param_u64(&mut ptx, "%rd_x", "x_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_w", "w_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_gamma", "gamma_ptr");
+    emit_ld_param_u64(&mut ptx, "%rd_y", "y_ptr");
+    emit_ld_param_u32(&mut ptx, "%m_param", "m_rows");
+    emit_ld_param_u32(&mut ptx, "%n_param", "n_cols");
+
+    // 5. Output-tile coords + zero accumulators.
+    emit_lora_output_tile_coords_dynamic(&mut ptx);
+    emit_zero_accumulators(&mut ptx, "main_accum", 8);
+
+    // 6. Main K-loop.
+    let k_iters = (config.k + MMA_K_U32 - 1) / MMA_K_U32;
+
+    let main_a_frag_names: [String; 4] = [
+        "main_a_frag0".into(), "main_a_frag1".into(),
+        "main_a_frag2".into(), "main_a_frag3".into(),
+    ];
+    let main_b_frag_names: [String; 2] = [
+        "main_b_frag0".into(), "main_b_frag1".into(),
+    ];
+    let main_a_frag: [String; 4] = [
+        "%main_a_frag0".into(), "%main_a_frag1".into(),
+        "%main_a_frag2".into(), "%main_a_frag3".into(),
+    ];
+    let main_b_frag: [String; 2] = [
+        "%main_b_frag0".into(), "%main_b_frag1".into(),
+    ];
+    let main_accum: [String; 4] = [
+        "%main_accum0".into(), "%main_accum1".into(),
+        "%main_accum2".into(), "%main_accum3".into(),
+    ];
+
     for k_tile in 0..k_iters {
-        emit_load_frag_a_main(&mut ptx, k_tile);
-        emit_load_frag_b_main(&mut ptx, k_tile);
-        emit_main_mma(&mut ptx);
+        ptx.push_str(&format!("    // ===== K-iteration {} =====\n", k_tile));
+
+        emit_lora_stage_x_tile(&mut ptx, k_tile, config.m, config.k);
+        emit_lora_stage_w_tile(&mut ptx, k_tile, config.n, config.k);
+
+        ptx.push_str("    bar.sync 0;\n");
+
+        emit_load_a_fragment_smem(&mut ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
+        emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
+
+        // Main MMA: main_accum += x_tile @ w_tile
+        emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+
+        ptx.push_str("    bar.sync 0;\n");
     }
-    ptx.push_str("    // === IA³ epilogue: main_accum *= gamma (broadcast) ===\n");
-    for i in 0..8 {
-        ptx.push_str(&format!(
-            "    ld.global.f32 %gamma{}, [%gamma_ptr + {}];\n",
-            i,
-            i * 4,
-        ));
-        ptx.push_str(&format!(
-            "    mul.f32 %main_accum{}, %main_accum{}, %gamma{};\n",
-            i, i, i,
-        ));
-    }
-    emit_store_y(&mut ptx);
+
+    // 7. IA³ epilogue: load γ, broadcast-multiply, store.
+    emit_ia3_load_gamma(&mut ptx);
+    emit_ia3_gamma_multiply(&mut ptx);
+    emit_ia3_store_output(&mut ptx, config.n);
+
+    // 8. Close the entry body.
+    ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
+
     ptx
 }
 
