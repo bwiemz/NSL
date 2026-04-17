@@ -277,3 +277,63 @@ pub fn emit_lora_stage_b_tile(ptx: &mut String, rank: u32, n: u32) {
     }
     ptx.push_str("lora_b_stage_done:\n");
 }
+
+// ─── C3: Accumulator init + predicated output store ───────────────────────
+
+/// Emit zero-init of N floating-point accumulator registers named
+/// `%<base>0..%<base>(N-1)`.
+pub fn emit_zero_accumulators(ptx: &mut String, base: &str, count: u32) {
+    for i in 0..count {
+        ptx.push_str(&format!("    mov.f32 %{}{}, 0f00000000;\n", base, i));
+    }
+}
+
+/// Emit the output-tile store with predication on m_real and n_real.
+///
+/// The `main_accum<8>` register pool holds a 16×8 f32 output tile
+/// distributed across 32 lanes.  Per the m16n8k16 D-fragment layout,
+/// each thread owns 4 f32 values in the (row, col) grid:
+///   main_accum0: (row_base_in_tile + 0, col_base_in_tile + 0)
+///   main_accum1: (row_base_in_tile + 0, col_base_in_tile + 1)
+///   main_accum2: (row_base_in_tile + 8, col_base_in_tile + 0)
+///   main_accum3: (row_base_in_tile + 8, col_base_in_tile + 1)
+/// where
+///   row_base_in_tile = tid / 4      (0..8 depending on lane)
+///   col_base_in_tile = (tid % 4) * 2  (0, 2, 4, or 6)
+///
+/// Global y is [m, n] f32 row-major.  The write address is
+///   rd_y + ((row_base + row_in_tile) * n + col_base + col_in_tile) * 4
+///
+/// Stores are predicated on (row_in_tile < m_real && col_in_tile < n_real)
+/// so tail boundary tiles (m%16 != 0 or n%8 != 0) don't overwrite
+/// neighboring memory.
+pub fn emit_lora_store_output(ptx: &mut String, n: u32) {
+    ptx.push_str("    // Store main_accum to y with m_real/n_real predication\n");
+    // row_base_in_tile = tid / 4
+    ptx.push_str("    shr.u32 %r4, %tid_x, 2;\n");
+    // col_base_in_tile = (tid % 4) * 2
+    ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
+    ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
+    // Per m16n8k16 D-fragment layout, each thread owns 4 outputs at
+    // positions: (r,c), (r,c+1), (r+8,c), (r+8,c+1) relative to tile origin.
+    let offsets: [(u32, u32); 4] = [(0, 0), (0, 1), (8, 0), (8, 1)];
+    for (i, (row_off, col_off)) in offsets.iter().enumerate() {
+        ptx.push_str(&format!("    // Store main_accum{} (row+{}, col+{})\n", i, row_off, col_off));
+        // row_in_tile = %r4 + row_off
+        ptx.push_str(&format!("    add.u32 %r6, %r4, {};\n", row_off));
+        // col_in_tile = %r5 + col_off
+        ptx.push_str(&format!("    add.u32 %r7, %r5, {};\n", col_off));
+        // Predicate: row_in_tile < m_real AND col_in_tile < n_real
+        ptx.push_str("    setp.lt.u32 %p1, %r6, %m_real;\n");
+        ptx.push_str("    setp.lt.and.u32 %p1, %r7, %n_real, %p1;\n");
+        // Global offset in bytes: ((row_base + row_in_tile) * n + col_base + col_in_tile) * 4
+        ptx.push_str("    add.u32 %r8, %row_base, %r6;\n");
+        ptx.push_str(&format!("    mul.lo.u32 %r8, %r8, {};\n", n));
+        ptx.push_str("    add.u32 %r8, %r8, %col_base;\n");
+        ptx.push_str("    add.u32 %r8, %r8, %r7;\n");
+        ptx.push_str("    shl.b32 %r8, %r8, 2;\n");
+        ptx.push_str("    cvt.u64.u32 %rd0, %r8;\n");
+        ptx.push_str("    add.u64 %rd0, %rd_y, %rd0;\n");
+        ptx.push_str(&format!("    @%p1 st.global.f32 [%rd0], %main_accum{};\n", i));
+    }
+}
