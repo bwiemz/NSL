@@ -636,3 +636,110 @@ fn build_4_fused_real_launch() {
          Check for fallback warnings in stderr above."
     );
 }
+
+// ─── Task E4: IA³ integration fixtures ─────────────────────────────────────
+//
+// Fixture A — full compute path baseline:
+//   x = ones([4,8]), W = ones([8,8]), γ = ones([8])
+//   y[i,j] = (x@W)[i,j] * γ[j] = 8 * 1 = 8 elementwise
+// Proves the IA³ matmul pipeline runs end-to-end (γ=1 is a passthrough
+// so a failure here means the x@W path itself is broken).
+//
+// Fixture B — γ actually multiplies:
+//   x = ones([4,8]), W = ones([8,8]), γ = [2, 2, ..., 2]
+//   y[i,j] = 8 * 2 = 16 elementwise
+// Proves γ is read from HBM and applied via broadcast-multiply.  If
+// Fixture A passes but B fails (y still = 8), γ is being ignored.
+
+const IA3_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=ia3, target=["Toy.w"])
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.ia3_scale_Toy_w__ia3 = ones([8]).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+const IA3_FIXTURE_B_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=ia3, target=["Toy.w"])
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.ia3_scale_Toy_w__ia3 = full([8], 2.0).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+#[cfg(feature = "cuda")]
+fn run_ia3_fixture(src: &str, expected: f32, fixture_name: &str) {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join(format!("{}.nsl", fixture_name));
+    fs::write(&src_path, src).unwrap();
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    assert!(
+        output.status.success(),
+        "{fixture_name} nsl run failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let tensor = parse_tensor_2d(&stdout);
+    let mut max_diff: f32 = 0.0;
+    for row in &tensor {
+        for v in row {
+            max_diff = max_diff.max((v - expected).abs());
+        }
+    }
+    assert!(
+        max_diff < 1e-4,
+        "{fixture_name}: max |y - {expected}| = {max_diff:.3e}, want < 1e-4. \
+         Tensor: {tensor:?}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn ia3_fixture_a_baseline() {
+    run_ia3_fixture(IA3_FIXTURE_A_SRC, 8.0, "ia3_a");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn ia3_fixture_b_gamma_scaling() {
+    run_ia3_fixture(IA3_FIXTURE_B_SRC, 16.0, "ia3_b");
+}
