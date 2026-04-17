@@ -1,0 +1,2 @@
+.extern .shared .align 16 .b8 shmem[];
+

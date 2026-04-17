@@ -26,10 +26,11 @@ sha2 = "0.10"
 safetensors = "0.4"
 half = { version = "2.4", features = ["std"] }
 base64 = "0.22"
+cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 
 [features]
 default = []
-cuda = ["nsl-runtime/cuda"]
+cuda = ["nsl-runtime/cuda", "dep:cudarc"]
 test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
 

@@ -1,0 +1,1 @@
+    .shared .align 16 .b8 shmem[1536];

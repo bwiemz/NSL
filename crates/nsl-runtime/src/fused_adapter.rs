@@ -230,19 +230,26 @@ fn try_cuda_launch_fused_lora(
 
     // 4. Marshal launch args.  Scale passed as .param .f32 (see
     //    wrga_fused_ptx.rs — scale is NOT baked into PTX).
+    //    m_rows and n_cols are passed as .param .u32 so the kernel
+    //    can predicate tail rows/cols correctly regardless of the
+    //    compile-time config.m used during prescan.
     let mut x_data = xt.data as u64;
     let mut w_data = wt.data as u64;
     let mut a_data = at.data as u64;
     let mut b_data = bt.data as u64;
     let mut scale_f32: f32 = scale as f32;
     let mut y_data = out_data as u64;
-    let args: [*mut c_void; 6] = [
+    let mut m_rows_u32: u32 = m as u32;
+    let mut n_cols_u32: u32 = n as u32;
+    let args: [*mut c_void; 8] = [
         &mut x_data as *mut _ as *mut c_void,
         &mut w_data as *mut _ as *mut c_void,
         &mut a_data as *mut _ as *mut c_void,
         &mut b_data as *mut _ as *mut c_void,
         &mut scale_f32 as *mut _ as *mut c_void,
         &mut y_data as *mut _ as *mut c_void,
+        &mut m_rows_u32 as *mut _ as *mut c_void,
+        &mut n_cols_u32 as *mut _ as *mut c_void,
     ];
 
     // 5. Grid/block.  The synthesizer emits m16n8k16 MMA tiles; one
@@ -268,8 +275,17 @@ fn try_cuda_launch_fused_lora(
         inner::free_managed(out_data);
         return None;
     }
-    unsafe {
-        cudarc::driver::sys::cuCtxSynchronize();
+    let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    if sync_result as u32 != 0 {
+        eprintln!(
+            "[nsl-wrga] fused LoRA kernel caused GPU error ({:?}) — falling back to CPU math",
+            sync_result
+        );
+        unsafe {
+            let _ = Box::from_raw(out_ptr);
+        }
+        inner::free_managed(out_data);
+        return None;
     }
     record_fused_gpu_launch();
     Some(out_ptr as i64)

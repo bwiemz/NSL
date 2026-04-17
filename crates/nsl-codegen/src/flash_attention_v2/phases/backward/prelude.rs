@@ -23,6 +23,9 @@ use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     backward_extra_bytes, total_bytes, Direction, SMEM_BUDGET_BYTES,
 };
+use crate::kernel_skeleton::indexing::{
+    emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
+};
 
 /// Stable kernel-name prefix for backward variants.
 pub fn kernel_name(config: &FlashAttentionConfig) -> String {
@@ -53,13 +56,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // a misrouted caller can't produce an invalid kernel.
     let _ = Direction::Backward;
 
-    ptx.push_str(".version 8.7\n");
-    ptx.push_str(".target sm_75\n");
-    ptx.push_str(".address_size 64\n\n");
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
 
     let dyn_smem = backward_needs_dynamic_smem(config);
     if dyn_smem {
-        ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+        use crate::kernel_skeleton::smem::emit_dynamic_smem_extern;
+        emit_dynamic_smem_extern(ptx);
     }
 
     let name = kernel_name(config);
@@ -101,17 +104,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str(")\n{\n");
 
     if !dyn_smem {
-        ptx.push_str(&format!(
-            "    .shared .align 16 .b8 shmem[{}];\n",
-            backward_total_bytes(config)
-        ));
+        use crate::kernel_skeleton::smem::emit_static_smem_decl;
+        emit_static_smem_decl(ptx, backward_total_bytes(config) as usize);
     }
 
     // Base register pool. f32 pool: 48 scratch + head_dim/32 Q slice +
     // head_dim/32 O-ish placeholder (retained for parity with forward).
     let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
     let f32_pool = 48 + slices_per_lane;
-    ptx.push_str("    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;\n");
+    emit_thread_lane_warp_register_decl(ptx);
     ptx.push_str("    .reg .u64 %rd<64>;\n");
     ptx.push_str(&format!("    .reg .f32 %f<{}>;\n", f32_pool));
     ptx.push_str("    .reg .b16 %h<32>;\n");
@@ -176,7 +177,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     ptx.push_str("    .reg .u64 %warp_row;\n");
 
-    ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
+    crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // log2(e)\n");
 
     // Initialise SMEM tile bases. Q tile at byte 0 (Tier A layout); K
@@ -221,11 +222,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    ld.param.u64 %rd_bwd_dx,  [dx_ptr];\n");
 
     // Thread/block indices — identical to forward.
-    ptx.push_str("    mov.u32 %tid_x, %tid.x;\n");
-    ptx.push_str("    shr.u32 %warp_id, %tid_x, 5;\n");
-    ptx.push_str("    and.b32 %lane, %tid_x, 31;\n");
-    ptx.push_str("    mov.u32 %bid_x, %ctaid.x;\n");
-    ptx.push_str("    mov.u32 %bid_y, %ctaid.y;\n");
+    emit_thread_lane_warp_register_init(ptx);
 
     ptx.push_str("    cvt.u64.u32 %q_start, %bid_x;\n");
     ptx.push_str(&format!(

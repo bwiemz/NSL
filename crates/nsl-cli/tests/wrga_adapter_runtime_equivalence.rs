@@ -294,6 +294,39 @@ let y = m.forward(x)
 print(y)
 "#;
 
+// GPU-resident variant of BUILD4_SRC used ONLY by the `#[ignore]`-d
+// hardening test `build_4_fused_cuda_actually_fires`.  Every tensor that
+// feeds into `m.forward(x)` — the model weight, the input, and both
+// seeded adapter tensors — is placed on CUDA so the fused FFI's "inputs
+// on GPU" gate is satisfied and the real cudarc PTX launch fires.
+//
+// Kept separate from BUILD4_SRC because the non-ignored build_4* tests
+// must continue to exercise the CPU-fallback path on machines without
+// a CUDA device.
+const BUILD4_SRC_GPU: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = zeros([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_A_Toy_w__lora = ones([8, 2]).to(cuda)
+m.lora_B_Toy_w__lora = ones([2, 8]).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
 // ─── B.3 Task 4: fused FFI reachability when target=cuda_sm80 ───────────
 //
 // Same load-bearing source as Build 4, but compiled with `--target
@@ -447,16 +480,17 @@ fn build_5_fused_launches_one_kernel_per_site() {
 // when `NSL_WRGA_FUSED_CUDA=1` is set, using a runtime counter that
 // only increments on successful cudarc launch — never on fallback.
 //
-// Test is `#[ignore]` by default: it requires a CUDA-capable device and
-// `NSL_WRGA_FUSED_CUDA=1`.  Run with:
+// Test is `#[cfg(feature = "cuda")]`-gated: runs automatically on CUDA
+// machines when the `cuda` feature is enabled.  The fused LoRA PTX
+// kernel is now valid (Tasks A-E) so the real cudarc launch fires.
 //   cargo test -p nsl-cli --test wrga_adapter_runtime_equivalence \
-//     build_4_fused_cuda_actually_fires -- --ignored
+//     --features cuda build_4_fused_cuda_actually_fires
+#[cfg(feature = "cuda")]
 #[test]
-#[ignore]
 fn build_4_fused_cuda_actually_fires() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("build4_gpu.nsl");
-    fs::write(&src_path, BUILD4_SRC).unwrap();
+    fs::write(&src_path, BUILD4_SRC_GPU).unwrap();
 
     let root = workspace_root();
     let stdlib = root.join("stdlib");
@@ -520,4 +554,193 @@ fn build_4_lora_rewrite_load_bearing_proof() {
             );
         }
     }
+}
+
+// ─── Task D1: build_4_fused_real_launch — integration numerical gate ─
+//
+// Runs BUILD4_SRC_GPU with NSL_WRGA_FUSED_CUDA=1 forced on, asserts:
+//   1. Output is 16.0 ± 1e-4 elementwise (numerical correctness via
+//      real cudarc launch, NOT CPU fallback — the 1e-4 tolerance is
+//      the milestone's numerical gate from spec §5).
+//   2. [nsl-gpu-launch-count] ≥ 1 (proves the fused PTX actually
+//      executed on GPU; count=0 would mean numerical result was
+//      produced by CPU fallback even though NSL_WRGA_FUSED_CUDA=1
+//      was set).
+//
+// Complementary to build_4_fused_cuda_actually_fires (which only
+// asserts count ≥ 1 without checking numerics).  This test catches
+// semantic bugs in the rewritten kernel that passed ptxas validation
+// but silently compute the wrong thing.
+//
+// Known C4 precision concern: the final (x@A)@B MMA requires packed-f16
+// A-operand; C4 emits cvt.rn.f16x2.f32 between the two epilogue MMAs.
+// For BUILD4 shape (x=ones, A=ones, B=ones, rank=2) epi_interm=8.0
+// fits f16 exactly so no loss; larger test shapes may need >1e-4
+// tolerance — raise this flag here if the assertion fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn build_4_fused_real_launch() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build4_real_launch.nsl");
+    fs::write(&src_path, BUILD4_SRC_GPU).unwrap();
+
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+
+    // Parse output tensor.
+    let tensor = parse_tensor_2d(&stdout);
+    assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
+
+    // Assert 16.0 ± 1e-4 per element.
+    let mut max_diff: f32 = 0.0;
+    for row in &tensor {
+        assert_eq!(row.len(), 8, "expected 8 cols");
+        for v in row {
+            max_diff = max_diff.max((v - 16.0).abs());
+        }
+    }
+    assert!(
+        max_diff < 1e-4,
+        "build_4_fused_real_launch: max |y - 16.0| = {max_diff:.3e}, want < 1e-4.\n\
+         Diagnostic hints:\n\
+         - ~1e-3: f16 precision (cvt.rn.f16x2.f32 between epilogue MMAs)\n\
+         - exactly 16.0 diff (y=0): base matmul fired but adapter delta dropped\n\
+         - exactly 0: test never exercised the fused path\n\
+         stderr:\n{stderr}"
+    );
+
+    // Assert the REAL cudarc launch fired (not CPU fallback).
+    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
+    let count: u64 = gpu_count_line
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "build_4_fused_real_launch: expected ≥1 real cudarc launch with \
+         NSL_WRGA_FUSED_CUDA=1, got {count}. Numerical output was correct \
+         but came from CPU fallback — the fused PTX path didn't fire. \
+         Check for fallback warnings in stderr above."
+    );
+}
+
+// ─── Task E4: IA³ integration fixtures ─────────────────────────────────────
+//
+// Fixture A — full compute path baseline:
+//   x = ones([4,8]), W = ones([8,8]), γ = ones([8])
+//   y[i,j] = (x@W)[i,j] * γ[j] = 8 * 1 = 8 elementwise
+// Proves the IA³ matmul pipeline runs end-to-end (γ=1 is a passthrough
+// so a failure here means the x@W path itself is broken).
+//
+// Fixture B — γ actually multiplies:
+//   x = ones([4,8]), W = ones([8,8]), γ = [2, 2, ..., 2]
+//   y[i,j] = 8 * 2 = 16 elementwise
+// Proves γ is read from HBM and applied via broadcast-multiply.  If
+// Fixture A passes but B fails (y still = 8), γ is being ignored.
+
+const IA3_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=ia3, target=["Toy.w"])
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.ia3_scale_Toy_w__ia3 = ones([8]).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+const IA3_FIXTURE_B_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=ia3, target=["Toy.w"])
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.ia3_scale_Toy_w__ia3 = full([8], 2.0).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+#[cfg(feature = "cuda")]
+fn run_ia3_fixture(src: &str, expected: f32, fixture_name: &str) {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join(format!("{}.nsl", fixture_name));
+    fs::write(&src_path, src).unwrap();
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    assert!(
+        output.status.success(),
+        "{fixture_name} nsl run failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let tensor = parse_tensor_2d(&stdout);
+    let mut max_diff: f32 = 0.0;
+    for row in &tensor {
+        for v in row {
+            max_diff = max_diff.max((v - expected).abs());
+        }
+    }
+    assert!(
+        max_diff < 1e-4,
+        "{fixture_name}: max |y - {expected}| = {max_diff:.3e}, want < 1e-4. \
+         Tensor: {tensor:?}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn ia3_fixture_a_baseline() {
+    run_ia3_fixture(IA3_FIXTURE_A_SRC, 8.0, "ia3_a");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn ia3_fixture_b_gamma_scaling() {
+    run_ia3_fixture(IA3_FIXTURE_B_SRC, 16.0, "ia3_b");
 }

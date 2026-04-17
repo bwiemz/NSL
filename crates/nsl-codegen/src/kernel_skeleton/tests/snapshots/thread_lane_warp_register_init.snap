@@ -1,0 +1,5 @@
+    mov.u32 %tid_x, %tid.x;
+    shr.u32 %warp_id, %tid_x, 5;
+    and.b32 %lane, %tid_x, 31;
+    mov.u32 %bid_x, %ctaid.x;
+    mov.u32 %bid_y, %ctaid.y;

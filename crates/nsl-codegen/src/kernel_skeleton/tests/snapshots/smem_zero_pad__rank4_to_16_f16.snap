@@ -1,0 +1,13 @@
+    // Zero-pad SMEM region [4, 16) at 16-bit granularity
+    st.shared.b16 [%a_tile_base + 8], 0;
+    st.shared.b16 [%a_tile_base + 10], 0;
+    st.shared.b16 [%a_tile_base + 12], 0;
+    st.shared.b16 [%a_tile_base + 14], 0;
+    st.shared.b16 [%a_tile_base + 16], 0;
+    st.shared.b16 [%a_tile_base + 18], 0;
+    st.shared.b16 [%a_tile_base + 20], 0;
+    st.shared.b16 [%a_tile_base + 22], 0;
+    st.shared.b16 [%a_tile_base + 24], 0;
+    st.shared.b16 [%a_tile_base + 26], 0;
+    st.shared.b16 [%a_tile_base + 28], 0;
+    st.shared.b16 [%a_tile_base + 30], 0;

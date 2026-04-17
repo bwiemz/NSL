@@ -4,6 +4,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes};
+use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 
 /// Emit the PTX file header up through the index-computation block.
 ///
@@ -24,9 +25,8 @@ use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes};
 /// `shmem` byte array declared here.
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // File header.
-    ptx.push_str(".version 8.7\n");
-    ptx.push_str(".target sm_75\n");
-    ptx.push_str(".address_size 64\n\n");
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
 
     // Dynamic SMEM module-scope declaration (must precede the .visible .entry).
     // In PTX, `.extern .shared` is a module-level directive — it CANNOT appear
@@ -34,7 +34,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // the declaration moves here; the static `.shared .align 16 .b8 shmem[N]`
     // form (which CAN appear inside a function body) is used for smaller configs.
     if needs_dynamic_smem(config) {
-        ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+        use crate::kernel_skeleton::smem::emit_dynamic_smem_extern;
+        emit_dynamic_smem_extern(ptx);
     }
 
     // Kernel entry + param block. All 30 params declared even when a
@@ -77,10 +78,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Dynamic SMEM configs use `.extern .shared` at module scope (emitted above,
     // before the .visible .entry).  Static configs declare the array here.
     if !needs_dynamic_smem(config) {
-        ptx.push_str(&format!(
-            "    .shared .align 16 .b8 shmem[{}];\n",
-            total_bytes(config)
-        ));
+        use crate::kernel_skeleton::smem::emit_static_smem_decl;
+        emit_static_smem_decl(ptx, total_bytes(config) as usize);
     }
 
     // Register declarations. f32 pool must cover the highest-indexed
@@ -91,7 +90,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Pool size N declares %f<N> = %f0..%f(N-1), so N = 48 + head_dim/32
     // to make %f{O_BASE + head_dim/32 - 1} a valid register.
     let f32_pool = 48 + (config.head_dim / 32) as u32;
-    ptx.push_str("    .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;\n");
+    emit_thread_lane_warp_register_decl(ptx);
     ptx.push_str("    .reg .u64 %rd<64>;\n");
     ptx.push_str(&format!("    .reg .f32 %f<{}>;\n", f32_pool));
     ptx.push_str("    .reg .b16 %h<32>;\n");
@@ -185,7 +184,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
     }
 
-    ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n");
+    crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))\n");
 
     // Load scalar params.
